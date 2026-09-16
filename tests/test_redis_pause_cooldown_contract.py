@@ -27,10 +27,10 @@ def test_every_redis_pausing_file_waits_out_the_breaker_cooldown():
     tests_dir = pathlib.Path(__file__).parent
     this_file = pathlib.Path(__file__).name
     offenders = []
-    # Scan test modules, conftest, and the shared helper modules (the _*.py files a test imports).
-    for path in sorted(list(tests_dir.glob("test_*.py")) + list(tests_dir.glob("_*.py"))
-                       + [tests_dir / "conftest.py"]):
-        if path.name == this_file or not path.exists():
+    # Scan EVERY .py under tests/ (test modules, conftest, and any helper module), so a pause site in
+    # a file the globs above would have missed cannot slip through.
+    for path in sorted(tests_dir.glob("*.py")):
+        if path.name == this_file:
             continue
         src = path.read_text(encoding="utf-8")
         if _PAUSE.search(src) and _SETTLES not in src:

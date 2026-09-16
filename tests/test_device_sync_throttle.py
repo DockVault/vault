@@ -6,11 +6,12 @@ the web UI. Now a credential that resolves to a device is throttled by device id
 with no device (a hand-out credential, an unknown or revoked username) still lands on the IP+username
 login throttle, so junk stays bounded.
 
-Everything here is exercised over HTTP at the web login door, where a device-minted credential
-charges its device bucket and is then refused (401) — so the device bucket and the human's IP bucket
-can be told apart by which one trips (429), with no reliance on SFTP timing or on X-Forwarded-For
-(ignored on shipped defaults; every host client shares one source IP, which is exactly why this must
-key on device identity, not IP).
+The doors differ. At the WEB door every temp_ name — device-linked or not — goes through the uniform
+login throttle (so no per-kind bucket leaks a name's existence, and a web attempt never reaches the
+device bucket). The per-kind buckets live at the SFTP door, where a device credential legitimately
+authenticates; the device-bucket tests here drive that door. X-Forwarded-For is ignored on shipped
+defaults, so every host client shares one source IP — which is exactly why device auth keys on device
+identity, not IP.
 
 Runs only where the login limit is small enough to trip over HTTP — the shipped default (5). On a
 suite stack that raises it, these skip (they cannot distinguish the buckets), mirroring
@@ -147,39 +148,36 @@ def test_a_second_device_is_unaffected_by_the_first(admin, temp_vault):
         f"a second device was throttled by the first's activity: {r.status_code} {r.text[:200]}")
 
 
-def test_the_device_bucket_bounds_a_runaway_device(admin, temp_vault):
-    """The device bucket is real and bounds a runaway: past its own limit the device is throttled —
-    and it took MORE than the IP threshold to get there, which is how we know it is the device bucket
-    (30), not the IP bucket (10), doing the bounding.
+def test_the_device_bucket_bounds_a_runaway_device_at_the_sftp_door(admin, temp_vault):
+    """The device bucket bounds a runaway at the SFTP door — the only door where a device-linked
+    credential spends its device bucket (at the web door every temp_ name goes through the uniform
+    login throttle). There is no per-IP bucket for device credentials at the SFTP door, so the only
+    thing that can refuse device A after a burst is its OWN device bucket.
 
-    A trip count alone cannot tell which layer produced the 429 (a 429 is a 429). The discriminator is
-    a SECOND device on the same IP: at the moment device A is throttled, device B must still
-    authenticate. If the shared IP bucket were the one that tripped, B — same IP — would be 429 too.
-    B answering 401 (its own empty device bucket, wrong password) proves it was A's device bucket."""
-    dev = _register_granted_device(admin, temp_vault)
+    The discriminator is a SECOND device on the SAME source IP: after device A's bucket is filled, A's
+    fresh credential is refused while device B's fresh credential still authenticates. A shared bucket
+    would refuse B too."""
+    dev_a = _register_granted_device(admin, temp_vault)
     dev_b = _register_granted_device(admin, temp_vault)
-    cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
-    cred_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
     device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
 
-    first_429 = None
-    for i in range(device_limit + 5):
-        r = _login_attempt(cred["temp_username"], _NEVER_VALID)
-        if r.status_code == 429:
-            first_429 = i
-            break
-        assert r.status_code == 401, r.text
-    assert first_429 is not None, "the device bucket never bounded a runaway device"
-    assert first_429 > _IP_THRESHOLD, (
-        f"the device was throttled after {first_429} attempts, at or below the IP threshold "
-        f"({_IP_THRESHOLD}) — that is the shared IP bucket tripping, not the per-device bucket")
+    # Reserve one live credential per device to test AFTER the burst (mint them first, leave unused).
+    reserved_a = mint_sync_cred(dev_a["secret"], temp_vault["id"]).json()
+    reserved_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
 
-    # The discriminator: device B, on the SAME IP, is untouched at the moment device A is throttled.
-    # A shared-IP-bucket trip would 429 B too; a per-device trip leaves B free.
-    r_b = _login_attempt(cred_b["temp_username"], _NEVER_VALID)
-    assert r_b.status_code == 401, (
-        f"a second device on the same IP was throttled ({r_b.status_code}) while device A was at its "
-        f"limit — the 429 came from the shared IP bucket, not device A's own bucket")
+    # Fill device A's bucket with wrong-password SFTP attempts (each charges the device bucket before
+    # the verify), cycling A's own names to stay within the per-device credential cap.
+    filler = _mint_many(admin, dev_a, temp_vault, device_limit)
+    assert filler, "could not mint any filler credential for device A"
+    for i in range(device_limit + 5):
+        sftp_authenticates(filler[i % len(filler)], _NEVER_VALID)  # fails auth, charges A's bucket
+
+    # Device A's reserved credential is now refused at the SFTP door — its device bucket is exhausted.
+    assert not sftp_authenticates(reserved_a["temp_username"], reserved_a["credential"]), (
+        "device A still authenticated after its device bucket should have been exhausted")
+    # Device B, on the SAME IP, is untouched — proof the bound is per-device, not shared.
+    assert sftp_authenticates(reserved_b["temp_username"], reserved_b["credential"]), (
+        "device B was refused while only device A was flooded — the throttle is not per-device")
 
 
 def test_unknown_username_spray_is_still_bounded(admin):
@@ -342,35 +340,57 @@ def test_the_device_bucket_still_bounds_a_runaway_under_a_redis_outage(admin, te
     onto the IP bucket or disable it. The fallback is a coarse fixed window, so the trip count can
     differ from the Redis path; what matters is that it trips AND does so in the device's own bucket
     (proved by a second device on the same IP still authenticating)."""
-    dev = _register_granted_device(admin, temp_vault)
+    dev_a = _register_granted_device(admin, temp_vault)
     dev_b = _register_granted_device(admin, temp_vault)
-    cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
-    cred_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
     device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
+    reserved_a = mint_sync_cred(dev_a["secret"], temp_vault["id"]).json()
+    reserved_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
+    filler = _mint_many(admin, dev_a, temp_vault, device_limit)
+    assert filler, "could not mint any filler credential for device A"
+    db_container = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
     def _docker(*args):
         return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
+
+    def _db_fallback_count(action, identifier):
+        """The attempt_count of the durable fallback row for (identifier, action), via psql in the DB
+        container, or None if the query could not run."""
+        sql = ("SELECT attempt_count FROM rate_limit_records WHERE action='%s' AND identifier='%s'"
+               % (action, identifier))
+        r = subprocess.run(
+            ["docker", "exec", db_container, "sh", "-c",
+             'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "%s"' % sql],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        out = r.stdout.strip()
+        return int(out) if out.isdigit() else None
 
     if _docker("inspect", _REDIS_CONTAINER).returncode != 0:
         pytest.skip(f"redis container {_REDIS_CONTAINER!r} not found")
     assert _docker("pause", _REDIS_CONTAINER).returncode == 0
     time.sleep(2)
     try:
-        first_429 = None
+        # At the SFTP door, under the outage, each wrong attempt drives the DB fallback throttle keyed
+        # by DEVICE. Fill device A's fallback bucket.
         for i in range(device_limit + 10):
-            r = _login_attempt(cred["temp_username"], _NEVER_VALID)
-            if r.status_code == 429:
-                first_429 = i
-                break
-            assert r.status_code == 401, r.text
-        assert first_429 is not None, (
-            "the device bucket failed OPEN during the Redis outage -- the DB fallback did not bound it")
-        # Same-IP discriminator: device B still authenticates, so the DB fallback bounded device A's
-        # OWN bucket, not a shared IP bucket.
-        r_b = _login_attempt(cred_b["temp_username"], _NEVER_VALID)
-        assert r_b.status_code == 401, (
-            f"a second device on the same IP was throttled ({r_b.status_code}) under the outage -- the "
-            f"DB fallback collapsed the per-device bound onto the IP bucket")
+            sftp_authenticates(filler[i % len(filler)], _NEVER_VALID)
+
+        # The fallback row must be keyed by the DEVICE, action 'device_sync' — not by IP — proving the
+        # outage did not collapse the per-device bound onto a shared bucket.
+        count = _db_fallback_count("device_sync", str(dev_a["device_id"]))
+        if count is None:
+            pytest.skip("could not read rate_limit_records via psql in the DB container")
+        assert count >= device_limit, (
+            f"the device_sync DB-fallback row for device A held {count} attempts; expected the burst "
+            f"to have driven it to at least the device limit ({device_limit})")
+
+        # Device A is bounded (its reserved credential is refused); device B, same IP, still works.
+        assert not sftp_authenticates(reserved_a["temp_username"], reserved_a["credential"]), (
+            "device A still authenticated during the outage — the DB fallback did not bound it")
+        assert sftp_authenticates(reserved_b["temp_username"], reserved_b["credential"]), (
+            "device B was refused during the outage — the DB fallback collapsed the per-device bound "
+            "onto a shared bucket")
     finally:
         _docker("unpause", _REDIS_CONTAINER)
         for _ in range(30):

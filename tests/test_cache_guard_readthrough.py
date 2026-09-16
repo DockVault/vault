@@ -95,24 +95,32 @@ def test_a_failed_auth_path_redis_op_never_writes_the_shared_breaker(name, trigg
     A._cache_guard_record_success()
 
 
-class _ExplodingRedis:
-    """Every op raises AssertionError — proves the caller did NOT touch the socket."""
+class _RecordingRedis:
+    """Records each op instead of raising. The consumers wrap their Redis calls in a bare `except
+    Exception`, so a stub that RAISED would be silently swallowed and the test could not tell a
+    skipped socket from a touched-then-swallowed one. Recording the touch and asserting it never
+    happened is the reliable signal."""
+
+    def __init__(self):
+        self.touched = []
 
     def exists(self, *a, **k):
-        raise AssertionError("touched Redis while the guard was open")
+        self.touched.append("exists")
+        return False
 
     def setex(self, *a, **k):
-        raise AssertionError("touched Redis while the guard was open")
+        self.touched.append("setex")
+        return True
 
 
-def _skip_denylist_read(monkeypatch):
-    monkeypatch.setattr(A, "redis_client", _ExplodingRedis())
-    assert A.is_token_denylisted("some-session-token") is False  # fails open, no socket
+def _skip_denylist_read(monkeypatch, fake):
+    monkeypatch.setattr(A, "redis_client", fake)
+    assert A.is_token_denylisted("some-session-token") is False  # fails open
 
 
-def _skip_denylist_write(monkeypatch):
-    monkeypatch.setattr(A, "redis_client", _ExplodingRedis())
-    A.denylist_token("some-session-token", 60)  # returns without a socket
+def _skip_denylist_write(monkeypatch, fake):
+    monkeypatch.setattr(A, "redis_client", fake)
+    A.denylist_token("some-session-token", 60)
 
 
 @pytest.mark.parametrize("name,op", [
@@ -121,12 +129,14 @@ def _skip_denylist_write(monkeypatch):
 ])
 def test_an_open_guard_skips_the_socket(name, op, monkeypatch):
     # With the guard open, these best-effort ops must skip Redis entirely — not stall a timeout per
-    # call during an outage. The exploding stub turns any socket touch into a failure. Removing the
-    # `if _cache_guard_*` skip in the consumer makes it touch the stub and go red.
+    # call during an outage. Removing the `if _cache_guard_*` skip in the consumer makes it touch the
+    # stub, so `touched` is non-empty and the test goes red.
     R._cb_record_success()
     A._cache_guard_record_success()
     A._cache_guard_record_failure(time.time())  # guard OPEN (private memory)
-    op(monkeypatch)  # must not raise
+    fake = _RecordingRedis()
+    op(monkeypatch, fake)
+    assert fake.touched == [], f"{name} touched Redis while the guard was open: {fake.touched}"
     A._cache_guard_record_success()
 
 

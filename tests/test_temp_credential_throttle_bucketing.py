@@ -17,6 +17,7 @@ out. Reverting the middle branch to the IP throttle turns the middle case red.
 """
 import pytest
 
+import app.services.auth_service as A
 from app.services.auth_service import AuthService
 
 pytestmark = pytest.mark.unit
@@ -77,27 +78,55 @@ def _route_for(cred, *, allow_device_credential=True):
     return exc.value.which
 
 
-def test_a_device_credential_routes_to_the_device_bucket_at_the_sftp_door():
-    # allow_device_credential=True is the SFTP door, where a device credential legitimately spends its
-    # device bucket.
+@pytest.mark.parametrize("cred", [
+    _Cred(device_id="dev-123"),  # device-linked
+    _Cred(device_id=None),       # known, no device (hand-out / deleted device)
+    None,                        # unknown name
+])
+def test_the_web_door_routes_every_kind_through_the_full_login_throttle(cred):
+    # allow_device_credential=False is the WEB door: EVERY temp_ name goes through the full
+    # login throttle (login:<temp_username> + login:<ip>). A per-kind bucket here is a status-code
+    # oracle — a known name's own-bucket path never touches login:<ip> while an unknown name's IP leg
+    # does, so priming login:<ip> then separates a live row (401) from a dead one (429). Routing any
+    # web-door kind to a per-kind bucket makes this read "device"/"username" and go red.
+    assert _route_for(cred, allow_device_credential=False) == "ip"
+
+
+def test_the_sftp_door_device_credential_routes_to_the_device_bucket():
     assert _route_for(_Cred(device_id="dev-123"), allow_device_credential=True) == "device"
 
 
-def test_a_device_credential_routes_to_its_username_bucket_at_the_web_door():
-    # allow_device_credential=False is the WEB door, where a device credential is refused after the
-    # throttle. It must NOT charge the device bucket there: otherwise its higher trip count classifies
-    # a device-sync name, and wrong-password web attempts drain the device's SFTP budget. It throttles
-    # in its own per-username bucket like any other known name. Reverting to the device bucket here
-    # makes this read "device" and go red.
-    assert _route_for(_Cred(device_id="dev-123"), allow_device_credential=False) == "username"
-
-
-def test_a_known_credential_without_a_device_routes_to_its_own_username_bucket():
+def test_the_sftp_door_known_credential_without_a_device_routes_to_its_username_bucket():
     # A hand-out credential, or one whose device was deleted (device_id NULL), is KNOWN and must
-    # throttle in its own per-username bucket — never login:<ip>. Reverting this to the IP throttle
-    # (the old behaviour) makes this assertion read "ip" and go red.
-    assert _route_for(_Cred(device_id=None)) == "username"
+    # throttle in its own per-username bucket at the SFTP door — never login:<ip>. Reverting this to
+    # the IP throttle lets a looping client spend the owner's IP budget — red.
+    assert _route_for(_Cred(device_id=None), allow_device_credential=True) == "username"
 
 
-def test_an_unknown_username_routes_to_the_ip_and_username_throttle():
-    assert _route_for(None) == "ip"
+def test_the_sftp_door_unknown_name_routes_to_the_ip_and_username_throttle():
+    assert _route_for(None, allow_device_credential=True) == "ip"
+
+
+def test_a_throttled_unknown_name_at_the_sftp_door_burns_a_dummy_verify(monkeypatch):
+    # R: at the SFTP door an UNKNOWN name refused on the IP leg must still cost one argon2 verify, so
+    # its timing matches a KNOWN name (which runs the real verify). Without the burn, a throttled
+    # unknown refuses before any verify and is faster — an existence timing oracle. Removing the
+    # dummy verify on the throttle-refusal path leaves `burned` empty — red.
+    from app.services.auth_service import RateLimitExceededError
+
+    svc = AuthService.__new__(AuthService)
+    svc.db = _FakeDB(None)  # unknown name
+
+    def _ip_leg_refuses(*a, **k):
+        raise RateLimitExceededError("Too many login attempts from this IP.", retry_after=1,
+                                     limit=10, remaining=0)
+
+    svc._check_rate_limit = _ip_leg_refuses
+    burned = []
+    monkeypatch.setattr(A, "verify_temporary_credential",
+                        lambda *a, **k: (burned.append(1), False)[1])
+
+    with pytest.raises(RateLimitExceededError):
+        svc.authenticate_temporary_credential("temp_ghost", "cred", "203.0.113.9",
+                                              allow_device_credential=True)
+    assert burned == [1], "the throttled-unknown SFTP path did not burn a dummy verify"

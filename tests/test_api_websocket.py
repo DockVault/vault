@@ -252,3 +252,50 @@ def test_ws_temp_cred_past_validity_window_closed(base_url, admin):
             ws.close()
         except Exception:
             pass
+
+
+@pytest.mark.websocket
+def test_ws_handshake_rejects_a_token_whose_session_row_is_gone(base_url, admin):
+    """A non-temporary token whose ActiveSession row has been DELETED must be rejected at the
+    handshake — the same fail-closed answer get_current_user gives. The API never deletes a session
+    row (revocation sets flags), so the row is deleted directly here. On the pre-fix handshake, which
+    rejected only a row MARKED revoked and accepted an ABSENT one, this token authenticates and
+    streams the fleet activity feed — red."""
+    import os
+    import subprocess
+    from conftest import ApiClient
+
+    user = admin.create_user(role="user")
+    client = ApiClient()
+    client.login(user["_username"], user["_password"])
+
+    db = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+    sql = "DELETE FROM active_sessions WHERE user_id='%s'" % user["id"]
+    deleted = subprocess.run(
+        ["docker", "exec", db, "sh", "-c",
+         'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "%s"' % sql],
+        capture_output=True, text=True, timeout=15)
+    if deleted.returncode != 0:
+        pytest.skip(f"could not delete the session row via psql: {deleted.stderr.strip()}")
+
+    try:
+        ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+        try:
+            ws.send(json.dumps({"type": "auth", "token": client.token}))
+            ws.settimeout(8)
+            authenticated = False
+            for _ in range(5):
+                try:
+                    msg = ws.recv()
+                except Exception:
+                    break  # socket closed -> handshake rejected, as required
+                if msg:
+                    authenticated = True
+                    break
+            assert not authenticated, (
+                "the handshake authenticated a token whose ActiveSession row was deleted — an ABSENT "
+                "row must be rejected like a revoked one")
+        finally:
+            ws.close()
+    finally:
+        admin.delete_user(user["id"])

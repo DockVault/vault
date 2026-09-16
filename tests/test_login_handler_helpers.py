@@ -57,10 +57,23 @@ def test_a_temp_429_drops_the_ratelimit_headers_and_uses_a_generic_body():
 def test_a_human_429_keeps_its_headers_and_exact_body():
     S = _api()
     exc = _Exc("Too many login attempts. Please try again in 42 seconds.",
-               limit=5, remaining=0, retry_after=42)
+               limit=5, remaining=3, retry_after=42)
     detail, headers = S._login_429_detail_and_headers("alice", exc)
     assert headers.get("X-RateLimit-Limit") == "5"
+    assert headers.get("X-RateLimit-Remaining") == "3"  # the human keeps ALL its rate-limit headers
+    assert headers.get("Retry-After") == "42"
     assert detail == "Too many login attempts. Please try again in 42 seconds."
+
+
+def test_a_temp_429_with_no_retry_after_uses_the_generic_no_countdown_body():
+    # The retry-less branch: when the exception carries no retry_after, the temp_ body is the generic
+    # no-countdown message and no Retry-After header is emitted. Pins that branch too.
+    S = _api()
+    exc = _Exc("Too many login attempts from this IP.", limit=30, remaining=0, retry_after=None)
+    detail, headers = S._login_429_detail_and_headers("temp_name", exc)
+    assert detail == "Too many login attempts. Please try again later."
+    assert "Retry-After" not in headers
+    assert "X-RateLimit-Limit" not in headers
 
 
 def test_record_failed_login_bg_records_through_the_monitor(monkeypatch):

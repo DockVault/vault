@@ -34,11 +34,19 @@ pytestmark = [
     ),
 ]
 
-# One unrelated request must return in well under the time N password verifies take when serialized
-# on the loop. A single Argon2 verify is ~0.1-0.2 s on a normal box, so N of them on the loop is ~1-2
-# s; offloaded, the unrelated request is a token-auth GET with no verify on its path and returns in
-# milliseconds. This sits between the two.
-_LOOP_FREE_CEILING = 0.3
+# The unrelated request must return WELL UNDER the time N password verifies take when serialized on
+# the loop. No absolute ceiling: a small shared runner (two vCPUs sharing N Argon2 verifies) makes
+# even the offloaded case take a few tenths of a second, so the test measures a single verify on the
+# same stack and bounds the burst-time request at a fraction of the fully-serialized N-verify wall.
+# The reverted (on-loop) case approaches that wall; the offloaded case is a small fraction of it,
+# because the loop is free and the request does not queue behind the verifies. The unit heartbeat
+# test (test_auth_offload.py) is the robust guard for the offload; this is the live confirmation.
+_SERIALIZED_FRACTION = 0.7
+
+
+def _median(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2]
 
 
 def test_a_login_burst_does_not_freeze_the_loop(admin):
@@ -48,6 +56,16 @@ def test_a_login_burst_does_not_freeze_the_loop(admin):
             return ApiClient(BASE_URL).session.post(
                 f"{BASE_URL}/auth/login",
                 json={"username": u["_username"], "password": u["_password"]}, timeout=30)
+
+        # Baseline: a single correct-password login on this stack ~ one Argon2 verify + overhead. The
+        # fully-serialized (on-loop) wall for the burst is about N of these.
+        verify_samples = []
+        for _ in range(3):
+            t0 = time.time()
+            assert _login(users[0]).status_code == 200
+            verify_samples.append(time.time() - t0)
+        t_verify = _median(verify_samples)
+        serialized_wall = _N * t_verify
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=_N) as pool:
             futures = [pool.submit(_login, u) for u in users]
@@ -62,10 +80,12 @@ def test_a_login_burst_does_not_freeze_the_loop(admin):
         assert r.status_code == 200, r.text
         # The logins themselves must succeed (else the burst was not real work on the loop/threads).
         assert all(lr.status_code == 200 for lr in logins), [lr.status_code for lr in logins]
-        assert elapsed < _LOOP_FREE_CEILING, (
-            f"an unrelated request took {elapsed:.2f}s during a {_N}-login burst — the password "
+        ceiling = _SERIALIZED_FRACTION * serialized_wall
+        assert elapsed < ceiling, (
+            f"an unrelated request took {elapsed:.2f}s during a {_N}-login burst — near the "
+            f"fully-serialized wall of {serialized_wall:.2f}s (N x {t_verify:.2f}s), so the password "
             f"verifies serialized on the event loop instead of running off it (expected under "
-            f"{_LOOP_FREE_CEILING}s)")
+            f"{ceiling:.2f}s)")
     finally:
         for u in users:
             admin.delete_user(u["id"])
