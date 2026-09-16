@@ -45,6 +45,15 @@ _cache_guard_open_until = 0.0
 
 
 def _cache_guard_is_open(now: float) -> bool:
+    """True while the guard is open: the limiter's breaker is open OR this guard's private memory is
+    inside its cooldown. Consumers that read this skip their Redis socket while it is True.
+
+    Note (carry-forward, BREAKER-PROBE): both the limiter's breaker and this private memory open for a
+    fixed cooldown and then simply lapse on a timer — the first Redis touch after each boundary
+    re-probes the socket and pays one timeout. The auth path's own re-probes are moved off the loop
+    (the offloaded login work, the offloaded failed-login record), but the general-API middleware's
+    synchronous limiter check still re-probes ON the loop once per boundary during an outage. Closing
+    that last on-loop re-probe is tracked separately, not here."""
     from app.core.rate_limiter import _cb_is_open
     return _cb_is_open(now) or now < _cache_guard_open_until
 

@@ -1990,13 +1990,15 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
 
 
 def _record_failed_login_bg(username, ip_address, reason) -> None:
-    """Record a failed login in the security monitor on its OWN short-lived DB session. Called INLINE
-    from both login except branches: the brute-force counter must advance on every failed login, so it
-    is never queued (a shed under a broadcast spray would lose it). It stays cheap on the loop — the
-    monitor's Redis ops (a windowed counter and a threshold publish) both go through the read-through
-    cache guard, so during an outage they skip the socket rather than stall. It opens its own session
-    (not the request's) like _notify_users does. Best-effort: monitoring must never affect the
-    response."""
+    """Record a failed login in the security monitor on its OWN short-lived DB session. Both login
+    except branches call it via `await run_offloaded(...)`: the brute-force counter must advance on
+    every failed login, so it is AWAITED (the record lands before the response, never shed under a
+    broadcast spray), but it runs in the offload pool, OFF the event loop. That matters because the
+    monitor's Redis ops (a windowed counter and a threshold publish) go through the read-through cache
+    guard, which skips the socket while open — but the one re-probe per cooldown boundary that does
+    reach the socket pays a full timeout, and on the loop that would freeze the whole server; in the
+    pool it does not. It opens its own session (not the request's) like _notify_users does.
+    Best-effort: monitoring must never affect the response."""
     try:
         from app.core.database import get_db_context
         from app.services.security_monitor import get_security_monitor
@@ -5847,10 +5849,12 @@ async def login(
     except (InvalidCredentialsError, AccountLockedError) as e:
         audit_logger.log_login_failure(login_request.username, client_ip, str(e))
         
-        # Record INLINE (not queued): the brute-force counter must advance on every failed login, and
-        # it is breaker-aware (its Redis ops go through the read-through guard), so it does not stall
-        # the loop during an outage.
-        _record_failed_login_bg(login_request.username, client_ip, str(e))
+        # AWAITED in the offload pool: the brute-force counter must advance on every failed login
+        # (never shed), so it is awaited — the record lands before the response — but OFF the loop.
+        # The guard skips the socket while open; the one re-probe per cooldown boundary that does
+        # reach the socket runs in the offload pool, so it never stalls the event loop. The request
+        # already holds its slot, so this adds no new pool pressure.
+        await run_offloaded(_record_failed_login_bg, login_request.username, client_ip, str(e))
 
         # A lock is only raised AFTER the password verified (verify-first ordering in
         # authenticate_user), so the caller has already proven they know the credential — telling
@@ -5888,8 +5892,10 @@ async def login(
             f"Rate limit exceeded: {str(e)}"
         )
         
-        # Record INLINE (not queued), same as the 401 branch — the counter must not be shed.
-        _record_failed_login_bg(login_request.username, client_ip, f"Rate limit exceeded: {str(e)}")
+        # Awaited in the offload pool, same as the 401 branch — the counter must not be shed, and its
+        # boundary re-probe must not stall the loop.
+        await run_offloaded(_record_failed_login_bg, login_request.username, client_ip,
+                            f"Rate limit exceeded: {str(e)}")
         
         detail, headers = _login_429_detail_and_headers(login_request.username, e)
         raise HTTPException(

@@ -260,9 +260,11 @@ class SecurityMonitor:
         # Go through the read-through cache guard, exactly as _broadcast_alert does below — not just
         # the limiter's breaker. redis_circuit_open() alone leaves a gap: it records nothing on
         # failure, so at every cooldown boundary a request reaches incrby with a closed breaker and
-        # stalls the loop, serially. The guard's own private memory (opened in the except) skips the
-        # socket for the rest of the cooldown, so the counter pays one stall per cooldown, not one per
-        # request at the boundary. It reads the limiter's breaker but never writes it.
+        # pays a socket timeout. The guard skips the socket while open; the one re-probe per boundary
+        # that does reach the socket opens the private memory so the rest of the cooldown skips again.
+        # This is called via run_offloaded from the failed-login path, so that one boundary re-probe
+        # runs in the offload pool, OFF the loop — it does not stall the event loop. It reads the
+        # limiter's breaker but never writes it.
         from app.services.auth_service import (
             _cache_guard_is_open, _cache_guard_record_failure, _cache_guard_record_success)
         if _cache_guard_is_open(time.time()):
