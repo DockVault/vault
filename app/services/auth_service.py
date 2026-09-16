@@ -464,10 +464,15 @@ class AuthService:
         # bounds only itself and never spends the owner's per-IP login budget — a device-linked
         # credential in its device bucket, any other known credential (hand-out, or one whose device
         # was DELETED and its link SET NULL) in its per-username bucket, and an UNKNOWN name on the IP
-        # + username login throttle. On that unknown-name IP-leg refusal, burn one dummy argon2 (as
-        # the not-found path below does) so a throttled unknown name costs the same as a known name —
-        # which runs the real verify below — closing a timing oracle for existence. Known names never
-        # consult login:<ip> here; that is the whole point.
+        # + username login throttle. A throttled refusal here stays CHEAP (no verify): burning a dummy
+        # argon2 on the unknown IP-leg refusal would (a) invert the gap once a KNOWN name's own bucket
+        # trips — the known refusal has no verify while the unknown burns a hash — and (b) turn the
+        # limiter into an amplifier, since the per-IP argon2 budget is otherwise bounded at the IP
+        # limit per window but a hash on every refused attempt is not. KNOWN-VALUE ORACLE ACCEPTED: a
+        # prober who already holds a candidate name can confirm its existence by timing at the SFTP
+        # door under a primed IP (a known name reaches the verify; an unknown, once the IP bucket is
+        # tripped, refuses cheaply). Refusals stay cheap by design; the web door is uniform, and the
+        # not-found path below still equalises the UNTHROTTLED miss.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
         if not allow_device_credential:
             self._check_rate_limit(temp_username, ip_address)
@@ -476,11 +481,7 @@ class AuthService:
         elif temp_cred is not None:
             self._check_username_rate_limit(temp_username)
         else:
-            try:
-                self._check_rate_limit(temp_username, ip_address)
-            except RateLimitExceededError:
-                verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)
-                raise
+            self._check_rate_limit(temp_username, ip_address)
 
         if not temp_cred:
             # Equalize timing with the real verify path so an absent temp_username isn't

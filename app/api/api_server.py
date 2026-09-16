@@ -1940,21 +1940,18 @@ _offloop_dropped = 0  # count of droppable side effects shed because the queue w
 _offloop_last_shed_log = 0.0  # rate-limits the shed warning to at most once per minute
 
 
-def _fire_offloop(fn, *args, droppable: bool = True, **kwargs) -> None:
-    """Run a self-contained, best-effort side effect (a broadcast, a notification, a failed-login
-    record) OFF the event loop, fire-and-forget, from an async handler. On the login/mint paths this
-    keeps a blocking Redis publish — which on a cold breaker stalls a socket timeout before the guard
-    is open — from freezing the loop and every request racing it.
+def _fire_offloop(fn, *args, **kwargs) -> None:
+    """Run a best-effort, DROPPABLE activity broadcast OFF the event loop, fire-and-forget, from an
+    async handler. On the login/mint paths this keeps a blocking Redis publish — which on a cold
+    breaker stalls a socket timeout before the guard is open — from freezing the loop and every
+    request racing it.
 
-    Bounded to FIRE_OFFLOOP_LIMIT concurrent side effects: each opens its OWN pooled DB session
-    (broadcast_event's metrics, _notify_users, the monitor), so an unbounded fan-out could, on a busy
-    host, add to the slot-held sessions and exceed the pool. A login never waits on any of this —
-    beyond the bound they queue as background tasks. Runs in the dedicated offload pool, not the
-    loop's shared default executor. The callable must own its DB session and swallow its own errors.
-
-    droppable=True (the default, for the activity broadcast) sheds the side effect when the queue is
-    saturated; pass droppable=False for a side effect that must not be lost — a durable notification
-    or the brute-force failed-login counter — which then only ever queues, never drops."""
+    Only best-effort broadcasts go through here now. Durable side effects — the notification ROW and
+    the brute-force failed-login counter — run INLINE at their call sites (the row exists within the
+    login response; the counter always advances), so everything queued here is droppable and the cap
+    below counts exactly it. Bounded to FIRE_OFFLOOP_LIMIT concurrent tasks in the dedicated offload
+    pool (not the loop's shared executor); a login never waits on any of it. The callable owns its DB
+    session and swallows its own errors."""
     import asyncio
     import contextvars
     import time as _t
@@ -1968,10 +1965,9 @@ def _fire_offloop(fn, *args, droppable: bool = True, **kwargs) -> None:
     if _offloop_sem is None:
         _offloop_sem = asyncio.Semaphore(FIRE_OFFLOOP_LIMIT)
 
-    # Shed rather than queue without bound — but ONLY droppable (best-effort telemetry) side effects.
-    # A durable notification / the failed-login counter is never dropped: the durable state is what
-    # matters and it is bounded by the slot, not by an attacker's spray.
-    if droppable and len(_BG_TASKS) >= _OFFLOOP_MAX_PENDING:
+    # Shed rather than queue without bound. Everything here is a best-effort broadcast, so a saturated
+    # queue drops the nudge; the durable state was already committed inline by the caller.
+    if len(_BG_TASKS) >= _OFFLOOP_MAX_PENDING:
         _offloop_dropped += 1
         now = _t.time()
         if now - _offloop_last_shed_log > 60:
@@ -5824,15 +5820,15 @@ async def login(
         # notification too (the WS toast is transient; this is the durable bell/history record). No
         # dedup key — every temp-credential sign-in is a distinct, notable event. Best-effort.
         if is_temporary:
-            # OFF the loop too: _notify_users ends in a broadcast publish, the same cold-breaker
-            # stall. It owns its own DB session, so it is safe to run in a worker thread.
-            _fire_offloop(
-                _notify_users,
+            # INLINE: the durable notification ROW must exist within the login response, so it is not
+            # queued (and never shed). _notify_users writes the row on its own DB session and fires
+            # only its live WS nudge off the loop as a droppable broadcast — the row is durable, the
+            # nudge is best-effort.
+            _notify_users(
                 [str(user.id)], "temp_login",
                 title="Temporary credential signed in",
                 body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
                 target="#temp-creds",
-                droppable=False,  # a durable owner notification must not be shed
             )
         else:
             # A real account sign-in optionally emails the owner a "New sign-in alert" (opt-in; the
@@ -5853,8 +5849,9 @@ async def login(
         # Record the failed login in the security monitor OFF the loop: its windowed counter and
         # threshold publish touch Redis, which stalls a socket timeout during an outage, and on the
         # loop a wrong-password spray would freeze the server one request per timeout.
-        _fire_offloop(_record_failed_login_bg, login_request.username, client_ip, str(e),
-                      droppable=False)  # the brute-force counter must not be shed
+        # Record INLINE (not queued): the brute-force counter must advance on every failed login, and
+        # it is breaker-aware, so it does not stall the loop during an outage.
+        _record_failed_login_bg(login_request.username, client_ip, str(e))
 
         # A lock is only raised AFTER the password verified (verify-first ordering in
         # authenticate_user), so the caller has already proven they know the credential — telling
@@ -5894,8 +5891,8 @@ async def login(
         
         # Record in the security monitor OFF the loop (same reason as the 401 branch): a throttled
         # spray must not freeze the loop one socket timeout per attempt during a cache outage.
-        _fire_offloop(_record_failed_login_bg, login_request.username, client_ip,
-                      f"Rate limit exceeded: {str(e)}", droppable=False)  # brute-force counter, never shed
+        # Record INLINE (not queued), same as the 401 branch — the counter must not be shed.
+        _record_failed_login_bg(login_request.username, client_ip, f"Rate limit exceeded: {str(e)}")
         
         detail, headers = _login_429_detail_and_headers(login_request.username, e)
         raise HTTPException(
@@ -12888,14 +12885,14 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
         # e.g. Notes) updates WITHOUT a page refresh. One event per recipient, owner_user_id set to
         # them, so the /ws/monitor per-user filter delivers it only to that recipient. The nudge
         # carries NO title/body — the client re-fetches via its authenticated endpoints — so it is
-        # safe even on the admin-visible feed. Best-effort: a broadcast failure never affects callers.
+        # safe even on the admin-visible feed. Best-effort AND droppable: the durable row above is what
+        # matters, so the nudge fires OFF the loop (shed under a saturated queue), never blocking or
+        # failing the caller. _fire_offloop runs it inline when there is no running loop.
         for uid in notified:
-            try:
-                broadcast_event({"event": {"type": "notification", "notification_type": ntype,
-                                           "target": target, "owner_user_id": str(uid)}},
-                                include_metrics=False)
-            except Exception:
-                pass
+            _fire_offloop(broadcast_event,
+                          {"event": {"type": "notification", "notification_type": ntype,
+                                     "target": target, "owner_user_id": str(uid)}},
+                          include_metrics=False)
     except Exception as e:
         print(f"⚠ notification write skipped: {e}")
 
