@@ -84,10 +84,12 @@ def _db_count(rate_key: str, window: int) -> int:
     cutoff = datetime.utcnow() - timedelta(seconds=window)
     tbl = RateLimitRecord.__table__
     with get_db_context() as db:
-        row = db.execute(
-            select(tbl.c.attempt_count, tbl.c.window_start)
-            .where(tbl.c.identifier == rate_key, tbl.c.action == _ACTION)
-        ).first()
+        row = redis_guard.timed_db(
+            "vault_attempt_throttle._db_count",
+            lambda: db.execute(
+                select(tbl.c.attempt_count, tbl.c.window_start)
+                .where(tbl.c.identifier == rate_key, tbl.c.action == _ACTION)
+            ).first())
     if row is None:
         return 0
     count, window_start = row[0], row[1]
@@ -118,4 +120,4 @@ def _db_burn(rate_key: str, window: int) -> None:
         )
     )
     with get_db_context() as db:
-        db.execute(stmt)
+        redis_guard.timed_db("vault_attempt_throttle._db_burn", lambda: db.execute(stmt))

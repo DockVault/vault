@@ -444,17 +444,23 @@ return {1, limit - current_count - 1, tostring(reset_at)}
         try:
             # Prune, count, decide, and insert as one Redis-side operation. A pipeline
             # alone cannot stop concurrent requests from all observing the same count.
-            results = self.redis.eval(
-                self._SLIDING_WINDOW_SCRIPT,
-                1,
-                key,
-                window_start,
-                now,
-                limit,
-                window + 1,
-                str(uuid.uuid4()),
-                window,
-            )
+            # Instrumented: this eval is the general-API middleware's per-request Redis touch, so it
+            # is the discovery stall every route crosses during an outage; timed_redis names the path
+            # (never the key) if it runs long.
+            from app.core import redis_guard
+            results = redis_guard.timed_redis(
+                "RateLimiter._sliding_window_check",
+                lambda: self.redis.eval(
+                    self._SLIDING_WINDOW_SCRIPT,
+                    1,
+                    key,
+                    window_start,
+                    now,
+                    limit,
+                    window + 1,
+                    str(uuid.uuid4()),
+                    window,
+                ))
             _cb_record_success()  # Redis is healthy — reset the breaker
             allowed = bool(int(results[0]))
             remaining = max(0, int(results[1]))

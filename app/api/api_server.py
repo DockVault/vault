@@ -37,7 +37,7 @@ from pathlib import Path
 from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
-from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
+from app.core.database import get_db, init_db, check_db_connection, check_redis_connection, redis_probe_ping
 from app.core import vault_attempt_throttle
 from app.core import redis_guard
 from app.core.rate_limiter import redis_circuit_open
@@ -1875,7 +1875,7 @@ def _guarded_publish(channel: str, message: str) -> bool:
     if _cache_guard_is_open(_t.time()):
         return False
     try:
-        redis_client.publish(channel, message)
+        redis_guard.timed_redis("_guarded_publish", lambda: redis_client.publish(channel, message))
         _cache_guard_record_success()
         return True
     except Exception:
@@ -1900,7 +1900,7 @@ def _guarded_publish_force(channel: str, message: str) -> bool:
     if _cache_guard_private_open(_t.time()):
         return False
     try:
-        redis_client.publish(channel, message)
+        redis_guard.timed_redis("_guarded_publish_force", lambda: redis_client.publish(channel, message))
         _cache_guard_record_success()
         return True
     except Exception:
@@ -2122,6 +2122,9 @@ def set_update_settings_endpoint(payload: dict, request: Request,
     return {"interval_minutes": minutes}
 
 
+_HEALTH_REDIS_PROBE_TIMEOUT = 1.0  # seconds; the off-loop health ping's own short bound
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint.
@@ -2136,8 +2139,22 @@ async def health_check():
     from app.core.health import (check_schema_state, check_sftp_status,
                                  check_storage_status)
 
-    db_ok = check_db_connection()
-    redis_ok = check_redis_connection()
+    # /health is on the healthcheck's 30 s cadence and is EXCLUDED from the rate-limit middleware, so
+    # nothing here consults the breaker for us. A bare ping on the main client (2 s timeout) blocked
+    # the event loop once per tick during a Redis outage. So: read the breaker first (report
+    # disconnected with no socket when it is open), else probe OFF the loop on the dedicated
+    # short-timeout client; the DB check also runs off the loop, bounded by its own connect timeout.
+    # Never write the breaker; keep the report exactly as honest and no richer (it is unauthenticated).
+    loop = asyncio.get_running_loop()
+    db_ok = await loop.run_in_executor(None, check_db_connection)
+    if redis_circuit_open():
+        redis_ok = False
+    else:
+        try:
+            await loop.run_in_executor(None, lambda: redis_probe_ping(_HEALTH_REDIS_PROBE_TIMEOUT))
+            redis_ok = True
+        except Exception:  # noqa: BLE001 — health is fail-quiet: any probe error reads as disconnected
+            redis_ok = False
     sftp = check_sftp_status()
     storage = check_storage_status()
     schema = check_schema_state()
@@ -9778,7 +9795,7 @@ def _notelink_record_fail(token: str) -> int:
     try:
         n = int(redis_guard.timed_redis("_notelink_record_fail", lambda: r.incr(_notelink_fail_key(token))))
         if n == 1:
-            r.expire(_notelink_fail_key(token), _NOTELINK_FAIL_WINDOW)
+            redis_guard.timed_redis("_notelink_record_fail", lambda: r.expire(_notelink_fail_key(token), _NOTELINK_FAIL_WINDOW))
         return n
     except Exception:
         return _NOTELINK_FAIL_MAX
@@ -9791,7 +9808,7 @@ def _notelink_clear_fails(token: str) -> None:
     r = getattr(_rl, "redis", None)
     if r is not None:
         try:
-            r.delete(_notelink_fail_key(token))
+            redis_guard.timed_redis("_notelink_clear_fails", lambda: r.delete(_notelink_fail_key(token)))
         except Exception:
             pass
 
@@ -10281,7 +10298,7 @@ def _publiclink_record_fail(token_hash: str) -> int:
     try:
         n = int(redis_guard.timed_redis("_publiclink_record_fail", lambda: r.incr(_publiclink_fail_key(token_hash))))
         if n == 1:
-            r.expire(_publiclink_fail_key(token_hash), _PUBLINK_FAIL_WINDOW)
+            redis_guard.timed_redis("_publiclink_record_fail", lambda: r.expire(_publiclink_fail_key(token_hash), _PUBLINK_FAIL_WINDOW))
         return n
     except Exception:
         return _PUBLINK_FAIL_MAX
@@ -10294,7 +10311,7 @@ def _publiclink_clear_fails(token_hash: str) -> None:
     r = getattr(_rl, "redis", None)
     if r is not None:
         try:
-            r.delete(_publiclink_fail_key(token_hash))
+            redis_guard.timed_redis("_publiclink_clear_fails", lambda: r.delete(_publiclink_fail_key(token_hash)))
         except Exception:
             pass
 
@@ -10349,7 +10366,7 @@ def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
     # Single-winner delete: two concurrent downloads with the same grant — only the one whose DELETE
     # actually removed the key proceeds.
     try:
-        removed = int(r.delete(key) or 0)
+        removed = int(redis_guard.timed_redis("_publiclink_consume_grant", lambda: r.delete(key)) or 0)
     except Exception:
         return False
     return removed >= 1
@@ -11679,7 +11696,7 @@ def _receiver_record_fail(token_hash: str) -> int:
     try:
         n = int(redis_guard.timed_redis("_receiver_record_fail", lambda: r.incr(_receiver_fail_key(token_hash))))
         if n == 1:
-            r.expire(_receiver_fail_key(token_hash), _RECV_FAIL_WINDOW)
+            redis_guard.timed_redis("_receiver_record_fail", lambda: r.expire(_receiver_fail_key(token_hash), _RECV_FAIL_WINDOW))
         return n
     except Exception:
         return _RECV_FAIL_MAX
@@ -11692,7 +11709,7 @@ def _receiver_clear_fails(token_hash: str) -> None:
     r = getattr(_rl, "redis", None)
     if r is not None:
         try:
-            r.delete(_receiver_fail_key(token_hash))
+            redis_guard.timed_redis("_receiver_clear_fails", lambda: r.delete(_receiver_fail_key(token_hash)))
         except Exception:
             pass
 

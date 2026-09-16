@@ -79,6 +79,19 @@ def timed_redis(function: str, op):
             logger.warning("slow on-loop Redis op in %s: %.2fs", function, elapsed)
 
 
+def timed_db(function: str, op):
+    """Like ``timed_redis`` but for the durable DB fallback path (RateLimitRecord). Same elapsed-only
+    warning (function + seconds, never the query), so a slow paused-Redis attempt that has dropped to
+    the DB can be attributed to its path too. Returns op()'s result and re-raises."""
+    start = time.monotonic()
+    try:
+        return op()
+    finally:
+        elapsed = time.monotonic() - start
+        if elapsed > SLOW_REDIS_OP_SECONDS:
+            logger.warning("slow on-loop DB fallback in %s: %.2fs", function, elapsed)
+
+
 def best_effort(function: str, op, *, default=None):
     """Run a best-effort, on-loop Redis op behind the read-through guard.
 

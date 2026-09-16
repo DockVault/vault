@@ -32,9 +32,11 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
 
-_EXEMPT_FILES = {"database.py", "rate_limiter.py", "redis_guard.py", "vault_attempt_throttle.py"}
+# database.py is scanned (not exempt wholesale): its client constructor uses redis.Redis (capitalised,
+# so unmatched) and its off-loop probe is registered by function below.
+_EXEMPT_FILES = {"rate_limiter.py", "redis_guard.py", "vault_attempt_throttle.py"}
 _CALL = re.compile(
-    r"(?:redis_client|self\.redis|_redis_probe_client|\bredis\b|\br\b|\bpipe\b)\.([a-z_]+)\(")
+    r"(?:redis_client|self\.redis|_redis_probe_client|\bredis\b|\br\b|\bpipe\b|\bpubsub\b)\.([a-z_]+)\(")
 # Not Redis commands that touch the socket in their own right: the pipeline constructor and its flush
 # (the queued commands are counted individually), the Lua redis.call/pcall inside script strings, and
 # .read (a bare `r` handle is also used for urllib HTTP responses, which have .read()).
@@ -52,6 +54,9 @@ _REGISTRY = {
         "upload_file": ("E", 3),                 # space reservation: skip the eval when open -> fallback
         "websocket_monitor_endpoint": ("E", 1),  # .pubsub() off-loop (subscribe/get via run_in_executor)
     },
+    "core/database.py": {
+        "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated
+    },                                           # short-timeout client (the constructor uses redis.Redis)
     "core/otp_service.py": {
         "_redis_put": ("C", 4), "_redis_load": ("C", 1),
         "_redis_delete": ("C", 1), "_redis_consume_verify": ("C", 2),
@@ -71,7 +76,7 @@ _REGISTRY = {
     },
     "sftp/sftp_server.py": {
         "_sftp_key_clear": ("D", 1),
-        "listen_for_terminations": ("E", 1),     # the termination listener's own client, off-loop thread
+        "listen_for_terminations": ("E", 4),     # the termination listener's own client, off-loop thread
     },
 }
 

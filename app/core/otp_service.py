@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import secrets
 import time
+from app.core import redis_guard
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -114,7 +115,7 @@ def _resolve_pepper(pepper):
 # --------------------------------------------------------------------------------------------------
 def _redis_delete(redis, purpose, user_id) -> None:
     try:
-        redis.delete(redis_key(purpose, user_id))
+        redis_guard.timed_redis("otp._redis_delete", lambda: redis.delete(redis_key(purpose, user_id)))
     except Exception:
         pass
 
@@ -127,20 +128,20 @@ def _redis_put(redis, purpose, user_id, *, code_hash, destination, expires_at, i
     epoch = _utc_epoch(expires_at)
     ttl = max(1, epoch - int(time.time())) + _REDIS_GRACE_SECONDS
     try:
-        redis.delete(key)   # clear any prior code for this (purpose, user) first
-        redis.hset(key, mapping={
+        redis_guard.timed_redis("otp._redis_put", lambda: redis.delete(key))   # clear any prior code first
+        redis_guard.timed_redis("otp._redis_put", lambda: redis.hset(key, mapping={
             "code_hash": code_hash,
             "destination": destination or "",
             "attempts": 0,
             "max_attempts": int(max_attempts),
             "expires_at": epoch,
             "issued_at": repr(float(issued_at)),   # sub-second so two issues can't tie the generation
-        })
-        redis.expire(key, ttl)
+        }))
+        redis_guard.timed_redis("otp._redis_put", lambda: redis.expire(key, ttl))
         return True
     except Exception:
         try:
-            redis.delete(key)   # roll back any partial write so it can't co-exist with the DB copy
+            redis_guard.timed_redis("otp._redis_put", lambda: redis.delete(key))   # roll back a partial write
         except Exception:
             pass
         return False
@@ -150,7 +151,7 @@ def _redis_load(redis, purpose, user_id):
     """Return the parsed Redis candidate dict (with int issued_at/expires_at/max_attempts) or None.
     None means the key is absent OR Redis is unreachable — verify uses issued_at to pick the winner."""
     try:
-        data = redis.hgetall(redis_key(purpose, user_id))
+        data = redis_guard.timed_redis("otp._redis_load", lambda: redis.hgetall(redis_key(purpose, user_id)))
     except Exception:
         return None
     if not data:
@@ -177,13 +178,13 @@ def _redis_consume_verify(redis, purpose, user_id, presented_hash, cand) -> OtpR
         # Single-winner consume: only the caller whose DELETE actually removed the key succeeds, so two
         # concurrent correct submissions can't both pass.
         try:
-            removed = int(redis.delete(key) or 0)
+            removed = int(redis_guard.timed_redis("otp._redis_consume_verify", lambda: redis.delete(key)) or 0)
         except Exception:
             removed = 1
         return OtpResult(True, destination=cand["destination"]) if removed >= 1 \
             else OtpResult(False, reason="not_found")
     try:
-        attempts = int(redis.hincrby(key, "attempts", 1))
+        attempts = int(redis_guard.timed_redis("otp._redis_consume_verify", lambda: redis.hincrby(key, "attempts", 1)))
     except Exception:
         attempts = cand["max_attempts"]            # if we can't count, fail closed by invalidating
     if attempts >= cand["max_attempts"]:

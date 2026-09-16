@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional
 from collections import defaultdict, deque
 import time
 import logging
+from app.core import redis_guard
 import json
 
 from sqlalchemy.orm import Session
@@ -272,13 +273,13 @@ class SecurityMonitor:
             return self._count_recent_events(fallback_deque, window_seconds)
 
         try:
-            count = self.redis.incrby(redis_key, amount)
+            count = redis_guard.timed_redis("SecurityMonitor._windowed_count", lambda: self.redis.incrby(redis_key, amount))
             # Set the TTL only when THIS increment created the key (its value equals the amount we
             # just added) -> a true FIXED window that expires window_seconds after the FIRST event.
             # Re-asserting the TTL on every hit would make it a "since the last event" window that
             # over-counts events spaced wider than the window (false-positive alerts).
             if count == amount:
-                self.redis.expire(redis_key, window_seconds)
+                redis_guard.timed_redis("SecurityMonitor._windowed_count", lambda: self.redis.expire(redis_key, window_seconds))
             _cache_guard_record_success()
             return int(count)
         except Exception as e:
@@ -628,7 +629,7 @@ class SecurityMonitor:
             if _cache_guard_is_open(time.time()):
                 return
             try:
-                self.redis.publish('security_alerts', json.dumps(alert_data))
+                redis_guard.timed_redis("SecurityMonitor._broadcast_alert", lambda: self.redis.publish('security_alerts', json.dumps(alert_data)))
                 _cache_guard_record_success()
             except Exception:
                 _cache_guard_record_failure(time.time())

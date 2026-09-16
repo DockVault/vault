@@ -111,12 +111,13 @@ def denylist_token(session_token: str, ttl_seconds: int) -> None:
         return
     if _cache_guard_is_open(time.time()):
         return  # guard open: skip the stall; the JWT still expires on its own
+    from app.core import redis_guard
     try:
-        redis_client.setex(
+        redis_guard.timed_redis("denylist_token", lambda: redis_client.setex(
             f"denylist:session:{hash_session_token(session_token)}",
             max(1, int(ttl_seconds)),
             "1",
-        )
+        ))
         _cache_guard_record_success()
     except Exception:
         _cache_guard_record_failure(time.time())  # best-effort: the JWT still expires on its own
@@ -138,8 +139,11 @@ def is_token_denylisted(session_token: str) -> bool:
     now = time.time()
     if _cache_guard_is_open(now):
         return False  # guard open: this check fails open anyway, so skip the stall
+    from app.core import redis_guard
     try:
-        listed = bool(redis_client.exists(f"denylist:session:{hash_session_token(session_token)}"))
+        listed = bool(redis_guard.timed_redis(
+            "is_token_denylisted",
+            lambda: redis_client.exists(f"denylist:session:{hash_session_token(session_token)}")))
         _cache_guard_record_success()
         return listed
     except Exception:
@@ -244,8 +248,9 @@ def _best_effort_cache(code: str, op) -> None:
     if _cache_guard_is_open(now):
         safe_event(code)
         return
+    from app.core import redis_guard
     try:
-        op()
+        redis_guard.timed_redis(code, op)  # instrument the op (the `code` names the path, never the key)
         _cache_guard_record_success()
     except Exception as e:  # noqa: BLE001 — best-effort cache op; the committed DB row is authoritative
         _cache_guard_record_failure(time.time())
@@ -1812,8 +1817,12 @@ class AuthService:
                 )
                 .returning(tbl.c.attempt_count, tbl.c.window_start)
             )
+            from app.core import redis_guard
             with get_db_context() as db:
-                row = db.execute(stmt).first()  # get_db_context commits on exit
+                # Elapsed-only warning (function + seconds, never the query) so a slow paused-Redis
+                # attempt that dropped to this DB fallback can be attributed to its path.
+                row = redis_guard.timed_db(
+                    "_db_throttle_hit", lambda: db.execute(stmt).first())  # commits on exit
             # A short deny used when the fallback can't establish the count -- long
             # enough to bound a spray during the Redis+DB double-failure, short
             # enough that a transient hiccup recovers quickly.
