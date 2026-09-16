@@ -86,6 +86,21 @@ def _mint_many(admin, dev, temp_vault, n):
     return names
 
 
+def _attempt_from_device(admin, dev, temp_vault, n_attempts):
+    """Make n_attempts web-login attempts with the device's credentials, counting ATTEMPTS not mints.
+
+    The device bucket is charged on EVERY attempt (success or failure), so once the per-device
+    credential cap (shipped default 10, not raised in CI) refuses more mints we keep attempting with
+    already-minted usernames — the 11th attempt does not need an 11th mint. Distinct usernames are
+    used as far as the cap allows, so on the reverted code each attempt lands a fresh charge on the
+    shared IP bucket before any single username's own bucket trips. Returns the usernames minted."""
+    names = _mint_many(admin, dev, temp_vault, n_attempts)
+    assert names, "could not mint any credential for the device"
+    for i in range(n_attempts):
+        _login_attempt(names[i % len(names)], _NEVER_VALID)
+    return names
+
+
 def test_a_looping_device_does_not_lock_out_the_human_web_login(admin, temp_vault):
     """(a) A device's sync auths — across DISTINCT single-use credentials, as a real run mints them —
     must not exhaust the human's shared per-IP login bucket. Distinct usernames are the point: each
@@ -93,23 +108,16 @@ def test_a_looping_device_does_not_lock_out_the_human_web_login(admin, temp_vaul
     from filling, and the human is locked out. On the fixed code every one is charged to the device's
     own bucket instead, so the IP bucket is untouched."""
     dev = _register_granted_device(admin, temp_vault)
-    # Fire STRICTLY MORE than the IP threshold of distinct-username device auths. On the reverted
-    # code each charges login:<ip> once, so this many is what actually pushes the shared IP bucket
-    # PAST its limit and locks the human out — at exactly _IP_THRESHOLD the reverted bucket sits at
-    # the limit without tripping and the human-401 assertion would pass on the bug too (vacuous).
-    fill = _IP_THRESHOLD + 1
-    names = _mint_many(admin, dev, temp_vault, fill)
-    assert len(names) >= fill, (
-        f"could not mint enough credentials to push the IP bucket past its limit: got {len(names)}, "
-        f"needed {fill}")
-
-    for name in names:
-        r = _login_attempt(name, _NEVER_VALID)  # wrong password: charges a bucket, spends nothing
-        assert r.status_code in (401, 429), r.text
+    # Make _IP_THRESHOLD device attempts. On the reverted code each charges login:<ip> once, filling
+    # the shared IP bucket exactly to its limit — so the human's OWN next attempt is the one that
+    # tips it over (the limit + 1) and returns 429. On the fixed code every attempt is charged to the
+    # device's own bucket, so the human's is the first on login:<ip> and returns 401. Counting
+    # attempts, not mints, keeps this within the per-device credential cap.
+    _attempt_from_device(admin, dev, temp_vault, _IP_THRESHOLD)
 
     # The human's per-IP login bucket must be untouched: a fresh human login is an ordinary 401, not a
-    # throttled 429. On the pre-fix code the device's distinct-username auths above filled the shared
-    # IP bucket and the human came back 429 — locked out by a sync client.
+    # throttled 429. On the pre-fix code the device's auths above filled the shared IP bucket and the
+    # human came back 429 — locked out by a sync client.
     human = _login_attempt(unique("human"), _NEVER_VALID)
     assert human.status_code == 401, (
         f"the human web login was throttled after a device's sync loop: {human.status_code} "
@@ -122,16 +130,15 @@ def test_a_second_device_is_unaffected_by_the_first(admin, temp_vault):
     is locked out; on the fixed code they go to device A's own bucket and device B is untouched."""
     dev_a = _register_granted_device(admin, temp_vault)
     dev_b = _register_granted_device(admin, temp_vault)
-    fill = _IP_THRESHOLD + 1  # strictly past the IP threshold, so the reverted IP bucket really trips
-    names_a = _mint_many(admin, dev_a, temp_vault, fill)
-    assert len(names_a) >= fill, f"could not mint enough for device A: {len(names_a)}, needed {fill}"
     cred_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
 
-    for name in names_a:
-        _login_attempt(name, _NEVER_VALID)  # device A fills the shared IP bucket on the pre-fix code
+    # Device A makes enough attempts to fill the shared IP bucket to its limit on the reverted code
+    # (attempts, not mints — within the per-device cap). Device B's single attempt below is then the
+    # one that would tip a shared IP bucket over.
+    _attempt_from_device(admin, dev_a, temp_vault, _IP_THRESHOLD)
 
     # Device B, untouched, is answered as an ordinary refusal — not throttled. On the pre-fix code
-    # device A's loop had exhausted the shared IP bucket and device B came back 429.
+    # device A's loop had filled the shared IP bucket and device B's attempt came back 429.
     r = _login_attempt(cred_b["temp_username"], _NEVER_VALID)
     assert r.status_code == 401, (
         f"a second device was throttled by the first's activity: {r.status_code} {r.text[:200]}")
@@ -246,46 +253,65 @@ def _first_temp_429(username, max_attempts):
     return None
 
 
-def test_a_temp_429_does_not_reveal_its_bucket_kind_in_headers(admin, temp_vault):
-    """A temp_ credential's 429 at the web door must not reveal WHICH bucket it hit. The
-    limit VALUE is a kind oracle -- a device bucket (30), a per-username bucket (5) and the IP bucket
-    (10) each carry a different X-RateLimit-Limit -- so for a temp_ username the door emits Retry-After
-    only and drops X-RateLimit-Limit / X-RateLimit-Remaining; the body is the same generic message for
-    every kind. The human's password-login 429 keeps its X-RateLimit headers. So two temp_ kinds are
-    indistinguishable, and only the human 429 carries the limit."""
+import re
+
+# Headers that legitimately vary between two otherwise-identical 429s: a clock, a per-request id, the
+# exact reset epoch, the live remaining count, and Content-Length (which tracks the countdown digits
+# in the body). Excluded from the comparison. X-RateLimit-LIMIT is deliberately NOT excluded — it is
+# the kind oracle (device 30 vs per-username 5 vs IP 10), so it must be equal across the kinds.
+_VOLATILE_HEADERS = {
+    "date", "retry-after", "x-ratelimit-reset", "x-ratelimit-remaining", "content-length",
+    "x-request-id", "x-correlation-id", "cf-ray",
+}
+
+
+def _comparable(resp):
+    return {k.lower(): v for k, v in resp.headers.items() if k.lower() not in _VOLATILE_HEADERS}
+
+
+def _normalize_countdown(text):
+    """Replace the "in N seconds" countdown (seeded at different moments per request) so two bodies
+    that differ only by that number compare equal. Any bare integer becomes N."""
+    return re.sub(r"\d+", "N", text or "")
+
+
+def test_a_temp_429_does_not_reveal_its_bucket_kind(admin, temp_vault):
+    """A temp_ credential's 429 at the web door must not reveal WHICH bucket it hit. The bucket limit
+    is a kind oracle -- device (30), per-username (5), IP (10) -- so a device-minted, a hand-out and
+    an unknown temp_ username driven to 429 must be INDISTINGUISHABLE: identical status, identical
+    body, and an identical header set once the values that legitimately vary (the clock, the seconds
+    until reset) are set aside. The route drops the rate-limit headers for a temp_ username as defence
+    in depth; the general rate-limit middleware then normalises X-RateLimit-* to one auth-class value
+    for every response, so the observable property is EQUALITY across the kinds, not their absence."""
     device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
 
-    # A per-username (hand-out) temp_ 429: a hand-out credential looped past the login limit.
+    # A hand-out (per-username bucket) temp_ 429.
     _sess, handout = temp_login(admin)
-    username_429 = _first_temp_429(handout["temp_username"], _LOGIN_LIMIT + 5)
-    assert username_429 is not None, "a hand-out credential's per-username bucket never tripped"
+    handout_429 = _first_temp_429(handout["temp_username"], _LOGIN_LIMIT + 5)
+    assert handout_429 is not None, "a hand-out credential's per-username bucket never tripped"
 
-    # A device-bucket temp_ 429: a device credential looped past the device limit.
+    # A device-bucket temp_ 429.
     dev = _register_granted_device(admin, temp_vault)
     device_cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
     device_429 = _first_temp_429(device_cred["temp_username"], device_limit + 5)
     assert device_429 is not None, "the device bucket never tripped over HTTP"
 
-    for r in (username_429, device_429):
-        assert "X-RateLimit-Limit" not in r.headers, (
-            f"a temp_ 429 leaked X-RateLimit-Limit ({r.headers.get('X-RateLimit-Limit')}) -- the "
-            f"bucket kind is a limit oracle")
-        assert "X-RateLimit-Remaining" not in r.headers, "a temp_ 429 leaked X-RateLimit-Remaining"
-    # The two temp_ kinds are indistinguishable: same body, neither carrying the limit headers.
-    assert username_429.text == device_429.text, (
-        "two temp_ 429 kinds returned different bodies -- the message reveals the bucket")
+    # An unknown temp_ username 429 (routes to the IP + username throttle; the per-username bucket
+    # trips first).
+    unknown_429 = _first_temp_429("temp_" + unique("ghost"), _IP_THRESHOLD + 5)
+    assert unknown_429 is not None, "an unknown temp_ username never tripped a throttle"
 
-    # The human 429 is unchanged: a regular username's IP-bucket 429 still carries the limit header.
-    human_429 = None
-    human = unique("human-hdr")
-    for _ in range(_IP_THRESHOLD + 5):
-        r = _login_attempt(human, _NEVER_VALID)
-        if r.status_code == 429:
-            human_429 = r
-            break
-    assert human_429 is not None, "the human login throttle did not engage"
-    assert "X-RateLimit-Limit" in human_429.headers, (
-        "the human password-login 429 lost its X-RateLimit-Limit header -- only temp_ 429s drop it")
+    kinds = {"device": device_429, "hand-out": handout_429, "unknown": unknown_429}
+    statuses = {name: r.status_code for name, r in kinds.items()}
+    assert len(set(statuses.values())) == 1, f"429 status differed across temp_ kinds: {statuses}"
+    bodies = {name: _normalize_countdown(r.text) for name, r in kinds.items()}
+    assert len(set(bodies.values())) == 1, f"429 body differed across temp_ kinds (countdown normalized): {bodies}"
+    headers = {name: _comparable(r) for name, r in kinds.items()}
+    ref = headers["device"]
+    for name, h in headers.items():
+        assert h == ref, (
+            f"the {name} temp_ 429 headers differ from the device temp_ 429 headers, so the bucket "
+            f"kind is observable: {name}={h} vs device={ref}")
 
 
 @pytest.mark.skipif(

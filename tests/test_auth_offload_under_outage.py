@@ -84,8 +84,15 @@ def _redis_paused():
 def test_the_loop_stays_free_while_a_login_runs_during_an_outage(admin):
     """With Redis freshly paused (breaker COLD) and one login in flight, an unrelated authenticated
     request fired 0.2 s into that login must be served after about ONE socket-timeout stall, not two.
-    On code that runs the login's broadcast on the event loop, the unrelated request also waits behind
-    that publish and pays a second timeout.
+    On code that runs the login's broadcast raw on the event loop, the unrelated request also waits
+    behind that publish and pays a second timeout.
+
+    What this primarily proves is the read-through GUARD: the login's own throttle read opens the
+    breaker first, after which the broadcast skips the socket even if it runs on the loop. Running the
+    broadcast OFF the loop is defense in depth for the brief cold window before the breaker opens, so
+    reverting only the off-loop scheduling may stay green — reverting the guard is what makes this
+    bite. It is a stay-responsive end-to-end check, not a red-on-revert proof of the off-loop step;
+    the guard's read-through invariant is pinned as a unit in test_cache_guard_readthrough.py.
 
     A dedicated second account does the login, so terminating its session (one-session-per-user) does
     not disturb the admin token used for the unrelated request."""

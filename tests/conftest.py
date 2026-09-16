@@ -682,13 +682,15 @@ def wait_out_breaker_cooldown(extra: float = 1.0) -> None:
     is routed to the DB fallback, which still holds the previous module's failed attempts for the
     runner's shared IP, and the admin fixture's own login comes back 429 before the test runs.
     Reordering modules would only move that hazard to whatever module runs next; every Redis-pausing
-    fixture calling this after it restores Redis removes it wherever the fixture is used."""
-    import time as _t
+    fixture calling this after it restores Redis removes it wherever the fixture is used.
+
+    Uses the module-level ``time`` (not a fresh ``import time`` inside the function) so a test can
+    monkeypatch ``conftest.time.sleep`` and not spend the real cooldown."""
     try:
         from app.core.rate_limiter import _CB_COOLDOWN_SECONDS as cooldown
     except Exception:  # noqa: BLE001 — app not importable in this lane; fall back to the known value
         cooldown = 10
-    _t.sleep(cooldown + extra)
+    time.sleep(cooldown + extra)
 
 
 def skip_if_container_absent(completed, container):

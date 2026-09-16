@@ -36,11 +36,22 @@ def _load_app():
     return server.app
 
 
-def _dep_names(app, path, method="POST"):
-    for route in app.routes:
+def _dep_names_from_routes(routes, path, method="POST"):
+    for route in routes:
         if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
             return [d.call.__name__ if d.call else d.name for d in route.dependant.dependencies]
     raise AssertionError(f"route {method} {path} not found")
+
+
+def _assert_slot_first(names, path, after):
+    assert "auth_offload_slot" in names, (
+        f"{path} does not declare the auth_offload_slot dependency — it is not bounded below the pool")
+    slot_at = names.index("auth_offload_slot")
+    for dep in after:
+        assert dep in names, f"{path} unexpectedly does not depend on {dep}: {names}"
+        assert slot_at < names.index(dep), (
+            f"{path} resolves {dep} before auth_offload_slot ({names}) — a connection can be checked "
+            f"out before the slot is held, so the slot does not bound the pool for this route")
 
 
 # (path, the connection-checking resolvers that MUST come after the slot on that route)
@@ -54,12 +65,27 @@ _OFFLOADED_ROUTES = [
 @pytest.mark.parametrize("path,after", _OFFLOADED_ROUTES)
 def test_offload_slot_is_resolved_before_any_connection_source(path, after):
     app = _load_app()
-    names = _dep_names(app, path)
-    assert "auth_offload_slot" in names, (
-        f"{path} does not declare the auth_offload_slot dependency — it is not bounded below the pool")
-    slot_at = names.index("auth_offload_slot")
-    for dep in after:
-        assert dep in names, f"{path} unexpectedly does not depend on {dep}: {names}"
-        assert slot_at < names.index(dep), (
-            f"{path} resolves {dep} before auth_offload_slot ({names}) — a connection can be checked "
-            f"out before the slot is held, so the slot does not bound the pool for this route")
+    names = _dep_names_from_routes(app.routes, path)
+    _assert_slot_first(names, path, after)
+
+
+def test_the_fourth_route_admin_user_mint_also_takes_the_slot_first():
+    # The admin "mint a credential for this user" route lives on the user-management router (its own
+    # prefix), so introspect that router directly rather than the assembled app.
+    _load_app()
+    import app.api.user_management_api as um
+    path = "/api/user-management/users/{user_id}/temp-credentials"
+    names = _dep_names_from_routes(um.router.routes, path)
+    _assert_slot_first(names, path, ["require_interactive_admin", "get_db"])
+
+
+def test_the_offload_limit_stays_below_the_database_pool():
+    # Raising AUTH_OFFLOAD_LIMIT to or past the pool base would let the offloaded routes alone drain
+    # the pool, defeating the bound — this pins the limit below the configured pool size.
+    _load_app()
+    from app.core.auth_offload import AUTH_OFFLOAD_LIMIT
+    from app.core.database import _require_engine
+    pool_size = _require_engine().pool.size()  # the configured base pool (overflow is separate)
+    assert AUTH_OFFLOAD_LIMIT < pool_size, (
+        f"AUTH_OFFLOAD_LIMIT ({AUTH_OFFLOAD_LIMIT}) is not below the database pool base ({pool_size}) "
+        f"— the offloaded routes could drain the pool on their own")
