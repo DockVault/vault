@@ -165,10 +165,18 @@ def _db_temp_counts(user_id) -> tuple:
 
 
 def _persisted_temp_state(owner) -> tuple:
+    names = frozenset(_temp_names(owner))
+    # Scope the Redis half to THIS owner's temp usernames. _redis_temp_keys() scans the whole
+    # deployment-wide temp_cred:* keyspace, so a temp-credential mint or release for ANY OTHER
+    # account between two snapshots would flip a comparison meant to prove a LOCAL invariant — the
+    # recurring false "race", which is a test defect, not timing. Intersecting with this owner's own
+    # names makes the snapshot immune to unrelated activity.
+    owned_keys = frozenset(
+        k for k in _redis_temp_keys() if k.split("temp_cred:", 1)[-1] in names)
     return (
-        frozenset(_temp_names(owner)),
+        names,
         _db_temp_counts(owner.user["id"]),
-        frozenset(_redis_temp_keys()),
+        owned_keys,
     )
 
 
