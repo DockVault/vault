@@ -76,6 +76,12 @@ def test_a_login_burst_does_not_freeze_the_loop(admin):
                 f"{BASE_URL}/auth/login",
                 json={"username": u["_username"], "password": u["_password"]}, timeout=30)
 
+        # Warm up before anything is timed: the one measured failure over 11 opt-in runs was the FIRST
+        # run on a freshly booted stack (cold caches, JIT-less argon2, lazy pools). One observer GET and
+        # one login through the burst path prime those before the baselines and the burst are measured.
+        admin.session.get(f"{BASE_URL}/vaults", timeout=30)
+        _login(users[0])
+
         # Baselines on this stack: the unrelated GET when the loop is idle, and a single
         # correct-password login (~ one Argon2 verify + overhead). The fully-serialized (on-loop) wall
         # for the burst is about N of the latter — larger under the burst's CPU contention, so N x an

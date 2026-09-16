@@ -1,13 +1,61 @@
-"""Unit pins for the login handler's helpers: the 429 body/header shaping, the inline failed-login
-record, and the metrics-free login broadcast. These are the handler-level guarantees the general
-rate-limit middleware would mask on the wire (it re-stamps X-RateLimit-*), so they are pinned here.
+"""Unit pins for the login handler's helpers: the 429 body/header shaping, the awaited-offloaded
+failed-login record, and the metrics-free login broadcast. These are the handler-level guarantees the
+general rate-limit middleware would mask on the wire (it re-stamps X-RateLimit-*), so they are pinned
+here.
 """
+import asyncio
 import contextlib
+import json
 import os
+import threading
 
 import pytest
 
 pytestmark = pytest.mark.unit
+
+
+def _drive_login(S, body_dict, events):
+    """Drive POST /auth/login through the ASGI app in-process on a fresh loop in its own thread — the
+    suite has no httpx/TestClient, so this speaks raw ASGI. Appends ("response", status) to the shared
+    `events` list (the test's patched monitor appends its own ("record", thread) entry), so their
+    ORDER is observable. Returns the loop thread's name."""
+    holder = {}
+
+    async def _drive():
+        holder["loop_thread"] = threading.current_thread().name
+        scope = {"type": "http", "http_version": "1.1", "method": "POST", "path": "/auth/login",
+                 "raw_path": b"/auth/login", "query_string": b"",
+                 "headers": [(b"content-type", b"application/json")],
+                 "client": ("127.0.0.1", 1234), "server": ("testserver", 80), "scheme": "http"}
+        payload = json.dumps(body_dict).encode()
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                events.append(("response", msg["status"]))
+
+        await S.app(scope, receive, send)
+
+    err = {}
+
+    def _worker():
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_drive())
+        except BaseException as exc:  # noqa: BLE001
+            err["e"] = exc
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join(30)
+    assert not t.is_alive(), "the ASGI drive did not finish"
+    if "e" in err:
+        raise err["e"]
+    return holder.get("loop_thread")
 
 
 def _api():
@@ -39,6 +87,68 @@ class _Exc(Exception):
         return self._message
 
 
+@pytest.mark.parametrize("raiser_name,expected_status", [
+    ("InvalidCredentialsError", 401),   # wrong password
+    ("AuthRateLimitExceededError", 429),  # throttled
+])
+def test_a_failed_login_records_off_loop_and_before_the_response(raiser_name, expected_status,
+                                                                 monkeypatch):
+    """In-process handler test (raw ASGI; the suite has no httpx/TestClient). For BOTH except branches:
+    the failed-login record runs on a NON-loop thread (the offload pool) AND completes BEFORE the
+    response is sent. Reverting to an inline call runs it on the loop thread (thread assertion reds);
+    _fire_offloop-ing it lets the response go first (order assertion reds). The broadcast queue is
+    filled to the cap first, proving the awaited record bypasses the shed entirely."""
+    S = _api()
+    from unittest.mock import MagicMock
+    from app.core.database import get_db
+    from app.services.auth_service import AuthService, InvalidCredentialsError
+    from app.services.auth_service import RateLimitExceededError as AuthRateLimitExceededError
+    from app.core import rate_limiter as R
+    import time as _t
+
+    raiser = {"InvalidCredentialsError": InvalidCredentialsError("bad"),
+              "AuthRateLimitExceededError": AuthRateLimitExceededError("too many", retry_after=1,
+                                                                       limit=5, remaining=0)}[raiser_name]
+
+    events = []
+
+    class _Monitor:
+        def record_failed_login(self, username, ip_address, reason):
+            events.append(("record", threading.current_thread().name))
+
+    def _fake_db():
+        yield MagicMock()
+
+    monkeypatch.setitem(S.app.dependency_overrides, get_db, _fake_db)
+    monkeypatch.setattr(AuthService, "authenticate_user",
+                        lambda *a, **k: (_ for _ in ()).throw(raiser))
+    monkeypatch.setattr("app.services.security_monitor.get_security_monitor", lambda db: _Monitor())
+    monkeypatch.setattr("app.core.database.get_db_context",
+                        lambda: contextlib.nullcontext(object()))
+    # Open the breaker so the general middleware / guarded reads skip the socket (no real Redis).
+    R._cb_record_failure(_t.time())
+    # Saturate the droppable broadcast queue; the awaited record must still land.
+    S._BG_TASKS.clear()
+    for i in range(S._OFFLOOP_MAX_PENDING):
+        S._BG_TASKS.add(("dummy", i))
+    try:
+        loop_thread = _drive_login(S, {"username": "alice", "password": "wrong"}, events)
+    finally:
+        S._BG_TASKS.clear()
+        R._cb_record_success()
+
+    kinds = [e[0] for e in events]
+    assert ("record" in kinds and "response" in kinds), f"missing record or response: {events}"
+    assert kinds.index("record") < kinds.index("response"), (
+        f"the failed-login record did not complete before the response: {events}")
+    record_thread = next(e[1] for e in events if e[0] == "record")
+    assert record_thread.startswith("auth-offload"), (
+        f"the failed-login record ran on {record_thread!r}, not the offload pool — it was not "
+        f"offloaded off the loop {loop_thread!r}")
+    response_status = next(e[1] for e in events if e[0] == "response")
+    assert response_status == expected_status, (response_status, events)
+
+
 def test_a_temp_429_drops_the_ratelimit_headers_and_uses_a_generic_body():
     # A device bucket's exception would carry limit=30 and the IP leg would say "from this IP" — both
     # kind oracles. For a temp_ username neither must survive. Deleting the `if not is_temp` branch in
@@ -68,23 +178,18 @@ def test_a_human_429_keeps_its_headers_and_exact_body(remaining):
     assert detail == "Too many login attempts. Please try again in 42 seconds."
 
 
-def test_the_failed_login_record_is_wired_inline_not_through_the_droppable_queue():
-    """WIRING PIN (source), not a behavioural test. The reviewer asked for a handler-in-process test
-    (TestClient, get_db overridden, authenticate_user patched, the queue filled, a wrong password
-    posted, the recorder asserted to fire synchronously). This suite has no such harness: it drives a
-    live server over HTTP with `requests`, and httpx/TestClient is not a test dependency (no in-process
-    ASGI transport). So this pins the WIRING from the handler source instead — the brute-force counter
-    must be called inline, never queued through _fire_offloop (whose queue sheds under saturation),
-    which is the "red if it ever goes back through the queue" guard. The behavioural saturation form —
-    fill the queue, fail a login, assert the monitor recorded before the response — is verified
-    against a running stack instead."""
+def test_the_failed_login_record_is_wired_awaited_offloaded_not_queued():
+    """WIRING PIN (source). Complements the behavioural in-process test below: the failed-login record
+    must be AWAITED through run_offloaded — awaited so the counter lands before the response and is
+    never shed, offloaded so its one boundary re-probe runs off the loop — in BOTH login except
+    branches, and never through _fire_offloop (whose queue is droppable). Both branches count."""
     import pathlib
     src = pathlib.Path("app/api/api_server.py").read_text(encoding="utf-8")
     assert "_fire_offloop(_record_failed_login_bg" not in src, (
         "the failed-login record is queued through _fire_offloop — it can be shed under a broadcast "
-        "spray; it must run inline")
-    assert "_record_failed_login_bg(login_request.username" in src, (
-        "the failed-login record is not called inline in the login handler")
+        "spray; it must be awaited via run_offloaded")
+    assert src.count("run_offloaded(_record_failed_login_bg, login_request.username") == 2, (
+        "expected the failed-login record awaited via run_offloaded in BOTH login except branches")
 
 
 def test_a_temp_429_with_no_retry_after_uses_the_generic_no_countdown_body():
