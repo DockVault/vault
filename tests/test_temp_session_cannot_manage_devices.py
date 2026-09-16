@@ -15,12 +15,21 @@ from _device_boundary_helpers import register_device, temp_login
 pytestmark = pytest.mark.integration
 
 
+def _denial_count(admin):
+    rows = admin.get("/audit/log?action=device_access_denied").json()
+    return len(rows) if isinstance(rows, list) else 0
+
+
 def test_a_temporary_session_cannot_manage_or_enumerate_devices(admin):
     sess, _ = temp_login(admin)
 
     real = register_device(admin)
     real_id = real["device_id"]
     fake_id = "00000000-0000-4000-8000-000000000000"
+    # Count BEFORE the probes: on a reused stack the log already carries this action from earlier
+    # runs, so `len > 0` would pass by history even with the audit write reverted. The delta is what
+    # this test's own probes add, so it goes red on revert on any stack.
+    denials_before = _denial_count(admin)
 
     checks = [
         ("post", "/devices", {"label": "hijack"}),
@@ -48,11 +57,11 @@ def test_a_temporary_session_cannot_manage_or_enumerate_devices(admin):
         assert still is not None and still.get("is_active") is True, (
             "a temporary session's calls altered the account's devices")
 
-        # And the probe left a trace: reaching for device management from a temporary session is
-        # recorded, the same way an admin-plane denial is — an unrecorded 403 is a blind spot.
-        denials = admin.get("/audit/log?action=device_access_denied").json()
-        assert isinstance(denials, list) and len(denials) > 0, (
-            "a temporary session's device-management probe was refused but left no audit row")
+        # And the probes left a trace: reaching for device management from a temporary session is
+        # recorded, the same way an admin-plane denial is — an unrecorded 403 is a blind spot. The
+        # count must GROW by this test's own probes, not merely be non-zero.
+        assert _denial_count(admin) > denials_before, (
+            "a temporary session's device-management probes were refused but left no audit rows")
     finally:
         admin.delete(f"/devices/{real_id}")
 
