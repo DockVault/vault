@@ -214,6 +214,111 @@ def test_the_validator_rejects(mutate, expected):
     assert expected in str(caught.value), f"expected {expected!r}, got {caught.value}"
 
 
+# --- the per-version vulnerabilities list ------------------------------------------------------
+
+def _valid_with_vuln():
+    """A matrix whose earlier version carries one well-formed, already-fixed vulnerability."""
+    m = _valid()
+    m["versions"]["0.1.0"]["support"] = _support(secure=False)
+    m["versions"]["0.1.0"]["vulnerabilities"] = [{
+        "title": "A fixed issue",
+        "description": "Something that was wrong and is now put right.",
+        "severity": None, "cvss": None, "id": None,
+        "fixed_in": "0.2.0", "published": "2026-01-02",
+    }]
+    return m
+
+
+def test_a_well_formed_vulnerability_list_is_accepted():
+    um.validate_matrix(_valid_with_vuln())
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    (lambda v: v.update({"surprise": 1}), "unknown key"),
+    (lambda v: v.pop("title"), "missing required key"),
+    (lambda v: v.pop("fixed_in"), "missing required key"),
+    (lambda v: v.pop("severity"), "missing required key"),
+    # An escape sequence in a string that the host tool prints raw on a terminal.
+    (lambda v: v.update({"title": "bad\x1b[31mred\x1b[0m"}), "non-printable"),
+    (lambda v: v.update({"description": "line\nbreak"}), "non-printable"),
+    (lambda v: v.update({"severity": "severe"}), "severity must be null or one of"),
+    (lambda v: v.update({"cvss": 11}), "cvss must be null or a number"),
+    (lambda v: v.update({"cvss": True}), "cvss must be null or a number"),  # a bool is not a number
+    (lambda v: v.update({"fixed_in": "9.9.9"}), "not a declared version"),
+    (lambda v: v.update({"fixed_in": "0.1.0"}), "later than"),   # cannot be fixed in its own version
+    (lambda v: v.update({"published": "soon"}), "malformed"),
+])
+def test_the_validator_rejects_a_bad_vulnerability(mutate, expected):
+    data = _valid_with_vuln()
+    mutate(data["versions"]["0.1.0"]["vulnerabilities"][0])
+    with pytest.raises(um.UpgradeMatrixError) as caught:
+        um.validate_matrix(data)
+    assert expected in str(caught.value), f"expected {expected!r}, got {caught.value}"
+
+
+def test_a_vulnerabilities_value_that_is_not_a_list_is_rejected():
+    data = _valid_with_vuln()
+    data["versions"]["0.1.0"]["vulnerabilities"] = {"title": "not in a list"}
+    with pytest.raises(um.UpgradeMatrixError, match="must be a list"):
+        um.validate_matrix(data)
+
+
+def test_a_secure_version_may_not_list_vulnerabilities():
+    data = _valid_with_vuln()
+    data["versions"]["0.1.0"]["support"] = _support(secure=True)  # secure but still listing one
+    with pytest.raises(um.UpgradeMatrixError, match="marked support.secure but lists"):
+        um.validate_matrix(data)
+
+
+def _matrix_reaching_0_29_0():
+    """_valid() extended with 0.28.0 (insecure) and 0.29.0, and the edges that reach them."""
+    m = _valid()
+    m["versions"]["0.28.0"] = {"released": "2026-09-04", "notes": "device sync",
+                               "support": _support(secure=False)}
+    m["versions"]["0.29.0"] = {"released": "2026-09-15", "notes": "later",
+                               "support": _support(secure=True)}
+    m["edges"] += [
+        {"from": "0.2.0", "to": "0.28.0", "kind": "direct", "reversible": True, "requires_backup": False},
+        {"from": "0.28.0", "to": "0.29.0", "kind": "direct", "reversible": True, "requires_backup": False},
+    ]
+    return m
+
+
+def test_an_insecure_version_from_0_28_0_on_must_name_its_vulnerabilities():
+    # 0.28.0 is insecure with no list: from 0.28.0 on that is a validation error, so the file cannot
+    # silently declare a release unsafe without saying what is wrong (and how to escape it).
+    with pytest.raises(um.UpgradeMatrixError, match="must name its known"):
+        um.validate_matrix(_matrix_reaching_0_29_0())
+
+
+def test_such_a_version_validates_once_it_lists_a_fixed_vulnerability():
+    data = _matrix_reaching_0_29_0()
+    data["versions"]["0.28.0"]["vulnerabilities"] = [{
+        "title": "t", "description": "d", "severity": None, "cvss": None, "id": None,
+        "fixed_in": "0.29.0", "published": "2026-09-16"}]
+    um.validate_matrix(data)
+
+
+def test_an_insecure_version_before_0_28_0_need_not_itemise():
+    # The pre-0.28.0 end-of-life releases carry a bare secure:false with no itemisation, by decision;
+    # the rule only bites from 0.28.0 on.
+    data = _valid()
+    data["versions"]["0.1.0"]["support"] = _support(secure=False)
+    um.validate_matrix(data)
+
+
+def test_the_committed_matrix_lists_the_vulnerabilities_fixed_in_0_29_1():
+    data = um.load_matrix(MATRIX_PATH)
+    for ver in ("0.28.0", "0.29.0"):
+        vulns = data["versions"][ver].get("vulnerabilities")
+        assert vulns and len(vulns) == 2, f"{ver} should list its two known, fixed vulnerabilities"
+        assert all(v["fixed_in"] == "0.29.1" for v in vulns), f"{ver} vulns must be fixed_in 0.29.1"
+        assert all(v["severity"] is None and v["cvss"] is None and v["id"] is None for v in vulns)
+    # The release that fixed them is marked secure and lists none.
+    assert data["versions"]["0.29.1"]["support"]["secure"] is True
+    assert not data["versions"]["0.29.1"].get("vulnerabilities")
+
+
 def test_the_shapes_a_real_non_trivial_upgrade_will_need_are_accepted():
     """Both richer edge shapes, so the rejections above are not all the schema is exercised against.
 

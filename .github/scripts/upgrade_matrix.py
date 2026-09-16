@@ -44,13 +44,23 @@ _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 
 KINDS = ("direct", "blocked")
 
-_VERSION_KEYS = {"released", "notes", "must_land_here", "support"}
+_VERSION_KEYS = {"released", "notes", "must_land_here", "support", "vulnerabilities"}
 # A version's lifecycle. `eol`/`secure` are always required so no release ships with its status
 # unstated. `code_support`/`security_support` are the extended-support end dates -- features/bug
 # fixes and security fixes can end on different days (the common security-only tail), and either may
 # be absent. They describe support GIVEN PAST end-of-life, so they are only meaningful on an EOL
 # version.
 _SUPPORT_KEYS = {"eol", "secure", "code_support", "security_support"}
+# A version's list of KNOWN, ALREADY-FIXED vulnerabilities. title/description carry the meaning; the
+# ratings (severity/cvss/id) are required keys that may be null, so an unrated finding says so rather
+# than omitting the field. `fixed_in` and `published` are what make the entry safe to publish: nothing
+# is listed until a release fixes it.
+_VULN_KEYS = {"title", "description", "severity", "cvss", "id", "fixed_in", "published"}
+_SEVERITIES = ("low", "medium", "high", "critical")
+# The secure/vulnerabilities consistency below is enforced only from this version on. Releases before
+# it predate the vulnerability-list feature; the owner's decision is to leave their (end-of-life)
+# status as a bare secure:false without itemising it.
+_VULN_LISTED_FROM = "0.28.0"
 _EDGE_KEYS = {"from", "to", "kind", "reversible", "requires_backup", "reason", "conditions"}
 _CONDITION_KEYS = {"id", "summary", "detect"}
 _WAIVER_KEYS = {"version", "reason"}
@@ -96,6 +106,23 @@ def _string(value: object, where: str, *, pattern: re.Pattern[str] | None = None
     _require(bool(text.strip()), f"{where} must not be empty")
     if pattern is not None:
         _require(pattern.fullmatch(text) is not None, f"{where} is malformed: {text!r}")
+    return text
+
+
+def _printable_string(value: object, where: str) -> str:
+    """A non-empty string carrying no control or otherwise non-printable characters.
+
+    The matrix is published as a release asset and the host tool prints these strings RAW on an
+    operator's terminal. A title or description carrying an escape sequence -- a colour code, a cursor
+    move, a screen-clear -- would execute there. The runtime tool strips such sequences defensively
+    from a fetched asset; rejecting them here keeps them out of the committed file in the first place.
+    `str.isprintable()` is the yardstick: it counts a plain space as printable and treats the C0/C1
+    controls (ESC included), line separators, and the other control/format categories as not.
+    """
+    text = _string(value, where)
+    bad = sorted({ch for ch in text if not ch.isprintable()})
+    _require(not bad, f"{where} contains non-printable character(s): "
+                      + ", ".join(hex(ord(ch)) for ch in bad))
     return text
 
 
@@ -146,6 +173,47 @@ def _validate_support(support: object, where: str) -> None:
     if "code_support" in dates and "security_support" in dates:
         _require(dates["security_support"] >= dates["code_support"],
                  f"{where}.support.security_support must not end before code_support")
+
+
+def _validate_vulnerabilities(meta: dict, version: str, versions: dict, where: str) -> None:
+    """The optional per-version list of KNOWN, ALREADY-FIXED vulnerabilities.
+
+    This is a public repository, so an unpatched-vulnerability disclosure here is a disclosure to an
+    attacker. The rule that keeps the list safe to publish: an entry appears only once a release fixes
+    it. So `fixed_in` is required and must name a declared version LATER than this one -- a
+    vulnerability cannot be fixed in the release it affects, or in one that predates it. `severity`,
+    `cvss` and `id` are required keys but may be null: an unrated finding states so explicitly, rather
+    than by omission, the same way the support block always states eol/secure. title and description
+    carry the meaning and must be printable (see `_printable_string`).
+    """
+    vulns = meta.get("vulnerabilities")
+    if vulns is None:
+        return
+    _require(isinstance(vulns, list), f"{where}.vulnerabilities must be a list")
+    for position, vuln in enumerate(vulns):
+        spot = f"{where}.vulnerabilities[{position}]"
+        _require(isinstance(vuln, dict), f"{spot} must be an object")
+        _no_unknown_keys(vuln, _VULN_KEYS, spot)
+        missing = sorted(_VULN_KEYS - set(vuln))
+        _require(not missing, f"{spot} is missing required key(s): {', '.join(missing)}")
+        _printable_string(vuln.get("title"), f"{spot}.title")
+        _printable_string(vuln.get("description"), f"{spot}.description")
+        severity = vuln.get("severity")
+        _require(severity is None or severity in _SEVERITIES,
+                 f"{spot}.severity must be null or one of {', '.join(_SEVERITIES)}, got {severity!r}")
+        cvss = vuln.get("cvss")
+        _require(cvss is None or (isinstance(cvss, (int, float)) and not isinstance(cvss, bool)
+                                  and 0.0 <= cvss <= 10.0),
+                 f"{spot}.cvss must be null or a number in 0.0-10.0, got {cvss!r}")
+        if vuln.get("id") is not None:
+            _string(vuln.get("id"), f"{spot}.id")
+        fixed_in = _string(vuln.get("fixed_in"), f"{spot}.fixed_in", pattern=_VERSION_RE)
+        _require(fixed_in in versions, f"{spot}.fixed_in is not a declared version: {fixed_in}")
+        _require(_sort_key(fixed_in) > _sort_key(version),
+                 f"{spot}.fixed_in ({fixed_in}) must be a version later than {version}; a "
+                 "vulnerability is listed only once fixed, and cannot be fixed in the release it "
+                 "affects or an earlier one")
+        _string(vuln.get("published"), f"{spot}.published", pattern=_DATE_RE)
 
 
 def load_matrix(path: Path) -> dict:
@@ -213,6 +281,20 @@ def validate_matrix(data: dict) -> dict:
             _require(isinstance(meta["must_land_here"], bool),
                      f"versions[{version}].must_land_here must be a boolean")
         _validate_support(meta.get("support"), f"versions[{version}]")
+        _validate_vulnerabilities(meta, version, versions, f"versions[{version}]")
+        # secure and the vulnerability list must agree. A secure version has nothing outstanding; and
+        # from _VULN_LISTED_FROM on, a version that declares itself insecure must say what is wrong
+        # with it (every such entry names a fix, so this discloses nothing unpatched).
+        secure = meta["support"]["secure"]
+        listed = meta.get("vulnerabilities") or []
+        _require(not (secure and listed),
+                 f"versions[{version}] is marked support.secure but lists {len(listed)} "
+                 "vulnerability(ies); a secure version has none outstanding")
+        if _sort_key(version) >= _sort_key(_VULN_LISTED_FROM):
+            _require(secure or listed,
+                     f"versions[{version}] is marked support.secure=false but lists no "
+                     f"vulnerabilities; from {_VULN_LISTED_FROM} on, an insecure version must name "
+                     "its known (now-fixed) vulnerabilities")
 
     edges = data.get("edges")
     _require(isinstance(edges, list), "upgrade matrix needs an 'edges' list")

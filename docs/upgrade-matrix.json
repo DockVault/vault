@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible.",
+  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible. A version may also carry a `vulnerabilities` list of known, ALREADY-FIXED issues (title, description, optional null-able severity/cvss/id, the `fixed_in` release, and the `published` date); nothing is listed until a release fixes it, so a secure version carries none and an insecure one names what to upgrade to.",
   "kinds": {
     "direct": "The upgrade can be taken in one step. Any caveats are listed in the edge's conditions.",
     "blocked": "The upgrade must not be taken. The edge says why, and what to do instead."
@@ -268,7 +268,27 @@
       "support": {
         "eol": false,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "Temporary-credential sessions could manage devices",
+          "description": "A temporary credential's web session could enroll a device, grant it vaults the credential was not scoped to, and mint sync credentials, obtaining lasting sync access that outlived the credential.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.29.1",
+          "published": "2026-09-16"
+        },
+        {
+          "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
+          "description": "With the cache down, minting failed while leaving an orphaned credential counting against the caps, a correct-password sign-in failed, and a valid single-use SFTP credential could be refused and consumed.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.29.1",
+          "published": "2026-09-16"
+        }
+      ]
     },
     "0.29.0": {
       "released": "2026-09-15",
@@ -276,7 +296,27 @@
       "support": {
         "eol": false,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "Temporary-credential sessions could manage devices",
+          "description": "A temporary credential's web session could enroll a device, grant it vaults the credential was not scoped to, and mint sync credentials, obtaining lasting sync access that outlived the credential.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.29.1",
+          "published": "2026-09-16"
+        },
+        {
+          "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
+          "description": "With the cache down, minting failed while leaving an orphaned credential counting against the caps, a correct-password sign-in failed, and a valid single-use SFTP credential could be refused and consumed.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.29.1",
+          "published": "2026-09-16"
+        }
+      ]
     },
     "0.29.1": {
       "released": "2026-09-16",
