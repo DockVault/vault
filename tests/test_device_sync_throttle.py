@@ -46,10 +46,12 @@ def _fresh_rate_limit_buckets():
     ignored on shipped defaults), so the login and device buckets are shared state with a 5-minute
     window that cannot be waited out — one test's flood would otherwise poison the next. Mirrors CI's
     FLUSHALL between throttle steps; scoped to rate_limit:* so sessions (DB-backed anyway) are left be."""
-    subprocess.run(
+    flush = subprocess.run(
         ["docker", "exec", _REDIS_CONTAINER, "sh", "-c",
-         "redis-cli --scan --pattern 'rate_limit:*' | xargs -r redis-cli del >/dev/null 2>&1 || true"],
+         "redis-cli --scan --pattern 'rate_limit:*' | xargs -r redis-cli del"],
         capture_output=True, text=True, timeout=20)
+    if flush.returncode != 0:
+        pytest.skip(f"could not clear the rate-limit buckets before the test: {flush.stderr.strip()}")
     yield
 
 _IP_THRESHOLD = (_LOGIN_LIMIT or 5) * 2  # the per-IP login bucket is 2x the per-account limit

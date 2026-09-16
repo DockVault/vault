@@ -426,7 +426,7 @@ jobs:
           docker compose exec -T vault-redis redis-cli FLUSHALL
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
-            python -m pytest tests/test_login_throttle.py --maxfail=1
+            python -m pytest tests/test_login_throttle.py tests/test_device_sync_throttle.py --maxfail=1
 
       # A browser failure here used to leave only the accessibility dump Playwright prints, which
       # says what the page contained and not why. One such failure cost an hour of hypotheses --
