@@ -1,4 +1,4 @@
-"""BV2 credential-lifecycle slot logic (app/core/temp_cred_slot.py): the ONE shared cap predicate
+"""Credential-lifecycle slot logic (app/core/temp_cred_slot.py): the ONE shared cap predicate
 both caps use, the release that frees a slot on connection FINISH, and the upgrade backfill that must
 not flip an in-flight row.
 
