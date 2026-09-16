@@ -53,6 +53,24 @@ def test_a_drop_in_update_is_reported_as_one():
                    "blocked": False, "conditions": [], "steps": 1, "stages": 1}
 
 
+def test_the_vulnerabilities_key_is_tolerated_and_not_surfaced():
+    # The app parses the matrix permissively and deliberately does not render a version's
+    # `vulnerabilities` list this phase (the host tool does). A matrix carrying it must describe the
+    # hop exactly as one without it, and never raise.
+    uc = _fresh_module()
+    m = _matrix()
+    m["schema_version"] = 2
+    m["versions"]["0.1.0"]["support"] = {"eol": False, "secure": False}
+    m["versions"]["0.1.0"]["vulnerabilities"] = [{
+        "title": "A fixed issue", "description": "d", "severity": None, "cvss": None,
+        "id": None, "fixed_in": "0.2.0", "published": "2026-01-02"}]
+    m["versions"]["0.2.0"]["support"] = {"eol": False, "secure": True}
+    hop = uc.describe_hop(m, "0.1.0", "0.2.0")
+    assert hop == {"known": True, "requires_backup": False, "irreversible": False,
+                   "blocked": False, "conditions": [], "steps": 1, "stages": 1}
+    assert "vulnerabilit" not in str(hop).lower()   # nothing about vulnerabilities is surfaced
+
+
 def test_an_update_that_needs_a_backup_says_so():
     uc = _fresh_module()
     hop = uc.describe_hop(_matrix(backup=True, reversible=False), "0.1.0", "0.2.0")

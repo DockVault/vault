@@ -259,6 +259,10 @@ def describe_hop(matrix, current, target):
     Returns {known, requires_backup, irreversible, blocked, conditions, steps}. Unknown resolves to
     "needs a backup, may be irreversible" -- the banner says so rather than implying a drop-in,
     because a gap in the matrix is where nobody has considered the upgrade.
+
+    A version's `vulnerabilities` list is read only by the host tool, which the operator drives; the
+    app does not surface it this phase. This consumer reads the matrix permissively, so the key is
+    ignored like any it does not use -- a matrix carrying it describes a hop exactly as one without.
     """
     unknown = {"known": False, "requires_backup": True, "irreversible": True,
                "blocked": False, "conditions": [], "steps": 0, "stages": 0}
