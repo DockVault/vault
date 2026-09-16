@@ -492,17 +492,3 @@ def assert_release_declared(data: dict, version: str) -> str | None:
             "route that can be taken, or waive it deliberately"
         )
     return None
-
-
-def validate_matrix_file(path: Path, version: str | None = None) -> dict:
-    """Load, validate, and optionally require that `version` has declared itself.
-
-    A general-purpose file validator (e.g. an ad-hoc check of a published asset), not the release
-    gate -- it has no VERSION or tag list to bound `fixed_in` against, so it passes
-    `released_ceiling=None` deliberately. The release gate calls `validate_matrix` directly with the
-    real ceiling; this path enforces structure and reachability only.
-    """
-    data = validate_matrix(load_matrix(path), released_ceiling=None)
-    if version is not None:
-        assert_release_declared(data, version)
-    return data
