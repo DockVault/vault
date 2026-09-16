@@ -41,21 +41,18 @@ from app.core import rate_limit_settings
 # for the cooldown, widening the fail-open trigger surface past the released baseline; and a cache
 # success could CLOSE a breaker the limiter opened, costing the limiter a fresh stall. So failures
 # land here, and the limiter's breaker is only ever read.
-_cache_guard_open_until = 0.0
-
-
+# The read-through cache guard now lives in app.core.redis_guard, shared with every other on-loop
+# Redis touch (the activity feed, the OTP store's health read, etc.) so the whole cohort has ONE
+# private failure memory: the first best-effort failure anywhere makes the rest skip. These names are
+# kept as thin delegations so the auth-path call sites and their tests are unchanged. The limiter's
+# breaker no longer lapses on a timer (a background probe heals it), so the old "one stall per
+# cooldown" note is gone: while the breaker is open every guarded site skips, and the outage costs
+# one discovery stall in total.
 def _cache_guard_is_open(now: float) -> bool:
-    """True while the guard is open: the limiter's breaker is open OR this guard's private memory is
-    inside its cooldown. Consumers that read this skip their Redis socket while it is True.
-
-    Note (known limit, tracked separately): both the limiter's breaker and this private memory open
-    for a fixed cooldown and then simply lapse on a timer — the first Redis touch after each boundary
-    re-probes the socket and pays one timeout. The auth path's own re-probes are moved off the loop
-    (the offloaded login work, the offloaded failed-login record), but the general-API middleware's
-    synchronous limiter check still re-probes ON the loop once per boundary during an outage. Closing
-    that last on-loop re-probe is tracked separately, not here."""
-    from app.core.rate_limiter import _cb_is_open
-    return _cb_is_open(now) or now < _cache_guard_open_until
+    """True while the guard is open: the limiter's breaker is open OR the shared private memory is
+    inside its cooldown. Consumers that read this skip their Redis socket while it is True."""
+    from app.core import redis_guard
+    return redis_guard.guard_is_open(now)
 
 
 def _cache_guard_private_open(now: float) -> bool:
@@ -63,18 +60,18 @@ def _cache_guard_private_open(now: float) -> bool:
     that must fire even when the limiter merely blipped — a session force-close must not be suppressed
     because the limiter's breaker opened — yet must still skip repeated stalls during a real cache
     outage (one stall per cooldown, not one per revoked session)."""
-    return now < _cache_guard_open_until
+    from app.core import redis_guard
+    return redis_guard.guard_private_open(now)
 
 
 def _cache_guard_record_failure(now: float) -> None:
-    global _cache_guard_open_until
-    from app.core.rate_limiter import _CB_COOLDOWN_SECONDS
-    _cache_guard_open_until = now + _CB_COOLDOWN_SECONDS
+    from app.core import redis_guard
+    redis_guard.guard_record_failure(now)
 
 
 def _cache_guard_record_success() -> None:
-    global _cache_guard_open_until
-    _cache_guard_open_until = 0.0
+    from app.core import redis_guard
+    redis_guard.guard_record_success()
 
 
 # Precomputed Argon2 hash used to equalize login timing: verifying the supplied password
