@@ -26,7 +26,7 @@ from app.core.session_hash_utils import hash_session_token
 from app.core.database import redis_client, get_db_context
 from app.core.safe_log import safe_event
 from app.core.config import settings
-from app.core import rate_limit_settings
+from app.core import rate_limit_settings, vault_attempt_throttle
 
 
 # --- Best-effort cache guard: read-through, with a PRIVATE failure memory ----------------------
@@ -976,8 +976,10 @@ class AuthService:
                     "rate_limit_vault_attempts_admin"
                     if (minting_user and minting_user.role == RoleEnum.ADMIN)
                     else "rate_limit_vault_attempts")
-                _rl_attempts = redis_client.get(_rl_key)
-                if _rl_attempts and int(_rl_attempts) >= _rl_limit:
+                _rl_window = rate_limit_settings.effective("rate_limit_vault_window_seconds")
+                # Shared fail-closed counter: Redis when healthy, the durable DB fallback during a
+                # Redis outage — never a skip, which would leave the mint password proof unthrottled.
+                if vault_attempt_throttle.over_limit(_rl_key, _rl_limit, _rl_window):
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail="Too many vault password attempts. Please try again later.",
@@ -985,10 +987,7 @@ class AuthService:
                 supplied = plan['request'].get('password')
                 if not supplied or not verify_password(supplied, vault.password_hash):
                     # Burn one failed attempt on the shared (vault, account) counter.
-                    _pipe = redis_client.pipeline()
-                    _pipe.incr(_rl_key)
-                    _pipe.expire(_rl_key, rate_limit_settings.effective("rate_limit_vault_window_seconds"))
-                    _pipe.execute()
+                    vault_attempt_throttle.burn(_rl_key, _rl_window)
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=(f"Vault '{vault.name}' is password-protected — its correct "

@@ -742,13 +742,16 @@ class VaultService:
             rate_key = f"rate_limit:vault:{vault_id}:{user.id}"
             from app.core.models import RoleEnum
             from app.core import rate_limit_settings
+            from app.core import vault_attempt_throttle
             # Different limits based on role (admins get higher limit); resolved through the rate-limit
             # registry so an admin override applies (bounded + fail-safe to the deployment default).
             limit = rate_limit_settings.effective(
                 "rate_limit_vault_attempts_admin" if user.role == RoleEnum.ADMIN
                 else "rate_limit_vault_attempts")
-            attempts = redis_client.get(rate_key)
-            if attempts and int(attempts) >= limit:
+            window = rate_limit_settings.effective("rate_limit_vault_window_seconds")
+            # Shared fail-closed counter: Redis while healthy, the durable DB fallback during a Redis
+            # outage — never a skip, which would leave vault-password guessing unthrottled.
+            if vault_attempt_throttle.over_limit(rate_key, limit, window):
                 raise RateLimitExceededError("Too many vault access attempts. Please try again later.")
 
             def _burn():
@@ -757,10 +760,7 @@ class VaultService:
                 # The bucket is keyed by (vault, account); a temp session runs AS the owning account, so
                 # a temp holder's wrong-passcode guesses share the owner's bucket — an intentional
                 # trade-off (a separate bucket would grant an attacker 2x total guesses).
-                pipe = redis_client.pipeline()
-                pipe.incr(rate_key)
-                pipe.expire(rate_key, rate_limit_settings.effective("rate_limit_vault_window_seconds"))
-                pipe.execute()
+                vault_attempt_throttle.burn(rate_key, window)
 
             if require_password:
                 # A temp-credential passcode opens the vault in place of the real vault password. When a

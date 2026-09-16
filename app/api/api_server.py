@@ -38,6 +38,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
+from app.core import vault_attempt_throttle
 from app.core.auth_offload import (
     auth_offload_slot, run_offloaded, FIRE_OFFLOOP_LIMIT, _offload_executor)
 from app.core.chunk_cleanup import fail_chunk_session
@@ -6892,16 +6893,15 @@ async def grant_device_vault_endpoint(
         _rl_limit = rate_limit_settings.effective(
             "rate_limit_vault_attempts_admin" if current_user.role == RoleEnum.ADMIN
             else "rate_limit_vault_attempts")
-        _rl_attempts = redis_client.get(_rl_key)
-        if _rl_attempts and int(_rl_attempts) >= _rl_limit:
+        _rl_window = rate_limit_settings.effective("rate_limit_vault_window_seconds")
+        # Shared fail-closed counter: Redis when healthy, the durable DB fallback during a Redis
+        # outage — never a skip, which would leave the device password proof unthrottled.
+        if vault_attempt_throttle.over_limit(_rl_key, _rl_limit, _rl_window):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many vault password attempts. Please try again later.")
         if not body.vault_password or not verify_password(body.vault_password, vault.password_hash):
-            _pipe = redis_client.pipeline()
-            _pipe.incr(_rl_key)
-            _pipe.expire(_rl_key, rate_limit_settings.effective("rate_limit_vault_window_seconds"))
-            _pipe.execute()
+            vault_attempt_throttle.burn(_rl_key, _rl_window)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=("This vault is password-protected — its correct password is required to "
