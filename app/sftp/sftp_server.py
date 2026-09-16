@@ -1692,7 +1692,13 @@ def _sftp_key_clear(ip: str, username: str) -> None:
     trips the throttle, including while Redis is down and the DB fallback is doing the counting."""
     try:
         from app.core.database import redis_client
-        redis_client.delete(f"rate_limit:{_sftp_key_id(ip, username)}")
+        from app.core import redis_guard
+        # Behind the read-through guard: while Redis looks down the delete is skipped rather than
+        # stalling the loop. Skipping is fail-closed here -- the counter is simply not cleared, so a
+        # client keeps its offer count (the DB fallback below still clears the durable row).
+        redis_guard.best_effort(
+            "_sftp_key_clear",
+            lambda: redis_client.delete(f"rate_limit:{_sftp_key_id(ip, username)}"))
     except Exception:
         pass
     # The Redis-outage fallback (_sftp_key_throttled) counts offers in a durable RateLimitRecord row;

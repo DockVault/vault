@@ -6535,9 +6535,14 @@ def _device_reuse_alert(device, *, ip=None):
     NOT suppress the alert. Never raises."""
     try:
         from app.core.database import redis_client
-        if redis_client.get(f"device_reuse_alert:{device.id}"):
+        _dedup_key = f"device_reuse_alert:{device.id}"
+        # Best-effort dedup behind the read-through guard: while the guard is open the socket is
+        # skipped and the get reads as absent, so the alert still fires (fail-open) without an on-loop
+        # stall — exactly the intended posture (an outage must not suppress the alert).
+        if redis_guard.best_effort("_device_reuse_alert.dedup", lambda: redis_client.get(_dedup_key)):
             return  # already alerted for this device this window
-        redis_client.setex(f"device_reuse_alert:{device.id}", 3600, "1")
+        redis_guard.best_effort("_device_reuse_alert.mark",
+                                lambda: redis_client.setex(_dedup_key, 3600, "1"))
     except Exception:  # noqa: BLE001 — Redis down must not suppress the alert (fail-open)
         pass
     try:
@@ -16020,17 +16025,24 @@ async def upload_file(
             """
             
             try:
-                # Execute atomic check-and-reserve
-                result = redis_client.eval(
-                    lua_script,
-                    0,  # number of keys (we use ARGV only)
-                    str(vault_id),
-                    reservation_key,
-                    str(estimated_upload_size),
-                    str(vault_current_size),
-                    str(vault_size_limit),
-                    reservation_pattern
-                )
+                # Skip the atomic reservation while the breaker is open: raising here reaches the
+                # except below, which falls back to the (pre-existing) non-atomic size check without
+                # paying a socket timeout on the loop.
+                if redis_circuit_open():
+                    raise RuntimeError("redis circuit open - using the non-atomic space check")
+                # Execute atomic check-and-reserve (instrumented so a slow one is pinned to this path)
+                result = redis_guard.timed_redis(
+                    "upload_file.reserve_space",
+                    lambda: redis_client.eval(
+                        lua_script,
+                        0,  # number of keys (we use ARGV only)
+                        str(vault_id),
+                        reservation_key,
+                        str(estimated_upload_size),
+                        str(vault_current_size),
+                        str(vault_size_limit),
+                        reservation_pattern,
+                    ))
                 
                 success = result[0]
                 current_reserved = result[1]
@@ -16461,10 +16473,12 @@ async def upload_file(
         # The space reservation goes back on the same terms, and for the same reason: held after
         # the request is over it counts against the vault for its full five-minute life, so a
         # refused or abandoned upload makes the vault look fuller than it is.
-        if reservation_key and vault_size_limit > 0:
+        if reservation_key and vault_size_limit > 0 and not redis_circuit_open():
             try:
-                reserved_amount = redis_client.get(reservation_key)
-                redis_client.delete(reservation_key)
+                reserved_amount = redis_guard.timed_redis(
+                    "upload_file.release_space.get", lambda: redis_client.get(reservation_key))
+                redis_guard.timed_redis(
+                    "upload_file.release_space.delete", lambda: redis_client.delete(reservation_key))
                 if reserved_amount:
                     print(f"🧹 Reservation cleanup: {int(reserved_amount) / (1024*1024):.2f} MB")
             except Exception as exc:
