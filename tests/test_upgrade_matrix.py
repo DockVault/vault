@@ -98,7 +98,7 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
         (line[1:] for line in tags.stdout.split() if line.startswith("v")),
         key=lambda v: tuple(int(p) for p in v.split(".")))
 
-    data = um.validate_matrix(um.load_matrix(MATRIX_PATH))
+    data = um.validate_matrix(um.load_matrix(MATRIX_PATH), released_ceiling=None)
     missing = [v for v in released if v not in data["versions"]]
     assert not missing, (
         f"released but undeclared in docs/upgrade-matrix.json: {missing}. The release gate would "
@@ -213,8 +213,18 @@ def test_the_validator_rejects(mutate, expected):
     data = _valid()
     mutate(data)
     with pytest.raises(um.UpgradeMatrixError) as caught:
-        um.validate_matrix(data)
+        # These synthetic matrices exercise structure only, not the release ceiling, so they pass
+        # released_ceiling=None explicitly -- the argument is keyword-only with no default (a bare
+        # call is a TypeError), which is what keeps a real caller from skipping the check by accident.
+        um.validate_matrix(data, released_ceiling=None)
     assert expected in str(caught.value), f"expected {expected!r}, got {caught.value}"
+
+
+def test_validate_matrix_requires_the_release_ceiling_to_be_passed():
+    # released_ceiling is keyword-only with no default: a bare call raises rather than validating
+    # with the disclosure check silently off. The no-bound escape hatch must write None on purpose.
+    with pytest.raises(TypeError):
+        um.validate_matrix(_valid())
 
 
 # --- the per-version vulnerabilities list ------------------------------------------------------
@@ -233,7 +243,7 @@ def _valid_with_vuln():
 
 
 def test_a_well_formed_vulnerability_list_is_accepted():
-    um.validate_matrix(_valid_with_vuln())
+    um.validate_matrix(_valid_with_vuln(), released_ceiling=None)
 
 
 @pytest.mark.parametrize("mutate, expected", [
@@ -255,7 +265,7 @@ def test_the_validator_rejects_a_bad_vulnerability(mutate, expected):
     data = _valid_with_vuln()
     mutate(data["versions"]["0.1.0"]["vulnerabilities"][0])
     with pytest.raises(um.UpgradeMatrixError) as caught:
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
     assert expected in str(caught.value), f"expected {expected!r}, got {caught.value}"
 
 
@@ -263,14 +273,14 @@ def test_a_vulnerabilities_value_that_is_not_a_list_is_rejected():
     data = _valid_with_vuln()
     data["versions"]["0.1.0"]["vulnerabilities"] = {"title": "not in a list"}
     with pytest.raises(um.UpgradeMatrixError, match="must be a list"):
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
 
 
 def test_a_secure_version_may_not_list_vulnerabilities():
     data = _valid_with_vuln()
     data["versions"]["0.1.0"]["support"] = _support(secure=True)  # secure but still listing one
     with pytest.raises(um.UpgradeMatrixError, match="marked support.secure but lists"):
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
 
 
 def _matrix_reaching_0_29_0():
@@ -291,7 +301,7 @@ def test_an_insecure_version_from_0_28_0_on_must_name_its_vulnerabilities():
     # 0.28.0 is insecure with no list: from 0.28.0 on that is a validation error, so the file cannot
     # silently declare a release unsafe without saying what is wrong (and how to escape it).
     with pytest.raises(um.UpgradeMatrixError, match="must name its known"):
-        um.validate_matrix(_matrix_reaching_0_29_0())
+        um.validate_matrix(_matrix_reaching_0_29_0(), released_ceiling=None)
 
 
 def test_such_a_version_validates_once_it_lists_a_fixed_vulnerability():
@@ -299,7 +309,7 @@ def test_such_a_version_validates_once_it_lists_a_fixed_vulnerability():
     data["versions"]["0.28.0"]["vulnerabilities"] = [{
         "title": "t", "description": "d", "severity": None, "cvss": None, "id": None,
         "fixed_in": "0.29.0", "published": "2026-09-16"}]
-    um.validate_matrix(data)
+    um.validate_matrix(data, released_ceiling=None)
 
 
 def test_an_insecure_version_before_0_28_0_need_not_itemise():
@@ -307,7 +317,7 @@ def test_an_insecure_version_before_0_28_0_need_not_itemise():
     # the rule only bites from 0.28.0 on.
     data = _valid()
     data["versions"]["0.1.0"]["support"] = _support(secure=False)
-    um.validate_matrix(data)
+    um.validate_matrix(data, released_ceiling=None)
 
 
 def _matrix_with_a_fix_in_the_newest_version():
@@ -343,7 +353,7 @@ def test_the_same_fix_is_accepted_once_its_version_is_released():
     data = _matrix_with_a_fix_in_the_newest_version()
     um.validate_matrix(data, released_ceiling="0.30.0")
     # And with no ceiling supplied the check is simply not applied (the declared-and-later rule holds).
-    um.validate_matrix(data)
+    um.validate_matrix(data, released_ceiling=None)
 
 
 def test_the_committed_matrix_lists_the_vulnerabilities_fixed_in_0_29_1():
@@ -388,7 +398,7 @@ def test_the_shapes_a_real_non_trivial_upgrade_will_need_are_accepted():
         "reversible": False, "requires_backup": True,
         "reason": "the 0.4.0 boot rewrites a column 0.3.0 still writes to.",
     })
-    um.validate_matrix(data)
+    um.validate_matrix(data, released_ceiling=None)
 
 
 def test_parsing_refuses_oversized_and_malformed_input(tmp_path):
@@ -560,7 +570,7 @@ def test_a_waiver_goes_stale_once_the_version_is_declared():
     data = _valid()
     data["waivers"] = [{"version": "0.2.0", "reason": "no longer true"}]
     with pytest.raises(um.UpgradeMatrixError, match="declared and reachable"):
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
 
 
 def test_a_waiver_may_cover_a_declared_floor_release_reached_only_by_a_blocked_edge():
@@ -572,7 +582,7 @@ def test_a_waiver_may_cover_a_declared_floor_release_reached_only_by_a_blocked_e
     data["edges"][0]["kind"] = "blocked"
     data["edges"][0]["reason"] = "no in-place upgrade; deploy fresh and restore"
     data["waivers"] = [{"version": "0.2.0", "reason": "floor release, reached by restore only"}]
-    um.validate_matrix(data)                                  # accepted, not stale
+    um.validate_matrix(data, released_ceiling=None)                                  # accepted, not stale
     # And the gate lets it be cut, returning the waiver reason rather than refusing on the blocked edge.
     assert "floor release" in (um.assert_release_declared(data, "0.2.0") or "")
 
@@ -727,7 +737,7 @@ def test_a_backport_released_after_a_later_version_does_not_have_to_lie(tmp_path
     data["versions"]["0.2.1"] = {"released": "2026-02-01", "notes": "backport, shipped later", "support": _support()}
     data["edges"].append({"from": "0.2.0", "to": "0.2.1", "kind": "direct",
                           "reversible": True, "requires_backup": False})
-    um.validate_matrix(data)   # no edge 0.2.1 -> ... is demanded
+    um.validate_matrix(data, released_ceiling=None)   # no edge 0.2.1 -> ... is demanded
 
     repo = _repo(tmp_path, "0.2.1", data)
     assert _run_gate(repo, "0.2.1", tmp_path).version == "0.2.1"
@@ -746,7 +756,7 @@ def test_the_backport_exemption_does_not_let_a_release_be_orphaned():
     data["edges"] = [{"from": "0.1.0", "to": "0.1.5", "kind": "direct",
                       "reversible": True, "requires_backup": False}]
     with pytest.raises(um.UpgradeMatrixError, match="older than 0.2.0"):
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
 
 
 def test_an_ordinary_forward_gap_is_still_rejected():
@@ -754,7 +764,7 @@ def test_an_ordinary_forward_gap_is_still_rejected():
     data = _valid()
     data["versions"]["0.3.0"] = {"released": "2026-03-01", "notes": "later in both senses", "support": _support()}
     with pytest.raises(um.UpgradeMatrixError, match=r"0\.2\.0 -> 0\.3\.0"):
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
 
 
 def test_the_gate_rejects_a_version_that_was_never_released(tmp_path):
@@ -791,7 +801,7 @@ def test_a_version_with_a_leading_zero_is_rejected():
     data = _valid()
     data["versions"]["0.02.0"] = {"released": "2026-01-05", "notes": "x", "support": _support()}
     with pytest.raises(um.UpgradeMatrixError, match="malformed"):
-        um.validate_matrix(data)
+        um.validate_matrix(data, released_ceiling=None)
 
 
 def test_a_symlinked_matrix_is_refused(tmp_path):

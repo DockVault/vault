@@ -250,13 +250,16 @@ def load_matrix(path: Path) -> dict:
     return data
 
 
-def validate_matrix(data: dict, released_ceiling: str | None = None) -> dict:
+def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
     """Check the whole file. Returns it unchanged so callers can chain.
 
     `released_ceiling` is the newest released version, against which a vulnerability's `fixed_in` is
     bounded so an unreleased fix cannot be listed (see `_validate_vulnerabilities`). Callers supply it
-    from the VERSION file (on main) or the version being cut (at release time); left None it is not
-    enforced.
+    from the VERSION file (on main) or the newest of the released tags and the version being cut (at
+    release time). It is KEYWORD-ONLY WITH NO DEFAULT on purpose: a bare call is a TypeError, so a
+    caller cannot silently switch the unreleased-fix check off by forgetting the argument -- the one
+    place that legitimately wants no bound (e.g. validating a published asset with no VERSION at hand)
+    must write `released_ceiling=None` deliberately.
     """
     _no_unknown_keys(data, _TOP_KEYS, "upgrade matrix")
     _require(
@@ -492,8 +495,14 @@ def assert_release_declared(data: dict, version: str) -> str | None:
 
 
 def validate_matrix_file(path: Path, version: str | None = None) -> dict:
-    """Load, validate, and optionally require that `version` has declared itself."""
-    data = validate_matrix(load_matrix(path))
+    """Load, validate, and optionally require that `version` has declared itself.
+
+    A general-purpose file validator (e.g. an ad-hoc check of a published asset), not the release
+    gate -- it has no VERSION or tag list to bound `fixed_in` against, so it passes
+    `released_ceiling=None` deliberately. The release gate calls `validate_matrix` directly with the
+    real ceiling; this path enforces structure and reachability only.
+    """
+    data = validate_matrix(load_matrix(path), released_ceiling=None)
     if version is not None:
         assert_release_declared(data, version)
     return data
