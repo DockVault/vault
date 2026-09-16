@@ -38,6 +38,7 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
+from app.core.auth_offload import auth_offload_slot, run_offloaded
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, PublicLink, ReceiverTag, Receiver, ReceiverUploadSession, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction, PendingLogin
@@ -1823,7 +1824,6 @@ def broadcast_event(event_data: dict, include_metrics: bool = True) -> None:
             - operations: Optional active operations count
         include_metrics: If True, fetch and include current metrics (default: True)
     """
-    from app.core.database import redis_client
     try:
         # Add current metrics to the broadcast
         if include_metrics:
@@ -1840,10 +1840,61 @@ def broadcast_event(event_data: dict, include_metrics: bool = True) -> None:
                     'download': metrics.get('downloadTraffic', 0)
                 }
         
-        # Publish to Redis channel that WebSocket endpoint subscribes to
-        redis_client.publish("activity_events", json.dumps(event_data))
+        # Publish to the Redis channel the WebSocket endpoint subscribes to, behind the read-through
+        # cache guard (see _guarded_publish): during a Redis outage the socket is skipped instead of
+        # stalling a timeout per broadcast, and the shared breaker is never written. On the login/mint
+        # handlers this whole call is ALSO run off the event loop (see _fire_offloop), so the one
+        # stall that survives a cold breaker — before the guard is open — cannot freeze the loop.
+        _guarded_publish("activity_events", json.dumps(event_data))
     except Exception as e:
         print(f"Error broadcasting event: {e}")
+
+
+# Fire-and-forget background tasks scheduled off the event loop. Keeping a strong reference until each
+# finishes stops the loop garbage-collecting a running task out from under itself.
+_BG_TASKS: set = set()
+
+
+def _guarded_publish(channel: str, message: str) -> bool:
+    """Publish to a Redis pub/sub channel behind the read-through cache guard, so a Redis outage skips
+    the socket instead of stalling a full timeout on every raw publish. Returns True if published,
+    False if the guard was open and the socket was skipped; re-raises a real publish error for the
+    caller's existing best-effort handler. Reads the limiter's breaker but NEVER writes it — a pub/sub
+    nudge must not open the shared breaker and fail the general-API limiter open. Best-effort by
+    construction: the caller has already committed the durable state (the revoked/inactive rows, the
+    audit trail); the publish only speeds the SFTP/WebSocket side's propagation."""
+    import time as _t
+    from app.core.database import redis_client
+    from app.services.auth_service import (
+        _cache_guard_is_open, _cache_guard_record_failure, _cache_guard_record_success,
+    )
+    if _cache_guard_is_open(_t.time()):
+        return False
+    try:
+        redis_client.publish(channel, message)
+        _cache_guard_record_success()
+        return True
+    except Exception:
+        _cache_guard_record_failure(_t.time())
+        raise
+
+
+def _fire_offloop(fn, *args, **kwargs) -> None:
+    """Run a self-contained, best-effort side effect (a broadcast, a notification) OFF the event loop,
+    fire-and-forget, from an async handler. On the login/mint paths this keeps a blocking Redis
+    publish — which on a cold breaker stalls a full socket timeout before the guard is open — from
+    freezing the loop and every request racing it. The callable must own its own DB session (both
+    broadcast_event and _notify_users do) and swallow its own errors; nothing here awaits the result,
+    so the handler returns without waiting on the side effect."""
+    import asyncio
+    try:
+        task = asyncio.create_task(asyncio.to_thread(lambda: fn(*args, **kwargs)))
+    except RuntimeError:
+        # No running loop (a sync caller): just run it inline — there is no loop to protect.
+        fn(*args, **kwargs)
+        return
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 def _vault_activity_fields(vault=None, current_user=None) -> dict:
@@ -5090,6 +5141,10 @@ class DeviceSyncCredentialRequest(BaseModel):
 @app.post("/device/sync-credential")
 async def mint_device_sync_credential_endpoint(
     body: DeviceSyncCredentialRequest,
+    # Declared BEFORE the principal resolver and get_db so the concurrency slot is held before any
+    # database connection is checked out — the principal resolver queries the device row, so a slot
+    # taken later would already hold a connection while it queued, falsifying the pool bound.
+    _offload_slot: None = Depends(auth_offload_slot),
     principal: DevicePrincipal = Depends(get_current_device_principal),
     db: Session = Depends(get_db),
 ):
@@ -5124,7 +5179,7 @@ async def mint_device_sync_credential_endpoint(
         )
 
     auth_service = AuthService(db)
-    cred = await _offload_auth(
+    cred = await run_offloaded(
         auth_service.mint_device_sync_credential,
         principal.device, body.vault_id, validity_minutes=body.validity_minutes)
     _audit_device("device_sync_cred_mint", principal.device, vault_id=body.vault_id,
@@ -5555,30 +5610,17 @@ async def second_factor_step_up(
                                                 session_hash=session_hash)}
 
 
-# Synchronous auth work (a login or a credential mint) touches the database and, during a cache
-# outage, blocks on a Redis socket. Run it in a worker thread so one caller's stall does not freeze
-# the event loop for every other request. Concurrency is bounded BELOW the DB pool on purpose: each
-# offloaded call holds a request-scoped DB session for its whole duration, and the default thread
-# pool (~40) is larger than the connection pool (10 + 20 overflow), so an unbounded outage-time burst
-# would drain the pool and fail EVERY request, not just logins — turning the freeze the offload is
-# meant to remove into pool exhaustion. This semaphore caps in-flight offloaded auth so the pool
-# always keeps headroom for unrelated requests. Pairs with the session-cache breaker (never instead):
-# the breaker bounds each stall to one per cooldown, the semaphore bounds how many run at once.
-_AUTH_OFFLOAD_LIMIT = 8  # < the DB pool base (10); the rest of the pool + overflow stays free
-_auth_offload = asyncio.Semaphore(_AUTH_OFFLOAD_LIMIT)
-
-
-async def _offload_auth(fn, *args, **kwargs):
-    """Run blocking auth work off the event loop, with concurrency bounded below the DB pool."""
-    async with _auth_offload:
-        return await asyncio.to_thread(lambda: fn(*args, **kwargs))
-
-
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
     request: Request,
-    db: Session = Depends(get_db)
+    # Declared BEFORE get_db so the concurrency slot is held before ANY database connection is
+    # checked out (this route resolves _login_identifier(db) — a real SELECT — as an argument to the
+    # offloaded call, so a slot acquired inside the handler would already hold a connection while it
+    # queued). The slot bounds these routes below the pool; the offload runs the blocking auth work
+    # off the loop. See app/core/auth_offload.py.
+    _offload_slot: None = Depends(auth_offload_slot),
+    db: Session = Depends(get_db),
 ):
     """
     Authenticate user and return access token.
@@ -5592,7 +5634,7 @@ async def login(
         # Check if this is a temporary credential (starts with "temp_")
         if login_request.username.startswith("temp_"):
             # Authenticate as temporary credential
-            user, session_token = await _offload_auth(
+            user, session_token = await run_offloaded(
                 auth_service.authenticate_temporary_credential,
                 temp_username=login_request.username,
                 credential=login_request.password,
@@ -5606,7 +5648,7 @@ async def login(
             # Regular user authentication. The org policy decides whether the submitted value is
             # resolved as a username, an email, or either — the temp_ branch above stays first and
             # policy-independent (temp usernames are their own namespace, never an email).
-            user, session_token = await _offload_auth(
+            user, session_token = await run_offloaded(
                 auth_service.authenticate_user,
                 login_request.username,
                 login_request.password,
@@ -5660,13 +5702,19 @@ async def login(
         if is_temporary:
             login_event["temp_username"] = login_request.username
             login_event["owner_user_id"] = str(user.id)
-        broadcast_event({"event": login_event})
+        # OFF the event loop: during a Redis outage this publish stalls a socket timeout on a cold
+        # breaker, and on the loop that freezes every concurrent request. Fire-and-forget — a login
+        # must not wait on its own telemetry.
+        _fire_offloop(broadcast_event, {"event": login_event})
 
         # Persist the owner-facing "your temporary credential just signed in" as an in-app
         # notification too (the WS toast is transient; this is the durable bell/history record). No
         # dedup key — every temp-credential sign-in is a distinct, notable event. Best-effort.
         if is_temporary:
-            _notify_users(
+            # OFF the loop too: _notify_users ends in a broadcast publish, the same cold-breaker
+            # stall. It owns its own DB session, so it is safe to run in a worker thread.
+            _fire_offloop(
+                _notify_users,
                 [str(user.id)], "temp_login",
                 title="Temporary credential signed in",
                 body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
@@ -5741,15 +5789,22 @@ async def login(
         except Exception as monitor_error:
             print(f"Warning: Failed to record security event: {monitor_error}")
         
-        # Add rate limit headers to 429 response
+        # Add rate-limit headers to the 429. For a temp_ credential at the web door emit ONLY
+        # Retry-After and DROP X-RateLimit-Limit / X-RateLimit-Remaining: the limit VALUE is a kind
+        # oracle — a device bucket, a per-username bucket and the human login bucket carry different
+        # limits, so a prober could tell which kind a temp_ username hit from its very first 429. The
+        # body is already the same generic "Too many login attempts" for every kind; dropping these
+        # two headers makes the whole 429 identical across temp_ kinds. The human password login is
+        # unaffected and keeps its headers.
         headers = {}
-        if hasattr(e, 'limit') and e.limit:
-            headers["X-RateLimit-Limit"] = str(e.limit)
-        if hasattr(e, 'remaining'):
-            headers["X-RateLimit-Remaining"] = str(e.remaining)
+        if not login_request.username.startswith("temp_"):
+            if hasattr(e, 'limit') and e.limit:
+                headers["X-RateLimit-Limit"] = str(e.limit)
+            if hasattr(e, 'remaining'):
+                headers["X-RateLimit-Remaining"] = str(e.remaining)
         if hasattr(e, 'retry_after') and e.retry_after:
             headers["Retry-After"] = str(e.retry_after)
-        
+
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=str(e),
@@ -5835,6 +5890,10 @@ async def get_session_access(
 @require_step_up("temp_credential.create")
 async def create_temp_credentials(
     payload: Optional[TempCredentialCreate] = None,
+    # Declared BEFORE get_current_user and get_db so the concurrency slot is held before any database
+    # connection is checked out — get_current_user queries the session/user rows, so a slot taken
+    # later would already hold a connection while it queued, falsifying the pool bound.
+    _offload_slot: None = Depends(auth_offload_slot),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     request: Request = None
@@ -5899,7 +5958,7 @@ async def create_temp_credentials(
         parent_vault_ids = list(parent_vault_caps.keys())
         parent_vault_scope = getattr(current_user, '_temp_vault_scope', {}) or {}
 
-    temp_creds = await _offload_auth(
+    temp_creds = await run_offloaded(
         auth_service.create_temporary_credential,
         current_user.id,
         validity_minutes=payload.validity_minutes if payload else None,
@@ -6162,7 +6221,7 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
         count += 1
         try:
-            redis_client.publish('session_terminations', json.dumps({
+            _guarded_publish('session_terminations', json.dumps({
                 'session_token': s.session_token,
                 'session_id': str(s.id),
                 'terminated_by': actor_username,
@@ -6852,7 +6911,7 @@ async def terminate_temp_credential_sessions(
         
         # Publish termination signal to Redis for SFTP server to close transport
         try:
-            redis_client.publish('session_terminations', json.dumps({
+            _guarded_publish('session_terminations', json.dumps({
                 'session_token': session.session_token,
                 'session_id': str(session.id),
                 'temp_username': temp_username,

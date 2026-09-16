@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import requests
 
-from conftest import ApiClient
+from conftest import ApiClient, wait_out_breaker_cooldown
 
 
 pytestmark = pytest.mark.integration
@@ -230,3 +230,5 @@ def test_general_api_classes_fail_open_during_redis_outage(base_url, temp_user_c
             except Exception:
                 pass
             time.sleep(1)
+        # Start the next test on the Redis path with a closed breaker.
+        wait_out_breaker_cooldown()

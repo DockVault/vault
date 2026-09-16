@@ -1,38 +1,57 @@
-"""During a cache outage, one caller's stall must not freeze the server for everyone.
+"""During a cache outage the event loop stays free while a login runs, so other requests are served.
 
-`POST /auth/login` and the two credential mints do synchronous work that, when Redis is unavailable,
-blocks on a socket. Two things keep that from becoming a server-wide freeze:
+A login does blocking work that touches Redis: the rate-limit read, the session-cache writes, and —
+the one this test targets — a broadcast publish on the activity channel after the session is minted.
+Two mechanisms keep a Redis outage from freezing the SERVER (not just the one login):
 
-  * the session-cache writes go through the same circuit breaker the rate limiter uses, so the auth
-    path pays ONE socket stall per cooldown instead of one per raw call; and
-  * the synchronous auth work runs off the event loop in a worker thread, with concurrency bounded
-    BELOW the database pool, so concurrent outage logins run in parallel instead of queueing behind
-    one event loop — and a burst of them cannot drain the connection pool and starve unrelated
-    requests.
+  * login runs its blocking auth work OFF the event loop (bounded below the DB pool by the
+    auth_offload_slot dependency — see test_auth_offload.py and test_auth_offload_slot_ordering.py),
+    so one caller's stall does not hold the loop; and
+  * the post-auth broadcast publish also runs off the loop (fire-and-forget) and behind the
+    read-through cache guard, so the publish that survives a COLD breaker — before any Redis failure
+    has opened the guard — cannot block the loop either.
 
-Timed, and they pause the Redis container, so they are opt-in and live in their own module. DISTINCT
-real users with CORRECT passwords throughout: a successful login is what exercises the session-cache
-write, and distinct users keep this about per-process concurrency rather than the single-credential
-session race, which is a separate concern.
+The freeze this proves: with Redis freshly paused (breaker COLD) and one login in flight, an unrelated
+authenticated request fired a fraction of a second into that login must be served after about ONE
+socket-timeout stall (its own denylist read, which a cold breaker cannot yet skip), not two. On code
+that runs the login's broadcast on the loop, the unrelated request also waits behind that publish and
+pays a SECOND socket timeout. Measured on a paused stack: ~2.0 s served vs ~3.8 s frozen. Opt-in and
+timed, so it lives with the other outage tests; needs the raised-login-limit stack so a burst of
+logins from one IP is not itself throttled.
 """
 import os
 import subprocess
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, configured_int_setting, unique, wait_out_breaker_cooldown
 
 _REDIS_CONTAINER = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
+_NEVER_VALID = "wrong-pw-xyz"  # noqa: S105 - deliberately-invalid probe value, never a real secret
+
+# The single socket-timeout floor a cold breaker cannot skip. The redis client's socket timeout is
+# 2.0 s, so one stall is ~2 s and two stacked stalls ~4 s. This threshold sits between the served
+# (~2.0 s) and frozen (~3.8 s) cases the QA runner measured on a paused stack.
+_ONE_STALL_CEILING = 3.0
+
+# Guard on the login limit: this test fires logins from one IP, so a small shipped login limit (5)
+# would 429 them before they reach the broadcast. Runs on the raised-limit offload/outage stack.
+_LOGIN_LIMIT = configured_int_setting("RATE_LIMIT_LOGIN_ATTEMPTS")
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
-        reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the cache-outage offload tests "
-               "(they pause/unpause the Redis container via docker)",
+        reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the cache-outage loop-freeze test "
+               "(it pauses/unpauses the Redis container via docker)",
+    ),
+    pytest.mark.skipif(
+        _LOGIN_LIMIT is not None and _LOGIN_LIMIT <= 50,
+        reason=f"needs a raised login limit so logins from one IP are not throttled mid-test; "
+               f"deployment has RATE_LIMIT_LOGIN_ATTEMPTS={_LOGIN_LIMIT}. Run on the offload stack.",
     ),
 ]
 
@@ -43,14 +62,12 @@ def _docker(*args):
 
 @contextmanager
 def _redis_paused():
-    """Pause Redis for the block, then unpause and wait for it to be healthy again. Set up your test
-    state (users, sessions) BEFORE entering, since the cache is down inside."""
     if _docker("version").returncode != 0:
         pytest.skip("docker not available")
     if _docker("inspect", _REDIS_CONTAINER).returncode != 0:
         pytest.skip(f"redis container {_REDIS_CONTAINER!r} not found")
     assert _docker("pause", _REDIS_CONTAINER).returncode == 0
-    time.sleep(2)
+    time.sleep(2)  # let the app start seeing Redis as unavailable (breaker stays COLD until a call)
     try:
         yield
     finally:
@@ -60,76 +77,53 @@ def _redis_paused():
             if s.returncode == 0 and s.stdout.strip() == "healthy":
                 break
             time.sleep(2)
+        # Start the next test on the Redis path with a closed breaker.
+        wait_out_breaker_cooldown()
 
 
-def _timed_login(creds):
-    """One CORRECT-password web login from its own client; returns (status, seconds). A success is
-    what writes the session cache, which is the stall this measures."""
-    username, password = creds
-    t0 = time.time()
-    r = ApiClient(BASE_URL).session.post(
-        f"{BASE_URL}/auth/login", json={"username": username, "password": password}, timeout=120)
-    return r.status_code, time.time() - t0
+def test_the_loop_stays_free_while_a_login_runs_during_an_outage(admin):
+    """With Redis freshly paused (breaker COLD) and one login in flight, an unrelated authenticated
+    request fired 0.2 s into that login must be served after about ONE socket-timeout stall, not two.
+    On code that runs the login's broadcast on the event loop, the unrelated request also waits behind
+    that publish and pays a second timeout.
 
+    A dedicated second account does the login, so terminating its session (one-session-per-user) does
+    not disturb the admin token used for the unrelated request."""
+    # A dedicated account whose login will run during the outage (created before the outage).
+    login_user = admin.create_user(role="user")
+    creds = {"username": login_user["_username"], "password": login_user["_password"]}
 
-def _make_users(admin, n):
-    users = [admin.create_user(role="user") for _ in range(n)]
-    return [(u["_username"], u["_password"]) for u in users]
+    result = {}
 
+    def _run_login():
+        c = ApiClient(BASE_URL)
+        t0 = time.time()
+        try:
+            r = c.session.post(f"{BASE_URL}/auth/login", json=creds, timeout=30)
+            result["login_status"] = r.status_code
+        except Exception as exc:  # noqa: BLE001 — a login error still frees the loop; we time the GET
+            result["login_error"] = repr(exc)
+        result["login_elapsed"] = time.time() - t0
 
-def _cleanup(admin, users):
-    data = admin.get("/users").json()
-    rows = data if isinstance(data, list) else data.get("users", [])
-    wanted = {name for name, _ in users}
-    for u in rows:
-        if u.get("username") in wanted:
-            try:
-                admin.delete(f"/users/{u['id']}")
-            except Exception:  # noqa: BLE001
-                pass
-
-
-def test_concurrent_outage_logins_do_not_serialize_behind_the_event_loop(admin):
-    """Three successful logins at once during the outage must overlap, not queue. Timed against one
-    login on the same paused stack: on the pre-offload code the synchronous session-cache stalls ran
-    on the event loop and three logins took about three times one; offloaded (and with the cache
-    write behind the breaker), the slowest of three is close to a single one."""
-    users = _make_users(admin, 4)  # one for the solo timing, three for the concurrent batch
     try:
         with _redis_paused():
-            _s, single = _timed_login(users[0])
-            assert _s == 200, f"a correct-password login should succeed during the outage: {_s}"
+            login_thread = threading.Thread(target=_run_login, daemon=True)
+            login_thread.start()
+            # Let the login get into its off-loop auth work, then fire the unrelated request while it
+            # is still running — this is the window that froze on the pre-fix code.
+            time.sleep(0.2)
 
             t0 = time.time()
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                results = list(pool.map(_timed_login, users[1:4]))
-            wall = time.time() - t0
+            r = admin.session.get(f"{BASE_URL}/vaults", timeout=30)
+            elapsed = time.time() - t0
 
-        assert all(code == 200 for code, _ in results), f"logins did not all succeed: {results}"
-        assert wall < max(2.0, single * 2), (
-            f"three concurrent outage logins took {wall:.1f}s against a single login's {single:.1f}s "
-            f"— they serialized behind the event loop instead of overlapping")
+            login_thread.join(timeout=30)
+
+        assert r.status_code == 200, r.text
+        assert elapsed < _ONE_STALL_CEILING, (
+            f"an unrelated authenticated request took {elapsed:.2f}s while a login ran during the "
+            f"outage — it paid a second socket timeout waiting behind the login's on-loop broadcast "
+            f"publish, so the loop was frozen (expected under {_ONE_STALL_CEILING}s: one stall, not "
+            f"two)")
     finally:
-        _cleanup(admin, users)
-
-
-def test_a_login_burst_during_outage_still_serves_an_unrelated_request(admin):
-    """A burst of outage logins must not drain the DB pool and starve an unrelated request. Each
-    offloaded login holds a connection for its stall, so without the concurrency bound a burst larger
-    than the pool would fail every request; the bound keeps the pool with headroom."""
-    users = _make_users(admin, 24)  # well over the offload bound
-    try:
-        with _redis_paused():
-            with ThreadPoolExecutor(max_workers=len(users)) as pool:
-                fut = [pool.submit(_timed_login, c) for c in users]
-                time.sleep(1)  # let the burst pile up and hold what connections it will
-                # An unrelated, authenticated request on its own established session, mid-burst. It
-                # must be served, not fail on a pool checkout timeout.
-                r = admin.session.get(f"{BASE_URL}/vaults", timeout=30)
-                codes = [f.result()[0] for f in fut]
-        assert r.status_code == 200, (
-            f"an unrelated request was starved during a login burst: {r.status_code} {r.text[:200]} "
-            f"— the offload drained the DB pool instead of bounding its own concurrency")
-        assert all(c == 200 for c in codes), f"some burst logins did not succeed: {set(codes)}"
-    finally:
-        _cleanup(admin, users)
+        admin.delete_user(login_user["id"])

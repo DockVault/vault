@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, unique, wait_out_breaker_cooldown
 from _device_boundary_helpers import (REDIS_CONTAINER, cred_row, docker, grant,
                                       mint_sync_cred, register_device, sftp_authenticates)
 
@@ -53,6 +53,8 @@ def redis_outage():
             if status.returncode == 0 and status.stdout.strip() == "healthy":
                 break
             time.sleep(2)
+        # Start the next test on the Redis path with a closed breaker.
+        wait_out_breaker_cooldown()
 
 
 def test_web_login_returns_a_token_during_a_cache_outage(admin, temp_user, redis_outage):

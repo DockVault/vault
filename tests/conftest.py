@@ -671,6 +671,26 @@ def configured_int_setting(name, container=None):
         return None
 
 
+def wait_out_breaker_cooldown(extra: float = 1.0) -> None:
+    """After a Redis outage is lifted, wait until the process-wide rate-limiter breaker is closed
+    again, so the NEXT test in the SAME pytest invocation starts on the Redis path.
+
+    A test that pauses Redis opens the breaker for _CB_COOLDOWN_SECONDS from its last failed Redis
+    call; the last failure is always before the unpause, so sleeping that long after unpause
+    guarantees the breaker has cooled and the next Redis call re-probes a now-healthy Redis and
+    closes it. Without this, a following throttle test starts inside the cooldown: its first login
+    is routed to the DB fallback, which still holds the previous module's failed attempts for the
+    runner's shared IP, and the admin fixture's own login comes back 429 before the test runs.
+    Reordering modules would only move that hazard to whatever module runs next; every Redis-pausing
+    fixture calling this after it restores Redis removes it wherever the fixture is used."""
+    import time as _t
+    try:
+        from app.core.rate_limiter import _CB_COOLDOWN_SECONDS as cooldown
+    except Exception:  # noqa: BLE001 — app not importable in this lane; fall back to the known value
+        cooldown = 10
+    _t.sleep(cooldown + extra)
+
+
 def skip_if_container_absent(completed, container):
     """Skip when `docker exec` failed because there is no such container.
 

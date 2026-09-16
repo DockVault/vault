@@ -22,7 +22,7 @@ import time
 import pytest
 import requests
 
-from conftest import ApiClient, configured_int_setting, unique
+from conftest import ApiClient, configured_int_setting, unique, wait_out_breaker_cooldown
 
 
 def _hammer_until_429(client, username, max_attempts):
@@ -147,6 +147,9 @@ def test_login_throttle_survives_redis_outage(base_url):
             if _app_sees_redis():
                 break
             time.sleep(1)
+        # Wait out the breaker cooldown so the next test in this invocation starts on the Redis path
+        # with a closed breaker (not routed to a DB fallback still holding this outage's attempts).
+        wait_out_breaker_cooldown()
 
 
 @pytest.mark.skipif(
@@ -194,3 +197,5 @@ def test_login_fast_fail_closed_during_redis_outage(base_url):
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(1)
+        # Start the next test on the Redis path with a closed breaker.
+        wait_out_breaker_cooldown()

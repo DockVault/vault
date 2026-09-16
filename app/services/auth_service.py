@@ -29,6 +29,37 @@ from app.core.config import settings
 from app.core import rate_limit_settings
 
 
+# --- Best-effort cache guard: read-through, with a PRIVATE failure memory ----------------------
+# The auth path's best-effort session-cache writes and the per-request denylist read skip the Redis
+# socket while the rate limiter's breaker is open — an outage the limiter has already seen on its own
+# calls — so they pay one stall per cooldown instead of one per call. They ALSO keep this private
+# failure memory: for the rare case where an outage begins AFTER the limiter's read but before a
+# later cache op, the first such op stalls once, opens this memory, and the rest of the cooldown
+# skips. What they must never do is write the limiter's breaker (_cb_record_failure /
+# _cb_record_success): its threshold is 1, so a single transient cache-write error on a healthy
+# Redis would open the shared breaker and fail EVERY fail-open caller (the general-API limiter) open
+# for the cooldown, widening the fail-open trigger surface past the released baseline; and a cache
+# success could CLOSE a breaker the limiter opened, costing the limiter a fresh stall. So failures
+# land here, and the limiter's breaker is only ever read.
+_cache_guard_open_until = 0.0
+
+
+def _cache_guard_is_open(now: float) -> bool:
+    from app.core.rate_limiter import _cb_is_open
+    return _cb_is_open(now) or now < _cache_guard_open_until
+
+
+def _cache_guard_record_failure(now: float) -> None:
+    global _cache_guard_open_until
+    from app.core.rate_limiter import _CB_COOLDOWN_SECONDS
+    _cache_guard_open_until = now + _CB_COOLDOWN_SECONDS
+
+
+def _cache_guard_record_success() -> None:
+    global _cache_guard_open_until
+    _cache_guard_open_until = 0.0
+
+
 # Precomputed Argon2 hash used to equalize login timing: verifying the supplied password
 # against this on the "no such user" path makes a non-existent username cost ~the same as a
 # real one, closing the username-enumeration timing oracle. Computed once at import.
@@ -72,12 +103,26 @@ def denylist_token(session_token: str, ttl_seconds: int) -> None:
 
 def is_token_denylisted(session_token: str) -> bool:
     """True if this token was revoked (logged out). Fails OPEN on a Redis error so a Redis
-    outage can't lock everyone out — the token still expires via its own JWT exp."""
+    outage can't lock everyone out — the token still expires via its own JWT exp.
+
+    This read is on the hot path of EVERY authenticated request, so it goes through the same
+    read-through guard the best-effort session-cache writes use: while the guard is open (the rate
+    limiter's breaker is open, or this guard's own private failure memory is inside its cooldown),
+    skip the socket and fail open at once instead of stalling one socket timeout per request. It reads
+    the limiter's breaker but never writes it. Behaviour is unchanged — an outage already fails open
+    here — but an authenticated request no longer freezes for the timeout while the cache is down,
+    which is what lets the login offload actually keep the server responsive during an outage."""
     if not session_token:
         return False
+    now = time.time()
+    if _cache_guard_is_open(now):
+        return False  # guard open: this check fails open anyway, so skip the stall
     try:
-        return bool(redis_client.exists(f"denylist:session:{hash_session_token(session_token)}"))
+        listed = bool(redis_client.exists(f"denylist:session:{hash_session_token(session_token)}"))
+        _cache_guard_record_success()
+        return listed
     except Exception:
+        _cache_guard_record_failure(time.time())
         return False
 
 
@@ -162,25 +207,27 @@ def _device_mint_refusal(reason: str, http_status: int = status.HTTP_403_FORBIDD
 
 
 def _best_effort_cache(code: str, op) -> None:
-    """Run a best-effort session-cache write/delete behind the SAME process-wide breaker the rate
-    limiter uses, so during a Redis outage the auth path pays ONE socket stall per cooldown instead
-    of one per raw call.
+    """Run a best-effort session-cache write/delete behind the read-through cache guard, so during a
+    Redis outage the auth path pays ONE socket stall per cooldown instead of one per raw call.
 
     The session cache is a convenience over the committed database rows, which are the source of
-    truth, so the op is best-effort either way. What the breaker adds: while it is open (a recent
-    Redis failure — opened here or, on the login path, by the rate-limit read that ran first) the
-    socket is skipped entirely, so a login no longer stalls once per raw call. The first real failure
-    opens it for every raw call that follows in the cooldown; a success closes it. Any error, or an
-    open breaker, is swallowed to `code` — the cache never fails the request."""
-    from app.core.rate_limiter import _cb_is_open, _cb_record_failure, _cb_record_success
-    if _cb_is_open(time.time()):
+    truth, so the op is best-effort either way. What the guard adds: while it is open (the rate
+    limiter's breaker is open — opened by the limiter's own read, which on the login path runs first —
+    or this guard's private memory is inside its cooldown) the socket is skipped entirely, so a login
+    no longer stalls once per raw call. The first real failure opens the PRIVATE memory for every raw
+    call that follows in the cooldown; a success clears it. It reads the limiter's breaker but never
+    writes it — a transient cache-write error on a healthy Redis must not open the shared breaker and
+    fail the general-API limiter open. Any error, or an open guard, is swallowed to `code` — the
+    cache never fails the request."""
+    now = time.time()
+    if _cache_guard_is_open(now):
         safe_event(code)
         return
     try:
         op()
-        _cb_record_success()
+        _cache_guard_record_success()
     except Exception as e:  # noqa: BLE001 — best-effort cache op; the committed DB row is authoritative
-        _cb_record_failure(time.time())
+        _cache_guard_record_failure(time.time())
         safe_event(code, exc=e)
 
 
@@ -380,23 +427,26 @@ class AuthService:
             RateLimitExceededError: If rate limit exceeded
             SessionLimitExceededError: If max sessions reached
         """
-        # Resolve the credential FIRST so a device-minted one is throttled in its OWN per-device
-        # bucket, not the shared IP/username login bucket — a looping sync client must not spend the
-        # human's login budget (that was the defect). A credential with no live device_id (a hand-out
-        # credential, or an unknown/revoked-to-NULL username) stays on the IP+username login throttle,
-        # so junk still lands in a bounded bucket. Moving the lookup ahead of the throttle opens no
-        # unthrottled spray path: the IP bucket still bounds the rate for a username with no device,
-        # and the dummy-verify below keeps a not-found response timing-identical.
+        # Resolve the credential FIRST so a KNOWN one is throttled in its OWN bucket, not the shared
+        # IP/username login bucket — a looping sync client must not spend the human's login budget
+        # (that was the defect). Moving the lookup ahead of the throttle opens no unthrottled spray
+        # path: an unknown username still hits the IP + username throttle below, and the dummy-verify
+        # keeps a not-found response timing-identical, so existence stays non-enumerable.
         temp_cred = self.db.query(TemporaryCredential).filter(
             TemporaryCredential.temp_username == temp_username
         ).first()
-        # A credential carrying a device_id — LIVE OR REVOKED — is throttled in that device's bucket:
-        # a revoked device's credential is still bounded, just in its own bucket and never on the
-        # human's. Only a credential with NO device_id (hand-out, unknown, or a deleted device whose
-        # link was SET NULL) falls to the IP + username login throttle.
+        # Any KNOWN temp_ credential throttles in a bucket of its OWN, never the shared login:<ip>
+        # bucket: the device's bucket when it carries a device_id (live or revoked), else its own
+        # per-username bucket (a hand-out credential, or one whose device was DELETED and its link SET
+        # NULL). This is what stops a looping client of a deleted/hand-out credential from spending
+        # the human's per-IP login budget and locking the owner out. Only a credential the lookup
+        # does NOT find (an unknown/probed username) falls to the IP + username login throttle, so
+        # junk still lands in a bounded bucket; the dummy-verify below keeps that miss timing-identical.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
         if device_id is not None:
             self._check_device_rate_limit(device_id, ip_address)
+        elif temp_cred is not None:
+            self._check_username_rate_limit(temp_username)
         else:
             self._check_rate_limit(temp_username, ip_address)
 
@@ -1587,6 +1637,38 @@ class AuthService:
                     retry_after=retry, limit=limit, remaining=0,
                 )
             return {'limit': limit, 'remaining': max(0, limit - 1),
+                    'reset': int(time.time()) + window}
+
+    def _check_username_rate_limit(self, username: str):
+        """Throttle a KNOWN temp_ credential that has no live device in its OWN per-username bucket
+        (`login:<username>`) at the login per-username limit — and NEVER charge the shared
+        `login:<ip>` bucket. A hand-out credential, or one whose device was deleted (device_id SET
+        NULL), is still bounded, just in a bucket of its own, so a client looping on it cannot spend
+        the human's per-IP login budget and lock the owner out. Same fail-closed posture as the login
+        throttle: on a Redis outage it drops to the durable DB fallback, keyed by username."""
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        user_limit = rate_limit_settings.effective("max_login_attempts")
+        window = rate_limit_settings.effective("rate_limit_login_window_seconds")
+        try:
+            allowed, remaining, reset = rate_limiter.check_rate_limit(
+                f"login:{username}", user_limit, window,
+                prefix="rate_limit", fail_open=False,
+            )
+            if not allowed:
+                retry_after = reset - int(time.time())
+                raise RateLimitExceededError(
+                    f"Too many login attempts. Please try again in {retry_after} seconds.",
+                    retry_after=retry_after, limit=user_limit, remaining=0,
+                )
+            return {'limit': user_limit, 'remaining': remaining, 'reset': reset}
+        except RateLimiterUnavailable:
+            allowed, retry = self._db_throttle_hit(username, "login_user", user_limit, window)
+            if not allowed:
+                raise RateLimitExceededError(
+                    f"Too many login attempts. Please try again in {retry} seconds.",
+                    retry_after=retry, limit=user_limit, remaining=0,
+                )
+            return {'limit': user_limit, 'remaining': max(0, user_limit - 1),
                     'reset': int(time.time()) + window}
 
     def _redis_rate_limit(self, rate_limiter, identifier, ip_address,
