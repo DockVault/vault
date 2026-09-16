@@ -12,15 +12,18 @@ what bounds the pool; this test pins the cap the ordering relies on. run_offload
 "off the loop" behaviour by the outage tests, carries no bound of its own.
 """
 import asyncio
+import contextvars
 import threading
 
 import pytest
 from fastapi import HTTPException
 
 import app.core.auth_offload as ao
-from app.core.auth_offload import AUTH_OFFLOAD_LIMIT, auth_offload_slot
+from app.core.auth_offload import AUTH_OFFLOAD_LIMIT, auth_offload_slot, run_offloaded
 
 pytestmark = pytest.mark.unit
+
+_probe = contextvars.ContextVar("offload_probe", default="unset")
 
 
 def _run(coro):
@@ -129,3 +132,16 @@ def test_the_slot_sheds_load_with_503_when_the_wait_exceeds_the_timeout(monkeypa
                     await g.__anext__()  # release each slot
 
     _run(run())
+
+
+def test_run_offloaded_preserves_contextvars_into_the_worker():
+    """run_offloaded must carry the caller's contextvars into the offloaded call. loop.run_in_executor
+    does NOT propagate them (asyncio.to_thread did), so without an explicit context copy the worker
+    would see the default value. Reverting to a bare run_in_executor turns this red."""
+    async def run():
+        _probe.set("set-on-the-loop")
+        return await run_offloaded(_probe.get)
+
+    assert _run(run()) == "set-on-the-loop", (
+        "the contextvar set on the loop was not visible inside the offloaded callable — "
+        "run_in_executor dropped the context")

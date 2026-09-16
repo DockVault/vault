@@ -18,6 +18,7 @@ is what bounds these routes. This pairs with the session-cache circuit breaker r
 it: the breaker bounds each stall, the slot bounds how many requests run at once.
 """
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException, status
@@ -66,6 +67,11 @@ async def auth_offload_slot():
 async def run_offloaded(fn, *args, **kwargs):
     """Run ``fn(*args, **kwargs)`` in the dedicated offload thread pool. Concurrency is bounded by the
     ``auth_offload_slot`` dependency the route holds, not here; the dedicated pool keeps that true by
-    not sharing the default executor with the WebSocket poller."""
+    not sharing the default executor with the WebSocket poller.
+
+    Copies the caller's contextvars into the worker call: ``loop.run_in_executor`` does NOT propagate
+    the current context the way ``asyncio.to_thread`` did, so without this the offloaded auth work
+    would run with an empty context (a request-id / trace contextvar set on the loop would be lost)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_offload_executor, lambda: fn(*args, **kwargs))
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_offload_executor, lambda: ctx.run(lambda: fn(*args, **kwargs)))

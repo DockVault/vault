@@ -1880,6 +1880,31 @@ def _guarded_publish(channel: str, message: str) -> bool:
         raise
 
 
+def _guarded_publish_force(channel: str, message: str) -> bool:
+    """Publish a session force-close / revocation signal, honouring ONLY the guard's PRIVATE failure
+    memory — never the limiter's breaker. A force-close must still fire when the limiter's breaker is
+    open (a limiter-only blip must not suppress the SFTP/WebSocket teardown of a revoked session), but
+    during a REAL cache outage N revocations must pay ONE stall, not one per session. So it attempts
+    the publish unless a cache op has already failed inside the cooldown, records the outcome to the
+    private memory, and never reads or writes the limiter's breaker. Returns True if published, False
+    if skipped; re-raises a real error after recording it. The durable revocation is already
+    committed; this only speeds propagation."""
+    import time as _t
+    from app.core.database import redis_client
+    from app.services.auth_service import (
+        _cache_guard_private_open, _cache_guard_record_failure, _cache_guard_record_success,
+    )
+    if _cache_guard_private_open(_t.time()):
+        return False
+    try:
+        redis_client.publish(channel, message)
+        _cache_guard_record_success()
+        return True
+    except Exception:
+        _cache_guard_record_failure(_t.time())
+        raise
+
+
 _offloop_sem = None  # created lazily on the running loop
 
 
@@ -1895,6 +1920,7 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
     beyond the bound they queue as background tasks. Runs in the dedicated offload pool, not the
     loop's shared default executor. The callable must own its DB session and swallow its own errors."""
     import asyncio
+    import contextvars
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1905,9 +1931,13 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
     if _offloop_sem is None:
         _offloop_sem = asyncio.Semaphore(FIRE_OFFLOOP_LIMIT)
 
+    # Copy the caller's context: run_in_executor does not propagate contextvars (asyncio.to_thread
+    # did), so the side effect would otherwise run with an empty context.
+    ctx = contextvars.copy_context()
+
     async def _runner():
         async with _offloop_sem:
-            await loop.run_in_executor(_offload_executor, lambda: fn(*args, **kwargs))
+            await loop.run_in_executor(_offload_executor, lambda: ctx.run(lambda: fn(*args, **kwargs)))
 
     task = asyncio.create_task(_runner())
     _BG_TASKS.add(task)
@@ -6261,12 +6291,18 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
         count += 1
         try:
-            redis_client.publish('session_terminations', json.dumps({
+            sent = _guarded_publish_force('session_terminations', json.dumps({
                 'session_token': s.session_token,
                 'session_id': str(s.id),
                 'terminated_by': actor_username,
             }))
-            print(f"📢 Force-closed session {s.session_token[:8]}... ({actor_username})")
+            if sent:
+                print(f"📢 Force-closed session {s.session_token[:8]}... ({actor_username})")
+            else:
+                # Durable revocation is committed; only the live teardown signal was skipped while a
+                # cache failure sits inside its cooldown.
+                print(f"↩ Revoked session {s.session_token[:8]}... ({actor_username}); live signal "
+                      f"skipped (cache guard), teardown falls to the session's own recheck")
         except Exception as e:  # noqa: BLE001
             print(f"❌ Failed to publish termination signal: {e}")
     return count
@@ -6949,15 +6985,19 @@ async def terminate_temp_credential_sessions(
         session.is_active = False
         terminated_count += 1
         
-        # Publish termination signal to Redis for SFTP server to close transport
+        # Publish termination signal to Redis for the SFTP server to close the transport.
         try:
-            redis_client.publish('session_terminations', json.dumps({
+            sent = _guarded_publish_force('session_terminations', json.dumps({
                 'session_token': session.session_token,
                 'session_id': str(session.id),
                 'temp_username': temp_username,
                 'terminated_by': current_user.username
             }))
-            print(f"📢 Published termination signal for session {session.session_token[:8]}...")
+            if sent:
+                print(f"📢 Published termination signal for session {session.session_token[:8]}...")
+            else:
+                print(f"↩ Revoked session {session.session_token[:8]}...; live signal skipped "
+                      f"(cache guard), teardown falls to the session's own recheck")
         except Exception as e:
             print(f"❌ Failed to publish termination signal: {e}")
         

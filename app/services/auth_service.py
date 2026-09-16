@@ -49,6 +49,14 @@ def _cache_guard_is_open(now: float) -> bool:
     return _cb_is_open(now) or now < _cache_guard_open_until
 
 
+def _cache_guard_private_open(now: float) -> bool:
+    """The guard's PRIVATE failure memory ONLY, ignoring the limiter's breaker. For a best-effort op
+    that must fire even when the limiter merely blipped — a session force-close must not be suppressed
+    because the limiter's breaker opened — yet must still skip repeated stalls during a real cache
+    outage (one stall per cooldown, not one per revoked session)."""
+    return now < _cache_guard_open_until
+
+
 def _cache_guard_record_failure(now: float) -> None:
     global _cache_guard_open_until
     from app.core.rate_limiter import _CB_COOLDOWN_SECONDS
