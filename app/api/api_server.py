@@ -1698,6 +1698,26 @@ async def require_interactive_admin(
     return current_user
 
 
+async def require_interactive_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Reject a temporary-credential session on the device-management routes.
+
+    A temporary credential is itself a scoped, expiring delegation. Managing devices — enrolling one,
+    granting it vaults, and listing or revoking them — mints or governs a longer-lived identity than
+    the credential doing it, so it belongs to a real interactive session, not a temp one. The listing
+    is included: it discloses every device label and last-seen time. This runs as a dependency, before
+    the handler body, so a temp session is turned away before any device lookup — a 404 for a missing
+    device id ahead of the 403 would itself tell a temp session whether that id exists.
+    """
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires an interactive session, not a temporary credential.",
+        )
+    return current_user
+
+
 def get_client_ip(request: Request) -> str:
     """Get the client IP. Honours X-Forwarded-For ONLY from a trusted proxy peer, so a direct
     (untrusted) client can't spoof its IP to poison per-IP throttles or audit logs. See
@@ -6408,7 +6428,7 @@ def _device_for_account_or_404(db, device_id, current_user):
 @app.post("/devices/{device_id}/revoke")
 async def revoke_device_endpoint(
     device_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """Revoke a device (account session): deactivate it and cascade-revoke every credential it
@@ -6424,7 +6444,7 @@ async def revoke_device_endpoint(
 @app.delete("/devices/{device_id}")
 async def delete_device_endpoint(
     device_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """Delete a device (account session). The revocation cascade runs FIRST, in the SAME transaction,
@@ -6447,7 +6467,7 @@ async def delete_device_endpoint(
 async def revoke_device_grant_endpoint(
     device_id: uuid.UUID,
     vault_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """Revoke a single (device, vault) grant (account session), leaving the device and its other
@@ -6470,7 +6490,7 @@ async def revoke_device_grant_endpoint(
 @app.post("/devices/{device_id}/restore")
 async def restore_device_endpoint(
     device_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """Restore a SUSPENDED device (owner account session). This is the ONLY way to clear a suspend:
@@ -6564,7 +6584,7 @@ class DeviceRegisterRequest(BaseModel):
 @app.post("/devices")
 async def register_device_endpoint(
     body: DeviceRegisterRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """Register a device for the current account and return its sync secret ONCE.
@@ -6626,7 +6646,7 @@ class DeviceGrantRequest(BaseModel):
 async def grant_device_vault_endpoint(
     device_id: uuid.UUID,
     body: DeviceGrantRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """Grant one of the CURRENT ACCOUNT's OWN devices access to a vault (account session).
@@ -6721,7 +6741,7 @@ async def grant_device_vault_endpoint(
 
 @app.get("/devices")
 async def list_devices_endpoint(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_interactive_user),
     db: Session = Depends(get_db)
 ):
     """List the current account's registered devices (account session), active and revoked, so the
