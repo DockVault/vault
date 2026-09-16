@@ -14,11 +14,12 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-def _drive_login(S, body_dict, events):
+def _drive_login(S, body_dict, events, drain=False):
     """Drive POST /auth/login through the ASGI app in-process on a fresh loop in its own thread — the
     suite has no httpx/TestClient, so this speaks raw ASGI. Appends ("response", status) to the shared
     `events` list (the test's patched monitor appends its own ("record", thread) entry), so their
-    ORDER is observable. Returns the loop thread's name."""
+    ORDER is observable. Returns the loop thread's name. With drain=True, lets fire-and-forget
+    background tasks (the success-path broadcast) finish before the loop closes."""
     holder = {}
 
     async def _drive():
@@ -37,6 +38,8 @@ def _drive_login(S, body_dict, events):
                 events.append(("response", msg["status"]))
 
         await S.app(scope, receive, send)
+        if drain:
+            await asyncio.sleep(0.3)  # let the fire-and-forget broadcast task run in the pool
 
     err = {}
 
@@ -147,6 +150,45 @@ def test_a_failed_login_records_off_loop_and_before_the_response(raiser_name, ex
         f"offloaded off the loop {loop_thread!r}")
     response_status = next(e[1] for e in events if e[0] == "response")
     assert response_status == expected_status, (response_status, events)
+
+
+def test_a_successful_login_broadcasts_with_include_metrics_false(monkeypatch):
+    """In-process handler test (raw ASGI) for the SUCCESS path: a successful login's activity broadcast
+    is fired with include_metrics=False, so it does not run the six COUNT queries (a full file count
+    among them) per login. Patches broadcast_event at the module attribute to record its kwarg. Flip
+    the kwarg in the handler (include_metrics=True) and this reds. The broadcast fires before the
+    response is built, so the response's own status is irrelevant here."""
+    import types
+    import uuid
+    from unittest.mock import MagicMock
+    from app.core.database import get_db
+    from app.services.auth_service import AuthService
+    from app.core import rate_limiter as R
+    import time as _t
+
+    S = _api()
+    user = types.SimpleNamespace(id=uuid.uuid4(), username="alice", email="alice@example.com")
+    recorded = []
+
+    def _fake_db():
+        yield MagicMock()
+
+    monkeypatch.setitem(S.app.dependency_overrides, get_db, _fake_db)
+    monkeypatch.setattr(AuthService, "authenticate_user", lambda *a, **k: (user, "session-tok"))
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, u: False)  # no 2FA pending
+    monkeypatch.setattr(S, "_setting_int", lambda db, key, default: default)
+    monkeypatch.setattr(S, "broadcast_event",
+                        lambda event, include_metrics=True: recorded.append(include_metrics))
+    R._cb_record_failure(_t.time())  # skip real Redis on the middleware / guarded reads
+    S._BG_TASKS.clear()
+    try:
+        _drive_login(S, {"username": "alice", "password": "right"}, [], drain=True)
+    finally:
+        S._BG_TASKS.clear()
+        R._cb_record_success()
+
+    assert recorded == [False], (
+        f"the login broadcast was not fired with include_metrics=False: recorded={recorded}")
 
 
 def test_a_temp_429_drops_the_ratelimit_headers_and_uses_a_generic_body():
