@@ -137,6 +137,25 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
         "throttled. A denial-of-service / key-enumeration bound, not a password control.",
         "Triggers on a flood of rejected SSH key offers from a single IP over the login window.",
     ),
+    RateLimitSpec(
+        "rate_limit_device_sync_attempts", "rate_limit_device_sync_attempts", 1, _ATTEMPTS_MAX,
+        "attempts", "sftp",
+        "Device-sync auth attempts (per device)",
+        "Sync authentications one registered device may make within the device-sync window before "
+        "being throttled. Keyed by device, separate from the human login throttle, so a looping sync "
+        "client bounds only itself and never the account's web login.",
+        "Triggers when one device's sync credential authenticates too often over the window below.",
+    ),
+    RateLimitSpec(
+        # Maximum capped at 1 hour, not the 24 h window ceiling: the durable fallback records are
+        # pruned at 1 h, so a device window longer than that would let the fallback under-count
+        # across the prune. 1 h is well above any legitimate sync cadence.
+        "rate_limit_device_sync_window_seconds", "rate_limit_device_sync_window_seconds", 10, 3600,
+        "seconds", "sftp",
+        "Device-sync window",
+        "The rolling time window over which one device's sync authentications are counted.",
+        "Applies to the per-device sync-auth counter above.",
+    ),
     # --- General API buckets (enforced by the middleware policy cache; listed here so the UI shows
     #     their deployment vs custom values through the same surface) ----------------------------
     RateLimitSpec(

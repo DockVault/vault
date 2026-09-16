@@ -241,6 +241,12 @@ class Settings(BaseSettings):
     # is a DoS / authorized-key-enumeration bound, not a credential-brute-force control —
     # generous, and fails OPEN on a Redis error (account lockout + is_active stay primary).
     rate_limit_sftp_key_attempts: int = Field(default=30)
+    # Device-sync auth (a temp credential minted for one device) is throttled in its OWN per-device
+    # bucket, separate from the human's shared IP/username login throttle, so a looping sync client
+    # bounds only itself. A real sync run makes ~1-2 auths and runs no more than ~once/45 s, so ~2/min
+    # sustained; 30 per 5 min is roughly 3x that headroom and still a firm ceiling on a runaway client.
+    rate_limit_device_sync_attempts: int = Field(default=30)
+    rate_limit_device_sync_window_seconds: int = Field(default=300)
     # Auto-unlock TTL (minutes) for an account locked by FAILED LOGINS — a time-boxed lock
     # instead of a permanent one, so 5 wrong passwords can't permanently DoS a known account.
     # An ADMIN lock (set via the API) stays permanent (locked_until is NULL). 0 disables the

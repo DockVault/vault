@@ -357,14 +357,22 @@ class AuthService:
             RateLimitExceededError: If rate limit exceeded
             SessionLimitExceededError: If max sessions reached
         """
-        # Check rate limit
-        self._check_rate_limit(temp_username, ip_address)
-        
-        # Find temporary credential
+        # Resolve the credential FIRST so a device-minted one is throttled in its OWN per-device
+        # bucket, not the shared IP/username login bucket — a looping sync client must not spend the
+        # human's login budget (that was the defect). A credential with no live device_id (a hand-out
+        # credential, or an unknown/revoked-to-NULL username) stays on the IP+username login throttle,
+        # so junk still lands in a bounded bucket. Moving the lookup ahead of the throttle opens no
+        # unthrottled spray path: the IP bucket still bounds the rate for a username with no device,
+        # and the dummy-verify below keeps a not-found response timing-identical.
         temp_cred = self.db.query(TemporaryCredential).filter(
             TemporaryCredential.temp_username == temp_username
         ).first()
-        
+        device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
+        if device_id is not None:
+            self._check_device_rate_limit(device_id, ip_address)
+        else:
+            self._check_rate_limit(temp_username, ip_address)
+
         if not temp_cred:
             # Equalize timing with the real verify path so an absent temp_username isn't
             # distinguishable by response time (temp-credential-enumeration oracle). Mirrors
@@ -1519,6 +1527,42 @@ class AuthService:
             return self._db_fallback_rate_limit(
                 identifier, ip_address, user_limit, ip_limit, window
             )
+
+    def _check_device_rate_limit(self, device_id, ip_address):
+        """Throttle device-sync auth in the DEVICE's own bucket, keyed by device id — never the
+        shared IP/username login bucket — so a looping sync client bounds only itself and a second
+        device is unaffected by the first. Same fail-closed posture as the login throttle: on a Redis
+        outage it drops to the durable DB fallback, also keyed by device, so an outage cannot silently
+        revert to IP-keying. `ip_address` is accepted for signature symmetry and audit parity; the
+        bucket is deliberately NOT keyed on it (that is the point — devices behind one egress IP must
+        not share a bucket)."""
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        limit = rate_limit_settings.effective("rate_limit_device_sync_attempts")
+        window = rate_limit_settings.effective("rate_limit_device_sync_window_seconds")
+
+        try:
+            allowed, remaining, reset = rate_limiter.check_rate_limit(
+                f"device_sync:{device_id}", limit, window,
+                prefix="rate_limit", fail_open=False,
+            )
+            if not allowed:
+                retry_after = reset - int(time.time())
+                raise RateLimitExceededError(
+                    f"Too many sync attempts for this device. Try again in {retry_after} seconds.",
+                    retry_after=retry_after, limit=limit, remaining=0,
+                )
+            return {'limit': limit, 'remaining': remaining, 'reset': reset}
+        except RateLimiterUnavailable:
+            # Redis down -> the durable DB throttle, still keyed by DEVICE (a distinct action from the
+            # login fallbacks), so the outage does not collapse the per-device bound onto the IP one.
+            allowed, retry = self._db_throttle_hit(str(device_id), "device_sync", limit, window)
+            if not allowed:
+                raise RateLimitExceededError(
+                    f"Too many sync attempts for this device. Try again in {retry} seconds.",
+                    retry_after=retry, limit=limit, remaining=0,
+                )
+            return {'limit': limit, 'remaining': max(0, limit - 1),
+                    'reset': int(time.time()) + window}
 
     def _redis_rate_limit(self, rate_limiter, identifier, ip_address,
                           user_limit, ip_limit, window):
