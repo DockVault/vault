@@ -105,27 +105,47 @@ def test_the_answer_differs_only_by_the_callers_own_state(admin, temp_vault):
     assert preflight(dev_fresh["secret"]).json()["status"] == "ok"
 
 
-def test_a_throttled_device_is_told_rate_limited_with_a_device_bucket_retry(admin, temp_vault):
+def test_a_throttled_device_is_rate_limited_while_a_peer_device_stays_ok(admin, temp_vault):
+    """rate-limited is the DEVICE's own bucket, not a shared IP bucket.
+
+    Throttle device A at the SFTP door; A is then told rate-limited with a retry-after that is
+    positive and bounded by the DEVICE-sync window (so an IP-bucket value -- a different key, its own
+    possibly-different window -- cannot masquerade as it). A second device B -- same account, same
+    vault grant, same source IP, no traffic of its own -- is told ok. If the peek keyed by IP, A's
+    flood would spill into B and B would read rate-limited too."""
     device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
     cap = configured_int_setting("MAX_DEVICE_SYNC_CREDS_PER_DEVICE") or 10
     if device_limit >= cap:
         pytest.skip(
             f"needs the device-sync rate limit ({device_limit}) below the cred cap ({cap}) so the "
             f"bucket trips before unspent creds fill the cap; run on the pre-flight stack")
-    dev = _granted_device(admin, temp_vault)
-    # Charge the device's SFTP-auth bucket over its limit with wrong-password attempts (each fails
-    # auth but charges the DEVICE bucket before the verify), cycling two of the device's own creds --
-    # kept below the cap so the block is the rate limit, not the cap.
-    names = [mint_sync_cred(dev["secret"], temp_vault["id"]).json()["temp_username"] for _ in range(2)]
+    device_window = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_WINDOW_SECONDS") or 300
+
+    dev_a = _granted_device(admin, temp_vault)
+    dev_b = _granted_device(admin, temp_vault)  # same account, same vault, same source IP as A
+
+    # Charge device A's SFTP-auth bucket over its limit with wrong-password attempts (each fails auth
+    # but charges the DEVICE bucket before the verify), cycling two of A's own creds -- kept below the
+    # cap so A's block is the rate limit, not the cap.
+    names = [mint_sync_cred(dev_a["secret"], temp_vault["id"]).json()["temp_username"] for _ in range(2)]
     for i in range(device_limit + 2):
         sftp_authenticates(names[i % len(names)], _NEVER_VALID)
 
-    r = preflight(dev["secret"])
-    assert r.status_code == 200, r.text
-    body = r.json()
+    ra = preflight(dev_a["secret"])
+    assert ra.status_code == 200, ra.text
+    body = ra.json()
     assert body["status"] == "rate-limited"
-    # The retry-after is the DEVICE bucket's own, never the shared IP bucket's.
-    assert isinstance(body.get("retry_after"), int) and body["retry_after"] >= 0
+    # Positive (A is over its limit right now) and bounded by the DEVICE-sync window -- the device
+    # bucket's own retry, which an IP-bucket value could not satisfy on both counts.
+    assert isinstance(body.get("retry_after"), int)
+    assert 0 < body["retry_after"] <= device_window
+
+    # Device B shares A's account, vault grant, and source IP but has no traffic of its own, so it is
+    # ok: the throttle bucket is keyed by device, and A's flood never touched B's. Keying the peek by
+    # IP makes B read rate-limited here -- red.
+    rb = preflight(dev_b["secret"])
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["status"] == "ok"
 
 
 @pytest.mark.skipif(not _OUTAGE, reason="opt-in: pauses Redis; set VAULT_REDIS_OUTAGE_TEST=1")
