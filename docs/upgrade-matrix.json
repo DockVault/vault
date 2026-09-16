@@ -277,6 +277,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.29.1": {
+      "released": "2026-09-16",
+      "notes": "Security fix; every deployment on 0.28.0 or 0.29.0 should upgrade. A temporary credential's web session could manage the owner's devices -- enroll a device that never expires, grant it vaults the credential itself was not scoped to, and so obtain lasting sync access that outlived the credential; the device routes now refuse temporary sessions. Signing in and minting a credential no longer fail, leave an orphaned credential counting against the caps, or spend a valid single-use credential when the session cache is unavailable. A device's sync credential is refused at the web sign-in, where it has no legitimate use. No schema change; a rollback to 0.29.0 is clean but reopens the fixed behaviour.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -522,6 +530,13 @@
     {
       "from": "0.28.0",
       "to": "0.29.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.29.0",
+      "to": "0.29.1",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
