@@ -11,6 +11,7 @@ from redis import Redis
 
 from app.core.database import redis_client
 from app.core.safe_log import safe_event
+from app.core import redis_guard
 
 
 class ActivityBroadcaster:
@@ -40,9 +41,15 @@ class ActivityBroadcaster:
         """
         try:
             event_json = json.dumps(event, default=str)
-            self.redis.publish(self.channel, event_json)
         except Exception as e:
             safe_event("activity.broadcast.failed", e)
+            return
+        # Best-effort feed: behind the read-through guard so a Redis outage skips the socket instead
+        # of stalling the event loop on every broadcast (the Live Monitor is on the request path).
+        redis_guard.best_effort(
+            "ActivityBroadcaster.broadcast_sync",
+            lambda: self.redis.publish(self.channel, event_json),
+        )
     
     async def broadcast(self, event: dict):
         """
@@ -123,9 +130,13 @@ class ProgressTracker:
                 "last_update": time.time()
             }
             
-            # Store in Redis
+            # Store in Redis (best-effort, behind the guard: during an outage progress just is not
+            # tracked rather than stalling the loop; the transfer itself proceeds).
             key = self._get_operation_key(operation_id)
-            self.redis.setex(key, self.ttl, json.dumps(operation))
+            redis_guard.best_effort(
+                "ProgressTracker.start_operation",
+                lambda: self.redis.setex(key, self.ttl, json.dumps(operation)),
+            )
             
             # Broadcast start event
             event = {
@@ -154,7 +165,9 @@ class ProgressTracker:
         """Atomically transition a live operation to completed or failed."""
         try:
             key = self._get_operation_key(operation_id)
-            data = self.redis.eval(
+            data = redis_guard.best_effort(
+                "ProgressTracker.complete_operation",
+                lambda: self.redis.eval(
                 """
                 local raw = redis.call('GET', KEYS[1])
                 if not raw then return false end
@@ -173,6 +186,8 @@ class ProgressTracker:
                 key,
                 "completed" if success else "failed",
                 str(time.time()),
+            ),
+                default=None,
             )
             if not data:
                 return None
@@ -203,8 +218,12 @@ class ProgressTracker:
         """
         try:
             key = self._get_operation_key(operation_id)
-            data = self.redis.get(key)
-            
+            data = redis_guard.best_effort(
+                "ProgressTracker.is_cancelled",
+                lambda: self.redis.get(key),
+                default=None,
+            )
+
             if not data:
                 return False
             
@@ -225,7 +244,9 @@ class ProgressTracker:
         """Atomically cancel a live operation for its exact principal or a full admin."""
         try:
             key = self._get_operation_key(operation_id)
-            data = self.redis.eval(
+            data = redis_guard.best_effort(
+                "ProgressTracker.cancel_operation",
+                lambda: self.redis.eval(
                 """
                 local raw = redis.call('GET', KEYS[1])
                 if not raw then return false end
@@ -264,6 +285,8 @@ class ProgressTracker:
                 "1" if is_admin else "0",
                 str(self.ttl),
                 str(time.time()),
+            ),
+                default=None,
             )
             if not data:
                 return False
