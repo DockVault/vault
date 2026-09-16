@@ -34,7 +34,7 @@ _NEVER_VALID = "wrong-pw-xyz"  # noqa: S105 - deliberately-invalid probe value, 
 
 # The single socket-timeout floor a cold breaker cannot skip. The redis client's socket timeout is
 # 2.0 s, so one stall is ~2 s and two stacked stalls ~4 s. This threshold sits between the served
-# (~2.0 s) and frozen (~3.8 s) cases the QA runner measured on a paused stack.
+# (~2.0 s) and frozen (~3.8 s) cases measured on a paused stack.
 _ONE_STALL_CEILING = 3.0
 
 # Guard on the login limit: this test fires logins from one IP, so a small shipped login limit (5)
