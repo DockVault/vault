@@ -6254,6 +6254,9 @@ async def list_temp_credentials(
             'is_used': cred.is_used,
             'is_active': cred.is_active,
             'used_at': (cred.used_at.isoformat() + 'Z') if cred.used_at else None,
+            # The authoritative FINISHED signal: set when the credential's connection closed (its cap
+            # slot freed). NULL while it still holds a slot (active, or in use with a live connection).
+            'slot_released_at': (cred.slot_released_at.isoformat() + 'Z') if cred.slot_released_at else None,
             'active_sessions': sessions_data,
             'active_session_count': len(sessions_data),
             'note': cred.note,

@@ -13,7 +13,7 @@ import time
 import pytest
 
 from conftest import configured_int_setting
-from _device_boundary_helpers import grant, mint_sync_cred, register_device, sftp_authenticates
+from _device_boundary_helpers import cred_row, grant, mint_sync_cred, register_device, sftp_authenticates
 
 pytestmark = [pytest.mark.integration, pytest.mark.sftp]
 
@@ -101,3 +101,22 @@ def test_a_finished_single_use_credential_no_longer_authenticates_at_the_sftp_do
             break
         time.sleep(0.5)
     assert still_authing is False, "a finished single-use credential still authenticated at the SFTP door"
+
+
+def test_the_owner_listing_shows_a_finished_credential_as_not_active(admin, temp_vault):
+    # The page state must match the connection state: after the connection closes, the owner's
+    # listing shows the slot released and no lingering active session, so the SPA (is_used -> 'Used',
+    # plus the active-session count) never renders a finished credential as active.
+    dev = _granted_device(admin, temp_vault)
+    cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
+    assert sftp_authenticates(cred["temp_username"], cred["credential"])
+
+    finished = False
+    for _ in range(20):
+        row = cred_row(admin, cred["temp_username"])
+        assert row is not None, "the credential vanished from the owner listing"
+        if row.get("slot_released_at") and row.get("active_session_count", 0) == 0 and row.get("is_used"):
+            finished = True
+            break
+        time.sleep(0.5)
+    assert finished, "the finished credential still showed a live slot or an active session in the listing"
