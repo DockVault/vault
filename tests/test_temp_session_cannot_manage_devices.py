@@ -27,6 +27,8 @@ def test_a_temporary_session_cannot_manage_or_enumerate_devices(admin):
         ("get", "/devices", None),
         ("post", f"/devices/{real_id}/grants", {"vault_id": fake_id}),
         ("post", f"/devices/{fake_id}/grants", {"vault_id": fake_id}),
+        ("post", f"/devices/{real_id}/grants/{fake_id}/revoke", None),
+        ("post", f"/devices/{fake_id}/grants/{fake_id}/revoke", None),
         ("post", f"/devices/{real_id}/restore", None),
         ("post", f"/devices/{fake_id}/restore", None),
         ("post", f"/devices/{real_id}/revoke", None),
