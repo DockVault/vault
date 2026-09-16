@@ -24,6 +24,7 @@ from app.core.security import (
 from app.core.email_identity import email_in_use, normalize_email, find_user_by_email
 from app.core.session_hash_utils import hash_session_token
 from app.core.database import redis_client, get_db_context
+from app.core.safe_log import safe_event
 from app.core.config import settings
 from app.core import rate_limit_settings
 
@@ -990,18 +991,24 @@ class AuthService:
             raise
         self.db.refresh(temp_cred)
         
-        # Store in Redis for quick expiration checks
+        # Store in Redis for quick expiration checks. Best-effort: the credential row is already
+        # committed above and is the source of truth (this cache is write-only — no reader falls back
+        # to the DB), so a cache outage must not 500 the mint and leave a committed, never-returned
+        # orphan counting against the caller's cap. The key is kept, not deleted.
         redis_key = f"temp_cred:{temp_username}"
-        redis_client.setex(
-            redis_key,
-            total_lifetime * 60,
-            json.dumps({
-                'id': str(temp_cred.id),
-                'user_id': str(user_id),
-                'deactivate_at': deactivate_at.isoformat(),
-                'expires_at': expires_at.isoformat()
-            })
-        )
+        try:
+            redis_client.setex(
+                redis_key,
+                total_lifetime * 60,
+                json.dumps({
+                    'id': str(temp_cred.id),
+                    'user_id': str(user_id),
+                    'deactivate_at': deactivate_at.isoformat(),
+                    'expires_at': expires_at.isoformat()
+                })
+            )
+        except Exception:  # noqa: BLE001 — cache write is best-effort; the DB row is authoritative
+            safe_event('temp-cred.cache-write.skipped')
         
         return {
             'id': str(temp_cred.id),
@@ -1206,16 +1213,19 @@ class AuthService:
         self.db.refresh(temp_cred)
 
         redis_key = f"temp_cred:{temp_username}"
-        redis_client.setex(
-            redis_key,
-            total_lifetime * 60,
-            json.dumps({
-                'id': str(temp_cred.id),
-                'user_id': str(device.user_id),
-                'deactivate_at': deactivate_at.isoformat(),
-                'expires_at': expires_at.isoformat(),
-            })
-        )
+        try:
+            redis_client.setex(
+                redis_key,
+                total_lifetime * 60,
+                json.dumps({
+                    'id': str(temp_cred.id),
+                    'user_id': str(device.user_id),
+                    'deactivate_at': deactivate_at.isoformat(),
+                    'expires_at': expires_at.isoformat(),
+                })
+            )
+        except Exception:  # noqa: BLE001 — best-effort cache write; the committed row is authoritative
+            safe_event('temp-cred.cache-write.skipped')
 
         return {
             'id': str(temp_cred.id),
@@ -1407,17 +1417,23 @@ class AuthService:
         self.db.commit()
         self.db.refresh(session)
         
-        # Cache in Redis with hashed token (security: prevents token exposure)
+        # Cache in Redis with hashed token (security: prevents token exposure). Best-effort: the
+        # ActiveSession row is already committed and is what every request re-validates against, so a
+        # cache outage must not 500 the auth step of every door — nor, on the temp-credential path,
+        # leave a credential already claimed as used with no session returned.
         token_hash = hash_session_token(session_token)
         redis_key = f"session:{token_hash}"
-        redis_client.setex(
-            redis_key,
-            1800,  # 30 minutes
-            json.dumps({
-                'session_id': str(session.id),
-                'user_id': str(user.id)
-            })
-        )
+        try:
+            redis_client.setex(
+                redis_key,
+                1800,  # 30 minutes
+                json.dumps({
+                    'session_id': str(session.id),
+                    'user_id': str(user.id)
+                })
+            )
+        except Exception:  # noqa: BLE001 — best-effort session cache; the DB row is authoritative
+            safe_event('session.cache-write.skipped')
         
         return session_token
     
@@ -1429,7 +1445,10 @@ class AuthService:
         # directly. Re-hashing it here would compute session:<hash-of-hash> and never delete the
         # real key, stranding the cached session until its own TTL.
         redis_key = f"session:{session.session_token}"
-        redis_client.delete(redis_key)
+        try:
+            redis_client.delete(redis_key)
+        except Exception:  # noqa: BLE001 — best-effort cache delete; the row flip below is what counts
+            safe_event('session.cache-delete.skipped')
 
         self.db.commit()
     
