@@ -36,6 +36,7 @@ def _reset_breaker():
         R._cb_record_success()
         with R._cb_lock:
             R._cb_probe_thread = None
+            R._cb_last_attempt_at = time.time()  # fresh, so the staleness backstop stays dormant
     _clear()
     yield
     _clear()
@@ -129,3 +130,116 @@ def test_a_closed_breaker_reports_not_open():
     R._cb_record_success()
     assert R._cb_is_open(time.time()) is False
     assert R.redis_circuit_open() is False
+
+
+# --- FIX 1: the breaker can never sit open with no working probe ---------------------------------
+# The flag has no timer and the probe is its only closer, and while open no foreground caller records
+# a failure -- so "open with no working probe" would be permanent. Three ways it could arise, each
+# covered below: a failure racing the probe's exit, a Thread.start() that raised, and a hung probe.
+
+
+def test_a_failure_racing_a_probe_success_does_not_strand_the_breaker_open(monkeypatch):
+    # Inject exactly one failure in the window between a probe recording success and the loop
+    # re-checking -- the window the exit fix closes. The loop must NOT exit stuck-open: it keeps
+    # looping on the SAME thread, and a later clean success closes it.
+    monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
+    monkeypatch.setattr(R, "_cb_ping", lambda: None)  # every ping succeeds
+    once = {"fired": False}
+
+    def _inject_failure():
+        if not once["fired"]:
+            once["fired"] = True
+            R._cb_record_failure(time.time())  # a failure lands right after success is recorded
+
+    monkeypatch.setattr(R, "_cb_probe_post_success", _inject_failure)
+
+    R._cb_record_failure(time.time())  # opens and starts the probe
+    thread = R._cb_probe_thread
+    assert thread is not None
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert R._cb_open is False          # not stranded; the second success closed it
+    assert R._cb_probe_thread is None   # same thread throughout; a clean close freed the slot
+
+
+def test_a_failed_probe_start_does_not_escape_and_the_backstop_heals(monkeypatch):
+    # A Thread.start() that raises (thread exhaustion) must not 500 the request, and must not wedge:
+    # the breaker opens with no probe, then the staleness backstop restarts one that heals.
+    real_thread = R.threading.Thread
+
+    class _BadThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread exhaustion")
+
+    monkeypatch.setattr(R.threading, "Thread", _BadThread)
+    R._cb_record_failure(time.time())            # must NOT raise
+    assert R._cb_open is True and R._cb_probe_thread is None  # open, no probe started
+
+    monkeypatch.setattr(R.threading, "Thread", real_thread)
+    monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
+    monkeypatch.setattr(R, "_cb_ping", lambda: None)          # healthy once a probe can start
+    R._cb_last_attempt_at = time.time() - (R._CB_PROBE_STALE_SECONDS + 1)  # age it: go stale
+    assert R._cb_is_open(time.time()) is True    # backstop restarts the probe and keeps skipping
+    thread = R._cb_probe_thread
+    assert thread is not None
+    thread.join(timeout=5)
+    assert R._cb_open is False                    # the restarted probe healed it
+
+
+def test_a_dead_probe_is_restarted_by_the_staleness_backstop(monkeypatch):
+    # A probe whose loop crashes leaves a DEAD thread in the slot; the backstop restarts it.
+    real_loop = R._cb_probe_loop
+    state = {"crashed": False}
+
+    def _loop_dies_once():
+        if not state["crashed"]:
+            state["crashed"] = True
+            raise RuntimeError("probe crashed on entry")
+        real_loop()
+
+    monkeypatch.setattr(R, "_cb_probe_loop", _loop_dies_once)
+    monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
+    monkeypatch.setattr(R, "_cb_ping", lambda: None)
+
+    R._cb_record_failure(time.time())            # opens; probe #1 crashes on entry
+    first = R._cb_probe_thread
+    assert first is not None
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert R._cb_open is True                     # a crashed probe closed nothing
+
+    R._cb_last_attempt_at = time.time() - (R._CB_PROBE_STALE_SECONDS + 1)
+    assert R._cb_is_open(time.time()) is True     # dead slot -> backstop restarts, stays open
+    second = R._cb_probe_thread
+    assert second is not None and second is not first
+    second.join(timeout=5)
+    assert R._cb_open is False                     # the restarted (real) probe healed it
+
+
+def test_a_hung_probe_lets_one_caller_reprobe(monkeypatch):
+    # A probe stuck in its ping (e.g. a DNS lookup the socket timeout does not bound) is ALIVE, so
+    # the "restart if dead" rule cannot help; the backstop instead lets ONE caller re-probe Redis
+    # directly (is_open returns False), and the next caller skips again -- one stall per stale period.
+    monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _hung_ping():
+        entered.set()
+        release.wait(30)  # stuck
+
+    monkeypatch.setattr(R, "_cb_ping", _hung_ping)
+    R._cb_record_failure(time.time())            # opens; the probe parks in the hung ping
+    thread = R._cb_probe_thread
+    assert thread is not None
+    assert entered.wait(5) and thread.is_alive()
+
+    R._cb_last_attempt_at = time.time() - (R._CB_PROBE_STALE_SECONDS + 1)  # go stale
+    assert R._cb_is_open(time.time()) is False   # alive-but-stale -> this caller re-probes directly
+    assert R._cb_is_open(time.time()) is True    # stamp reset -> the next caller skips again
+
+    release.set()
+    thread.join(timeout=5)
