@@ -61,7 +61,7 @@ def test_web_login_returns_a_token_during_a_cache_outage(admin, temp_user, redis
     # 30 s, brought down from 90 now the session-cache writes go through the breaker: an outage
     # login pays about one socket stall, not one per raw call (measured ~2-4 s on a paused stack). The
     # contract is "returns a token, not a 500"; 30 s is generous margin for a slower CI runner while
-    # still far below the pre-breaker worst case. The QA runner confirms the CI figure on the green run.
+    # still far below the pre-breaker worst case, and the CI run confirms the figure.
     first = ApiClient(BASE_URL)
     r1 = first.session.post(f"{BASE_URL}/auth/login",
                             json={"username": temp_user["_username"], "password": temp_user["_password"]},
