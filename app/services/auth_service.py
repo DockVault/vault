@@ -1021,8 +1021,8 @@ class AuthService:
                     'expires_at': expires_at.isoformat()
                 })
             )
-        except Exception:  # noqa: BLE001 — cache write is best-effort; the DB row is authoritative
-            safe_event('temp-cred.cache-write.skipped')
+        except Exception as e:  # noqa: BLE001 — cache write is best-effort; the DB row is authoritative
+            safe_event('temp-cred.cache-write.skipped', exc=e)
         
         return {
             'id': str(temp_cred.id),
@@ -1238,8 +1238,8 @@ class AuthService:
                     'expires_at': expires_at.isoformat(),
                 })
             )
-        except Exception:  # noqa: BLE001 — best-effort cache write; the committed row is authoritative
-            safe_event('temp-cred.cache-write.skipped')
+        except Exception as e:  # noqa: BLE001 — best-effort cache write; the committed row is authoritative
+            safe_event('temp-cred.cache-write.skipped', exc=e)
 
         return {
             'id': str(temp_cred.id),
@@ -1446,8 +1446,8 @@ class AuthService:
                     'user_id': str(user.id)
                 })
             )
-        except Exception:  # noqa: BLE001 — best-effort session cache; the DB row is authoritative
-            safe_event('session.cache-write.skipped')
+        except Exception as e:  # noqa: BLE001 — best-effort session cache; the DB row is authoritative
+            safe_event('session.cache-write.skipped', exc=e)
         
         return session_token
     
@@ -1461,8 +1461,8 @@ class AuthService:
         redis_key = f"session:{session.session_token}"
         try:
             redis_client.delete(redis_key)
-        except Exception:  # noqa: BLE001 — best-effort cache delete; the row flip below is what counts
-            safe_event('session.cache-delete.skipped')
+        except Exception as e:  # noqa: BLE001 — best-effort cache delete; the row flip below is what counts
+            safe_event('session.cache-delete.skipped', exc=e)
 
         self.db.commit()
     
