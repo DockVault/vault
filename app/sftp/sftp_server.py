@@ -724,6 +724,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         if datetime.now(timezone.utc) > _da:
                             safe_event('session.credential-expired', session=token[:8])
                             return False
+                    # A credential whose connection has FINISHED (slot released on close) is
+                    # done: refuse any further SFTP op even within its validity window.
+                    if getattr(tc, "slot_released_at", None) is not None:
+                        safe_event('session.credential-finished', session=token[:8])
+                        return False
                 return True
         except Exception as e:  # noqa: BLE001
             safe_event('session.check.failed', e)
@@ -2175,6 +2180,21 @@ def handle_sftp_client(
             with transport_lock:
                 active_transports.pop(hash_session_token(server.session_token), None)
             safe_event('transport.unregistered', session=server.session_token[:8])
+
+        # The connection has FINISHED: release this credential's cap slot and end its session, so the
+        # slot frees on close rather than lingering to the validity window. State-derived from the
+        # server's own close -- never a holder-claimable "I'm done" call. Best-effort: a DB hiccup
+        # here must not break the teardown, and the validity bound + the reaper backstop still free
+        # the slot. Single-use is untouched -- a spent credential stays spent.
+        if server and getattr(server, "session_token", None):
+            try:
+                from app.core.models import ActiveSession as _AS, TemporaryCredential as _TC
+                from app.core.temp_cred_slot import release_for_session
+                with get_db_context() as _slot_db:
+                    if release_for_session(_slot_db, _TC, _AS, server.session_token):
+                        safe_event('session.slot-released', session=server.session_token[:8])
+            except Exception as _slot_exc:  # noqa: BLE001 -- best-effort; never break teardown
+                safe_event('session.slot-release.failed', _slot_exc)
 
         if transport:
             transport.close()

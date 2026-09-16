@@ -1586,6 +1586,16 @@ async def get_current_user(
                 headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
             )
 
+        # A credential whose connection has FINISHED (its slot released on close) is done
+        # EVERYWHERE, not only on SFTP: refuse it on the web door too, so a single-use sync
+        # credential cannot be replayed into a web session after its connection closed.
+        if temp_cred.slot_released_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Temporary credential session has ended. Please login again.",
+                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
+            )
+
         # Bound the session by the credential's OWN stated lifetime, not just the
         # inactivity grace window above: a temp cred past its validity window
         # (deactivate_at) or hard expiry (expires_at) must stop authorizing requests
@@ -7330,10 +7340,14 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                         raise ValueError("Session terminated")
                     # Fail closed: an active session whose backing credential row is gone must not
                     # authorize (it would otherwise run unscoped).
-                    _tc = _wsdb.query(_WsTC.deactivate_at, _WsTC.expires_at).filter(
-                        _WsTC.id == _sess[1]
-                    ).first()
+                    _tc = _wsdb.query(
+                        _WsTC.deactivate_at, _WsTC.expires_at, _WsTC.slot_released_at
+                    ).filter(_WsTC.id == _sess[1]).first()
                     if _tc is None:
+                        raise ValueError("Session terminated")
+                    # A credential whose connection has FINISHED (slot released on close) is
+                    # done: the live-monitor socket must not open for it even within validity.
+                    if _tc[2] is not None:
                         raise ValueError("Session terminated")
                     _now = datetime.now(timezone.utc)
                     for _lim in (_tc[0], _tc[1]):
@@ -20339,6 +20353,18 @@ async def cleanup_expired_sessions():
                         session.is_active = False
                     db.commit()
                     print(f"🧹 Cleaned up {len(expired_sessions)} expired session(s)")
+
+                # Backstop for the connection-close slot release: a SIGKILLed sync connection leaves
+                # its credential's slot unreleased. Release the slots of credentials past their
+                # VALIDITY window (deactivate_at) -- NEVER keyed on the never-updated last_activity --
+                # so a finished-but-orphaned credential shows released, not lingering. The validity
+                # bound already drops it from the cap; this records the state. Single-use untouched.
+                from app.core.temp_cred_slot import release_expired_slots
+                from app.core.models import TemporaryCredential as _TC_slot
+                released_slots = release_expired_slots(db, _TC_slot, datetime.utcnow())
+                if released_slots:
+                    db.commit()
+                    print(f"🧹 Released {released_slots} finished credential slot(s)")
 
                 # Prune stale DB-backed login-throttle rows (only written when Redis
                 # is down). Their window is minutes; anything older than an hour is

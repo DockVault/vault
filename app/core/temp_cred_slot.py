@@ -129,3 +129,52 @@ def released_backfill_query(db, cred_model, session_model, now: datetime):
         cred_model.is_used == True,  # noqa: E712 — spent under the old model = finished
         ~live_session,               # ...unless its connection is open right now (in flight)
     )
+
+
+def release_for_session(db, cred_model, session_model, session_token, when: datetime = None) -> bool:
+    """The connection-close hook's DB effect: end the session behind ``session_token`` and, if it is a
+    temporary-credential session, RELEASE that credential's cap slot. State-derived from the server's
+    own close — never a holder-claimable call. Idempotent (an already-released slot is not moved, and
+    an already-ended session stays ended) and single-use-safe (never touches ``is_used``). Parameterised
+    by model so it is pinned against a throwaway schema. The raw token is hashed here (never compared
+    in plaintext), so callers pass the token the transport holds. Returns True only when it released."""
+    from app.core.session_hash_utils import hash_session_token
+    session = (
+        db.query(session_model)
+        .filter(session_model.session_token == hash_session_token(session_token))
+        .first()
+    )
+    if session is None:
+        return False
+    released = False
+    if session.temp_credential_id is not None:
+        cred = (
+            db.query(cred_model)
+            .filter(cred_model.id == session.temp_credential_id)
+            .first()
+        )
+        if cred is not None:
+            released = mark_released(cred, when)
+    session.is_active = False  # the connection is gone -> the session ends (the gates see it closed)
+    return released
+
+
+def release_expired_slots(db, cred_model, now: datetime) -> int:
+    """Reaper BACKSTOP: release the slots of credentials whose VALIDITY window has ended but whose
+    close hook never fired — a SIGKILLed connection. Keyed on ``deactivate_at``, NEVER on the
+    never-updated ``last_activity`` column. The validity bound already drops these from the cap; this
+    records the finished state and bounds a SIGKILL orphan. Idempotent (only unreleased rows), and it
+    never touches ``is_used``. Returns rows released."""
+    from sqlalchemy import func
+    return (
+        db.query(cred_model)
+        .filter(
+            cred_model.is_active == True,  # noqa: E712 — a revoked row is 'deleted', not a freed slot
+            cred_model.slot_released_at.is_(None),
+            cred_model.deactivate_at < now,
+        )
+        .update(
+            {cred_model.slot_released_at: func.coalesce(cred_model.deactivate_at, now)},
+            synchronize_session=False,
+        )
+    )

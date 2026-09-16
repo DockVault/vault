@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core import temp_cred_slot as slot
+from app.core.session_hash_utils import hash_session_token as _h
 
 pytestmark = pytest.mark.unit
 
@@ -102,6 +103,7 @@ def _sqlite_env():
     class Sess(Base):
         __tablename__ = "sess_probe"
         id = sa.Column(sa.Integer, primary_key=True)
+        session_token = sa.Column(sa.String)
         temp_credential_id = sa.Column(sa.Integer)
         is_active = sa.Column(sa.Boolean)
         expires_at = sa.Column(sa.DateTime)
@@ -156,3 +158,84 @@ def test_backfill_releases_spent_credentials_but_never_an_in_flight_one():
     s.commit()
     assert s.get(Cred, 2).slot_released_at is None   # in flight -> stays in use across upgrade
     assert s.get(Cred, 1).slot_released_at == _NOW
+
+
+# ---- release on connection close + reaper backstop (against the throwaway schema) ----------------
+def test_release_for_session_releases_a_temp_cred_slot_and_ends_the_session():
+    Cred, Sess, s = _sqlite_env()
+    s.add(Cred(id=1, is_active=True, is_used=True, deactivate_at=_FUTURE, slot_released_at=None))
+    s.add(Sess(id=1, session_token=_h("tok"), temp_credential_id=1, is_active=True, expires_at=_FUTURE))
+    s.commit()
+    assert slot.release_for_session(s, Cred, Sess, "tok", _NOW) is True
+    s.commit()
+    assert s.get(Cred, 1).slot_released_at == _NOW     # slot freed on close
+    assert s.get(Cred, 1).is_used is True              # spent stays spent
+    assert s.get(Sess, 1).is_active is False           # connection gone -> session ended
+
+
+def test_release_for_session_ends_a_key_auth_session_without_touching_any_credential():
+    Cred, Sess, s = _sqlite_env()
+    s.add(Sess(id=1, session_token=_h("k"), temp_credential_id=None, is_active=True, expires_at=_FUTURE))
+    s.commit()
+    assert slot.release_for_session(s, Cred, Sess, "k", _NOW) is False  # no credential slot to free
+    s.commit()
+    assert s.get(Sess, 1).is_active is False
+
+
+def test_release_for_session_is_idempotent_on_an_already_released_slot():
+    Cred, Sess, s = _sqlite_env()
+    s.add(Cred(id=1, is_active=True, is_used=True, deactivate_at=_FUTURE, slot_released_at=_PAST))
+    s.add(Sess(id=1, session_token=_h("t"), temp_credential_id=1, is_active=True, expires_at=_FUTURE))
+    s.commit()
+    assert slot.release_for_session(s, Cred, Sess, "t", _NOW) is False  # first release already won
+    s.commit()
+    assert s.get(Cred, 1).slot_released_at == _PAST    # not moved
+    assert s.get(Sess, 1).is_active is False           # session still ended
+
+
+def test_release_for_session_unknown_token_is_a_noop():
+    Cred, Sess, s = _sqlite_env()
+    assert slot.release_for_session(s, Cred, Sess, "does-not-exist", _NOW) is False
+
+
+def test_release_expired_slots_releases_only_past_validity_live_orphans():
+    Cred, _Sess, s = _sqlite_env()
+    s.add_all([
+        Cred(id=1, is_active=True, is_used=True, deactivate_at=_PAST, slot_released_at=None),    # orphan -> release
+        Cred(id=2, is_active=True, is_used=True, deactivate_at=_FUTURE, slot_released_at=None),  # within validity -> no
+        Cred(id=3, is_active=True, is_used=True, deactivate_at=_PAST, slot_released_at=_PAST),   # already released -> no
+        Cred(id=4, is_active=False, is_used=True, deactivate_at=_PAST, slot_released_at=None),   # revoked ('deleted') -> no
+    ])
+    s.commit()
+    assert slot.release_expired_slots(s, Cred, _NOW) == 1
+    s.commit()
+    assert s.get(Cred, 1).slot_released_at is not None
+    assert s.get(Cred, 2).slot_released_at is None
+    assert s.get(Cred, 4).slot_released_at is None
+
+
+# ---- wiring: the close hook and the reaper backstop call the shared release ----------------------
+def test_the_connection_close_hook_and_reaper_backstop_are_wired():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    sftp_src = (root / "app" / "sftp" / "sftp_server.py").read_text(encoding="utf-8")
+    api_src = (root / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    # The SFTP connection-teardown finally releases the slot on close (the primary, state-derived path).
+    assert "release_for_session(" in sftp_src
+    # The API reaper calls the deactivate_at-keyed backstop (release_expired_slots keys on validity,
+    # never on the never-updated last_activity column -- pinned by its behaviour above).
+    assert "release_expired_slots(" in api_src
+
+
+def test_all_three_per_request_gates_refuse_a_finished_credential():
+    # The web door (get_current_user), the /ws/monitor handshake, and the SFTP per-op gate each need
+    # api_server/sftp_server to import the whole app, so the wiring is pinned from source; the
+    # end-to-end refusal is exercised over HTTP + SFTP in the live lane. A finished credential is one
+    # whose slot was released on connection close.
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    api = (root / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    sftp = (root / "app" / "sftp" / "sftp_server.py").read_text(encoding="utf-8")
+    assert "temp_cred.slot_released_at is not None" in api          # web door (get_current_user)
+    assert "_WsTC.slot_released_at" in api                          # /ws/monitor handshake
+    assert 'getattr(tc, "slot_released_at", None) is not None' in sftp  # SFTP per-op gate
