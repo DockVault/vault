@@ -470,8 +470,10 @@ class AuthService:
         # limiter into an amplifier, since the per-IP argon2 budget is otherwise bounded at the IP
         # limit per window but a hash on every refused attempt is not. KNOWN-VALUE ORACLE ACCEPTED: a
         # prober who already holds a candidate name can confirm its existence by timing at the SFTP
-        # door under a primed IP (a known name reaches the verify; an unknown, once the IP bucket is
-        # tripped, refuses cheaply). Refusals stay cheap by design; the web door is uniform, and the
+        # door under a primed IP (a known name reaches the verify — ~0.16 s of Argon2 — while an
+        # unknown, once the IP bucket is tripped, refuses in milliseconds). Refusals stay cheap by
+        # design (that ~0.16 s gap is far smaller than the amplification a per-refusal hash would
+        # cost); the web door is uniform, and the
         # not-found path below still equalises the UNTHROTTLED miss.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
         if not allow_device_credential:

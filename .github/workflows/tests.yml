@@ -388,7 +388,18 @@ jobs:
           set -euo pipefail
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
-            python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage tests/test_auth_survives_cache_outage.py tests/test_auth_offload_under_outage.py --maxfail=1
+            python -m pytest tests/test_api_rate_limit_classes.py::test_general_api_classes_fail_open_during_redis_outage tests/test_auth_survives_cache_outage.py tests/test_auth_offload_under_outage.py --maxfail=1 --junitxml=outage-junit.xml
+          # Guard against a silently vacuous step: at least one non-skipped test must have run (an
+          # opt-in gate or a missing precondition skipping the lot would otherwise pass green).
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("outage-junit.xml").getroot()
+          tests = sum(int(s.get("tests", 0)) for s in root.iter("testsuite"))
+          skipped = sum(int(s.get("skipped", 0)) for s in root.iter("testsuite"))
+          print(f"outage step: {tests - skipped} ran, {skipped} skipped, {tests} collected")
+          if tests - skipped < 1:
+              sys.exit("::error::the Redis-outage step ran no non-skipped tests (vacuous)")
+          PY
           # The test unpauses the container and waits for the API to report the connection
           # back, which is not the same as docker calling it healthy again: a paused
           # container cannot answer its own healthcheck, so that verdict only clears on the
@@ -426,7 +437,20 @@ jobs:
           docker compose exec -T vault-redis redis-cli FLUSHALL
           VAULT_REDIS_OUTAGE_TEST=1 \
           VAULT_REDIS_CONTAINER=vault-redis \
-            python -m pytest tests/test_login_throttle.py tests/test_device_sync_throttle.py --maxfail=1
+            python -m pytest tests/test_login_throttle.py tests/test_device_sync_throttle.py --maxfail=1 --junitxml=throttle-junit.xml
+          # The whole point of this step is that the device-sync/login throttle tests RUN on the
+          # small-limit stack. Assert several non-skipped tests actually ran, so a guard that skipped
+          # the module (e.g. a misread login limit) cannot pass this step green.
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("throttle-junit.xml").getroot()
+          tests = sum(int(s.get("tests", 0)) for s in root.iter("testsuite"))
+          skipped = sum(int(s.get("skipped", 0)) for s in root.iter("testsuite"))
+          print(f"throttle step: {tests - skipped} ran, {skipped} skipped, {tests} collected")
+          if tests - skipped < 3:
+              sys.exit("::error::the throttle step ran fewer than 3 non-skipped tests (the throttle "
+                       "modules were skipped, not exercised)")
+          PY
 
       # A browser failure here used to leave only the accessibility dump Playwright prints, which
       # says what the page contained and not why. One such failure cost an hour of hypotheses --

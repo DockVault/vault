@@ -257,8 +257,15 @@ class SecurityMonitor:
         # Auth and general API throttling share a process-wide Redis circuit breaker.
         # Once either has observed an outage, do not repeat the same potentially slow
         # DNS/connect attempt from monitoring on the same request.
-        from app.core.rate_limiter import redis_circuit_open
-        if redis_circuit_open():
+        # Go through the read-through cache guard, exactly as _broadcast_alert does below — not just
+        # the limiter's breaker. redis_circuit_open() alone leaves a gap: it records nothing on
+        # failure, so at every cooldown boundary a request reaches incrby with a closed breaker and
+        # stalls the loop, serially. The guard's own private memory (opened in the except) skips the
+        # socket for the rest of the cooldown, so the counter pays one stall per cooldown, not one per
+        # request at the boundary. It reads the limiter's breaker but never writes it.
+        from app.services.auth_service import (
+            _cache_guard_is_open, _cache_guard_record_failure, _cache_guard_record_success)
+        if _cache_guard_is_open(time.time()):
             self._signal_detection_degraded()
             return self._count_recent_events(fallback_deque, window_seconds)
 
@@ -270,8 +277,10 @@ class SecurityMonitor:
             # over-counts events spaced wider than the window (false-positive alerts).
             if count == amount:
                 self.redis.expire(redis_key, window_seconds)
+            _cache_guard_record_success()
             return int(count)
         except Exception as e:
+            _cache_guard_record_failure(time.time())
             # redis_key embeds the raw username:ip (see _windowed_count callers), so sanitize it
             # before it reaches the log -- a CRLF-carrying username must not forge log lines here,
             # the same defence record_failed_login already applies to its own log output.

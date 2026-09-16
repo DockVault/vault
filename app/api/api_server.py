@@ -1930,13 +1930,13 @@ def _login_429_detail_and_headers(username: str, exc):
 
 
 _offloop_sem = None  # created lazily on the running loop
-# Queue-depth cap. FIRE_OFFLOOP_LIMIT bounds how many side effects run AT ONCE; this bounds how many
-# may PILE UP waiting. Headroom for queued work is therefore cap − concurrency (16 − 4 = 12 queued
-# beyond the 4 running). Only DROPPABLE side effects (the best-effort activity broadcast) are shed
-# beyond this; a durable notification and the brute-force failed-login counter are never dropped —
-# they are bounded by the slot, so their queue is bounded by the request rate, not by an attacker.
+# Queue-depth cap. FIRE_OFFLOOP_LIMIT bounds how many broadcasts run AT ONCE; this bounds how many may
+# PILE UP waiting. Headroom for queued work is therefore cap − concurrency (16 − 4 = 12 queued beyond
+# the 4 running). Everything queued here is a best-effort activity broadcast — durable side effects
+# (the notification ROW, the brute-force counter) run INLINE at their call sites, never queued — so
+# beyond this cap the broadcast is simply shed; the durable state was already committed.
 _OFFLOOP_MAX_PENDING = FIRE_OFFLOOP_LIMIT * 4
-_offloop_dropped = 0  # count of droppable side effects shed because the queue was saturated
+_offloop_dropped = 0  # count of broadcasts shed because the queue was saturated
 _offloop_last_shed_log = 0.0  # rate-limits the shed warning to at most once per minute
 
 
@@ -1990,12 +1990,13 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
 
 
 def _record_failed_login_bg(username, ip_address, reason) -> None:
-    """Record a failed login in the security monitor on its OWN short-lived DB session, so it can run
-    OFF the event loop via _fire_offloop. The monitor's Redis ops (a windowed counter and a threshold
-    publish) block a socket timeout during an outage; on the loop, in both login except branches, a
-    wrong-password or throttled spray would freeze the server one request per timeout. A worker thread
-    cannot share the request's Session, so it opens its own like _notify_users does. Best-effort:
-    monitoring must never affect the response."""
+    """Record a failed login in the security monitor on its OWN short-lived DB session. Called INLINE
+    from both login except branches: the brute-force counter must advance on every failed login, so it
+    is never queued (a shed under a broadcast spray would lose it). It stays cheap on the loop — the
+    monitor's Redis ops (a windowed counter and a threshold publish) both go through the read-through
+    cache guard, so during an outage they skip the socket rather than stall. It opens its own session
+    (not the request's) like _notify_users does. Best-effort: monitoring must never affect the
+    response."""
     try:
         from app.core.database import get_db_context
         from app.services.security_monitor import get_security_monitor
@@ -5846,11 +5847,9 @@ async def login(
     except (InvalidCredentialsError, AccountLockedError) as e:
         audit_logger.log_login_failure(login_request.username, client_ip, str(e))
         
-        # Record the failed login in the security monitor OFF the loop: its windowed counter and
-        # threshold publish touch Redis, which stalls a socket timeout during an outage, and on the
-        # loop a wrong-password spray would freeze the server one request per timeout.
         # Record INLINE (not queued): the brute-force counter must advance on every failed login, and
-        # it is breaker-aware, so it does not stall the loop during an outage.
+        # it is breaker-aware (its Redis ops go through the read-through guard), so it does not stall
+        # the loop during an outage.
         _record_failed_login_bg(login_request.username, client_ip, str(e))
 
         # A lock is only raised AFTER the password verified (verify-first ordering in
@@ -5889,8 +5888,6 @@ async def login(
             f"Rate limit exceeded: {str(e)}"
         )
         
-        # Record in the security monitor OFF the loop (same reason as the 401 branch): a throttled
-        # spray must not freeze the loop one socket timeout per attempt during a cache outage.
         # Record INLINE (not queued), same as the 401 branch — the counter must not be shed.
         _record_failed_login_bg(login_request.username, client_ip, f"Rate limit exceeded: {str(e)}")
         

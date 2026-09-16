@@ -28,8 +28,9 @@ from fastapi import HTTPException, status
 
 # Below the database pool base (10); the rest of the pool plus overflow stays free for other requests.
 AUTH_OFFLOAD_LIMIT = 8
-# How many best-effort background side effects (a broadcast, a notification, a failed-login record)
-# may run at once. A login never waits on these; beyond this they queue as background tasks.
+# How many best-effort activity broadcasts (the only thing put off the loop now — durable side
+# effects run inline at their call sites) may run at once. A login never waits on these; beyond this
+# they queue as background tasks and, past the queue cap, are shed.
 FIRE_OFFLOOP_LIMIT = 4
 
 # A DEDICATED thread pool for the offloaded auth work and the background side effects, so they do not
