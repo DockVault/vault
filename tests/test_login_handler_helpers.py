@@ -7,17 +7,24 @@ import os
 
 import pytest
 
-for _k, _v in {
-    "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
-    "REDIS_URL": "redis://localhost:6379/0",
-    "SECRET_KEY": "t" * 32,
-    "JWT_SECRET_KEY": "t" * 32,
-}.items():
-    os.environ.setdefault(_k, _v)
-
-import app.api.api_server as S
-
 pytestmark = pytest.mark.unit
+
+
+def _api():
+    """Import the API module LAZILY (inside a test), never at module scope. Importing it runs the
+    API bootstrap, which fails closed with SystemExit in a bare environment — that would abort strict
+    COLLECTION (pytest imports every test module to collect it) before any test runs. Deferring the
+    import to call time keeps collection free of the bootstrap, matching the sibling unit tests. Dummy
+    connection strings so the import that does happen at run time is side-effect-free."""
+    for _k, _v in {
+        "DATABASE_URL": "postgresql://x:x@localhost:5432/x",
+        "REDIS_URL": "redis://localhost:6379/0",
+        "SECRET_KEY": "t" * 32,
+        "JWT_SECRET_KEY": "t" * 32,
+    }.items():
+        os.environ.setdefault(_k, _v)
+    import app.api.api_server as S
+    return S
 
 
 class _Exc(Exception):
@@ -36,6 +43,7 @@ def test_a_temp_429_drops_the_ratelimit_headers_and_uses_a_generic_body():
     # A device bucket's exception would carry limit=30 and the IP leg would say "from this IP" — both
     # kind oracles. For a temp_ username neither must survive. Deleting the `if not is_temp` branch in
     # the helper (so the headers are always added) turns the header assertions red.
+    S = _api()
     exc = _Exc("Too many login attempts from this IP. Try again in 42 seconds.",
                limit=30, remaining=0, retry_after=42)
     detail, headers = S._login_429_detail_and_headers("temp_devicename", exc)
@@ -47,6 +55,7 @@ def test_a_temp_429_drops_the_ratelimit_headers_and_uses_a_generic_body():
 
 
 def test_a_human_429_keeps_its_headers_and_exact_body():
+    S = _api()
     exc = _Exc("Too many login attempts. Please try again in 42 seconds.",
                limit=5, remaining=0, retry_after=42)
     detail, headers = S._login_429_detail_and_headers("alice", exc)
@@ -63,6 +72,7 @@ def test_record_failed_login_bg_records_through_the_monitor(monkeypatch):
         def record_failed_login(self, username, ip_address, reason):
             seen.append((username, ip_address, reason))
 
+    S = _api()
     monkeypatch.setattr("app.core.database.get_db_context",
                         lambda: contextlib.nullcontext(object()))
     monkeypatch.setattr("app.services.security_monitor.get_security_monitor",
@@ -76,6 +86,7 @@ def test_login_broadcast_skips_metrics_when_include_metrics_false(monkeypatch):
     # The login broadcast passes include_metrics=False so it does not run the six COUNT queries
     # (a full file count among them) per login. Pin the metrics-free contract: get_current_metrics
     # must not be called.
+    S = _api()
     called = {"metrics": False}
 
     def _boom():
