@@ -335,6 +335,15 @@ extended support — the dates its code fixes and its (usually longer) security-
 `dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
 one, and warns before moving to a version with known unpatched vulnerabilities.
 
+When a version is not secure, the matrix can also list the specific issues behind that verdict, under
+a per-version `vulnerabilities` key: each carries a title and description, the release that fixes it
+(`fixed_in`), an optional severity/CVSS/advisory id, and the date it was published. **An issue is
+listed only once a release fixes it** — this is a public repository, so listing an unpatched
+vulnerability here would disclose it to an attacker; the validator enforces that every entry names a
+released `fixed_in`, that a secure version lists none, and that an insecure one (from 0.28.0 on) names
+what is wrong with it. `dockvault.py update` names these titles, and the release they were fixed in,
+in the warning it shows before moving to an affected version.
+
 **0.17.0 is the minimum supported version.** It seals vault names, descriptions and file checksums at
 rest in columns an older image cannot read, so there is no in-place upgrade into it from 0.16.1 and no
 in-place downgrade off it — an older image fails closed rather than serving something wrong. Reach
