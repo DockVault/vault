@@ -58,22 +58,21 @@ def redis_outage():
 def test_web_login_returns_a_token_during_a_cache_outage(admin, temp_user, redis_outage):
     """A correct password signs in during the outage — including a user who already holds a session,
     the case that stayed broken until the terminate-session cache delete became best-effort too."""
-    # 90 s, not the usual 15: during the pause each raw redis call on the login path stalls for the
-    # socket timeout before its guard continues (rate-limit read, terminate-session delete,
-    # create-session write, plus the try-wrapped monitor/activity publishes), and a CI runner pays
-    # more of them than a local box. The contract is "returns a token, not a 500" — latency during an
-    # outage is not what this test asserts, so a tight client timeout would be a false red.
+    # 30 s, brought down from 90 now the session-cache writes go through the breaker: an outage
+    # login pays about one socket stall, not one per raw call (measured ~2-4 s on a paused stack). The
+    # contract is "returns a token, not a 500"; 30 s is generous margin for a slower CI runner while
+    # still far below the pre-breaker worst case. The QA runner confirms the CI figure on the green run.
     first = ApiClient(BASE_URL)
     r1 = first.session.post(f"{BASE_URL}/auth/login",
                             json={"username": temp_user["_username"], "password": temp_user["_password"]},
-                            timeout=90)
+                            timeout=30)
     assert r1.status_code == 200 and r1.json().get("access_token"), (
         f"first login during outage returned no token: {r1.status_code} {r1.text[:200]}")
 
     second = ApiClient(BASE_URL)
     r2 = second.session.post(f"{BASE_URL}/auth/login",
                              json={"username": temp_user["_username"], "password": temp_user["_password"]},
-                             timeout=90)
+                             timeout=30)
     assert r2.status_code == 200 and r2.json().get("access_token"), (
         f"re-login for a user with an existing session failed during the outage: "
         f"{r2.status_code} {r2.text[:200]}")

@@ -161,6 +161,29 @@ def _device_mint_refusal(reason: str, http_status: int = status.HTTP_403_FORBIDD
                          detail={"reason": reason, "message": "Device sync credential was refused"})
 
 
+def _best_effort_cache(code: str, op) -> None:
+    """Run a best-effort session-cache write/delete behind the SAME process-wide breaker the rate
+    limiter uses, so during a Redis outage the auth path pays ONE socket stall per cooldown instead
+    of one per raw call.
+
+    The session cache is a convenience over the committed database rows, which are the source of
+    truth, so the op is best-effort either way. What the breaker adds: while it is open (a recent
+    Redis failure — opened here or, on the login path, by the rate-limit read that ran first) the
+    socket is skipped entirely, so a login no longer stalls once per raw call. The first real failure
+    opens it for every raw call that follows in the cooldown; a success closes it. Any error, or an
+    open breaker, is swallowed to `code` — the cache never fails the request."""
+    from app.core.rate_limiter import _cb_is_open, _cb_record_failure, _cb_record_success
+    if _cb_is_open(time.time()):
+        safe_event(code)
+        return
+    try:
+        op()
+        _cb_record_success()
+    except Exception as e:  # noqa: BLE001 — best-effort cache op; the committed DB row is authoritative
+        _cb_record_failure(time.time())
+        safe_event(code, exc=e)
+
+
 class AuthService:
     """Service for authentication operations."""
     
@@ -367,6 +390,10 @@ class AuthService:
         temp_cred = self.db.query(TemporaryCredential).filter(
             TemporaryCredential.temp_username == temp_username
         ).first()
+        # A credential carrying a device_id — LIVE OR REVOKED — is throttled in that device's bucket:
+        # a revoked device's credential is still bounded, just in its own bucket and never on the
+        # human's. Only a credential with NO device_id (hand-out, unknown, or a deleted device whose
+        # link was SET NULL) falls to the IP + username login throttle.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
         if device_id is not None:
             self._check_device_rate_limit(device_id, ip_address)
@@ -1028,10 +1055,9 @@ class AuthService:
             'deactivate_at': deactivate_at.isoformat(),
             'expires_at': expires_at.isoformat()
         })
-        try:
-            redis_client.setex(redis_key, total_lifetime * 60, redis_value)
-        except Exception as e:  # noqa: BLE001 — cache write is best-effort; the DB row is authoritative
-            safe_event('temp-cred.cache-write.skipped', exc=e)
+        _best_effort_cache(
+            'temp-cred.cache-write.skipped',
+            lambda: redis_client.setex(redis_key, total_lifetime * 60, redis_value))
         
         return {
             'id': str(temp_cred.id),
@@ -1242,10 +1268,9 @@ class AuthService:
             'deactivate_at': deactivate_at.isoformat(),
             'expires_at': expires_at.isoformat(),
         })
-        try:
-            redis_client.setex(redis_key, total_lifetime * 60, redis_value)
-        except Exception as e:  # noqa: BLE001 — best-effort cache write; the committed row is authoritative
-            safe_event('temp-cred.cache-write.skipped', exc=e)
+        _best_effort_cache(
+            'temp-cred.cache-write.skipped',
+            lambda: redis_client.setex(redis_key, total_lifetime * 60, redis_value))
 
         return {
             'id': str(temp_cred.id),
@@ -1447,10 +1472,10 @@ class AuthService:
             'session_id': str(session.id),
             'user_id': str(user.id)
         })
-        try:
-            redis_client.setex(redis_key, 1800, redis_value)  # 30 minutes
-        except Exception as e:  # noqa: BLE001 — best-effort session cache; the DB row is authoritative
-            safe_event('session.cache-write.skipped', exc=e)
+        # 30-minute session cache, best-effort behind the breaker.
+        _best_effort_cache(
+            'session.cache-write.skipped',
+            lambda: redis_client.setex(redis_key, 1800, redis_value))
         
         return session_token
     
@@ -1462,10 +1487,7 @@ class AuthService:
         # directly. Re-hashing it here would compute session:<hash-of-hash> and never delete the
         # real key, stranding the cached session until its own TTL.
         redis_key = f"session:{session.session_token}"
-        try:
-            redis_client.delete(redis_key)
-        except Exception as e:  # noqa: BLE001 — best-effort cache delete; the row flip below is what counts
-            safe_event('session.cache-delete.skipped', exc=e)
+        _best_effort_cache('session.cache-delete.skipped', lambda: redis_client.delete(redis_key))
 
         self.db.commit()
     
@@ -1547,8 +1569,11 @@ class AuthService:
             )
             if not allowed:
                 retry_after = reset - int(time.time())
+                # Same wording as the per-username login throttle: the web-login 429 handler echoes
+                # this message, and a device-specific one there would tell a prober the username is a
+                # sync credential. SFTP surfaces AUTH_FAILED uniformly, so it reveals nothing either way.
                 raise RateLimitExceededError(
-                    f"Too many sync attempts for this device. Try again in {retry_after} seconds.",
+                    f"Too many login attempts. Please try again in {retry_after} seconds.",
                     retry_after=retry_after, limit=limit, remaining=0,
                 )
             return {'limit': limit, 'remaining': remaining, 'reset': reset}
@@ -1558,7 +1583,7 @@ class AuthService:
             allowed, retry = self._db_throttle_hit(str(device_id), "device_sync", limit, window)
             if not allowed:
                 raise RateLimitExceededError(
-                    f"Too many sync attempts for this device. Try again in {retry} seconds.",
+                    f"Too many login attempts. Please try again in {retry} seconds.",
                     retry_after=retry, limit=limit, remaining=0,
                 )
             return {'limit': limit, 'remaining': max(0, limit - 1),
