@@ -1930,14 +1930,17 @@ def _login_429_detail_and_headers(username: str, exc):
 
 
 _offloop_sem = None  # created lazily on the running loop
-# Queue-depth cap: FIRE_OFFLOOP_LIMIT bounds how many side effects run AT ONCE, not how many may
-# pile up waiting. The failed-login record feeds this queue from an UNAUTHENTICATED door, so under a
-# spray the backlog could grow without bound. Beyond this many pending, shed the side effect.
+# Queue-depth cap. FIRE_OFFLOOP_LIMIT bounds how many side effects run AT ONCE; this bounds how many
+# may PILE UP waiting. Headroom for queued work is therefore cap − concurrency (16 − 4 = 12 queued
+# beyond the 4 running). Only DROPPABLE side effects (the best-effort activity broadcast) are shed
+# beyond this; a durable notification and the brute-force failed-login counter are never dropped —
+# they are bounded by the slot, so their queue is bounded by the request rate, not by an attacker.
 _OFFLOOP_MAX_PENDING = FIRE_OFFLOOP_LIMIT * 4
-_offloop_dropped = 0  # count of side effects shed because the queue was saturated (best-effort telemetry)
+_offloop_dropped = 0  # count of droppable side effects shed because the queue was saturated
+_offloop_last_shed_log = 0.0  # rate-limits the shed warning to at most once per minute
 
 
-def _fire_offloop(fn, *args, **kwargs) -> None:
+def _fire_offloop(fn, *args, droppable: bool = True, **kwargs) -> None:
     """Run a self-contained, best-effort side effect (a broadcast, a notification, a failed-login
     record) OFF the event loop, fire-and-forget, from an async handler. On the login/mint paths this
     keeps a blocking Redis publish — which on a cold breaker stalls a socket timeout before the guard
@@ -1947,23 +1950,34 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
     (broadcast_event's metrics, _notify_users, the monitor), so an unbounded fan-out could, on a busy
     host, add to the slot-held sessions and exceed the pool. A login never waits on any of this —
     beyond the bound they queue as background tasks. Runs in the dedicated offload pool, not the
-    loop's shared default executor. The callable must own its DB session and swallow its own errors."""
+    loop's shared default executor. The callable must own its DB session and swallow its own errors.
+
+    droppable=True (the default, for the activity broadcast) sheds the side effect when the queue is
+    saturated; pass droppable=False for a side effect that must not be lost — a durable notification
+    or the brute-force failed-login counter — which then only ever queues, never drops."""
     import asyncio
     import contextvars
+    import time as _t
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         # No running loop (a sync caller): just run it inline — there is no loop to protect.
         fn(*args, **kwargs)
         return
-    global _offloop_sem, _offloop_dropped
+    global _offloop_sem, _offloop_dropped, _offloop_last_shed_log
     if _offloop_sem is None:
         _offloop_sem = asyncio.Semaphore(FIRE_OFFLOOP_LIMIT)
 
-    # Shed rather than queue without bound: a login must never wait on telemetry, and under a
-    # pathological backlog the durable state is unaffected — only this best-effort nudge is lost.
-    if len(_BG_TASKS) >= _OFFLOOP_MAX_PENDING:
+    # Shed rather than queue without bound — but ONLY droppable (best-effort telemetry) side effects.
+    # A durable notification / the failed-login counter is never dropped: the durable state is what
+    # matters and it is bounded by the slot, not by an attacker's spray.
+    if droppable and len(_BG_TASKS) >= _OFFLOOP_MAX_PENDING:
         _offloop_dropped += 1
+        now = _t.time()
+        if now - _offloop_last_shed_log > 60:
+            _offloop_last_shed_log = now
+            print(f"⚠️ shedding best-effort side effects; background queue saturated "
+                  f"({_offloop_dropped} dropped so far)")
         return
 
     # Copy the caller's context: run_in_executor does not propagate contextvars (asyncio.to_thread
@@ -5818,6 +5832,7 @@ async def login(
                 title="Temporary credential signed in",
                 body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
                 target="#temp-creds",
+                droppable=False,  # a durable owner notification must not be shed
             )
         else:
             # A real account sign-in optionally emails the owner a "New sign-in alert" (opt-in; the
@@ -5838,8 +5853,9 @@ async def login(
         # Record the failed login in the security monitor OFF the loop: its windowed counter and
         # threshold publish touch Redis, which stalls a socket timeout during an outage, and on the
         # loop a wrong-password spray would freeze the server one request per timeout.
-        _fire_offloop(_record_failed_login_bg, login_request.username, client_ip, str(e))
-        
+        _fire_offloop(_record_failed_login_bg, login_request.username, client_ip, str(e),
+                      droppable=False)  # the brute-force counter must not be shed
+
         # A lock is only raised AFTER the password verified (verify-first ordering in
         # authenticate_user), so the caller has already proven they know the credential — telling
         # them the account is locked (and when it frees) reveals nothing an attacker couldn't
@@ -5879,7 +5895,7 @@ async def login(
         # Record in the security monitor OFF the loop (same reason as the 401 branch): a throttled
         # spray must not freeze the loop one socket timeout per attempt during a cache outage.
         _fire_offloop(_record_failed_login_bg, login_request.username, client_ip,
-                      f"Rate limit exceeded: {str(e)}")
+                      f"Rate limit exceeded: {str(e)}", droppable=False)  # brute-force counter, never shed
         
         detail, headers = _login_429_detail_and_headers(login_request.username, e)
         raise HTTPException(

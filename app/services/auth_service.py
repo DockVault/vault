@@ -450,24 +450,37 @@ class AuthService:
         temp_cred = self.db.query(TemporaryCredential).filter(
             TemporaryCredential.temp_username == temp_username
         ).first()
-        # Any KNOWN temp_ credential throttles in a bucket of its OWN, never the shared login:<ip>
-        # bucket, so a looping client cannot spend the human's per-IP login budget and lock the owner
-        # out. WHICH own bucket depends on the door: a device-linked credential charges its device
-        # bucket ONLY at the SFTP door (allow_device_credential); at the WEB door it is a known temp_
-        # name like any other and charges login:<temp_username>. That keeps the web door from (a)
-        # classifying a device-sync name by its higher device trip count and (b) draining the device's
-        # SFTP budget to lock the real device out — the web door can never reach the device bucket.
-        # Every other known credential (hand-out, or one whose device was DELETED and its link SET
-        # NULL) uses its per-username bucket. Only a credential the lookup does NOT find (an
-        # unknown/probed username) falls to the IP + username login throttle, so junk still lands in a
-        # bounded bucket; the dummy-verify below keeps that miss timing-identical.
+        # The throttle bucket depends on the DOOR.
+        #
+        # WEB door (allow_device_credential=False): EVERY temp_ name — known or unknown, device-linked
+        # or not — goes through the full login throttle (login:<temp_username> + login:<ip>), the
+        # uniform login path. A per-kind bucket here is a status-code oracle: a known name's own
+        # bucket never touches login:<ip>, while an unknown name's IP leg does, so priming login:<ip>
+        # then made a known name's 401 and an unknown name's 429 an existence classifier. Uniform
+        # closes it, and it still never reaches the device bucket, so a web attempt cannot drain a
+        # device's SFTP budget and every temp_ name trips at the same count.
+        #
+        # SFTP door (allow_device_credential=True): the per-kind buckets, so a looping sync client
+        # bounds only itself and never spends the owner's per-IP login budget — a device-linked
+        # credential in its device bucket, any other known credential (hand-out, or one whose device
+        # was DELETED and its link SET NULL) in its per-username bucket, and an UNKNOWN name on the IP
+        # + username login throttle. On that unknown-name IP-leg refusal, burn one dummy argon2 (as
+        # the not-found path below does) so a throttled unknown name costs the same as a known name —
+        # which runs the real verify below — closing a timing oracle for existence. Known names never
+        # consult login:<ip> here; that is the whole point.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
-        if device_id is not None and allow_device_credential:
+        if not allow_device_credential:
+            self._check_rate_limit(temp_username, ip_address)
+        elif device_id is not None:
             self._check_device_rate_limit(device_id, ip_address)
         elif temp_cred is not None:
             self._check_username_rate_limit(temp_username)
         else:
-            self._check_rate_limit(temp_username, ip_address)
+            try:
+                self._check_rate_limit(temp_username, ip_address)
+            except RateLimitExceededError:
+                verify_temporary_credential(credential, _DUMMY_PASSWORD_HASH)
+                raise
 
         if not temp_cred:
             # Equalize timing with the real verify path so an absent temp_username isn't
