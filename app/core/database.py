@@ -162,3 +162,31 @@ def check_redis_connection() -> bool:
     except Exception:
         print("Redis connection failed")
         return False
+
+
+_redis_probe_client = None
+
+
+def redis_probe_ping(timeout: float) -> None:
+    """Ping Redis on a dedicated, short-timeout connection for the rate-limiter breaker's health
+    probe. Raises on any failure.
+
+    The breaker's probe runs off the request path in a background thread and must not linger, so it
+    uses its own connection with a short connect/socket timeout rather than the main client's (whose
+    socket timeout is deliberately longer for real work). Built once from the same settings as the
+    main client; no health-check interval, since each call is a single one-shot ping."""
+    global _redis_probe_client
+    initialize_consumers()
+    if _redis_probe_client is None:
+        _redis_probe_client = redis.Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password if settings.redis_password else None,
+            decode_responses=True,
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+            socket_keepalive=True,
+            retry=Retry(NoBackoff(), 0),
+        )
+    _redis_probe_client.ping()

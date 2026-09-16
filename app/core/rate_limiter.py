@@ -22,7 +22,7 @@ from fastapi import Request, HTTPException, status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-from app.core.database import redis_client
+from app.core.database import redis_client, redis_probe_ping
 
 import logging
 
@@ -187,45 +187,106 @@ class RateLimiterUnavailable(Exception):
 
 
 # --- Redis circuit breaker -------------------------------------------------
-# Even with a short Redis connect timeout, paying it on EVERY request during a sustained
-# outage makes logins crawl — and the timeout doesn't even bound DNS resolution (a dead
-# Redis host can stall getaddrinfo for several seconds per call). After the first
-# Redis failure we OPEN the breaker and skip Redis entirely for a cooldown —
-# so the fail-closed auth path drops to its DB fallback instantly, and general (fail-open)
-# traffic isn't delayed at all. After the cooldown the next call probes Redis again
-# (half-open); a success resets, a failure re-opens. The cooldown is comfortably longer than
-# any burst of requests so the breaker stays open through an outage instead of re-probing
-# (and re-stalling) every few requests. Process-local state — fine for our single worker.
+# Paying the Redis socket timeout on EVERY request during an outage makes the whole server crawl (and
+# the timeout does not even bound DNS: a dead host can stall getaddrinfo for seconds per call). So
+# after the first failure we OPEN the breaker and skip Redis entirely: the fail-closed auth path
+# drops to its DB fallback at once, and fail-open traffic is not delayed.
+#
+# Closing it must NOT be a timer. If the breaker simply lapsed after a cooldown, the first foreground
+# caller to touch Redis afterwards -- typically RateLimitMiddleware.dispatch's synchronous check, ON
+# the event loop, on every route -- would pay the socket timeout again to rediscover an ongoing
+# outage, freezing the server for ~one timeout every cooldown, for everyone. Instead a single
+# BACKGROUND daemon thread heals the breaker: while open it waits a cooldown, pings Redis on its own
+# short-timeout connection, and closes the breaker only on success (else it stays open and tries
+# again). No foreground request ever pays the discovery stall; the server recovers while idle rather
+# than on a victim request; and a plain sleep is enough for a caller to wait the breaker out. It is a
+# thread (not an event-loop task) so the API and the SFTP process behave the same, one per process
+# (guarded by a lock), and a daemon so process shutdown never waits on it. Process-local state.
 _CB_FAIL_THRESHOLD = 1
-# Cooldown the breaker stays open before a half-open probe. Long enough to outlast any burst of
-# requests during an outage (so it stays open instead of re-probing/re-stalling every few
-# requests), short enough that rate limiting resumes quickly after Redis recovers. A half-open
-# probe may pay one resolver delay, so the breaker re-opens immediately on failure.
+# Cooldown the breaker stays open before each health probe. Long enough to outlast a burst, short
+# enough that rate limiting resumes promptly once Redis recovers.
 _CB_COOLDOWN_SECONDS = 10
+# The probe's own timeout, kept short so the background thread never lingers -- independent of the
+# main client's (longer) socket timeout for real work.
+_CB_PROBE_TIMEOUT_SECONDS = 1.0
 _cb_consecutive_failures = 0
-_cb_open_until = 0.0
+_cb_open = False                 # True while the breaker is skipping Redis
+_cb_lock = threading.Lock()      # guards the open flag, the failure count and the single probe thread
+_cb_probe_thread = None          # the one background probe thread while open, else None/dead
 
 
 def _cb_is_open(now: float) -> bool:
-    return now < _cb_open_until
+    """Whether to skip Redis right now. A pure read: the background probe, not the caller, closes the
+    breaker, so no foreground path ever touches the socket to rediscover an outage. `now` is unused
+    (kept for the existing call sites)."""
+    return _cb_open
 
 
 def redis_circuit_open() -> bool:
-    """Return whether this process recently observed a Redis backend failure."""
+    """Return whether this process is currently skipping Redis after a backend failure."""
     return _cb_is_open(time.time())
 
 
 def _cb_record_success() -> None:
-    global _cb_consecutive_failures, _cb_open_until
-    _cb_consecutive_failures = 0
-    _cb_open_until = 0.0
+    """Redis is proven healthy (a live op, or the background probe, succeeded): close the breaker."""
+    global _cb_consecutive_failures, _cb_open
+    with _cb_lock:
+        _cb_consecutive_failures = 0
+        _cb_open = False
 
 
 def _cb_record_failure(now: float) -> None:
-    global _cb_consecutive_failures, _cb_open_until
-    _cb_consecutive_failures += 1
-    if _cb_consecutive_failures >= _CB_FAIL_THRESHOLD:
-        _cb_open_until = now + _CB_COOLDOWN_SECONDS
+    """Record a Redis failure; open the breaker and start the background probe once the threshold is
+    hit. `now` is unused (the probe, not a timer, decides recovery) but kept for the call sites."""
+    global _cb_consecutive_failures, _cb_open
+    with _cb_lock:
+        _cb_consecutive_failures += 1
+        if _cb_consecutive_failures >= _CB_FAIL_THRESHOLD:
+            _cb_open = True
+            _cb_ensure_probe_locked()
+
+
+def _cb_ensure_probe_locked() -> None:
+    """Start the single background probe thread if one is not already running. The caller holds
+    ``_cb_lock``; the guard is what keeps it to one probe per process."""
+    global _cb_probe_thread
+    if _cb_probe_thread is not None and _cb_probe_thread.is_alive():
+        return
+    _cb_probe_thread = threading.Thread(target=_cb_probe_loop, name="redis-cb-probe", daemon=True)
+    _cb_probe_thread.start()
+
+
+def _cb_ping() -> None:
+    """Ping Redis on the dedicated short-timeout connection; raise on failure. A seam for tests."""
+    redis_probe_ping(_CB_PROBE_TIMEOUT_SECONDS)
+
+
+def _cb_probe_sleep(seconds: float) -> None:
+    """The probe's wait between attempts. A seam so a test can drive the loop without real time."""
+    time.sleep(seconds)
+
+
+def _cb_probe_attempt() -> bool:
+    """One probe attempt: ping Redis; on success close the breaker and return True, else return
+    False (the breaker stays open). Split out from the loop so a test can drive one attempt."""
+    try:
+        _cb_ping()
+    except Exception:
+        return False
+    _cb_record_success()
+    return True
+
+
+def _cb_probe_loop() -> None:
+    """Background: while the breaker is open, wait a cooldown then probe Redis; close on success and
+    exit, else stay open and try again. Sleeping BEFORE the probe means a breaker that a live success
+    closed during the wait exits without ever touching the socket. One per process, daemon."""
+    while _cb_open:
+        _cb_probe_sleep(_CB_COOLDOWN_SECONDS)
+        if not _cb_open:
+            return
+        if _cb_probe_attempt():
+            return
 
 
 class RateLimiter:

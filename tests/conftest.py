@@ -671,26 +671,30 @@ def configured_int_setting(name, container=None):
         return None
 
 
-def wait_out_breaker_cooldown(extra: float = 1.0) -> None:
+def wait_out_breaker_cooldown(extra: float = 2.0) -> None:
     """After a Redis outage is lifted, wait until the process-wide rate-limiter breaker is closed
     again, so the NEXT test in the SAME pytest invocation starts on the Redis path.
 
-    A test that pauses Redis opens the breaker for _CB_COOLDOWN_SECONDS from its last failed Redis
-    call; the last failure is always before the unpause, so sleeping that long after unpause
-    guarantees the breaker has cooled and the next Redis call re-probes a now-healthy Redis and
-    closes it. Without this, a following throttle test starts inside the cooldown: its first login
-    is routed to the DB fallback, which still holds the previous module's failed attempts for the
-    runner's shared IP, and the admin fixture's own login comes back 429 before the test runs.
-    Reordering modules would only move that hazard to whatever module runs next; every Redis-pausing
-    fixture calling this after it restores Redis removes it wherever the fixture is used.
+    The breaker closes when its background probe pings a healthy Redis, not on a timer: while open, a
+    daemon thread waits a cooldown, then probes. The last failed probe is before the unpause, so the
+    probe's next cycle -- at most one cooldown plus its short probe timeout away -- pings the
+    now-healthy Redis and closes the breaker, with no request needed. Sleeping cooldown + the probe
+    timeout + a margin covers that worst case. Without this, a following throttle test starts inside
+    that window: its first login is routed to the DB fallback, which still holds the previous
+    module's failed attempts for the runner's shared IP, and the admin fixture's own login comes back
+    429 before the test runs. Every Redis-pausing fixture calling this after it restores Redis removes
+    the hazard wherever the fixture is used.
 
     Uses the module-level ``time`` (not a fresh ``import time`` inside the function) so a test can
     monkeypatch ``conftest.time.sleep`` and not spend the real cooldown."""
     try:
-        from app.core.rate_limiter import _CB_COOLDOWN_SECONDS as cooldown
-    except Exception:  # noqa: BLE001 — app not importable in this lane; fall back to the known value
-        cooldown = 10
-    time.sleep(cooldown + extra)
+        from app.core.rate_limiter import (
+            _CB_COOLDOWN_SECONDS as cooldown,
+            _CB_PROBE_TIMEOUT_SECONDS as probe,
+        )
+    except Exception:  # noqa: BLE001 — app not importable in this lane; fall back to known values
+        cooldown, probe = 10, 1.0
+    time.sleep(cooldown + probe + extra)
 
 
 def skip_if_container_absent(completed, container):
