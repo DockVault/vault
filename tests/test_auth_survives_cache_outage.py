@@ -8,6 +8,7 @@ a committed credential nobody received counting against the caps. The throttle R
 NOT covered by this: they have no database fallback, and quietly continuing past them would turn a
 brute-force bound fail-open for the length of any outage — so they 500 (fail-closed), which is right.
 """
+import os
 import time
 
 import pytest
@@ -16,7 +17,19 @@ from conftest import ApiClient, BASE_URL, unique
 from _device_boundary_helpers import (REDIS_CONTAINER, cred_row, docker, grant,
                                       mint_sync_cred, register_device, sftp_authenticates)
 
-pytestmark = pytest.mark.integration
+# Opt-in, exactly like the repo's other Redis-pausing tests (test_login_throttle.py,
+# test_api_rate_limit_classes.py): pausing the shared Redis mid-suite would, after unpause, leave
+# the rate limiter's circuit breaker open for its cooldown, during which any throttle-shaped test
+# reads differently — a red release build on a correct change. This module runs only in the
+# dedicated outage CI step, which pauses and then waits for the container to be healthy again.
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
+        reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the session-cache-outage tests "
+               "(they pause/unpause the Redis container via docker)",
+    ),
+]
 
 
 @pytest.fixture
@@ -32,7 +45,14 @@ def redis_outage():
         yield
     finally:
         docker("unpause", REDIS_CONTAINER)
-        time.sleep(2)
+        # Leave Redis the way we found it: a paused container cannot answer its own healthcheck, so
+        # wait for the next successful probe rather than a fixed sleep — a following step declared
+        # `condition: service_healthy` on redis fails while the verdict is stale. Mirrors the CI loop.
+        for _ in range(30):
+            status = docker("inspect", "--format", "{{.State.Health.Status}}", REDIS_CONTAINER)
+            if status.returncode == 0 and status.stdout.strip() == "healthy":
+                break
+            time.sleep(2)
 
 
 def test_web_login_returns_a_token_during_a_cache_outage(admin, temp_user, redis_outage):
@@ -72,9 +92,8 @@ def test_a_valid_sftp_credential_is_not_burned_during_a_cache_outage(admin, redi
 def test_mints_during_a_cache_outage_do_not_500_or_orphan(admin, temp_vault, redis_outage):
     """Both mint doors return a typed, usable credential during the outage — not a 500 that commits a
     row nobody receives, which counts against the caps until the cache recovers."""
-    before = len(admin.get("/temp-creds/list").json())
-
-    interactive = admin.post("/auth/temp-credentials", json={"note": unique("outage")})
+    note = unique("outage")
+    interactive = admin.post("/auth/temp-credentials", json={"note": note})
     assert interactive.status_code in (200, 201), (
         f"interactive mint failed during the outage: {interactive.status_code} {interactive.text[:200]}")
     assert interactive.json().get("credential"), "interactive mint returned no usable credential"
@@ -86,9 +105,20 @@ def test_mints_during_a_cache_outage_do_not_500_or_orphan(admin, temp_vault, red
         assert minted.status_code in (200, 201), (
             f"device mint failed during the outage: {minted.status_code} {minted.text[:200]}")
         assert minted.json().get("credential"), "device mint returned no usable credential"
+        device_username = minted.json()["temp_username"]
 
-        after = len(admin.get("/temp-creds/list").json())
-        assert after == before + 2, (
-            f"credential rows grew by {after - before}, not the 2 successful mints — orphans committed")
+        # Order-proof, and still an orphan net: /temp-creds/list is deployment-wide for an admin, so
+        # a bare before/after count flips under any concurrent mint. Filter to THIS test's own rows
+        # instead — the interactive mint by its unique note, the device mint by the exact username it
+        # returned (the list does not expose a device id at this version) — and assert exactly
+        # one of each, not is_used. A failed mint that committed an orphan while returning non-500
+        # would leave a SECOND row under the same note, so the "exactly one" still catches it.
+        rows = admin.get("/temp-creds/list").json()
+        by_note = [r for r in rows if r.get("note") == note]
+        assert len(by_note) == 1 and by_note[0]["is_used"] is False, (
+            f"interactive mint left {len(by_note)} rows under its note — orphan committed: {by_note}")
+        by_user = [r for r in rows if r.get("temp_username") == device_username]
+        assert len(by_user) == 1 and by_user[0]["is_used"] is False, (
+            f"device mint's returned credential is not a single usable row: {by_user}")
     finally:
         admin.delete(f"/devices/{dev['device_id']}")
