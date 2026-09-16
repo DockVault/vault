@@ -130,18 +130,12 @@ def test_share_notification_deduped_per_recipient(admin, temp_user, temp_user_cl
 
 
 def test_temp_login_notifies_owner(admin):
-    import time as _t
     before = admin.get("/notifications/unread-count").json()["count"]
     tc = admin.post("/auth/temp-credentials", json={"validity_minutes": 30}).json()
     ApiClient().login(tc["temp_username"], tc["credential"])
-    # The owner notification is written OFF the request path now (fire-and-forget), so it may not be
-    # visible on the very next call — poll briefly instead of reading once.
-    after = before
-    for _ in range(50):
-        after = admin.get("/notifications/unread-count").json()["count"]
-        if after > before:
-            break
-        _t.sleep(0.1)
+    # The owner notification ROW is written INLINE within the login response (only the live WS nudge
+    # is off-loop), so it is visible on the very first read — no poll.
+    after = admin.get("/notifications/unread-count").json()["count"]
     assert after > before, "the owner should be notified when their temp credential signs in"
     assert "temp_login" in {n["type"] for n in _notifs(admin)["notifications"]}
 

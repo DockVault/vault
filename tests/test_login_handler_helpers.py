@@ -1,4 +1,4 @@
-"""Unit pins for the login handler's helpers: the 429 body/header shaping, the off-loop failed-login
+"""Unit pins for the login handler's helpers: the 429 body/header shaping, the inline failed-login
 record, and the metrics-free login broadcast. These are the handler-level guarantees the general
 rate-limit middleware would mask on the wire (it re-stamps X-RateLimit-*), so they are pinned here.
 """
@@ -54,23 +54,30 @@ def test_a_temp_429_drops_the_ratelimit_headers_and_uses_a_generic_body():
     assert detail == "Too many login attempts. Please try again in 42 seconds."
 
 
-def test_a_human_429_keeps_its_headers_and_exact_body():
+@pytest.mark.parametrize("remaining", [0, 3])
+def test_a_human_429_keeps_its_headers_and_exact_body(remaining):
     S = _api()
     exc = _Exc("Too many login attempts. Please try again in 42 seconds.",
-               limit=5, remaining=0, retry_after=42)  # a 429 leaves 0 remaining
+               limit=5, remaining=remaining, retry_after=42)
     detail, headers = S._login_429_detail_and_headers("alice", exc)
     assert headers.get("X-RateLimit-Limit") == "5"
-    assert headers.get("X-RateLimit-Remaining") == "0"  # the human keeps ALL its rate-limit headers
+    # The human keeps ALL its rate-limit headers, whatever the remaining count — including 0, where a
+    # `hasattr`/`if exc.remaining` guard would wrongly drop the header.
+    assert headers.get("X-RateLimit-Remaining") == str(remaining)
     assert headers.get("Retry-After") == "42"
     assert detail == "Too many login attempts. Please try again in 42 seconds."
 
 
-def test_the_failed_login_record_runs_inline_not_through_the_droppable_queue():
-    # T4: the brute-force failed-login counter must advance on EVERY failed login, so it runs inline
-    # in both except branches, never through _fire_offloop (whose queue sheds under saturation). This
-    # is the regression guard the reviewer asked for: if the record is ever put back on the queue it
-    # can be dropped by a broadcast spray. Reads the handler source (a workflow-contract pin like
-    # test_infra_hardening's), since the async handler cannot be driven without a live DB here.
+def test_the_failed_login_record_is_wired_inline_not_through_the_droppable_queue():
+    """WIRING PIN (source), not a behavioural test. The reviewer asked for a handler-in-process test
+    (TestClient, get_db overridden, authenticate_user patched, the queue filled, a wrong password
+    posted, the recorder asserted to fire synchronously). This suite has no such harness: it drives a
+    live server over HTTP with `requests`, and httpx/TestClient is not a test dependency (no in-process
+    ASGI transport). So this pins the WIRING from the handler source instead — the brute-force counter
+    must be called inline, never queued through _fire_offloop (whose queue sheds under saturation),
+    which is the "red if it ever goes back through the queue" guard. The behavioural saturation form —
+    fill the queue, fail a login, assert the monitor recorded before the response — is verified
+    against a running stack instead."""
     import pathlib
     src = pathlib.Path("app/api/api_server.py").read_text(encoding="utf-8")
     assert "_fire_offloop(_record_failed_login_bg" not in src, (
@@ -92,7 +99,7 @@ def test_a_temp_429_with_no_retry_after_uses_the_generic_no_countdown_body():
 
 
 def test_record_failed_login_bg_records_through_the_monitor(monkeypatch):
-    # The off-loop failed-login helper must open its own session and record via the monitor. If it
+    # The inline failed-login helper must open its own session and record via the monitor. If it
     # silently dropped the event this stays empty — red.
     seen = []
 

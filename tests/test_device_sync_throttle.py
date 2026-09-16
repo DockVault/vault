@@ -94,9 +94,14 @@ def _flood_device_at_sftp(admin, dev, temp_vault, n_attempts):
     web door now routes every temp_ name through the uniform login throttle, so a device loop's effect
     on the device bucket is only observable here."""
     names = _mint_many(admin, dev, temp_vault, n_attempts)
-    assert names, "could not mint any credential for the device"
+    # At least two distinct usernames, so the flood is real device-bucket traffic across credentials,
+    # not one username's own state.
+    assert len(names) >= 2, f"expected at least 2 device credentials for the flood, got {len(names)}"
     for i in range(n_attempts):
-        sftp_authenticates(names[i % len(names)], _NEVER_VALID)
+        # Wrong password: every attempt must FAIL auth (and charge the device bucket before the
+        # verify). A True here would mean the credential authenticated, so the flood is not doing what
+        # it claims.
+        assert sftp_authenticates(names[i % len(names)], _NEVER_VALID) is False
     return names
 
 
