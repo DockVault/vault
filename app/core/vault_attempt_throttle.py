@@ -12,6 +12,12 @@ and an increment-only BURN (``burn``) -- only a wrong attempt burns, exactly as 
 The three call sites (the vault-access gate, the device-grant proof, the temp-credential mint proof)
 share this one helper. It reads the shared guard but, like every read-through consumer, records a
 failure only to the guard's PRIVATE memory, never the limiter's breaker.
+
+The Redis counter and the RateLimitRecord DB counter are SEPARATE stores with independent windows, so
+across an outage transition (a live Redis count, then the breaker opens and counting moves to the DB)
+a guesser can accumulate up to roughly 2x the limit before being refused -- the same bound the login
+throttle accepts for the same reason. The window is short and the DB account/vault backstops remain,
+so this is an accepted degradation, not a bypass.
 """
 import time
 import uuid

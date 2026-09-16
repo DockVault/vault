@@ -62,8 +62,8 @@ def test_publiclink_lockout_and_grant_fail_closed_off_the_socket_while_open(_ope
     assert S._publiclink_record_fail("h") == S._PUBLINK_FAIL_MAX
     S._publiclink_clear_fails("h")
     with pytest.raises(RuntimeError):
-        S._publiclink_issue_grant("lid", "1.2.3.4")     # a grant that can't be stored is never issued
-    assert S._publiclink_consume_grant("g", "lid", "1.2.3.4") is False   # uniform 404
+        S._publiclink_issue_grant("lid", "192.0.2.10")     # a grant that can't be stored is never issued
+    assert S._publiclink_consume_grant("g", "lid", "192.0.2.10") is False   # uniform 404
     assert _open_breaker_with_a_tripwire_redis.calls == []
 
 
