@@ -17,6 +17,7 @@ from sqlalchemy import func, and_, or_
 from pydantic import BaseModel, EmailStr, Field
 
 from app.core.database import get_db
+from app.core.auth_offload import auth_offload_slot, run_offloaded
 from app.core.email_identity import email_in_use, normalize_email
 from app.core.models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from app.services.auth_service import AuthService
@@ -754,6 +755,10 @@ async def list_user_temp_credentials(
 async def create_temp_credential_for_user(
     user_id: uuid.UUID,
     request_data: TempCredentialCreateRequest,
+    # Declared BEFORE the admin resolver and get_db so the concurrency slot is held before any
+    # database connection is checked out — this mint runs the same blocking credential generation as
+    # its three sibling routes, so it takes a slot and runs off the loop too.
+    _offload_slot: None = Depends(auth_offload_slot),
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
@@ -787,9 +792,9 @@ async def create_temp_credential_for_user(
             detail=("This user owns or is a member of zero-knowledge vaults, which organization policy "
                     "forbids in a temporary credential. Ask them to mint a scoped credential for themselves."))
 
-    # Create the temp credential
+    # Create the temp credential OFF the loop (bounded by the slot held above), like the sibling mints.
     auth_service = AuthService(db)
-    result = auth_service.create_temporary_credential(user_id)
+    result = await run_offloaded(auth_service.create_temporary_credential, user_id)
     
     # Log the action
     audit_logger = AuditLogger(db)

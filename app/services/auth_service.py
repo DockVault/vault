@@ -88,17 +88,24 @@ def user_reaches_active_zk_vault(db, user_id) -> bool:
 # request (which would also enforce single-session-per-user — a separate, opt-in concern).
 # The token is stored hashed so a Redis read can't recover a live token.
 def denylist_token(session_token: str, ttl_seconds: int) -> None:
-    """Revoke a session token for the remainder of its lifetime (best-effort)."""
+    """Revoke a session token for the remainder of its lifetime (best-effort).
+
+    Behind the read-through cache guard, like is_token_denylisted: while the guard is open skip the
+    socket instead of stalling a timeout on the logout path during an outage (the JWT still expires
+    on its own). Reads the limiter's breaker, never writes it."""
     if not session_token:
         return
+    if _cache_guard_is_open(time.time()):
+        return  # guard open: skip the stall; the JWT still expires on its own
     try:
         redis_client.setex(
             f"denylist:session:{hash_session_token(session_token)}",
             max(1, int(ttl_seconds)),
             "1",
         )
+        _cache_guard_record_success()
     except Exception:
-        pass  # best-effort: the JWT still expires on its own
+        _cache_guard_record_failure(time.time())  # best-effort: the JWT still expires on its own
 
 
 def is_token_denylisted(session_token: str) -> bool:

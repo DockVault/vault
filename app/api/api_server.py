@@ -38,7 +38,8 @@ from app.core.config import bootstrap_entrypoint
 bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, check_redis_connection
-from app.core.auth_offload import auth_offload_slot, run_offloaded
+from app.core.auth_offload import (
+    auth_offload_slot, run_offloaded, FIRE_OFFLOOP_LIMIT, _offload_executor)
 from app.core.chunk_cleanup import fail_chunk_session
 from app.core.session_hash_utils import hash_session_token
 from app.core.models import User, RoleEnum, PermissionEnum, VaultPermissionEnum, Vault, File, Folder, Group, user_groups, ChunkedUploadSession, UserPreference, ShareTag, Share, ShareClaim, RetiredObjectId, VaultStorageGrant, SchemaStep, NoteLinkTag, NoteLink, PublicLink, ReceiverTag, Receiver, ReceiverUploadSession, SecondFactorEnrollment, SecondFactorRecoveryCode, SecondFactorAction, PendingLogin
@@ -1879,22 +1880,54 @@ def _guarded_publish(channel: str, message: str) -> bool:
         raise
 
 
+_offloop_sem = None  # created lazily on the running loop
+
+
 def _fire_offloop(fn, *args, **kwargs) -> None:
-    """Run a self-contained, best-effort side effect (a broadcast, a notification) OFF the event loop,
-    fire-and-forget, from an async handler. On the login/mint paths this keeps a blocking Redis
-    publish — which on a cold breaker stalls a full socket timeout before the guard is open — from
-    freezing the loop and every request racing it. The callable must own its own DB session (both
-    broadcast_event and _notify_users do) and swallow its own errors; nothing here awaits the result,
-    so the handler returns without waiting on the side effect."""
+    """Run a self-contained, best-effort side effect (a broadcast, a notification, a failed-login
+    record) OFF the event loop, fire-and-forget, from an async handler. On the login/mint paths this
+    keeps a blocking Redis publish — which on a cold breaker stalls a socket timeout before the guard
+    is open — from freezing the loop and every request racing it.
+
+    Bounded to FIRE_OFFLOOP_LIMIT concurrent side effects: each opens its OWN pooled DB session
+    (broadcast_event's metrics, _notify_users, the monitor), so an unbounded fan-out could, on a busy
+    host, add to the slot-held sessions and exceed the pool. A login never waits on any of this —
+    beyond the bound they queue as background tasks. Runs in the dedicated offload pool, not the
+    loop's shared default executor. The callable must own its DB session and swallow its own errors."""
     import asyncio
     try:
-        task = asyncio.create_task(asyncio.to_thread(lambda: fn(*args, **kwargs)))
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         # No running loop (a sync caller): just run it inline — there is no loop to protect.
         fn(*args, **kwargs)
         return
+    global _offloop_sem
+    if _offloop_sem is None:
+        _offloop_sem = asyncio.Semaphore(FIRE_OFFLOOP_LIMIT)
+
+    async def _runner():
+        async with _offloop_sem:
+            await loop.run_in_executor(_offload_executor, lambda: fn(*args, **kwargs))
+
+    task = asyncio.create_task(_runner())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+
+
+def _record_failed_login_bg(username, ip_address, reason) -> None:
+    """Record a failed login in the security monitor on its OWN short-lived DB session, so it can run
+    OFF the event loop via _fire_offloop. The monitor's Redis ops (a windowed counter and a threshold
+    publish) block a socket timeout during an outage; on the loop, in both login except branches, a
+    wrong-password or throttled spray would freeze the server one request per timeout. A worker thread
+    cannot share the request's Session, so it opens its own like _notify_users does. Best-effort:
+    monitoring must never affect the response."""
+    try:
+        from app.core.database import get_db_context
+        from app.services.security_monitor import get_security_monitor
+        with get_db_context() as bg_db:
+            get_security_monitor(bg_db).record_failed_login(username, ip_address, reason)
+    except Exception as e:  # noqa: BLE001 — best-effort threat telemetry; never fails the response
+        print(f"Warning: Failed to record security event: {e}")
 
 
 def _vault_activity_fields(vault=None, current_user=None) -> dict:
@@ -5704,8 +5737,9 @@ async def login(
             login_event["owner_user_id"] = str(user.id)
         # OFF the event loop: during a Redis outage this publish stalls a socket timeout on a cold
         # breaker, and on the loop that freezes every concurrent request. Fire-and-forget — a login
-        # must not wait on its own telemetry.
-        _fire_offloop(broadcast_event, {"event": login_event})
+        # must not wait on its own telemetry. include_metrics=False: a login event does not need the
+        # six COUNT queries (a full count(File.id) among them) that metrics enrichment runs.
+        _fire_offloop(broadcast_event, {"event": login_event}, include_metrics=False)
 
         # Persist the owner-facing "your temporary credential just signed in" as an in-app
         # notification too (the WS toast is transient; this is the durable bell/history record). No
@@ -5736,14 +5770,10 @@ async def login(
     except (InvalidCredentialsError, AccountLockedError) as e:
         audit_logger.log_login_failure(login_request.username, client_ip, str(e))
         
-        # Record failed login in security monitor for threat detection
-        try:
-            from app.services.security_monitor import get_security_monitor
-            monitor = get_security_monitor(db)
-            monitor.record_failed_login(login_request.username, client_ip, str(e))
-        except Exception as monitor_error:
-            # Don't fail the response if monitoring fails
-            print(f"Warning: Failed to record security event: {monitor_error}")
+        # Record the failed login in the security monitor OFF the loop: its windowed counter and
+        # threshold publish touch Redis, which stalls a socket timeout during an outage, and on the
+        # loop a wrong-password spray would freeze the server one request per timeout.
+        _fire_offloop(_record_failed_login_bg, login_request.username, client_ip, str(e))
         
         # A lock is only raised AFTER the password verified (verify-first ordering in
         # authenticate_user), so the caller has already proven they know the credential — telling
@@ -5781,13 +5811,10 @@ async def login(
             f"Rate limit exceeded: {str(e)}"
         )
         
-        # Record in security monitor
-        try:
-            from app.services.security_monitor import get_security_monitor
-            monitor = get_security_monitor(db)
-            monitor.record_failed_login(login_request.username, client_ip, f"Rate limit exceeded: {str(e)}")
-        except Exception as monitor_error:
-            print(f"Warning: Failed to record security event: {monitor_error}")
+        # Record in the security monitor OFF the loop (same reason as the 401 branch): a throttled
+        # spray must not freeze the loop one socket timeout per attempt during a cache outage.
+        _fire_offloop(_record_failed_login_bg, login_request.username, client_ip,
+                      f"Rate limit exceeded: {str(e)}")
         
         # Add rate-limit headers to the 429. For a temp_ credential at the web door emit ONLY
         # Retry-After and DROP X-RateLimit-Limit / X-RateLimit-Remaining: the limit VALUE is a kind
@@ -5797,7 +5824,8 @@ async def login(
         # two headers makes the whole 429 identical across temp_ kinds. The human password login is
         # unaffected and keeps its headers.
         headers = {}
-        if not login_request.username.startswith("temp_"):
+        is_temp_username = login_request.username.startswith("temp_")
+        if not is_temp_username:
             if hasattr(e, 'limit') and e.limit:
                 headers["X-RateLimit-Limit"] = str(e.limit)
             if hasattr(e, 'remaining'):
@@ -5805,9 +5833,21 @@ async def login(
         if hasattr(e, 'retry_after') and e.retry_after:
             headers["Retry-After"] = str(e.retry_after)
 
+        # Body must not reveal WHICH bucket raised for a temp_ username. A known credential's buckets
+        # only ever say "Too many login attempts…", but an unknown temp_ name falls to the IP leg
+        # whose message says "…from this IP…" — a one-request kind/existence classifier. Emit one
+        # generic detail for every temp_ username regardless of the bucket; the human keeps the exact
+        # message. Retry-After carries the countdown either way.
+        if is_temp_username:
+            retry = getattr(e, 'retry_after', None)
+            detail = ("Too many login attempts. Please try again in "
+                      f"{retry} seconds." if retry else "Too many login attempts. Please try again later.")
+        else:
+            detail = str(e)
+
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(e),
+            detail=detail,
             headers=headers
         )
 
@@ -6221,7 +6261,7 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
         count += 1
         try:
-            _guarded_publish('session_terminations', json.dumps({
+            redis_client.publish('session_terminations', json.dumps({
                 'session_token': s.session_token,
                 'session_id': str(s.id),
                 'terminated_by': actor_username,
@@ -6911,7 +6951,7 @@ async def terminate_temp_credential_sessions(
         
         # Publish termination signal to Redis for SFTP server to close transport
         try:
-            _guarded_publish('session_terminations', json.dumps({
+            redis_client.publish('session_terminations', json.dumps({
                 'session_token': session.session_token,
                 'session_id': str(session.id),
                 'temp_username': temp_username,

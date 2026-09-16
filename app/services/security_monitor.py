@@ -609,7 +609,19 @@ class SecurityMonitor:
                 'details': alert.details
             }
             
-            self.redis.publish('security_alerts', json.dumps(alert_data))
+            # Behind the read-through cache guard, like the counter above: skip the socket when the
+            # guard is open, and record the outcome to the shared private memory. Reads the limiter's
+            # breaker, never writes it.
+            from app.services.auth_service import (
+                _cache_guard_is_open, _cache_guard_record_failure, _cache_guard_record_success)
+            if _cache_guard_is_open(time.time()):
+                return
+            try:
+                self.redis.publish('security_alerts', json.dumps(alert_data))
+                _cache_guard_record_success()
+            except Exception:
+                _cache_guard_record_failure(time.time())
+                raise
         except Exception as e:
             logger.error(f"Failed to broadcast security alert: {e}")
     

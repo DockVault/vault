@@ -18,20 +18,54 @@ is what bounds these routes. This pairs with the session-cache circuit breaker r
 it: the breaker bounds each stall, the slot bounds how many requests run at once.
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi import HTTPException, status
 
 # Below the database pool base (10); the rest of the pool plus overflow stays free for other requests.
 AUTH_OFFLOAD_LIMIT = 8
+# How many best-effort background side effects (a broadcast, a notification, a failed-login record)
+# may run at once. A login never waits on these; beyond this they queue as background tasks.
+FIRE_OFFLOOP_LIMIT = 4
+
+# A DEDICATED thread pool for the offloaded auth work and the background side effects, so they do not
+# share the event loop's default executor with the /ws/monitor pub/sub poller (which parks ~a whole
+# worker per open browser). Sized to the slot count plus the side-effect bound, so the SLOT — not an
+# incidentally-starved executor — is what bounds the offloaded routes, as the module contract says.
+_offload_executor = ThreadPoolExecutor(
+    max_workers=AUTH_OFFLOAD_LIMIT + FIRE_OFFLOOP_LIMIT, thread_name_prefix="auth-offload")
+# The longest a request waits for a slot before shedding load with 503 + Retry-After. During a cache
+# outage each held slot lasts about one socket timeout, so the queue drains steadily and a normal
+# request never waits this long; the cap only bites under a pathological pileup, bounding the waiters
+# a fail-open outage would otherwise let grow without limit (a slow-drain queue is a memory sink and
+# serves nobody once the wait exceeds any client's own timeout).
+SLOT_ACQUIRE_TIMEOUT_SECONDS = 15.0
+_SLOT_RETRY_AFTER_SECONDS = 5
 _auth_slots = asyncio.Semaphore(AUTH_OFFLOAD_LIMIT)
 
 
 async def auth_offload_slot():
     """FastAPI dependency: hold one bounded slot for the whole request. Declare it FIRST on an
-    offloaded route so the slot is held before any database connection is checked out."""
-    async with _auth_slots:
+    offloaded route so the slot is held before any database connection is checked out. Waits at most
+    SLOT_ACQUIRE_TIMEOUT_SECONDS for a slot, then sheds load with 503 + Retry-After rather than let
+    waiters queue without bound during a fail-open outage."""
+    try:
+        await asyncio.wait_for(_auth_slots.acquire(), timeout=SLOT_ACQUIRE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The server is busy; please retry shortly.",
+            headers={"Retry-After": str(_SLOT_RETRY_AFTER_SECONDS)},
+        )
+    try:
         yield
+    finally:
+        _auth_slots.release()
 
 
 async def run_offloaded(fn, *args, **kwargs):
-    """Run ``fn(*args, **kwargs)`` in a worker thread. Concurrency is bounded by the
-    ``auth_offload_slot`` dependency the route holds, not here."""
-    return await asyncio.to_thread(lambda: fn(*args, **kwargs))
+    """Run ``fn(*args, **kwargs)`` in the dedicated offload thread pool. Concurrency is bounded by the
+    ``auth_offload_slot`` dependency the route holds, not here; the dedicated pool keeps that true by
+    not sharing the default executor with the WebSocket poller."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_offload_executor, lambda: fn(*args, **kwargs))
