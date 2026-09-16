@@ -27,9 +27,9 @@ def test_every_redis_pausing_file_waits_out_the_breaker_cooldown():
     tests_dir = pathlib.Path(__file__).parent
     this_file = pathlib.Path(__file__).name
     offenders = []
-    # Scan EVERY .py under tests/ (test modules, conftest, and any helper module), so a pause site in
-    # a file the globs above would have missed cannot slip through.
-    for path in sorted(tests_dir.glob("*.py")):
+    # Scan EVERY .py under tests/ RECURSIVELY (test modules, conftest, helper modules, any subdir),
+    # so a pause site the non-recursive globs would have missed cannot slip through.
+    for path in sorted(tests_dir.rglob("*.py")):
         if path.name == this_file:
             continue
         src = path.read_text(encoding="utf-8")

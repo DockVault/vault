@@ -36,6 +36,12 @@ pytestmark = pytest.mark.unit
 
 _probe = contextvars.ContextVar("offload_probe", default="unset")
 
+# Captured at import, BEFORE the autouse fixture or _fresh_slots() can rebind ao._auth_slots: the
+# SHIPPED semaphore's initial count, i.e. the real bound the routes run under. The concurrency test
+# rebinds the semaphore to dodge cross-loop binding, so on its own it proves only the CAP mechanism,
+# not the shipped value — a shipped Semaphore(200) with the constant left at 8 would pass it.
+_SHIPPED_SLOT_INITIAL = ao._auth_slots._value
+
 
 @pytest.fixture(autouse=True)
 def _restore_offload_globals():
@@ -202,6 +208,15 @@ def test_run_offloaded_keeps_the_loop_free_under_a_blocking_burst():
     assert advanced >= 15, (
         f"the loop ticked only {advanced} times during an offloaded blocking burst — it was frozen, "
         f"so run_offloaded did not move the blocking work off the loop")
+
+
+def test_the_shipped_slot_semaphore_is_sized_to_the_limit():
+    # Pin the SHIPPED bound, not the rebound one the concurrency test uses. The module's own semaphore,
+    # as created at import, must start at AUTH_OFFLOAD_LIMIT. A shipped Semaphore(200) with the
+    # constant left at 8 reddens here even though the rebound-semaphore concurrency test stays green.
+    assert _SHIPPED_SLOT_INITIAL == AUTH_OFFLOAD_LIMIT, (
+        f"the shipped auth-offload semaphore starts at {_SHIPPED_SLOT_INITIAL}, not AUTH_OFFLOAD_LIMIT "
+        f"({AUTH_OFFLOAD_LIMIT}) — the routes run under a different bound than the unit test proves")
 
 
 def test_the_shed_constants_are_the_shipped_values():

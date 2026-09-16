@@ -104,29 +104,8 @@ def test_the_sftp_door_known_credential_without_a_device_routes_to_its_username_
 
 
 def test_the_sftp_door_unknown_name_routes_to_the_ip_and_username_throttle():
+    # An SFTP-door unknown name still hits the IP + username login throttle. A throttled refusal here
+    # stays CHEAP (no verify): burning a dummy hash would invert the gap once a known name's own
+    # bucket trips and would turn the limiter into an argon2 amplifier. The known-value timing oracle
+    # under a primed IP is an accepted residual (see the contract comment).
     assert _route_for(None, allow_device_credential=True) == "ip"
-
-
-def test_a_throttled_unknown_name_at_the_sftp_door_burns_a_dummy_verify(monkeypatch):
-    # R: at the SFTP door an UNKNOWN name refused on the IP leg must still cost one argon2 verify, so
-    # its timing matches a KNOWN name (which runs the real verify). Without the burn, a throttled
-    # unknown refuses before any verify and is faster — an existence timing oracle. Removing the
-    # dummy verify on the throttle-refusal path leaves `burned` empty — red.
-    from app.services.auth_service import RateLimitExceededError
-
-    svc = AuthService.__new__(AuthService)
-    svc.db = _FakeDB(None)  # unknown name
-
-    def _ip_leg_refuses(*a, **k):
-        raise RateLimitExceededError("Too many login attempts from this IP.", retry_after=1,
-                                     limit=10, remaining=0)
-
-    svc._check_rate_limit = _ip_leg_refuses
-    burned = []
-    monkeypatch.setattr(A, "verify_temporary_credential",
-                        lambda *a, **k: (burned.append(1), False)[1])
-
-    with pytest.raises(RateLimitExceededError):
-        svc.authenticate_temporary_credential("temp_ghost", "cred", "203.0.113.9",
-                                              allow_device_credential=True)
-    assert burned == [1], "the throttled-unknown SFTP path did not burn a dummy verify"

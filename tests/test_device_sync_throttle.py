@@ -87,65 +87,52 @@ def _mint_many(admin, dev, temp_vault, n):
     return names
 
 
-def _attempt_from_device(admin, dev, temp_vault, n_attempts):
-    """Make n_attempts web-login attempts with the device's credentials, counting ATTEMPTS not mints.
-
-    The device bucket is charged on EVERY attempt (success or failure), so once the per-device
-    credential cap (shipped default 10, not raised in CI) refuses more mints we keep attempting with
-    already-minted usernames — the 11th attempt does not need an 11th mint. Distinct usernames are
-    used as far as the cap allows, so on the reverted code each attempt lands a fresh charge on the
-    shared IP bucket before any single username's own bucket trips. Returns the usernames minted."""
+def _flood_device_at_sftp(admin, dev, temp_vault, n_attempts):
+    """Fill a device's SFTP throttle bucket with n wrong-password SFTP attempts, cycling the device's
+    own credential names (within the per-device mint cap). Each fails auth but charges the device
+    bucket before the verify. The SFTP door is where a device credential spends its device bucket; the
+    web door now routes every temp_ name through the uniform login throttle, so a device loop's effect
+    on the device bucket is only observable here."""
     names = _mint_many(admin, dev, temp_vault, n_attempts)
-    # At least two distinct usernames, so on the reverted code the shared IP bucket really fills from
-    # distinct-username charges rather than one username's own bucket tripping first and masking it.
-    assert len(names) >= 2, f"expected at least 2 device credentials for the burst, got {len(names)}"
+    assert names, "could not mint any credential for the device"
     for i in range(n_attempts):
-        r = _login_attempt(names[i % len(names)], _NEVER_VALID)
-        assert r.status_code in (401, 429), r.text
+        sftp_authenticates(names[i % len(names)], _NEVER_VALID)
     return names
 
 
 def test_a_looping_device_does_not_lock_out_the_human_web_login(admin, temp_vault):
-    """(a) A device's sync auths — across DISTINCT single-use credentials, as a real run mints them —
-    must not exhaust the human's shared per-IP login bucket. Distinct usernames are the point: each
-    has its own login-username bucket, so on the pre-fix code nothing shields the shared IP bucket
-    from filling, and the human is locked out. On the fixed code every one is charged to the device's
-    own bucket instead, so the IP bucket is untouched."""
+    """(a) A device's sync loop at the SFTP door spends its OWN device bucket, never the human's
+    shared per-IP login bucket, so it cannot lock the operator out of the web UI. On the reverted code
+    — the device throttle keyed by IP, the original defect — device A's loop fills login:<ip> and the
+    human's fresh web login comes back 429."""
+    device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
     dev = _register_granted_device(admin, temp_vault)
-    # Make _IP_THRESHOLD device attempts. On the reverted code each charges login:<ip> once, filling
-    # the shared IP bucket exactly to its limit — so the human's OWN next attempt is the one that
-    # tips it over (the limit + 1) and returns 429. On the fixed code every attempt is charged to the
-    # device's own bucket, so the human's is the first on login:<ip> and returns 401. Counting
-    # attempts, not mints, keeps this within the per-device credential cap.
-    _attempt_from_device(admin, dev, temp_vault, _IP_THRESHOLD)
+    _flood_device_at_sftp(admin, dev, temp_vault, device_limit + 5)
 
-    # The human's per-IP login bucket must be untouched: a fresh human login is an ordinary 401, not a
-    # throttled 429. On the pre-fix code the device's auths above filled the shared IP bucket and the
-    # human came back 429 — locked out by a sync client.
+    # The human's per-IP login bucket must be untouched: a fresh human WEB login is an ordinary 401,
+    # not a throttled 429.
     human = _login_attempt(unique("human"), _NEVER_VALID)
     assert human.status_code == 401, (
-        f"the human web login was throttled after a device's sync loop: {human.status_code} "
-        f"{human.text[:200]} — the device spent the human's shared login budget")
+        f"the human web login was throttled ({human.status_code}) after a device's SFTP sync loop — "
+        f"the device spent the human's shared IP login budget")
 
 
 def test_a_second_device_is_unaffected_by_the_first(admin, temp_vault):
-    """(b) One device's sync auths must not throttle a SECOND device on the same IP. Same mechanism as
-    (a): distinct-username device-A auths fill the shared IP bucket on the pre-fix code, so device B
-    is locked out; on the fixed code they go to device A's own bucket and device B is untouched."""
+    """(b) One device's sync loop at the SFTP door must not throttle a SECOND device on the same IP.
+    On the reverted (IP-keyed) device throttle, device A's loop fills the shared bucket and device B is
+    refused; per-device, device B still authenticates."""
+    device_limit = configured_int_setting("RATE_LIMIT_DEVICE_SYNC_ATTEMPTS") or 30
     dev_a = _register_granted_device(admin, temp_vault)
     dev_b = _register_granted_device(admin, temp_vault)
-    cred_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
+    reserved_b = mint_sync_cred(dev_b["secret"], temp_vault["id"]).json()
 
-    # Device A makes enough attempts to fill the shared IP bucket to its limit on the reverted code
-    # (attempts, not mints — within the per-device cap). Device B's single attempt below is then the
-    # one that would tip a shared IP bucket over.
-    _attempt_from_device(admin, dev_a, temp_vault, _IP_THRESHOLD)
+    _flood_device_at_sftp(admin, dev_a, temp_vault, device_limit + 5)
 
-    # Device B, untouched, is answered as an ordinary refusal — not throttled. On the pre-fix code
-    # device A's loop had filled the shared IP bucket and device B's attempt came back 429.
-    r = _login_attempt(cred_b["temp_username"], _NEVER_VALID)
-    assert r.status_code == 401, (
-        f"a second device was throttled by the first's activity: {r.status_code} {r.text[:200]}")
+    # Device B, on the SAME source IP, still authenticates at the SFTP door — proof the device throttle
+    # is per-device, not a shared bucket device A could exhaust.
+    assert sftp_authenticates(reserved_b["temp_username"], reserved_b["credential"]), (
+        "device B was refused at the SFTP door while only device A was flooded — the device throttle "
+        "is not per-device")
 
 
 def test_the_device_bucket_bounds_a_runaway_device_at_the_sftp_door(admin, temp_vault):
@@ -329,6 +316,38 @@ def test_a_temp_429_does_not_reveal_its_bucket_kind(admin, temp_vault):
             f"kind is observable: {name}={h} vs device={ref}")
 
 
+def test_a_primed_ip_makes_every_temp_kind_identical_at_the_web_door(admin, temp_vault):
+    """The web-door existence oracle, at the point it actually bites: prime login:<ip> with DISTINCT
+    unknown names until it trips, then probe a hand-out, a device-linked and a fresh unknown temp_
+    name ONCE each. Under the uniform web door all three hit the tripped IP bucket and return an
+    identical 429 (status + countdown-normalized body). On a per-kind door a known name's own bucket
+    (still at 1) answers 401 while the unknown's IP leg answers 429 — a one-probe status classifier —
+    so the statuses differ and this goes red."""
+    _sess, handout = temp_login(admin)
+    dev = _register_granted_device(admin, temp_vault)
+    device_cred = mint_sync_cred(dev["secret"], temp_vault["id"]).json()
+
+    # Prime the shared per-IP login bucket PAST its threshold with distinct unknown names (minting
+    # above uses the admin session, not login:<ip>, so it does not disturb the priming).
+    for _ in range(_IP_THRESHOLD + 1):
+        _login_attempt("temp_" + unique("prime"), _NEVER_VALID)
+
+    probes = {
+        "hand-out": handout["temp_username"],
+        "device-linked": device_cred["temp_username"],
+        "unknown": "temp_" + unique("probe"),
+    }
+    responses = {name: _login_attempt(u, _NEVER_VALID) for name, u in probes.items()}
+    statuses = {name: r.status_code for name, r in responses.items()}
+    assert len(set(statuses.values())) == 1, (
+        f"a primed IP bucket made the temp_ kinds distinguishable by status: {statuses} — the web "
+        f"door is not uniform (a per-kind bucket answers a known name 401 while the unknown is 429)")
+    assert all(s == 429 for s in statuses.values()), (
+        f"expected every probe to hit the primed IP bucket (429): {statuses}")
+    bodies = {name: _normalize_countdown(r.text) for name, r in responses.items()}
+    assert len(set(bodies.values())) == 1, f"probe bodies differ across temp_ kinds: {bodies}"
+
+
 @pytest.mark.skipif(
     os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
     reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the device-bucket DB-fallback test "
@@ -354,7 +373,9 @@ def test_the_device_bucket_still_bounds_a_runaway_under_a_redis_outage(admin, te
 
     def _db_fallback_count(action, identifier):
         """The attempt_count of the durable fallback row for (identifier, action), via psql in the DB
-        container, or None if the query could not run."""
+        container. Returns None ONLY when psql itself could not run (skip); an EMPTY result — the
+        query ran but there is no such row — returns 0, which must FAIL (the fallback did not record
+        keyed by device), not skip."""
         sql = ("SELECT attempt_count FROM rate_limit_records WHERE action='%s' AND identifier='%s'"
                % (action, identifier))
         r = subprocess.run(
@@ -362,9 +383,9 @@ def test_the_device_bucket_still_bounds_a_runaway_under_a_redis_outage(admin, te
              'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "%s"' % sql],
             capture_output=True, text=True, timeout=15)
         if r.returncode != 0:
-            return None
+            return None  # psql failed -> infrastructure, skip
         out = r.stdout.strip()
-        return int(out) if out.isdigit() else None
+        return int(out) if out.isdigit() else 0  # empty = no row = 0 attempts recorded
 
     if _docker("inspect", _REDIS_CONTAINER).returncode != 0:
         pytest.skip(f"redis container {_REDIS_CONTAINER!r} not found")

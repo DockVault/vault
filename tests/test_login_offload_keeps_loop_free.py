@@ -49,6 +49,14 @@ def _median(xs):
     return xs[len(xs) // 2]
 
 
+def _timed(call):
+    """Run a request callable, assert it succeeded, and return how long it took."""
+    t0 = time.time()
+    resp = call()
+    assert resp.status_code == 200, resp.text
+    return time.time() - t0
+
+
 def test_a_login_burst_does_not_freeze_the_loop(admin):
     users = [admin.create_user(role="user") for _ in range(_N)]
     try:
@@ -57,13 +65,13 @@ def test_a_login_burst_does_not_freeze_the_loop(admin):
                 f"{BASE_URL}/auth/login",
                 json={"username": u["_username"], "password": u["_password"]}, timeout=30)
 
-        # Baseline: a single correct-password login on this stack ~ one Argon2 verify + overhead. The
-        # fully-serialized (on-loop) wall for the burst is about N of these.
-        verify_samples = []
-        for _ in range(3):
-            t0 = time.time()
-            assert _login(users[0]).status_code == 200
-            verify_samples.append(time.time() - t0)
+        # Baselines on this stack: the unrelated GET when the loop is idle, and a single
+        # correct-password login (~ one Argon2 verify + overhead). The fully-serialized (on-loop) wall
+        # for the burst is about N of the latter — larger under the burst's CPU contention, so N x an
+        # UNCONTENDED verify is a conservative floor for it.
+        base_get = _median([_timed(lambda: admin.session.get(f"{BASE_URL}/vaults", timeout=30))
+                            for _ in range(3)])
+        verify_samples = [_timed(lambda: _login(users[0])) for _ in range(3)]
         t_verify = _median(verify_samples)
         serialized_wall = _N * t_verify
 
@@ -82,10 +90,10 @@ def test_a_login_burst_does_not_freeze_the_loop(admin):
         assert all(lr.status_code == 200 for lr in logins), [lr.status_code for lr in logins]
         ceiling = _SERIALIZED_FRACTION * serialized_wall
         assert elapsed < ceiling, (
-            f"an unrelated request took {elapsed:.2f}s during a {_N}-login burst — near the "
-            f"fully-serialized wall of {serialized_wall:.2f}s (N x {t_verify:.2f}s), so the password "
-            f"verifies serialized on the event loop instead of running off it (expected under "
-            f"{ceiling:.2f}s)")
+            f"an unrelated request took {elapsed:.2f}s during a {_N}-login burst (idle baseline "
+            f"{base_get:.2f}s) — near the fully-serialized wall of {serialized_wall:.2f}s "
+            f"(N x {t_verify:.2f}s), so the password verifies serialized on the event loop instead of "
+            f"running off it (expected under {ceiling:.2f}s)")
     finally:
         for u in users:
             admin.delete_user(u["id"])

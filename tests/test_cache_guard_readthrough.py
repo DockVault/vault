@@ -112,6 +112,10 @@ class _RecordingRedis:
         self.touched.append("setex")
         return True
 
+    def publish(self, *a, **k):
+        self.touched.append("publish")
+        return 1
+
 
 def _skip_denylist_read(monkeypatch, fake):
     monkeypatch.setattr(A, "redis_client", fake)
@@ -123,14 +127,27 @@ def _skip_denylist_write(monkeypatch, fake):
     A.denylist_token("some-session-token", 60)
 
 
+def _skip_best_effort_cache(monkeypatch, fake):
+    A._best_effort_cache("test.cache", fake.setex)  # the op is skipped while the guard is open
+
+
+def _skip_guarded_publish(monkeypatch, fake):
+    import app.core.database as dbmod
+    monkeypatch.setattr(dbmod, "redis_client", fake)
+    import app.api.api_server as S
+    assert S._guarded_publish("activity_events", "{}") is False  # skipped -> False
+
+
 @pytest.mark.parametrize("name,op", [
     ("denylist_read", _skip_denylist_read),
     ("denylist_write", _skip_denylist_write),
+    ("best_effort_cache", _skip_best_effort_cache),
+    ("guarded_publish", _skip_guarded_publish),
 ])
 def test_an_open_guard_skips_the_socket(name, op, monkeypatch):
-    # With the guard open, these best-effort ops must skip Redis entirely — not stall a timeout per
-    # call during an outage. Removing the `if _cache_guard_*` skip in the consumer makes it touch the
-    # stub, so `touched` is non-empty and the test goes red.
+    # With the guard open, all four best-effort consumers must skip Redis entirely — not stall a
+    # timeout per call during an outage. Removing the `if _cache_guard_*` skip in a consumer makes it
+    # touch the stub, so `touched` is non-empty and the test goes red.
     R._cb_record_success()
     A._cache_guard_record_success()
     A._cache_guard_record_failure(time.time())  # guard OPEN (private memory)
