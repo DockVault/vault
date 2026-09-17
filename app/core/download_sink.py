@@ -28,11 +28,15 @@ USER_CHOICE = "user_choice"
 ORG_POLICIES = frozenset({BUFFERED, STREAMING, USER_CHOICE})
 USER_PREFERENCES = frozenset({BUFFERED, STREAMING})
 
-#: Chosen so the shipped defaults reproduce today's behaviour exactly: the organisation delegates,
-#: the user has expressed nothing, and the result is the buffered path that already ships. Nobody
-#: gets bytes on disk early until somebody asks for it.
+#: The organisation delegates by default (USER_CHOICE), and a user who has expressed nothing STREAMS:
+#: a download lands on disk either way, so streaming it incrementally is no new exposure, and it is
+#: what keeps the browser's memory flat on a large file (the whole point of the bounded-memory work).
+#: An organisation may still force BUFFERED, and a user may still choose it; only the unspoken default
+#: changed. Streaming needs a secure context + a service worker, and resolve_download_sink() falls
+#: back to BUFFERED where either is missing -- there the file UI refuses a download too large to
+#: buffer rather than holding it whole in memory.
 DEFAULT_ORG_POLICY = USER_CHOICE
-DEFAULT_USER_PREFERENCE = BUFFERED
+DEFAULT_USER_PREFERENCE = STREAMING
 
 
 def resolve_download_sink(org_policy, user_preference, *, secure_context: bool = True) -> str:

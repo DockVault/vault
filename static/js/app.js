@@ -13401,6 +13401,44 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
  * The distinction between `false` and `'failed'` is the whole contract. Collapsing them would
  * either hide a real failure or re-download a file that is already arriving.
  */
+// The largest file the buffered download path may hold whole in memory. Above this, when the
+// streaming sink is unavailable (buffered policy, no service worker, or a plain-HTTP context), the
+// file UI REFUSES the download with a clear message rather than silently reading gigabytes into the
+// tab -- the no-silent-whole-file-fallback rule of the bounded-memory work.
+const MAX_BUFFERED_DOWNLOAD_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Stream a STANDARD-vault download (the server has already decrypted) straight into a browser
+ * download via the service-worker sink, so nothing accumulates in the tab. Same three outcomes as
+ * zkTryStreamedDownload: `true` (under way), `'failed'` (a sink was opened and the transfer broke
+ * part-way -- do NOT fall back, bytes are already in the download), `false` (streaming was never
+ * entered: no sink, nothing written -- the caller re-fetches for the buffered path).
+ */
+async function dvTryStandardStreamedDownload(response, fileName, size, mime, abortCtl) {
+    if (!response.body || !response.body.getReader) return false;
+    const sink = await dvOpenDownloadSink({ filename: fileName, size, mime });
+    if (!sink) return false;                       // no service worker / not a secure context
+    const reader = response.body.getReader();
+    const dlId = downloadProgress.start(fileName, () => { try { abortCtl.abort(); } catch (_) {} });
+    let received = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            sink.write(value);                     // transfers the chunk to the SW; released here
+            received += value.length;
+            downloadProgress.update(dlId, received, size || 0);
+        }
+        sink.done();
+        return true;
+    } catch (e) {
+        sink.abort(String((e && e.name) || 'failed'));
+        return 'failed';                           // bytes already in the download; cannot rewind
+    } finally {
+        downloadProgress.done(dlId);
+    }
+}
+
 async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileName) {
     const lib = eccLib();
     const declared = Number(response.headers.get('Content-Length'));
@@ -14196,6 +14234,9 @@ async function _downloadFile(fileId, fileName) {
     // -- it just lets the user stop one.) Declared before the try so the catch can tell a
     // user-initiated cancel from a genuine failure.
     const _dlAbort = new AbortController();
+    const _finfo = (state.currentFiles || []).find(i => i.id === fileId) || {};
+    const _fsize = Number(_finfo.size) || 0;
+    const _fmime = _finfo.mime_type || 'application/octet-stream';
     try {
         // Zero-knowledge: if we couldn't decrypt this item's NAME we also lack the DEK for
         // its content epoch, so a download can't be decrypted here — say so plainly.
@@ -14232,6 +14273,24 @@ async function _downloadFile(fileId, fileName) {
         // accumulates and size stops being a limit. Attempted only when the resolved policy asks
         // for it; anything that does not line up falls through to the buffered path rather than
         // failing, because a download that works is worth more than the mode it used.
+        // Standard vault (server already decrypted): stream the body straight into the download so
+        // the tab never holds the whole file. Only when the resolved policy asks for streaming;
+        // otherwise fall through to the (threshold-guarded) buffered path.
+        if (!isZkVault(state.currentVault) && state.downloadSink === 'streaming') {
+            const streamed = await dvTryStandardStreamedDownload(
+                response, fileName, _fsize, _fmime, _dlAbort);
+            if (streamed === true) { showSuccess(`Downloading "${fileName}"`); return; }
+            if (streamed === 'failed') {
+                showError(`Download of "${fileName}" failed part-way. `
+                          + `Any partial file in your downloads is incomplete.`);
+                return;
+            }
+            // streamed === false: the sink was unavailable, nothing written; re-fetch for buffered.
+            response = await fetch(
+                `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
+            if (!response.ok) throw new Error('Download failed');
+        }
+
         if (isZkVault(state.currentVault) && state.downloadSink === 'streaming') {
             const streamed = await zkTryStreamedDownload(
                 response, state.currentVault, zkFileKeyVersion(fileId), fileId, fileName);
@@ -14252,6 +14311,17 @@ async function _downloadFile(fileId, fileName) {
                 `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`,
                 { headers });
             if (!response.ok) throw new Error('Download failed');
+        }
+
+        // No silent whole-file fallback: if we reach the buffered path (streaming unavailable or not
+        // asked for) and the file is too large to hold in memory, REFUSE rather than read gigabytes
+        // into the tab. A multi-GB transfer must never silently take the whole-file path.
+        if (_fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
+            showError(`"${fileName}" is ${formatBytes ? formatBytes(_fsize) : _fsize + ' B'} and this `
+                + `browser/context can't stream it to disk, so it is too large to download here `
+                + `(streaming needs a secure https context with a service worker). `
+                + `Open the site over https, or use the SFTP sync path for very large files.`);
+            return;
         }
 
         let blob;

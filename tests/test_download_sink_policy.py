@@ -44,14 +44,15 @@ def test_delegation_hands_the_choice_to_the_user():
     assert resolve(USER_CHOICE, BUFFERED) == BUFFERED
 
 
-def test_the_shipped_defaults_are_todays_behaviour():
-    """Nothing configured anywhere must resolve to what already ships.
-
-    If this ever fails, an upgrade silently starts putting unverified bytes on people's disks.
-    """
-    assert resolve(None, None) == BUFFERED
+def test_the_shipped_default_streams_in_a_secure_context():
+    """Nothing configured anywhere STREAMS by default in a secure context, so a default deployment
+    keeps browser memory flat on a large download. A download lands on disk either way, so streaming
+    it incrementally is no new exposure; an org may still force buffered and a user may still choose
+    it. (Plain HTTP still falls back to buffered -- see the secure-context test below.)"""
+    assert resolve(None, None) == STREAMING
     assert _SINK.DEFAULT_ORG_POLICY == USER_CHOICE
-    assert _SINK.DEFAULT_USER_PREFERENCE == BUFFERED
+    assert _SINK.DEFAULT_USER_PREFERENCE == STREAMING
+    assert resolve(None, None, secure_context=False) == BUFFERED   # no SW off a secure context
 
 
 def test_plain_http_cannot_stream_however_the_policy_reads():

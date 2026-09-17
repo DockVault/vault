@@ -109,9 +109,11 @@ def test_the_user_decides_when_the_organisation_delegates(admin, restored_policy
     assert _sink(admin)["sink"] == "buffered"
 
 
-def test_an_unset_deployment_behaves_exactly_as_before(admin, restored_policy):
-    """The upgrade case. Nothing configured must mean nothing on disk early, or an upgrade
-    silently changes where people's unverified plaintext lands."""
+def test_an_explicit_buffered_preference_is_honoured(admin, restored_policy):
+    """A user (or org) may still CHOOSE buffered under the delegating default, and it is honoured.
+    The unset default now STREAMS in a secure context (proven without a stack in
+    test_download_sink_policy.py::test_the_shipped_default_streams_in_a_secure_context); a download
+    lands on disk either way, so streaming it incrementally is no new exposure."""
     assert _set_policy(admin, "user_choice").status_code == 200
     _set_pref(admin, "buffered")
     assert _sink(admin)["sink"] == "buffered"
