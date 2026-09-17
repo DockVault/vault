@@ -168,6 +168,13 @@ class ECCCryptoLibrary {
         // so its transcript binds only the vault and the recipient.
         this.V2_PURPOSE_NAME_INDEX_KEY = 0x05;
         this.V2_INFO_NAME_INDEX_KEY = 'dockvault-zk-name-index-key-v2';
+        // A share/note-link URL token, wrapped to its OWNER's own public key so a later "Show link
+        // again" is a client-side decrypt (the server stores the blob opaque and never decrypts).
+        // Unlike the key wraps this payload is a short VARIABLE-length string, so the container is not
+        // the fixed 68 bytes; its transcript binds the (link id, owner id) so a blob cannot be
+        // replayed onto another link or owner, and its own purpose byte keeps it distinct.
+        this.V2_PURPOSE_LINK_TOKEN = 0x06;
+        this.V2_INFO_LINK_TOKEN = 'dockvault-zk-link-token-v2';
         this.V2_CONTENT_HEADER_BYTES = 28;      // 8 shared + 4 chunk size + 16 attempt token
         this.V2_CONTENT_CHUNK_OVERHEAD = 28;    // 12-byte nonce + 16-byte tag, per chunk
         // The smallest possible file is the header plus one empty chunk. Anything shorter is
@@ -807,6 +814,111 @@ class ECCCryptoLibrary {
                                             true, ['encrypt', 'decrypt']);
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapNameIndexKey');
+        }
+    }
+
+    /**
+     * Transcript for the owner-encrypted link-token re-copy (purpose 0x06). Binds the link id and
+     * the owner id, so a blob wrapped for one link/owner fails to authenticate against another.
+     * @private
+     */
+    _v2LinkTokenTranscript(linkId, ownerId) {
+        const enc = new TextEncoder();
+        const header = this._v2Header(this.V2_PURPOSE_LINK_TOKEN);
+        const z = new Uint8Array([0]);
+        const context = this._concatBytes([
+            this._v2Uuid(linkId, 'v2LinkToken.linkId'), z,
+            this._v2Uuid(ownerId, 'v2LinkToken.ownerId'), z,
+        ]);
+        return {
+            header,
+            info: this._concatBytes([enc.encode(this.V2_INFO_LINK_TOKEN), z, context]),
+            aad: this._concatBytes([header, context]),
+        };
+    }
+
+    /**
+     * Wrap a link's URL token to its owner's OWN public key, for a client-side "Show link again".
+     * Returns ONE opaque base64 container: header(8) || ephemeralPublicKey(97 raw P-384) ||
+     * nonce(12) || ciphertext+tag. The token is a short variable-length string, so (unlike the key
+     * wraps) the container is not a fixed length; the server stores it opaque and never decrypts it.
+     * The AAD binds (link id, owner id), so the blob cannot be replayed onto another link or owner.
+     * @param {string} token the plaintext URL token (shown once at creation)
+     * @param {CryptoKey} ownerPublicKey the owner's own ECC public key
+     * @param {{linkId:string, ownerId:string}} context
+     * @returns {Promise<string>} base64 container
+     */
+    async wrapLinkTokenV2(token, ownerPublicKey, context) {
+        const { linkId, ownerId } = context || {};
+        const t = this._v2LinkTokenTranscript(linkId, ownerId);
+        try {
+            const ephemeral = await this._subtle().generateKey(
+                { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']);
+            const shared = await this._subtle().deriveBits(
+                { name: 'ECDH', public: ownerPublicKey }, ephemeral.privateKey, 384);
+            const key = await this._deriveV2WrappingKey(shared, t.info);
+            const nonce = this._randomBytes(12);
+            const pt = new TextEncoder().encode(String(token));
+            const ct = await this._subtle().encrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, pt);
+            const ephRaw = new Uint8Array(await this._subtle().exportKey('raw', ephemeral.publicKey));
+            if (ephRaw.length !== 97 || ephRaw[0] !== 0x04) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapLinkTokenV2.point');
+            }
+            const container = this._concatBytes([t.header, ephRaw, nonce, new Uint8Array(ct)]);
+            return this._arrayBufferToBase64(container.buffer);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'wrapLinkTokenV2');
+        }
+    }
+
+    /**
+     * Unwrap a link-token re-copy container with the owner's unlocked private key. Throws (a coded
+     * failure) on a structural mismatch, on an AAD mismatch (a blob wrapped for another link/owner),
+     * or when the owner's key has been rotated (the retired key can no longer derive the secret) --
+     * the caller renders the honest "create a new link" message rather than a dead button.
+     * @returns {Promise<string>} the plaintext URL token
+     */
+    async unwrapLinkTokenV2(containerBase64, userPrivateKey, context) {
+        const { linkId, ownerId } = context || {};
+        const b = new Uint8Array(this._base64ToArrayBuffer(containerBase64));
+        if (b.length < 8 + 97 + 12 + 16 + 1) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.length');
+        }
+        if (b[0] !== 0x44 || b[1] !== 0x56 || b[2] !== 0x5A || b[3] !== 0x32) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.magic');
+        }
+        if (b[4] !== this.V2_VERSION) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.version');
+        }
+        if (b[5] !== this.V2_PURPOSE_LINK_TOKEN) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.purpose');
+        }
+        if (b[6] !== 0 || b[7] !== 0) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.reserved');
+        }
+        const epk = b.slice(8, 105);
+        if (epk.length !== 97 || epk[0] !== 0x04) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.point');
+        }
+        const nonce = b.slice(105, 117);
+        const body = b.slice(117);
+        const t = this._v2LinkTokenTranscript(linkId, ownerId);
+        let ephemeralPublicKey;
+        try {
+            ephemeralPublicKey = await this._importRawPublicKey(epk.buffer);
+        } catch (error) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, 'unwrapLinkToken.curve');
+        }
+        try {
+            const shared = await this._subtle().deriveBits(
+                { name: 'ECDH', public: ephemeralPublicKey }, userPrivateKey, 384);
+            const key = await this._deriveV2WrappingKey(shared, t.info);
+            const plain = await this._subtle().decrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, body);
+            return new TextDecoder().decode(plain);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapLinkToken');
         }
     }
 
@@ -3159,6 +3271,8 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     wrapVaultDEKV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapTeamDEKV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapTeamPrivateKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    wrapLinkTokenV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    unwrapLinkTokenV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapPrivateKeyToPublic: CRYPTO_ERROR_CODES.WRAP_FAILED,
     unwrapPrivateKeyFromWrapped: CRYPTO_ERROR_CODES.WRAP_FAILED,
 
