@@ -9849,8 +9849,8 @@ def _notelink_public_dict(link, tag=None) -> dict:
     variant (_notelink_admin_dict) strips body + token — an admin must not read others' content."""
     return {
         "id": str(link.id),
-        "token": link.token,
-        "url_path": f"/l/{link.token}",
+        # No token / url_path: the plaintext token is shown ONCE at creation and is hashed at rest,
+        # so the owner list never re-shows it. "Show link again" comes from the owner-encrypted copy.
         "title": link.title_snapshot or "",
         "body": link.body_snapshot or "",
         "tag_id": str(link.tag_id) if link.tag_id else None,
@@ -9869,8 +9869,18 @@ def _notelink_public_dict(link, tag=None) -> dict:
     }
 
 
+def _notelink_token_hash(token: str) -> str:
+    """sha256 of a note-link URL token, matching PublicLink. The token lives only in the shared URL;
+    the DB stores this hash so a leak hands out no working links, and lookups hash the presented
+    token and confirm with a constant-time compare."""
+    import hashlib as _hashlib
+    return _hashlib.sha256(token.encode()).hexdigest()
+
+
 def _notelink_fail_key(token: str) -> str:
-    return f"notelink:fail:{token}"
+    # Key the lockout counter on the token HASH, never the plaintext token, so no cleartext token
+    # sits in Redis either.
+    return f"notelink:fail:{_notelink_token_hash(token)}"
 
 
 def _notelink_locked(token: str) -> bool:
@@ -9995,14 +10005,15 @@ async def create_note_link(
     token = None
     for _ in range(8):
         cand = _notelink_gen_token(pol["token_len"])
-        if not db.query(NoteLink.id).filter(NoteLink.token == cand).first():
+        if not db.query(NoteLink.id).filter(NoteLink.token_hash == _notelink_token_hash(cand)).first():
             token = cand
             break
     if token is None:
         raise HTTPException(status_code=500, detail="Could not allocate a link token; try again.")
 
     link = NoteLink(
-        owner_id=current_user.id, tag_id=tag.id, token=token, token_len=pol["token_len"],
+        owner_id=current_user.id, tag_id=tag.id, token_hash=_notelink_token_hash(token),
+        token_len=pol["token_len"],
         title_snapshot=note.title or "", body_snapshot=note.body or "",
         secret_kind=pol["secret_kind"], password_hash=password_hash,
         expires_at=expires_at, max_uses=pol["max_uses"])
@@ -10023,7 +10034,12 @@ async def create_note_link(
             ip_address=get_client_ip(request))
     except Exception:
         pass
-    return _notelink_public_dict(link, tag)
+    # The plaintext token is returned ONCE, here at creation (the one-time show); it is never stored
+    # in the clear and no other endpoint returns it.
+    created = _notelink_public_dict(link, tag)
+    created["token"] = token
+    created["url_path"] = f"/l/{token}"
+    return created
 
 
 @app.get("/note-links")
@@ -10288,8 +10304,12 @@ async def redeem_note_link(
         _audit("failure", reason="feature_disabled")
         raise HTTPException(status_code=404, detail="This link is not available.")
 
-    link = db.query(NoteLink).filter(NoteLink.token == token).first()
-    # A missing OR unusable link returns the SAME 404 (no revoked/expired/exhausted oracle).
+    _presented_hash = _notelink_token_hash(token)
+    link = db.query(NoteLink).filter(NoteLink.token_hash == _presented_hash).first()
+    # A missing OR unusable link returns the SAME 404 (no revoked/expired/exhausted oracle). The
+    # hash lookup is confirmed in constant time, like the other bearer tokens.
+    if link and not hmac.compare_digest(link.token_hash or "", _presented_hash):
+        link = None
     if not link or _notelink_status(link) != "active":
         _audit("failure", reason="not_available", link_id=(link.id if link else None))
         raise HTTPException(status_code=404, detail="This link is not available.")
@@ -20966,6 +20986,12 @@ def _run_lightweight_migrations():
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
             "ALTER TABLE note_public_links ALTER COLUMN title_snapshot TYPE TEXT",
+            # Note-link tokens are hashed at rest (like PublicLink). Add the hash column + its
+            # partial-unique lookup index, and drop NOT NULL on the legacy plaintext token so the
+            # boot migration can null it (the column is dropped in a later release).
+            "ALTER TABLE note_public_links ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_notelink_token_hash ON note_public_links (token_hash) WHERE token_hash IS NOT NULL",
+            "ALTER TABLE note_public_links ALTER COLUMN token DROP NOT NULL",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS note VARCHAR(500)",
             # The credential-lifecycle slot marker: set by the connection-close hook when a
             # credential's connection finishes, freeing its cap slot (see app/core/temp_cred_slot.py).
@@ -21516,6 +21542,21 @@ def _purge_audit_log_names():
         print(f"⚠ audit-log name redaction skipped: {e}")
 
 
+def _backfill_notelink_tokens():
+    """Hash legacy plaintext note-link tokens at rest and null the cleartext, so a DB leak hands out
+    no working links while every existing link keeps redeeming (idempotent; a marker makes it a no-op
+    after the first run). Best-effort: never block boot. Logic lives in app.core.notelink_token_migration."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.notelink_token_migration import backfill_notelink_token_hashes
+        with get_db_context() as db:
+            migrated = backfill_notelink_token_hashes(db)
+        if migrated:
+            print(f"[OK] Hashed {migrated} legacy note-link token(s) at rest")
+    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
+        print(f"⚠ note-link token hashing skipped: {e}")
+
+
 def _backfill_file_checksums():
     """Seal any legacy plaintext file content checksums at rest (idempotent, batched). Covers every
     file (ZK + Standard). Best-effort: never block boot. Logic lives in app.core.file_migrations."""
@@ -21739,6 +21780,7 @@ async def lifespan(app: FastAPI):
     _backfill_encrypted_names()
     _backfill_file_checksums()          # seal any legacy plaintext file content checksums at rest
     _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
+    _backfill_notelink_tokens()         # hash legacy plaintext note-link tokens at rest
     _release_finished_cred_slots()      # free cap slots of credentials finished before this upgrade
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _admin_bootstrap_status = _seed_admin_user()

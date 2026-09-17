@@ -19,6 +19,8 @@ LOG_PATH_SECRET_SUBS = [
     (re.compile(r"^(/invites/)[^/]+"), r"\1<redacted>"),           # GET/POST /invites/{token}[/accept]
     (re.compile(r"^(/reset/)[^/]+"), r"\1<redacted>"),             # GET/POST /reset/{password-reset-token}
     (re.compile(r"^(/shares/)[^/]+(/claim)"), r"\1<redacted>\2"),  # /shares/{claim-secret}/claim
+    (re.compile(r"^(/l/)[^/]+"), r"\1<redacted>"),                # GET /l/{note-link-token} (public read)
+    (re.compile(r"^(/note-links/)[^/]+(/redeem)"), r"\1<redacted>\2"),  # POST /note-links/{token}/redeem
 ]
 
 # Covers both the /?invite=<token> and /?reset=<token> landing links (the token rides the query on the

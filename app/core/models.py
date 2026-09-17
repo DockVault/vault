@@ -1538,8 +1538,14 @@ class NoteLink(Base):
     # can delete a tag without destroying links — the frozen policy below still governs the link.
     tag_id = Column(UUID(as_uuid=True), ForeignKey('note_link_tags.id', ondelete='SET NULL'), nullable=True)
 
-    # The opaque URL id. base62, length == token_len (>= the tag's min_token_len). Unique + indexed.
-    token = Column(String(64), nullable=False, unique=True, index=True)
+    # Legacy plaintext URL token. As of the token-hash release the token is stored HASHED
+    # (token_hash below), like PublicLink; this column is NULLED at creation and back-filled to NULL
+    # for existing rows by the boot migration, and dropped in a later release once the hash is
+    # populated and verified. Kept nullable (and no longer NOT NULL) for that migration window.
+    token = Column(String(64), nullable=True, index=True)
+    # sha256 of the opaque base62 URL token (never the token itself). The unique lookup key; a
+    # partial-unique index (WHERE token_hash IS NOT NULL) is added by the boot DDL.
+    token_hash = Column(String(64), nullable=True, index=True)
     token_len = Column(Integer, nullable=False)
 
     # Frozen content snapshot. Text (not String(255)): sealed at rest like the note it copies; the
