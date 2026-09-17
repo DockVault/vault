@@ -1876,6 +1876,108 @@ def support_line(matrix, version):
     return head
 
 
+_MAIN_MATRIX_URL = MATRIX_RAW_URL % "main"   # the lifecycle copy on main (a fixed URL, NOT a tag)
+_MAIN_MATRIX_MAX_BYTES = 512 * 1024
+
+
+def fetch_main_lifecycle_matrix(opener=None):
+    """MAIN's upgrade matrix from the fixed raw URL, or None. Bounded (timeout + size cap) and
+    fail-safe: any error, oversized body, or wrong shape yields None so the caller falls back to the
+    copy it already has. Never raises. Only the LIFECYCLE fields are ever read from it, and the merge
+    that consumes it is add-only, so a compromised copy can only tighten -- never clear, never falsely
+    secure, never gate an upgrade (the hard gates stay on the tag-pinned matrices)."""
+    import json as _json
+    try:
+        import urllib.request
+        get = opener or urllib.request.urlopen
+        with get(_MAIN_MATRIX_URL, timeout=15) as response:
+            raw = response.read(_MAIN_MATRIX_MAX_BYTES + 1)
+        if len(raw) > _MAIN_MATRIX_MAX_BYTES:
+            return None
+        data = _json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("versions"), dict) else None
+
+
+def _credible_remote_vulns(remote_vulns, released_ceiling):
+    """Drop a remote vulnerability whose fixed_in names a version NEWER than the newest RELEASE the
+    tool can see -- an unreleased fix is not a credible disclosure. The ceiling is the newest RELEASE
+    tag, never the running version, so a fix in a newer-but-released version is kept. A vuln with no
+    fix, or an unparseable ceiling, is kept (never over-drop)."""
+    ceil = parse_semver(released_ceiling)
+    out = []
+    for v in remote_vulns:
+        if not isinstance(v, dict):
+            continue
+        fx = parse_semver(v.get("fixed_in"))
+        if fx is None or ceil is None or fx <= ceil:
+            out.append(v)
+    return out
+
+
+def _earlier_date(a, b):
+    """The earlier of two ISO date strings; whichever is present when only one is (ISO sorts
+    chronologically). Add-only: support never ends LATER than either source says."""
+    present = [d for d in (a, b) if isinstance(d, str) and d]
+    return min(present) if present else None
+
+
+def _merge_support(local_s, remote_s):
+    """Add-only merge of two support blocks: insecure if EITHER is insecure, eol if EITHER is eol,
+    support-end the EARLIER. Never clears a local verdict, never sets secure (no false secure:true)."""
+    merged = dict(local_s or {})
+    if (local_s or {}).get("secure") is False or (remote_s or {}).get("secure") is False:
+        merged["secure"] = False
+    if (local_s or {}).get("eol") is True or (remote_s or {}).get("eol") is True:
+        merged["eol"] = True
+    for key in ("code_support", "security_support"):
+        d = _earlier_date((local_s or {}).get(key), (remote_s or {}).get(key))
+        if d is not None:
+            merged[key] = d
+    return merged
+
+
+def _merge_vulnerabilities(local_v, remote_v):
+    """Union of two vulnerability lists, deduped by (title, fixed_in). Local entries are always kept;
+    the remote can only ADD."""
+    seen, out = set(), []
+    for v in list(local_v or []) + list(remote_v or []):
+        if not isinstance(v, dict):
+            continue
+        key = (v.get("title"), v.get("fixed_in"))
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def merge_lifecycle_matrix(local_matrix, main_matrix, released_ceiling):
+    """A copy of `local_matrix` with each version's LIFECYCLE (support + vulnerabilities) merged
+    ADD-ONLY with main's. Returns (merged_matrix, source): source 'main' when main contributed, else
+    'local'. DISPLAY/advisory only -- the hard upgrade-path gates keep reading the tag-pinned
+    matrices, so a compromised main can raise a false warning but can never block or wave through a
+    hop. Never prefers a source and never clears a field."""
+    import copy as _copy
+    if main_matrix is None:
+        return local_matrix, "local"
+    merged = _copy.deepcopy(local_matrix) if isinstance(local_matrix, dict) else {"versions": {}}
+    versions = merged.setdefault("versions", {})
+    local_vers = (local_matrix or {}).get("versions") or {}
+    main_vers = main_matrix.get("versions") or {}
+    for ver in set(local_vers) | set(main_vers):
+        ms = _merge_support(version_support(local_matrix, ver), version_support(main_matrix, ver))
+        mv = _merge_vulnerabilities(
+            version_vulnerabilities(local_matrix, ver),
+            _credible_remote_vulns(version_vulnerabilities(main_matrix, ver), released_ceiling))
+        meta = versions.setdefault(ver, {})
+        if ms:
+            meta["support"] = ms
+        if mv:
+            meta["vulnerabilities"] = mv
+    return merged, "main"
+
+
 def fetch_upgrade_matrix(tag, root=None, opener=None):
     """The upgrade matrix describing a hop TO `tag`. Returns (matrix_or_None, source_description).
 
@@ -4355,15 +4457,24 @@ class DockVault:
         # This checkout's matrix describes every version's lifecycle up to what it ships; use it to
         # decide which releases to OFFER (end-of-life ones are hidden) and to annotate the rest.
         local_matrix, _ = fetch_upgrade_matrix(None, root=self.root)
+        # Lifecycle (eol / secure / vulnerabilities) changes AFTER a tag is cut, so read the
+        # DISPLAY lifecycle from this checkout's copy merged ADD-ONLY with the copy on main; the
+        # hard gates below stay on the tag-pinned matrices. Fixed URL, bounded, fail-safe to
+        # source 'local'. The ceiling for a credible remote fix is the newest release tag we can
+        # see, never the running version.
+        _release_tags = fetch_release_tags()
+        _lifecycle_ceiling = _release_tags[0] if _release_tags else None
+        merged_lifecycle, lifecycle_source = merge_lifecycle_matrix(
+            local_matrix, fetch_main_lifecycle_matrix(), _lifecycle_ceiling)
         if not tag:
-            tags = fetch_release_tags()
+            tags = _release_tags
             if tags:
                 offered = [t for t in tags if not is_eol(local_matrix, t)]
                 hidden = len(tags) - len(offered)
                 print(pal.paint("\n  Available releases (newest first):", "cyan"))
                 for t in offered[:15]:
                     label = "   <- current" if parse_semver(t) == parse_semver(current) else ""
-                    note = support_line(local_matrix, t)
+                    note = support_line(merged_lifecycle, t)
                     if note and note != "supported":
                         label += "   (%s)" % note
                     print("    %s%s" % (t, label))
@@ -4414,18 +4525,23 @@ class DockVault:
         if is_eol(eol_matrix, tag):
             self._fail("%s is end-of-life and cannot be upgraded or downgraded to (%s)."
                        % (tag, support_line(eol_matrix, tag)))
-        if version_support(eol_matrix, tag).get("secure") is False:
-            vulns = version_vulnerabilities(eol_matrix, tag)
+        # ADVISORY (not a gate): read the merged DISPLAY lifecycle so a vulnerability found AFTER the
+        # target's tag was cut still shows, and name which source produced the verdict.
+        _src_phrase = ("per the current matrix on main" if lifecycle_source == "main"
+                       else "per this release's matrix")
+        if version_support(merged_lifecycle, tag).get("secure") is False:
+            vulns = version_vulnerabilities(merged_lifecycle, tag)
             if vulns:
                 titles = "; ".join(clean_matrix_text(v.get("title") or "") for v in vulns)
                 fixes = sorted({v.get("fixed_in") for v in vulns if v.get("fixed_in")},
                                key=lambda t: parse_semver(t) or (0, 0, 0))
                 fixed = (" Fixed in %s." % ", ".join(clean_matrix_text(f) for f in fixes)) if fixes else ""
                 print(pal.paint(
-                    "  WARNING: %s has %d known unpatched vulnerability(ies): %s.%s"
-                    % (tag, len(vulns), titles, fixed), "red"))
+                    "  WARNING: %s has %d known unpatched vulnerability(ies): %s.%s (%s)"
+                    % (tag, len(vulns), titles, fixed, _src_phrase), "red"))
             else:
-                print(pal.paint("  WARNING: %s has known unpatched vulnerabilities." % tag, "red"))
+                print(pal.paint(
+                    "  WARNING: %s has known unpatched vulnerabilities. (%s)" % (tag, _src_phrase), "red"))
 
         # A downgrade the matrix refuses: an older image cannot read data written by the newer one,
         # so the move is not offered even with an 'i accept'. Read off this checkout's matrix, which
