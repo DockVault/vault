@@ -178,3 +178,18 @@ def release_expired_slots(db, cred_model, now: datetime) -> int:
             synchronize_session=False,
         )
     )
+
+
+def display_lifecycle(cred, active_session_count=0, now: datetime = None) -> str:
+    """The user-facing lifecycle label for a credential row: 'expired' when it no longer holds a slot
+    (released on the connection close, revoked, or past its validity window), 'in-use' when it still
+    holds a slot AND a live session is open, else 'active'. Derived from is_active + slot_released_at +
+    deactivate_at (via :func:`is_outstanding`) and the live-session count -- the same signals the cap
+    reads -- so the page state matches the connection state and a finished credential never shows
+    active."""
+    now = now or datetime.utcnow()
+    if not is_outstanding(cred, now):
+        return "expired"
+    if active_session_count and active_session_count > 0:
+        return "in-use"
+    return "active"

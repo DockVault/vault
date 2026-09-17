@@ -239,3 +239,22 @@ def test_all_three_per_request_gates_refuse_a_finished_credential():
     assert "temp_cred.slot_released_at is not None" in api          # web door (get_current_user)
     assert "_WsTC.slot_released_at" in api                          # /ws/monitor handshake
     assert 'getattr(tc, "slot_released_at", None) is not None' in sftp  # SFTP per-op gate
+
+
+# ---- the user-facing lifecycle label (active / in-use / expired) ---------------------------------
+def test_display_lifecycle_active_when_holding_a_slot_with_no_session():
+    assert slot.display_lifecycle(_cred(), active_session_count=0, now=_NOW) == "active"
+
+
+def test_display_lifecycle_in_use_when_a_live_session_is_open():
+    assert slot.display_lifecycle(_cred(is_used=True), active_session_count=1, now=_NOW) == "in-use"
+
+
+def test_display_lifecycle_expired_when_released_even_with_a_session():
+    # A released credential is finished regardless of a lingering session count -- never shown active.
+    assert slot.display_lifecycle(_cred(slot_released_at=_PAST), active_session_count=3, now=_NOW) == "expired"
+
+
+def test_display_lifecycle_expired_when_past_validity_or_revoked():
+    assert slot.display_lifecycle(_cred(deactivate_at=_PAST), active_session_count=0, now=_NOW) == "expired"
+    assert slot.display_lifecycle(_cred(is_active=False), active_session_count=0, now=_NOW) == "expired"

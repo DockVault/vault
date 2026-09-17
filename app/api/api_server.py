@@ -6199,6 +6199,7 @@ async def list_temp_credentials(
     """
     from app.core.models import TemporaryCredential, ActiveSession
     from datetime import datetime
+    from app.core import temp_cred_slot
     
     # A temp session (scoped OR legacy NULL-scope) sees only the credentials IT created —
     # never the whole deployment's, even though a NULL-scope temp cred keeps the admin role.
@@ -6221,7 +6222,18 @@ async def list_temp_credentials(
     
     result = []
     now = datetime.now(timezone.utc)  # Use timezone-naive to match database
-    
+
+    # Batch the device display names for the device-minted credentials, so the per-computer section
+    # can name WHICH computer minted each one. Only the label (a user-chosen, non-identifying display
+    # name) is read -- never the device id or secret. The credentials are already scoped to the
+    # viewer, so the devices joined here belong to that same owner.
+    from app.core.models import Device
+    _device_ids = {c.device_id for c in temp_creds if c.device_id is not None}
+    _device_names = {}
+    if _device_ids:
+        for _d in db.query(Device.id, Device.label).filter(Device.id.in_(_device_ids)).all():
+            _device_names[_d.id] = _d.label
+
     for cred in temp_creds:
         # Get active sessions for this credential (only those within grace period)
         from datetime import timedelta
@@ -6260,6 +6272,13 @@ async def list_temp_credentials(
             # The authoritative FINISHED signal: set when the credential's connection closed (its cap
             # slot freed). NULL while it still holds a slot (active, or in use with a live connection).
             'slot_released_at': (cred.slot_released_at.isoformat() + 'Z') if cred.slot_released_at else None,
+            # Which door this credential belongs to (never its device id/secret): a boolean split for
+            # the two page sections, and the device's DISPLAY NAME for the per-computer section.
+            'is_device_credential': cred.device_id is not None,
+            'device_name': (_device_names.get(cred.device_id) if cred.device_id is not None else None),
+            # The credential-lifecycle label the per-computer section shows: active / in-use / expired, from
+            # is_active + slot_released_at + validity + the live-session count (page state == conn state).
+            'lifecycle': temp_cred_slot.display_lifecycle(cred, len(sessions_data), now),
             'active_sessions': sessions_data,
             'active_session_count': len(sessions_data),
             'note': cred.note,

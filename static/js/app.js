@@ -4557,7 +4557,15 @@ function renderTempCreds() {
     const countEl = document.getElementById('tc-count');
     if (countEl) countEl.textContent = `${visible.length} of ${list.length}`;
 
-    container.innerHTML = `
+    // Two sections: hand-out credentials (no device) keep today's expandable, actionable table; the
+    // per-computer sync credentials (minted by a registered device) get a read-only table naming
+    // WHICH computer minted each -- the device's display name, never its id or secret -- and the credential
+    // lifecycle state, so a finished credential reads Expired and never Active.
+    const shared = visible.filter(c => !c.is_device_credential);
+    const perComputer = visible.filter(c => c.is_device_credential);
+
+    const sharedSection = shared.length ? `
+        <h3 class="section-title mt-md" id="tc-shared-heading">Shared / handed-out</h3>
         <div class="card table-card">
             <div class="data-table-wrapper">
                 <table class="data-table exp-table">
@@ -4568,16 +4576,38 @@ function renderTempCreds() {
                         <th>Status</th>
                         <th>Expires</th>
                     </tr></thead>
-                    <tbody>${visible.map(renderTempCredRow).join('')}</tbody>
+                    <tbody>${shared.map(renderTempCredRow).join('')}</tbody>
                 </table>
             </div>
-        </div>
-        ${remaining > 0 ? `<div class="text-center mt-md">
-            <button id="tc-show-more" class="btn btn-secondary btn-sm" type="button">Show ${Math.min(50, remaining)} more · ${remaining} hidden</button>
-        </div>` : ''}`;
+        </div>` : '';
 
+    const perComputerSection = perComputer.length ? `
+        <h3 class="section-title mt-lg" id="tc-per-computer-heading">Per-computer sync credentials</h3>
+        <div class="card table-card">
+            <div class="data-table-wrapper">
+                <table class="data-table" id="tc-per-computer-table">
+                    <thead><tr>
+                        <th>Computer</th>
+                        <th>Credential</th>
+                        <th>Status</th>
+                        <th>Expires</th>
+                    </tr></thead>
+                    <tbody>${perComputer.map(renderPerComputerRow).join('')}</tbody>
+                </table>
+            </div>
+        </div>` : '';
+
+    container.innerHTML = sharedSection + perComputerSection +
+        (remaining > 0 ? `<div class="text-center mt-md">
+            <button id="tc-show-more" class="btn btn-secondary btn-sm" type="button">Show ${Math.min(50, remaining)} more · ${remaining} hidden</button>
+        </div>` : '');
+
+    // Countdown timers live only on the (expandable) shared rows; the per-computer rows show a static
+    // expiry, and startCountdownTimer is a no-op for them anyway (no countdown element).
     visible.forEach(cred => {
-        if (cred.is_active && !cred.is_used) startCountdownTimer(cred.temp_username, cred.expires_at);
+        if (!cred.is_device_credential && cred.is_active && !cred.is_used) {
+            startCountdownTimer(cred.temp_username, cred.expires_at);
+        }
     });
     const moreBtn = document.getElementById('tc-show-more');
     if (moreBtn) moreBtn.addEventListener('click', () => { tempCredsLimit += 50; renderTempCreds(); });
@@ -4637,6 +4667,30 @@ function toggleTempCredRow(id) {
 
 // Back-compat alias; renders one credential as an expandable table row pair.
 function renderTempCredItem(cred) { return renderTempCredRow(cred); }
+
+// The credential-lifecycle state as a badge. A finished credential (server lifecycle 'expired') reads
+// Expired, never Active -- the page state matches the connection state.
+function tcLifecycleBadge(lifecycle) {
+    if (lifecycle === 'in-use') return { label: 'In use', badge: 'info', data: 'active' };
+    if (lifecycle === 'active') return { label: 'Active', badge: 'success', data: 'active' };
+    return { label: 'Expired', badge: 'error', data: 'expired' };
+}
+
+// One per-computer sync credential: names WHICH computer minted it (the device display name, never
+// its id or secret) and its lifecycle state. Read-only -- these are auto-minted per sync run and
+// managed by revoking the device, not one credential at a time.
+function renderPerComputerRow(cred) {
+    const uname = escapeHtml(cred.temp_username);
+    const computer = cred.device_name ? escapeHtml(cred.device_name) : '(unnamed device)';
+    const lc = tcLifecycleBadge(cred.lifecycle);
+    return `
+        <tr class="cred-row" data-id="${uname}" data-status="${lc.data}">
+            <td class="tc-computer">${computer}</td>
+            <td><span class="mono cred-name">${uname}</span></td>
+            <td><span class="badge badge-${lc.badge}">${lc.label}</span></td>
+            <td><span class="mono cred-expires">${formatServerTime(cred.expires_at)}</span></td>
+        </tr>`;
+}
 function renderTempCredRow(cred) {
     const now = new Date();
     const expiresAt = parseServerTime(cred.expires_at);

@@ -754,7 +754,14 @@ class AuthService:
         # cares about (a non-admin cannot amplify past the cap by minting children).
         _max_temp = _tp_policy.get("max_temp_creds_per_user", 0)
         if _max_temp > 0:
-            _owner = self.db.query(User).filter(User.id == user_id).first()
+            # Lock the OWNER row FOR UPDATE and hold it across the cap COUNT and the INSERT+commit
+            # below (no commit intervenes), so two concurrent interactive mints for the same user
+            # cannot both pass the check-then-act at the boundary -- the same discipline the device
+            # mint uses on the device row. populate_existing() overwrites the cached instance with the
+            # locked row's committed state. A different user's mint locks a different row, so this
+            # serializes only same-user concurrency; an uncapped deployment (max 0) takes no lock.
+            _owner = (self.db.query(User).filter(User.id == user_id)
+                      .populate_existing().with_for_update().first())
             _exempt = (_owner is not None
                        and getattr(_owner, "role", None) == RoleEnum.ADMIN)
             if not _exempt:
