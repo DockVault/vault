@@ -38,7 +38,8 @@ MAX_BODY_BYTES = 512 * 1024  # cap the response we buffer/parse (fail-closed on 
 _USER_AGENT = "DockVault-update-check"
 
 # Process-level cache; re-checks after a restart, which is fine (no persistence needed).
-_cache = {"checked_at": 0.0, "latest": None, "url": None, "notes": None, "matrix": None}
+_cache = {"checked_at": 0.0, "latest": None, "url": None, "notes": None, "matrix": None,
+          "main_matrix": None, "main_fetched_at": None}
 # Serialize the outbound fetch so concurrent admin requests (this runs in FastAPI's sync-endpoint
 # threadpool) coalesce into ONE GitHub call per interval instead of a thundering herd at expiry.
 _fetch_lock = threading.Lock()
@@ -145,7 +146,9 @@ def get_update_status(current_version, enabled, managed, force=False, interval_s
                     # None: the banner then degrades to what it said before this existed, which is
                     # a worse banner but not a broken one.
                     _cache.update({"checked_at": time.time(), "latest": latest, "url": url,
-                                   "notes": notes, "matrix": _fetch_matrix(latest)})
+                                   "notes": notes, "matrix": _fetch_matrix(latest),
+                                   "main_matrix": fetch_main_matrix(),
+                                   "main_fetched_at": time.time()})
     latest = _cache["latest"]
     available = is_newer(latest, current_version)
     status = {
@@ -163,6 +166,14 @@ def get_update_status(current_version, enabled, managed, force=False, interval_s
         # verdict to a deployment that is already current would put a warning on the screen about
         # an upgrade nobody is being offered.
         status["upgrade"] = describe_hop(_cache.get("matrix"), current_version, latest)
+    # The deployment's OWN security posture, merged add-only from the copy on main into the bundled
+    # copy. Always present when the check runs (fail-safe source "bundled" when main is unreachable);
+    # never a false secure. The ceiling for a credible remote fix is the newest release we can see
+    # (latest), never the running version, so a fix in a newer release is still surfaced.
+    status["security"] = merged_security(
+        current_version, released_ceiling=latest,
+        local_matrix=_read_bundled_matrix(), main_matrix=_cache.get("main_matrix"),
+        fetched_at=_cache.get("main_fetched_at"))
     return status
 
 
@@ -310,3 +321,165 @@ def _fetch_matrix(tag):
         return _http_json(MATRIX_URL % (tag if str(tag).startswith("v") else "v%s" % tag))
     except Exception:  # noqa: BLE001 — fail-closed-silent, like the rest of this module
         return None
+
+
+# --- Lifecycle from main: the version's security posture can change AFTER its tag was cut ----------
+#
+# A version's own shipped matrix (and its tag-frozen copy) self-declares secure forever -- it cannot
+# know a vulnerability found later. So the security verdict for the DEPLOYMENT'S OWN version is read
+# from the bundled copy MERGED, add-only, with the copy on main:
+#   secure  = bundled AND main       (main can only ADD an insecure verdict, never clear one)
+#   eol     = bundled OR main
+#   vulns   = UNION (dedupe title+fixed_in)  support-end dates = the EARLIER
+# No source is preferred and nothing is ever cleared; a retraction is a code release. The merge can
+# only TIGHTEN, so a poisoned main can raise a false warning but can NEVER produce a false secure.
+# The host tool applies the same rule for its own display; a test feeds both the same matrices and
+# asserts they agree, since the two live apart (the tool is stdlib-only, host-side).
+MAIN_MATRIX_URL = "https://raw.githubusercontent.com/DockVault/vault/main/docs/upgrade-matrix.json"
+
+
+def _version_support(matrix, version):
+    """The `support` block for `version`, or {} (tolerant: an old/permissive matrix reads as
+    'nothing stated', never an error)."""
+    if not isinstance(matrix, dict):
+        return {}
+    version = (version or "").lstrip("vV")
+    meta = (matrix.get("versions") or {}).get(version) or {}
+    support = meta.get("support")
+    return support if isinstance(support, dict) else {}
+
+
+def _version_vulnerabilities(matrix, version):
+    """The declared vulnerabilities for `version`, or []. Tolerant like _version_support."""
+    if not isinstance(matrix, dict):
+        return []
+    version = (version or "").lstrip("vV")
+    meta = (matrix.get("versions") or {}).get(version) or {}
+    vulns = meta.get("vulnerabilities")
+    return vulns if isinstance(vulns, list) else []
+
+
+def _credible_remote_vulns(remote_vulns, released_ceiling):
+    """Drop a remote vulnerability whose `fixed_in` names a version NEWER than the newest RELEASE the
+    consumer can see -- an unreleased fix is not a credible disclosure (a poisoning tell). The ceiling
+    is the newest RELEASE tag, NEVER the running version, so a fix in a newer-but-released version is
+    kept (else exactly the deployments this exists for would drop the warning). A vuln with no fix
+    stated (a known-unpatched one) is kept; an unparseable ceiling keeps everything (never over-drop)."""
+    ceil = _parse_semver(released_ceiling)
+    out = []
+    for v in remote_vulns:
+        if not isinstance(v, dict):
+            continue
+        fx = _parse_semver(v.get("fixed_in"))
+        if fx is None or ceil is None or fx <= ceil:
+            out.append(v)
+    return out
+
+
+def _earlier_date(a, b):
+    """The earlier of two ISO (YYYY-MM-DD) date strings; whichever is present when only one is.
+    ISO dates sort chronologically as strings. Add-only: support never ends LATER than either says."""
+    present = [d for d in (a, b) if isinstance(d, str) and d]
+    return min(present) if present else None
+
+
+def _merge_support(local_s, remote_s):
+    """Add-only merge of two `support` blocks: insecure if EITHER is insecure, eol if EITHER is eol,
+    support-end the EARLIER. Never lets the remote CLEAR a local insecure/eol, and never sets secure
+    (so no false secure:true)."""
+    merged = dict(local_s or {})
+    if local_s.get("secure") is False or remote_s.get("secure") is False:
+        merged["secure"] = False
+    if local_s.get("eol") is True or remote_s.get("eol") is True:
+        merged["eol"] = True
+    for key in ("code_support", "security_support"):
+        d = _earlier_date(local_s.get(key), remote_s.get(key))
+        if d is not None:
+            merged[key] = d
+    return merged
+
+
+def _merge_vulnerabilities(local_vulns, remote_vulns):
+    """Union of two vulnerability lists, deduped by (title, fixed_in). Local (bundled) entries are
+    always kept; the remote can only ADD."""
+    seen, out = set(), []
+    for v in list(local_vulns or []) + list(remote_vulns or []):
+        if not isinstance(v, dict):
+            continue
+        key = (v.get("title"), v.get("fixed_in"))
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def _read_bundled_matrix():
+    """The upgrade matrix shipped in THIS image (the offline copy), or None. Never raises."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in ("/app/docs/upgrade-matrix.json",
+                 os.path.join(here, "..", "..", "docs", "upgrade-matrix.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+        except Exception:  # noqa: BLE001 — an unreadable/absent copy is just 'no bundled matrix'
+            continue
+    return None
+
+
+def fetch_main_matrix(opener=None):
+    """The lifecycle matrix on MAIN (fixed URL), or None. Bounded (timeout + size cap) and fail-safe:
+    any error, oversized body, or wrong shape yields None so the caller uses the bundled copy. Never
+    raises. TLS-to-GitHub-authenticated and nothing more, which is why the merge that consumes it is
+    add-only (a compromised copy can only tighten, never clear or falsely secure)."""
+    try:
+        data = _http_json(MAIN_MATRIX_URL)
+    except Exception:  # noqa: BLE001 — fail-closed-silent like the rest of this module
+        return None
+    if isinstance(data, dict) and isinstance(data.get("versions"), dict):
+        return data
+    return None
+
+
+_UNSET = object()
+
+
+def merged_security(current_version, released_ceiling, *, local_matrix=_UNSET, main_matrix=_UNSET, fetched_at=None):
+    """The `security` block for `current_version`, merging the copy on main ADD-ONLY into the bundled
+    copy. Returns {secure, vulnerabilities:[{title, fixed_in}], source, fetched_at}:
+      * source 'main' when main's copy was available and merged, else 'bundled' (fail-safe);
+      * secure is False when EITHER copy marks it insecure OR any vulnerability is listed; it is only
+        True when nothing -- bundled or main -- says otherwise, so the merge never produces a false
+        secure:true;
+      * vulnerabilities are the union, each reduced to {title, fixed_in}, with a remote fix newer than
+        `released_ceiling` (the newest release the consumer can see) dropped as not credible.
+    `local_matrix`/`main_matrix` are injectable for tests; by default the bundled copy is read from
+    the image and main is fetched here."""
+    import time as _time
+    # A sentinel default distinguishes "not provided -> obtain it here" from an explicit None, which
+    # means "unavailable" (an unreachable main, an unreadable bundled copy) and must be honoured, not
+    # re-fetched -- so the caller can pass a cached/absent copy and get the fail-safe verdict.
+    local_matrix = _read_bundled_matrix() if local_matrix is _UNSET else local_matrix
+    if main_matrix is _UNSET:
+        main_matrix = fetch_main_matrix()
+    source = "main" if main_matrix is not None else "bundled"
+
+    local_s = _version_support(local_matrix, current_version)
+    local_v = _version_vulnerabilities(local_matrix, current_version)
+    remote_s = _version_support(main_matrix, current_version)
+    remote_v = _credible_remote_vulns(_version_vulnerabilities(main_matrix, current_version),
+                                      released_ceiling)
+
+    support = _merge_support(local_s, remote_s)
+    vulns = _merge_vulnerabilities(local_v, remote_v)
+    # secure is False on an explicit insecure verdict OR any listed vulnerability; True only when the
+    # merged view says nothing bad. Never a false secure: the remote can add badness, never remove it.
+    secure = not (support.get("secure") is False or bool(vulns))
+    return {
+        "secure": secure,
+        "vulnerabilities": [{"title": v.get("title"), "fixed_in": v.get("fixed_in")} for v in vulns],
+        "source": source,
+        "fetched_at": fetched_at if fetched_at is not None else _time.time(),
+    }

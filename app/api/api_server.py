@@ -2090,8 +2090,11 @@ def get_update_status_endpoint(force: bool = False,
 
     Gated behind an interactive admin so the (mildly fingerprint-aiding) 'outdated?' signal is
     not exposed publicly like /version is. Returns {enabled, managed, current, latest,
-    update_available, url, notes, checked_at, interval_minutes}; the check itself is
-    fail-closed-silent and only ever runs when UPDATE_CHECK_ENABLED is set (never when managed)."""
+    update_available, url, notes, checked_at, interval_minutes}, plus a `security` block for THIS
+    version's own posture (secure / vulnerabilities / source / fetched_at), merged add-only from the
+    copy on main into the bundled copy -- fail-safe to the bundled verdict, never a false secure. The
+    check itself is fail-closed-silent and only ever runs when UPDATE_CHECK_ENABLED is set (never when
+    managed)."""
     from app.services import update_check
     interval = _effective_update_interval_minutes(db)
     status = update_check.get_update_status(
