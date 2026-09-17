@@ -74,3 +74,17 @@ def test_every_refusal_aborts_the_connection_by_construction():
     assert body.count("_refuseTooLarge()") >= 3
     # The refusal names the administrator action (LOW: not just "open over https").
     assert "ask an administrator to serve the site over https" in body
+
+
+def test_the_service_worker_activation_wait_is_bounded():
+    # navigator.serviceWorker.ready never rejects and never resolves when a worker cannot activate
+    # (blocked / throws on install), so a blind await hangs the download with no refusal. dvSinkWorker
+    # must bound the wait so a blocked worker resolves to "no sink" -> the caller refuses (with abort)
+    # an over-threshold file. (mutation: drop the Promise.race timer -> the wait is unbounded -> red.)
+    js = _js()
+    fn = js[js.index("async function dvSinkWorker("):js.index("async function dvOpenDownloadSink(")]
+    assert "Promise.race([" in fn
+    assert "navigator.serviceWorker.ready" in fn
+    assert "setTimeout(" in fn and "reject(" in fn      # the bounding timer that rejects on expiry
+    # A blocked/failed activation returns null (no sink), which routes the caller to refuse+abort.
+    assert "return null;" in fn

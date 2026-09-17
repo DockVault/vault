@@ -13318,11 +13318,25 @@ async function dvSinkWorker() {
     if (!('serviceWorker' in navigator) || !window.isSecureContext) return null;
     try {
         const registration = await navigator.serviceWorker.register('/download-sw.js', { scope: '/' });
-        await navigator.serviceWorker.ready;
+        // BOUND the activation wait. navigator.serviceWorker.ready never rejects by spec, and it also
+        // never RESOLVES when activation cannot happen (a worker that throws on install, a policy or
+        // extension that blocks activation) -- so a blind `await ...ready` hangs the download forever
+        // with no refusal. Race it against a short timer (same order as the 5 s 'dv-sink-ready' wait
+        // in dvOpenDownloadSink); on expiry there is no usable sink, so return null and let the caller
+        // refuse an over-threshold file (with the connection abort) or buffer a small one. Prefer the
+        // already-active registration if one is present, so a fast/warm worker needs no wait at all.
+        const _ready = registration.active
+            ? Promise.resolve()
+            : Promise.race([
+                navigator.serviceWorker.ready,
+                new Promise((resolve, reject) => setTimeout(() => reject(new Error('sw-activation-timeout')), 5000)),
+            ]);
+        await _ready;
         _sinkWorker = registration.active || navigator.serviceWorker.controller;
-        return _sinkWorker;
+        return _sinkWorker || null;
     } catch (_) {
-        // A deployment that cannot register one simply does not stream. The caller falls back.
+        // A deployment that cannot register one (or whose worker never activates in time) simply does
+        // not stream. The caller falls back: refuse an over-threshold file, buffer a small one.
         return null;
     }
 }
