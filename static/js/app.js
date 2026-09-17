@@ -7883,8 +7883,39 @@ function renderUpdateBanner(us) {
 // --- Update-check controls (opt-in; admin-only endpoint) --------------------------------------
 let _updatePollId = null;
 
+function renderSecurityBanner(us) {
+    // The deployment's OWN version security posture, from /api/update-status's security block (merged
+    // add-only from the copy on main into the bundled copy). Shown ONLY on a concrete insecure
+    // verdict; a secure or absent block hides it (an "assume the worst" banner about the running
+    // version would be noise). Rendered via textContent with a hard length cap and NO link -- the
+    // matrix text is untrusted (main is fetched), so any escape or markup in it is inert here.
+    const banner = document.getElementById('security-banner');
+    if (!banner) return;
+    const sec = us && us.security;
+    if (!sec || sec.secure !== false) { banner.style.display = 'none'; return; }
+    const el = document.getElementById('security-banner-text');
+    if (el) {
+        const CAP = 300;
+        const vulns = Array.isArray(sec.vulnerabilities) ? sec.vulnerabilities : [];
+        const n = vulns.length;
+        const fixes = [];
+        for (const v of vulns) {
+            const f = v && v.fixed_in ? String(v.fixed_in).slice(0, 40) : '';
+            if (f && !fixes.includes(f)) { fixes.push(f); }
+        }
+        const fixed = fixes.length ? ` \u2014 fixed in ${fixes.join(', ')}` : '';
+        const src = sec.source === 'main' ? 'per the current matrix on main' : 'per this release matrix';
+        const msg = n > 0
+            ? `This version has ${n} known ${n === 1 ? 'vulnerability' : 'vulnerabilities'}${fixed} (${src}).`
+            : `This version has known unpatched vulnerabilities (${src}).`;
+        el.textContent = msg.slice(0, CAP);   // textContent + cap: no HTML, no link, bounded length
+    }
+    banner.style.display = '';
+}
+
 function renderUpdateStatus(us) {
     renderUpdateBanner(us);
+    renderSecurityBanner(us);
     const controls = document.getElementById('update-controls');
     if (!controls) return;
     // Only expose the check-now + interval controls when the check is enabled and not managed.
