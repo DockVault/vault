@@ -13309,36 +13309,72 @@ function zkDownloadHeaders() {
 // docs/design/vault-download-sink-and-policy.md for what it costs.
 
 let _sinkWorker = null;
+// Why the last dvSinkWorker() call produced no sink, so _refuseTooLarge can pick honest wording:
+//   'timeout-installing' -> a first-visit worker still installing at the backstop; a retry will work.
+//   'redundant' / 'unsupported' / 'register-failed' / 'blocked' -> this browser cannot stream here.
+// Reset per download; only a no-sink outcome sets it (a successful sink clears it to null).
+let _sinkUnavailableReason = null;
 
 async function dvSinkWorker() {
     // Registered lazily, never at boot. A service worker is origin-wide and persistent; installing
     // one on every visitor to support a mode most deployments do not enable would be a large,
     // invisible change for no benefit.
+    //
+    // Returns the active worker, or null when there is no usable sink -- and NEVER throws (a throw
+    // would surface inside dvTryStandardStreamedDownload's try as 'failed', showing the wrong
+    // message and skipping the refusal). On a no-sink outcome it records WHY in _sinkUnavailableReason
+    // so the refusal can choose honest wording, and it does NOT cache _sinkWorker, so a later attempt
+    // succeeds once a worker activates.
     if (_sinkWorker) return _sinkWorker;
-    if (!('serviceWorker' in navigator) || !window.isSecureContext) return null;
-    try {
-        const registration = await navigator.serviceWorker.register('/download-sw.js', { scope: '/' });
-        // BOUND the activation wait. navigator.serviceWorker.ready never rejects by spec, and it also
-        // never RESOLVES when activation cannot happen (a worker that throws on install, a policy or
-        // extension that blocks activation) -- so a blind `await ...ready` hangs the download forever
-        // with no refusal. Race it against a short timer (same order as the 5 s 'dv-sink-ready' wait
-        // in dvOpenDownloadSink); on expiry there is no usable sink, so return null and let the caller
-        // refuse an over-threshold file (with the connection abort) or buffer a small one. Prefer the
-        // already-active registration if one is present, so a fast/warm worker needs no wait at all.
-        const _ready = registration.active
-            ? Promise.resolve()
-            : Promise.race([
-                navigator.serviceWorker.ready,
-                new Promise((resolve, reject) => setTimeout(() => reject(new Error('sw-activation-timeout')), 5000)),
-            ]);
-        await _ready;
-        _sinkWorker = registration.active || navigator.serviceWorker.controller;
-        return _sinkWorker || null;
-    } catch (_) {
-        // A deployment that cannot register one (or whose worker never activates in time) simply does
-        // not stream. The caller falls back: refuse an over-threshold file, buffer a small one.
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) {
+        _sinkUnavailableReason = 'unsupported';
         return null;
     }
+    let registration;
+    try {
+        registration = await navigator.serviceWorker.register('/download-sw.js', { scope: '/' });
+    } catch (_) {
+        _sinkUnavailableReason = 'register-failed';   // script unreachable / registration refused
+        return null;
+    }
+    if (registration.active) {                        // warm worker: no wait at all
+        _sinkWorker = registration.active;
+        _sinkUnavailableReason = null;
+        return _sinkWorker;
+    }
+    // Race THREE signals rather than a blind `await ready` (which never settles when activation cannot
+    // happen): (1) serviceWorker.ready -> a worker is active + controlling; (2) the installing worker
+    // reaching 'activated' (same success) or 'redundant' (threw on install -> will NEVER activate ->
+    // resolve no-sink IMMEDIATELY, no timer); (3) a backstop timer for states with no event at all
+    // (blocked by policy so nothing installs; an extension swallowing activation) -- generous enough
+    // for a real first-visit install on a slow device (5 s, the sink-ready order of magnitude).
+    const installing = registration.installing || registration.waiting;
+    const outcome = await new Promise((resolve) => {
+        let settled = false;
+        const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+        navigator.serviceWorker.ready
+            .then(() => done({ sink: registration.active || navigator.serviceWorker.controller }))
+            .catch(() => { /* ready never rejects; the timer/redundant paths settle this */ });
+        if (installing) {
+            installing.addEventListener('statechange', () => {
+                if (installing.state === 'activated') {
+                    done({ sink: registration.active || navigator.serviceWorker.controller });
+                } else if (installing.state === 'redundant') {
+                    done({ reason: 'redundant' });    // definitively will not activate
+                }
+            });
+        }
+        setTimeout(() => done({
+            reason: (installing && installing.state === 'installing') ? 'timeout-installing' : 'blocked',
+        }), 5000);
+    });
+    if (outcome.sink) {
+        _sinkWorker = outcome.sink;                   // cache ONLY on success
+        _sinkUnavailableReason = null;
+        return _sinkWorker;
+    }
+    _sinkUnavailableReason = outcome.reason;          // 'redundant' | 'timeout-installing' | 'blocked'; NOT cached
+    return null;
 }
 
 /**
@@ -14252,6 +14288,7 @@ async function _downloadFile(fileId, fileName) {
     // -- it just lets the user stop one.) Declared before the try so the catch can tell a
     // user-initiated cancel from a genuine failure.
     const _dlAbort = new AbortController();
+    _sinkUnavailableReason = null;   // a fresh download; only this run's sink attempt may set it
     const _finfo = (state.currentFiles || []).find(i => i.id === fileId) || {};
     const _fsize = Number(_finfo.size) || 0;
     const _fmime = _finfo.mime_type || 'application/octet-stream';
@@ -14284,10 +14321,18 @@ async function _downloadFile(fileId, fileName) {
             // return happens after _peekStream has locked response.body, so response.body.cancel()
             // would throw -- the controller abort tears the connection down regardless of the lock.
             try { _dlAbort.abort(); } catch (_) { /* nothing in flight to abort */ }
-            showError(`"${fileName}" is ${formatBytes ? formatBytes(_fsize) : _fsize + ' B'} and this browser/context `
-                + `can't stream it to disk, so it is too large to download here. Streaming needs a secure `
-                + `https context with a service worker; ask an administrator to serve the site over https `
-                + `and enable streaming downloads, or use the SFTP sync path for very large files.`);
+            const _sz = formatBytes ? formatBytes(_fsize) : _fsize + ' B';
+            if (_sinkUnavailableReason === 'timeout-installing') {
+                // A first-visit worker was still installing at the backstop -- a retry after it
+                // finishes will stream, so say so rather than "this browser can't stream".
+                showError(`"${fileName}" (${_sz}) is too large to download until streaming is ready. `
+                    + `The streaming helper is still starting up on this first visit -- try again in a moment.`);
+                return;
+            }
+            showError(`"${fileName}" is ${_sz} and this browser/context can't stream it to disk, so it is `
+                + `too large to download here. Streaming needs a secure https context with a service worker; `
+                + `ask an administrator to serve the site over https and enable streaming downloads, or use `
+                + `the SFTP sync path for very large files.`);
         };
         if (state.downloadSink !== 'streaming' && _fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
             _refuseTooLarge();

@@ -76,15 +76,50 @@ def test_every_refusal_aborts_the_connection_by_construction():
     assert "ask an administrator to serve the site over https" in body
 
 
-def test_the_service_worker_activation_wait_is_bounded():
-    # navigator.serviceWorker.ready never rejects and never resolves when a worker cannot activate
-    # (blocked / throws on install), so a blind await hangs the download with no refusal. dvSinkWorker
-    # must bound the wait so a blocked worker resolves to "no sink" -> the caller refuses (with abort)
-    # an over-threshold file. (mutation: drop the Promise.race timer -> the wait is unbounded -> red.)
+def _sinkworker_src():
     js = _js()
-    fn = js[js.index("async function dvSinkWorker("):js.index("async function dvOpenDownloadSink(")]
-    assert "Promise.race([" in fn
+    return js[js.index("async function dvSinkWorker("):js.index("async function dvOpenDownloadSink(")]
+
+
+def test_the_service_worker_activation_wait_is_bounded():
+    # navigator.serviceWorker.ready never rejects and never resolves when a worker cannot activate,
+    # so a blind await hangs the download with no refusal. The wait is bounded by a backstop timer
+    # raced against ready + the installing worker's statechange. (mutation: drop the timer -> the
+    # blocked-activation case is unbounded and hangs again -> red.)
+    fn = _sinkworker_src()
     assert "navigator.serviceWorker.ready" in fn
-    assert "setTimeout(" in fn and "reject(" in fn      # the bounding timer that rejects on expiry
-    # A blocked/failed activation returns null (no sink), which routes the caller to refuse+abort.
-    assert "return null;" in fn
+    assert "setTimeout(" in fn                          # the backstop timer for no-event states
+    assert "new Promise((resolve)" in fn                # the three-signal race
+
+
+def test_a_redundant_worker_resolves_no_sink_immediately():
+    # A worker that throws on install goes 'redundant' -- definitively will not activate -- so the
+    # statechange listener resolves no-sink AT ONCE, not after the timer. (mutation: drop the
+    # statechange listener -> a dead worker waits the full timer -> red.)
+    fn = _sinkworker_src()
+    assert "addEventListener('statechange'" in fn
+    assert "'redundant'" in fn
+    assert "installing.state === 'redundant'" in fn
+
+
+def test_the_worker_is_not_cached_on_a_failure():
+    # _sinkWorker is assigned ONLY on a real sink (ready/activated), never on redundant/timeout/
+    # blocked -- so a later download succeeds once a worker activates. (mutation: cache on failure ->
+    # a transient block would permanently disable streaming for the tab.)
+    fn = _sinkworker_src()
+    # Every `_sinkWorker = ` assignment sits with a success return, never on the reason path.
+    assert "_sinkUnavailableReason = outcome.reason;" in fn
+    reason_path = fn[fn.index("_sinkUnavailableReason = outcome.reason;"):]
+    assert "_sinkWorker =" not in reason_path           # no cache after the reason is set
+
+
+def test_the_refusal_wording_is_reason_driven():
+    # A first-visit worker still installing at the backstop -> "try again in a moment" (a retry
+    # works), NOT "this browser can't stream". Every other reason keeps the can't-stream/admin text.
+    # (mutation: collapse the branch -> the installing case shows the wrong message -> red.)
+    body = _download_fn()
+    assert "_sinkUnavailableReason === 'timeout-installing'" in body
+    branch = body[body.index("_sinkUnavailableReason === 'timeout-installing'"):]
+    assert "try again in a moment" in branch[:700]
+    # the reason is reset per download so a pre-fetch refusal never reads a stale value
+    assert "_sinkUnavailableReason = null;" in body
