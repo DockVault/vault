@@ -132,3 +132,44 @@ def test_a_throttled_unknown_name_at_the_sftp_door_does_not_burn_a_verify(monkey
         svc.authenticate_temporary_credential("temp_ghost", "cred", "203.0.113.9",
                                               allow_device_credential=True)
     assert verifies == [], "the throttled-unknown SFTP refusal burned a verify — it must stay cheap"
+
+
+# ---- the web door REFUSES a device-sync credential (offline, fail-loud; not skip-gated) ----------
+def _service_reaching_the_device_check(cred):
+    # Drive authenticate_temporary_credential PAST the throttle and the verify so the device-sync
+    # refusal branch is reached: throttles no-op, the credential verifies, failed-login recording is
+    # a no-op. Pure unit -- no Redis, no DB, no argon2 -- so it runs in the offline lane and cannot
+    # pass by skipping (the integration module that also pins this DOES skip without a stack).
+    svc = AuthService.__new__(AuthService)
+    svc.db = _FakeDB(cred)
+    svc._check_rate_limit = lambda *a, **k: None
+    svc._check_device_rate_limit = lambda *a, **k: None
+    svc._check_username_rate_limit = lambda *a, **k: None
+    svc._record_failed_login = lambda *a, **k: None
+    return svc
+
+
+def test_the_web_door_refuses_a_device_sync_credential_offline():
+    # A device-minted sync credential (device_id set) presented at the WEB door
+    # (allow_device_credential=False) is REFUSED after it verifies -- it has no interactive use.
+    # (mutation: replace the `raise InvalidCredentialsError("device sync credential presented at the
+    # web login")` with `pass` -> this offline assertion goes red, so the refusal can no longer be
+    # dropped while the offline lane stays green.)
+    from app.services.auth_service import InvalidCredentialsError
+
+    class _DeviceCred:
+        device_id = "dev-abc"
+        credential_hash = "irrelevant-hash"
+
+    svc = _service_reaching_the_device_check(_DeviceCred())
+    A_mod = __import__("app.services.auth_service", fromlist=["verify_temporary_credential"])
+    _orig = A_mod.verify_temporary_credential
+    A_mod.verify_temporary_credential = lambda *a, **k: True   # the credential verifies
+    try:
+        with pytest.raises(InvalidCredentialsError) as exc:
+            svc.authenticate_temporary_credential(
+                "temp_dev", "whatever", "203.0.113.9", allow_device_credential=False)
+    finally:
+        A_mod.verify_temporary_credential = _orig
+    # The DISTINCT internal message (audit/security-monitor honesty), never the wire body.
+    assert "device sync credential presented at the web login" in str(exc.value)

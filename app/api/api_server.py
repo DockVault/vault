@@ -3891,9 +3891,10 @@ async def pull_logs(
     # valid token, but not scoped for this component
     if service not in log_pull.validate_scope(token.scope):
         raise HTTPException(status_code=403, detail="Token not scoped for this component")
-    # Phase 1 serves only web/sftp (from the sink); db-diag/redis-diag arrive in Phase 2.
+    # Only the sink-backed components (web/sftp) are served here; others (db-diag/redis-diag) are
+    # recognised and scoped but have no served log source yet, so they 404 rather than error.
     if service not in log_pull.SERVEABLE_COMPONENTS:
-        raise HTTPException(status_code=404, detail="Component logs not available in this phase")
+        raise HTTPException(status_code=404, detail="Logs are not available for this component")
     tail = max(1, min(int(tail or 500), 5000))
     svc_lines = log_pull.filter_service_lines(_read_sink_lines(), service)
     truncated = len(svc_lines) > tail
