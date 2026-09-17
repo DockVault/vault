@@ -15812,7 +15812,60 @@ async def list_vault_files(
                 entry['name'] = None if _zk_sealed(file.enc_name) else _ZK_UNSEALED
                 entry['mime_type'] = None
             items.append(entry)
-        
+
+        # In-flight upload markers (Standard vaults only): UNION the ephemeral "uploading by
+        # <member>" rows an SFTP write-open published for THIS folder, as disabled rows the SPA
+        # renders non-interactive. Best-effort -- with Redis down list_folder returns [] (no rows),
+        # so an outage never blocks the listing or invents rows. The FINAL name is decrypted here
+        # (the server holds the Standard filename key). A scoped principal sees a marker only where
+        # it may see this folder's files (the folder is in its file scope), and the uploader identity
+        # is revealed only to a member-grade principal -- never a scoped cred / share recipient --
+        # mirroring modified_by_name.
+        if not is_zk:
+            from app.core import upload_marker as _um
+            from app.core.security import decrypt_upload_marker_name as _dec_marker
+            from app.core.temp_scope import scope_ids as _scope_ids
+            from app.core.id_scope import id_in_scope as _id_in_scope
+            _scope = _scope_ids(current_user, vault_id)
+            _folder_visible = (
+                _scope is None
+                or (folder_uuid is not None
+                    and _id_in_scope(_scope, str(folder_uuid),
+                                     folder_ancestry(db, vault_id, folder_uuid))))
+            _marker_rows = _um.list_folder(vault_id, folder_uuid) if _folder_visible else []
+            if _marker_rows:
+                _m_names = {}
+                if _show_actor:
+                    _m_uuids = []
+                    for _mid in {mr.get("member_id") for mr in _marker_rows if mr.get("member_id")}:
+                        try:
+                            _m_uuids.append(uuid.UUID(_mid))
+                        except (ValueError, TypeError):
+                            pass
+                    if _m_uuids:
+                        for _uid, _uname in db.query(User.id, User.username).filter(
+                                User.id.in_(_m_uuids)).all():
+                            _m_names[str(_uid)] = _uname
+                _now_iso = datetime.utcnow().isoformat()
+                for _r in _marker_rows:
+                    try:
+                        _final = _dec_marker(vault_id, folder_uuid, _r["enc_name"])
+                    except Exception:  # noqa: BLE001 -- a marker that won't decrypt here is skipped
+                        continue
+                    items.append({
+                        'id': 'upload:' + str(_r["enc_name"])[:22],  # synthetic; never a real file id
+                        'name': _final,
+                        'type': 'file',
+                        'size': 0,                 # no percentage / size for an in-flight row
+                        'mime_type': None,
+                        'modified': _now_iso,
+                        'has_password': False,
+                        'in_progress': True,       # the SPA renders this row disabled
+                        'uploading_by': (_m_names.get(_r.get("member_id")) if _show_actor else None),
+                        'key_version': None,
+                        'modified_by_name': None,
+                    })
+
         response_data = {'items': items}
         
         # Use conditional response with ETag - critical for 5s polling optimization

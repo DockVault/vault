@@ -11448,8 +11448,9 @@ function renderVaultFiles() {
     const view = state.filesView === 'grid' ? 'grid' : 'table';
     const canWrite = state.canWriteCurrentVault !== false;
 
-    // Drop any selected ids that are no longer present (e.g. after navigation).
-    const fileIds = new Set(items.filter(i => i.type !== 'folder').map(i => i.id));
+    // Drop any selected ids that are no longer present (e.g. after navigation). In-flight upload
+    // rows are synthetic (no real file id) and never selectable, so they are excluded here.
+    const fileIds = new Set(items.filter(i => i.type !== 'folder' && !i.in_progress).map(i => i.id));
     state.selectedFileIds.forEach(id => { if (!fileIds.has(id)) state.selectedFileIds.delete(id); });
 
     const tableWrap = document.getElementById('vault-files-table-wrap');
@@ -11549,6 +11550,27 @@ function renderFilesTable(items, canWrite, tbody) {
     if (!tbody) return;
     if (!items.length) { tbody.innerHTML = filesEmptyStateHtml(false); return; }
     tbody.innerHTML = items.map(item => {
+        // An in-flight SFTP upload: a disabled row (no select, no preview, no actions) that shows
+        // the FINAL name and, to a member-grade viewer, who is uploading it. Removed when the marker
+        // clears on the uploader's close.
+        if (item.in_progress) {
+            const by = item.uploading_by ? ` by ${escapeHtml(item.uploading_by)}` : '';
+            return `
+            <tr class="is-uploading" aria-disabled="true" style="opacity:.6;" title="Upload in progress">
+                <td class="col-check"></td>
+                <td>
+                    <div class="file-name">
+                        <span class="file-icon">${getFileIcon(item.name)}</span>
+                        <span>${escapeHtml(item.name)}</span>
+                    </div>
+                </td>
+                <td class="col-num"><span class="file-size">—</span></td>
+                <td><span class="file-type">Uploading…</span></td>
+                <td><span class="file-modified">—</span></td>
+                <td><span class="file-modified-by">uploading${by}</span></td>
+                <td class="col-actions"></td>
+            </tr>`;
+        }
         const isFolder = item.type === 'folder';
         const icon = isFolder ? iconSvg('folder') : getFileIcon(item.name);
         const size = isFolder ? '—' : formatBytes(item.size);
@@ -11581,6 +11603,17 @@ function renderFilesGrid(items, canWrite, grid) {
     if (!grid) return;
     if (!items.length) { grid.innerHTML = filesEmptyStateHtml(true); return; }
     grid.innerHTML = items.map(item => {
+        // In-flight SFTP upload: a disabled tile (no select/preview/actions) naming the final file
+        // and, for a member-grade viewer, its uploader. Gone when the uploader's marker clears.
+        if (item.in_progress) {
+            const by = item.uploading_by ? ` by ${escapeHtml(item.uploading_by)}` : '';
+            return `
+            <div class="file-tile is-uploading" aria-disabled="true" style="opacity:.6;" title="Upload in progress">
+                <div class="tile-icon">${getFileIcon(item.name)}</div>
+                <div class="file-name tile-name">${escapeHtml(item.name)}</div>
+                <div class="tile-meta">Uploading${by}…</div>
+            </div>`;
+        }
         const isFolder = item.type === 'folder';
         const icon = isFolder ? iconSvg('folder') : getFileIcon(item.name);
         const meta = isFolder ? 'Folder' : formatBytes(item.size);
@@ -12157,7 +12190,7 @@ function setupFilesViewControls() {
     const all = document.getElementById('files-select-all');
     if (all) all.addEventListener('change', () => {
         if (!(state.selectedFileIds instanceof Set)) state.selectedFileIds = new Set();
-        const files = (state.currentFiles || []).filter(i => i.type !== 'folder');
+        const files = (state.currentFiles || []).filter(i => i.type !== 'folder' && !i.in_progress);
         if (all.checked) files.forEach(i => state.selectedFileIds.add(i.id));
         else state.selectedFileIds.clear();
         renderVaultFiles();
