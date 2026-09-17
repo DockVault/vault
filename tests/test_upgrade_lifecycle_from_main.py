@@ -167,3 +167,24 @@ def test_the_merge_bounds_an_oversized_or_nonstring_title_and_fixed_in():
     assert len(vs) == 1
     assert isinstance(vs[0]["title"], str) and len(vs[0]["title"]) <= 200
     assert vs[0]["fixed_in"] == "999"
+
+
+def test_an_unhashable_remote_title_or_fixed_in_does_not_raise_and_is_coerced():
+    # {} / [] in a title or fixed_in is unhashable -- the dedupe key would have raised. Normalising at
+    # read makes the key hashable and coerces the entry; the merge succeeds (source main).
+    merged, source = _merged(_matrix(V),
+                             _matrix(V, secure=False, vulns=[{"title": [], "fixed_in": {}}]))
+    assert source == "main"
+    vs = dv.version_vulnerabilities(merged, V)
+    assert len(vs) == 1
+    assert isinstance(vs[0]["title"], str) and isinstance(vs[0]["fixed_in"], str)
+
+
+def test_a_raising_merge_falls_back_to_the_local_matrix(monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("merge blew up")
+    monkeypatch.setattr(dv, "_merge_vulnerabilities", _boom)
+    local = _matrix(V, secure=False)
+    merged, source = dv.merge_lifecycle_matrix(local, _matrix(V, secure=True), "0.30.0")
+    assert source == "local"
+    assert merged is local   # untouched; the tool's upgrade path never crashes on a bad remote

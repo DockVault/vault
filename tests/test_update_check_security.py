@@ -219,3 +219,41 @@ def test_secure_is_none_when_neither_source_knows_the_version():
 def test_secure_is_true_when_a_source_lists_the_version_and_nothing_is_wrong():
     b = U.merged_security(V, "0.30.0", local_matrix=_matrix(V), main_matrix=None)
     assert b["secure"] is True   # the bundled copy vouches for a version it actually lists
+
+
+# ---- unhashable / malformed remote entries must not crash the merge ------------------------------
+def test_an_unhashable_remote_title_or_fixed_in_does_not_raise_and_is_coerced():
+    # {} / [] in a title or fixed_in passes the shape check but is unhashable -- the dedupe key would
+    # have raised before the bound ran. Normalising at read makes the key hashable; the entry merges.
+    b = U.merged_security(V, "0.30.0", local_matrix=_matrix(V),
+                          main_matrix=_matrix(V, secure=False, vulns=[{"title": [], "fixed_in": {}}]))
+    assert b["source"] == "main"
+    assert len(b["vulnerabilities"]) == 1
+    v = b["vulnerabilities"][0]
+    assert isinstance(v["title"], str) and isinstance(v["fixed_in"], str)
+
+
+def test_a_raising_merge_falls_back_to_the_bundled_verdict(monkeypatch):
+    # Defence in depth: if the merge path itself raises, the block is the bundled verdict, computed
+    # without the merge, so the status never 500s.
+    def _boom(*a, **k):
+        raise RuntimeError("merge blew up")
+    monkeypatch.setattr(U, "_merge_vulnerabilities", _boom)
+    b = U.merged_security(V, "0.30.0",
+                          local_matrix=_matrix(V, secure=False, vulns=[{"title": "X", "fixed_in": "0.29.1"}]),
+                          main_matrix=_matrix(V, secure=True))
+    assert b["source"] == "bundled"
+    assert b["fetched_at"] is None
+    assert b["secure"] is False   # the bundled insecure verdict survives
+
+
+def test_get_update_status_over_a_malformed_remote_stays_two_hundred_shaped(monkeypatch):
+    monkeypatch.setattr(U, "_fetch_latest", lambda: ("0.30.0", "http://example/rel", "notes"))
+    monkeypatch.setattr(U, "_fetch_matrix", lambda tag: None)
+    monkeypatch.setattr(U, "fetch_main_matrix",
+                        lambda: _matrix(V, secure=False, vulns=[{"title": {}, "fixed_in": []}]))
+    monkeypatch.setattr(U, "_read_bundled_matrix", lambda: _matrix(V))
+    _reset_cache()
+    st = U.get_update_status(current_version=V, enabled=True, managed=False, force=True)
+    assert "security" in st and isinstance(st["security"]["vulnerabilities"], list)
+    assert st["security"]["source"] == "main"   # merged without raising

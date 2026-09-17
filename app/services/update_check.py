@@ -352,13 +352,19 @@ def _version_support(matrix, version):
 
 
 def _version_vulnerabilities(matrix, version):
-    """The declared vulnerabilities for `version`, or []. Tolerant like _version_support."""
+    """The declared vulnerabilities for `version`, or []. Tolerant like _version_support. Each entry
+    is normalised to {title, fixed_in} with BOTH coerced to a bounded str or None as it is read --
+    before it ever reaches the dedupe -- so an unhashable JSON value ({} / []) in either field can
+    never blow the (title, fixed_in) dedupe key. A non-dict entry is dropped."""
     if not isinstance(matrix, dict):
         return []
     version = (version or "").lstrip("vV")
     meta = (matrix.get("versions") or {}).get(version) or {}
     vulns = meta.get("vulnerabilities")
-    return vulns if isinstance(vulns, list) else []
+    if not isinstance(vulns, list):
+        return []
+    return [{"title": _bound(v.get("title")), "fixed_in": _bound(v.get("fixed_in"))}
+            for v in vulns if isinstance(v, dict)]
 
 
 def _knows_version(matrix, version):
@@ -477,13 +483,44 @@ def merged_security(current_version, released_ceiling, *, local_matrix=_UNSET, m
         `released_ceiling` (the newest release the consumer can see) dropped as not credible.
     `local_matrix`/`main_matrix` are injectable for tests; by default the bundled copy is read from
     the image and main is fetched here."""
-    import time as _time
     # A sentinel default distinguishes "not provided -> obtain it here" from an explicit None, which
     # means "unavailable" (an unreachable main, an unreadable bundled copy) and must be honoured, not
     # re-fetched -- so the caller can pass a cached/absent copy and get the fail-safe verdict.
     local_matrix = _read_bundled_matrix() if local_matrix is _UNSET else local_matrix
     if main_matrix is _UNSET:
         main_matrix = fetch_main_matrix()
+    try:
+        return _security_block(current_version, released_ceiling, local_matrix, main_matrix, fetched_at)
+    except Exception:  # noqa: BLE001 -- a malformed remote entry must NEVER raise out of the status;
+        # fall back to the bundled verdict, computed WITHOUT the merge path (which is what may have
+        # thrown), so /api/update-status stays 200 while main serves a bad file.
+        return _bundled_verdict(current_version, local_matrix)
+
+
+def _bundled_verdict(current_version, local_matrix):
+    """The security verdict from the BUNDLED copy alone, built without the merge path -- the fail-safe
+    when merging an untrusted remote raises. source "bundled", fetched_at None; same three-valued
+    secure rule (False on an insecure verdict/vulnerability, True when the bundled copy lists the
+    version and nothing is wrong, None when it does not know it)."""
+    local_s = _version_support(local_matrix, current_version)
+    local_v = _version_vulnerabilities(local_matrix, current_version)
+    if local_s.get("secure") is False or local_v:
+        secure = False
+    elif _knows_version(local_matrix, current_version):
+        secure = True
+    else:
+        secure = None
+    return {
+        "secure": secure,
+        "vulnerabilities": [{"title": _bound(v.get("title")), "fixed_in": _bound(v.get("fixed_in"))} for v in local_v],
+        "source": "bundled",
+        "fetched_at": None,
+    }
+
+
+def _security_block(current_version, released_ceiling, local_matrix, main_matrix, fetched_at):
+    """The merge itself. Split out so merged_security can wrap it in the fetch's own fail-safe."""
+    import time as _time
     source = "main" if main_matrix is not None else "bundled"
 
     local_s = _version_support(local_matrix, current_version)

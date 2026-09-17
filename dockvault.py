@@ -1838,13 +1838,19 @@ def version_vulnerabilities(matrix, version):
     """The list of known, already-fixed vulnerabilities declared for `version`, or [].
 
     Tolerant like `version_support`: a matrix that predates the field, or does not declare the
-    version, or states something other than a list, reads as 'none listed' rather than an error."""
+    version, or states something other than a list, reads as 'none listed' rather than an error. Each
+    entry is normalised to {title, fixed_in} with BOTH coerced to a bounded str or None as it is read
+    -- before it ever reaches the dedupe -- so an unhashable JSON value ({} / []) in either field can
+    never blow the (title, fixed_in) dedupe key. A non-dict entry is dropped."""
     if not isinstance(matrix, dict):
         return []
     version = (version or "").lstrip("vV")
     meta = (matrix.get("versions") or {}).get(version) or {}
     vulns = meta.get("vulnerabilities")
-    return vulns if isinstance(vulns, list) else []
+    if not isinstance(vulns, list):
+        return []
+    return [{"title": _bound_scalar(v.get("title")), "fixed_in": _bound_scalar(v.get("fixed_in"))}
+            for v in vulns if isinstance(v, dict)]
 
 
 def support_line(matrix, version):
@@ -1968,25 +1974,28 @@ def merge_lifecycle_matrix(local_matrix, main_matrix, released_ceiling):
     import copy as _copy
     if main_matrix is None:
         return local_matrix, "local"
-    merged = _copy.deepcopy(local_matrix) if isinstance(local_matrix, dict) else {"versions": {}}
-    versions = merged.setdefault("versions", {})
-    local_vers = (local_matrix or {}).get("versions") or {}
-    main_vers = main_matrix.get("versions") or {}
-    for ver in set(local_vers) | set(main_vers):
-        ms = _merge_support(version_support(local_matrix, ver), version_support(main_matrix, ver))
-        mv = _merge_vulnerabilities(
-            version_vulnerabilities(local_matrix, ver),
-            _credible_remote_vulns(version_vulnerabilities(main_matrix, ver), released_ceiling))
-        meta = versions.setdefault(ver, {})
-        if ms:
-            meta["support"] = ms
-        if mv:
-            # Bound the two untrusted scalars once here, so every downstream print (the list note and
-            # the target warning) is capped; clean_matrix_text still runs at those sites.
-            meta["vulnerabilities"] = [
-                {**v, "title": _bound_scalar(v.get("title")), "fixed_in": _bound_scalar(v.get("fixed_in"))}
-                for v in mv]
-    return merged, "main"
+    try:
+        merged = _copy.deepcopy(local_matrix) if isinstance(local_matrix, dict) else {"versions": {}}
+        versions = merged.setdefault("versions", {})
+        local_vers = (local_matrix or {}).get("versions") or {}
+        main_vers = main_matrix.get("versions") or {}
+        for ver in set(local_vers) | set(main_vers):
+            ms = _merge_support(version_support(local_matrix, ver), version_support(main_matrix, ver))
+            mv = _merge_vulnerabilities(
+                version_vulnerabilities(local_matrix, ver),
+                _credible_remote_vulns(version_vulnerabilities(main_matrix, ver), released_ceiling))
+            meta = versions.setdefault(ver, {})
+            if ms:
+                meta["support"] = ms
+            if mv:
+                # Bound the two untrusted scalars once here, so every downstream print (the list note
+                # and the target warning) is capped; clean_matrix_text still runs at those sites.
+                meta["vulnerabilities"] = [
+                    {**v, "title": _bound_scalar(v.get("title")), "fixed_in": _bound_scalar(v.get("fixed_in"))}
+                    for v in mv]
+        return merged, "main"
+    except Exception:  # a malformed remote must never crash the tool's upgrade path (constraint 2);
+        return local_matrix, "local"
 
 
 def fetch_upgrade_matrix(tag, root=None, opener=None):
