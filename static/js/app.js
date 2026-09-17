@@ -13401,11 +13401,15 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
  * The distinction between `false` and `'failed'` is the whole contract. Collapsing them would
  * either hide a real failure or re-download a file that is already arriving.
  */
-// The largest file the buffered download path may hold whole in memory. Above this, when the
-// streaming sink is unavailable (buffered policy, no service worker, or a plain-HTTP context), the
-// file UI REFUSES the download with a clear message rather than silently reading gigabytes into the
-// tab -- the no-silent-whole-file-fallback rule of the bounded-memory work.
-const MAX_BUFFERED_DOWNLOAD_BYTES = 256 * 1024 * 1024;
+// The largest file the DEGRADED (non-streaming) download path may hold whole in memory. It bounds
+// only the fallback the file UI takes when the streaming sink is unavailable (an org that forced
+// buffered, no service worker, or a plain-HTTP context) -- the default deployment streams and never
+// buffers a large file. 256 MB is chosen as the fallback ceiling: comfortably above any ordinary
+// document so those still download when streaming is off, and far below the multi-GB sizes that must
+// never be read whole into the tab. Above it the UI REFUSES with a clear message rather than
+// silently reading gigabytes into memory -- the no-silent-whole-file-fallback rule. The acceptance runner asserts it:
+// a file just above 256 MB is refused, one just below downloads buffered.
+const MAX_BUFFERED_DOWNLOAD_BYTES = 256 * 1024 * 1024;   // 256 MiB fallback ceiling
 
 /**
  * Stream a STANDARD-vault download (the server has already decrypted) straight into a browser
