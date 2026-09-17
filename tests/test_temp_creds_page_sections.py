@@ -1,7 +1,7 @@
 """Backend contract for the two-section temp-credentials page: the listing carries the section
 split, the device DISPLAY NAME, and the lifecycle state for device-minted credentials, and never a
-device id, device secret, or credential secret. The per-user interactive cap is taken under the owner
-row lock.
+device id, device secret, or credential secret. The per-user interactive cap serialises under a
+transaction-scoped advisory lock, never a users-row lock.
 
 The listing runs behind get_current_user + a DB session and create_temporary_credential needs the
 full app to import, so the field contract and the lock are pinned from source; the HTTP rows/scoping
@@ -78,6 +78,52 @@ def test_both_credential_cap_refusals_roll_back_before_raising():
     _rollback_precedes("You already have the maximum")                 # per-user cap 409
     _rollback_precedes('_device_mint_refusal("device-cred-cap"')       # device cap 409
     _rollback_precedes("is password-protected — its correct")          # vault-proof failure (400)
+
+
+def test_a_raise_from_a_validation_branch_rolls_back_the_locked_span():
+    # Behavioural, not textual: the fix must be TOTAL -- a raise ANYWHERE inside a locked span
+    # releases the lock, not only at the branches that remembered to roll back. The device mint's
+    # 'no-grant' branch raises AFTER taking the device row FOR UPDATE and carries NO explicit
+    # rollback of its own, so the only thing that can release that lock is the span backstop. Drive
+    # it with a session spy that yields a live device then no grant, and assert the raise rolled the
+    # session back. (mutation: remove @_rollback_on_error from the method -> no rollback -> red.)
+    import os, sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    import _bare_api_env; _bare_api_env.set_bare_api_env()
+    from fastapi import HTTPException
+    from app.services.auth_service import AuthService
+
+    class _Dev:
+        id = "dev-1"; user_id = "user-1"; is_active = True; suspended = False; expires_at = None
+
+    class _Spy:
+        # .query(...).filter(...).populate_existing().with_for_update().first() -> next queued row.
+        def __init__(self, rows):
+            self._rows = list(rows)
+            self.rolled_back = 0
+        def query(self, *a, **k): return self
+        def filter(self, *a, **k): return self
+        def populate_existing(self, *a, **k): return self
+        def with_for_update(self, *a, **k): return self
+        def first(self): return self._rows.pop(0) if self._rows else None
+        def rollback(self): self.rolled_back += 1
+
+    svc = AuthService.__new__(AuthService)
+    svc.db = _Spy([_Dev()])            # device read -> live device; grant read -> None -> 'no-grant'
+
+    with pytest.raises(HTTPException) as caught:
+        svc.mint_device_sync_credential(_Dev(), "vault-1")
+    assert caught.value.detail["reason"] == "no-grant"          # the validation branch we hit
+    assert svc.db.rolled_back == 1, "the locked span did not roll back on a validation raise"
+
+
+def test_both_mint_methods_carry_the_total_rollback_decorator():
+    # The span backstop is applied to BOTH locked mints. (mutation: drop @_rollback_on_error from
+    # either method -> red; the behavioural test above then proves the decorator still has teeth.)
+    src = AUTH.read_text(encoding="utf-8")
+    for defline in ("def create_temporary_credential(", "def mint_device_sync_credential("):
+        assert re.search(r"@_rollback_on_error\s+" + re.escape(defline), src), (
+            "%s is not wrapped by @_rollback_on_error" % defline)
 
 
 def test_the_post_mint_audit_is_awaited_off_the_loop():

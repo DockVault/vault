@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import uuid
 import json
 import time
+import functools
 
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, case
@@ -159,6 +160,30 @@ def is_token_denylisted(session_token: str) -> bool:
 # foreign key to that row takes (the audit insert), the ecc_router users-row locks, or the
 # SFTP process's audit inserts -- the deadlock a row lock here caused cannot form.
 _TEMP_CRED_CAP_ADVISORY_CLASS = 0x7443  # stable, arbitrary, distinct from any other lock class
+
+
+def _rollback_on_error(method):
+    """Make a mint method's locked span TOTAL against lock leaks: ANY exception raised anywhere in
+    the wrapped method rolls back self.db before it propagates, so a lock still held at the raise
+    (the per-user cap's transaction-scoped advisory lock, or the device row's FOR UPDATE) is released
+    then and there instead of living -- idle-in-transaction -- until get_db closes the session back on
+    the event loop, where a concurrent on-loop DB write could block on it and freeze the loop. A
+    rollback taken before any lock exists, or after the commit, is a harmless no-op, and the success
+    path never touches the session. Individual branches may still roll back explicitly for local
+    clarity; this is the backstop that no new branch has to remember to add."""
+    @functools.wraps(method)
+    def _wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            try:
+                self.db.rollback()
+            except Exception:
+                # The original failure is the one worth surfacing; a rollback that itself fails
+                # (e.g. a dead connection) must not mask it. The connection teardown reclaims the lock.
+                pass
+            raise
+    return _wrapper
 
 
 def account_locked(user) -> bool:
@@ -627,6 +652,7 @@ class AuthService:
         
         return user, session_token
     
+    @_rollback_on_error
     def create_temporary_credential(
         self,
         user_id: uuid.UUID,
@@ -1206,6 +1232,7 @@ class AuthService:
             'password_policy': 'One-time viewing only. Password is hashed and cannot be retrieved after creation.'
         }
 
+    @_rollback_on_error
     def mint_device_sync_credential(self, device, vault_id, validity_minutes=None) -> dict:
         """Mint a single-use SFTP sync credential for a registered device, authorized by a device
         GRANT rather than an interactive vault-password proof.

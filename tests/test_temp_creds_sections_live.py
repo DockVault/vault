@@ -105,10 +105,10 @@ def _race_two_mints(client):
 
 
 def test_two_concurrent_mints_at_the_per_user_cap_admit_exactly_one(admin, temp_user_client):
-    # Carried pre-existing check-then-act, now under the owner-row lock. Repeat the boundary race so a
+    # Carried pre-existing check-then-act, now under the per-user advisory lock. Repeat the boundary race so a
     # stall is caught, not tolerated: each trial fills the non-admin to one below the cap, fires two
     # mints at once, and asserts exactly one is admitted and one hits the cap -- within a wall-clock
-    # bound, so reverting the lock to plain FOR UPDATE (which deadlocks the audit insert) FAILS the
+    # bound, so reverting the advisory lock to a users-row FOR UPDATE (which deadlocks the audit insert) FAILS the
     # test on a hung thread instead of hanging the lane.
     cap = (admin.session.get(f"{BASE_URL}/temp-passcode-policy", timeout=30).json()
            .get("max_temp_creds_per_user") or 0)
@@ -129,8 +129,8 @@ def test_two_concurrent_mints_at_the_per_user_cap_admit_exactly_one(admin, temp_
 
 
 def test_two_different_users_mint_concurrently_without_contention(admin):
-    # Cross-user control: the owner-row lock serializes ONE user, never two. Two different non-admins
-    # each mint at once and both succeed -- they lock different owner rows, so there is no wait.
+    # Cross-user control: the per-user advisory lock serializes ONE user, never two. Two different
+    # non-admins each mint at once and both succeed -- they hash to different advisory keys, no wait.
     from conftest import ApiClient
     u1 = admin.create_user(role="user")
     u2 = admin.create_user(role="user")

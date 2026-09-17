@@ -6916,8 +6916,8 @@ async def register_device_endpoint(
     # account is exempt; 0 = unlimited. 409 (well-formed request, conflicts with current state) at
     # the cap. This bounds total active device sync credentials per account together with the
     # per-device cred cap, so unlimited registration can't make the total unbounded. This
-    # count-then-insert is NOT serialized (unlike the interactive per-user cap, which now takes an
-    # owner-row lock across its count and insert): a concurrent burst can transiently exceed this
+    # count-then-insert is NOT serialized (unlike the interactive per-user cap, which now takes a
+    # transaction-scoped ADVISORY lock across its count and insert): a concurrent burst can transiently exceed this
     # device cap by a small bounded amount — acceptable for a resource/DoS bound (not a security
     # invariant); strict enforcement would need a per-account lock or a DB constraint.
     cap = getattr(settings, "max_devices_per_user", 0) or 0
