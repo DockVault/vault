@@ -629,14 +629,19 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             srv._pending_status_desc = desc
 
     @staticmethod
-    def _resolve_member_name(db, member_id):
-        """Best-effort display name for the marker holder, to name them in a same-name refusal.
-        Falls back to 'another member' if the id cannot be resolved -- never fail a refusal on a
-        name lookup."""
+    def _resolve_member_name(db, member_id, viewer):
+        """Display name for the marker holder in a same-name refusal, gated exactly like the web
+        listing's uploader identity: reveal the holder's USERNAME only to a MEMBER-GRADE viewer (an
+        interactive member -- never a scoped credential, which is what most SFTP uploaders are), and
+        never an email. Everyone else gets a neutral "another member". Best-effort: any lookup miss
+        or failure also reads as "another member", so a refusal never 500s on a name lookup."""
+        from app.core.temp_scope import is_scoped
+        if is_scoped(viewer):
+            return "another member"
         try:
             u = db.query(User).filter(User.id == member_id).first()
             if u is not None:
-                return getattr(u, "username", None) or getattr(u, "email", None) or "another member"
+                return getattr(u, "username", None) or "another member"
         except Exception:  # noqa: BLE001 -- a lookup failure must not turn a refusal into a 500
             pass
         return "another member"
@@ -1240,13 +1245,13 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             # name is refused, naming the holder. SFTP serves only Standard vaults, so this is
             # always the standard filename-key path. Best-effort: with Redis down it SKIPs (returns
             # no marker key) and the upload proceeds (fail open) -- an outage never blocks uploads.
-            _marker_outcome = upload_marker.place(vault_id, folder_id, filename, user.id)
+            _marker_outcome, _marker_token = upload_marker.place(vault_id, folder_id, filename, user.id)
             if isinstance(_marker_outcome, str):
                 self._set_pending_status(
                     "'%s' is currently being uploaded by %s"
-                    % (filename, self._resolve_member_name(db, _marker_outcome)))
+                    % (filename, self._resolve_member_name(db, _marker_outcome, user)))
                 return paramiko.SFTP_PERMISSION_DENIED
-            _upload_marker_ref = ((vault_id, folder_id, filename)
+            _upload_marker_ref = ((vault_id, folder_id, filename, _marker_token)
                                   if _marker_outcome is None else None)
 
         # Streaming upload (opt-in via SFTP_STREAMING_UPLOAD): encrypt + persist records as they
@@ -1258,11 +1263,17 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             handle.max_bytes = _eff_max
             handle._sftp_server = getattr(self, "_sftp_server", None)
             handle.upload_marker_ref = _upload_marker_ref
-            handle.stream = _StreamingUpload(
-                handle=handle, interface=self, vault_id=vault_id, folder_id=folder_id,
-                filename=filename, can_overwrite=can_overwrite, max_bytes=_eff_max,
-                reorder_bytes=max(0, settings.sftp_streaming_reorder_mb) * 1024 * 1024,
-            )
+            try:
+                handle.stream = _StreamingUpload(
+                    handle=handle, interface=self, vault_id=vault_id, folder_id=folder_id,
+                    filename=filename, can_overwrite=can_overwrite, max_bytes=_eff_max,
+                    reorder_bytes=max(0, settings.sftp_streaming_reorder_mb) * 1024 * 1024,
+                )
+            except Exception as e:  # noqa: BLE001 -- no handle will close, so free the lock now
+                safe_event('upload.stream-open.failed', e)
+                if _upload_marker_ref:
+                    upload_marker.remove(*_upload_marker_ref)
+                return paramiko.SFTP_FAILURE
             return handle
 
         # Buffer the plaintext to a temp file; encrypt + persist at close().

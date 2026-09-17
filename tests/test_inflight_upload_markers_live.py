@@ -191,8 +191,12 @@ def test_a_second_same_name_upload_is_refused_naming_the_member(admin, temp_vaul
             sftp2 = paramiko.SFTPClient.from_transport(t)
             with pytest.raises(IOError) as caught:
                 sftp2.open("/%s/%s" % (temp_vault["name"], name), "wb")   # same name, same folder
-            # The refusal names the member (the status message the server attached to open()).
-            assert "uploading" in str(caught.value).lower()
+            msg = str(caught.value)
+            # The refusal says the name is being uploaded. The second uploader here is a device-sync
+            # credential -- a SCOPED principal -- so the identity is gated to "another member" (a
+            # member-grade viewer would see the holder's username instead), never the owner's name.
+            # The neutral "another member" form is proof in itself that no holder username leaked.
+            assert "uploading" in msg.lower() and "another member" in msg.lower()
         finally:
             t.close()
     finally:

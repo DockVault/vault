@@ -60,8 +60,8 @@ _REGISTRY = {
     "core/upload_marker.py": {                   # in-flight upload markers: all best-effort,
         "place": ("D", 4),                       # SET NX lock + SADD/EXPIRE the folder index + GET holder
         "holder": ("D", 1),                      # GET the holder without taking the lock (rename clash)
-        "remove": ("D", 2),                      # DELETE marker + SREM the folder index (close/abort)
-        "refresh": ("D", 2),                     # EXPIRE marker + EXPIRE index (slow-transfer heartbeat)
+        "remove": ("D", 1),                      # one token-checked compare-and-delete script (close/abort)
+        "refresh": ("D", 1),                     # one token-checked compare-and-refresh script (heartbeat)
         "list_folder": ("D", 3),                 # SMEMBERS the folder index + MGET + lazy SREM of stale
     },
     "core/otp_service.py": {

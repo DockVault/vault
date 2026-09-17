@@ -18,6 +18,7 @@ listing returns NO rows -- an outage never blocks uploads or leaks names. The ma
 EXPLICITLY on close/abort; its TTL is only the backstop for a client killed before it can clean up.
 """
 import json
+import secrets
 
 from app.core.database import redis_client
 from app.core import redis_guard
@@ -33,6 +34,28 @@ _DEFAULT_TTL_SECONDS = 900
 # Sentinel: the read-through guard was open (Redis unavailable) so the op was SKIPPED. Distinct from
 # a real result, so a caller can fail OPEN instead of mistaking "unknown" for "not held" / "no rows".
 SKIPPED = object()
+
+# Compare-and-delete / compare-and-refresh, atomically, so a STALE holder cannot touch a marker that
+# is now someone else's. The marker key is deterministic from (vault, folder, name), so after A's
+# marker expires and B claims the same name, A's late close() would otherwise DEL B's key. Each runs
+# under best_effort as ONE Redis script; the ownership token lives in the payload ("t"). (A
+# GET-compare-DEL in Python is a race; the check and the act must be one round trip.)
+_CAD_REMOVE = (
+    "local v = redis.call('GET', KEYS[1])\n"
+    "if v and cjson.decode(v).t == ARGV[1] then\n"
+    "  redis.call('DEL', KEYS[1])\n"
+    "  redis.call('SREM', KEYS[2], KEYS[1])\n"
+    "  return 1\n"
+    "end\n"
+    "return 0")
+_CAD_REFRESH = (
+    "local v = redis.call('GET', KEYS[1])\n"
+    "if v and cjson.decode(v).t == ARGV[1] then\n"
+    "  redis.call('EXPIRE', KEYS[1], ARGV[2])\n"
+    "  redis.call('EXPIRE', KEYS[2], ARGV[2])\n"
+    "  return 1\n"
+    "end\n"
+    "return 0")
 
 
 def marker_ttl_seconds() -> int:
@@ -62,42 +85,51 @@ def index_key(vault_id, folder_id) -> str:
     return "%s:idx:v=%s:f=%s" % (_KEY_PREFIX, vault_id, _folder_token(folder_id))
 
 
-def place(vault_id, folder_id, name: str, member_id) -> object:
+def place(vault_id, folder_id, name: str, member_id):
     """Claim the same-name lock and publish the marker for an in-flight upload.
 
-    Returns None when the lock was ACQUIRED (marker now published, indexed); the holder's member id
-    (str) when a DIFFERENT upload already holds it (the caller REFUSES, naming the member); or SKIPPED
-    when Redis is unavailable (fail OPEN -- proceed with no marker). Best-effort (class D).
+    Returns a ``(outcome, token)`` pair: outcome is None when the lock was ACQUIRED (marker published
+    and indexed) and ``token`` is this holder's ownership nonce; outcome is the holder's member id
+    (str) when a DIFFERENT upload already holds it (the caller REFUSES, naming the member); outcome is
+    SKIPPED when Redis is unavailable (fail OPEN -- proceed with no marker). ``token`` is None unless
+    acquired. The token is carried on the handle and required to remove/refresh, so a STALE close can
+    never delete or extend a marker that has since become another holder's. Best-effort (class D).
     """
     mkey = marker_key(vault_id, folder_id, name)
     ikey = index_key(vault_id, folder_id)
     ttl = marker_ttl_seconds()
+    token = secrets.token_hex(16)
     payload = json.dumps({
         "n": encrypt_upload_marker_name(vault_id, folder_id, name),
         "m": str(member_id),
+        "t": token,
     })
-    acquired = redis_guard.best_effort(
-        "upload_marker.place",
-        lambda: redis_client.set(mkey, payload, nx=True, ex=ttl),
-        default=SKIPPED)
-    if acquired is SKIPPED:
-        return SKIPPED            # Redis down: fail OPEN, no marker
-    if acquired:
-        # Index the marker for folder-scoped enumeration; the index carries the marker's TTL.
-        redis_guard.best_effort("upload_marker.index_add", lambda: redis_client.sadd(ikey, mkey), default=None)
-        redis_guard.best_effort("upload_marker.index_ttl", lambda: redis_client.expire(ikey, ttl), default=None)
-        return None
-    # Not acquired: a marker for this exact (vault, folder, name) already exists. Read it to name the
-    # holder; a miss (it just expired or was removed) means there is no holder to refuse against, so
-    # fail OPEN and let the caller retry the claim rather than refuse blindly.
-    existing = redis_guard.best_effort(
-        "upload_marker.holder", lambda: redis_client.get(mkey), default=SKIPPED)
-    if existing is SKIPPED or existing is None:
-        return SKIPPED
-    try:
-        return json.loads(existing).get("m")
-    except (ValueError, TypeError):
-        return SKIPPED
+    # Retry the claim ONCE if we lose SET NX but the holder read then misses: the marker expired
+    # between the two calls, so there is no real holder to refuse against -- try to claim it again
+    # rather than proceed markerless.
+    for _attempt in range(2):
+        acquired = redis_guard.best_effort(
+            "upload_marker.place",
+            lambda: redis_client.set(mkey, payload, nx=True, ex=ttl),
+            default=SKIPPED)
+        if acquired is SKIPPED:
+            return SKIPPED, None            # Redis down: fail OPEN, no marker
+        if acquired:
+            # Index the marker for folder-scoped enumeration; the index carries the marker's TTL.
+            redis_guard.best_effort("upload_marker.index_add", lambda: redis_client.sadd(ikey, mkey), default=None)
+            redis_guard.best_effort("upload_marker.index_ttl", lambda: redis_client.expire(ikey, ttl), default=None)
+            return None, token
+        existing = redis_guard.best_effort(
+            "upload_marker.holder", lambda: redis_client.get(mkey), default=SKIPPED)
+        if existing is SKIPPED:
+            return SKIPPED, None
+        if existing is None:
+            continue                        # expired between SET NX and GET -> retry the claim once
+        try:
+            return json.loads(existing).get("m"), None
+        except (ValueError, TypeError):
+            return SKIPPED, None
+    return SKIPPED, None                     # lost the retry too -> fail OPEN
 
 
 def holder(vault_id, folder_id, name: str) -> object:
@@ -119,24 +151,28 @@ def holder(vault_id, folder_id, name: str) -> object:
         return None
 
 
-def remove(vault_id, folder_id, name: str) -> None:
-    """Remove the marker for a (vault, folder, name) on close/abort: delete the marker key and drop
-    it from the folder index. Best-effort (never raises), so it is safe in a teardown finally; a skip
-    (Redis down) just leaves the TTL to reap both."""
+def remove(vault_id, folder_id, name: str, token: str) -> None:
+    """Remove THIS holder's marker for a (vault, folder, name) on close/abort: an atomic
+    compare-and-delete that only drops the marker key + its index entry when the stored ownership
+    token matches. A stale close whose marker already expired and was re-claimed by someone else is a
+    no-op, so it can never delete the new holder's marker. Best-effort (never raises), so it is safe
+    in a teardown finally; a skip (Redis down) just leaves the TTL to reap it."""
     mkey = marker_key(vault_id, folder_id, name)
     ikey = index_key(vault_id, folder_id)
-    redis_guard.best_effort("upload_marker.remove", lambda: redis_client.delete(mkey), default=None)
-    redis_guard.best_effort("upload_marker.index_srem", lambda: redis_client.srem(ikey, mkey), default=None)
+    redis_guard.best_effort(
+        "upload_marker.remove", lambda: redis_client.eval(_CAD_REMOVE, 2, mkey, ikey, token), default=None)
 
 
-def refresh(vault_id, folder_id, name: str) -> None:
-    """Best-effort TTL refresh of a marker AND its index entry, so a slow-but-live transfer's marker
-    (and its same-name lock and listing row) does not expire mid-upload."""
+def refresh(vault_id, folder_id, name: str, token: str) -> None:
+    """Best-effort TTL refresh of THIS holder's marker AND its index entry (token-checked, atomic), so
+    a slow-but-live transfer's marker does not lapse mid-upload -- and a STALE holder can never extend
+    a marker that has become someone else's."""
+    mkey = marker_key(vault_id, folder_id, name)
+    ikey = index_key(vault_id, folder_id)
     ttl = marker_ttl_seconds()
     redis_guard.best_effort(
-        "upload_marker.refresh", lambda: redis_client.expire(marker_key(vault_id, folder_id, name), ttl), default=None)
-    redis_guard.best_effort(
-        "upload_marker.index_refresh", lambda: redis_client.expire(index_key(vault_id, folder_id), ttl), default=None)
+        "upload_marker.refresh",
+        lambda: redis_client.eval(_CAD_REFRESH, 2, mkey, ikey, token, str(ttl)), default=None)
 
 
 def list_folder(vault_id, folder_id):

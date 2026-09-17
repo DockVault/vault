@@ -3,9 +3,10 @@
 Proves the crypto (the final name round-trips, is BOUND to its (vault, folder) so a marker cannot be
 replayed into another folder, and never appears in cleartext at rest), the lock (a deterministic
 KEYED hash, folder-sensitive; a second same-name upload is refused with the holder's member),
-enumeration by a per-folder INDEX SET (not a keyspace SCAN), and the outage posture (breaker open =>
-place SKIPS and fails OPEN, listing empty, remove/refresh inert). The live behaviour (a real SFTP
-upload publishes/removes the marker) is a live-lane test.
+enumeration by a per-folder INDEX SET (not a keyspace SCAN), the OWNERSHIP TOKEN (a stale close can
+never delete or extend a marker that has become another holder's), and the outage posture (breaker
+open => place SKIPS and fails OPEN, listing empty, remove/refresh inert). The live behaviour is a
+live-lane test.
 """
 import json
 import uuid
@@ -23,8 +24,9 @@ from app.core import redis_guard  # noqa: E402
 
 
 class _FakeRedis:
-    """A dict-backed stand-in with just the ops the marker module uses: string keys (SET NX/EX, GET,
-    DELETE, EXPIRE, MGET) and the per-folder index SET (SADD/SREM/SMEMBERS)."""
+    """A dict-backed stand-in with the ops the marker module uses: string keys (SET NX/EX, GET, MGET),
+    the per-folder index SET (SADD/SREM/SMEMBERS/EXPIRE), and a script runner for the token-checked
+    compare-and-delete / compare-and-refresh scripts (emulated in Python)."""
     def __init__(self):
         self.store = {}
         self.sets = {}
@@ -38,19 +40,11 @@ class _FakeRedis:
     def get(self, key):
         return self.store.get(key)
 
-    def delete(self, *keys):
-        n = 0
-        for k in keys:
-            if k in self.store:
-                del self.store[k]
-                n += 1
-        return n
+    def mget(self, keys):
+        return [self.store.get(k) for k in keys]
 
     def expire(self, key, ttl):
         return key in self.store or key in self.sets
-
-    def mget(self, keys):
-        return [self.store.get(k) for k in keys]
 
     def sadd(self, key, *vals):
         self.sets.setdefault(key, set()).update(vals)
@@ -68,12 +62,28 @@ class _FakeRedis:
     def smembers(self, key):
         return set(self.sets.get(key, set()))
 
+    def eval(self, script, numkeys, *args):
+        keys, argv = list(args[:numkeys]), list(args[numkeys:])
+        mkey, ikey, token = keys[0], (keys[1] if len(keys) > 1 else None), argv[0]
+        v = self.store.get(mkey)
+        if not v:
+            return 0
+        try:
+            if json.loads(v).get("t") != token:      # not our marker any more -> no-op
+                return 0
+        except Exception:
+            return 0
+        if "DEL" in script:                           # compare-and-delete
+            self.store.pop(mkey, None)
+            if ikey in self.sets:
+                self.sets[ikey].discard(mkey)
+        return 1                                      # (EXPIRE branch: no real TTL to move in the fake)
+
 
 @pytest.fixture
 def fake_redis(monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(um, "redis_client", r)
-    # Guard closed by default (no breaker, no private-memory failure), so best_effort runs the op.
     monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: False)
     return r
 
@@ -93,12 +103,11 @@ def test_marker_name_round_trips_and_is_bound_to_its_vault_and_folder():
     f1, f2 = uuid.uuid4(), uuid.uuid4()
     name = "Quarterly Report.xlsx"
     token = security.encrypt_upload_marker_name(v1, f1, name)
-
-    assert security.decrypt_upload_marker_name(v1, f1, token) == name   # round-trips in its own slot
-    assert name not in token                                            # ciphertext, not the name
+    assert security.decrypt_upload_marker_name(v1, f1, token) == name
+    assert name not in token
     for wrong in ((v1, f2), (v2, f1), (v2, f2)):
         with pytest.raises(Exception):
-            security.decrypt_upload_marker_name(wrong[0], wrong[1], token)   # AAD binds (vault, folder)
+            security.decrypt_upload_marker_name(wrong[0], wrong[1], token)
 
 
 def test_root_folder_none_round_trips_as_its_own_slot():
@@ -115,40 +124,33 @@ def test_lock_index_is_deterministic_keyed_and_folder_and_name_sensitive():
     v, f, f2 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     name = "同名.pdf"
     idx = security.upload_marker_lock_index(v, f, name)
-
-    assert idx == security.upload_marker_lock_index(v, f, name)          # deterministic
-    assert len(idx) == 64 and int(idx, 16) >= 0                          # hex sha256 digest
-    assert idx != name and idx != hashlib.sha256(name.encode()).hexdigest()  # KEYED, not plaintext/unkeyed
-    assert idx != security.upload_marker_lock_index(v, f, name + "x")    # name-sensitive
-    assert idx != security.upload_marker_lock_index(v, f2, name)         # folder-sensitive
-    assert idx != security.upload_marker_lock_index(uuid.uuid4(), f, name)  # vault-sensitive
+    assert idx == security.upload_marker_lock_index(v, f, name)
+    assert len(idx) == 64 and int(idx, 16) >= 0
+    assert idx != name and idx != hashlib.sha256(name.encode()).hexdigest()
+    assert idx != security.upload_marker_lock_index(v, f, name + "x")
+    assert idx != security.upload_marker_lock_index(v, f2, name)
+    assert idx != security.upload_marker_lock_index(uuid.uuid4(), f, name)
 
 
 def test_place_acquires_then_a_second_same_name_is_refused_with_the_holder(fake_redis):
     v, f = uuid.uuid4(), uuid.uuid4()
     alice, bob = uuid.uuid4(), uuid.uuid4()
-
-    assert um.place(v, f, "report.pdf", alice) is None          # first upload acquires the lock
-    assert um.place(v, f, "report.pdf", bob) == str(alice)      # second is refused, names the holder
-    assert um.place(v, f, "other.pdf", bob) is None             # a different name is free
-    assert um.place(v, uuid.uuid4(), "report.pdf", bob) is None  # a different folder is a different slot
+    outcome, token = um.place(v, f, "report.pdf", alice)
+    assert outcome is None and token                     # acquired, with an ownership token
+    assert um.place(v, f, "report.pdf", bob)[0] == str(alice)   # second refused, names the holder
+    assert um.place(v, f, "other.pdf", bob)[0] is None          # a different name is free
+    assert um.place(v, uuid.uuid4(), "report.pdf", bob)[0] is None  # a different folder is a different slot
 
 
 def test_the_final_name_is_never_stored_in_cleartext_with_a_positive_control(fake_redis):
     v, f = uuid.uuid4(), uuid.uuid4()
     member = uuid.uuid4()
     name = "SECRET-payroll-2026.csv"
-    assert um.place(v, f, name, member) is None
-
+    assert um.place(v, f, name, member)[0] is None
     assert not _appears_anywhere(fake_redis, name), "the cleartext final name leaked into Redis"
-    # (The member ID may appear -- an opaque id, not a name; the brief forbids the cleartext filename
-    # and the member USERNAME at rest, not the member id.)
-    # Positive control: the scanner is not vacuously passing -- a value known present IS found.
     fake_redis.store["__control__"] = name
-    assert _appears_anywhere(fake_redis, name)
+    assert _appears_anywhere(fake_redis, name)           # positive control: the scanner works
     del fake_redis.store["__control__"]
-
-    # And the listing recovers the correct final name for an authorized viewer.
     rows = um.list_folder(v, f)
     assert len(rows) == 1
     assert security.decrypt_upload_marker_name(v, f, rows[0]["enc_name"]) == name
@@ -161,7 +163,6 @@ def test_listing_reads_the_folder_index_not_a_keyspace_scan(fake_redis):
     um.place(v, f1, "a.txt", uuid.uuid4())
     um.place(v, f1, "b.txt", uuid.uuid4())
     um.place(v, f2, "c.txt", uuid.uuid4())
-    # Each folder's markers are enumerated from its own index set.
     assert um.index_key(v, f1) in fake_redis.sets and len(fake_redis.sets[um.index_key(v, f1)]) == 2
     assert len(um.list_folder(v, f1)) == 2
     assert len(um.list_folder(v, f2)) == 1
@@ -177,44 +178,99 @@ def test_listing_prunes_a_stale_index_entry_whose_marker_expired(fake_redis):
     assert mkey not in fake_redis.sets[um.index_key(v, f)]   # ...and pruned from the index lazily
 
 
-def test_remove_clears_the_marker_and_the_index_and_frees_the_lock(fake_redis):
+def test_the_holders_own_close_removes_the_marker_and_index_and_frees_the_lock(fake_redis):
     v, f = uuid.uuid4(), uuid.uuid4()
     a, b = uuid.uuid4(), uuid.uuid4()
-    assert um.place(v, f, "x.bin", a) is None
-    um.remove(v, f, "x.bin")
+    _, token = um.place(v, f, "x.bin", a)
+    um.remove(v, f, "x.bin", token)
     assert um.list_folder(v, f) == []
     assert um.marker_key(v, f, "x.bin") not in fake_redis.sets.get(um.index_key(v, f), set())
-    assert um.place(v, f, "x.bin", b) is None      # freed: the next upload may claim it
+    assert um.place(v, f, "x.bin", b)[0] is None   # freed: the next upload may claim it
+
+
+def test_a_stale_close_never_removes_a_new_holders_marker(fake_redis):
+    # The stale-close scenario: A places, A's marker expires (a client stalled past the TTL with no
+    # heartbeat), B places the SAME name and now owns the marker, then A's LATE close() fires. The
+    # ownership token makes A's remove a no-op, so B's marker and index entry survive.
+    v, f = uuid.uuid4(), uuid.uuid4()
+    a, b = uuid.uuid4(), uuid.uuid4()
+    _, tok_a = um.place(v, f, "same.bin", a)
+    mkey = um.marker_key(v, f, "same.bin")
+    fake_redis.store.pop(mkey)                                  # A's marker expires (TTL)
+    fake_redis.sets.get(um.index_key(v, f), set()).discard(mkey)
+    outcome_b, tok_b = um.place(v, f, "same.bin", b)            # B re-claims the freed name
+    assert outcome_b is None and tok_b != tok_a
+
+    um.remove(v, f, "same.bin", tok_a)                          # A's stale close -> must be a no-op
+    rows = um.list_folder(v, f)
+    assert len(rows) == 1 and rows[0]["member_id"] == str(b), "a stale close deleted the new holder's marker"
+
+    um.remove(v, f, "same.bin", tok_b)                          # B's own close removes it
+    assert um.list_folder(v, f) == []
+
+
+def test_a_stale_refresh_never_extends_a_new_holders_marker(fake_redis):
+    # The refresh twin: a stale holder's heartbeat must not touch the new holder's marker. (The fake
+    # has no real TTL, so we assert the token-checked script reports a no-op for the wrong token and a
+    # match for the right one.)
+    v, f = uuid.uuid4(), uuid.uuid4()
+    _, tok = um.place(v, f, "hb.bin", uuid.uuid4())
+    mkey, ikey = um.marker_key(v, f, "hb.bin"), um.index_key(v, f)
+    assert fake_redis.eval(um._CAD_REFRESH, 2, mkey, ikey, "wrong-token", "900") == 0
+    assert fake_redis.eval(um._CAD_REFRESH, 2, mkey, ikey, tok, "900") == 1
 
 
 def test_holder_reads_the_lock_without_taking_it(fake_redis):
     v, f = uuid.uuid4(), uuid.uuid4()
     m = uuid.uuid4()
-    assert um.holder(v, f, "x.pdf") is None             # free
-    assert um.place(v, f, "x.pdf", m) is None
-    assert um.holder(v, f, "x.pdf") == str(m)           # held -> names the member
-    assert um.holder(v, f, "y.pdf") is None             # a free name it read stays claimable
-    assert um.place(v, f, "y.pdf", uuid.uuid4()) is None
+    assert um.holder(v, f, "x.pdf") is None
+    assert um.place(v, f, "x.pdf", m)[0] is None
+    assert um.holder(v, f, "x.pdf") == str(m)
+    assert um.holder(v, f, "y.pdf") is None
+    assert um.place(v, f, "y.pdf", uuid.uuid4())[0] is None
 
 
 def test_holder_fails_open_on_an_outage(monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(um, "redis_client", r)
     monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: True)
-    assert um.holder(uuid.uuid4(), uuid.uuid4(), "x") is um.SKIPPED   # SKIPPED != None: fail open
+    assert um.holder(uuid.uuid4(), uuid.uuid4(), "x") is um.SKIPPED
+
+
+def test_place_retries_the_claim_when_the_marker_expires_between_setnx_and_holder_read(monkeypatch):
+    # SET NX loses but the holder GET then misses (the marker expired in between): place must retry
+    # the claim once rather than proceed markerless. Emulate by losing the first SET NX while the key
+    # is absent (so GET misses), then winning the retry.
+    r = _FakeRedis()
+    monkeypatch.setattr(um, "redis_client", r)
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: False)
+    calls = {"n": 0}
+    real_set = r.set
+
+    def _flaky_set(key, val, nx=False, ex=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None          # lose the first SET NX, key absent -> GET misses
+        return real_set(key, val, nx=nx, ex=ex)
+
+    r.set = _flaky_set
+    v, f = uuid.uuid4(), uuid.uuid4()
+    outcome, token = um.place(v, f, "retry.bin", uuid.uuid4())
+    assert outcome is None and token          # the retry claimed it
+    assert calls["n"] == 2                     # exactly one retry
 
 
 def test_breaker_open_skips_place_fails_open_listing_empty_remove_inert(monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(um, "redis_client", r)
     monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: True)   # outage: guard open
-
     v, f = uuid.uuid4(), uuid.uuid4()
-    assert um.place(v, f, "x.bin", uuid.uuid4()) is um.SKIPPED   # fail OPEN, no marker written
-    assert r.store == {} and r.sets == {}                        # nothing touched Redis
-    assert um.list_folder(v, f) == []                            # listing shows no rows during outage
-    um.remove(v, f, "x.bin")                                     # inert, never raises
-    um.refresh(v, f, "x.bin")                                    # inert, never raises
+    outcome, token = um.place(v, f, "x.bin", uuid.uuid4())
+    assert outcome is um.SKIPPED and token is None    # fail OPEN, no marker
+    assert r.store == {} and r.sets == {}
+    assert um.list_folder(v, f) == []
+    um.remove(v, f, "x.bin", "any-token")             # inert, never raises
+    um.refresh(v, f, "x.bin", "any-token")            # inert, never raises
 
 
 def test_marker_ttl_is_readable_and_positive():

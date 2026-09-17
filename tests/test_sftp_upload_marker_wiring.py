@@ -33,7 +33,7 @@ def test_open_write_claims_the_same_name_lock_for_every_upload():
     assert "upload_marker.place(vault_id, folder_id, filename, user.id)" in body
     # It runs OUTSIDE the `if not can_overwrite:` no-clobber block, so it applies to everyone: the
     # place() call is not indented under that block (16 spaces would mean nested; it sits at 12).
-    assert "\n            _marker_outcome = upload_marker.place(" in body, \
+    assert "\n            _marker_outcome, _marker_token = upload_marker.place(" in body, \
         "the same-name lock must apply to EVERYONE, not only principals lacking DELETE"
 
 
@@ -41,7 +41,7 @@ def test_a_same_name_conflict_is_refused_and_names_the_holder():
     body = _open_write_body()
     # A holder id (a str) means the name is in flight: refuse, and name the member in the status.
     assert "isinstance(_marker_outcome, str)" in body
-    assert "_resolve_member_name(db, _marker_outcome)" in body
+    assert "_resolve_member_name(db, _marker_outcome, user)" in body   # gated on the refusing principal
     assert "is currently being uploaded by" in body
     # The refusal returns a denied status (not a silent success).
     ref = body[body.index("isinstance(_marker_outcome, str)"):]
@@ -50,9 +50,19 @@ def test_a_same_name_conflict_is_refused_and_names_the_holder():
 
 def test_the_acquired_marker_key_is_carried_on_the_handle_both_paths():
     body = _open_write_body()
-    # Acquired -> remember the key so close() removes it; SKIPPED (Redis down) -> None, fail open.
-    assert "_upload_marker_ref = ((vault_id, folder_id, filename)" in body
+    # Acquired -> remember (vault, folder, name, TOKEN) so close() can compare-and-delete only its
+    # own marker; SKIPPED (Redis down) -> None, fail open.
+    assert "_upload_marker_ref = ((vault_id, folder_id, filename, _marker_token)" in body
     assert body.count("handle.upload_marker_ref = _upload_marker_ref") == 2  # streaming + buffered
+
+
+def test_a_failed_streaming_open_frees_the_lock_it_took():
+    body = _open_write_body()
+    # If the streaming encryptor's constructor raises, no handle is returned, so no close() runs to
+    # remove the marker -- free it inline (like the buffered-open failure), not hold it for the TTL.
+    seg = body[body.index("upload.stream-open.failed"):]
+    assert "upload_marker.remove(*_upload_marker_ref)" in seg[:300]
+    assert "return paramiko.SFTP_FAILURE" in seg[:300]
 
 
 def test_close_removes_the_marker_on_every_close_path():
@@ -79,3 +89,41 @@ def test_the_write_path_heartbeats_the_marker_ttl():
     assert "upload_marker.refresh(*self.upload_marker_ref)" in s
     # ...throttled, so it is not a Redis op per write.
     assert "self._marker_last_refresh" in s
+
+
+def test_the_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
+    # Behavioural: the refusal reveals the holder's USERNAME only to a member-grade viewer (an
+    # interactive member), gated exactly like the web listing's uploader identity -- a scoped
+    # credential (what most SFTP uploaders are) gets a neutral "another member", and an email is
+    # NEVER used as a fallback. (mutation: drop the is_scoped gate -> scoped case red; restore the
+    # email fallback -> the no-username case red.)
+    import os
+    import sys
+    from types import SimpleNamespace
+    sys.path.insert(0, os.path.dirname(__file__))
+    import _bare_api_env
+    _bare_api_env.set_bare_api_env()
+    from app.sftp.sftp_server import SFTPServerInterface
+
+    class _DB:
+        def __init__(self, user):
+            self._user = user
+
+        def query(self, *a):
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def first(self):
+            return self._user
+
+    resolve = SFTPServerInterface._resolve_member_name
+    member = SimpleNamespace(_is_temp_session=False, _temp_scope=None)              # interactive member
+    scoped = SimpleNamespace(_is_temp_session=True, _temp_scope={"pages": ["vaults"]})  # scoped cred
+
+    named = _DB(SimpleNamespace(username="alice", email="alice@example.com"))
+    assert resolve(named, "id", member) == "alice"                 # member-grade -> username
+    assert resolve(named, "id", scoped) == "another member"        # scoped -> neutral, no name
+    noname = _DB(SimpleNamespace(username=None, email="bob@example.com"))
+    assert resolve(noname, "id", member) == "another member"       # no username -> neutral, NEVER email
