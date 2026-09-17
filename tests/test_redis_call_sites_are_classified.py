@@ -57,6 +57,12 @@ _REGISTRY = {
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated
     },                                           # short-timeout client (the constructor uses redis.Redis)
+    "core/upload_marker.py": {                   # in-flight upload markers: all best-effort,
+        "place": ("D", 2),                       # SET NX the lock + GET the holder to name them
+        "remove_key": ("D", 1),                  # DELETE on close/abort (skip => the TTL reaps it)
+        "refresh_key": ("D", 1),                 # EXPIRE heartbeat for a slow-but-live transfer
+        "list_folder": ("D", 2),                 # SCAN the folder + MGET; skip => empty listing
+    },
     "core/otp_service.py": {
         "_redis_put": ("C", 4), "_redis_load": ("C", 1),
         "_redis_delete": ("C", 1), "_redis_consume_verify": ("C", 2),

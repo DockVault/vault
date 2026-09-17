@@ -918,6 +918,67 @@ def name_blind_index(vault_id, name: str) -> str:
     return hmac.new(key, name.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
+# --- In-flight upload markers ------------------------------------------------
+# An SFTP write-open publishes an EPHEMERAL Redis marker so the web listing can show "uploading by
+# <member>" and a second upload of the SAME final name in the same folder is refused. The marker
+# carries the FINAL filename ENCRYPTED (no cleartext name ever reaches Redis) under the vault's
+# existing at-rest filename key (_name_encryption_root), and the Redis sub-key is a DETERMINISTIC
+# KEYED hash of (vault, folder, name) so the marker doubles as the lock. Both the ciphertext AAD and
+# the lock index bind (vault, folder), so a marker cannot be replayed into another folder and two
+# folders never share a lock slot. A NULL folder (vault root) folds to the same zero-UUID sentinel
+# the DB uniqueness index uses.
+_UPLOAD_MARKER_ROOT_FOLDER = uuid.UUID('00000000-0000-0000-0000-000000000000')
+
+
+def _marker_folder(folder_id):
+    return folder_id if folder_id is not None else _UPLOAD_MARKER_ROOT_FOLDER
+
+
+def _marker_name_key(vault_id, folder_id) -> bytes:
+    # Off the SAME root as file names ("the vault's existing at-rest filename key"), then bound to
+    # (vault, folder) so a marker blob only decrypts in the folder it was sealed for.
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-upload-marker-v1',
+        info=_uuid_bytes(vault_id) + _uuid_bytes(_marker_folder(folder_id)),
+    ).derive(_name_encryption_root())
+
+
+def _marker_name_aad(vault_id, folder_id) -> bytes:
+    return (b'dockvault-upload-marker-aad:'
+            + _uuid_bytes(vault_id) + _uuid_bytes(_marker_folder(folder_id)))
+
+
+def encrypt_upload_marker_name(vault_id, folder_id, name: str) -> str:
+    """Seal an in-flight upload's FINAL filename for its Redis marker: base64(nonce||ct+tag), under
+    the vault filename key with AAD bound to (vault, folder). No cleartext name ever reaches Redis."""
+    aesgcm = AESGCM(_marker_name_key(vault_id, folder_id))
+    nonce = secrets.token_bytes(_GCM_NONCE_SIZE)
+    ct = aesgcm.encrypt(nonce, name.encode('utf-8'), _marker_name_aad(vault_id, folder_id))
+    return base64.b64encode(nonce + ct).decode('ascii')
+
+
+def decrypt_upload_marker_name(vault_id, folder_id, token: str) -> str:
+    """Inverse of encrypt_upload_marker_name. Raises on tamper or on a marker sealed for a different
+    (vault, folder) -- the AAD binding is what refuses a replay into another folder."""
+    raw = base64.b64decode(token)
+    nonce, ct = raw[:_GCM_NONCE_SIZE], raw[_GCM_NONCE_SIZE:]
+    aesgcm = AESGCM(_marker_name_key(vault_id, folder_id))
+    return aesgcm.decrypt(nonce, ct, _marker_name_aad(vault_id, folder_id)).decode('utf-8')
+
+
+def upload_marker_lock_index(vault_id, folder_id, name: str) -> str:
+    """Deterministic KEYED hash of (vault, folder, final-name) -- the marker/lock Redis sub-key. Same
+    (vault, folder, name) -> same digest (so a second same-name upload collides on it), keyed so the
+    digest is neither the plaintext name nor an unkeyed hash anyone could recompute from a guess."""
+    key = HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-upload-marker-bi-v1',
+        info=_uuid_bytes(vault_id) + _uuid_bytes(_marker_folder(folder_id)),
+    ).derive(_name_blind_index_root())
+    return hmac.new(key, name.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
 def _content_mac_key(file_id) -> bytes:
     """Per-file HMAC key for the content MAC, derived from the deployment root key."""
     return HKDF(

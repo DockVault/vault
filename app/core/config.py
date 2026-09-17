@@ -104,6 +104,14 @@ class Settings(BaseSettings):
     sftp_streaming_upload: bool = Field(default=False)
     sftp_streaming_reorder_mb: int = Field(default=16)
 
+    # In-flight upload markers: the backstop TTL (seconds) on the ephemeral Redis marker an
+    # SFTP write-open publishes. The marker is removed explicitly on close/abort, so this only reaps
+    # a marker left by a client killed before it could clean up. Kept long enough not to expire under
+    # a slow-but-live transfer (the write path refreshes it), short enough to reclaim an abandoned
+    # same-name lock reasonably soon. Readable so a kill test can refuse to judge when the TTL is
+    # shorter than its observation window.
+    upload_marker_ttl_seconds: int = Field(default=900)
+
     # API Server Configuration
     api_host: str = Field(default="0.0.0.0")  # Bind to all interfaces for network access
     api_port: int = Field(default=8000)
