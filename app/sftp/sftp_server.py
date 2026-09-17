@@ -287,8 +287,8 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # same-name lock; removed at close(), which paramiko calls on a graceful CLOSE AND on
         # the subsystem-finish that runs on every disconnect/abort. The TTL is only a crash
         # backstop. None when Redis was down at open (fail-open, no marker to remove).
-        self.upload_marker_key = None
-        self._marker_last_refresh = 0.0
+        self.upload_marker_ref = None   # (vault_id, folder_id, final_name) while this handle
+        self._marker_last_refresh = 0.0  # holds the same-name lock; None if none/Redis-down
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
@@ -362,21 +362,21 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         return paramiko.SFTP_OP_UNSUPPORTED
 
     def _refresh_marker(self):
-        if not self.upload_marker_key:
+        if not self.upload_marker_ref:
             return
         now = time.monotonic()
         if now - self._marker_last_refresh < max(1, upload_marker.marker_ttl_seconds() // 3):
             return
         self._marker_last_refresh = now
-        upload_marker.refresh_key(self.upload_marker_key)
+        upload_marker.refresh(*self.upload_marker_ref)
 
     def close(self):
         # Remove the in-flight upload marker FIRST, on every close path -- a graceful client
         # CLOSE and the paramiko subsystem-finish that closes open handles on any
         # disconnect/abort both land here. Best-effort (never raises); a skip leaves the TTL.
-        if self.upload_marker_key:
-            upload_marker.remove_key(self.upload_marker_key)
-            self.upload_marker_key = None
+        if self.upload_marker_ref:
+            upload_marker.remove(*self.upload_marker_ref)
+            self.upload_marker_ref = None
         # Read mode: release the blob. Held for the life of the handle, so a client that opens a
         # file and leaves is the case this matters for.
         if self.reader is not None:
@@ -1246,7 +1246,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     "'%s' is currently being uploaded by %s"
                     % (filename, self._resolve_member_name(db, _marker_outcome)))
                 return paramiko.SFTP_PERMISSION_DENIED
-            _upload_marker_key = (upload_marker.marker_key(vault_id, folder_id, filename)
+            _upload_marker_ref = ((vault_id, folder_id, filename)
                                   if _marker_outcome is None else None)
 
         # Streaming upload (opt-in via SFTP_STREAMING_UPLOAD): encrypt + persist records as they
@@ -1257,7 +1257,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             handle = VaultSFTPHandle(flags=os.O_WRONLY)
             handle.max_bytes = _eff_max
             handle._sftp_server = getattr(self, "_sftp_server", None)
-            handle.upload_marker_key = _upload_marker_key
+            handle.upload_marker_ref = _upload_marker_ref
             handle.stream = _StreamingUpload(
                 handle=handle, interface=self, vault_id=vault_id, folder_id=folder_id,
                 filename=filename, can_overwrite=can_overwrite, max_bytes=_eff_max,
@@ -1273,8 +1273,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             wf = open(tmp_path, "wb")
         except Exception as e:  # noqa: BLE001
             safe_event('upload.buffer-open.failed', e)
-            if _upload_marker_key:
-                upload_marker.remove_key(_upload_marker_key)  # no handle to close -> free the lock now
+            if _upload_marker_ref:
+                upload_marker.remove(*_upload_marker_ref)  # no handle to close -> free the lock now
             return paramiko.SFTP_FAILURE
 
         handle = VaultSFTPHandle(flags=os.O_WRONLY)
@@ -1286,7 +1286,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # Let an in-stream refusal (over-limit / staging-full) carry a descriptive status instead of
         # paramiko's bare "Failure". _sftp_server is the protocol handler, wired by _MessageSFTPServer.
         handle._sftp_server = getattr(self, "_sftp_server", None)
-        handle.upload_marker_key = _upload_marker_key
+        handle.upload_marker_ref = _upload_marker_ref
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )

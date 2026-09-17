@@ -51,17 +51,17 @@ def test_a_same_name_conflict_is_refused_and_names_the_holder():
 def test_the_acquired_marker_key_is_carried_on_the_handle_both_paths():
     body = _open_write_body()
     # Acquired -> remember the key so close() removes it; SKIPPED (Redis down) -> None, fail open.
-    assert "_upload_marker_key = (upload_marker.marker_key(vault_id, folder_id, filename)" in body
-    assert body.count("handle.upload_marker_key = _upload_marker_key") == 2  # streaming + buffered
+    assert "_upload_marker_ref = ((vault_id, folder_id, filename)" in body
+    assert body.count("handle.upload_marker_ref = _upload_marker_ref") == 2  # streaming + buffered
 
 
 def test_close_removes_the_marker_on_every_close_path():
     s = _src()
     close = s[s.index("    def close(self):"):]
     close = close[:close.index("\n    def ", 1)]
-    assert "upload_marker.remove_key(self.upload_marker_key)" in close
+    assert "upload_marker.remove(*self.upload_marker_ref)" in close
     # Removal is the FIRST thing in close(), before the read/stream/buffered branches that return.
-    assert close.index("upload_marker.remove_key(") < close.index("if self.reader is not None:")
+    assert close.index("upload_marker.remove(") < close.index("if self.reader is not None:")
 
 
 def test_a_failed_buffered_open_frees_the_lock_it_took():
@@ -69,13 +69,13 @@ def test_a_failed_buffered_open_frees_the_lock_it_took():
     # If the staging tempfile can't be opened we return before a handle exists, so there is no
     # close() to remove the marker -- free it inline instead of leaking it to the TTL.
     seg = body[body.index("upload.buffer-open.failed"):]
-    assert "upload_marker.remove_key(_upload_marker_key)" in seg[:400]
+    assert "upload_marker.remove(*_upload_marker_ref)" in seg[:400]
 
 
 def test_the_write_path_heartbeats_the_marker_ttl():
     s = _src()
     # A slow-but-live transfer must not let its marker lapse mid-upload: write() refreshes it.
     assert "self._refresh_marker()" in s
-    assert "upload_marker.refresh_key(self.upload_marker_key)" in s
+    assert "upload_marker.refresh(*self.upload_marker_ref)" in s
     # ...throttled, so it is not a Redis op per write.
     assert "self._marker_last_refresh" in s

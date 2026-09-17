@@ -6,9 +6,15 @@ lets the web listing show a disabled "uploading by <member>" row and doubles as 
 final name is stored ENCRYPTED (never cleartext) and the Redis sub-key is a deterministic KEYED hash
 of (vault, folder, name), so nothing at rest reveals the name. The member is stored by ID, not name.
 
+Enumeration for the listing is by a per-(vault, folder) INDEX SET, not a keyspace SCAN: place adds
+the marker key to `upload_marker:idx:v=<vault>:f=<folder>` and list_folder reads that set + MGETs
+the members, so a folder view costs O(markers in this folder), never O(all Redis keys). The index
+carries the same TTL as its markers (refreshed together); a stale member (its marker already gone)
+is harmless -- MGET returns None for it and list_folder prunes it lazily.
+
 Every Redis touch here is BEST-EFFORT behind the read-through guard (redis_guard.best_effort): with
 the breaker open the marker is SKIPPED, the same-name lock FAILS OPEN (the upload proceeds), and the
-listing returns NO rows -- an outage must never block uploads or leak names. The marker is removed
+listing returns NO rows -- an outage never blocks uploads or leaks names. The marker is removed
 EXPLICITLY on close/abort; its TTL is only the backstop for a client killed before it can clean up.
 """
 import json
@@ -50,37 +56,42 @@ def marker_key(vault_id, folder_id, name: str) -> str:
         upload_marker_lock_index(vault_id, folder_id, name))
 
 
-def _folder_scan_pattern(vault_id, folder_id) -> str:
-    return "%s:v=%s:f=%s:n=*" % (_KEY_PREFIX, vault_id, _folder_token(folder_id))
+def index_key(vault_id, folder_id) -> str:
+    """The per-(vault, folder) index SET holding this folder's live marker keys, for O(folder)
+    enumeration instead of a keyspace SCAN."""
+    return "%s:idx:v=%s:f=%s" % (_KEY_PREFIX, vault_id, _folder_token(folder_id))
 
 
 def place(vault_id, folder_id, name: str, member_id) -> object:
     """Claim the same-name lock and publish the marker for an in-flight upload.
 
-    Returns None when the lock was ACQUIRED (marker now published); the holder's member id (str)
-    when a DIFFERENT upload already holds it (the caller REFUSES, naming the member); or SKIPPED when
-    Redis is unavailable (fail OPEN -- proceed with no marker). Best-effort (class D).
+    Returns None when the lock was ACQUIRED (marker now published, indexed); the holder's member id
+    (str) when a DIFFERENT upload already holds it (the caller REFUSES, naming the member); or SKIPPED
+    when Redis is unavailable (fail OPEN -- proceed with no marker). Best-effort (class D).
     """
-    key = marker_key(vault_id, folder_id, name)
+    mkey = marker_key(vault_id, folder_id, name)
+    ikey = index_key(vault_id, folder_id)
+    ttl = marker_ttl_seconds()
     payload = json.dumps({
         "n": encrypt_upload_marker_name(vault_id, folder_id, name),
         "m": str(member_id),
     })
     acquired = redis_guard.best_effort(
         "upload_marker.place",
-        lambda: redis_client.set(key, payload, nx=True, ex=marker_ttl_seconds()),
+        lambda: redis_client.set(mkey, payload, nx=True, ex=ttl),
         default=SKIPPED)
     if acquired is SKIPPED:
         return SKIPPED            # Redis down: fail OPEN, no marker
     if acquired:
-        return None               # lock acquired, marker published
+        # Index the marker for folder-scoped enumeration; the index carries the marker's TTL.
+        redis_guard.best_effort("upload_marker.index_add", lambda: redis_client.sadd(ikey, mkey), default=None)
+        redis_guard.best_effort("upload_marker.index_ttl", lambda: redis_client.expire(ikey, ttl), default=None)
+        return None
     # Not acquired: a marker for this exact (vault, folder, name) already exists. Read it to name the
     # holder; a miss (it just expired or was removed) means there is no holder to refuse against, so
     # fail OPEN and let the caller retry the claim rather than refuse blindly.
     existing = redis_guard.best_effort(
-        "upload_marker.holder",
-        lambda: redis_client.get(key),
-        default=SKIPPED)
+        "upload_marker.holder", lambda: redis_client.get(mkey), default=SKIPPED)
     if existing is SKIPPED or existing is None:
         return SKIPPED
     try:
@@ -94,9 +105,10 @@ def holder(vault_id, folder_id, name: str) -> object:
     lock: the holder's member id (str) when a live upload holds the name, None when it is free, or
     SKIPPED when Redis is down (callers fail OPEN -- an outage never blocks a rename/upload). Lets a
     committed-rows-only check (rename clash) also refuse to land on a name a live upload will take."""
-    key = marker_key(vault_id, folder_id, name)
     raw = redis_guard.best_effort(
-        "upload_marker.holder_read", lambda: redis_client.get(key), default=SKIPPED)
+        "upload_marker.holder_read",
+        lambda: redis_client.get(marker_key(vault_id, folder_id, name)),
+        default=SKIPPED)
     if raw is SKIPPED:
         return SKIPPED
     if raw is None:
@@ -108,48 +120,54 @@ def holder(vault_id, folder_id, name: str) -> object:
 
 
 def remove(vault_id, folder_id, name: str) -> None:
-    """Remove the marker for a (vault, folder, name) on close/abort."""
-    remove_key(marker_key(vault_id, folder_id, name))
+    """Remove the marker for a (vault, folder, name) on close/abort: delete the marker key and drop
+    it from the folder index. Best-effort (never raises), so it is safe in a teardown finally; a skip
+    (Redis down) just leaves the TTL to reap both."""
+    mkey = marker_key(vault_id, folder_id, name)
+    ikey = index_key(vault_id, folder_id)
+    redis_guard.best_effort("upload_marker.remove", lambda: redis_client.delete(mkey), default=None)
+    redis_guard.best_effort("upload_marker.index_srem", lambda: redis_client.srem(ikey, mkey), default=None)
 
 
-def remove_key(key: str) -> None:
-    """Best-effort delete of a marker by its key. A skip (Redis down) just leaves the TTL to reap it
-    -- the backstop. Never raises, so it is safe in a teardown finally."""
-    redis_guard.best_effort("upload_marker.remove", lambda: redis_client.delete(key), default=None)
-
-
-def refresh_key(key: str) -> None:
-    """Best-effort TTL refresh, so a slow-but-live transfer's marker does not expire mid-upload."""
+def refresh(vault_id, folder_id, name: str) -> None:
+    """Best-effort TTL refresh of a marker AND its index entry, so a slow-but-live transfer's marker
+    (and its same-name lock and listing row) does not expire mid-upload."""
+    ttl = marker_ttl_seconds()
     redis_guard.best_effort(
-        "upload_marker.refresh", lambda: redis_client.expire(key, marker_ttl_seconds()), default=None)
+        "upload_marker.refresh", lambda: redis_client.expire(marker_key(vault_id, folder_id, name), ttl), default=None)
+    redis_guard.best_effort(
+        "upload_marker.index_refresh", lambda: redis_client.expire(index_key(vault_id, folder_id), ttl), default=None)
 
 
 def list_folder(vault_id, folder_id):
-    """The in-flight markers for a (vault, folder) as a list of {"enc_name", "member_id"}.
+    """The in-flight markers for a (vault, folder) as a list of {"enc_name", "member_id"}, read from
+    the folder index (O(folder), not a keyspace SCAN).
 
     Empty on an outage (guard open) -- the listing simply shows no in-flight rows while Redis is
-    down. The FINAL name stays ENCRYPTED here; the listing decrypts it only for an authorized viewer.
+    down. A stale index member (marker already expired/removed) reads back as None from MGET and is
+    pruned lazily. The FINAL name stays ENCRYPTED here; the listing decrypts it only for an
+    authorized viewer.
     """
-    pattern = _folder_scan_pattern(vault_id, folder_id)
+    ikey = index_key(vault_id, folder_id)
     keys = redis_guard.best_effort(
-        "upload_marker.scan",
-        lambda: list(redis_client.scan_iter(match=pattern, count=100)),
-        default=None)
+        "upload_marker.index_members", lambda: list(redis_client.smembers(ikey)), default=None)
     if not keys:
         return []
     values = redis_guard.best_effort(
-        "upload_marker.read",
-        lambda: redis_client.mget(keys),
-        default=None)
+        "upload_marker.read", lambda: redis_client.mget(keys), default=None)
     if not values:
         return []
-    out = []
-    for raw in values:
+    out, stale = [], []
+    for k, raw in zip(keys, values):
         if not raw:
+            stale.append(k)          # the marker expired/was removed but its index entry lingers
             continue
         try:
             blob = json.loads(raw)
             out.append({"enc_name": blob["n"], "member_id": blob.get("m")})
         except (ValueError, KeyError, TypeError):
-            continue
+            stale.append(k)
+    if stale:
+        redis_guard.best_effort(
+            "upload_marker.index_prune", lambda: redis_client.srem(ikey, *stale), default=None)
     return out
