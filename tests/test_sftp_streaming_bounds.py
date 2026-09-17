@@ -82,12 +82,17 @@ def test_the_persist_locks_the_vault_row_before_the_quota_check():
     # the with_for_update re-read -> the quota is read unlocked and two persists both commit -> the
     # live two-upload race goes red.)
     src = SFTP.read_text(encoding="utf-8")
-    fn = src[src.index("def _authorize_upload_persist("):src.index("def _make_upload_finalizer(")]
+    fn_full = src[src.index("def _authorize_upload_persist("):src.index("def _make_upload_finalizer(")]
+    # Assert against CODE only, not comments: the explanatory comment inside this function names
+    # "with_for_update(key_share=True)" too, so a substring check would pass on the comment even with
+    # the call removed from the query. Strip `#` comment lines, and key on the exact query chain token
+    # (the comment has no `.first()` and no leading dot), so the pin tracks the code.
+    fn = "\n".join(ln for ln in fn_full.splitlines() if not ln.lstrip().startswith("#"))
     # FOR NO KEY UPDATE (key_share=True), never FOR UPDATE (the audit-insert KEY SHARE deadlock lesson).
-    assert "with_for_update(key_share=True)" in fn
-    assert "populate_existing()" in fn                    # refresh the get_vault instance to the locked total
+    assert ".with_for_update(key_share=True).first()" in fn
+    assert ".populate_existing()" in fn                   # refresh the get_vault instance to the locked total
     # The lock precedes the size_limit check, so the quota is read from the locked row.
-    lock_at = fn.index("with_for_update(key_share=True)")
+    lock_at = fn.index(".with_for_update(key_share=True).first()")
     quota_at = fn.index("vault.total_size_bytes or 0) + size > vault.size_limit")
     assert lock_at < quota_at, "the vault row must be locked before the quota check"
     # A lock_timeout is a clean drop (blob discarded, marker removed by the caller), never a hang.
