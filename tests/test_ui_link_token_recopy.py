@@ -72,8 +72,9 @@ def _create_open_note_link(page: Page) -> str:
     expect(page.locator("#note-public-result")).to_be_visible(timeout=10000)
     url = page.locator("#note-public-link-value").input_value()
     assert re.search(r"/l/[0-9A-Za-z]+$", url), url
-    # Close the create modal so the Shared tab is reachable.
-    page.locator("#note-public-link-modal .close-modal-btn").first.click()
+    # Close the create modal so the Shared tab is reachable (the control is `.modal-close`
+    # / [data-note-public-close], not `.close-modal-btn`).
+    page.locator("#note-public-link-modal .modal-close").first.click()
     return url
 
 
