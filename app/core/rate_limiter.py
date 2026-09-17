@@ -550,7 +550,11 @@ return {over, tostring(reset_at)}
             reset_at = int(results[1])
             # retry_after is meaningful only when over the limit; report 0 otherwise, so a caller
             # never reads a spurious wait out of an under-limit peek (whose reset is just now+window).
-            return over, (max(0, reset_at - int(now)) if over else 0)
+            # Clamp to the window: reset_at is math.ceil(oldest + window) in the Lua while the wait
+            # here truncates now with int(), so when the oldest entry's fractional second exceeds
+            # now's the two roundings disagree and the raw value is window + 1. A retry-after must
+            # never exceed the window it belongs to.
+            return over, (max(0, min(window, reset_at - int(now))) if over else 0)
         except Exception as e:
             # Do NOT trip the breaker here: this observer must not drive the state machine. Signal
             # unavailability so the caller uses the durable DB peek instead of trusting a blank read.
@@ -620,7 +624,9 @@ return {over, tostring(reset_at)}
         )
         
         if not allowed:
-            retry_after = reset_time - int(time.time())
+            # Clamp to the window (see peek_rate_limit): the Lua ceils reset while this truncates
+            # now, so the raw gap can be window + 1; a retry-after must never exceed its window.
+            retry_after = max(0, min(window, reset_time - int(time.time())))
             raise RateLimitExceeded(
                 message=message,
                 retry_after=retry_after,
