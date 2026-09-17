@@ -159,6 +159,33 @@ def release_for_session(db, cred_model, session_model, session_token, when: date
     return released
 
 
+def release_ended_session_slots(db, cred_model, session_model, ended_cred_ids, when=None) -> int:
+    """Release the cap slot of each temp credential in ``ended_cred_ids`` whose LAST active session
+    has just ended -- web logout, admin terminate, or the session reaper. A hand-out credential spent
+    at the WEB door otherwise holds its slot until its validity window; this frees it when the
+    session that was using it goes away, the web twin of the SFTP connection-close release.
+
+    The caller must have ALREADY marked the ended sessions ``is_active=False`` (and flushed), so the
+    "any session still open?" guard sees the truth: a credential with another live session keeps its
+    slot (a temp credential is single-session today, so this guards a future, not a common case).
+    Idempotent and single-use-safe -- ``mark_released`` never touches ``is_used``/``is_active``.
+    Returns the count released."""
+    released = 0
+    for cid in {c for c in ended_cred_ids if c is not None}:
+        still_open = (
+            db.query(session_model.id)
+            .filter(session_model.temp_credential_id == cid,
+                    session_model.is_active == True)  # noqa: E712
+            .first()
+        )
+        if still_open is not None:
+            continue
+        cred = db.query(cred_model).filter(cred_model.id == cid).first()
+        if cred is not None and mark_released(cred, when):
+            released += 1
+    return released
+
+
 def release_expired_slots(db, cred_model, now: datetime) -> int:
     """Reaper BACKSTOP: release the slots of credentials whose VALIDITY window has ended but whose
     close hook never fired — a SIGKILLed connection. Keyed on ``deactivate_at``, NEVER on the

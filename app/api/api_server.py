@@ -7155,9 +7155,17 @@ async def terminate_temp_credential_sessions(
                 "ip_address": session.ip_address
             }
         )
-    
+
+    # Admin/user terminate: all of THIS credential's active sessions were just ended, so its web-door
+    # cap slot is free -- release it (the web twin of the SFTP connection-close release). Flush first
+    # so the "any session still open?" guard sees the terminations. Never touches is_used/is_active.
+    if terminated_count:
+        from app.core.temp_cred_slot import release_ended_session_slots
+        db.flush()
+        release_ended_session_slots(db, TemporaryCredential, ActiveSession, {temp_cred.id})
+
     db.commit()
-    
+
     return {
         "message": f"Terminated {terminated_count} active session(s)",
         "terminated_count": terminated_count
@@ -19821,6 +19829,14 @@ async def logout(
                 # Durable revocation: rejected per-request even if the Redis denylist read
                 # fails open during an outage (get_current_user checks ActiveSession.revoked).
                 session.revoked = True
+                # A hand-out credential spent at the web door frees its cap slot when its (only) web
+                # session ends -- release it here on logout, the web twin of the SFTP close release.
+                # Never touches is_used/is_active on the credential.
+                if session.temp_credential_id is not None:
+                    from app.core.temp_cred_slot import release_ended_session_slots
+                    from app.core.models import TemporaryCredential as _TC_logout
+                    db.flush()
+                    release_ended_session_slots(db, _TC_logout, ActiveSession, {session.temp_credential_id})
                 db.commit()
                 session_invalidated = True
                 print(f"🔓 Session invalidated for user {current_user.username} (session_token: {session_token[:16]}...)")
@@ -20434,8 +20450,20 @@ async def cleanup_expired_sessions():
                 ).all()
 
                 if expired_sessions:
+                    _ended_tc = set()
                     for session in expired_sessions:
                         session.is_active = False
+                        if session.temp_credential_id is not None:
+                            _ended_tc.add(session.temp_credential_id)
+                    db.flush()  # the is_active=False must be visible to the 'any session left?' guard
+                    # A hand-out credential spent at the web door holds its cap slot until validity;
+                    # when its LAST web session is reaped here (before deactivate_at), free the slot
+                    # now instead of waiting for the validity-keyed backstop below. Never touches
+                    # is_used/is_active on the credential.
+                    if _ended_tc:
+                        from app.core.temp_cred_slot import release_ended_session_slots
+                        from app.core.models import TemporaryCredential as _TC_end
+                        release_ended_session_slots(db, _TC_end, ActiveSession, _ended_tc)
                     db.commit()
                     print(f"🧹 Cleaned up {len(expired_sessions)} expired session(s)")
 

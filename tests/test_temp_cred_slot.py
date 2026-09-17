@@ -214,6 +214,36 @@ def test_release_expired_slots_releases_only_past_validity_live_orphans():
     assert s.get(Cred, 4).slot_released_at is None
 
 
+# ---- web-door release: free a spent hand-out credential's slot when its last web session ends ----
+def test_release_ended_session_slots_frees_only_when_the_last_session_ended():
+    Cred, Sess, s = _sqlite_env()
+    s.add_all([
+        Cred(id=1, is_active=True, is_used=True, deactivate_at=_FUTURE, slot_released_at=None),
+        Cred(id=2, is_active=True, is_used=True, deactivate_at=_FUTURE, slot_released_at=None),
+    ])
+    s.add_all([
+        Sess(id=1, temp_credential_id=1, is_active=False, expires_at=_FUTURE),  # cred 1: only session ended
+        Sess(id=2, temp_credential_id=2, is_active=False, expires_at=_FUTURE),  # cred 2: one ended...
+        Sess(id=3, temp_credential_id=2, is_active=True, expires_at=_FUTURE),   # ...but another still open
+    ])
+    s.commit()
+    n = slot.release_ended_session_slots(s, Cred, Sess, {1, 2}, _NOW)
+    s.commit()
+    assert n == 1
+    assert s.get(Cred, 1).slot_released_at == _NOW   # last session ended -> slot freed
+    assert s.get(Cred, 2).slot_released_at is None   # a still-open session protects the slot
+    assert s.get(Cred, 1).is_used is True            # single-use untouched
+
+
+def test_release_ended_session_slots_is_idempotent_and_ignores_none_ids():
+    Cred, Sess, s = _sqlite_env()
+    s.add(Cred(id=1, is_active=True, is_used=True, deactivate_at=_FUTURE, slot_released_at=_PAST))
+    s.commit()
+    # Already released -> not moved; a None id (a key-auth session) is skipped, not queried.
+    assert slot.release_ended_session_slots(s, Cred, Sess, {1, None}, _NOW) == 0
+    assert s.get(Cred, 1).slot_released_at == _PAST
+
+
 # ---- wiring: the close hook and the reaper backstop call the shared release ----------------------
 def test_the_connection_close_hook_and_reaper_backstop_are_wired():
     from pathlib import Path
@@ -225,6 +255,26 @@ def test_the_connection_close_hook_and_reaper_backstop_are_wired():
     # The API reaper calls the deactivate_at-keyed backstop (release_expired_slots keys on validity,
     # never on the never-updated last_activity column -- pinned by its behaviour above).
     assert "release_expired_slots(" in api_src
+
+
+def test_the_web_door_slot_release_is_wired_on_logout_terminate_and_the_reaper():
+    # The carried gap: a hand-out credential spent at the WEB door kept its cap slot until validity
+    # because only the SFTP close released it. All three web-door session-end paths now release the
+    # slot. (The shared helper's behaviour is pinned above; this pins the three call sites.)
+    from pathlib import Path
+    api_src = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    assert api_src.count("release_ended_session_slots(") >= 3
+
+    def _fn(marker):
+        start = api_src.index(marker)
+        tail = api_src[start:]
+        nxt = tail.find("\n@app.", 1)
+        return tail if nxt == -1 else tail[:nxt]
+
+    assert "release_ended_session_slots(" in _fn('@app.post("/api/logout")')
+    assert "release_ended_session_slots(" in _fn("async def terminate_temp_credential_sessions(")
+    reaper = api_src[api_src.index("async def cleanup_expired_sessions"):]
+    assert "release_ended_session_slots(" in reaper[:3500]
 
 
 def test_all_three_per_request_gates_refuse_a_finished_credential():
