@@ -356,16 +356,52 @@ def test_the_same_fix_is_accepted_once_its_version_is_released():
     um.validate_matrix(data, released_ceiling=None)
 
 
-def test_the_committed_matrix_lists_the_vulnerabilities_fixed_in_0_29_1():
+#: The 0.29.1-era defect titles. Every version released BEFORE 0.29.1 must keep listing these as
+#: fixed_in 0.29.1, so a later release appending its own defects cannot silently drop them. Titles,
+#: not a count -- a future release adds more entries to these same versions.
+_VULNS_FIXED_IN_0_29_1 = {
+    "Temporary-credential sessions could manage devices",
+    "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
+}
+
+
+def test_the_committed_matrix_holds_its_vulnerability_invariants():
+    # Durable invariants of the COMMITTED docs/upgrade-matrix.json (never a fixture), so this survives
+    # every future release commit instead of snapshotting one release's state (the 0.29.1 snapshot it
+    # replaced broke the moment 0.30.0 added more entries and flipped 0.29.1 to secure=false).
     data = um.load_matrix(MATRIX_PATH)
+    versions = data["versions"]
+
+    # (a) MEMBERSHIP: 0.28.0 and 0.29.0 each still list the 0.29.1-era titles, fixed_in 0.29.1.
     for ver in ("0.28.0", "0.29.0"):
-        vulns = data["versions"][ver].get("vulnerabilities")
-        assert vulns and len(vulns) == 2, f"{ver} should list its two known, fixed vulnerabilities"
-        assert all(v["fixed_in"] == "0.29.1" for v in vulns), f"{ver} vulns must be fixed_in 0.29.1"
-        assert all(v["severity"] is None and v["cvss"] is None and v["id"] is None for v in vulns)
-    # The release that fixed them is marked secure and lists none.
-    assert data["versions"]["0.29.1"]["support"]["secure"] is True
-    assert not data["versions"]["0.29.1"].get("vulnerabilities")
+        by_title = {v["title"]: v for v in (versions[ver].get("vulnerabilities") or [])}
+        for title in _VULNS_FIXED_IN_0_29_1:
+            assert title in by_title, f"{ver} no longer lists the 0.29.1-fixed defect {title!r}"
+            assert by_title[title]["fixed_in"] == "0.29.1", f"{ver}:{title!r} must be fixed_in 0.29.1"
+
+    # (b) FIXED_IN STRICTLY LATER, over EVERY version: the release that fixes a defect never lists it,
+    # and a fixed_in typo that marks a version as its own fix is caught.
+    for ver, meta in versions.items():
+        for v in (meta.get("vulnerabilities") or []):
+            assert um._sort_key(v["fixed_in"]) > um._sort_key(ver), (
+                f"{ver} lists {v['title']!r} with fixed_in={v['fixed_in']}, "
+                f"which is not strictly later than {ver}")
+
+    # (c) SECURE DERIVED: any version carrying a vulnerability entry reads support.secure false. A
+    # version carrying none is NOT asserted either way (old/EOL releases are insecure for other
+    # reasons, and a secure release simply lists nothing).
+    for ver, meta in versions.items():
+        if meta.get("vulnerabilities"):
+            assert meta["support"]["secure"] is False, (
+                f"{ver} lists vulnerabilities but is marked support.secure true")
+
+    # (d) SHAPE: every entry carries id / severity / cvss keys, all null (the shape all entries follow
+    # today), so a stray extra field or a missing key still fails.
+    for ver, meta in versions.items():
+        for v in (meta.get("vulnerabilities") or []):
+            for key in ("id", "severity", "cvss"):
+                assert key in v, f"{ver}:{v.get('title')!r} is missing the {key!r} key"
+                assert v[key] is None, f"{ver}:{v.get('title')!r} has a non-null {key}"
 
 
 def test_the_shapes_a_real_non_trivial_upgrade_will_need_are_accepted():
