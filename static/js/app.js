@@ -18301,10 +18301,12 @@ function _noteLinkCard(l) {
     view.addEventListener('click', () => openNoteLinkSnapshot(l));
     actions.appendChild(view);
     if (l.status === 'active') {
-        const copy = _el('button', 'btn btn-ghost btn-sm', 'Copy link');
-        copy.type = 'button';
-        copy.addEventListener('click', () => copyNoteLinkUrl(l));
-        actions.appendChild(copy);
+        if (l.has_token_copy) {
+            const again = _el('button', 'btn btn-ghost btn-sm', 'Show link again');
+            again.type = 'button';
+            again.addEventListener('click', () => _showLinkAgain('note', l.id, '/l/'));
+            actions.appendChild(again);
+        }
         const revoke = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
         revoke.type = 'button';
         revoke.addEventListener('click', () => revokeNoteLink(l.id));
@@ -18326,6 +18328,70 @@ function openNoteLinkSnapshot(l) {
     if (titleEl) titleEl.textContent = l.title || 'Untitled note';
     if (bodyEl) bodyEl.textContent = (l.body != null) ? l.body : '(snapshot text unavailable)';
     openModal('note-link-snapshot-modal');
+}
+
+// --- Owner-encrypted link re-copy ("Show link again") -------------------------------------------
+// The URL token is shown ONCE at creation. If the account has an ECC keypair, the client also wraps
+// the token to the owner's OWN public key (encryption needs only the PUBLIC key -> no unlock prompt
+// here) and stores that opaque blob, so a later "Show link again" is a client-side decrypt.
+// Best-effort: a failure to save the re-copy never fails link creation -- the link stays one-time-show.
+async function _saveLinkReCopy(kind, link) {
+    if (!link || !link.token || !link.id) return { saved: false, reason: 'no-token' };
+    let pub;
+    try { pub = await apiRequest('/ecc/keys/public', { silent: true }); } catch (_e) { pub = null; }
+    if (!pub || !pub.has_keypair || !pub.public_key) return { saved: false, reason: 'no-keypair' };
+    try {
+        const ownerPub = await eccLib().importPublicKeyPEM(pub.public_key);
+        const ownerId = link.owner_id || (currentUser && currentUser.id);
+        const blob = await eccLib().wrapLinkTokenV2(link.token, ownerPub, { linkId: link.id, ownerId });
+        const base = kind === 'note' ? '/note-links/' : '/public-links/';
+        await apiRequest(base + link.id + '/token-copy',
+            { method: 'PUT', body: JSON.stringify({ token_enc: blob }), silent: true });
+        return { saved: true };
+    } catch (_e) {
+        return { saved: false, reason: 'error' };   // network / shape 400 / import error
+    }
+}
+
+// Set the quiet one-line note under a create result: saved, no-keypair (set up your key), or a
+// best-effort failure that leaves the link one-time-show.
+function _setLinkReCopyNote(resultElId, rc) {
+    const host = document.getElementById(resultElId);
+    if (!host) return;
+    let note = host.querySelector('.link-recopy-note');
+    if (!note) { note = _el('p', 'text-secondary text-sm mt-sm link-recopy-note'); host.appendChild(note); }
+    if (rc.saved) {
+        note.textContent = 'You can show this link again later from the Shared tab.';
+    } else if (rc.reason === 'no-keypair') {
+        note.textContent = 'Set up your encryption key to be able to see links again.';
+    } else {
+        note.textContent = 'Re-copy not saved — this link is shown once.';
+    }
+}
+
+// Reveal a saved re-copy: fetch the blob, unlock the private key, unwrap client-side, copy the URL.
+// Any unwrap failure (a rotated key, a blob for another link) renders the honest message -- never a
+// dead button or a 500.
+async function _showLinkAgain(kind, id, urlPrefix) {
+    const base = kind === 'note' ? '/note-links/' : '/public-links/';
+    let resp;
+    try { resp = await apiRequest(base + id + '/token-copy', { silent: true }); } catch (_e) { resp = null; }
+    if (!resp || !resp.token_enc) { showError('No saved copy for this link.'); return; }
+    let token;
+    try {
+        const priv = await zkEnsureUnlocked();
+        token = await eccLib().unwrapLinkTokenV2(
+            resp.token_enc, priv, { linkId: id, ownerId: (currentUser && currentUser.id) });
+    } catch (_e) {
+        showError('Re-copy unavailable after your key change — create a new link');
+        return;
+    }
+    const url = window.location.origin + urlPrefix + token;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => showSuccess('Link copied')).catch(() => showError('Copy failed — ' + url));
+    } else {
+        showError('Copy not supported — ' + url);
+    }
 }
 
 function copyNoteLinkUrl(l) {
@@ -18694,6 +18760,9 @@ async function submitNotePublicLink() {
         _npEl('note-public-result').hidden = false;
         _npEl('note-public-link-value').value = url;
         btn.hidden = true;
+        // Show the token FIRST (above), THEN try to save the owner-encrypted re-copy. A failure here
+        // never fails creation or hides the token -- the link just stays one-time-show.
+        _setLinkReCopyNote('note-public-result', await _saveLinkReCopy('note', link));
         if (_npEl('note-public-cancel')) _npEl('note-public-cancel').hidden = true;
         if (_npEl('note-public-done')) _npEl('note-public-done').hidden = false;
         // Refresh so the new link shows on the "Shared" tab without a page reload.
@@ -18853,6 +18922,8 @@ async function submitPublicFileLink() {
         _pflEl('pfl-result').hidden = false;
         _pflEl('pfl-link-value').value = url;
         btn.hidden = true;
+        // Show the token FIRST (above), THEN best-effort save the owner-encrypted re-copy.
+        _setLinkReCopyNote('pfl-result', await _saveLinkReCopy('public', link));
         if (_pflEl('pfl-cancel')) _pflEl('pfl-cancel').hidden = true;
         if (_pflEl('pfl-done')) _pflEl('pfl-done').hidden = false;
     } catch (e) {
@@ -18913,6 +18984,11 @@ function renderMyPublicLinks(links) {
         // The link URL is shown only once at creation (the token isn't stored in the clear), so there
         // is no "copy" here — just revoke (while active) and delete.
         const actTd = _el('td', 'flex gap-sm');
+        if (l.has_token_copy) {
+            const again = _el('button', 'btn btn-ghost btn-sm', 'Show link again'); again.type = 'button';
+            again.addEventListener('click', () => _showLinkAgain('public', l.id, '/p/'));
+            actTd.appendChild(again);
+        }
         if (l.status === 'active') {
             const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';
             rv.addEventListener('click', () => revokeMyPublicLink(l.id));

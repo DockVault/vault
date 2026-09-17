@@ -89,6 +89,8 @@ def test_the_blob_is_never_in_a_listing_and_creation_carries_owner_id_for_aad():
     src = _src()
     for dict_fn in ("def _notelink_public_dict(", "def _publiclink_public_dict("):
         body = src[src.index(dict_fn):src.index("\n\n", src.index(dict_fn) + 200)]
-        assert "token_enc" not in body        # the owner list never carries the blob
+        assert '"token_enc":' not in body      # the owner list never carries the blob VALUE...
+        # ...only a presence flag so the UI can show "Show link again" without a dead button.
+        assert '"has_token_copy": link.token_enc is not None' in body
     # The create responses carry owner_id so the client can bind AAD = link id || owner id.
     assert src.count('["owner_id"] = str(current_user.id)') == 2

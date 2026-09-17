@@ -9864,6 +9864,7 @@ def _notelink_public_dict(link, tag=None) -> dict:
         "view_count": link.view_count,
         "last_viewed_at": link.last_viewed_at.isoformat() if link.last_viewed_at else None,
         "revoked": bool(link.revoked),
+        "has_token_copy": link.token_enc is not None,   # presence flag only; the blob is never listed
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
     }
@@ -10551,6 +10552,7 @@ def _publiclink_public_dict(link, tag=None) -> dict:
         "download_count": link.download_count,
         "bytes_served": link.bytes_served,
         "revoked": bool(link.revoked),
+        "has_token_copy": link.token_enc is not None,   # presence flag only; the blob is never listed
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
         "last_used_at": link.last_used_at.isoformat() if link.last_used_at else None,
