@@ -438,6 +438,14 @@ def build_env_lines(cfg):
     if sftp_active and cfg.get("sftp_streaming_reorder_mb") not in (None, "") \
             and int(cfg["sftp_streaming_reorder_mb"]) != 16:
         bare("SFTP_STREAMING_REORDER_MB", int(cfg["sftp_streaming_reorder_mb"]))
+    # In-flight upload marker TTL (seconds): the backstop on the ephemeral Redis marker an SFTP
+    # write-open publishes so the web listing shows "uploading by <member>" and a same-name upload
+    # is refused. Removed explicitly on close and refreshed during a live transfer, so this only
+    # reaps a marker left by a killed client. Written only when the operator set a non-default value
+    # (default 900); a normal install never mentions it and an existing value is preserved below.
+    if sftp_active and cfg.get("upload_marker_ttl_seconds") not in (None, "") \
+            and int(cfg["upload_marker_ttl_seconds"]) != 900:
+        bare("UPLOAD_MARKER_TTL_SECONDS", int(cfg["upload_marker_ttl_seconds"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
     # Deployment storage ceiling. Only written when the operator chose one: left out, the app's
@@ -1205,6 +1213,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # Keep an experimental SFTP streaming-upload choice + reorder window across a fresh volume set.
         "sftp_streaming_upload": truthy("SFTP_STREAMING_UPLOAD"),
         "sftp_streaming_reorder_mb": (current_env.get("SFTP_STREAMING_REORDER_MB") or "").strip() or None,
+        # Keep a custom in-flight upload marker TTL across a fresh volume set, like the fields above.
+        "upload_marker_ttl_seconds": (current_env.get("UPLOAD_MARKER_TTL_SECONDS") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
