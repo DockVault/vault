@@ -1547,6 +1547,10 @@ class NoteLink(Base):
     # partial-unique index (WHERE token_hash IS NOT NULL) is added by the boot DDL.
     token_hash = Column(String(64), nullable=True, index=True)
     token_len = Column(Integer, nullable=False)
+    # OPTIONAL owner-encrypted re-copy of the URL token, wrapped CLIENT-side to the owner's ECC
+    # public key so only the owner's client can decrypt it ("Show link again"). The server stores it
+    # OPAQUE and never decrypts it; NULL when the creating client stored none (one-time-show only).
+    token_enc = Column(Text, nullable=True)
 
     # Frozen content snapshot. Text (not String(255)): sealed at rest like the note it copies; the
     # boot DDL widens the same column on an already-deployed DB.
@@ -1596,6 +1600,9 @@ class PublicLink(Base):
     # sha256 of the opaque base62 URL token (never the token itself). Unique + indexed for O(1) lookup.
     token_hash = Column(String(64), nullable=False, unique=True, index=True)
     token_len = Column(Integer, nullable=False)   # length of the plaintext token (for the policy display)
+    # Owner-encrypted re-copy of the URL token (see NoteLink.token_enc). Opaque, client-wrapped,
+    # server never decrypts; NULL when none was stored.
+    token_enc = Column(Text, nullable=True)
 
     # The LIVE target. Cascades from vault/file/folder, so the link dies with what it points at.
     vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)

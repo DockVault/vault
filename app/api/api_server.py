@@ -10039,6 +10039,7 @@ async def create_note_link(
     created = _notelink_public_dict(link, tag)
     created["token"] = token
     created["url_path"] = f"/l/{token}"
+    created["owner_id"] = str(current_user.id)   # for the client to bind AAD = link id || owner id
     return created
 
 
@@ -10729,6 +10730,7 @@ async def create_public_link(
     out = _publiclink_public_dict(link, tag)
     out["token"] = token
     out["url_path"] = f"/p/{token}"
+    out["owner_id"] = str(current_user.id)   # for the client to bind AAD = link id || owner id
     return out
 
 
@@ -10746,6 +10748,118 @@ async def list_public_links(
     tag_ids = {l.tag_id for l in links if l.tag_id}
     tags = {t.id: t for t in db.query(NoteLinkTag).filter(NoteLinkTag.id.in_(tag_ids)).all()} if tag_ids else {}
     return {"links": [_publiclink_public_dict(l, tags.get(l.tag_id)) for l in links]}
+
+
+# ---- Owner-encrypted re-copy of a link's URL token ("Show link again") --------------------------
+# The token is stored HASHED and shown in cleartext exactly once, at creation. A keypair-holding
+# owner's CLIENT may also wrap the token to the owner's OWN ECC public key and store that OPAQUE blob
+# here, so a later "Show link again" is a client-side decrypt. The server never sees the plaintext
+# after creation, never decrypts the blob, and never returns a plaintext token from any endpoint.
+_LINK_TOKEN_COPY_MAX = 8192                      # size cap on the opaque blob (a few KB)
+_LINK_TOKEN_COPY_MIN = 8 + 97 + 12 + 16 + 1      # V2 header + P-384 epk + GCM nonce + tag + >=1 ct
+
+
+def _valid_link_token_copy(blob) -> bool:
+    """Shape-ONLY validation of the opaque re-copy blob. The server CANNOT verify the blob is wrapped
+    to the owner's key (that needs the private key it never holds) nor that a client did not store its
+    own plaintext -- but a client that stored plaintext would harm only its OWN link, never worse than
+    the one-time-show it replaces. What the server DOES enforce: a base64 V2 LINK-TOKEN container
+    (magic 'DVZ2', version 2, purpose 0x06, reserved 0) of a sane length within the size cap. A raw
+    plaintext token, an empty blob or an oversized blob all fail this."""
+    if not isinstance(blob, str) or not blob:
+        return False
+    import base64 as _b64
+    import binascii as _binascii
+    try:
+        raw = _b64.b64decode(blob, validate=True)
+    except (ValueError, _binascii.Error):
+        return False
+    if not (_LINK_TOKEN_COPY_MIN <= len(raw) <= _LINK_TOKEN_COPY_MAX):
+        return False
+    return (raw[0:4] == b"DVZ2" and raw[4] == 0x02 and raw[5] == 0x06
+            and raw[6] == 0 and raw[7] == 0)
+
+
+class LinkTokenCopyBody(BaseModel):
+    token_enc: str
+
+
+def _link_owner_or_404(db, model, link_id, current_user):
+    # Owner-only, INTERACTIVE member-grade. A temp/scoped session or a non-owner (an admin included)
+    # gets the SAME 404 as a missing link -- no oracle -- like the other per-owner link routes.
+    from app.core.temp_scope import is_scoped
+    if is_scoped(current_user) or getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=404, detail="Not found.")
+    link = db.query(model).filter(model.id == link_id, model.owner_id == current_user.id).first()
+    if link is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return link
+
+
+def _link_is_live(link, now=None) -> bool:
+    now = now or datetime.utcnow()
+    return (not link.revoked
+            and (link.expires_at is None or link.expires_at > now)
+            and (link.max_uses is None or link.use_count < link.max_uses))
+
+
+def _store_link_token_copy(db, link, blob) -> dict:
+    # WRITE-ONCE (no owner replace -- a key rotation invalidates the copy honestly, it is not
+    # re-written here), accepted only while the link is live, and only a well-formed V2 container.
+    if link.token_enc is not None:
+        raise HTTPException(status_code=409, detail="A re-copy is already stored for this link.")
+    if not _link_is_live(link):
+        raise HTTPException(status_code=409, detail="This link is no longer active.")
+    if not _valid_link_token_copy(blob):
+        raise HTTPException(status_code=400, detail="Malformed re-copy blob.")
+    link.token_enc = blob
+    db.commit()
+    return {"stored": True}
+
+
+def _read_link_token_copy(link) -> dict:
+    if not link.token_enc:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"token_enc": link.token_enc}
+
+
+@app.put("/note-links/{link_id}/token-copy")
+async def put_note_link_token_copy(
+    link_id: uuid.UUID, payload: LinkTokenCopyBody,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Store the owner-encrypted re-copy for a note link (see _valid_link_token_copy for the opaque
+    contract). Write-once, owner-only on an interactive session, live links only."""
+    link = _link_owner_or_404(db, NoteLink, link_id, current_user)
+    return _store_link_token_copy(db, link, payload.token_enc)
+
+
+@app.get("/note-links/{link_id}/token-copy")
+async def get_note_link_token_copy(
+    link_id: uuid.UUID,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return the owner-encrypted re-copy BLOB (never a plaintext token) for the owner's own note
+    link; 404 for anyone else or when no copy was stored."""
+    link = _link_owner_or_404(db, NoteLink, link_id, current_user)
+    return _read_link_token_copy(link)
+
+
+@app.put("/public-links/{link_id}/token-copy")
+async def put_public_link_token_copy(
+    link_id: uuid.UUID, payload: LinkTokenCopyBody,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Store the owner-encrypted re-copy for a file/folder link. Same contract as the note-link twin."""
+    link = _link_owner_or_404(db, PublicLink, link_id, current_user)
+    return _store_link_token_copy(db, link, payload.token_enc)
+
+
+@app.get("/public-links/{link_id}/token-copy")
+async def get_public_link_token_copy(
+    link_id: uuid.UUID,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return the owner-encrypted re-copy BLOB (never a plaintext token) for the owner's own file
+    link; 404 for anyone else or when no copy was stored."""
+    link = _link_owner_or_404(db, PublicLink, link_id, current_user)
+    return _read_link_token_copy(link)
 
 
 @app.get("/public-link-policy")
@@ -20992,6 +21106,10 @@ def _run_lightweight_migrations():
             "ALTER TABLE note_public_links ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64)",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_notelink_token_hash ON note_public_links (token_hash) WHERE token_hash IS NOT NULL",
             "ALTER TABLE note_public_links ALTER COLUMN token DROP NOT NULL",
+            # Optional owner-encrypted re-copy of the URL token (opaque, client-wrapped) for both
+            # link types, so "Show link again" can return the blob for the owner's client to decrypt.
+            "ALTER TABLE note_public_links ADD COLUMN IF NOT EXISTS token_enc TEXT",
+            "ALTER TABLE public_links ADD COLUMN IF NOT EXISTS token_enc TEXT",
             "ALTER TABLE temporary_credentials ADD COLUMN IF NOT EXISTS note VARCHAR(500)",
             # The credential-lifecycle slot marker: set by the connection-close hook when a
             # credential's connection finishes, freeing its cap slot (see app/core/temp_cred_slot.py).
