@@ -77,6 +77,7 @@ from app.core.session_hash_utils import hash_session_token
 from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
+from app.core import upload_marker
 from sqlalchemy import or_
 
 # Global registry of active transports: session_token -> transport
@@ -282,6 +283,12 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # setting a pending description here lets _send_status attach a message that names the actual
         # cause (over the size limit / staging buffer full) so the SFTP client is not left guessing.
         self._sftp_server = None
+        # In-flight upload marker (Redis) key, set at open() when this handle claimed the
+        # same-name lock; removed at close(), which paramiko calls on a graceful CLOSE AND on
+        # the subsystem-finish that runs on every disconnect/abort. The TTL is only a crash
+        # backstop. None when Redis was down at open (fail-open, no marker to remove).
+        self.upload_marker_key = None
+        self._marker_last_refresh = 0.0
         # shared
         self.attrs: Optional[paramiko.SFTPAttributes] = None
 
@@ -308,6 +315,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             return paramiko.SFTP_FAILURE
 
     def write(self, offset: int, data: bytes):
+        # Heartbeat the in-flight marker so a slow-but-live transfer's marker (and its
+        # same-name lock) does not lapse to the TTL mid-upload. Throttled to at most once per
+        # TTL/3, so a hot write loop is not one Redis op per write; best-effort, never affects
+        # the write result.
+        self._refresh_marker()
         if self.stream is not None:
             return self.stream.write(offset, data)
         if self.writefile is None:
@@ -349,7 +361,22 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             return self.attrs
         return paramiko.SFTP_OP_UNSUPPORTED
 
+    def _refresh_marker(self):
+        if not self.upload_marker_key:
+            return
+        now = time.monotonic()
+        if now - self._marker_last_refresh < max(1, upload_marker.marker_ttl_seconds() // 3):
+            return
+        self._marker_last_refresh = now
+        upload_marker.refresh_key(self.upload_marker_key)
+
     def close(self):
+        # Remove the in-flight upload marker FIRST, on every close path -- a graceful client
+        # CLOSE and the paramiko subsystem-finish that closes open handles on any
+        # disconnect/abort both land here. Best-effort (never raises); a skip leaves the TTL.
+        if self.upload_marker_key:
+            upload_marker.remove_key(self.upload_marker_key)
+            self.upload_marker_key = None
         # Read mode: release the blob. Held for the life of the handle, so a client that opens a
         # file and leaves is the case this matters for.
         if self.reader is not None:
@@ -592,6 +619,27 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # per-file/folder scope check silently degrades to no-op.
         "_temp_vault_scope",
     )
+
+    def _set_pending_status(self, desc: str):
+        """Attach a human description to the status paramiko sends for the CURRENT request, so an
+        open-time refusal (the same-name upload lock) reaches the client as a message, not a bare
+        'Permission denied'. Consumed by _MessageSFTPServer._send_status right after open()."""
+        srv = getattr(self, "_sftp_server", None)
+        if srv is not None:
+            srv._pending_status_desc = desc
+
+    @staticmethod
+    def _resolve_member_name(db, member_id):
+        """Best-effort display name for the marker holder, to name them in a same-name refusal.
+        Falls back to 'another member' if the id cannot be resolved -- never fail a refusal on a
+        name lookup."""
+        try:
+            u = db.query(User).filter(User.id == member_id).first()
+            if u is not None:
+                return getattr(u, "username", None) or getattr(u, "email", None) or "another member"
+        except Exception:  # noqa: BLE001 -- a lookup failure must not turn a refusal into a 500
+            pass
+        return "another member"
 
     def _load_principal(self, db) -> Optional[User]:
         """Load the authenticated principal FRESH in the given session.
@@ -1185,6 +1233,22 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if clash is not None:
                     return paramiko.SFTP_PERMISSION_DENIED
 
+            # Same-name lock + in-flight marker, for EVERYONE (the no-clobber check above runs only
+            # for a principal lacking DELETE; a concurrent upload of the SAME final name must be
+            # refused whether or not the caller may overwrite). place() claims a Redis SET-NX lock
+            # keyed by (vault, folder, name) and publishes the marker; a live second upload of that
+            # name is refused, naming the holder. SFTP serves only Standard vaults, so this is
+            # always the standard filename-key path. Best-effort: with Redis down it SKIPs (returns
+            # no marker key) and the upload proceeds (fail open) -- an outage never blocks uploads.
+            _marker_outcome = upload_marker.place(vault_id, folder_id, filename, user.id)
+            if isinstance(_marker_outcome, str):
+                self._set_pending_status(
+                    "'%s' is currently being uploaded by %s"
+                    % (filename, self._resolve_member_name(db, _marker_outcome)))
+                return paramiko.SFTP_PERMISSION_DENIED
+            _upload_marker_key = (upload_marker.marker_key(vault_id, folder_id, filename)
+                                  if _marker_outcome is None else None)
+
         # Streaming upload (opt-in via SFTP_STREAMING_UPLOAD): encrypt + persist records as they
         # arrive, so the plaintext is never staged whole to the .sftp_tmp tmpfs. All the open()-time
         # authorization above (no-clobber + write permission) already ran and applies unchanged; the
@@ -1193,6 +1257,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             handle = VaultSFTPHandle(flags=os.O_WRONLY)
             handle.max_bytes = _eff_max
             handle._sftp_server = getattr(self, "_sftp_server", None)
+            handle.upload_marker_key = _upload_marker_key
             handle.stream = _StreamingUpload(
                 handle=handle, interface=self, vault_id=vault_id, folder_id=folder_id,
                 filename=filename, can_overwrite=can_overwrite, max_bytes=_eff_max,
@@ -1208,6 +1273,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             wf = open(tmp_path, "wb")
         except Exception as e:  # noqa: BLE001
             safe_event('upload.buffer-open.failed', e)
+            if _upload_marker_key:
+                upload_marker.remove_key(_upload_marker_key)  # no handle to close -> free the lock now
             return paramiko.SFTP_FAILURE
 
         handle = VaultSFTPHandle(flags=os.O_WRONLY)
@@ -1219,6 +1286,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # Let an in-stream refusal (over-limit / staging-full) carry a descriptive status instead of
         # paramiko's bare "Failure". _sftp_server is the protocol handler, wired by _MessageSFTPServer.
         handle._sftp_server = getattr(self, "_sftp_server", None)
+        handle.upload_marker_key = _upload_marker_key
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )
