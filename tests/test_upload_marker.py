@@ -209,6 +209,61 @@ def test_a_stale_close_never_removes_a_new_holders_marker(fake_redis):
     assert um.list_folder(v, f) == []
 
 
+def test_remove_is_atomic_not_a_get_then_delete_race(monkeypatch):
+    # Pins ATOMICITY, not just the token check (test_a_stale_close_... passes even for a GET-then-DEL
+    # remove, because the plain fake is single-threaded). Here get() and the script runner fire a
+    # one-shot hook that expires A's marker and lets B claim the SAME name mid-operation. The shipped
+    # one-script remove() reads-and-deletes in ONE atomic step, so it sees B's token and no-ops -> B's
+    # marker and index entry survive. A GET-then-DEL remove() reads A's stale value and then deletes
+    # the key unconditionally on the match -> it destroys B's marker.
+    # (mutation: rewrite remove() as redis_client.get(...) then redis_client.delete(...) -> red.)
+    import json as _json
+    from app.core import security as _sec
+
+    v, f = uuid.uuid4(), uuid.uuid4()
+    a, b = uuid.uuid4(), uuid.uuid4()
+    name = "raced.bin"
+    tok_b = "bbbbbbbbbbbbbbbb"
+
+    class _Interleaving(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self._hook = None
+
+        def _fire(self):
+            if self._hook:
+                h, self._hook = self._hook, None
+                h()
+
+        def get(self, key):
+            v_ = super().get(key)
+            self._fire()          # the window a two-call (GET-then-DEL) shape opens is right here
+            return v_
+
+        def eval(self, script, numkeys, *args):
+            self._fire()          # an atomic script sees B's concurrent claim serialized before its read
+            return super().eval(script, numkeys, *args)
+
+    r = _Interleaving()
+    monkeypatch.setattr(um, "redis_client", r)
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: False)
+    _, tok_a = um.place(v, f, name, a)
+    mkey, ikey = um.marker_key(v, f, name), um.index_key(v, f)
+
+    def _b_claims():
+        # A's marker expired; B claims the same name (same key, B's token) mid-operation.
+        r.store[mkey] = _json.dumps({"n": _sec.encrypt_upload_marker_name(v, f, name), "m": str(b), "t": tok_b})
+        r.sets.setdefault(ikey, set()).add(mkey)
+    r._hook = _b_claims
+
+    um.remove(v, f, name, tok_a)   # A's close, racing B's claim
+
+    # The atomic remove saw B's token and no-oped: B's marker and its index entry survive.
+    assert mkey in r.store and _json.loads(r.store[mkey])["t"] == tok_b, \
+        "the atomic remove deleted the new holder's marker (a GET-then-DEL race)"
+    assert mkey in r.sets.get(ikey, set())
+
+
 def test_a_stale_refresh_never_extends_a_new_holders_marker(fake_redis):
     # The refresh twin: a stale holder's heartbeat must not touch the new holder's marker. (The fake
     # has no real TTL, so we assert the token-checked script reports a no-op for the wrong token and a
