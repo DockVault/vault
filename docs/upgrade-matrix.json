@@ -12,7 +12,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.7.0": {
       "released": "2026-07-22",
@@ -20,7 +31,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.7.1": {
       "released": "2026-07-22",
@@ -28,7 +50,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.7.2": {
       "released": "2026-07-22",
@@ -36,7 +69,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.8.0": {
       "released": "2026-07-23",
@@ -44,7 +88,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.9.0": {
       "released": "2026-07-24",
@@ -52,7 +107,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.10.0": {
       "released": "2026-08-02",
@@ -60,7 +126,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.11.0": {
       "released": "2026-08-20",
@@ -68,7 +145,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.11.1": {
       "released": "2026-08-21",
@@ -76,7 +164,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.11.2": {
       "released": "2026-08-21",
@@ -84,7 +183,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.12.0": {
       "released": "2026-08-22",
@@ -92,7 +202,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.13.0": {
       "released": "2026-08-23",
@@ -100,7 +221,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.14.0": {
       "released": "2026-08-24",
@@ -108,7 +240,18 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.15.0": {
       "released": "2026-08-25",
@@ -116,7 +259,27 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.16.0": {
       "released": "2026-08-25",
@@ -124,7 +287,27 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.16.1": {
       "released": "2026-08-25",
@@ -132,135 +315,475 @@
       "support": {
         "eol": true,
         "secure": false
-      }
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.17.0": {
       "released": "2026-08-27",
       "notes": "Minimum supported release. First version to seal names, descriptions and content checksums at rest. Schema: adds vaults.name_key_version and files.enc_checksum, and makes files.checksum_sha256 nullable (the content checksum is sealed into enc_checksum and decrypted on load), all applied by the boot DDL. An image older than 0.17.0 cannot read a deployment written by it: a vault name/description reads back NULL, a note title reads as an opaque sealed token, and a file download fails closed mid-stream because the integrity verifier finds checksum_sha256 NULL. There is therefore no in-place downgrade off it, and no in-place upgrade into it from 0.16.1 -- reach it by deploying fresh and restoring from a backup (see the blocked edge and the waiver). Every release below it is end-of-life.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.18.1": {
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0/0.18.0. Follow-up fixes from an external audit of 0.18.0, none a confidentiality break: two vault handlers (update-info, change-password) that answered an authorization failure with 500 now return 403; the ECC key-topology endpoint (/ecc/vaults/{id}/keys) returns 403 for a vault the caller cannot reach instead of leaking mode/dek_version to a non-member or 404-vs-403 confirming existence; the public note-link redeem endpoint adds the missing per-IP rate-limit bucket (token enumeration was unthrottled); chunked-upload completion returns a named 409 (not a 500) for a session it cannot read, and the 0.17.0->0.18.0 downgrade edge now documents that in-flight uploads do not survive a downgrade; the download Content-Disposition header strips forward slashes as well as backslashes; a NUL byte in an uploaded filename is rejected with 400 instead of surfacing as a 500; and the base-image apk-upgrade reproducibility exception is documented and contract-tested. A rollback to 0.18.0 is clean and needs no backup.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.18.2": {
       "released": "2026-08-28",
       "notes": "Additive schema fix, no data migration. Adds the foreign key for temporary_credentials.created_by_temp_credential_id (self-referential, ON DELETE SET NULL) that create_all already declares but the boot DDL omitted, so a fresh install and an upgraded one converge to the same physical schema. Deleting a temp credential that had minted others now nulls their created_by_temp_credential_id provenance pointer instead of leaving a dangling id (any pre-existing dangling ids are nulled first, so the constraint add cannot fail on an install that ran the earlier column-only DDL). A rollback to 0.18.1 is clean and needs no backup: the older image simply does not re-add the foreign key and the column is unchanged.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.18.0": {
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0. Follow-up hardening and fixes on the 0.17.0 at-rest sealing round. At rest: seals a Standard vault's ACTIVE resumable-upload filename and MIME (they were plaintext in chunked_upload_sessions for the life of the upload; the enc_name/enc_mime/name_bi columns already existed and are simply now used for Standard uploads too, decrypted transparently on read), and stops copying already-sealed item/vault names and note titles into the plaintext notification body (the recipient reaches the live item via the deep link). Host tool (dockvault.py): drops the spent ADMIN_PASSWORD from .env after the admin is bootstrapped (only when the DB bootstrap marker confirms an admin exists; fail-closed otherwise); no longer archives a never-used fresh .env when 'deploy a new set' is chosen on a fresh install, and warns in red when a real .env is archived; and lock/status now surface unsealed plaintext .env.* archives. SFTP: the effective per-file upload limit is min(MAX_FILE_SIZE_MB, the RAM staging tmpfs) -- the shipped .env.example defaults are reconciled to agree, the effective SFTP limit is surfaced in the admin settings, and an over-limit or staging-full upload returns a named error instead of a bare 'Failure'. A rollback to 0.17.0 is clean and needs no backup: no persistent schema or data changed, and only an upload in flight at the moment of a downgrade would be affected.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.19.0": {
       "released": "2026-08-28",
       "notes": "In-vault file operations & previews. Additive schema: files.modified_by (nullable UUID, FK users.id ON DELETE SET NULL) records who last renamed a file in place; the column AND its foreign key are both added by the boot DDL so a fresh create_all install and an upgraded one match. Adds a safe Markdown/HTML/source preview renderer (server-side nh3 allowlist, CSP-locked empty-sandbox srcdoc iframe), a copyable plaintext SHA-256 (Standard vaults, download-gated), a Move/Copy staging panel, upload fixes, live download progress, and bounded-memory preview (large media refused inline, big text windowed via Range). Depends on Markdown 3.10.3 + Pygments 2.20.0 (hash-pinned, pure-Python). A rollback to 0.18.2 is clean and needs no backup: the modified_by column is left in place and simply ignored by the older image.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.19.1": {
       "released": "2026-08-29",
       "notes": "No schema change. Security & authorization hardening from the v0.19.0 review: an SFTP pre-auth connection admission (a total + per-source-IP connection ceiling and an auth grace timeout, the SSH MaxStartups equivalent) so a no-credential connection flood can't exhaust threads and Transports; a password change now durably revokes the account's sessions on the self-service and admin paths, matching the reset path; regular web sessions get an absolute server-side expiry so abandoned rows age out, and session_timeout is clamped to a 30-day maximum; new password key-encryption-key wraps derive at 600,000 PBKDF2 iterations (existing wraps still open at their stored count); and denial tests plus a coverage guard for the four destructive vault capabilities. Adds SFTP_MAX_CONNECTIONS / SFTP_MAX_CONNECTIONS_PER_IP / SFTP_AUTH_GRACE_SECONDS settings (defaults suit a single tenant). A rollback to 0.19.0 is clean and needs no backup: no persistent schema or data changed.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.19.2": {
       "released": "2026-08-29",
       "notes": "No schema change. Follow-up security cleanup from the v0.19.0 security review: the ECC name-index-key GET and the member-keys GET now refuse a non-member with 403 whether or not the vault exists, so neither confirms a vault id to a stranger (parity with the DEK keys endpoint); POST /ecc/keys/register refuses a temporary session before charging the account's ECC register rate budget, so a refused temp request can no longer spend the owner's once-per-account budget; plus regression tests pinning cross-tenant file-plane access at 403-not-500 and the temp-credential scope contract. A rollback to 0.19.1 is clean and needs no backup: no persistent schema or data changed.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.19.3": {
       "released": "2026-08-29",
       "notes": "No schema change. Collaboration features now default ON for a fresh self-hosted install: internal file sharing, public note links, and admin invite-by-link. These are admin master switches that previously shipped off-by-default; an explicit stored 'off' is still honored, and nothing is exposed until a user actively creates a share or link (invite-by-link is admin-only). Self-signup stays off by default. A rollback to 0.19.2 is clean and needs no backup: no persistent schema or data changed.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.20.0": {
       "released": "2026-08-30",
       "notes": "Adds optional two-factor authentication. A user can enroll an authenticator app (TOTP) with mandatory recovery codes; login becomes two-step for an enrolled or required account. An admin can require two-factor (forced enrollment at next sign-in), scope step-up per high-risk action (require the authenticator and/or a password re-authentication), and require a temporary credential for SFTP when an account's second factor is in effect. New two-factor tables are created automatically by the app on first start -- no migration step. A rollback to 0.19.3 leaves those tables and their data intact but DISABLES two-factor enforcement (accounts then sign in with their password only) until you upgrade again.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.21.0": {
       "released": "2026-08-30",
       "notes": "Adds public links for files and folders (\"secure send\"): an admin can enable anonymous, tokenized links that let anyone with the URL download one file or one folder of a Standard vault, governed by the existing public-link tags (token-length floor, optional PIN/password, expiry, use cap) and revocable at any time. The link token is stored hashed and shown once at creation; the anonymous read path re-checks the owner's access on every request. New public_links table and a note_link_tags.allowed_targets column are created automatically at boot -- no migration step, and no existing data is changed. A rollback to 0.20.0 leaves the table and column intact but stops serving public file links until you upgrade again.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.22.0": {
       "released": "2026-08-30",
       "notes": "Adds upload links (\"receivers\"): an admin can enable anonymous, tokenized links that let anyone with the URL upload files into a dedicated, owner-paid Standard vault, governed by receiver tags (token-length floor, optional PIN/password, expiry, per-file and total size caps, retention) and revocable or pausable at any time. The link token is stored hashed and shown once. Anonymous uploads reserve their declared size against the receiver's cap before any bytes move, are admitted on a separate transfer budget so they cannot starve signed-in transfers, and can only ever land in the receiver's own vault. New receivers, receiver_tags and receiver_upload_sessions tables plus a receivers.reserved_bytes column are created automatically at boot -- no migration step, and no existing data is changed. A rollback to 0.21.0 leaves the tables intact but stops serving upload links until you upgrade again.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.23.0": {
       "released": "2026-08-30",
       "notes": "Adds the owner and admin UI for the public file/folder links (\"secure send\", backend added in 0.21.0) and upload links (\"receivers\", 0.22.0), which previously shipped with no interface: create, manage and revoke links, and govern them with tags and per-feature settings. Also a round of two-factor and settings usability fixes -- a full-size enrollment QR code, an MFA column in the accounts list, a single-step-up save for the whole step-up action matrix, an admin \"copy reset link\" action for accounts with no email, and a reworked rate-limit settings surface that shows each limit's read-only deployment value beside an optional, bounded custom override (now extended to the login, vault-unlock and SFTP throttles). No schema change and no existing data is altered; a rollback to 0.22.0 simply hides the new UI.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.24.0": {
       "released": "2026-08-31",
       "notes": "Security-hardening release. Adds admin-configurable per-user resource limits (a vault-count cap, a per-account storage budget defaulting to 50 GB, and a cap on active temporary credentials; 0 means unlimited and administrators are exempt), tightens authorization on the file plane (opening an SFTP/chunked upload session now requires write permission, and a nonexistent vault answers 404 instead of 500), hardens a zero-knowledge vault-name re-seal against a future key epoch that would make the name undecryptable, sandboxes the in-browser PDF/media preview, clears the vault list and upload state on logout, keeps the account second-factor requirement from being switched off, bounds the admin login-attempt override, and removes the Server header. No schema change and no existing data is altered; a rollback to 0.23.0 simply restores the prior limits and header behaviour.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.25.0": {
       "released": "2026-08-31",
       "notes": "Adds a memory-bounded streaming SFTP upload behind a default-OFF flag (SFTP_STREAMING_UPLOAD). When enabled, an SFTP upload encrypts and persists 1 MiB records as they arrive instead of buffering the whole plaintext to the .sftp_tmp staging tmpfs, so RAM/tmpfs use is bounded to one record plus a small reorder window regardless of file size, and the per-file limit is no longer tied to the tmpfs size. The at-rest format is byte-identical to the buffered/web upload path (same codec, 1 MiB records, monotonic AEAD index), so streamed and web-uploaded files are mutually decryptable. All the close-time authorization gates (membership, folder scope, vault password, vault size limit, plan ceiling, and a write-permission re-check) run before the file record commits, and any failure leaves no orphan blob and never destroys an existing same-name file. Adds SFTP_STREAMING_UPLOAD and SFTP_STREAMING_REORDER_MB settings. No schema change; ships OFF, so a rollback to 0.24.0 is clean.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.26.0": {
       "released": "2026-08-31",
       "notes": "UI polish across the app — no schema change and no new required configuration. Vault cards show a Standard/Zero-knowledge badge; the department access list in a vault's Permissions tab is now the same table as the per-user list with inline level editing, a members modal, and member/granted columns; the audit log paginates and each row opens an 80vw event modal with a table-of-contents of the page's events; the live monitor paginates and a failed login second factor is now recorded and broadcast; the Upload Links page has Links and Drop-vaults tabs (the throwaway drop vaults are also hidden from the main Vaults page); a public file link now counts a use on the actual download rather than on the landing-page visit (a peek returns metadata without consuming a use); native confirm()/alert() dialogs are replaced by the app's themed ones; several tables and the settings tab strip are tightened; and the anonymous share pages get calmer styling. Adds no new environment settings; a rollback to 0.25.0 is clean.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.27.0": {
       "released": "2026-09-02",
       "notes": "Adds the full SFTP host public key to the host-key endpoint (GET /sftp/host-key) so a client can pin the server's SFTP identity, alongside the existing fingerprint. No schema change, no new required configuration, and no new environment settings; a rollback to 0.26.0 is clean.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
     },
     "0.28.0": {
       "released": "2026-09-04",
@@ -287,6 +810,33 @@
           "id": null,
           "fixed_in": "0.29.1",
           "published": "2026-09-16"
+        },
+        {
+          "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
+          "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18"
+        },
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
         }
       ]
     },
@@ -315,12 +865,76 @@
           "id": null,
           "fixed_in": "0.29.1",
           "published": "2026-09-16"
+        },
+        {
+          "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
+          "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18"
+        },
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
         }
       ]
     },
     "0.29.1": {
       "released": "2026-09-16",
       "notes": "Security fix; every deployment on 0.28.0 or 0.29.0 should upgrade. A temporary credential's web session could manage the owner's devices -- enroll a device that never expires, grant it vaults the credential itself was not scoped to, and so obtain lasting sync access that outlived the credential; the device routes now refuse temporary sessions. Signing in and minting a credential no longer fail, leave an orphaned credential counting against the caps, or spend a valid single-use credential when the session cache is unavailable. A device's sync credential is refused at the web sign-in, where it has no legitimate use. No schema change; a rollback to 0.29.0 is clean but reopens the fixed behaviour.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
+          "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
+          "severity": null,
+          "cvss": null,
+          "id": null,
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18"
+        },
+        {
+          "title": "Note-link URL tokens were stored in cleartext",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        },
+        {
+          "title": "A temporary credential in use was distinguishable at sign-in",
+          "fixed_in": "0.30.0",
+          "published": "2026-09-18",
+          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+          "severity": null,
+          "cvss": null,
+          "id": null
+        }
+      ]
+    },
+    "0.30.0": {
+      "released": "2026-09-18",
+      "notes": "Device sync is throttled per device in its own bucket, so a looping sync client can no longer lock the owner out of the web sign-in from the same address; a device can ask the server whether it may sync before it tries; a sync credential frees its slot when its connection closes; an in-progress upload shows in the web listing and a second upload of the same name is refused, over the web as well as SFTP; note-link URL tokens are stored hashed with an in-place migration and links can be shown again only by their owner through an encrypted copy; SFTP uploads stream to storage by default within a documented memory ceiling, browser downloads stream to disk by default, and a file too large to hold in memory is refused up front instead of buffered when streaming is unavailable; the version lifecycle shown by the app and the host tool comes from the current matrix, not the release's frozen copy; database waits are bounded; the host tool's update no longer changes the deployment's image reference until the new image has actually been pulled. A rollback to 0.29.1 is not clean: note-link tokens are stored hashed and an older release cannot read them back.",
       "support": {
         "eol": false,
         "secure": true
@@ -579,6 +1193,20 @@
       "to": "0.29.1",
       "kind": "direct",
       "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.29.1",
+      "to": "0.30.0",
+      "kind": "direct",
+      "reversible": false,
+      "requires_backup": false
+    },
+    {
+      "from": "0.29.0",
+      "to": "0.30.0",
+      "kind": "direct",
+      "reversible": false,
       "requires_backup": false
     }
   ],
