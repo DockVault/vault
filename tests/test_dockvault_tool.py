@@ -3314,3 +3314,26 @@ def test_docs_document_host_fde_prerequisite_and_zk_metadata_nongoal():
     assert "full-disk encryption" in readme and "prerequisite" in readme
     zk = (ROOT / "docs" / "design" / "vault-zk-envelope-v2.md").read_text(encoding="utf-8").lower()
     assert "non-goal" in zk and "metadata" in zk
+
+
+def test_update_pull_leg_persists_the_image_only_after_a_successful_pull():
+    # A failed `docker compose pull` (registry outage, rate limit, unpublished/mistyped tag) must NOT
+    # leave .env naming an image that cannot be pulled -- otherwise the next `restart` (down + up)
+    # fails to bring the vault back. The pull runs with the new reference in the PROCESS ENVIRONMENT
+    # (Compose honours it over .env) and DOCKVAULT_IMAGE is written to .env ONLY after the pull
+    # succeeds. (mutation: move the _set_env_key(...DOCKVAULT_IMAGE...) call before the pull -> a
+    # failed pull leaves .env pointing at the unpullable image -> this pin goes red.)
+    import inspect
+    src = inspect.getsource(dv.DockVault._perform_leg)
+    leg = src[src.index('image = "%s:%s" % (GHCR_IMAGE, tag)'):]
+    leg = leg[:leg.index("# from-source rebuilds")] if "# from-source rebuilds" in leg else leg
+    # The pull passes the new reference via the process env, not by writing .env first.
+    assert '_pull_env["DOCKVAULT_IMAGE"] = image' in leg
+    assert "env=_pull_env" in leg
+    # The .env write comes AFTER the pull-failure check, so a failed pull never persists it.
+    fail_check = leg.index("pr.returncode != 0")
+    persist = leg.index('_set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)')
+    assert fail_check < persist, "DOCKVAULT_IMAGE must be persisted only after the pull succeeds"
+    # And no .env write precedes the pull in this leg (the regression this guards against).
+    pull_call = leg.index('self._run_dc("pull"')
+    assert '_set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)' not in leg[:pull_call]

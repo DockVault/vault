@@ -4674,14 +4674,24 @@ class DockVault:
                 self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", LOCAL_IMAGE)
         else:
             image = "%s:%s" % (GHCR_IMAGE, tag)
-            self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)
-            print(pal.paint("  set DOCKVAULT_IMAGE=%s; pulling ..." % image, "cyan"))
+            print(pal.paint("  pulling %s ..." % image, "cyan"))
+            # Pull with the new reference in the PROCESS ENVIRONMENT (Compose honours a shell
+            # DOCKVAULT_IMAGE over the .env value), NOT by writing .env first. A failed pull -- a
+            # registry outage, a rate limit, a mistyped or not-yet-published tag -- must not leave
+            # .env naming an image that cannot be pulled: the running stack survives, but the next
+            # `restart` (down + up) would then fail to bring the vault back until the image exists or
+            # .env is hand-edited. Persist DOCKVAULT_IMAGE only AFTER the pull succeeds, so a failure
+            # leaves .env byte-identical and never reaches the recreate step below.
+            _pull_env = dict(os.environ)
+            _pull_env["DOCKVAULT_IMAGE"] = image
             try:
-                pr = self._run_dc("pull", capture=False, timeout=600)
+                pr = self._run_dc("pull", capture=False, timeout=600, env=_pull_env)
             except (OSError, subprocess.SubprocessError) as exc:
                 self._fail("docker compose pull failed: %s" % exc)
             if pr.returncode != 0:
                 self._fail("docker compose pull failed - is %s published? (or use --source to build)" % image)
+            self._set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)
+            print(pal.paint("  set DOCKVAULT_IMAGE=%s" % image, "cyan"))
 
         # from-source rebuilds the local Dockerfile; the pull path recreates from the pulled image
         # WITHOUT --build (a rebuild would clobber the just-pulled release image with a local build).
