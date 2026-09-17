@@ -2058,6 +2058,15 @@ class VaultService:
         if existing_file:
             raise ValueError(f"A file or folder named '{new_name}' already exists in this location")
 
+        # An in-flight upload has no committed File row yet, so the clash query above cannot see
+        # it; consult the ephemeral marker so a rename cannot land on a name a live upload is
+        # about to take. Best-effort: with Redis down holder() returns SKIPPED and the rename
+        # proceeds (fail open) -- an outage never blocks a rename. A miss/None means the name is
+        # free. (No committed row is clobbered either way; this closes the in-flight window.)
+        from app.core import upload_marker as _um
+        if isinstance(_um.holder(file.vault_id, file.folder_id, new_name), str):
+            raise ValueError(f"A file named '{new_name}' is currently being uploaded in this location")
+
         # Capture the kind BEFORE sealing nulls the in-memory mime_type.
         is_folder_kind = (file.mime_type == 'folder')
         old_name = file.original_name

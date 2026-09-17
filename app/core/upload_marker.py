@@ -89,6 +89,24 @@ def place(vault_id, folder_id, name: str, member_id) -> object:
         return SKIPPED
 
 
+def holder(vault_id, folder_id, name: str) -> object:
+    """Read who, if anyone, holds an in-flight upload of (vault, folder, name) WITHOUT taking the
+    lock: the holder's member id (str) when a live upload holds the name, None when it is free, or
+    SKIPPED when Redis is down (callers fail OPEN -- an outage never blocks a rename/upload). Lets a
+    committed-rows-only check (rename clash) also refuse to land on a name a live upload will take."""
+    key = marker_key(vault_id, folder_id, name)
+    raw = redis_guard.best_effort(
+        "upload_marker.holder_read", lambda: redis_client.get(key), default=SKIPPED)
+    if raw is SKIPPED:
+        return SKIPPED
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw).get("m")
+    except (ValueError, TypeError):
+        return None
+
+
 def remove(vault_id, folder_id, name: str) -> None:
     """Remove the marker for a (vault, folder, name) on close/abort."""
     remove_key(marker_key(vault_id, folder_id, name))

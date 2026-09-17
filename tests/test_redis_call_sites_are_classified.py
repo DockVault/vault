@@ -59,6 +59,7 @@ _REGISTRY = {
     },                                           # short-timeout client (the constructor uses redis.Redis)
     "core/upload_marker.py": {                   # in-flight upload markers: all best-effort,
         "place": ("D", 2),                       # SET NX the lock + GET the holder to name them
+        "holder": ("D", 1),                      # GET the holder without taking the lock (rename clash)
         "remove_key": ("D", 1),                  # DELETE on close/abort (skip => the TTL reaps it)
         "refresh_key": ("D", 1),                 # EXPIRE heartbeat for a slow-but-live transfer
         "list_folder": ("D", 2),                 # SCAN the folder + MGET; skip => empty listing

@@ -158,6 +158,25 @@ def test_remove_clears_the_marker_and_frees_the_lock(fake_redis):
     assert um.place(v, f, "x.bin", b) is None      # freed: the next upload may claim it
 
 
+def test_holder_reads_the_lock_without_taking_it(fake_redis):
+    v, f = uuid.uuid4(), uuid.uuid4()
+    m = uuid.uuid4()
+    assert um.holder(v, f, "x.pdf") is None             # free
+    assert um.place(v, f, "x.pdf", m) is None
+    assert um.holder(v, f, "x.pdf") == str(m)           # held -> names the member
+    # holder() must NOT acquire: a free name it read stays claimable.
+    assert um.holder(v, f, "y.pdf") is None
+    assert um.place(v, f, "y.pdf", uuid.uuid4()) is None
+
+
+def test_holder_fails_open_on_an_outage(monkeypatch):
+    r = _FakeRedis()
+    monkeypatch.setattr(um, "redis_client", r)
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: True)
+    # SKIPPED, not None: a caller must be able to tell "Redis down" (fail open) from "name free".
+    assert um.holder(uuid.uuid4(), uuid.uuid4(), "x") is um.SKIPPED
+
+
 def test_breaker_open_skips_place_fails_open_listing_empty_remove_inert(monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(um, "redis_client", r)
