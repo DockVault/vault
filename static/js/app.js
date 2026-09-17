@@ -4568,7 +4568,7 @@ function renderTempCreds() {
         <h3 class="section-title mt-md" id="tc-shared-heading">Shared / handed-out</h3>
         <div class="card table-card">
             <div class="data-table-wrapper">
-                <table class="data-table exp-table">
+                <table class="data-table exp-table" id="tc-shared-table">
                     <thead><tr>
                         <th class="col-toggle"></th>
                         <th>Credential</th>

@@ -48,14 +48,68 @@ def test_the_listing_never_renders_a_device_id_or_any_secret():
         assert forbidden not in body, f"the listing renders a secret/identifier: {forbidden}"
 
 
-def test_the_per_user_cap_is_taken_under_the_owner_row_lock():
-    # Two concurrent interactive mints at the boundary must not both pass: the owner row is locked
-    # FOR UPDATE across the cap count and the insert, like the device path. The behavioural race is
-    # a live-lane test (real row locks); this pins the mechanism.
+def test_the_per_user_cap_serializes_with_an_advisory_lock_not_a_row_lock():
+    # The cap serializes concurrent same-user mints WITHOUT locking the users ROW: a row lock there
+    # deadlocked the FK KEY SHARE the audit insert takes on that row. It uses a transaction-scoped
+    # advisory lock keyed by the user, and its owner read takes no row lock. (mutation: revert to a
+    # with_for_update on the users query -> red)
     flat = re.sub(r"\s+", " ", AUTH.read_text(encoding="utf-8"))
-    owner_reads = re.findall(r"query\(User\)\.filter\(User\.id == user_id\)[^;]{0,120}?\.first\(\)", flat)
-    cap_owner = [q for q in owner_reads if "populate_existing().with_for_update()" in q]
-    assert cap_owner, "the per-user cap's owner read is not taken FOR UPDATE (still check-then-act)"
+    assert "pg_advisory_xact_lock(" in flat and "_TEMP_CRED_CAP_ADVISORY_CLASS" in flat
+    assert "hashtext(:uid)" in flat   # keyed on the user id (per-user serialisation, not global)
+    reads = re.findall(r"query\(User\)\.filter\(User\.id == user_id\)[^;]{0,120}?\.first\(\)", flat)
+    assert reads, "the cap owner read was not found"
+    for q in reads:
+        assert "with_for_update" not in q, "the per-user cap still row-locks the users row"
+
+
+def test_both_credential_cap_refusals_roll_back_before_raising():
+    # A refusal raised in the offload thread with a lock still held would live until get_db closes the
+    # session on the event loop; both cap 409s roll back first. (mutation: drop a rollback -> red)
+    lines = AUTH.read_text(encoding="utf-8").splitlines()
+
+    def _rollback_precedes(needle, window=12):
+        for i, ln in enumerate(lines):
+            if needle in ln:
+                assert any("self.db.rollback()" in lines[j] for j in range(max(0, i - window), i)), (
+                    f"no self.db.rollback() in the {window} lines before: {ln.strip()}")
+                return
+        raise AssertionError(f"marker not found: {needle}")
+
+    _rollback_precedes("You already have the maximum")                 # per-user cap 409
+    _rollback_precedes('_device_mint_refusal("device-cred-cap"')       # device cap 409
+    _rollback_precedes("is password-protected — its correct")          # vault-proof failure (400)
+
+
+def test_the_post_mint_audit_is_awaited_off_the_loop():
+    # The synchronous audit INSERT (KEY SHARE on the users row) must not run on the event loop, where
+    # it could block on a held lock and freeze every request. (mutation: make it a direct call -> red)
+    src = API.read_text(encoding="utf-8")
+    assert "run_offloaded(audit_logger.log_temp_credential_created" in src
+    assert "\n    audit_logger.log_temp_credential_created(" not in src   # no bare on-loop call
+
+
+def test_the_engine_sets_a_lock_timeout_backstop():
+    src = (ROOT / "app" / "core" / "database.py").read_text(encoding="utf-8")
+    assert "_LOCK_TIMEOUT_MS" in src
+    assert "lock_timeout={_LOCK_TIMEOUT_MS}" in src   # applied via libpq options on every connection
+
+
+def test_the_boot_ddl_disables_lock_timeout_for_its_own_statements():
+    # A schema change may legitimately wait on a lock, so the DDL replay overrides the engine
+    # lock_timeout to 0 per statement (SET LOCAL, resets at each commit). (mutation: drop it -> the
+    # DDL could be killed mid-migration under the engine timeout; pinned so it is not removed.)
+    src = API.read_text(encoding="utf-8")
+    assert "SET LOCAL lock_timeout = 0" in src
+
+
+def test_the_db_service_carries_an_idle_in_transaction_backstop():
+    # A leaked open transaction is bounded server-side too. Both deploy composes set the timeout on
+    # the postgres service.
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    for compose in ("deploy/docker-compose.secure.yml", "deploy/docker-compose.yml"):
+        text = (root / compose).read_text(encoding="utf-8")
+        assert "idle_in_transaction_session_timeout=" in text, compose
 
 
 # ---- SPA: the two sections render safely (source-pinned; the browser render is a UI-lane test) ---

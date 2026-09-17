@@ -153,6 +153,14 @@ def is_token_denylisted(session_token: str) -> bool:
 
 
 # --- Account lockout (time-boxed auto-unlock) ------------------------------
+# Class id for the per-user temp-credential cap's transaction-scoped advisory lock (paired
+# with hashtext(user_id) as the object id). An advisory lock serialises concurrent mints for
+# ONE user without locking the users ROW, so it has zero interaction with the KEY SHARE a
+# foreign key to that row takes (the audit insert), the ecc_router users-row locks, or the
+# SFTP process's audit inserts -- the deadlock a row lock here caused cannot form.
+_TEMP_CRED_CAP_ADVISORY_CLASS = 0x7443  # stable, arbitrary, distinct from any other lock class
+
+
 def account_locked(user) -> bool:
     """Whether an account is CURRENTLY locked.
 
@@ -754,22 +762,31 @@ class AuthService:
         # cares about (a non-admin cannot amplify past the cap by minting children).
         _max_temp = _tp_policy.get("max_temp_creds_per_user", 0)
         if _max_temp > 0:
-            # Lock the OWNER row FOR UPDATE and hold it across the cap COUNT and the INSERT+commit
-            # below (no commit intervenes), so two concurrent interactive mints for the same user
-            # cannot both pass the check-then-act at the boundary -- the same discipline the device
-            # mint uses on the device row. populate_existing() overwrites the cached instance with the
-            # locked row's committed state. A different user's mint locks a different row, so this
-            # serializes only same-user concurrency; an uncapped deployment (max 0) takes no lock.
-            _owner = (self.db.query(User).filter(User.id == user_id)
-                      .populate_existing().with_for_update().first())
+            _owner = self.db.query(User).filter(User.id == user_id).first()
             _exempt = (_owner is not None
                        and getattr(_owner, "role", None) == RoleEnum.ADMIN)
             if not _exempt:
+                # Serialize concurrent mints for THIS user across the cap COUNT and the INSERT+commit
+                # below (no commit intervenes), so two at the boundary cannot both pass. A
+                # transaction-scoped ADVISORY lock (auto-released on commit/rollback) -- not a row
+                # lock -- does this without touching the users row, so it never conflicts with the FK
+                # KEY SHARE the 'temp_credential_created' audit insert takes on that row. A different
+                # user hashes to a different key (same-user only); an uncapped deployment (max 0)
+                # takes no lock. lock_timeout is set at the engine level (see database.py).
+                from sqlalchemy import text as _sql_text
+                self.db.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:cls, hashtext(:uid))"),
+                    {"cls": _TEMP_CRED_CAP_ADVISORY_CLASS, "uid": str(user_id)})
                 _active_temp = self.db.query(TemporaryCredential).filter(
                     TemporaryCredential.user_id == user_id,
                     *outstanding_conditions(TemporaryCredential, datetime.utcnow()),
                 ).count()
                 if _active_temp >= _max_temp:
+                    # ROLL BACK before raising: this runs in the offload thread and still holds the
+                    # advisory lock (and an open transaction); without the rollback the lock would
+                    # live until get_db's finally closes the session ON THE EVENT LOOP, and a
+                    # concurrent on-loop DB write could block on it and freeze the loop.
+                    self.db.rollback()
                     # 409 (not 400): the request is well-formed; it conflicts with the current state
                     # (already at the active-credential cap). Matches the per-user vault-count cap so
                     # the two resource-count limits answer with the same status.
@@ -992,6 +1009,7 @@ class AuthService:
                 # Shared fail-closed counter: Redis when healthy, the durable DB fallback during a
                 # Redis outage — never a skip, which would leave the mint password proof unthrottled.
                 if vault_attempt_throttle.over_limit(_rl_key, _rl_limit, _rl_window):
+                    self.db.rollback()  # release the cap advisory lock before raising (offload thread)
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail="Too many vault password attempts. Please try again later.",
@@ -1000,6 +1018,7 @@ class AuthService:
                 if not supplied or not verify_password(supplied, vault.password_hash):
                     # Burn one failed attempt on the shared (vault, account) counter.
                     vault_attempt_throttle.burn(_rl_key, _rl_window)
+                    self.db.rollback()  # release the cap advisory lock before raising (offload thread)
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=(f"Vault '{vault.name}' is password-protected — its correct "
@@ -1298,6 +1317,10 @@ class AuthService:
                 *outstanding_conditions(TemporaryCredential, datetime.utcnow()),
             ).count()
             if active_for_device >= cap:
+                # ROLL BACK before raising: the mint holds the device row FOR UPDATE and runs in the
+                # offload thread, so without this the row lock would live until get_db's finally
+                # closes the session on the event loop (the latent twin of the per-user cap deadlock).
+                self.db.rollback()
                 # 409 (well-formed request, conflicts with current state), mirroring the per-user
                 # cap's status. NOT a password/limiter path.
                 raise _device_mint_refusal("device-cred-cap", http_status=status.HTTP_409_CONFLICT)

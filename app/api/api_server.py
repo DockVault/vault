@@ -6160,18 +6160,19 @@ async def create_temp_credentials(
         passcode_same_for_all=bool(payload.passcode_same_for_all) if payload else False,
     )
 
-    audit_logger.log_temp_credential_created(
-        current_user,
-        temp_creds['temp_username'],
-        client_ip
-    )
+    # OFF the event loop: these are SYNCHRONOUS DB writes (INSERT + commit), and each takes a KEY
+    # SHARE on the users row for its user_id foreign key. Run on the loop, one would block the loop if
+    # any other transaction held a conflicting lock on that row -- freezing every concurrent request,
+    # not just this one. run_offloaded runs the blocking write in the offload pool instead.
+    await run_offloaded(audit_logger.log_temp_credential_created,
+                        current_user, temp_creds['temp_username'], client_ip)
     # A minted passcode is a second access door to a vault — record it (vault ids + kinds + count,
     # never the passcode plaintext) so a mint is auditable alongside its redemptions.
     if temp_creds.get('passcodes'):
-        audit_logger.log_temp_passcode_minted(
+        await run_offloaded(
+            audit_logger.log_temp_passcode_minted,
             current_user, client_ip, temp_creds['passcodes'],
-            same_for_all=bool(payload.passcode_same_for_all) if payload else False,
-        )
+            same_for_all=bool(payload.passcode_same_for_all) if payload else False)
 
     # Optionally email the account owner that a temporary credential was issued for their access
     # (opt-in). NEVER include the credential plaintext — only that one exists + when it expires.
@@ -6914,10 +6915,11 @@ async def register_device_endpoint(
     # Per-account device cap (mirrors max_temp_creds_per_user): count ACTIVE devices; an admin
     # account is exempt; 0 = unlimited. 409 (well-formed request, conflicts with current state) at
     # the cap. This bounds total active device sync credentials per account together with the
-    # per-device cred cap, so unlimited registration can't make the total unbounded. Like the
-    # interactive per-user cap, the count-then-insert is not serialized, so a concurrent burst can
-    # transiently exceed the cap by a small bounded amount — acceptable for a resource/DoS bound
-    # (not a security invariant); strict enforcement would need a per-account lock or a DB constraint.
+    # per-device cred cap, so unlimited registration can't make the total unbounded. This
+    # count-then-insert is NOT serialized (unlike the interactive per-user cap, which now takes an
+    # owner-row lock across its count and insert): a concurrent burst can transiently exceed this
+    # device cap by a small bounded amount — acceptable for a resource/DoS bound (not a security
+    # invariant); strict enforcement would need a per-account lock or a DB constraint.
     cap = getattr(settings, "max_devices_per_user", 0) or 0
     if cap > 0 and getattr(current_user, "role", None) != RoleEnum.ADMIN:
         active_devices = db.query(Device).filter(
@@ -21227,6 +21229,11 @@ END $$;""",
             recorder = _SchemaStepRecorder(db)
             for stmt in statements:
                 try:
+                    # A schema change may legitimately wait on a lock, so disable the engine-level
+                    # lock_timeout for THIS statement's transaction only. SET LOCAL is scoped to the
+                    # current transaction and resets at the commit below, so the pooled connection
+                    # returns with the engine default (never a leaked 0).
+                    db.execute(text("SET LOCAL lock_timeout = 0"))
                     db.execute(text(stmt))
                     db.commit()
                     recorder.record(stmt, SchemaStep.OUTCOME_APPLIED)

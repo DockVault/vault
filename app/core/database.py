@@ -18,6 +18,13 @@ from app.core.config import (
 from app.core.models import Base
 
 _consumer_lock = threading.Lock()
+# Server-side lock_timeout (ms) applied to every app connection via libpq options, so any statement
+# that waits on a row lock longer than this fails with a clean error instead of blocking a request
+# path forever. A backstop, not the mechanism: the app avoids holding contended locks in request
+# paths. The boot-time DDL/migration transaction overrides this to 0 (SET LOCAL) because schema
+# changes may legitimately wait on a lock; and the Postgres service also sets
+# idle_in_transaction_session_timeout in the deploy composes as a second backstop. No env flag.
+_LOCK_TIMEOUT_MS = 5000
 _engine = None
 _session_factory = None
 _redis_client = None
@@ -48,7 +55,7 @@ def initialize_consumers() -> None:
                 pool_size=10,
                 max_overflow=20,
                 echo=settings.log_level == "DEBUG",
-                connect_args={"connect_timeout": 5},
+                connect_args={"connect_timeout": 5, "options": f"-c lock_timeout={_LOCK_TIMEOUT_MS}"},
             )
             factory = sessionmaker(
                 autocommit=False,

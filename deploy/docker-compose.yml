@@ -26,6 +26,11 @@ services:
     # documented upgrade path in dockvault.py, not a digest change. 15 is supported to Nov 2027.
     image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
     container_name: vault-db
+    # Backstop for a leaked open transaction: Postgres itself aborts any session left
+    # idle-in-transaction longer than this, releasing whatever locks it held, so a bug that
+    # forgot to commit/rollback cannot wedge other requests indefinitely (the app also sets a
+    # per-connection lock_timeout in database.py).
+    command: ["postgres", "-c", "idle_in_transaction_session_timeout=15000"]
     environment:
       POSTGRES_USER: sftp_user
       # VAULT_DB_PASSWORD is now REQUIRED (no shipped default). NB: postgres only applies this on

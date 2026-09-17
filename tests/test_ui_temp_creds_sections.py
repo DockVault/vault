@@ -31,6 +31,9 @@ def test_temp_creds_page_splits_into_two_sections_and_names_the_device(page, adm
     page.click('.sidebar-item[data-section="temp-creds"]')
     expect(page.locator("#active-temp-creds")).to_be_visible(timeout=10000)
 
+    # Show every credential, so a status filter can never hide a section's fixture row.
+    page.select_option("#tc-status-filter", "all")
+
     # Both sections render.
     expect(page.locator("#tc-shared-heading")).to_be_visible(timeout=10000)
     expect(page.locator("#tc-per-computer-heading")).to_be_visible()
@@ -42,6 +45,6 @@ def test_temp_creds_page_splits_into_two_sections_and_names_the_device(page, adm
 
     # The device credential is in the per-computer section, never the shared one; the hand-out
     # credential is in the shared table.
-    shared_table = page.locator("table.exp-table")
+    shared_table = page.locator("#tc-shared-table")   # its own id: table.exp-table is rendered twice
     expect(shared_table).to_contain_text(handout["temp_username"])
     expect(shared_table).not_to_contain_text(minted["temp_username"])
