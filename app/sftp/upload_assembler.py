@@ -74,6 +74,14 @@ class UploadAssembler:
         self.total_bytes = 0
 
     # -- public API ---------------------------------------------------------
+    def buffered_bytes(self) -> int:
+        """Bytes the assembler is holding IN MEMORY right now: the pending contiguous tail (always
+        < record_size after each synchronous flush) plus the out-of-order gap bytes (<= reorder
+        window). This is the writer's own buffering the memory ceiling bounds -- records are flushed
+        to storage synchronously in feed(), so this never grows without the client being
+        back-pressured, and a gap write past the window is refused rather than buffered."""
+        return len(self._pending) + self._gap_bytes
+
     def feed(self, offset: int, data: bytes) -> None:
         """Accept one SFTP write. Emits any records that become complete."""
         if self._finished:

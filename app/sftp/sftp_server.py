@@ -1263,11 +1263,18 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             handle.max_bytes = _eff_max
             handle._sftp_server = getattr(self, "_sftp_server", None)
             handle.upload_marker_ref = _upload_marker_ref
+            # Clamp the reorder window to the in-process memory ceiling, so no client write pattern
+            # can grow the writer's buffer past the documented bound (full records flush to storage
+            # synchronously, so the contiguous path is already back-pressured; this bounds the
+            # out-of-order gap buffer). The ceiling covers the reorder window + one record + framing.
+            _ceiling_bytes = max(1, settings.sftp_transfer_buffer_mb) * 1024 * 1024
+            _reorder_bytes = min(max(0, settings.sftp_streaming_reorder_mb) * 1024 * 1024,
+                                 max(0, _ceiling_bytes - _StreamingUpload.RECORD_SIZE))
             try:
                 handle.stream = _StreamingUpload(
                     handle=handle, interface=self, vault_id=vault_id, folder_id=folder_id,
                     filename=filename, can_overwrite=can_overwrite, max_bytes=_eff_max,
-                    reorder_bytes=max(0, settings.sftp_streaming_reorder_mb) * 1024 * 1024,
+                    reorder_bytes=_reorder_bytes,
                 )
             except Exception as e:  # noqa: BLE001 -- no handle will close, so free the lock now
                 safe_event('upload.stream-open.failed', e)

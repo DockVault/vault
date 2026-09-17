@@ -92,17 +92,27 @@ class Settings(BaseSettings):
     sftp_max_connections: int = Field(default=100)
     sftp_max_connections_per_ip: int = Field(default=10)
     sftp_auth_grace_seconds: int = Field(default=30)
-    # Memory-bounded streaming upload (experimental, default OFF). When on, an SFTP upload is
-    # encrypted and persisted record-by-record as it arrives instead of being buffered whole to the
-    # .sftp_tmp staging tmpfs, so RAM/tmpfs use is bounded to one 1 MiB record plus the reorder
-    # window regardless of file size (the at-rest format is byte-identical to the buffered/web path).
+    # Memory-bounded streaming upload. When on, an SFTP upload is encrypted and persisted
+    # record-by-record as it arrives instead of being buffered whole to the .sftp_tmp staging tmpfs,
+    # so in-process memory is bounded to one 1 MiB record plus the reorder window regardless of file
+    # size (the at-rest format is byte-identical to the buffered/web path), and there is no >512 MB
+    # tmpfs refusal. Ships ON: a multi-GB upload lands with flat RSS. Set it False to fall back to the
+    # buffered path (staged whole to the tmpfs, capped at SFTP_STAGING_TMPFS_MB) -- the pre-streaming
+    # behaviour, kept as a rollback with no at-rest format change.
+    sftp_streaming_upload: bool = Field(default=True)
     # sftp_streaming_reorder_mb caps how much out-of-order data is held to bridge a client that writes
     # records slightly out of order; a write beyond it (or a rewrite of an already-sealed region)
     # fails the upload with a descriptive error -- sftp put / scp write sequentially, so only an
-    # exotic random-access client hits it. Ships OFF; flip on after a large-file measurement confirms
-    # flat RSS and a byte-identical round-trip. Rollback is just flipping it back (no format change).
-    sftp_streaming_upload: bool = Field(default=False)
+    # exotic random-access client hits it.
     sftp_streaming_reorder_mb: int = Field(default=16)
+    # The streaming writer's in-process memory CEILING (MiB): it bounds the writer's own anonymous
+    # memory -- the pending record plus the reorder window plus AES-GCM framing staging (Linux
+    # RssAnon / smaps Private_*). The kernel page cache produced by writing the blob to storage is
+    # NOT counted (it is reclaimable and not owned by the process). The reorder window is clamped to
+    # this, so no client write pattern can grow the buffer past it; each full record is written to
+    # storage synchronously, which back-pressures a fast client against a slow disk rather than
+    # growing. Default 64: comfortably covers the 16 MiB reorder window + a 1 MiB record + framing.
+    sftp_transfer_buffer_mb: int = Field(default=64)
 
     # In-flight upload markers: the backstop TTL (seconds) on the ephemeral Redis marker an
     # SFTP write-open publishes. The marker is removed explicitly on close/abort, so this only reaps

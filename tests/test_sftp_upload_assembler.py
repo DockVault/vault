@@ -173,3 +173,41 @@ def test_full_roundtrip_realistic_sizes():
     # Every record except possibly the last is exactly the record size.
     assert all(len(r) == 1024 * 1024 for r in recs[:-1])
     assert 0 < len(recs[-1]) <= 1024 * 1024
+
+
+# ---- the buffered-bytes bound (the memory ceiling holds under back-pressure) ----------------------
+def test_buffered_bytes_never_exceeds_one_record_on_a_sequential_fast_client():
+    # A fast sequential client whose sink drains slowly: on_record is where the record goes to
+    # storage, and it runs SYNCHRONOUSLY inside feed(), so feed() cannot return (and the client
+    # cannot send the next write) until the record is drained -- the back-pressure. Sampling the
+    # buffered bytes at the moment each record is emitted proves the writer never holds more than one
+    # record's worth on the contiguous path, regardless of how much the client sends.
+    peak = {"n": 0}
+    a = None
+
+    def _slow_sink(_record):
+        # Observe the writer's own buffering at the instant a record is handed to storage.
+        peak["n"] = max(peak["n"], a.buffered_bytes())
+
+    a = UploadAssembler(_slow_sink, record_size=4, reorder_window=1024)
+    for i in range(0, 4000, 4):
+        a.feed(i, b"ABCD")
+    a.finish()
+    # Never more than ONE record in flight: at emit the pending holds exactly record_size (deleted
+    # right after), and between flushes it is strictly less -- so the contiguous buffer is bounded by
+    # one record no matter how much the client streams.
+    assert peak["n"] <= 4, f"buffered bytes exceeded one record: {peak['n']}"
+    assert a.buffered_bytes() == 0
+
+
+def test_out_of_order_buffer_is_capped_at_the_reorder_window_and_refuses_past_it():
+    # The reorder window (clamped to the memory ceiling by the caller) is a HARD bound: out-of-order
+    # bytes are held only up to it, and a write that would push past is REFUSED, never buffered. So a
+    # fast client cannot grow the writer's buffer past the ceiling by writing out of order.
+    a, _ = _collect(record_size=4, reorder_window=8)
+    a.feed(4, b"BBBB")               # a gap ahead of the frontier: 4 buffered
+    a.feed(8, b"CCCC")               # 8 buffered -- exactly the window
+    assert a.buffered_bytes() == 8
+    with pytest.raises(AssemblerError):
+        a.feed(12, b"DDDD")          # would be 12 > 8 -> refused, not buffered
+    assert a.buffered_bytes() == 8   # unchanged: the refused write added nothing

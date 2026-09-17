@@ -430,14 +430,18 @@ def build_env_lines(cfg):
     ):
         if sftp_active and cfg.get(_cfg_key) not in (None, "") and int(cfg[_cfg_key]) != _default:
             bare(_env_name, int(cfg[_cfg_key]))
-    # SFTP streaming upload (experimental, default off): only authored when explicitly enabled, or the
-    # reorder window differs from the app default (16). A normal install never mentions it, and an
-    # existing value is preserved through the env reader below rather than prompted for.
-    if sftp_active and cfg.get("sftp_streaming_upload"):
-        bare("SFTP_STREAMING_UPLOAD", "true")
+    # SFTP streaming upload (default ON): a normal install never mentions it. Author SFTP_STREAMING_UPLOAD
+    # only when the operator explicitly DISABLED it (the buffered rollback), preserving that choice
+    # across a fresh volume set; the reorder window and the memory ceiling are authored only when they
+    # differ from the app defaults (16 / 64). An existing value is preserved through the env reader below.
+    if sftp_active and str(cfg.get("sftp_streaming_upload") or "").strip().lower() in ("false", "0", "no", "off"):
+        bare("SFTP_STREAMING_UPLOAD", "false")
     if sftp_active and cfg.get("sftp_streaming_reorder_mb") not in (None, "") \
             and int(cfg["sftp_streaming_reorder_mb"]) != 16:
         bare("SFTP_STREAMING_REORDER_MB", int(cfg["sftp_streaming_reorder_mb"]))
+    if sftp_active and cfg.get("sftp_transfer_buffer_mb") not in (None, "") \
+            and int(cfg["sftp_transfer_buffer_mb"]) != 64:
+        bare("SFTP_TRANSFER_BUFFER_MB", int(cfg["sftp_transfer_buffer_mb"]))
     # In-flight upload marker TTL (seconds): the backstop on the ephemeral Redis marker an SFTP
     # write-open publishes so the web listing shows "uploading by <member>" and a same-name upload
     # is refused. Removed explicitly on close and refreshed during a live transfer, so this only
@@ -1210,9 +1214,11 @@ def new_set_config(current_env, new_prefix, new_id):
         "sftp_max_connections": (current_env.get("SFTP_MAX_CONNECTIONS") or "").strip() or None,
         "sftp_max_connections_per_ip": (current_env.get("SFTP_MAX_CONNECTIONS_PER_IP") or "").strip() or None,
         "sftp_auth_grace_seconds": (current_env.get("SFTP_AUTH_GRACE_SECONDS") or "").strip() or None,
-        # Keep an experimental SFTP streaming-upload choice + reorder window across a fresh volume set.
-        "sftp_streaming_upload": truthy("SFTP_STREAMING_UPLOAD"),
+        # Keep an SFTP streaming-upload choice (raw, so an explicit "false" rollback survives; default
+        # is ON), the reorder window, and the memory ceiling across a fresh volume set.
+        "sftp_streaming_upload": (current_env.get("SFTP_STREAMING_UPLOAD") or "").strip() or None,
         "sftp_streaming_reorder_mb": (current_env.get("SFTP_STREAMING_REORDER_MB") or "").strip() or None,
+        "sftp_transfer_buffer_mb": (current_env.get("SFTP_TRANSFER_BUFFER_MB") or "").strip() or None,
         # Keep a custom in-flight upload marker TTL across a fresh volume set, like the fields above.
         "upload_marker_ttl_seconds": (current_env.get("UPLOAD_MARKER_TTL_SECONDS") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
