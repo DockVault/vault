@@ -76,7 +76,7 @@ def test_no_non_device_route_depends_on_the_device_resolver():
 def test_every_device_route_shares_the_mints_rate_limit_class_and_is_not_excluded():
     from app.core.rate_limiter import classify_api_rate_limit
     mint_class = classify_api_rate_limit("POST", "/device/sync-credential")
-    excluded = ("/docs", "/openapi.json", "/redoc", "/health")
+    from app.core.rate_limiter import RATE_LIMIT_EXCLUDE_PATHS as excluded  # the middleware's own list, not a copy
     for r in _device_routes(_app()):
         assert not any(r.path.startswith(e) for e in excluded), f"{r.path} is on the rate-limit exclude list"
         for method in _real_methods(r) or {"GET"}:

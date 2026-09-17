@@ -50,6 +50,12 @@ POLL_GET_PATHS = frozenset({
 })
 
 
+# Paths the general-API rate-limit middleware never counts (health check + API docs). Defined once
+# here so the middleware default and any test that reasons about it read the SAME list and cannot
+# drift apart.
+RATE_LIMIT_EXCLUDE_PATHS = ("/docs", "/openapi.json", "/redoc", "/health")
+
+
 def classify_api_rate_limit(method: str, path: str) -> str:
     """Return one general-API class with auth > upload(_chunk) > download > poll > default precedence.
 
@@ -680,7 +686,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 poll_window if poll_window is not None else default_window,
             ),
         })
-        self.exclude_paths = exclude_paths or ["/docs", "/openapi.json", "/redoc", "/health"]
+        self.exclude_paths = exclude_paths or list(RATE_LIMIT_EXCLUDE_PATHS)
     
     def _get_client_identifier(self, request: Request) -> str:
         """
