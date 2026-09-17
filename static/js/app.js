@@ -18111,6 +18111,7 @@ async function loadNotes() {
         state.notes = (a && a.notes) || [];
         state.notesReceived = (b && b.notes) || [];
         state.noteLinks = (c && c.links) || [];
+        await _refreshAccountKeypairFlag();
         renderNotes();
     } catch (e) {
         if (mine) mine.replaceChildren(_el('div', 'alert alert-error', 'Failed to load notes: ' + ((e && e.message) || '')));
@@ -18301,11 +18302,14 @@ function _noteLinkCard(l) {
     view.addEventListener('click', () => openNoteLinkSnapshot(l));
     actions.appendChild(view);
     if (l.status === 'active') {
-        if (l.has_token_copy) {
+        if (l.status === 'active' && l.has_token_copy) {
             const again = _el('button', 'btn btn-ghost btn-sm', 'Show link again');
             again.type = 'button';
             again.addEventListener('click', () => _showLinkAgain('note', l.id, '/l/'));
             actions.appendChild(again);
+        } else if (l.status === 'active' && !l.has_token_copy && _accountHasKeypair === false) {
+            actions.appendChild(_el('span', 'text-tertiary text-xs link-recopy-hint',
+                'Set up your encryption key to be able to see links again.'));
         }
         const revoke = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
         revoke.type = 'button';
@@ -18335,6 +18339,19 @@ function openNoteLinkSnapshot(l) {
 // the token to the owner's OWN public key (encryption needs only the PUBLIC key -> no unlock prompt
 // here) and stores that opaque blob, so a later "Show link again" is a client-side decrypt.
 // Best-effort: a failure to save the re-copy never fails link creation -- the link stays one-time-show.
+// Cached "does THIS account have an ECC keypair" flag, refreshed before the owner link lists render
+// so a no-keypair account's card can show the set-up hint (a keypair user's API-script link with no
+// re-copy simply shows no button and no hint).
+let _accountHasKeypair = null;
+async function _refreshAccountKeypairFlag() {
+    try {
+        const pub = await apiRequest('/ecc/keys/public', { silent: true });
+        _accountHasKeypair = !!(pub && pub.has_keypair && pub.public_key);
+    } catch (_e) {
+        _accountHasKeypair = null;   // unknown -> show neither the button nor the hint
+    }
+}
+
 async function _saveLinkReCopy(kind, link) {
     if (!link || !link.token || !link.id) return { saved: false, reason: 'no-token' };
     let pub;
@@ -18953,6 +18970,7 @@ async function loadMyPublicLinks() {
     host.replaceChildren(_el('div', 'spinner'));
     try {
         const data = await apiRequest('/public-links', { silent: true });
+        await _refreshAccountKeypairFlag();
         renderMyPublicLinks((data && data.links) || []);
     } catch (e) {
         host.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load your links: ' + ((e && e.message) || '')));
@@ -18984,10 +19002,13 @@ function renderMyPublicLinks(links) {
         // The link URL is shown only once at creation (the token isn't stored in the clear), so there
         // is no "copy" here — just revoke (while active) and delete.
         const actTd = _el('td', 'flex gap-sm');
-        if (l.has_token_copy) {
+        if (l.status === 'active' && l.has_token_copy) {
             const again = _el('button', 'btn btn-ghost btn-sm', 'Show link again'); again.type = 'button';
             again.addEventListener('click', () => _showLinkAgain('public', l.id, '/p/'));
             actTd.appendChild(again);
+        } else if (l.status === 'active' && !l.has_token_copy && _accountHasKeypair === false) {
+            actTd.appendChild(_el('span', 'text-tertiary text-xs link-recopy-hint',
+                'Set up your encryption key to be able to see links again.'));
         }
         if (l.status === 'active') {
             const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';

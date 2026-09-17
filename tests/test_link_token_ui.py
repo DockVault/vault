@@ -1,4 +1,4 @@
-"""Source-pinned wiring of the owner-encrypted re-copy into the SPA (LINK-TOKENS part b UX).
+"""Source-pinned wiring of the owner-encrypted re-copy into the SPA.
 
 The behaviour (wrap at creation with the public key only, "Show link again" client-decrypt, the
 no-keypair and post-rotation messages) is a UI/live-lane test; here we pin the wiring in app.js:
@@ -31,7 +31,7 @@ def test_show_again_unlocks_and_decrypts_client_side_with_an_honest_rotation_mes
     js = _js()
     show = js[js.index("async function _showLinkAgain("):js.index("function copyNoteLinkUrl(")]
     assert "zkEnsureUnlocked()" in show and "unwrapLinkTokenV2(" in show     # client-side decrypt
-    assert "Re-copy unavailable after your key change — create a new link" in show   # S2 rotation string
+    assert "Re-copy unavailable after your key change — create a new link" in show   # the post-rotation message
 
 
 def test_the_no_keypair_and_not_saved_notes_use_the_confirmed_strings():
@@ -52,7 +52,8 @@ def test_creation_shows_the_token_before_it_tries_to_save_the_recopy():
 
 def test_both_owner_cards_offer_show_again_only_when_a_recopy_exists():
     js = _js()
-    assert js.count("if (l.has_token_copy) {") == 2                          # note card + file card
+    # The button shows only for an ACTIVE link that has a re-copy (no dead button on revoked/expired).
+    assert js.count("if (l.status === 'active' && l.has_token_copy) {") == 2   # note card + file card
     assert "_showLinkAgain('note', l.id, '/l/')" in js
     assert "_showLinkAgain('public', l.id, '/p/')" in js
     # the broken plaintext "Copy link" (token is no longer listed) is gone from the note card

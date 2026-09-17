@@ -1,4 +1,4 @@
-"""Live-lane acceptance for LINK-TOKENS, against a running stack.
+"""Live-lane acceptance for the at-rest link tokens, against a running stack.
 
 Part (a): a note link seeded THROUGH THE PRODUCT stores no plaintext token in the database yet still
 redeems -- asserted in the SAME run, with a proven-plaintext control (the admin username, which IS in

@@ -1,4 +1,4 @@
-"""Server-side contract for the owner-encrypted link re-copy (LINK-TOKENS part b, client-side wrap).
+"""Server-side contract for the owner-encrypted link re-copy (client-side wrap).
 
 The server stores the re-copy blob OPAQUE: it cannot verify the blob is wrapped to the owner's key
 (that needs the private key it never holds), so it enforces only that the blob is a V2 LINK-TOKEN
@@ -70,6 +70,15 @@ def test_the_copy_is_write_once_live_gated_and_shape_checked():
     assert "link.token_enc is not None" in store and "status_code=409" in store  # write-once
     assert "_link_is_live(link)" in store                                        # live only
     assert "_valid_link_token_copy(blob)" in store and "status_code=400" in store  # shape checked
+
+
+def test_the_read_path_is_liveness_gated_so_a_revoked_link_cannot_be_shown_again():
+    # The GET must 404 on a non-live link (revoked / expired / max-uses) even though the blob row
+    # still exists, so revoking makes the re-copy unrecoverable. (mutation: drop _link_is_live from
+    # _read_link_token_copy -> a revoked link's blob is still returned -> red.)
+    src = _src()
+    read = src[src.index("def _read_link_token_copy("):src.index("@app.put(\"/note-links/{link_id}/token-copy\")")]
+    assert "_link_is_live(link)" in read and "status_code=404" in read
 
 
 def test_both_link_types_have_write_once_and_read_endpoints():

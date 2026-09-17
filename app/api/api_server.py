@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import asyncio
 import hashlib
+import hmac
 import uuid
 import json
 import re
@@ -10820,6 +10821,10 @@ def _store_link_token_copy(db, link, blob) -> dict:
 
 
 def _read_link_token_copy(link) -> dict:
+    # Liveness-gated like the PUT: revoking (or expiry / max-uses) makes the re-copy unrecoverable,
+    # same uniform 404 as a missing link -- so a revoked link cannot be "shown again".
+    if not _link_is_live(link):
+        raise HTTPException(status_code=404, detail="Not found.")
     if not link.token_enc:
         raise HTTPException(status_code=404, detail="Not found.")
     return {"token_enc": link.token_enc}
@@ -21673,8 +21678,12 @@ def _backfill_notelink_tokens():
             migrated = backfill_notelink_token_hashes(db)
         if migrated:
             print(f"[OK] Hashed {migrated} legacy note-link token(s) at rest")
-    except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
-        print(f"⚠ note-link token hashing skipped: {e}")
+    except Exception as e:  # noqa: BLE001 — never block boot; the migration retries next boot
+        # Fail-CLOSED, no plaintext fallback: until a later boot completes this migration,
+        # existing note links (whose token_hash is still NULL) will not redeem -- redemption
+        # looks up by hash only. New links created after the switch are unaffected.
+        print(f"⚠ note-link token hashing FAILED; existing links will not redeem until a later "
+              f"boot completes the migration: {e}")
 
 
 def _backfill_file_checksums():
