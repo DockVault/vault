@@ -52,9 +52,10 @@ def test_the_tmpfs_512mb_refusal_applies_only_to_the_buffered_fallback():
 def test_the_streaming_writer_holds_no_db_transaction_across_the_byte_stream():
     src = SFTP.read_text(encoding="utf-8")
     cls = src[src.index("class _StreamingUpload:"):src.index("\nclass ", src.index("class _StreamingUpload:") + 10)]
-    # STREAM-TXN: every DB session in the writer is a `with get_db_context()` block that COMMITS/closes
-    # before (or after) the transfer -- never one held open across write(). The encryptor is opened in
-    # a brief session on the first record; the File-row insert runs in a FRESH session at close.
+    # No DB transaction is held across the client-paced byte stream: every session in the writer is a
+    # short `with get_db_context()` block that commits/closes before the next record -- never one held
+    # open across write(). The encryptor is opened in a brief session on the first record; the File-row
+    # insert runs in a FRESH session at close.
     assert "with get_db_context() as db:" in cls
     # The per-record write path (_emit -> write_chunk) touches the file-handle context, not a session:
     emit = cls[cls.index("def _emit("):cls.index("def write(")]
