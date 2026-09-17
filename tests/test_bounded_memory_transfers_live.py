@@ -74,3 +74,69 @@ def test_the_old_512mb_refusal_is_gone_from_the_running_server():
         "this deployment has SFTP_STREAMING_UPLOAD off -- large uploads take the buffered tmpfs path "
         "with the >512 MB refusal; the bounded-memory acceptance measures the streaming default")
     assert settings.sftp_transfer_buffer_mb > 0
+
+
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
+
+
+def _psql(sql, timeout=30):
+    return subprocess.run(
+        ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
+        capture_output=True, text=True, timeout=timeout)
+
+
+def test_two_concurrent_sftp_uploads_cannot_both_pass_one_vaults_quota(admin, temp_vault):
+    # Shaped like the two-mint race: set the vault's size_limit so ONE upload fits but two do not,
+    # fire two SFTP puts of distinct names at once, and assert exactly one lands and the vault total
+    # never exceeds the limit -- the persist step locks the vault row FOR NO KEY UPDATE and reads the
+    # quota under it. (mutation: drop the with_for_update in _authorize_upload_persist -> both commit,
+    # total overshoots -> this fails.) The RSS/size measurement is the acceptance runner's; this is the
+    # quota-race half at a CI-affordable size.
+    import threading
+    import time as _t
+    _require_admin_pw_or_skip()
+    if _psql("SELECT 1").returncode != 0:
+        (pytest.fail if _CI else pytest.skip)(
+            "cannot reach the DB via docker exec %s to set a small size_limit; set VAULT_DB_CONTAINER"
+            % _DB_CONTAINER)
+    try:
+        import paramiko  # noqa: F401
+    except Exception:  # noqa: BLE001
+        pytest.skip("paramiko not available")
+    from test_sftp_roundtrip import sftp_session
+
+    vid, vname = temp_vault["id"], temp_vault["name"]
+    each = 2 * 1024 * 1024                      # 2 MiB per upload
+    limit = 3 * 1024 * 1024                     # room for one, not two
+    if _psql("UPDATE vaults SET size_limit = %d WHERE id = '%s'" % (limit, vid)).returncode != 0:
+        pytest.skip("could not set a small size_limit on the test vault")
+
+    payload = secrets.token_bytes(each)
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def _put(tag):
+        name = unique("race-" + tag) + ".bin"
+        barrier.wait()
+        try:
+            with sftp_session(ADMIN_USER, ADMIN_PASS) as sftp:
+                with sftp.open("/%s/%s" % (vname, name), "wb") as fh:
+                    fh.write(payload)
+            results[tag] = "ok"
+        except Exception as exc:  # noqa: BLE001 -- a quota refusal is the expected outcome for one leg
+            results[tag] = "refused:%s" % exc.__class__.__name__
+
+    threads = [threading.Thread(target=_put, args=(t,)) for t in ("a", "b")]
+    started = _t.monotonic()
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(60)
+    assert all(not th.is_alive() for th in threads), "an SFTP upload hung -- a lock wedge"
+    assert _t.monotonic() - started < 60
+
+    # Exactly one landed; the vault total never exceeded the limit.
+    landed = _psql("SELECT count(*) FROM files WHERE vault_id = '%s'" % vid).stdout.strip()
+    total = _psql("SELECT COALESCE(total_size_bytes, 0) FROM vaults WHERE id = '%s'" % vid).stdout.strip()
+    assert landed == "1", "expected exactly one upload to land, got %s (results=%s)" % (landed, results)
+    assert int(total or "0") <= limit, "the vault total %s overshot the limit %d" % (total, limit)

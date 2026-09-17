@@ -1344,6 +1344,31 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         if vault.password_hash is not None and not self._vault_password_proven(user, vault):
             safe_event('upload.aborted.password-proof-invalid')
             return None
+        # Lock the vault row for the quota check + the File-row insert that follows in this SAME
+        # persist transaction (finalize_streaming_upload runs on this db). The web upload path locks
+        # the row before its per-vault size check; the SFTP persist read it UNLOCKED, so two
+        # concurrent streamed uploads could both pass the check and jointly overshoot size_limit --
+        # and with the tmpfs clamp gone on the streaming path the overshoot per upload is now the
+        # per-file ceiling, not ~512 MB. FOR NO KEY UPDATE (with_for_update(key_share=True)), never
+        # FOR UPDATE: it is mutually exclusive between two persists yet COMPATIBLE with the KEY SHARE
+        # the audit insert's users-row FK takes, so it cannot deadlock that insert (the per-user-cap
+        # lesson). populate_existing() refreshes the get_vault instance with the locked committed
+        # total. The engine lock_timeout bounds the wait: a timeout raises OperationalError -> a clean
+        # drop (the caller discards the blob and removes the marker), never an unbounded hold. No DB
+        # transaction spans the byte stream -- this lock lives only in the close-time persist txn.
+        from sqlalchemy.exc import OperationalError as _OperationalError
+        from app.core.models import Vault as _Vault
+        try:
+            locked_vault = (db.query(_Vault).filter(_Vault.id == vault_id)
+                            .populate_existing().with_for_update(key_share=True).first())
+        except _OperationalError:
+            db.rollback()
+            safe_event('upload.rejected.vault-lock-timeout', vault=vault_id, bytes=size)
+            return None
+        if locked_vault is None:
+            safe_event('upload.aborted.reauthz-failed', 'vault vanished before persist')
+            return None
+        vault = locked_vault
         if vault.size_limit and (vault.total_size_bytes or 0) + size > vault.size_limit:
             safe_event('upload.rejected.vault-limit', vault=vault.id, bytes=size, limit=vault.size_limit)
             return None

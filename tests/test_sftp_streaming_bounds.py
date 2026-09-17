@@ -72,3 +72,23 @@ def test_authenticate_before_release_the_file_row_is_the_commit_point():
     # same-name file. (The record codec verifies each chunk's tag on read; the commit gates exposure.)
     assert "_authorize_upload_persist(" in cls          # close-time re-authz before the File row
     assert "self._abort()" in cls                       # a failure discards the uncommitted blob
+
+
+def test_the_persist_locks_the_vault_row_before_the_quota_check():
+    # Two concurrent streamed uploads must not both pass the per-vault size_limit and jointly
+    # overshoot it (with the tmpfs clamp gone the overshoot per upload is the per-file ceiling). The
+    # persist step (_authorize_upload_persist, close-time) locks the vault row FOR NO KEY UPDATE and
+    # reads the total UNDER the lock, in the SAME transaction as the File-row insert. (mutation: drop
+    # the with_for_update re-read -> the quota is read unlocked and two persists both commit -> the
+    # live two-upload race goes red.)
+    src = SFTP.read_text(encoding="utf-8")
+    fn = src[src.index("def _authorize_upload_persist("):src.index("def _make_upload_finalizer(")]
+    # FOR NO KEY UPDATE (key_share=True), never FOR UPDATE (the audit-insert KEY SHARE deadlock lesson).
+    assert "with_for_update(key_share=True)" in fn
+    assert "populate_existing()" in fn                    # refresh the get_vault instance to the locked total
+    # The lock precedes the size_limit check, so the quota is read from the locked row.
+    lock_at = fn.index("with_for_update(key_share=True)")
+    quota_at = fn.index("vault.total_size_bytes or 0) + size > vault.size_limit")
+    assert lock_at < quota_at, "the vault row must be locked before the quota check"
+    # A lock_timeout is a clean drop (blob discarded, marker removed by the caller), never a hang.
+    assert "except _OperationalError:" in fn and "return None" in fn[fn.index("except _OperationalError:"):]
