@@ -168,3 +168,54 @@ def test_get_update_status_security_block_fails_safe_to_bundled(monkeypatch):
     st = U.get_update_status(current_version=V, enabled=True, managed=False, force=True)
     assert st["security"]["source"] == "bundled"
     assert st["security"]["secure"] is True   # honest bundled verdict; never fabricated
+
+
+# ---- (a) a bundled verdict has no fetch time -----------------------------------------------------
+def test_fetched_at_is_none_when_the_verdict_is_bundled():
+    # A failed or skipped fetch has no fetch time; even a stamp passed in is ignored for a bundled
+    # verdict, so it can never misread as fresh.
+    b = U.merged_security(V, "0.30.0", local_matrix=_matrix(V, secure=False),
+                          main_matrix=None, fetched_at=12345.0)
+    assert b["source"] == "bundled"
+    assert b["fetched_at"] is None
+
+
+# ---- (b) untrusted title/fixed_in are coerced to str and length-capped ---------------------------
+def test_the_block_bounds_an_oversized_or_nonstring_title_and_fixed_in():
+    b = U.merged_security(V, "0.30.0", local_matrix=_matrix(V),
+                          main_matrix=_matrix(V, secure=False,
+                                              vulns=[{"title": "x" * 5000, "fixed_in": 12345}]))
+    v = b["vulnerabilities"][0]
+    assert isinstance(v["title"], str) and len(v["title"]) <= 200
+    assert v["fixed_in"] == "12345"   # a non-string coerced to str
+
+
+# ---- (c) disabled / managed still return the bundled block, with NO fetch of any kind ------------
+def test_disabled_and_managed_return_a_bundled_block_without_any_fetch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(U, "fetch_main_matrix", lambda *a, **k: calls.append("main") or None)
+    monkeypatch.setattr(U, "_fetch_latest", lambda: calls.append("latest") or (None, None, None))
+    monkeypatch.setattr(U, "_read_bundled_matrix",
+                        lambda: _matrix(V, secure=False, vulns=[{"title": "X", "fixed_in": "0.29.1"}]))
+    for kwargs in ({"enabled": False, "managed": False}, {"enabled": True, "managed": True}):
+        _reset_cache()
+        st = U.get_update_status(V, **kwargs)
+        assert "security" in st, kwargs
+        assert st["security"]["source"] == "bundled"
+        assert st["security"]["fetched_at"] is None
+        assert st["security"]["secure"] is False   # the bundled insecure verdict is still shown
+    assert calls == [], "disabled/managed must not fetch anything over the network"
+
+
+# ---- (d) secure is three-valued: None when neither source knows the version ----------------------
+def test_secure_is_none_when_neither_source_knows_the_version():
+    # Reachable only as a failure state (unreadable bundled copy AND a silent main): a positive with
+    # no evidence must not be asserted.
+    b = U.merged_security(V, "0.30.0", local_matrix=None, main_matrix=None)
+    assert b["secure"] is None
+    assert b["source"] == "bundled"
+
+
+def test_secure_is_true_when_a_source_lists_the_version_and_nothing_is_wrong():
+    b = U.merged_security(V, "0.30.0", local_matrix=_matrix(V), main_matrix=None)
+    assert b["secure"] is True   # the bundled copy vouches for a version it actually lists

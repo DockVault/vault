@@ -156,3 +156,14 @@ def test_the_tool_and_the_app_merge_the_same_lifecycle():
     assert tool_secsupport == app_support.get("security_support")
     # and both dropped the unreleased fix by the ceiling
     assert ("unreleased", "0.99.0") not in tool_vulns
+
+
+def test_the_merge_bounds_an_oversized_or_nonstring_title_and_fixed_in():
+    # (b) The untrusted scalars are coerced to str and capped once in the merge, so every downstream
+    # print is bounded; clean_matrix_text still strips escapes at the print sites.
+    merged, _ = _merged(_matrix(V),
+                        _matrix(V, secure=False, vulns=[{"title": "y" * 5000, "fixed_in": 999}]))
+    vs = dv.version_vulnerabilities(merged, V)
+    assert len(vs) == 1
+    assert isinstance(vs[0]["title"], str) and len(vs[0]["title"]) <= 200
+    assert vs[0]["fixed_in"] == "999"

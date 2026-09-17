@@ -1938,6 +1938,13 @@ def _merge_support(local_s, remote_s):
     return merged
 
 
+def _bound_scalar(value, cap=200):
+    """Coerce an untrusted matrix scalar (a fetched title/fixed_in can be any JSON type up to the body
+    cap) to a bounded str, or None. Applied to the merged lifecycle before any print; clean_matrix_text
+    still strips terminal escapes at the print sites."""
+    return None if value is None else str(value)[:cap]
+
+
 def _merge_vulnerabilities(local_v, remote_v):
     """Union of two vulnerability lists, deduped by (title, fixed_in). Local entries are always kept;
     the remote can only ADD."""
@@ -1974,7 +1981,11 @@ def merge_lifecycle_matrix(local_matrix, main_matrix, released_ceiling):
         if ms:
             meta["support"] = ms
         if mv:
-            meta["vulnerabilities"] = mv
+            # Bound the two untrusted scalars once here, so every downstream print (the list note and
+            # the target warning) is capped; clean_matrix_text still runs at those sites.
+            meta["vulnerabilities"] = [
+                {**v, "title": _bound_scalar(v.get("title")), "fixed_in": _bound_scalar(v.get("fixed_in"))}
+                for v in mv]
     return merged, "main"
 
 

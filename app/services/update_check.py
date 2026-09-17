@@ -120,9 +120,11 @@ def get_update_status(current_version, enabled, managed, force=False, interval_s
     "check now" that bypasses the interval but still honours ``force_min_seconds`` between real
     requests, so repeated clicks can't be spammed into the rate limit."""
     if managed:
-        return {"enabled": False, "managed": True, "current": current_version, "update_available": False}
+        return {"enabled": False, "managed": True, "current": current_version, "update_available": False,
+                "security": merged_security(current_version, released_ceiling=None, main_matrix=None)}
     if not enabled:
-        return {"enabled": False, "managed": False, "current": current_version, "update_available": False}
+        return {"enabled": False, "managed": False, "current": current_version, "update_available": False,
+                "security": merged_security(current_version, released_ceiling=None, main_matrix=None)}
     ttl = CACHE_TTL if interval_seconds is None else max(1, int(interval_seconds))
 
     def _due():
@@ -359,6 +361,16 @@ def _version_vulnerabilities(matrix, version):
     return vulns if isinstance(vulns, list) else []
 
 
+def _knows_version(matrix, version):
+    """True when `matrix` LISTS `version` at all (a versions entry, even an empty one). Distinct from
+    having a support block: it is how a positive 'secure' is earned -- a source must actually know the
+    version to vouch for it."""
+    if not isinstance(matrix, dict):
+        return False
+    version = (version or "").lstrip("vV")
+    return version in (matrix.get("versions") or {})
+
+
 def _credible_remote_vulns(remote_vulns, released_ceiling):
     """Drop a remote vulnerability whose `fixed_in` names a version NEWER than the newest RELEASE the
     consumer can see -- an unreleased fix is not a credible disclosure (a poisoning tell). The ceiling
@@ -443,6 +455,14 @@ def fetch_main_matrix(opener=None):
     return None
 
 
+def _bound(value, cap=200):
+    """Coerce an untrusted matrix scalar to a bounded str (or None). A fetched matrix can
+    carry any JSON type (a huge string, a number, a nested object) in a title/fixed_in up to
+    the body cap; str-coerce it and cap the length before it enters the block, so it cannot
+    bloat the response or a render. None (a vulnerability with no fix stated) stays None."""
+    return None if value is None else str(value)[:cap]
+
+
 _UNSET = object()
 
 
@@ -474,12 +494,22 @@ def merged_security(current_version, released_ceiling, *, local_matrix=_UNSET, m
 
     support = _merge_support(local_s, remote_s)
     vulns = _merge_vulnerabilities(local_v, remote_v)
-    # secure is False on an explicit insecure verdict OR any listed vulnerability; True only when the
-    # merged view says nothing bad. Never a false secure: the remote can add badness, never remove it.
-    secure = not (support.get("secure") is False or bool(vulns))
+    # Three-valued: False on any explicit insecure verdict OR any listed vulnerability; True only when
+    # at least one source actually KNOWS the version and nothing says otherwise; None when NEITHER
+    # source knows it (reachable only as a failure state -- an unreadable bundled copy AND a silent
+    # main). A positive with no evidence must never be asserted; the remote can add badness, never
+    # remove it, so this is never a false secure. The SPA banner keys on `=== false`, so None hides.
+    if support.get("secure") is False or vulns:
+        secure = False
+    elif _knows_version(local_matrix, current_version) or _knows_version(main_matrix, current_version):
+        secure = True
+    else:
+        secure = None
     return {
         "secure": secure,
-        "vulnerabilities": [{"title": v.get("title"), "fixed_in": v.get("fixed_in")} for v in vulns],
+        "vulnerabilities": [{"title": _bound(v.get("title")), "fixed_in": _bound(v.get("fixed_in"))} for v in vulns],
         "source": source,
-        "fetched_at": fetched_at if fetched_at is not None else _time.time(),
+        # None when the verdict is the bundled copy: a failed or skipped fetch has no fetch
+        # time, so it must not stamp one (a "bundled at <now>" would misread as fresh).
+        "fetched_at": None if source == "bundled" else (fetched_at if fetched_at is not None else _time.time()),
     }

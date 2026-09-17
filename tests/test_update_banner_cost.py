@@ -193,9 +193,12 @@ def test_a_managed_deployment_is_still_suppressed(monkeypatch):
     calls = []
     _stub_fetches(uc, monkeypatch, matrix=_matrix(), calls=calls)
     status = uc.get_update_status("0.1.0", enabled=True, managed=True)
-    assert status == {"enabled": False, "managed": True, "current": "0.1.0",
-                      "update_available": False}
+    assert status["enabled"] is False and status["managed"] is True
+    assert status["current"] == "0.1.0" and status["update_available"] is False
     assert calls == [], "a managed deployment made an outbound request"
+    # The bundled security verdict rides along, but from the bundled copy alone: source "bundled" and
+    # no fetch time (no outbound request was spent -- the calls assertion above holds it).
+    assert status["security"]["source"] == "bundled" and status["security"]["fetched_at"] is None
 
 
 def test_disabled_stays_disabled(monkeypatch):
