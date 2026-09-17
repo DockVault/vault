@@ -109,10 +109,10 @@ class Settings(BaseSettings):
     # memory -- the pending record plus the reorder window plus AES-GCM framing staging (Linux
     # RssAnon / smaps Private_*). The kernel page cache produced by writing the blob to storage is
     # NOT counted (it is reclaimable and not owned by the process). The reorder window is clamped to
-    # this MINUS one record (record + reorder-window + framing all fit under the ceiling), so no
-    # client write pattern can grow the buffer past it; each full record is written to
-    # storage synchronously, which back-pressures a fast client against a slow disk rather than
-    # growing. Default 64: comfortably covers the 16 MiB reorder window + a 1 MiB record + framing.
+    # the ceiling MINUS one record; the per-record AES-GCM framing (a few dozen bytes) is not reserved
+    # separately. So no client write pattern can grow the buffer past the ceiling; each full record is
+    # written to storage synchronously, which back-pressures a fast client against a slow disk rather
+    # than growing. Default 64: comfortably covers the 16 MiB reorder window plus a 1 MiB record.
     sftp_transfer_buffer_mb: int = Field(default=64)
 
     # In-flight upload markers: the backstop TTL (seconds) on the ephemeral Redis marker an

@@ -60,13 +60,17 @@ def test_an_over_threshold_file_is_refused_before_any_content_get_when_not_strea
     assert pre_guard < first_fetch, "the size refusal must precede the first content GET"
 
 
-def test_a_streaming_attempt_that_fails_cancels_the_body_instead_of_buffering_a_huge_file():
+def test_every_refusal_aborts_the_connection_by_construction():
     body = _download_fn()
-    # When a streaming attempt returns false (sink unavailable at runtime) for an over-threshold file,
-    # the spent response body is CANCELLED and the download refused -- never re-fetched into a buffered
-    # whole-file read. Both the standard and the ZK false-branches do this.
-    assert body.count("await response.body.cancel();") >= 2
-    # Each cancel sits with a threshold guard + a refusal, not a re-fetch.
-    assert body.count("_refuseTooLarge()") >= 3   # pre-fetch + both false-branches (+ final backstop)
+    # _refuseTooLarge aborts the fetch controller BEFORE showing the message, so every refusal path
+    # (pre-fetch, both streamed===false branches, the final backstop) tears the connection down --
+    # the guarantee that works even on the ZK branch where _peekStream has locked response.body and
+    # response.body.cancel() would throw. (mutation: delete the _dlAbort.abort() inside
+    # _refuseTooLarge -> a locked-body refusal leaves the download running -> red.)
+    refuse_def = body[body.index("const _refuseTooLarge = () => {"):]
+    refuse_def = refuse_def[:refuse_def.index("showError(")]
+    assert "_dlAbort.abort();" in refuse_def, "the refusal must abort the fetch before showing the message"
+    # The refusal is used on every path: pre-fetch guard + both false-branches (+ the final backstop).
+    assert body.count("_refuseTooLarge()") >= 3
     # The refusal names the administrator action (LOW: not just "open over https").
     assert "ask an administrator to serve the site over https" in body

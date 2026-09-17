@@ -14264,10 +14264,17 @@ async function _downloadFile(fileId, fileName) {
         // buffered, no service worker, or a plain-HTTP context -> state.downloadSink !== 'streaming'),
         // refuse an over-threshold file BEFORE issuing any content GET, so the browser never buffers a
         // file we are about to refuse. The size is known from the listing (_fsize) without a request.
-        const _refuseTooLarge = () => showError(`"${fileName}" is ${formatBytes ? formatBytes(_fsize) : _fsize + ' B'} and this browser/context `
+        const _refuseTooLarge = () => {
+            // Abort the fetch by its signal FIRST, then show the message. This is the guarantee that
+            // no connection keeps downloading behind an honest refusal: on the ZK branch the false
+            // return happens after _peekStream has locked response.body, so response.body.cancel()
+            // would throw -- the controller abort tears the connection down regardless of the lock.
+            try { _dlAbort.abort(); } catch (_) { /* nothing in flight to abort */ }
+            showError(`"${fileName}" is ${formatBytes ? formatBytes(_fsize) : _fsize + ' B'} and this browser/context `
                 + `can't stream it to disk, so it is too large to download here. Streaming needs a secure `
                 + `https context with a service worker; ask an administrator to serve the site over https `
                 + `and enable streaming downloads, or use the SFTP sync path for very large files.`);
+        };
         if (state.downloadSink !== 'streaming' && _fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
             _refuseTooLarge();
             return;
