@@ -13330,43 +13330,52 @@ async function dvSinkWorker() {
         _sinkUnavailableReason = 'unsupported';
         return null;
     }
-    let registration;
-    try {
-        registration = await navigator.serviceWorker.register('/download-sw.js', { scope: '/' });
-    } catch (_) {
-        _sinkUnavailableReason = 'register-failed';   // script unreachable / registration refused
-        return null;
-    }
-    if (registration.active) {                        // warm worker: no wait at all
-        _sinkWorker = registration.active;
-        _sinkUnavailableReason = null;
-        return _sinkWorker;
-    }
-    // Race THREE signals rather than a blind `await ready` (which never settles when activation cannot
-    // happen): (1) serviceWorker.ready -> a worker is active + controlling; (2) the installing worker
-    // reaching 'activated' (same success) or 'redundant' (threw on install -> will NEVER activate ->
-    // resolve no-sink IMMEDIATELY, no timer); (3) a backstop timer for states with no event at all
-    // (blocked by policy so nothing installs; an extension swallowing activation) -- generous enough
-    // for a real first-visit install on a slow device (5 s, the sink-ready order of magnitude).
-    const installing = registration.installing || registration.waiting;
+    // Bound the WHOLE opener with ONE backstop timer, started BEFORE register(): register() fetches
+    // the worker script with no timeout guarantee, so a proxy/extension that black-holes
+    // /download-sw.js leaves it pending forever -- a hang with no refusal, just like a never-settling
+    // activation. The single timer covers the register fetch AND the activation wait. The outcome is
+    // settled ONCE, so a late-resolving registration (or a worker that activates after the timer)
+    // cannot flip _sinkWorker for this download. Never throws; never caches on a failure.
+    //   Success arms:   serviceWorker.ready (active + controlling), or the installing worker reaching
+    //                   'activated'.
+    //   Immediate fail: register() rejects ('register-failed'); the installing worker goes 'redundant'
+    //                   (threw on install, will NEVER activate -- resolve at once, no timer wait).
+    //   Backstop timer: nothing settled by 5 s (register never resolved / no activation event) ->
+    //                   'timeout-installing' if a worker is still installing (a retry will work),
+    //                   else 'blocked'. Generous enough for a real first-visit install on a slow box.
+    let installing = null;
     const outcome = await new Promise((resolve) => {
         let settled = false;
-        const done = (v) => { if (!settled) { settled = true; resolve(v); } };
-        navigator.serviceWorker.ready
-            .then(() => done({ sink: registration.active || navigator.serviceWorker.controller }))
-            .catch(() => { /* ready never rejects; the timer/redundant paths settle this */ });
-        if (installing) {
-            installing.addEventListener('statechange', () => {
-                if (installing.state === 'activated') {
-                    done({ sink: registration.active || navigator.serviceWorker.controller });
-                } else if (installing.state === 'redundant') {
-                    done({ reason: 'redundant' });    // definitively will not activate
-                }
-            });
-        }
-        setTimeout(() => done({
+        let timer = null;
+        const done = (v) => {
+            if (settled) return;
+            settled = true;
+            if (timer) { try { clearTimeout(timer); } catch (_) { /* ignore */ } }
+            resolve(v);
+        };
+        timer = setTimeout(() => done({
             reason: (installing && installing.state === 'installing') ? 'timeout-installing' : 'blocked',
         }), 5000);
+        navigator.serviceWorker.register('/download-sw.js', { scope: '/' }).then((registration) => {
+            // A falsy registration (some blocked-SW harnesses resolve undefined in 0 ms; a real
+            // browser resolves a registration or rejects) is treated as register-failed -- reading
+            // .active on it would throw a TypeError, so guard it rather than rely on the catch.
+            if (!registration) { done({ reason: 'register-failed' }); return; }
+            if (registration.active) { done({ sink: registration.active }); return; }  // warm worker
+            installing = registration.installing || registration.waiting;
+            navigator.serviceWorker.ready
+                .then(() => done({ sink: registration.active || navigator.serviceWorker.controller }))
+                .catch(() => { /* ready never rejects; the timer/redundant paths settle this */ });
+            if (installing) {
+                installing.addEventListener('statechange', () => {
+                    if (installing.state === 'activated') {
+                        done({ sink: registration.active || navigator.serviceWorker.controller });
+                    } else if (installing.state === 'redundant') {
+                        done({ reason: 'redundant' });    // definitively will not activate
+                    }
+                });
+            }
+        }).catch(() => done({ reason: 'register-failed' }));   // script unreachable / registration refused
     });
     if (outcome.sink) {
         _sinkWorker = outcome.sink;                   // cache ONLY on success

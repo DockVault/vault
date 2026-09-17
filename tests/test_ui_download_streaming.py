@@ -123,3 +123,36 @@ def test_the_refusal_wording_is_reason_driven():
     assert "try again in a moment" in branch[:700]
     # the reason is reset per download so a pre-fetch refusal never reads a stale value
     assert "_sinkUnavailableReason = null;" in body
+
+
+def test_the_whole_opener_is_bounded_timer_before_register():
+    # register() itself fetches the worker script with no timeout, so a black-holed /download-sw.js
+    # leaves it pending forever. The single backstop timer is started BEFORE register(), covering the
+    # register fetch AND the activation wait, so a never-settling registration resolves no-sink at the
+    # bound. (mutation: move the setTimeout after the register() call -> the register fetch is
+    # unbounded again -> red.)
+    fn = _sinkworker_src()
+    timer_at = fn.index("setTimeout(")
+    register_at = fn.index("navigator.serviceWorker.register(")
+    assert timer_at < register_at, "the backstop timer must start before register()"
+    # A never-settling registration falls to the timer with reason blocked/timeout-installing.
+    assert "reason: (installing && installing.state === 'installing') ? 'timeout-installing' : 'blocked'" in fn
+
+
+def test_a_falsy_registration_is_register_failed_without_throwing():
+    # Some blocked-SW harnesses resolve register() to undefined; reading .active on it would throw a
+    # TypeError out of dvSinkWorker, breaking the never-throw contract (it would surface as a 'failed'
+    # stream and skip the refusal). A falsy registration is treated as register-failed. (mutation:
+    # drop the `if (!registration)` guard -> a TypeError escapes -> red.)
+    fn = _sinkworker_src()
+    assert "if (!registration) { done({ reason: 'register-failed' }); return; }" in fn
+    # The whole opener is inside the settle-once Promise with a catch, so no throw escapes dvSinkWorker.
+    assert ".catch(() => done({ reason: 'register-failed' }));" in fn
+
+
+def test_the_outcome_is_settled_once():
+    # A late-resolving registration or a worker that activates after the timer must not flip the
+    # result for this download: done() is guarded by a settled flag and clears the timer.
+    fn = _sinkworker_src()
+    assert "if (settled) return;" in fn and "settled = true;" in fn
+    assert "clearTimeout(timer)" in fn
