@@ -196,7 +196,8 @@ def test_a_second_same_name_upload_is_refused_naming_the_member(admin, temp_vaul
             # credential -- a SCOPED principal -- so the identity is gated to "another member" (a
             # member-grade viewer would see the holder's username instead), never the owner's name.
             # The neutral "another member" form is proof in itself that no holder username leaked.
-            assert "uploading" in msg.lower() and "another member" in msg.lower()
+            # (The server's wording is "'<name>' is currently being uploaded by <who>".)
+            assert "being uploaded" in msg.lower() and "another member" in msg.lower()
         finally:
             t.close()
     finally:
