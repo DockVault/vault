@@ -46,17 +46,27 @@ def test_downloadFile_prefers_the_standard_streaming_path_when_policy_streams():
     assert "=== true" in seg[:400] and "'failed'" in seg[:600]
 
 
-def test_the_buffered_path_refuses_a_file_too_large_to_hold_in_memory():
+def test_an_over_threshold_file_is_refused_before_any_content_get_when_not_streaming():
     js = _js()
     assert "const MAX_BUFFERED_DOWNLOAD_BYTES = 256 * 1024 * 1024;" in js
     body = _download_fn()
-    # The threshold check sits BEFORE the buffered blob read, and returns (refuses) rather than
-    # buffering. (mutation: drop the `_fsize > MAX_BUFFERED_DOWNLOAD_BYTES` guard -> a multi-GB file
-    # falls into the whole-blob read -> the browser blows up.)
-    assert "_fsize > MAX_BUFFERED_DOWNLOAD_BYTES" in body
-    guard = body.index("_fsize > MAX_BUFFERED_DOWNLOAD_BYTES")
-    blob_read = body.index("let blob;", guard)
-    assert guard < blob_read, "the size refusal must precede the buffered blob read"
-    # The refusal names why (too large + streaming unavailable), it does not silently proceed.
-    refuse = body[guard:blob_read]
-    assert "too large to download here" in refuse and "return;" in refuse
+    # When streaming is NOT going to be attempted (buffered policy / no service worker / plain HTTP),
+    # the size refusal fires BEFORE the first content GET, so the browser never buffers a file it is
+    # about to refuse. (mutation: move the guard back below the first fetch -> a fetch whose body is
+    # never read keeps downloading gigabytes while the tab shows the refusal.)
+    assert "state.downloadSink !== 'streaming' && _fsize > MAX_BUFFERED_DOWNLOAD_BYTES" in body
+    pre_guard = body.index("state.downloadSink !== 'streaming' && _fsize > MAX_BUFFERED_DOWNLOAD_BYTES")
+    first_fetch = body.index("await fetch(")
+    assert pre_guard < first_fetch, "the size refusal must precede the first content GET"
+
+
+def test_a_streaming_attempt_that_fails_cancels_the_body_instead_of_buffering_a_huge_file():
+    body = _download_fn()
+    # When a streaming attempt returns false (sink unavailable at runtime) for an over-threshold file,
+    # the spent response body is CANCELLED and the download refused -- never re-fetched into a buffered
+    # whole-file read. Both the standard and the ZK false-branches do this.
+    assert body.count("await response.body.cancel();") >= 2
+    # Each cancel sits with a threshold guard + a refusal, not a re-fetch.
+    assert body.count("_refuseTooLarge()") >= 3   # pre-fetch + both false-branches (+ final backstop)
+    # The refusal names the administrator action (LOW: not just "open over https").
+    assert "ask an administrator to serve the site over https" in body

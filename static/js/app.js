@@ -14260,6 +14260,19 @@ async function _downloadFile(fileId, fileName) {
             headers['X-Vault-Password'] = state.vaultPassword;
         }
 
+        // No silent whole-file download: when streaming is NOT going to be attempted (an org forced
+        // buffered, no service worker, or a plain-HTTP context -> state.downloadSink !== 'streaming'),
+        // refuse an over-threshold file BEFORE issuing any content GET, so the browser never buffers a
+        // file we are about to refuse. The size is known from the listing (_fsize) without a request.
+        const _refuseTooLarge = () => showError(`"${fileName}" is ${formatBytes ? formatBytes(_fsize) : _fsize + ' B'} and this browser/context `
+                + `can't stream it to disk, so it is too large to download here. Streaming needs a secure `
+                + `https context with a service worker; ask an administrator to serve the site over https `
+                + `and enable streaming downloads, or use the SFTP sync path for very large files.`);
+        if (state.downloadSink !== 'streaming' && _fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
+            _refuseTooLarge();
+            return;
+        }
+
         // Fetch file. Not const: a streaming attempt that cannot proceed has already consumed
         // this body, so the buffered fallback replaces it.
         let response = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, {
@@ -14289,7 +14302,14 @@ async function _downloadFile(fileId, fileName) {
                           + `Any partial file in your downloads is incomplete.`);
                 return;
             }
-            // streamed === false: the sink was unavailable, nothing written; re-fetch for buffered.
+            // streamed === false: the sink was unavailable at runtime, nothing written. An
+            // over-threshold file must NOT fall to a buffered whole-file read -- cancel the spent
+            // body so it stops downloading, and refuse. Only a small file re-fetches for buffered.
+            if (_fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
+                try { if (response.body) await response.body.cancel(); } catch (_) { /* already done */ }
+                _refuseTooLarge();
+                return;
+            }
             response = await fetch(
                 `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
             if (!response.ok) throw new Error('Download failed');
@@ -14309,22 +14329,25 @@ async function _downloadFile(fileId, fileName) {
                           + `Any partial file in your downloads is incomplete.`);
                 return;
             }
-            // streamed === false: streaming was not possible, and nothing was written. The
-            // response body is spent, so the buffered path below re-fetches.
+            // streamed === false: streaming was not possible at runtime, nothing written. As in the
+            // standard branch, an over-threshold file is refused (cancel the spent body) rather than
+            // re-fetched into a buffered whole-file read; only a small file re-fetches.
+            if (_fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
+                try { if (response.body) await response.body.cancel(); } catch (_) { /* already done */ }
+                _refuseTooLarge();
+                return;
+            }
             response = await fetch(
                 `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`,
                 { headers });
             if (!response.ok) throw new Error('Download failed');
         }
 
-        // No silent whole-file fallback: if we reach the buffered path (streaming unavailable or not
-        // asked for) and the file is too large to hold in memory, REFUSE rather than read gigabytes
-        // into the tab. A multi-GB transfer must never silently take the whole-file path.
+        // Final backstop: any remaining path here is a small file (the pre-fetch guard and the
+        // streamed===false guards above already refused an over-threshold one before buffering).
         if (_fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
-            showError(`"${fileName}" is ${formatBytes ? formatBytes(_fsize) : _fsize + ' B'} and this `
-                + `browser/context can't stream it to disk, so it is too large to download here `
-                + `(streaming needs a secure https context with a service worker). `
-                + `Open the site over https, or use the SFTP sync path for very large files.`);
+            try { if (response.body) await response.body.cancel(); } catch (_) { /* already done */ }
+            _refuseTooLarge();
             return;
         }
 

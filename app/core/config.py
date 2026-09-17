@@ -109,7 +109,8 @@ class Settings(BaseSettings):
     # memory -- the pending record plus the reorder window plus AES-GCM framing staging (Linux
     # RssAnon / smaps Private_*). The kernel page cache produced by writing the blob to storage is
     # NOT counted (it is reclaimable and not owned by the process). The reorder window is clamped to
-    # this, so no client write pattern can grow the buffer past it; each full record is written to
+    # this MINUS one record (record + reorder-window + framing all fit under the ceiling), so no
+    # client write pattern can grow the buffer past it; each full record is written to
     # storage synchronously, which back-pressures a fast client against a slow disk rather than
     # growing. Default 64: comfortably covers the 16 MiB reorder window + a 1 MiB record + framing.
     sftp_transfer_buffer_mb: int = Field(default=64)
