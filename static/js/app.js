@@ -16530,8 +16530,17 @@ async function uploadFiles(files) {
                         enc = written.blob;
                     } else {
                         // The legacy writer takes the whole plaintext and has no chunked form, so
-                        // this branch still reads the file. Its cost is stated rather than hidden:
-                        // it is the reason the branch above exists.
+                        // this branch still reads the file. No silent whole-file read for a large
+                        // file: refuse above the in-memory threshold rather than pull gigabytes into
+                        // the tab (a client with the v2 chunked writer streams from the File above
+                        // and is exempt).
+                        if (entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES) {
+                            showError(`"${entry.name}" is too large to encrypt in this browser `
+                                + `(${formatBytes ? formatBytes(entry.file.size) : entry.file.size + ' B'}); `
+                                + `update the app to the streaming encryptor, or use the SFTP sync path `
+                                + `for very large files.`);
+                            return;
+                        }
                         entry.blobId = zkNewBlobId();
                         enc = await lib.encryptFile(await entry.file.arrayBuffer(), dek);
                     }
