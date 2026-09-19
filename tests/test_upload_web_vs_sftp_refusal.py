@@ -6,6 +6,7 @@ standard vaults only (SFTP never serves zero-knowledge, and a ZK name is server-
 and fail-open. The client refuses a legacy-ZK whole-file encrypt above the in-memory threshold rather
 than reading a multi-GB file into the tab. The live behaviour is the live lane.
 """
+import re
 from pathlib import Path
 
 import pytest
@@ -74,25 +75,39 @@ def _refuse_download_closure(js: str) -> str:
     return js[start:js.index("if (state.downloadSink !== 'streaming' && _fsize", start)]
 
 
+# The whole guard, matched as one exact shape rather than as loose substrings. Two substrings pass
+# against a dead guard (`if (false && <substrings>) {`) and against a reversed comparison whenever
+# another line in the slice happens to spell `> MAX_BUFFERED_DOWNLOAD_BYTES` -- which the legacy
+# branch's OWN refusal does. Matching the full `if (...) {` closes both, and the slice below stops
+# before the legacy branch so its refusal cannot stand in for this one.
+_UPLOAD_GUARD = re.compile(
+    r"if \(state\.downloadSink !== 'streaming'\s*"
+    r"&& entry\.file\.size > MAX_BUFFERED_DOWNLOAD_BYTES\) \{")
+
+
 def test_the_v2_zk_upload_refuses_over_threshold_before_encrypting_when_buffered():
     # With the v2 content writer on, a file that could not be DOWNLOADED here must not be created
     # here: when the uploader's context cannot stream (state.downloadSink !== 'streaming'), an
     # over-threshold ZK upload is refused BEFORE any encryption, and a streaming sink is unrestricted.
     js = APPJS.read_text(encoding="utf-8")
-    v2 = _strip_line_comments(_zk_upload_block(js))
-    # The v2 branch only: cut at the legacy writer call. Splitting on the first `} else {` would land
-    # on the guard's OWN inner else, not the branch boundary.
-    v2 = v2[:v2.index("encryptFile(await entry.file.arrayBuffer()")]
-    assert "state.downloadSink !== 'streaming'" in v2
-    assert "entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES" in v2
-    # Refuses BEFORE encryption: the guard's return precedes the writer call, and no encryptBlobV2
-    # call appears before the guard. (mutation: drop the guard -> the strings are gone -> red; move
-    # it below encryptBlobV2 -> the ordering assert reds.)
-    guard_at = v2.index("state.downloadSink !== 'streaming'")
-    return_at = v2.index("return;", guard_at)
+    start = js.index("if (lib.ZK_CONTENT_WRITE_V2) {")
+    # Cut at the legacy branch's OWN comment, BEFORE stripping comments, so the legacy refusal (which
+    # also spells `> MAX_BUFFERED_DOWNLOAD_BYTES`) is not inside the v2 slice and cannot satisfy this
+    # pin for it.
+    end = js.index("// The legacy writer takes the whole plaintext", start)
+    v2 = _strip_line_comments(js[start:end])
+    # Exactly one guard, matched whole: a dead `false &&` guard or a reversed `<` comparison is no
+    # longer this shape, so the count drops to zero. (mutation: `false &&` the guard -> 0 matches ->
+    # red; reverse the comparison to `<` -> 0 matches -> red; drop the guard -> 0 matches -> red.)
+    guards = list(_UPLOAD_GUARD.finditer(v2))
+    assert len(guards) == 1, f"expected exactly one over-threshold guard in the v2 branch, found {len(guards)}"
+    # Refuses BEFORE encryption: the guard's return follows it, and no encryptBlobV2 call precedes it.
+    # (mutation: move the writer above the guard -> the ordering assert reds.)
+    guard_end = guards[0].end()
+    return_at = v2.index("return;", guard_end)
     writer_at = v2.index("encryptBlobV2(")
     assert return_at < writer_at, "the over-threshold refusal must return before encryptBlobV2"
-    assert "encryptBlobV2(" not in v2[:guard_at], "encryption is reached before the refusal guard"
+    assert "encryptBlobV2(" not in v2[:guards[0].start()], "encryption is reached before the refusal guard"
     # A failed/slow policy read leaves the sink unresolved; that case gets its own retry wording
     # rather than blaming the browser.
     assert "state.downloadSink === undefined" in v2
@@ -107,6 +122,10 @@ def test_no_zero_knowledge_refusal_path_names_the_sftp_sync_path():
     # the Standard ending still offers it. (mutation: drop the isZkVault branch -> the ZK arm carries
     # the SFTP tail -> red.)
     closure = _strip_line_comments(_refuse_download_closure(js))
+    # The unresolved-sink branch (policy read failed / not yet landed) gets its own retry wording
+    # instead of blaming the browser, the same as the upload twin. (mutation: delete this branch ->
+    # red.)
+    assert "state.downloadSink === undefined" in closure
     assert "isZkVault(state.currentVault)" in closure
     tail = closure[closure.index("isZkVault(state.currentVault)"):]
     zk_arm = tail[tail.index("?"):tail.index(":")]

@@ -235,8 +235,9 @@ class ECCCryptoLibrary {
         // Files written BEFORE this switch stay in the legacy whole-file format and keep reading
         // unchanged, and a restore of a pre-switch backup is readable for the same reason. Unlike a
         // wrap already minted, content has a way back for anything not yet written: returning this
-        // flag to the legacy form writes new files the old way without stranding any v2 file
-        // already written.
+        // flag to the legacy form writes new files the old way -- which then refuses any file over
+        // the in-memory limit (256 MiB) in the browser, because the whole-file encryptor cannot
+        // stream -- without stranding any v2 file already written.
         this.ZK_CONTENT_WRITE_V2 = true;
 
         // Raw platform exceptions are diagnostics, not user-facing detail. Off in production;
