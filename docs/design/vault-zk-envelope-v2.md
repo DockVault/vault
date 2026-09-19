@@ -699,8 +699,15 @@ Order, as planned: amend the error contract (§6.5) → widen the server's algor
 
 **What actually shipped took the team wraps before content.** The error contract, the algorithm
 filters, the direct wrap and both team wraps are in, and content is now in as well — the reader
-first, then the writer behind its own gate. Every writer is gated off and the canonical algorithm
-label is still generation 1, so nothing in this tree can write a v2 row without a source change.
+first, then the writer behind its own gate. Both writers are now the default and the canonical
+algorithm label is generation 2, so this tree writes v2 content and v2 wraps. The reader ordering
+held: the v2 readers first shipped in v0.11.0 and the minimum supported release is 0.17.0, so every
+supported release reads both formats before any of them is written. What remains is the stale-tab
+exposure, and only for a tab loaded from a bundle older than the v0.11.0 reader; a downgrade to a
+release older than 0.11.0 cannot open zero-knowledge vaults or files written after the change, which
+is why this edge is one-way, requires a typed acknowledgement and a backup. Legacy-format files
+written earlier keep reading; the content side can still return to the legacy form for new files,
+the wrap side cannot, because a v2 wrap locks out any reader older than v0.11.0.
 
 The content writer's gate is a second constant rather than a reuse of the wrap gate, because the
 two protect against different readers. A wrap is read by *other members*, so writing one early

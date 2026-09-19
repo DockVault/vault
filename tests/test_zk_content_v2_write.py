@@ -312,13 +312,75 @@ def test_the_writer_is_registered_with_the_error_boundary():
         f"the boundary lists name(s) that are not methods: {sorted(listed - methods)}")
 
 
-def test_the_writer_is_off_by_default(written):
-    """Readers ship before writers. The gate is the mechanism, so it gets a test.
+def test_the_writer_ships_on_by_default(written):
+    """Readers shipped before this writer; the writer is now the default. The gate is the
+    mechanism, so it gets a test.
 
-    Also asserted against the source text: a build could flip the field after construction and the
-    runtime check alone would not notice.
+    Both the runtime value the constructed library reports and the source text are checked: a build
+    could flip the field after construction and the runtime check alone would not notice, and the
+    source could carry a value the constructor overrides.
     """
-    assert written["checks"]["write_gate_default"] is False
+    assert written["checks"]["write_gate_default"] is True
     source = CRYPTO_JS.read_text(encoding="utf-8")
-    assert "this.ZK_CONTENT_WRITE_V2 = false;" in source
-    assert source.count("ZK_CONTENT_WRITE_V2 = true") == 0
+    assert "this.ZK_CONTENT_WRITE_V2 = true;" in source
+    # Exactly one assignment, and it is the enabled one: no leftover default-off line survives.
+    assert source.count("ZK_CONTENT_WRITE_V2 = true") == 1
+    assert "ZK_CONTENT_WRITE_V2 = false" not in source
+
+
+def test_the_legacy_whole_file_writer_covers_the_flag_off_branch():
+    """The writer ships on and the e2e path now exercises the v2 branch by default, so the legacy
+    whole-file encryptor -- the branch the flag selects when it is OFF -- keeps a behavioural pin.
+
+    Forcing the flag off in a constructed library, the legacy encryptor produces a NON-framed blob
+    (a 12-byte IV, then ciphertext and a GCM tag -- not the DVZ2 content header) that round-trips
+    through the legacy reader. (mutation: make the legacy encryptor emit a framed header -> the
+    header check reds; or point the OFF upload branch at the v2 writer -> the `encryptFile` slice
+    below is not found and this reds.)
+    """
+    node = shutil.which("node")
+    assert node, "Node is required: the browser side of this format must not be skipped"
+    harness = f"""
+const {{ webcrypto }} = require('crypto');
+global.window = {{ crypto: webcrypto }};
+console.error = () => {{}};
+const ECCCryptoLibrary = require({json.dumps(str(CRYPTO_JS))});
+(async () => {{
+  const lib = new ECCCryptoLibrary();
+  lib.ZK_CONTENT_WRITE_V2 = false;                       // force the legacy branch
+  const dek = await webcrypto.subtle.generateKey(
+      {{ name: 'AES-GCM', length: 256 }}, true, ['encrypt', 'decrypt']);
+  const plain = new Uint8Array(4096);
+  for (let i = 0; i < plain.length; i++) plain[i] = (i * 13) & 0xff;
+  const enc = await lib.encryptFile(plain, dek);
+  const bytes = new Uint8Array(enc);
+  const back = new Uint8Array(await lib.decryptFile(enc, dek));
+  let ok = back.length === plain.length;
+  for (let i = 0; ok && i < plain.length; i++) if (back[i] !== plain[i]) ok = false;
+  process.stdout.write(JSON.stringify({{
+    flag_after_force: lib.ZK_CONTENT_WRITE_V2,
+    header4: Array.from(bytes.slice(0, 4)),
+    total_len: bytes.length,
+    roundtrips: ok,
+  }}));
+}})().catch(e => {{ process.stderr.write('HARNESS ' + (e && e.stack || e)); process.exit(1); }});
+"""
+    done = subprocess.run([node, "-e", harness], cwd=str(ROOT),
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    assert out["flag_after_force"] is False
+    # DVZ2 is 0x44 0x56 0x5a 0x32; the legacy blob must not carry the v2 content header.
+    assert out["header4"] != [0x44, 0x56, 0x5a, 0x32], "the legacy writer emitted a v2 content header"
+    # A 12-byte AES-GCM IV + the 4096-byte plaintext + the 16-byte tag; no per-chunk framing.
+    assert out["total_len"] == 12 + 4096 + 16
+    assert out["roundtrips"] is True
+
+    # The flag-OFF upload branch keeps the whole-file read behind the in-memory refusal. The
+    # behavioural 256 MiB refusal runs in the ui/live lane; it is source-pinned here so the legacy
+    # branch is not left uncovered now that the default upload path is v2.
+    app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    off = app[app.index("The legacy writer takes the whole plaintext"):]
+    off = off[:off.index("encryptFile(await entry.file.arrayBuffer()") + 60]
+    assert "entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES" in off
+    assert "too large to encrypt in this browser" in off

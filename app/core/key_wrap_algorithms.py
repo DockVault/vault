@@ -23,9 +23,11 @@ the new DEK. Revocation reports success and does nothing.
 So the widening has to land **before** any writer exists, not alongside it. This module is
 that widening: membership tests, not equality tests, over a vocabulary declared once.
 
-**The canonical constants are what we WRITE; the sets are what we ACCEPT.** New rows keep
-using generation 1 until a v2 writer ships. Turning that on is a one-line change here, and it
-cannot be done in one place and forgotten in another, because there is only one place.
+**The canonical constants are what we WRITE; the sets are what we ACCEPT.** New rows are now
+written with the generation-2 labels, in lockstep with the browser's v2 wrap writer; the sets
+still accept every generation, so rows written by older builds keep reading. This is the one
+place that decides the written label, so the writer flip could not be done here and forgotten
+somewhere else -- and it is paired with the client flag by a test that fails if the two disagree.
 
 **Registering a label into the prune is a claim about epochs, not just a name.** The stale-key
 prune compares `key_version` against a floor chosen per kind. Adding a label to one of these sets
@@ -57,9 +59,9 @@ TEAMPRIV_ALGO_V1 = 'ECDH-P384-AES-GCM-TEAMPRIV'
 # unclassified tripwire silent on an ordinary old deployment.
 DIRECT_DEK_ALGO_LEGACY = 'ECDH-AES-256-GCM'
 
-# --- generation 2: reserved by the v2 envelope grammar, not yet written by anything -----------
-# Declared here ahead of the writer on purpose. The queries below must already accept these on
-# the day the first one appears, because the failure mode of a late widening is silent.
+# --- generation 2: the v2 envelope grammar, and now the labels we write ----------------------
+# Declared here ahead of the writer, and now selected as the canonical write labels below. The
+# queries accept these alongside generation 1, because the failure mode of a late widening is silent.
 DIRECT_DEK_ALGO_V2 = 'ECDH-P384-AES-GCM-DIRECT-V2'
 TEAMPRIV_ALGO_V2 = 'ECDH-P384-AES-GCM-TEAMPRIV-V2'
 
@@ -73,8 +75,8 @@ ALL_KNOWN_ALGOS = DIRECT_DEK_ALGOS | TEAMPRIV_ALGOS
 assert not (DIRECT_DEK_ALGOS & TEAMPRIV_ALGOS), "a label cannot name both kinds of wrap"
 
 # --- what we write ----------------------------------------------------------------------------
-DIRECT_DEK_ALGO = DIRECT_DEK_ALGO_V1
-TEAMPRIV_ALGO = TEAMPRIV_ALGO_V1
+DIRECT_DEK_ALGO = DIRECT_DEK_ALGO_V2
+TEAMPRIV_ALGO = TEAMPRIV_ALGO_V2
 
 
 def is_direct_dek(label) -> bool:

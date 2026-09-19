@@ -73,13 +73,14 @@ const codeOf = async fn => {{
 # The gate
 # =================================================================================================
 
-def test_the_v2_writer_is_off_in_source():
+def test_the_v2_writer_is_on_in_source():
     """Pinned as literal source text, matching how the private-key envelope's gate is pinned.
 
-    A runtime read would pass equally against a build that had flipped it, and a flipped gate does
-    not show up as a failing test -- it shows up as members locked out after somebody rekeys.
+    A runtime read would pass equally against a build that had NOT flipped it. The wrap writer now
+    ships on; the state that matters -- and that a mislabel would betray -- is that this flag and the
+    server's canonical wrap label move together, which `test_key_wrap_algorithm_generations` pins.
     """
-    assert "this.ZK_WRAP_WRITE_V2 = false;" in CRYPTO_JS.read_text(encoding="utf-8")
+    assert "this.ZK_WRAP_WRITE_V2 = true;" in CRYPTO_JS.read_text(encoding="utf-8")
 
 
 def test_the_writer_is_a_new_method_not_a_change_to_the_shared_one():

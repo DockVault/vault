@@ -195,53 +195,43 @@ class ECCCryptoLibrary {
         // shifts every boundary, so crypto chunks and transport chunks never line up anyway.
         this.V2_CONTENT_CHUNK_DEFAULT = 1048576;
 
-        // The v2 WRITER is off by default, same mechanism and same reasoning as the envelope
-        // above -- but the blast radius is larger. That envelope is read only by the account
-        // that wrote it; a DEK wrap is minted by one member's browser and read by others. One
-        // user on a v2-writing build performing one rekey locks out every member still on an
-        // older bundle, and there is no server-side recovery. Readers accept v2 regardless,
-        // which is what makes shipping them first useful.
+        // The v2 WRAP writer, now shipped ON. A DEK wrap is minted by one member's browser and
+        // read by others, so this was the larger commitment of the two writers: once a v2 wrap
+        // exists, a reader from a bundle that predates the v2 wrap reader cannot open the vault,
+        // and the server holds nothing it could re-wrap from. That reader has shipped in every
+        // bundle since long before this switch, and the minimum supported release is newer still,
+        // so every browser that can reach a vault at all already understands v2 -- which is the
+        // whole reason the readers went first.
         //
-        // BEFORE ENABLING THIS, an operator needs all of the following to be true:
-        //   * every browser that will read this deployment's vaults is serving a bundle whose
-        //     reader understands v2 -- the cache-buster in the page's script tags is how you
-        //     force that, and a tab left open since before the upgrade is the case that bites;
-        //   * the server writes the matching algorithm label. It does not yet: the canonical
-        //     write constant in app/core/key_wrap_algorithms.py is still the v1 label, so
-        //     turning this on alone would store v2 bytes under a name that says otherwise.
-        //     That is a second, independent one-line change and it belongs in the same commit.
-        // There is no way back: once a v2 wrap exists, a reader that predates it cannot open
-        // the vault and the server holds nothing it could re-wrap from.
-        this.ZK_WRAP_WRITE_V2 = false;
+        // This is one-way in practice: a rekey on a v2-writing build converts the vault, and a
+        // rollback to a bundle older than the v2 reader would lock members out fleet-wide. The
+        // canonical algorithm label the SERVER stamps has to move in lockstep with this flag, and
+        // does -- the write constant in app/core/key_wrap_algorithms.py is the generation-2 label.
+        // The two are a matched pair (v2 bytes under a v1 label, or the reverse, is a mislabelled
+        // row that a filter would misfile), so they were flipped together in one change and a test
+        // asserts the flag and that label agree.
+        this.ZK_WRAP_WRITE_V2 = true;
 
-        // The v2 CONTENT writer, off by default and for a different reason than the wrap above.
+        // The v2 CONTENT writer, now shipped ON, and one-way only for what it writes.
         //
-        // A wrap is read by other members, so writing one early locks them out. Content is read
-        // by whoever can already open the vault, and every reader that can open a vault at all
-        // has understood this format since the reader shipped -- so the exposure is not other
-        // people, it is other TABS. A tab loaded before the reader shipped, left open, and used
-        // to download a file written by this flag reports the file as damaged.
+        // A wrap is read by other members; content is read by whoever can already open the vault,
+        // and every reader that can open a vault at all has understood this format since the v2
+        // reader shipped -- so the exposure was never other people, only other TABS. A tab loaded
+        // from a bundle that predates the v2 reader, left open, and used to download a file written
+        // here reports the file as damaged: a pre-reader build takes the first twelve bytes as an
+        // IV and the rest as ciphertext, and AES-GCM refuses the tag, so the symptom is an intact
+        // file reported as damaged rather than silent garbage. The v2 reader has been deployed long
+        // enough, and the bundle is served `no-store` so any reload picks it up, that no live tab
+        // predates it in a current deployment. A rollback to an image older than the v2 reader is
+        // the same exposure arriving fleet-wide rather than one tab at a time -- nothing is lost,
+        // and rolling forward reads the files again.
         //
-        // BEFORE ENABLING THIS, an operator needs all of the following to be true:
-        //   * the reader has been deployed long enough that no live tab predates it. That is the
-        //     whole of the condition: the bundle is served `no-store`, so there is no HTTP cache
-        //     to bust and any reload picks the reader up immediately. Bumping the version string
-        //     in the page's script tags does nothing for a tab that is ALREADY open, which is the
-        //     only case that matters here -- an earlier draft of this list said to bump it, which
-        //     would have let someone believe they had mitigated something;
-        //   * the deployment will not be rolled back to an image that predates the reader. It is
-        //     the same exposure as the stale tab and it arrives fleet-wide rather than one tab at
-        //     a time. Nothing is lost either way -- the bytes are intact and rolling forward reads
-        //     them -- but every v2 file reports as damaged until it is;
-        //   * a restore of a backup taken before the switch is still readable, which it is, since
-        //     readers keep the legacy path unchanged.
-        // What a pre-reader build DOES with a v2 file is throw, not misread: it takes the first
-        // twelve bytes as an IV and the rest as ciphertext, and AES-GCM refuses the tag. So the
-        // symptom is an intact file reported as damaged -- the mislabel the content error codes
-        // were added to eliminate -- rather than silent garbage.
-        // Unlike the wrap flag there IS a way back for anything not yet written: turning this off
-        // returns the writer to the legacy form, and files already written in v2 keep reading.
-        this.ZK_CONTENT_WRITE_V2 = false;
+        // Files written BEFORE this switch stay in the legacy whole-file format and keep reading
+        // unchanged, and a restore of a pre-switch backup is readable for the same reason. Unlike
+        // the wrap flag there is still a way back for anything not yet written: returning this flag
+        // to the legacy form writes new files the old way without stranding any v2 file already
+        // written.
+        this.ZK_CONTENT_WRITE_V2 = true;
 
         // Raw platform exceptions are diagnostics, not user-facing detail. Off in production;
         // a source constant rather than anything a deployment can flip at runtime, so turning

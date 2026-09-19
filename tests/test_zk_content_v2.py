@@ -231,34 +231,36 @@ def test_the_reader_is_reachable_only_through_the_documented_seam():
     assert "_v2ContentTranscript(\n            ctx.vaultId" in body or "ctx.vaultId, ctx.objectId" in body
 
 
-def test_the_writer_did_not_ship_in_this_change():
+def test_the_writer_shipped_on_after_its_reader():
     """Readers before writers, and this is the document's own rule.
 
     A file written by a newer build and met by an older one that cannot read it is unrecoverable
     without the server's help, and the server holds nothing it could re-derive. The reader has to be
     in every bundle first.
 
-    It was, and this test used to say so by asserting no writer existed at all. A writer has since
-    shipped, in a later change and behind its own default-off constant, so the assertion that still
-    means something is the gate rather than the absence -- and it is checked here as well as in the
-    writer's own file, because this is where someone comes to ask whether the ordering held.
+    It was, and this test used to assert no writer existed at all, then that the writer was gated
+    off. The writer now ships ON -- the reader has been in every bundle since long before this
+    switch and the minimum supported release is newer still -- so the assertion that still means
+    something is that the gate is the sole condition on the write branch (so the on-path has offline
+    coverage), checked here as well as in the writer's own file because this is where someone comes
+    to ask whether the ordering held.
     """
     src = CRYPTO_JS.read_text(encoding="utf-8")
-    assert "this.ZK_CONTENT_WRITE_V2 = false;" in src, (
-        "the version-2 content writer is not gated off at the source")
+    assert "this.ZK_CONTENT_WRITE_V2 = true;" in src, (
+        "the version-2 content writer is not enabled at the source")
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     # Exactly one place decides whether a file is written in the new format. A second would mean an
-    # upload path that ignores the gate, which is how a writer ships by accident.
+    # upload path that ignores the gate, which is how the two branches drift apart by accident.
     assert app.count("lib.ZK_CONTENT_WRITE_V2") == 1, (
         "the content writer has more than one choke point")
     # And the gate is the WHOLE condition. A count alone is satisfied by `false && lib.GATE`, which
-    # a review mutation confirmed passes every offline test -- fail-safe, but it means the on-path
-    # would have no offline coverage at all and nobody would know.
+    # a review mutation confirmed passes every offline test -- so the branch is guarded by the flag
+    # alone, which is what lets the flag turn the legacy path back on for new files.
     assert "if (lib.ZK_CONTENT_WRITE_V2) {" in app, (
         "the gate is no longer the sole condition on the writer branch")
 
-    # And the existing wrap gate is untouched: its own tests count the choke points.
-    assert "this.ZK_WRAP_WRITE_V2 = false;" in src
+    # And the wrap gate shipped on in the same change: its own tests count the choke points.
+    assert "this.ZK_WRAP_WRITE_V2 = true;" in src
 
 
 def test_the_specification_still_says_what_this_implements():

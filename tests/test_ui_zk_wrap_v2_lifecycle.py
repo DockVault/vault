@@ -8,7 +8,8 @@ turns it on first, as a vault that opens for nobody.
 
 Three properties are load-bearing here and each is easy to lose:
 
-  * **Legacy reads first.** The vault is created and shared BEFORE the gate is flipped. A format
+  * **Legacy reads first.** With the writer now on by default, the owner's page turns it OFF and
+    creates the vault before re-enabling, so a pre-switch legacy wrap exists to read. A format
     change that stranded existing members would otherwise look like a pass, because every wrap in
     the test would be new.
   * **The stored bytes are checked.** A lifecycle that "works" proves nothing if the gate never
@@ -18,11 +19,11 @@ Three properties are load-bearing here and each is easy to lose:
     with the wrong vault, recipient or epoch is well formed, is stored happily, and fails only
     when someone tries to open it.
 
-The gate is turned on per page, in the page, exactly as the content format's live test does. A test
-that edited the source constant would prove the format works and prove nothing about the gate. One
-flag drives all three wrap constructions -- direct, team DEK, team private key -- so enabling it
-for the direct sites enables the others too; there is no per-purpose gate, and adding one would
-edit a file a parallel workstream holds.
+The gate is driven per page, in the page, exactly as the content format's live test does -- off to
+arrange the pre-switch legacy wrap, then on for the v2 one. A test that edited the source constant
+would prove the format works and prove nothing about the gate. One flag drives all three wrap
+constructions -- direct, team DEK, team private key -- so it moves them together; there is no
+per-purpose gate.
 
 Deliberately NOT in test_ui_e2e.py: user creation there is being changed by that workstream, and
 this file has no reason to collide with it.
@@ -43,6 +44,16 @@ pytestmark = pytest.mark.ui
 ENABLE_V2_WRAPS = """() => {
     const lib = eccLib();
     lib.ZK_WRAP_WRITE_V2 = true;
+    return lib.ZK_WRAP_WRITE_V2;
+}"""
+
+# The wrap writer now ships ON, so a legacy wrap -- the state every pre-switch deployment is in --
+# only exists if a page turns the writer OFF before it creates one. These tests do that on the
+# owner's page before the pre-switch vault, then re-enable, so "legacy first" is an arranged fact
+# rather than an accident of where the flip happens to sit.
+DISABLE_V2_WRAPS = """() => {
+    const lib = eccLib();
+    lib.ZK_WRAP_WRITE_V2 = false;
     return lib.ZK_WRAP_WRITE_V2;
 }"""
 
@@ -171,6 +182,9 @@ def test_a_share_written_by_the_version_2_writer_opens_for_its_recipient(browser
     member_page = member_ctx.new_page()
     try:
         _login(owner_page, owner_user["_username"], owner_user["_password"])
+        # Writer OFF on this page first, so the owner's creation wrap is the legacy form every
+        # pre-switch deployment holds. Re-enabled below, before the share.
+        assert owner_page.evaluate(DISABLE_V2_WRAPS) is False
         owner_vid = _create_zk_vault_via_ui(owner_page, owner, "passphrase-owner-123")
         _open_vault(owner_page, owner_vid)
         owner_page.set_input_files("#file-upload-input", files=[
@@ -241,6 +255,9 @@ def test_a_revocation_rewraps_the_survivors_under_version_2_at_the_new_epoch(bro
     leaver_page = leaver_ctx.new_page()
     try:
         _login(owner_page, owner_user["_username"], owner_user["_password"])
+        # Writer OFF on this page first, so the share below writes the legacy wrap the rotation will
+        # replace. Re-enabled before the revoke.
+        assert owner_page.evaluate(DISABLE_V2_WRAPS) is False
         owner_vid = _create_zk_vault_via_ui(owner_page, owner, "passphrase-owner-456")
         _open_vault(owner_page, owner_vid)
         owner_page.set_input_files("#file-upload-input", files=[
@@ -342,10 +359,11 @@ def test_a_revocation_rewraps_the_survivors_under_version_2_at_the_new_epoch(bro
 
 @pytest.mark.ui
 def test_a_version_2_wrap_still_opens_in_a_page_that_never_enabled_the_writer(browser, admin):
-    """A staged rollout means readers run with the gate off. That is every other page.
+    """A wrap written on one page has to be readable by a fresh page at the shipped default.
 
-    A wrap written by an enabled writer has to be readable by a page at the shipped default -- and
-    the gate is per page, so a single-context test cannot see this at all.
+    The writer now ships on, so the fresh page reads at that default rather than with the gate off;
+    the reader is what this proves, and the gate is per page, so a single-context test cannot see
+    this at all.
     """
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     owner_user = admin.create_user(role="admin")
@@ -362,6 +380,9 @@ def test_a_version_2_wrap_still_opens_in_a_page_that_never_enabled_the_writer(br
     member_page = member_ctx.new_page()
     try:
         _login(owner_page, owner_user["_username"], owner_user["_password"])
+        # Writer OFF on this page first, so the owner's creation wrap is legacy; re-enabled before
+        # the share so the member receives a v2 wrap the fresh default page then reads.
+        assert owner_page.evaluate(DISABLE_V2_WRAPS) is False
         owner_vid = _create_zk_vault_via_ui(owner_page, owner, "passphrase-owner-789")
         _open_vault(owner_page, owner_vid)
         owner_page.set_input_files("#file-upload-input", files=[
@@ -387,12 +408,14 @@ def test_a_version_2_wrap_still_opens_in_a_page_that_never_enabled_the_writer(br
         _assert_v2_direct(base64.b64decode(keys["wrapped_dek"]), "the member's v2 wrap")
         member_ctx.close()
 
-        # A completely fresh context: new page, new login, gate at its shipped default.
+        # A completely fresh context: new page, new login, writer at its shipped default (now on).
+        # The point is the READER: this page never manually enabled the writer -- it runs the
+        # default -- and still opens a v2 wrap written elsewhere.
         fresh_ctx = browser.new_context(base_url=BASE_URL)
         fresh = fresh_ctx.new_page()
         _login(fresh, member_user["_username"], member_user["_password"])
-        assert fresh.evaluate("() => eccLib().ZK_WRAP_WRITE_V2") is False, (
-            "the gate leaked into a new context, so this test would prove nothing")
+        assert fresh.evaluate("() => eccLib().ZK_WRAP_WRITE_V2") is True, (
+            "a fresh page is not at the shipped-on default, so this no longer tests the default path")
 
         # Opening a zero-knowledge vault in a locked page asks for the passphrase first. The
         # vault list renders before that, so the prompt arrives on the open, not on the login.

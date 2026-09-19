@@ -1106,13 +1106,17 @@ def test_zk_content_v2_survives_a_real_upload_and_download(page: Page, admin):
                 page.wait_for_timeout(500)
             raise AssertionError(f"only {len(rows)} file(s) landed, expected {count}")
 
+        # The writer ships ON, so to keep a legacy-format file to read beside a v2 one, turn it OFF
+        # on this page before the first upload. Editing the source constant would prove the format
+        # works and prove nothing about the gate; flipping it in the page is what the gate does.
+        page.evaluate("() => { eccLib().ZK_CONTENT_WRITE_V2 = false; }")
         legacy_name = _u("legacy") + ".txt"
-        legacy_body = b"written before the writer was switched on\n" * 40
+        legacy_body = b"written with the writer turned off for this page\n" * 40
         page.set_input_files("#file-upload-input", files=[
             {"name": legacy_name, "mimeType": "text/plain", "buffer": legacy_body}])
         _wait_for_files(1)
 
-        # Switch the writer on for this page only. A source constant is the ship-time control; a
+        # Switch the writer back on for this page. A source constant is the ship-time control; a
         # test that edited the source would prove the format works and prove nothing about the gate.
         page.evaluate("""() => {
             const lib = eccLib();

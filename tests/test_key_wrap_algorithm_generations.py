@@ -14,10 +14,12 @@ The second is the one that keeps me up: revocation returns 200 and the removed m
 read every new file, because their retained team private key unwraps a DEK wrapped to a team
 public key nobody rotated.
 
-The unit tests below pin the vocabulary and guard the *shape* of every query. The integration
-tests prove the two failures above are actually closed, by writing a next-generation label
-directly into the database -- which is the only way to produce one, because no writer exists yet.
-That is the entire point of doing this before one does.
+The unit tests below pin the vocabulary and guard the *shape* of every query, and pin that the
+canonical write label and the client's v2 wrap-writer flag move together -- a mislabel is exactly
+the failure this control exists to prevent. The integration tests prove the two failures above are
+actually closed, by writing a chosen-generation label directly into the database, which stays the
+cleanest way to exercise the prune against a specific generation regardless of what the writer
+currently emits. The widening landed before the writer, which is why the filters were ready for it.
 """
 
 import os
@@ -32,9 +34,11 @@ from conftest import unique, ensure_ecc_keypair
 from app.core.key_wrap_algorithms import (
     DIRECT_DEK_ALGO,
     DIRECT_DEK_ALGO_LEGACY,
+    DIRECT_DEK_ALGO_V1,
     DIRECT_DEK_ALGO_V2,
     DIRECT_DEK_ALGOS,
     TEAMPRIV_ALGO,
+    TEAMPRIV_ALGO_V1,
     TEAMPRIV_ALGO_V2,
     TEAMPRIV_ALGOS,
     classify,
@@ -42,6 +46,7 @@ from app.core.key_wrap_algorithms import (
 
 _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 _APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
+_CRYPTO_JS = os.path.join(os.path.dirname(_APP), "static", "js", "ecc_crypto.js")
 
 
 # =================================================================================================
@@ -110,10 +115,54 @@ def test_registering_a_label_is_a_claim_about_epochs_not_just_a_name():
     """
     assert DIRECT_DEK_ALGO_V2 in DIRECT_DEK_ALGOS
     assert TEAMPRIV_ALGO_V2 in TEAMPRIV_ALGOS
-    # Nothing writes them yet: the canonical write constants are still generation 1. If that ever
-    # stops being true, the v2 grammar has shipped and this test should be revisited with it.
-    assert DIRECT_DEK_ALGO != DIRECT_DEK_ALGO_V2
-    assert TEAMPRIV_ALGO != TEAMPRIV_ALGO_V2
+    # The canonical write constants are now generation 2: the v2 grammar ships as the default writer.
+    # Both generations stay in the accept-sets so rows written by older builds keep reading.
+    assert DIRECT_DEK_ALGO == DIRECT_DEK_ALGO_V2
+    assert TEAMPRIV_ALGO == TEAMPRIV_ALGO_V2
+
+
+def _wrap_writer_flag_on() -> bool:
+    """The client's version-2 WRAP-writer flag, read from the shipped browser source.
+
+    Parsed rather than imported because it lives in a browser module. The value the browser ships
+    is the one that has to agree with the label the server stamps.
+    """
+    with open(_CRYPTO_JS, encoding="utf-8") as fh:
+        src = fh.read()
+    m = re.search(r"this\.ZK_WRAP_WRITE_V2\s*=\s*(true|false)\s*;", src)
+    assert m, "could not find the ZK_WRAP_WRITE_V2 assignment in ecc_crypto.js"
+    return m.group(1) == "true"
+
+
+@pytest.mark.unit
+def test_the_wrap_writer_flag_and_the_canonical_label_agree():
+    """A v2 wrap must never be stamped with a v1 label, nor a v1 wrap with a v2 label.
+
+    The client flag decides which wrap FORMAT the browser writes; the server's canonical
+    ``DIRECT_DEK_ALGO`` / ``TEAMPRIV_ALGO`` decide the LABEL every new row is stamped with. They are
+    one switch spread over two files, and either half alone is a lie the row carries forever: the
+    flag on with a v1 label stores v2 bytes under a name that says v1, and a filter keyed on the
+    label then misfiles the row -- the prune and ``_team_rotation_owed`` failures this whole module
+    exists to prevent. So the two are pinned to move together, in the same change.
+
+    (mutation: set ``ZK_WRAP_WRITE_V2`` back to false without reverting the label, or revert the
+    canonical label to generation 1 without the flag -> this reds.)
+    """
+    flag_on = _wrap_writer_flag_on()
+    label_is_v2 = (DIRECT_DEK_ALGO == DIRECT_DEK_ALGO_V2
+                   and TEAMPRIV_ALGO == TEAMPRIV_ALGO_V2)
+    label_is_v1 = (DIRECT_DEK_ALGO == DIRECT_DEK_ALGO_V1
+                   and TEAMPRIV_ALGO == TEAMPRIV_ALGO_V1)
+    # One generation is selected for writing, never a mix -- a v2 direct label beside a v1 team
+    # label would get one kind right and mislabel the other.
+    assert label_is_v2 or label_is_v1, (
+        f"the canonical write labels are a mixed generation: direct={DIRECT_DEK_ALGO!r}, "
+        f"team={TEAMPRIV_ALGO!r}")
+    assert flag_on == label_is_v2, (
+        "the client v2 wrap-writer flag and the server's canonical wrap label disagree: "
+        f"ZK_WRAP_WRITE_V2={flag_on}, canonical label is generation "
+        f"{'2' if label_is_v2 else '1'} -- a wrap would be written in one format and stamped with "
+        "the other")
 
 
 # =================================================================================================
