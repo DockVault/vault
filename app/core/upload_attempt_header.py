@@ -28,16 +28,23 @@ _TOKEN = slice(12, 28)
 def header_token_mismatch(head: bytes, declared_blob_id) -> bool:
     """True when ``head`` opens a version-2 content file whose token is NOT ``declared_blob_id``.
 
-    ``head`` is the first bytes of transport chunk 0 (up to 28). A body that does not start with
-    the version-2 content prefix is some other format and is left alone. One that DOES start with
-    it but is too short to carry the whole header is refused too: the writer always sends the
-    header in one piece at the front of chunk 0, so a split header is not a shape to be lenient
-    about -- leniency there would be the way around the comparison.
+    ``head`` is the first bytes of transport chunk 0 (up to 28). A session that declared a token
+    must deliver a chunk 0 of at least 28 bytes, WHATEVER it starts with: a first chunk of one to
+    five bytes cannot even be told apart from "some other format", and the rest of the header would
+    then ride in chunk 1, which is never looked at -- on disk the first 28 bytes would be a valid
+    header carrying a token the session never declared. Both real writers clear that bar: the
+    smallest version-2 file is 56 bytes, and the smallest legacy body is a 12-byte nonce plus a
+    16-byte tag, exactly 28.
+
+    Past that, a body that does not start with the version-2 content prefix is some other format
+    and is left alone (the legacy format opens with a random nonce).
     """
-    if not declared_blob_id or head[:len(V2_CONTENT_PREFIX)] != V2_CONTENT_PREFIX:
+    if not declared_blob_id:
         return False
     if len(head) < V2_CONTENT_HEADER_BYTES:
         return True
+    if head[:len(V2_CONTENT_PREFIX)] != V2_CONTENT_PREFIX:
+        return False
     try:
         declared = bytes.fromhex(declared_blob_id)
     except (TypeError, ValueError):

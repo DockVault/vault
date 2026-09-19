@@ -68,11 +68,19 @@ def test_the_header_is_28_bytes_with_the_token_last():
     (HEADER[:27] + b"\x00", DECLARED, True),                    # last token byte differs
     (HEADER[:20], DECLARED, True),                              # v2 prefix but a split/short header
     (HEADER[:6], DECLARED, True),
-    (b"\x8a" * 28, DECLARED, False),                            # legacy whole-file format: a random IV
+    (b"\x8a" * 28, DECLARED, False),                            # the SMALLEST legacy body (12-byte nonce +
+                                                                # 16-byte tag) is exactly 28: still accepted
+    (b"\x8a" * 4096, DECLARED, False),                          # legacy whole-file format: a random nonce
     (b"DVZ2\x02\x01" + b"\x00" * 22, DECLARED, False),          # another v2 purpose (a wrap), not content
     (b"DVZ1\x02\x04" + b"\x00" * 22, DECLARED, False),
-    (b"", DECLARED, False),
+    # A declared token needs a chunk 0 of at least 28 bytes WHATEVER it starts with: five bytes
+    # cannot even be told from "some other format", and the header would ride in chunk 1 unseen.
+    (b"DVZ2\x02", DECLARED, True),
+    (b"\x8a" * 5, DECLARED, True),
+    (b"\x8a" * 27, DECLARED, True),
+    (b"", DECLARED, True),
     (HEADER, None, False),                                      # a Standard session declares no token
+    (b"ab", None, False),                                       # ...and may send a chunk 0 of any size
     (HEADER, "", False),
     (HEADER, "not-hex", True),                                  # unparseable declaration: refuse
 ])
