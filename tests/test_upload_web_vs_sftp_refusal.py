@@ -132,3 +132,32 @@ def test_no_zero_knowledge_refusal_path_names_the_sftp_sync_path():
     std_arm = tail[tail.index(":"):tail.index("showError", tail.index(":"))]
     assert "SFTP" not in zk_arm, "the zero-knowledge download refusal names SFTP"
     assert "SFTP" in std_arm, "the Standard download refusal no longer offers the SFTP path"
+
+
+def test_the_buffered_download_threshold_is_one_declaration_pinned_to_256_mib():
+    # One number governs every bounded-memory refusal: the v2 upload guard, the download pre-fetch
+    # refusal, the two post-streaming-failure refusals, the final backstop and the legacy encrypt
+    # refusal all read MAX_BUFFERED_DOWNLOAD_BYTES. Raising it reopens uploads-that-cannot-be-
+    # downloaded and lets a buffered download pull gigabytes into the tab, and no other test notices.
+    code = _strip_line_comments(APPJS.read_text(encoding="utf-8"))
+    # Exactly one declaration -- a second, shadowing one inside a function could feed the guards a
+    # different value. (mutation: add a shadow `const MAX_BUFFERED_DOWNLOAD_BYTES = ...` inside
+    # _downloadFile -> count 2 -> red.)
+    assert code.count("const MAX_BUFFERED_DOWNLOAD_BYTES") == 1, "shadow threshold declaration"
+    # And its exact value, up to the semicolon so a trailing-comment edit cannot red it.
+    # (mutation: multiply the value by 1024 -> the `* 1024;` breaks this substring -> red.)
+    assert "const MAX_BUFFERED_DOWNLOAD_BYTES = 256 * 1024 * 1024;" in code
+
+
+def test_the_state_literal_does_not_initialise_the_download_sink():
+    # state.downloadSink is written once, by the boot policy read; leaving it uninitialised is what
+    # makes a failed or not-yet-completed read fail CLOSED -- undefined !== 'streaming', so every
+    # bounded-memory guard refuses until the real policy lands. An initialised default of 'streaming'
+    # would fail OPEN: the guards would pass before the policy is known. The object-literal form
+    # `downloadSink:` occurs nowhere today (the one write is `state.downloadSink = ...`, and the
+    # server field is snake_case), so its absence is the pin. (mutation: add `downloadSink:
+    # 'streaming',` to the state literal -> red.)
+    code = _strip_line_comments(APPJS.read_text(encoding="utf-8"))
+    assert "downloadSink:" not in code, (
+        "the download sink is initialised as an object-literal field; a default defeats the "
+        "fail-closed guard")
