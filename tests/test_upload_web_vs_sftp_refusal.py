@@ -186,25 +186,64 @@ process.stdout.write(JSON.stringify(cases));
 
 
 def test_a_refused_entry_and_its_destructive_steps_are_dropped_before_the_enqueue():
-    # The refusal record is enacted ONCE, after the seal loop and before the single enqueue: the
-    # refused entries leave toUpload, and their destructive steps leave toDelete (a refused overwrite
-    # must not delete the original it cannot replace) and the deferred cancel set (a refused
-    # replacement must not cancel the in-flight upload it cannot replace). Order: filter -> cancels
-    # -> deletes -> enqueue, so nothing destructive runs before the batch is sealed-and-filtered and
-    # the enqueue is last.
+    # The refusal record is enacted ONCE, after the seal loop and before the single enqueue, keyed by
+    # ENTRY IDENTITY: refused entries leave toUpload, their overwrite deletes leave toDelete, and
+    # their in-flight cancels are pruned from cancelVictims. Order: filter -> cancels -> deletes ->
+    # enqueue, so nothing destructive runs before the batch is sealed-and-filtered and the enqueue is
+    # last.
     code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
     assert "toUpload = toUpload.filter(e => !refused.has(e))" in code, "refused entries are not removed from the batch"
-    assert "toDelete = toDelete.filter(t => !_refusedNames.has(t.name))" in code, "a refused overwrite's delete is not dropped"
-    assert "toCancelInFlight.delete(_n)" in code, "a refused replacement's in-flight cancel is not dropped"
+    assert "toDelete = toDelete.filter(t => !refused.has(t.entry))" in code, "a refused overwrite's delete is not dropped by entry"
+    assert "cancelVictims.filter(v => !refused.has(v.entry))" in code, "a refused replacement's in-flight cancel is not pruned by entry"
     seal_loop = code[code.index("for (const entry of toUpload)"):
                      code.index("toUpload = toUpload.filter(e => !refused.has(e))")]
     assert ".splice(" not in seal_loop, "the seal loop splices the array it is walking"
     filter_at = code.index("toUpload = toUpload.filter(e => !refused.has(e))")
-    cancel_at = code.index("uploadManager.cancel(vid)")
+    cancel_at = code.index("uploadManager.cancel(v.itemId)")
     delete_at = code.index("/files/${target.id}/delete")
     enqueue_at = code.index("uploadManager.enqueueNamed(toUpload)")
     assert filter_at < cancel_at < delete_at < enqueue_at, (
         "destructive steps must run after the refusal filter and before the single enqueue")
+
+
+def test_destructive_steps_are_keyed_by_entry_identity_not_name():
+    # One drop can carry two files of the same name (both take the overwrite branch over one committed
+    # original). Keying the refusal / stuck filters by NAME would drop both originals' steps while a
+    # replacement still uploaded -- two rows under one name in a vault whose names the server cannot
+    # see. Every destructive record carries its ENTRY and is filtered by identity.
+    # (mutation: filter toDelete or the stuck set by `.name` -> red.)
+    code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
+    assert "toDelete.push({ id, name: file.name, entry })" in code, "the overwrite delete is not tied to its entry"
+    assert "toCancelReq.push({ name: file.name, entry })" in code, "the in-flight cancel request is not tied to its entry"
+    assert "toDelete = toDelete.filter(t => !refused.has(t.entry))" in code
+    # The failed-delete 'stuck' set drops replacements by ENTRY too, not by name.
+    assert "new Set(survived.map(t => t.entry))" in code, "the failed-delete stuck set is keyed by name, not entry"
+    assert "toUpload.filter(e => !stuck.has(e))" in code
+
+
+def test_in_flight_cancel_victims_are_resolved_before_sealing():
+    # RACE (a): sealing is async, so a second drop of the same name can enqueue a NEW live item while
+    # we seal. Resolving victims to item IDS (stable identities) happens BEFORE the seal loop; only
+    # the cancel CALLS are deferred. A name-matched scan run after the loop would cancel that
+    # bystander. (mutation: move the cancelVictims scan below the seal loop -> red.)
+    code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
+    scan_at = code.index("cancelVictims.push({ itemId: it.id")
+    seal_at = code.index("for (const entry of toUpload)")
+    call_at = code.index("uploadManager.cancel(v.itemId)")
+    assert scan_at < seal_at, "the in-flight victim scan must resolve item ids before the seal loop"
+    assert seal_at < call_at, "the cancel calls must be deferred until after sealing"
+
+
+def test_a_victim_that_completed_during_sealing_drops_its_replacement():
+    # RACE (b): a victim that finished while we sealed can no longer be cancelled without deleting a
+    # file that already landed. Treat it like a failed overwrite delete -- drop that replacement so
+    # both copies do not land. (mutation: drop the stuck handling -> a completed victim's replacement
+    # stays in the batch -> red.)
+    code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
+    assert "if (!it || !_pendingUpload(it)) { cancelStuck.add(v.entry); continue; }" in code, (
+        "a no-longer-pending victim is not detected")
+    assert "catch (_) { cancelStuck.add(v.entry); }" in code, "a failed cancel is not treated as stuck"
+    assert "toUpload = toUpload.filter(e => !cancelStuck.has(e))" in code, "stuck replacements are not dropped from the batch"
 
 
 def test_no_zero_knowledge_refusal_path_names_the_sftp_sync_path():

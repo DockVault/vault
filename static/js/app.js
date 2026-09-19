@@ -16543,7 +16543,7 @@ async function uploadFiles(files) {
     // carries the plaintext name the user chose, so this also covers zero-knowledge vaults, where
     // the server never sees the name. An in-flight name has no committed id to delete: choosing
     // "replace" for one cancels that in-flight upload and uploads the new file in its place (see
-    // toCancelInFlight below), rather than pushing a second copy that would race the first.
+    // toCancelReq below), rather than pushing a second copy that would race the first.
     //
     // Only NOT-YET-COMMITTED statuses count. A finished ('done') upload has already refreshed the
     // file list (loadVaultFiles runs on completion), so its name is in state.currentFiles if it is
@@ -16557,8 +16557,8 @@ async function uploadFiles(files) {
         if (it.fileName) existing.add(it.fileName);
     }
     let toUpload = [];   // {file, name}
-    let toDelete = [];   // existing file ids to remove (overwrite) -- filtered below if a refusal drops one
-    const toCancelInFlight = new Set();   // in-flight upload names to cancel (DEFERRED until the batch is ready)
+    let toDelete = [];   // {id, name, entry} originals to remove (overwrite) -- keyed by ENTRY for the filters
+    const toCancelReq = [];   // {name, entry} in-flight uploads the user chose to replace (victims resolved below)
     const refused = new Set();   // entries refused per-file (over-threshold in a non-streaming context)
     let blanket = null;    // {action} once "apply to all" is chosen
 
@@ -16577,17 +16577,21 @@ async function uploadFiles(files) {
         if (choice.action === 'skip') continue;
         if (choice.action === 'overwrite') {
             const id = idByName.get(file.name);
-            // The name travels with the id: if the delete fails, the replacement that would have
-            // taken this name has to be dropped, and it is identified by name rather than id.
+            // Tie each destructive record to THIS entry object, not just its name: one drop can
+            // carry two files of the same name (both reach the overwrite branch over one committed
+            // original), and a per-NAME filter on a later refusal or a failed delete would drop both
+            // originals' steps while a replacement still uploaded -- two rows under one name in a
+            // vault whose names the server cannot see. Identity is what the toUpload filter uses.
+            const entry = { file, name: file.name };
+            toUpload.push(entry);
             if (id) {
-                toDelete.push({ id, name: file.name });
+                toDelete.push({ id, name: file.name, entry });
             } else {
                 // No committed row -- the name is held by an upload still IN FLIGHT. "Replace"
                 // means replace THAT upload: cancel it (below) before enqueuing this one, so a
                 // second copy of the same name can't race it and both land.
-                toCancelInFlight.add(file.name);
+                toCancelReq.push({ name: file.name, entry });
             }
-            toUpload.push({ file, name: file.name });
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
             name = uniqueUploadName(name, existing);
@@ -16596,9 +16600,21 @@ async function uploadFiles(files) {
         }
     }
 
-    // In-flight uploads the user chose to replace are cancelled LATER, deferred until the batch is
-    // sealed and the refusal record has pruned the cancel set (see below, before the enqueue), so a
-    // refusal cannot cancel an upload whose replacement never enqueues.
+    // Resolve the in-flight victims to cancel NOW, by identity, before any async sealing runs: a
+    // second drop of the same name while we seal would enqueue a NEW live item, and a name-matched
+    // scan run later would cancel that bystander the user never chose to replace. Item ids are
+    // stable identities; names are not. Only the cancel CALLS are deferred (below, before the
+    // enqueue), so a refusal can still prune a victim before it is cancelled.
+    const cancelVictims = [];   // {itemId, entry}
+    if (toCancelReq.length) {
+        for (const it of uploadManager.items.values()) {
+            if (it.vaultId !== state.currentVault.id) continue;
+            if ((it.folderId || null) !== _curFolder) continue;
+            if (!_pendingUpload(it)) continue;
+            const req = toCancelReq.find(r => r.name === it.fileName);
+            if (req) cancelVictims.push({ itemId: it.id, entry: req.entry });
+        }
+    }
 
     if (toUpload.length) {
         // Zero-knowledge vault: encrypt each file in the browser BEFORE it enters
@@ -16715,33 +16731,37 @@ async function uploadFiles(files) {
         }
 
         // Per-entry refusal recorded refusals during the loop (it never touched the walked array).
-        // Enact them ONCE now, before anything destructive runs: drop the refused entries from the
-        // batch, and drop the destructive steps that belong to them -- a refused overwrite must not
-        // delete the original it cannot replace, and a refused replacement must not cancel the
-        // in-flight upload it cannot replace (a fresh same-page upload of that name is still in
-        // flight, and cancelling it for a replacement that never comes loses that work in progress
-        // and its local ciphertext).
+        // Enact them ONCE now, before anything destructive runs, keyed by ENTRY IDENTITY so two
+        // same-named files don't share a fate: drop the refused entries from the batch, and drop the
+        // destructive steps that belong to them -- a refused overwrite must not delete the original
+        // it cannot replace, and a refused replacement must not cancel the in-flight upload it cannot
+        // replace (a fresh same-page upload of that name is still in flight, and cancelling it for a
+        // replacement that never comes loses that work in progress and its local ciphertext). The
+        // cancel victims are pruned by the same record just before the cancel calls.
         if (refused.size) {
-            const _refusedNames = new Set([...refused].map(e => e.name));
             toUpload = toUpload.filter(e => !refused.has(e));
-            toDelete = toDelete.filter(t => !_refusedNames.has(t.name));
-            for (const _n of _refusedNames) toCancelInFlight.delete(_n);
+            toDelete = toDelete.filter(t => !refused.has(t.entry));
         }
 
-        // Cancel any in-flight uploads the user chose to REPLACE -- DEFERRED to here, after every
-        // kept entry is sealed and the refusal record has pruned the set, but still BEFORE the
-        // enqueue so a name's old and new copies can't both finish. Re-scanned (the modal ran async)
-        // and matched by vault + folder + name; cancel() deletes the server session so the
-        // replacement uploads cleanly.
-        if (toCancelInFlight.size) {
-            const victims = [];
-            for (const it of uploadManager.items.values()) {
-                if (it.vaultId !== state.currentVault.id) continue;
-                if ((it.folderId || null) !== _curFolder) continue;
-                if (!_pendingUpload(it)) continue;
-                if (toCancelInFlight.has(it.fileName)) victims.push(it.id);
+        // Cancel the in-flight victims resolved earlier -- the CALLS are deferred to here (after
+        // sealing, and after the refusal record has pruned them) but still BEFORE the enqueue, so a
+        // name's old and new copies can't both finish. A victim that COMPLETED while we sealed can
+        // no longer be cancelled without deleting a file that already landed; treat it like a failed
+        // overwrite delete -- drop that replacement and say so, rather than let both copies land.
+        const _victims = cancelVictims.filter(v => !refused.has(v.entry));
+        if (_victims.length) {
+            const cancelStuck = new Set();
+            for (const v of _victims) {
+                const it = uploadManager.items.get(v.itemId);
+                if (!it || !_pendingUpload(it)) { cancelStuck.add(v.entry); continue; }
+                try { await uploadManager.cancel(v.itemId); } catch (_) { cancelStuck.add(v.entry); }
             }
-            for (const vid of victims) { try { await uploadManager.cancel(vid); } catch (_) { /* best effort */ } }
+            if (cancelStuck.size) {
+                toUpload = toUpload.filter(e => !cancelStuck.has(e));
+                showError(`Could not replace ${cancelStuck.size} in-flight upload`
+                          + `${cancelStuck.size === 1 ? '' : 's'} that finished first; `
+                          + `${cancelStuck.size === 1 ? 'it was' : 'they were'} left as uploaded.`);
+            }
         }
 
         // The originals go LAST, and only for replacements that are ready to send.
@@ -16769,8 +16789,8 @@ async function uploadFiles(files) {
                 // The original is still there, so uploading its replacement under the same name
                 // would either be refused or produce a duplicate. Better to say so and change
                 // nothing than to guess: the user still has their file.
-                const stuck = new Set(survived.map(t => t.name));
-                toUpload = toUpload.filter(e => !stuck.has(e.name));
+                const stuck = new Set(survived.map(t => t.entry));
+                toUpload = toUpload.filter(e => !stuck.has(e));
                 showError(`Could not replace ${survived.length} existing file`
                           + `${survived.length === 1 ? '' : 's'}; `
                           + `the original${survived.length === 1 ? '' : 's'} are unchanged.`);
