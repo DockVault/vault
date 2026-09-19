@@ -19,7 +19,7 @@ import uuid
 
 import pytest
 
-from conftest import unique, ensure_ecc_keypair, ZK_ENC_NAME_STUB
+from conftest import unique, ensure_ecc_keypair, ZK_ENC_NAME_STUB, require_zk_first_chunk
 
 
 def _init(admin, vault_id, **extra):
@@ -82,6 +82,9 @@ def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1, resume=
         body["file_id"] = str(file_id)
     token = uuid.uuid4().hex if blob_id is _UNSET else blob_id
     if token is not None:
+        # Declaring a token is what makes the server hold the first chunk to 28 bytes, so the site
+        # that declares it vouches for the body this module sends.
+        require_zk_first_chunk(_ZK_BODY)
         body["blob_id"] = token
     if resume is not None:
         # Resuming is asked for now: without naming a session the server opens a new one, because
@@ -278,6 +281,7 @@ def test_an_encrypted_upload_is_protected_too(admin):
 
     try:
         declared = uuid.uuid4()
+        require_zk_first_chunk(_ZK_BODY)   # this session declares an attempt token
         r = admin.post(f"/vaults/{vid}/uploads", json={
             "total_size": len(_ZK_BODY), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
             "enc_name": "zk2:" + base64.b64encode(b"sealed-name").decode(),
@@ -434,8 +438,10 @@ def test_a_short_delivery_is_refused_instead_of_stored(admin, zk_vault):
 
     # One chunk, short of the bytes the session declared -- but still long enough to be a first
     # chunk at all, so what is refused is the SHORT DELIVERY at commit, not the chunk on arrival.
+    short = _ZK_BODY[:30]
+    require_zk_first_chunk(short)
     assert admin.put(f"/vaults/{zk_vault}/uploads/{sid}/chunks/0",
-                     data=_ZK_BODY[:30]).status_code in (200, 201)
+                     data=short).status_code in (200, 201)
 
     done = admin.post(f"/vaults/{zk_vault}/uploads/{sid}/complete",
                       json={"file_id": str(declared)})

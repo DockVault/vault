@@ -82,17 +82,82 @@ def test_no_call_site_fabricates_a_first_chunk_the_server_would_refuse():
         "session that declared an attempt token):\n  " + "\n  ".join(short))
 
 
-def test_every_helper_refuses_a_short_body_at_the_call_site():
-    # The run-time half, pinned on the source: each helper checks the body BEFORE it opens a
-    # session, so a short fabrication fails where it was written, with the reason, in any lane.
-    conftest = (TESTS / "conftest.py").read_text(encoding="utf-8")
-    assert "ZK_MIN_FIRST_CHUNK = 28" in conftest
-    shared = conftest[conftest.index("def zk_chunked_upload("):]
-    assert shared.index("require_zk_first_chunk(content[:chunk_size])") < shared.index('client.post(f"/vaults/')
-    for file, helper in (("test_zk_dek_rotation.py", "_zk_chunked_upload"),
-                         ("test_api_zk_vault.py", "_zk_pw_upload"),
-                         ("test_zk_name_index_dual_read.py", "_upload_named")):
-        src = (TESTS / file).read_text(encoding="utf-8")
-        body = src[src.index(f"def {helper}("):]
-        body = body[:body.index("\ndef ", 1)] if "\ndef " in body[1:] else body
-        assert "require_zk_first_chunk(content)" in body, f"{file}: {helper} does not check its body"
+GUARD = "require_zk_first_chunk"
+
+#: Files where the string "blob_id" appears in some form OTHER than building an upload's request
+#: body, each with the reason no first chunk is ever sent from there. Anything not listed here and
+#: not a declaration (below) fails the scan, so a new form cannot slip past unexamined.
+OTHER_MENTIONS = {
+    "test_ui_e2e.py": "reads back the init the BROWSER sent; the page seals the bytes itself",
+    "test_upload_object_id.py": "a Standard upload carrying the field is refused at init: no chunk",
+    "test_upload_session_principal.py": "a Standard upload carrying the field is refused at init: no chunk",
+    "test_zk_fixture_bodies.py": "this module",
+}
+
+
+def _is_blob_id(node) -> bool:
+    return isinstance(node, ast.Constant) and node.value == "blob_id"
+
+
+def _declarations(tree):
+    """Every place a request body is given a "blob_id": a dict literal's key, or body["blob_id"] = ..."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if _is_blob_id(key):
+                    yield key
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and _is_blob_id(node.slice):
+            yield node.slice
+
+
+def _calls(func, name):
+    return [n for n in ast.walk(func) if isinstance(n, ast.Call)
+            and (getattr(n.func, "id", None) == name or getattr(n.func, "attr", None) == name)]
+
+
+def _scan():
+    sites, unguarded, stray = [], [], []
+    for path in sorted(TESTS.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        declared = list(_declarations(tree))
+        for key in declared:
+            where = f"{path.name}:{key.lineno}"
+            sites.append(where)
+            func = key
+            while func is not None and not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func = parents.get(func)
+            # The guard is a real CALL in the enclosing function's syntax tree, so a commented-out
+            # call, or the name left behind in a docstring, does not count.
+            guards = _calls(func, GUARD) if func is not None else []
+            if not guards:
+                unguarded.append(f"{where} declares an attempt token with no {GUARD}() call")
+                continue
+            # ...and it runs BEFORE the statement that makes the declaration -- the request that
+            # opens the session, or the line that puts the token into its body. (A function may
+            # well post other things first, such as creating the vault it uploads into.)
+            stmt = key
+            while not isinstance(stmt, ast.stmt):
+                stmt = parents[stmt]
+            if min(g.lineno for g in guards) >= stmt.lineno:
+                unguarded.append(f"{where}: {GUARD}() runs only after the token is declared")
+        mentions = sum(1 for n in ast.walk(tree) if _is_blob_id(n))
+        if mentions > len(declared) and path.name not in OTHER_MENTIONS:
+            stray.append(f"{path.name}: \"blob_id\" appears in a form this scan does not understand")
+    return sites, unguarded, stray
+
+
+def test_every_site_that_declares_an_attempt_token_holds_its_first_chunk_to_the_bar():
+    # Driven off the DECLARATIONS, not off a list of helper names: a fifth helper, a session opened
+    # directly in a test, or a computed body is invisible to a scan that only knows four names. Here
+    # every request body that is given a "blob_id" must sit in a function that really CALLS the
+    # guard, before it opens the session -- or the scan fails naming file:line.
+    # (mutation: comment the guard call out -> red; add a "blob_id" init with no guard -> red.)
+    sites, unguarded, stray = _scan()
+    assert len(sites) >= 7, f"only {len(sites)} declarations found; the scan has gone blind: {sites}"
+    assert not unguarded, "\n  ".join(["a first chunk is not held to the server's bar:"] + unguarded)
+    assert not stray, "\n  ".join(stray)
+    conftest = ast.parse((TESTS / "conftest.py").read_text(encoding="utf-8"))
+    bar = [n for n in ast.walk(conftest) if isinstance(n, ast.Assign)
+           and getattr(n.targets[0], "id", None) == "ZK_MIN_FIRST_CHUNK"]
+    assert len(bar) == 1 and bar[0].value.value == MIN_FIRST_CHUNK

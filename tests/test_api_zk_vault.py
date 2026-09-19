@@ -478,6 +478,9 @@ def test_zk_chunked_upload_resumes_and_stores_ciphertext_verbatim(admin):
         # stores bytes). A tiny chunk_size keeps the payload small but genuinely multi-chunk.
         part0 = b"ZK-CIPHERTEXT-CHUNK-0-" * 4
         part1 = b"ZK-CIPHERTEXT-CHUNK-1-" * 4
+        # This session declares an attempt token, so its FIRST chunk is held to the server's bar.
+        from conftest import require_zk_first_chunk
+        require_zk_first_chunk(part0)
         blob = part0 + part1
 
         # ZK uploads carry the name ENCRYPTED (never plaintext): supply enc_name + name_bi.

@@ -555,15 +555,18 @@ def test_a_session_opened_without_an_epoch_is_still_refused_at_completion(admin)
         dek = os.urandom(32)
         name = unique("zk") + ".bin"
         fid = str(_uuid.uuid4())
+        body = b"epochless" * 4
+        from conftest import require_zk_first_chunk
+        require_zk_first_chunk(body)   # this session declares an attempt token
         r = admin.post(f"/vaults/{vid}/uploads", json={
-            "total_size": 36, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
+            "total_size": len(body), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
             "enc_name": zk_encrypt_name(name, dek, vid, "name", 1, obj_id=fid),
             "name_bi": zk_name_blind_index(name, dek, vid, 1),
             "zk_key_version": 1, "file_id": fid, "blob_id": _uuid.uuid4().hex,
         })
         r.raise_for_status()
         sid = r.json()["session_id"]
-        admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=b"epochless" * 4,
+        admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=body,
                   headers={"Content-Type": "application/octet-stream"})
 
         # Put the session into the state a pre-requirement client would have left it in.
