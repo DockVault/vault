@@ -16513,6 +16513,18 @@ function resolveUploadConflict(name, autoName) {
     });
 }
 
+// The per-file decision for a zero-knowledge upload, pure and argument-only so it is unit-tested
+// offline: refuse a file this context could never download -- a non-streaming sink (an org
+// 'buffered' policy, no service worker, plain HTTP, or the sink not yet resolved -- anything that
+// is not 'streaming') AND a size over the in-memory ceiling -- otherwise seal it. 'streaming' is
+// the one sink that never refuses; the comparison is strictly greater-than, matching the download
+// side, so a file exactly at the threshold still fits. It reads ONLY its arguments -- never
+// `state` or a module constant -- so the binding the call site passes is what a test and a reviewer
+// can see.
+function zkUploadDecision(size, sink, threshold) {
+    return (sink !== 'streaming' && size > threshold) ? 'refuse' : 'seal';
+}
+
 // Public entry point kept for existing callers (button + drag-drop). Resolves any
 // filename collisions in the current folder before enqueueing.
 async function uploadFiles(files) {
@@ -16545,8 +16557,9 @@ async function uploadFiles(files) {
         if (it.fileName) existing.add(it.fileName);
     }
     let toUpload = [];   // {file, name}
-    const toDelete = [];   // existing file ids to remove (overwrite)
-    const toCancelInFlight = new Set();   // in-flight upload names to cancel before re-uploading
+    let toDelete = [];   // existing file ids to remove (overwrite) -- filtered below if a refusal drops one
+    const toCancelInFlight = new Set();   // in-flight upload names to cancel (DEFERRED until the batch is ready)
+    const refused = new Set();   // entries refused per-file (over-threshold in a non-streaming context)
     let blanket = null;    // {action} once "apply to all" is chosen
 
     for (const file of arr) {
@@ -16583,20 +16596,9 @@ async function uploadFiles(files) {
         }
     }
 
-    // Cancel any in-flight uploads the user chose to REPLACE, before enqueuing their replacements,
-    // so the old and new copies of a name can't both finish. Re-scanned here (the modal ran async,
-    // so the live set may have changed) and matched by vault + folder + name; cancel() deletes the
-    // server session, so the replacement uploads cleanly.
-    if (toCancelInFlight.size) {
-        const victims = [];
-        for (const it of uploadManager.items.values()) {
-            if (it.vaultId !== state.currentVault.id) continue;
-            if ((it.folderId || null) !== _curFolder) continue;
-            if (!_pendingUpload(it)) continue;
-            if (toCancelInFlight.has(it.fileName)) victims.push(it.id);
-        }
-        for (const vid of victims) { try { await uploadManager.cancel(vid); } catch (_) { /* best effort */ } }
-    }
+    // In-flight uploads the user chose to replace are cancelled LATER, deferred until the batch is
+    // sealed and the refusal record has pruned the cancel set (see below, before the enqueue), so a
+    // refusal cannot cancel an upload whose replacement never enqueues.
 
     if (toUpload.length) {
         // Zero-knowledge vault: encrypt each file in the browser BEFORE it enters
@@ -16627,18 +16629,16 @@ async function uploadFiles(files) {
                     let enc;
                     if (lib.ZK_CONTENT_WRITE_V2) {
                         // The streaming writer can seal a file of any size, but a file that could
-                        // not be DOWNLOADED here should not be created here. When this uploader's
-                        // context cannot stream a download (state.downloadSink !== 'streaming'), an
-                        // over-threshold zero-knowledge file could be uploaded and then never
-                        // retrieved -- so refuse it BEFORE any encryption; a streaming sink leaves
-                        // the v2 branch unrestricted. This bounds the UPLOADER's context, which
-                        // covers the fleet-wide cases (the server resolves plain HTTP as buffered
-                        // for everyone, and an org 'buffered' policy applies to all) but not a
-                        // per-member browser that cannot register the helper, nor a member whose own
-                        // preference is buffered under user_choice (recoverable by changing it) --
-                        // an accepted residual, not a guarantee.
-                        if (state.downloadSink !== 'streaming'
-                                && entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES) {
+                        // not be DOWNLOADED here should not be created here. The pure decision
+                        // (zkUploadDecision) refuses when this uploader's context cannot stream a
+                        // download and the file is over the in-memory ceiling -- refuse it BEFORE
+                        // any encryption; a streaming sink leaves the v2 branch unrestricted. This
+                        // bounds the UPLOADER's context, which covers the fleet-wide cases (the
+                        // server resolves plain HTTP as buffered for everyone, and an org 'buffered'
+                        // policy applies to all) but not a per-member browser that cannot register
+                        // the helper, nor a member whose own preference is buffered under user_choice
+                        // (recoverable by changing it) -- an accepted residual, not a guarantee.
+                        if (zkUploadDecision(entry.file.size, state.downloadSink, MAX_BUFFERED_DOWNLOAD_BYTES) === 'refuse') {
                             const _sz = formatBytes ? formatBytes(entry.file.size) : entry.file.size + ' B';
                             if (state.downloadSink === undefined) {
                                 // The boot policy read failed or has not landed -- not a browser
@@ -16652,7 +16652,14 @@ async function uploadFiles(files) {
                                     + `vault from a context that can stream downloads, or ask an administrator `
                                     + `to enable streaming downloads.`);
                             }
-                            return;
+                            // Per-entry refusal: RECORD this file and skip it -- the guard never
+                            // touches toUpload itself (splicing the array this for-of walks would
+                            // skip the next entry and leave it unsealed in the batch). It is removed
+                            // once, after the loop, together with its overwrite delete and its
+                            // in-flight cancel, before anything destructive runs, so the others still
+                            // upload and this one never reaches the uploader unsealed.
+                            refused.add(entry);
+                            continue;
                         }
                         // Chunk-framed content, encrypted FROM THE FILE rather than from a copy of
                         // it. Reading the file first would put the plaintext in the heap, the
@@ -16706,6 +16713,37 @@ async function uploadFiles(files) {
                 return;
             }
         }
+
+        // Per-entry refusal recorded refusals during the loop (it never touched the walked array).
+        // Enact them ONCE now, before anything destructive runs: drop the refused entries from the
+        // batch, and drop the destructive steps that belong to them -- a refused overwrite must not
+        // delete the original it cannot replace, and a refused replacement must not cancel the
+        // in-flight upload it cannot replace (a fresh same-page upload of that name is still in
+        // flight, and cancelling it for a replacement that never comes loses that work in progress
+        // and its local ciphertext).
+        if (refused.size) {
+            const _refusedNames = new Set([...refused].map(e => e.name));
+            toUpload = toUpload.filter(e => !refused.has(e));
+            toDelete = toDelete.filter(t => !_refusedNames.has(t.name));
+            for (const _n of _refusedNames) toCancelInFlight.delete(_n);
+        }
+
+        // Cancel any in-flight uploads the user chose to REPLACE -- DEFERRED to here, after every
+        // kept entry is sealed and the refusal record has pruned the set, but still BEFORE the
+        // enqueue so a name's old and new copies can't both finish. Re-scanned (the modal ran async)
+        // and matched by vault + folder + name; cancel() deletes the server session so the
+        // replacement uploads cleanly.
+        if (toCancelInFlight.size) {
+            const victims = [];
+            for (const it of uploadManager.items.values()) {
+                if (it.vaultId !== state.currentVault.id) continue;
+                if ((it.folderId || null) !== _curFolder) continue;
+                if (!_pendingUpload(it)) continue;
+                if (toCancelInFlight.has(it.fileName)) victims.push(it.id);
+            }
+            for (const vid of victims) { try { await uploadManager.cancel(vid); } catch (_) { /* best effort */ } }
+        }
+
         // The originals go LAST, and only for replacements that are ready to send.
         //
         // They used to go first, "so the new upload doesn't collide" -- before the replacement was

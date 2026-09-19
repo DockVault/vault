@@ -6,7 +6,10 @@ standard vaults only (SFTP never serves zero-knowledge, and a ZK name is server-
 and fail-open. The client refuses a legacy-ZK whole-file encrypt above the in-memory threshold rather
 than reading a multi-GB file into the tab. The live behaviour is the live lane.
 """
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -75,42 +78,133 @@ def _refuse_download_closure(js: str) -> str:
     return js[start:js.index("if (state.downloadSink !== 'streaming' && _fsize", start)]
 
 
-# The whole guard, matched as one exact shape rather than as loose substrings. Two substrings pass
-# against a dead guard (`if (false && <substrings>) {`) and against a reversed comparison whenever
-# another line in the slice happens to spell `> MAX_BUFFERED_DOWNLOAD_BYTES` -- which the legacy
-# branch's OWN refusal does. Matching the full `if (...) {` closes both, and the slice below stops
-# before the legacy branch so its refusal cannot stand in for this one.
-_UPLOAD_GUARD = re.compile(
-    r"if \(state\.downloadSink !== 'streaming'\s*"
-    r"&& entry\.file\.size > MAX_BUFFERED_DOWNLOAD_BYTES\) \{")
+# The guard is pinned as ONE exact string -- the call, the `=== 'refuse'` comparison, and the three
+# arguments in their exact order. Looser checks pass against an inverted comparison (`!== 'refuse'`
+# seals over-threshold files), a swapped argument order (refuse when the threshold exceeds the file),
+# a shadow threshold, a different sink source, or an inlined literal that leaves the helper dead.
+_UPLOAD_GUARD_CALL = (
+    "if (zkUploadDecision(entry.file.size, state.downloadSink, MAX_BUFFERED_DOWNLOAD_BYTES) "
+    "=== 'refuse') {")
+
+
+def _zk_upload_decision_src(js: str) -> str:
+    # The whole pure helper, body and all. Its body has no braces (one return), so a non-greedy
+    # brace-free match lands on exactly this function.
+    m = re.search(r"function zkUploadDecision\([^)]*\)\s*\{[^{}]*\}", js)
+    assert m, "zkUploadDecision() not found in app.js"
+    return m.group(0)
+
+
+def _upload_files_src(js: str) -> str:
+    start = js.index("async function uploadFiles(files) {")
+    return js[start:js.index("function setupFileDragDrop(", start)]
 
 
 def test_the_v2_zk_upload_refuses_over_threshold_before_encrypting_when_buffered():
     # With the v2 content writer on, a file that could not be DOWNLOADED here must not be created
-    # here: when the uploader's context cannot stream (state.downloadSink !== 'streaming'), an
-    # over-threshold ZK upload is refused BEFORE any encryption, and a streaming sink is unrestricted.
+    # here: the pure decision refuses when the uploader's context cannot stream and the file is over
+    # the ceiling, it refuses BEFORE any encryption, and it does so PER ENTRY without abandoning the
+    # batch.
     js = APPJS.read_text(encoding="utf-8")
     start = js.index("if (lib.ZK_CONTENT_WRITE_V2) {")
-    # Cut at the legacy branch's OWN comment, BEFORE stripping comments, so the legacy refusal (which
-    # also spells `> MAX_BUFFERED_DOWNLOAD_BYTES`) is not inside the v2 slice and cannot satisfy this
-    # pin for it.
+    # Cut at the legacy branch's OWN comment, before stripping comments, so the legacy refusal is not
+    # inside the v2 slice and cannot satisfy this pin for it.
     end = js.index("// The legacy writer takes the whole plaintext", start)
     v2 = _strip_line_comments(js[start:end])
-    # Exactly one guard, matched whole: a dead `false &&` guard or a reversed `<` comparison is no
-    # longer this shape, so the count drops to zero. (mutation: `false &&` the guard -> 0 matches ->
-    # red; reverse the comparison to `<` -> 0 matches -> red; drop the guard -> 0 matches -> red.)
-    guards = list(_UPLOAD_GUARD.finditer(v2))
-    assert len(guards) == 1, f"expected exactly one over-threshold guard in the v2 branch, found {len(guards)}"
-    # Refuses BEFORE encryption: the guard's return follows it, and no encryptBlobV2 call precedes it.
-    # (mutation: move the writer above the guard -> the ordering assert reds.)
-    guard_end = guards[0].end()
-    return_at = v2.index("return;", guard_end)
+    # The exact guard call, exactly once (an inverted comparison, a swapped arg order, a shadow
+    # threshold or an inlined literal is no longer this string), and only one call to the helper.
+    assert v2.count(_UPLOAD_GUARD_CALL) == 1, "the exact over-threshold guard call is not present exactly once"
+    assert v2.count("zkUploadDecision(") == 1, "more than one call to the decision helper in the v2 branch"
+    guard_at = v2.index(_UPLOAD_GUARD_CALL)
+    guard_end = guard_at + len(_UPLOAD_GUARD_CALL)
+    # Refuses BEFORE encryption.
+    assert "encryptBlobV2(" not in v2[:guard_at], "encryption is reached before the refusal guard"
+    # The per-entry exit is `continue;`, NOT `return;` (a return abandons the whole batch, discarding
+    # files already sealed), and it comes before the writer call.
+    continue_at = v2.index("continue;", guard_end)
     writer_at = v2.index("encryptBlobV2(")
-    assert return_at < writer_at, "the over-threshold refusal must return before encryptBlobV2"
-    assert "encryptBlobV2(" not in v2[:guards[0].start()], "encryption is reached before the refusal guard"
-    # A failed/slow policy read leaves the sink unresolved; that case gets its own retry wording
-    # rather than blaming the browser.
+    assert continue_at < writer_at, "the per-entry refusal must `continue` before encryptBlobV2"
+    guard_block = v2[guard_at:continue_at]
+    assert "return;" not in guard_block, "the guard exits with `return;` -- that abandons the batch"
+    # It RECORDS the refusal and never touches the array the for-of is walking (a splice would skip
+    # the next entry and leave it unsealed in the batch).
+    assert "refused.add(entry)" in guard_block, "the guard does not record the refusal"
+    assert "toUpload" not in guard_block, "the guard writes to the batch it is walking"
+    # The distinct unresolved-policy wording is still present.
     assert "state.downloadSink === undefined" in v2
+
+
+def test_the_zk_upload_decision_is_a_pure_parameter_only_predicate():
+    # The decision reads ONLY its parameters -- never `state` or a module constant -- so the binding
+    # the call site passes is what the pin and a reviewer see, and a later change that reads state
+    # internally reds here. (mutation: `false &&`, a reversed comparison, or a hard-coded threshold
+    # inside the helper -> red, on this pin and on the table below.)
+    body = _strip_line_comments(_zk_upload_decision_src(APPJS.read_text(encoding="utf-8")))
+    # The WHOLE return, exactly -- not the condition as a substring, which `false &&` and a reversed
+    # comparison both leave intact. This is the shape the table exercises.
+    assert "return (sink !== 'streaming' && size > threshold) ? 'refuse' : 'seal';" in body, (
+        "the decision predicate changed shape")
+    assert "state" not in body, "the decision reads global state instead of its arguments"
+    assert "MAX_BUFFERED_DOWNLOAD_BYTES" not in body, "the decision hard-codes the threshold instead of taking it"
+
+
+def test_the_zk_upload_decision_table():
+    # The pure function's truth table, run offline. Extracted from the shipped source and evaluated
+    # under Node, so a mutation to its body reds here as well as on the source pin.
+    node = shutil.which("node")
+    assert node, "Node is required: the decision must not be skipped"
+    fn = _zk_upload_decision_src(APPJS.read_text(encoding="utf-8"))
+    harness = fn + """
+const T = 268435456;   // 256 MiB, the shipped threshold value (the function takes it as an argument)
+const cases = {
+    'undefined-over': zkUploadDecision(T + 1, undefined, T),
+    'buffered-over':  zkUploadDecision(T + 1, 'buffered', T),
+    'streaming-over': zkUploadDecision(T + 1, 'streaming', T),
+    'streaming-huge': zkUploadDecision(T * 100, 'streaming', T),
+    'buffered-under': zkUploadDecision(T - 1, 'buffered', T),
+    'buffered-at':    zkUploadDecision(T, 'buffered', T),
+    'undefined-under': zkUploadDecision(1, undefined, T),
+    'nan-buffered':   zkUploadDecision(NaN, 'buffered', T),
+    'null-over':      zkUploadDecision(T + 1, null, T),
+};
+process.stdout.write(JSON.stringify(cases));
+"""
+    done = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    r = json.loads(done.stdout)
+    assert r["undefined-over"] == "refuse"          # sink not resolved -> not 'streaming' -> refuse
+    assert r["buffered-over"] == "refuse"
+    assert r["streaming-over"] == "seal"            # 'streaming' never refuses, at any size
+    assert r["streaming-huge"] == "seal"
+    assert r["buffered-under"] == "seal"
+    assert r["buffered-at"] == "seal"               # strictly greater-than: a file exactly at the ceiling fits
+    assert r["undefined-under"] == "seal"
+    # NaN > T is false -> 'seal' here; the writer's own safe-integer check (ecc_crypto.js ~:2206)
+    # then refuses a non-finite size with INVALID_INPUT, so this is not a hole.
+    assert r["nan-buffered"] == "seal"
+    assert r["null-over"] == "refuse"               # null !== 'streaming' -> refuse
+
+
+def test_a_refused_entry_and_its_destructive_steps_are_dropped_before_the_enqueue():
+    # The refusal record is enacted ONCE, after the seal loop and before the single enqueue: the
+    # refused entries leave toUpload, and their destructive steps leave toDelete (a refused overwrite
+    # must not delete the original it cannot replace) and the deferred cancel set (a refused
+    # replacement must not cancel the in-flight upload it cannot replace). Order: filter -> cancels
+    # -> deletes -> enqueue, so nothing destructive runs before the batch is sealed-and-filtered and
+    # the enqueue is last.
+    code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
+    assert "toUpload = toUpload.filter(e => !refused.has(e))" in code, "refused entries are not removed from the batch"
+    assert "toDelete = toDelete.filter(t => !_refusedNames.has(t.name))" in code, "a refused overwrite's delete is not dropped"
+    assert "toCancelInFlight.delete(_n)" in code, "a refused replacement's in-flight cancel is not dropped"
+    seal_loop = code[code.index("for (const entry of toUpload)"):
+                     code.index("toUpload = toUpload.filter(e => !refused.has(e))")]
+    assert ".splice(" not in seal_loop, "the seal loop splices the array it is walking"
+    filter_at = code.index("toUpload = toUpload.filter(e => !refused.has(e))")
+    cancel_at = code.index("uploadManager.cancel(vid)")
+    delete_at = code.index("/files/${target.id}/delete")
+    enqueue_at = code.index("uploadManager.enqueueNamed(toUpload)")
+    assert filter_at < cancel_at < delete_at < enqueue_at, (
+        "destructive steps must run after the refusal filter and before the single enqueue")
 
 
 def test_no_zero_knowledge_refusal_path_names_the_sftp_sync_path():
