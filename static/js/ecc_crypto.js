@@ -161,6 +161,9 @@ class ECCCryptoLibrary {
         // attempt that produced it.
         this.V2_PURPOSE_CONTENT = 0x04;
         this.V2_INFO_CONTENT = 'dockvault-zk-content-v2';
+        // Not a wire format: the label for the HMAC key behind the per-frame resume MACs a browser
+        // keeps locally. Its own string so that key is independent of every content key.
+        this.V2_INFO_RESUME_FRAME_MAC = 'dockvault-zk-resume-frame-mac-v1';
         // A per-vault NAME INDEX key, wrapped to a member exactly like the direct DEK (a 32-byte
         // symmetric key, 68 bytes wrapped) but with its own purpose byte and info string so a DEK
         // wrap and an index-key wrap for the same (vault, member) can never be swapped for one
@@ -2149,23 +2152,37 @@ class ECCCryptoLibrary {
      */
     async _sealV2Chunks(key, t, totals, n, readChunk, emit) {
         for (let i = 0; i < n; i++) {
-            const isFinal = (i === n - 1);
-            const nonce = this._randomBytes(12);
-            const sealed = await this._subtle().encrypt(
-                {
-                    name: this.AES_ALGORITHM,
-                    iv: nonce,
-                    additionalData: t.aadFor(i, isFinal, totals),
-                    tagLength: this.AES_TAG_LENGTH,
-                },
-                key,
-                await readChunk(i),
-            );
+            const f = await this._sealV2Frame(key, t, totals, n, i, () => readChunk(i));
             // Handed over rather than collected here. Accumulating for the caller would decide
             // its memory profile for it -- which is the whole difference between the two writers
             // below, and the reason this loop does not keep anything.
-            emit(nonce, new Uint8Array(sealed));
+            emit(f.nonce, f.sealed);
         }
+    }
+
+    /**
+     * Seal ONE chunk of a version-2 content file: a fresh random nonce, and associated data that
+     * binds the chunk's index, whether it is the last, and (on the last) the totals.
+     *
+     * The one place a frame is sealed, shared by the whole-file loop above and the on-demand
+     * session below, so the two cannot disagree about what a frame is. `read` is a thunk so the
+     * nonce is minted before the plaintext is read, as it always was.
+     * @private
+     */
+    async _sealV2Frame(key, t, totals, n, i, read) {
+        const isFinal = (i === n - 1);
+        const nonce = this._randomBytes(12);
+        const sealed = await this._subtle().encrypt(
+            {
+                name: this.AES_ALGORITHM,
+                iv: nonce,
+                additionalData: t.aadFor(i, isFinal, totals),
+                tagLength: this.AES_TAG_LENGTH,
+            },
+            key,
+            await read(),
+        );
+        return { nonce, sealed: new Uint8Array(sealed) };
     }
 
     _hex(bytes) {
@@ -2253,6 +2270,164 @@ class ECCCryptoLibrary {
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
         }
+    }
+
+    /**
+     * START a version-2 content encryption without sealing anything yet.
+     *
+     * encryptBlobV2 retains one chunk but still hands back the whole ciphertext as one Blob, so a
+     * caller that uploads it holds (or spills) the entire file. This is the same writer opened up:
+     * it mints the attempt token, derives the key, and reports the exact ciphertext length -- all
+     * of which are known from `blob.size` alone -- and then seals frames ON DEMAND, so an uploader
+     * can open its session with the exact size and send each frame as it is produced. The bytes a
+     * session emits (header, then frame 0..n-1) are the same grammar, the same transcript and the
+     * same framing as the two writers above; nothing about them says which writer produced them.
+     *
+     * The token is minted HERE, once, exactly as the other writers mint it, and is never accepted
+     * from a caller: `blobId` and the token inside `header()` are one value from one mint, so the
+     * token a caller declares to the server and the token the bytes carry cannot drift apart.
+     *
+     * @returns {Promise<object>} a session: blobId, chunkSize, totalChunks, totalPlaintext,
+     *   ciphertextLength, header(), frameLength(i), sealFrame(i), frameMac(i), resumeState()
+     */
+    async startContentV2Encryption(blob, vaultDEK, context, options) {
+        const W = 'startContentV2Encryption';
+        try {
+            const opts = options || {};
+            return await this._v2ContentSession(
+                W, blob, vaultDEK, context,
+                opts.chunkSize === undefined ? this.V2_CONTENT_CHUNK_DEFAULT : opts.chunkSize,
+                this._randomBytes(16));
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
+        }
+    }
+
+    /**
+     * Re-open an interrupted encryption of the SAME plaintext, to seal the frames still missing.
+     *
+     * `state` is what a session's own resumeState() returned -- the writer's record of an attempt
+     * it minted, not a token a caller composed. Each frame authenticates alone under its index, so
+     * sealing only the missing ones under the same token yields a file that opens; what must never
+     * happen is two DIFFERENT plaintexts sharing a token (their frames would substitute for one
+     * another). So this refuses outright when the blob is not the size the attempt was opened
+     * with, and the caller is expected to have checked the frames already delivered against
+     * frameMac() before trusting that the content is the same. Anything that does not check out
+     * is a new attempt: call startContentV2Encryption and open a new upload.
+     */
+    async resumeContentV2Encryption(blob, vaultDEK, context, state) {
+        const W = 'resumeContentV2Encryption';
+        try {
+            const s = state || {};
+            if (s.v !== 1 || typeof s.blobId !== 'string' || !/^[0-9a-f]{32}$/.test(s.blobId)
+                    || !Number.isSafeInteger(s.totalPlaintext)) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.state');
+            }
+            if (!blob || blob.size !== s.totalPlaintext) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.size');
+            }
+            const token = new Uint8Array(16);
+            for (let i = 0; i < 16; i++) token[i] = parseInt(s.blobId.substr(i * 2, 2), 16);
+            return await this._v2ContentSession(W, blob, vaultDEK, context, s.chunkSize, token);
+        } catch (error) {
+            throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
+        }
+    }
+
+    /**
+     * The session both entry points above return. Holds no plaintext and no ciphertext: a frame is
+     * read from the blob, sealed, handed back and forgotten.
+     * @private
+     */
+    async _v2ContentSession(W, blob, vaultDEK, context, chunkSizeIn, blobIdBytes) {
+        if (!blob || typeof blob.slice !== 'function'
+            || !Number.isSafeInteger(blob.size) || blob.size < 0) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.blob');
+        }
+        if (typeof blob.arrayBuffer !== 'function') {
+            throw new CryptoError(CRYPTO_ERROR_CODES.CRYPTO_UNAVAILABLE, W + '.arrayBuffer');
+        }
+        const ctx = context || {};
+        const t = this._v2ContentTranscript(
+            ctx.vaultId, ctx.objectId, ctx.dekEpoch, chunkSizeIn, blobIdBytes);
+        const chunkSize = t.chunkSize;
+        const key = await this._deriveV2ContentKey(vaultDEK, t.info);
+        const macKey = await this._deriveV2FrameMacKey(vaultDEK, t.info);
+        const total = blob.size;
+        const n = Math.max(1, Math.ceil(total / chunkSize));
+        const totals = { totalChunks: n, totalPlaintext: total };
+        const OVER = this.V2_CONTENT_CHUNK_OVERHEAD;
+        const blobIdHex = this._hex(blobIdBytes);
+
+        const at = (i) => {
+            if (!Number.isInteger(i) || i < 0 || i >= n) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.frameIndex');
+            }
+            return i;
+        };
+        const plainLength = (i) => Math.min((i + 1) * chunkSize, total) - i * chunkSize;
+        const read = async (i) => new Uint8Array(await blob
+            .slice(i * chunkSize, Math.min((i + 1) * chunkSize, total)).arrayBuffer());
+        const mac = async (i, plain) => {
+            const signed = await this._subtle().sign('HMAC', macKey, this._concatBytes([
+                this._v2U64(i, W + '.macIndex', CRYPTO_ERROR_CODES.INVALID_INPUT), plain]));
+            return this._hex(new Uint8Array(signed));
+        };
+        const guard = async (fn) => {
+            try { return await fn(); } catch (error) {
+                throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
+            }
+        };
+
+        return Object.freeze({
+            blobId: blobIdHex,
+            chunkSize,
+            totalChunks: n,
+            totalPlaintext: total,
+            // Header + plaintext + one nonce-and-tag per frame: exact, and known before a byte is read.
+            ciphertextLength: this.V2_CONTENT_HEADER_BYTES + total + OVER * n,
+            header: () => new Uint8Array(t.fileHeader),
+            frameLength: (i) => OVER + plainLength(at(i)),
+            // One read serves both: the sealed frame to send, and the keyed MAC of its PLAINTEXT
+            // that a later resume checks the same file against.
+            sealFrame: (i) => guard(async () => {
+                at(i);
+                let plain = null;
+                const f = await this._sealV2Frame(key, t, totals, n, i,
+                    async () => { plain = await read(i); return plain; });
+                return { frame: this._concatBytes([f.nonce, f.sealed]), mac: await mac(i, plain) };
+            }),
+            frameMac: (i) => guard(async () => mac(at(i), await read(i))),
+            resumeState: () => ({ v: 1, blobId: blobIdHex, chunkSize, totalPlaintext: total }),
+        });
+    }
+
+    /**
+     * The key for the per-frame resume MACs: from the vault DEK, like the content key, but under
+     * its own label and as an HMAC key, so it is independent of every content key and useless for
+     * opening anything. Keyed on purpose -- an unkeyed digest of the plaintext, kept in browser
+     * storage, would let anyone holding the profile test a candidate file against it.
+     * @private
+     */
+    async _deriveV2FrameMacKey(dekCryptoKey, contentInfo) {
+        const alg = (dekCryptoKey && dekCryptoKey.algorithm) || {};
+        if (alg.name !== this.AES_ALGORITHM) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'content.dekAlgorithm');
+        }
+        const raw = await this._subtle().exportKey('raw', dekCryptoKey);
+        if (raw.byteLength !== 32) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'content.dekLength');
+        }
+        const base = await this._subtle().importKey('raw', raw, 'HKDF', false, ['deriveKey']);
+        const info = this._concatBytes([
+            new TextEncoder().encode(this.V2_INFO_RESUME_FRAME_MAC), new Uint8Array([0]), contentInfo]);
+        return this._subtle().deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt: this.V2_HKDF_SALT, info },
+            base,
+            { name: 'HMAC', hash: 'SHA-256', length: 256 },
+            false,
+            ['sign']
+        );
     }
 
     /**
@@ -3282,6 +3457,8 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     v2ContentResumeOffset: CRYPTO_ERROR_CODES.CONTENT_INVALID,
     encryptFileV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     encryptBlobV2: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    startContentV2Encryption: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    resumeContentV2Encryption: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     decryptName: CRYPTO_ERROR_CODES.CONTENT_AUTH_FAILED,
 
     // Everything else: a primitive rejected for a reason that is not authentication, not policy
