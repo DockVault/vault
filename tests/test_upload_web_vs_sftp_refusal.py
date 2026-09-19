@@ -55,3 +55,61 @@ def test_the_client_refuses_a_legacy_zk_whole_file_encrypt_above_the_threshold()
     assert "entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES" in legacy
     assert "too large to encrypt in this browser" in legacy
     assert "return;" in legacy   # refuses, does not proceed to the whole-file read
+
+
+def _strip_line_comments(s: str) -> str:
+    # Assert on CODE, not comments: the guard and closure carry comments that themselves discuss the
+    # streaming sink and SFTP, so a raw search would pass on the prose even if the code regressed.
+    return "\n".join(ln for ln in s.splitlines() if not ln.lstrip().startswith("//"))
+
+
+def _zk_upload_block(js: str) -> str:
+    start = js.index("if (lib.ZK_CONTENT_WRITE_V2) {")
+    return js[start:js.index("entry.keyVersion = keyVersion;", start)]
+
+
+def _refuse_download_closure(js: str) -> str:
+    start = js.index("const _refuseTooLarge = () => {")
+    # Ends just before the call site that invokes it; that boundary line is code, not a comment.
+    return js[start:js.index("if (state.downloadSink !== 'streaming' && _fsize", start)]
+
+
+def test_the_v2_zk_upload_refuses_over_threshold_before_encrypting_when_buffered():
+    # With the v2 content writer on, a file that could not be DOWNLOADED here must not be created
+    # here: when the uploader's context cannot stream (state.downloadSink !== 'streaming'), an
+    # over-threshold ZK upload is refused BEFORE any encryption, and a streaming sink is unrestricted.
+    js = APPJS.read_text(encoding="utf-8")
+    v2 = _strip_line_comments(_zk_upload_block(js))
+    # The v2 branch only: cut at the legacy writer call. Splitting on the first `} else {` would land
+    # on the guard's OWN inner else, not the branch boundary.
+    v2 = v2[:v2.index("encryptFile(await entry.file.arrayBuffer()")]
+    assert "state.downloadSink !== 'streaming'" in v2
+    assert "entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES" in v2
+    # Refuses BEFORE encryption: the guard's return precedes the writer call, and no encryptBlobV2
+    # call appears before the guard. (mutation: drop the guard -> the strings are gone -> red; move
+    # it below encryptBlobV2 -> the ordering assert reds.)
+    guard_at = v2.index("state.downloadSink !== 'streaming'")
+    return_at = v2.index("return;", guard_at)
+    writer_at = v2.index("encryptBlobV2(")
+    assert return_at < writer_at, "the over-threshold refusal must return before encryptBlobV2"
+    assert "encryptBlobV2(" not in v2[:guard_at], "encryption is reached before the refusal guard"
+    # A failed/slow policy read leaves the sink unresolved; that case gets its own retry wording
+    # rather than blaming the browser.
+    assert "state.downloadSink === undefined" in v2
+
+
+def test_no_zero_knowledge_refusal_path_names_the_sftp_sync_path():
+    # SFTP cannot serve a zero-knowledge vault, so no ZK refusal may send the user there.
+    js = APPJS.read_text(encoding="utf-8")
+    block = _strip_line_comments(_zk_upload_block(js))
+    assert "SFTP" not in block, "a zero-knowledge upload refusal names the SFTP sync path"
+    # The shared download refusal closure branches on the vault kind: the ZK ending names no SFTP;
+    # the Standard ending still offers it. (mutation: drop the isZkVault branch -> the ZK arm carries
+    # the SFTP tail -> red.)
+    closure = _strip_line_comments(_refuse_download_closure(js))
+    assert "isZkVault(state.currentVault)" in closure
+    tail = closure[closure.index("isZkVault(state.currentVault)"):]
+    zk_arm = tail[tail.index("?"):tail.index(":")]
+    std_arm = tail[tail.index(":"):tail.index("showError", tail.index(":"))]
+    assert "SFTP" not in zk_arm, "the zero-knowledge download refusal names SFTP"
+    assert "SFTP" in std_arm, "the Standard download refusal no longer offers the SFTP path"

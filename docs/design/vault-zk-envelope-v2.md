@@ -703,11 +703,15 @@ first, then the writer behind its own gate. Both writers are now the default and
 algorithm label is generation 2, so this tree writes v2 content and v2 wraps. The reader ordering
 held: the v2 readers first shipped in v0.11.0 and the minimum supported release is 0.17.0, so every
 supported release reads both formats before any of them is written. What remains is the stale-tab
-exposure, and only for a tab loaded from a bundle older than the v0.11.0 reader; a downgrade to a
-release older than 0.11.0 cannot open zero-knowledge vaults or files written after the change, which
-is why this edge is one-way, requires a typed acknowledgement and a backup. Legacy-format files
-written earlier keep reading; the content side can still return to the legacy form for new files,
-the wrap side cannot, because a v2 wrap locks out any reader older than v0.11.0.
+exposure — a tab left open since before the v0.11.0 reader shipped keeps running the old code until
+it is reloaded, and no cache header or asset buster changes what an already-open tab runs. A
+downgrade to a release older than 0.11.0 cannot open zero-knowledge vaults or files written after
+the switch. The release will record the 0.30.0 → 0.31.0 edge as one-way (`reversible: false`,
+`requires_backup: true`), and the host tool will gate that downgrade behind a typed acknowledgement
+and a backup; neither exists in this tree yet — they land in the release commit. Legacy-format files
+written earlier keep reading, and each writer flag keeps a legacy fallback, so turning a flag back
+writes NEW data in the old form. What cannot be undone is data already written in v2 — above all a
+v2 WRAP, which the server cannot re-wrap for a reader that predates it.
 
 The content writer's gate is a second constant rather than a reuse of the wrap gate, because the
 two protect against different readers. A wrap is read by *other members*, so writing one early

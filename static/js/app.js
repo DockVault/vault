@@ -14338,10 +14338,21 @@ async function _downloadFile(fileId, fileName) {
                     + `The streaming helper is still starting up on this first visit -- try again in a moment.`);
                 return;
             }
+            if (state.downloadSink === undefined) {
+                // The boot policy read failed or has not landed -- not a browser limit; ask for a
+                // retry rather than blaming the context, the same way the installing case does.
+                showError(`"${fileName}" (${_sz}) is too large to download until the download policy is `
+                    + `known -- it could not be read; reload and try again.`);
+                return;
+            }
+            // The closing clause is the only part that differs by vault kind: SFTP can serve a
+            // Standard vault but never a zero-knowledge one, so the ZK ending must not name it.
+            const _tail = isZkVault(state.currentVault)
+                ? `open the vault from a context that can stream downloads, or ask an administrator to enable streaming downloads`
+                : `ask an administrator to serve the site over https and enable streaming downloads, or use the SFTP sync path for very large files`;
             showError(`"${fileName}" is ${_sz} and this browser/context can't stream it to disk, so it is `
                 + `too large to download here. Streaming needs a secure https context with a service worker; `
-                + `ask an administrator to serve the site over https and enable streaming downloads, or use `
-                + `the SFTP sync path for very large files.`);
+                + `${_tail}.`);
         };
         if (state.downloadSink !== 'streaming' && _fsize > MAX_BUFFERED_DOWNLOAD_BYTES) {
             _refuseTooLarge();
@@ -16615,6 +16626,34 @@ async function uploadFiles(files) {
                     // encryption gets a new one, which is exactly what the server refuses to merge.
                     let enc;
                     if (lib.ZK_CONTENT_WRITE_V2) {
+                        // The streaming writer can seal a file of any size, but a file that could
+                        // not be DOWNLOADED here should not be created here. When this uploader's
+                        // context cannot stream a download (state.downloadSink !== 'streaming'), an
+                        // over-threshold zero-knowledge file could be uploaded and then never
+                        // retrieved -- so refuse it BEFORE any encryption; a streaming sink leaves
+                        // the v2 branch unrestricted. This bounds the UPLOADER's context, which
+                        // covers the fleet-wide cases (the server resolves plain HTTP as buffered
+                        // for everyone, and an org 'buffered' policy applies to all) but not a
+                        // per-member browser that cannot register the helper, nor a member whose own
+                        // preference is buffered under user_choice (recoverable by changing it) --
+                        // an accepted residual, not a guarantee.
+                        if (state.downloadSink !== 'streaming'
+                                && entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES) {
+                            const _sz = formatBytes ? formatBytes(entry.file.size) : entry.file.size + ' B';
+                            if (state.downloadSink === undefined) {
+                                // The boot policy read failed or has not landed -- not a browser
+                                // limit; ask for a retry rather than blaming the context.
+                                showError(`"${entry.name}" (${_sz}) can't be uploaded until the download `
+                                    + `policy is known -- it could not be read; reload and try again.`);
+                            } else {
+                                showError(`"${entry.name}" (${_sz}) is too large to download in this `
+                                    + `context, so it cannot be uploaded here: a download this large needs a `
+                                    + `streaming sink (a secure https context with a service worker). Open the `
+                                    + `vault from a context that can stream downloads, or ask an administrator `
+                                    + `to enable streaming downloads.`);
+                            }
+                            return;
+                        }
                         // Chunk-framed content, encrypted FROM THE FILE rather than from a copy of
                         // it. Reading the file first would put the plaintext in the heap, the
                         // sealed copy would join it, and a large upload would peak near three
@@ -16639,8 +16678,7 @@ async function uploadFiles(files) {
                         if (entry.file.size > MAX_BUFFERED_DOWNLOAD_BYTES) {
                             showError(`"${entry.name}" is too large to encrypt in this browser `
                                 + `(${formatBytes ? formatBytes(entry.file.size) : entry.file.size + ' B'}); `
-                                + `update the app to the streaming encryptor, or use the SFTP sync path `
-                                + `for very large files.`);
+                                + `update the app to the streaming encryptor to handle files this large.`);
                             return;
                         }
                         entry.blobId = zkNewBlobId();
