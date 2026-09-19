@@ -111,7 +111,7 @@ def test_rekey_forward_secrecy_new_epoch_unreadable_by_revoked(admin, temp_user,
         }).raise_for_status()
 
         # New upload lands at epoch 2.
-        fid = _zk_chunked_upload(admin, vid, b"new-epoch-content", zk_key_version=2)
+        fid = _zk_chunked_upload(admin, vid, b"new-epoch-content" * 2, zk_key_version=2)
         listed = next(it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == fid)
         assert listed["key_version"] == 2
         # The revoked member has no key for epoch 2.
@@ -247,6 +247,8 @@ def _zk_chunked_upload(client, vid, content: bytes, zk_key_version=None, expect_
     instead of driving the upload — that is how the epoch-omitted case is exercised now."""
     import os
     import uuid as _uuid
+    from conftest import require_zk_first_chunk
+    require_zk_first_chunk(content)   # a declared-token session is refused a shorter first chunk
     dek = os.urandom(32)
     name_epoch = zk_key_version if zk_key_version is not None else 1
     name = unique("zk") + ".bin"
@@ -287,10 +289,10 @@ def test_upload_with_stale_epoch_is_rejected(admin):
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
         # An upload still declaring epoch 1 is refused.
-        c = _zk_chunked_upload(admin, vid, b"stale", zk_key_version=1, expect_status=409)
+        c = _zk_chunked_upload(admin, vid, b"stale" * 6, zk_key_version=1, expect_status=409)
         assert c.status_code == 409, c.text
         # The same content at the current epoch succeeds and is tagged 2.
-        fid = _zk_chunked_upload(admin, vid, b"fresh", zk_key_version=2)
+        fid = _zk_chunked_upload(admin, vid, b"fresh" * 6, zk_key_version=2)
         listed = next(it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == fid)
         assert listed["key_version"] == 2
     finally:
@@ -304,7 +306,7 @@ def test_unrotated_vault_tags_epoch_1(admin):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        fid = _zk_chunked_upload(admin, vid, b"hello", zk_key_version=1)
+        fid = _zk_chunked_upload(admin, vid, b"hello" * 6, zk_key_version=1)
         listed = next(it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it["id"] == fid)
         assert listed["key_version"] == 1
         keys = admin.get(f"/ecc/vaults/{vid}/keys").json()
@@ -351,7 +353,7 @@ def test_retire_version_keeps_epochs_still_in_use(admin):
         # file below.
         vid = create_zk_vault(admin, seal_name=False)["id"]
     try:
-        _zk_chunked_upload(admin, vid, b"old-epoch-file", zk_key_version=1)  # file pins epoch 1
+        _zk_chunked_upload(admin, vid, b"old-epoch-file" * 2, zk_key_version=1)  # file pins epoch 1
         admin.post(f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
@@ -528,7 +530,7 @@ def test_epochless_upload_is_refused_before_a_byte_is_sent(admin):
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
-        r = _zk_chunked_upload(admin, vid, b"epochless", zk_key_version=None,
+        r = _zk_chunked_upload(admin, vid, b"epochless" * 4, zk_key_version=None,
                                expect_init_status=400)
         assert "zk_key_version" in r.text, r.text
     finally:
@@ -554,14 +556,14 @@ def test_a_session_opened_without_an_epoch_is_still_refused_at_completion(admin)
         name = unique("zk") + ".bin"
         fid = str(_uuid.uuid4())
         r = admin.post(f"/vaults/{vid}/uploads", json={
-            "total_size": 9, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
+            "total_size": 36, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
             "enc_name": zk_encrypt_name(name, dek, vid, "name", 1, obj_id=fid),
             "name_bi": zk_name_blind_index(name, dek, vid, 1),
             "zk_key_version": 1, "file_id": fid, "blob_id": _uuid.uuid4().hex,
         })
         r.raise_for_status()
         sid = r.json()["session_id"]
-        admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=b"epochless",
+        admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0", data=b"epochless" * 4,
                   headers={"Content-Type": "application/octet-stream"})
 
         # Put the session into the state a pre-requirement client would have left it in.

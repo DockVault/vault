@@ -241,6 +241,55 @@ def test_what_an_entry_replaces_travels_on_the_entry_and_each_entry_resolves_its
     assert code.index("entry.replaces.cancelItemIds =") < code.index("for (const entry of toUpload) {\n                    const mime")
 
 
+def test_every_live_upload_of_the_name_is_a_victim_run_against_the_shipped_scan():
+    # The textual pin above catches a `.find`, but not a truncation that keeps `.filter` (say
+    # `.slice(0, 1)`): the ALL-matches property has to be shown, not spelled. So the shipped scan is
+    # lifted out of uploadFiles verbatim, with the shipped pending-predicate, and run under Node over
+    # a tray holding TWO live uploads of one name. Both must become victims of EVERY entry that
+    # replaces that name -- and nothing else may: not another name, not a finished or cancelled
+    # upload, not another vault or folder. (mutation: `.slice(0, 1)` -> red; `.find` -> red.)
+    node = shutil.which("node")
+    assert node, "Node is required: the victim scan must not be skipped"
+    js = APPJS.read_text(encoding="utf-8")
+    pending = re.search(r"const _pendingUpload = \(it\) => [^\n]*;", js)
+    assert pending, "the pending-upload predicate moved"
+    start = js.index("    for (const entry of toUpload) {\n        if (!entry.replaces || !entry.replaces.inFlightName) continue;")
+    scan = js[start:js.index("\n    }\n", start) + 6]
+    harness = """
+const state = { currentVault: { id: 'V' } };
+const _curFolder = null;
+""" + pending.group(0) + """
+const mk = (id, name, extra) => Object.assign(
+    { id, vaultId: 'V', folderId: null, fileName: name, status: 'uploading', cancelled: false }, extra || {});
+const uploadManager = { items: new Map([
+    ['a', mk('a', 'X')], ['b', mk('b', 'X', { status: 'queued' })],   // two LIVE uploads of X
+    ['c', mk('c', 'Y')],                                              // another name
+    ['d', mk('d', 'X', { status: 'done' })],                          // finished
+    ['e', mk('e', 'X', { status: 'error' })],                         // failed
+    ['f', mk('f', 'X', { cancelled: true })],                         // cancelled
+    ['g', mk('g', 'X', { vaultId: 'OTHER' })],                        // another vault
+    ['h', mk('h', 'X', { folderId: 'F2' })],                          // another folder
+]) };
+const toUpload = [
+    { name: 'X', replaces: { inFlightName: 'X' } },
+    { name: 'X', replaces: { inFlightName: 'X' } },                   // a second entry of the same name
+    { name: 'Z', replaces: { deleteId: '1' } },                       // replaces a committed row: no scan
+    { name: 'Q' },                                                    // replaces nothing
+];
+""" + scan + """
+process.stdout.write(JSON.stringify(
+    toUpload.map(e => (e.replaces && e.replaces.cancelItemIds) ? e.replaces.cancelItemIds : null)));
+"""
+    done = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    first, second, committed, plain = json.loads(done.stdout)
+    assert sorted(first) == ["a", "b"], f"not every live upload of the name is a victim: {first}"
+    # The second entry of the same name resolves its OWN full list: refusing the first must not
+    # cost the second its cancel.
+    assert sorted(second) == ["a", "b"], second
+    assert committed is None and plain is None
+
+
 def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everything():
     # THE FIRE POINT. An original is deleted, and an in-flight upload cancelled, only when the server
     # holds EVERY chunk and exactly the declared bytes -- after the last chunk, before the commit.

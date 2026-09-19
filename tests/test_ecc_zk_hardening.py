@@ -144,7 +144,7 @@ def test_ecc_zk_download_serves_neutral_mime(admin):
     vid = vz["id"]
     try:
         dek = os.urandom(32)
-        fid = zk_chunked_upload(admin, vid, "secret.pdf", b"opaque-ciphertext", dek,
+        fid = zk_chunked_upload(admin, vid, "secret.pdf", b"opaque-ciphertext" * 2, dek,
                                 mime="application/pdf", file_id=str(uuid.uuid4()))
         # Simulate a legacy row: a server-readable plaintext mime_type.
         _psql_must_work(f"UPDATE files SET mime_type='application/pdf' WHERE id='{fid}';",

@@ -1,0 +1,98 @@
+"""No test fabricates a zero-knowledge upload body the server would refuse.
+
+A zero-knowledge upload declares an attempt token, and the server refuses such a session a first
+chunk shorter than 28 bytes -- the smallest real body is a 12-byte nonce plus a 16-byte tag. Test
+helpers fabricate bodies, and a short one surfaces as a 409 on the first chunk deep inside a test
+about something else. Worse, the API suite stops at its first failure, so ONE short caller hides
+every other: that is how a dozen call sites went unnoticed behind the one that sorted first.
+
+The helpers refuse a short body at run time, but those tests need a running stack. This is the
+half that needs nothing: every call site that passes a LITERAL body is read from the source and
+measured here, in the offline lane.
+"""
+import ast
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+TESTS = Path(__file__).resolve().parent
+MIN_FIRST_CHUNK = 28
+
+#: helper -> index of its `content` positional argument
+HELPERS = {
+    "zk_chunked_upload": 3,     # (client, vault_id, name, content, dek, ...)
+    "_zk_chunked_upload": 2,    # (client, vid, content, ...)
+    "_zk_pw_upload": 3,         # (client, vid, name, content, dek, pw)
+    "_upload_named": 4,         # (admin, vid, name, dek, content, epoch, ...)
+}
+
+
+def _literal_bytes(node):
+    """The bytes a literal expression denotes, or None when it is not a literal we can measure."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        for data, times in ((node.left, node.right), (node.right, node.left)):
+            base = _literal_bytes(data)
+            if base is not None and isinstance(times, ast.Constant) and isinstance(times.value, int):
+                return base * times.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _literal_bytes(node.left), _literal_bytes(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _call_sites():
+    for path in sorted(TESTS.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name not in HELPERS:
+                continue
+            index = HELPERS[name]
+            arg = node.args[index] if len(node.args) > index else next(
+                (kw.value for kw in node.keywords if kw.arg == "content"), None)
+            if arg is not None:
+                yield path.name, node.lineno, name, arg
+
+
+def test_the_scan_sees_the_call_sites_it_is_meant_to_measure():
+    # Guard against vacuity: a rename of a helper, or a change to its signature, would otherwise
+    # leave the check below passing on nothing.
+    sites = list(_call_sites())
+    measured = [s for s in sites if _literal_bytes(s[3]) is not None]
+    assert len(sites) >= 30, f"only {len(sites)} zero-knowledge upload call sites were found"
+    assert len(measured) >= 20, f"only {len(measured)} of them pass a measurable literal body"
+    assert {s[2] for s in sites} == set(HELPERS), "a zero-knowledge upload helper is no longer called"
+    assert _literal_bytes(ast.parse('b"ab" * 3 + b"c"', mode="eval").body) == b"abababc"
+
+
+def test_no_call_site_fabricates_a_first_chunk_the_server_would_refuse():
+    short = [f"{file}:{line} {helper}(... {len(_literal_bytes(arg))} bytes ...)"
+             for file, line, helper, arg in _call_sites()
+             if _literal_bytes(arg) is not None and len(_literal_bytes(arg)) < MIN_FIRST_CHUNK]
+    assert not short, (
+        f"a zero-knowledge upload's first chunk must be at least {MIN_FIRST_CHUNK} bytes (a 12-byte "
+        "nonce + a 16-byte tag is the smallest real body; the server refuses a shorter one for a "
+        "session that declared an attempt token):\n  " + "\n  ".join(short))
+
+
+def test_every_helper_refuses_a_short_body_at_the_call_site():
+    # The run-time half, pinned on the source: each helper checks the body BEFORE it opens a
+    # session, so a short fabrication fails where it was written, with the reason, in any lane.
+    conftest = (TESTS / "conftest.py").read_text(encoding="utf-8")
+    assert "ZK_MIN_FIRST_CHUNK = 28" in conftest
+    shared = conftest[conftest.index("def zk_chunked_upload("):]
+    assert shared.index("require_zk_first_chunk(content[:chunk_size])") < shared.index('client.post(f"/vaults/')
+    for file, helper in (("test_zk_dek_rotation.py", "_zk_chunked_upload"),
+                         ("test_api_zk_vault.py", "_zk_pw_upload"),
+                         ("test_zk_name_index_dual_read.py", "_upload_named")):
+        src = (TESTS / file).read_text(encoding="utf-8")
+        body = src[src.index(f"def {helper}("):]
+        body = body[:body.index("\ndef ", 1)] if "\ndef " in body[1:] else body
+        assert "require_zk_first_chunk(content)" in body, f"{file}: {helper} does not check its body"

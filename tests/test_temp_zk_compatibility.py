@@ -912,7 +912,7 @@ def test_new_zk_object_scoped_mint_is_rejected_atomically(
                     owner,
                     vault["id"],
                     "new-object-mint.txt",
-                    b"opaque-new-object-mint",
+                    b"opaque-new-object-mint" * 2,
                     name_key,
                 )
             )
@@ -1055,7 +1055,7 @@ def test_live_scope_change_to_zk_object_scope_denies_further_key_release(
                     owner,
                     vault["id"],
                     "allowed.txt",
-                    b"opaque-a",
+                    b"opaque-a" * 4,
                     name_key,
                 )
             )
@@ -1064,7 +1064,7 @@ def test_live_scope_change_to_zk_object_scope_denies_further_key_release(
                     owner,
                     vault["id"],
                     "hidden.txt",
-                    b"opaque-b",
+                    b"opaque-b" * 4,
                     name_key,
                 )
             )

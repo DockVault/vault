@@ -45,7 +45,7 @@ def test_zk_unsealed_count_detects_a_legacy_row(admin):
         with _zk_on(admin):
             v = create_zk_vault(admin)
             vid = v["id"]
-            fid = zk_chunked_upload(admin, vid, "secret.txt", b"hello zk world", dek)
+            fid = zk_chunked_upload(admin, vid, "secret.txt", b"hello zk world, as opaque bytes", dek)
         base = admin.get("/zk/unsealed").json()
         assert set(base) >= {"zk_vaults", "files_unsealed", "folders_unsealed", "vaults_affected"}
         assert base["zk_vaults"] >= 1

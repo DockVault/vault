@@ -34,6 +34,11 @@ def _init(admin, vault_id, **extra):
 
 
 _UNSET = object()   # "not specified" -- distinct from an explicit None, which means "omit it"
+# What a zero-knowledge session here declares and sends. A session that declares an attempt token is
+# refused a first chunk under 28 bytes (a 12-byte nonce + a 16-byte tag is the smallest real body),
+# so the fabricated body clears that bar with room for a delivery that is short of it but still
+# long enough to be a first chunk at all.
+_ZK_BODY = b"opaque-ciphertext-bytes-for-tests-0123456789"   # 44 bytes
 _BI = uuid.uuid4().hex
 
 
@@ -66,7 +71,7 @@ def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1, resume=
     import base64
 
     body = {
-        "total_size": 11, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
+        "total_size": len(_ZK_BODY), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
         "enc_name": "zk2:" + base64.b64encode(b"sealed-name").decode(),
         "enc_mime": "zk2:" + base64.b64encode(b"sealed-mime").decode(),
         "name_bi": name_bi,
@@ -274,7 +279,7 @@ def test_an_encrypted_upload_is_protected_too(admin):
     try:
         declared = uuid.uuid4()
         r = admin.post(f"/vaults/{vid}/uploads", json={
-            "total_size": 11, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
+            "total_size": len(_ZK_BODY), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
             "enc_name": "zk2:" + base64.b64encode(b"sealed-name").decode(),
             "enc_mime": "zk2:" + base64.b64encode(b"sealed-mime").decode(),
             "name_bi": uuid.uuid4().hex,
@@ -285,7 +290,7 @@ def test_an_encrypted_upload_is_protected_too(admin):
         assert r.status_code in (200, 201), r.text
         sid = r.json()["session_id"]
         assert admin.put(f"/vaults/{vid}/uploads/{sid}/chunks/0",
-                         data=b"ciphertext!").status_code in (200, 201)
+                         data=_ZK_BODY).status_code in (200, 201)
 
         wrong = admin.post(f"/vaults/{vid}/uploads/{sid}/complete",
                            json={"file_id": str(uuid.uuid4())})
@@ -427,9 +432,10 @@ def test_a_short_delivery_is_refused_instead_of_stored(admin, zk_vault):
     assert r.status_code in (200, 201), r.text
     sid = r.json()["session_id"]
 
-    # One chunk, short of the 11 bytes the session declared.
+    # One chunk, short of the bytes the session declared -- but still long enough to be a first
+    # chunk at all, so what is refused is the SHORT DELIVERY at commit, not the chunk on arrival.
     assert admin.put(f"/vaults/{zk_vault}/uploads/{sid}/chunks/0",
-                     data=b"short").status_code in (200, 201)
+                     data=_ZK_BODY[:30]).status_code in (200, 201)
 
     done = admin.post(f"/vaults/{zk_vault}/uploads/{sid}/complete",
                       json={"file_id": str(declared)})

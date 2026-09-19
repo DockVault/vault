@@ -230,6 +230,25 @@ def zk_name_blind_index(name: str, dek: bytes, vault_id, epoch) -> str:
     return _hmac.new(bi_key, str(name).encode(), _hashlib.sha256).hexdigest()
 
 
+#: A zero-knowledge upload declares an attempt token, and the server refuses such a session a FIRST
+#: CHUNK shorter than this: the smallest real body is a 12-byte nonce plus a 16-byte tag, and a
+#: shorter first chunk could carry a version-2 header past the token comparison in pieces.
+ZK_MIN_FIRST_CHUNK = 28
+
+
+def require_zk_first_chunk(first_chunk: bytes) -> None:
+    """Fail at the CALL SITE when a test fabricates a zero-knowledge body below the server's bar.
+
+    Without this the fabrication surfaces as a 409 on the first chunk, deep inside a test that is
+    about something else -- and, since the suite stops at its first failure, it hides every other
+    caller that has the same problem behind whichever one happens to sort first.
+    """
+    assert len(first_chunk) >= ZK_MIN_FIRST_CHUNK, (
+        f"a zero-knowledge upload's first chunk must be at least {ZK_MIN_FIRST_CHUNK} bytes "
+        f"(a 12-byte nonce + a 16-byte tag is the smallest real body; the server refuses a shorter "
+        f"one for a session that declared an attempt token) -- this one is {len(first_chunk)}")
+
+
 def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/plain",
                       folder_id=None, chunk_size=None, file_id=None):
     """Upload a file to a ZERO-KNOWLEDGE vault the browser way: the name + MIME are encrypted
@@ -242,6 +261,7 @@ def zk_chunked_upload(client, vault_id, name, content, dek, epoch=1, mime="text/
     on write, and the anti-transposition property went untested on every call site that did not
     opt in."""
     chunk_size = chunk_size or max(1, len(content))
+    require_zk_first_chunk(content[:chunk_size])
     total_chunks = max(1, (len(content) + chunk_size - 1) // chunk_size)
     declared_id = file_id or uuid.uuid4()
     init = client.post(f"/vaults/{vault_id}/uploads", json={

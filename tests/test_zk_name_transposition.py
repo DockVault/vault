@@ -63,8 +63,8 @@ def test_zk_v2_file_name_not_transposable(admin):
         dek = os.urandom(32)
         fid_a, fid_b = str(uuid.uuid4()), str(uuid.uuid4())
         name_a, name_b = unique("A"), unique("B")
-        got_a = zk_chunked_upload(admin, vid, name_a, b"a" * 16, dek, epoch=1, file_id=fid_a)
-        got_b = zk_chunked_upload(admin, vid, name_b, b"b" * 16, dek, epoch=1, file_id=fid_b)
+        got_a = zk_chunked_upload(admin, vid, name_a, b"a" * 32, dek, epoch=1, file_id=fid_a)
+        got_b = zk_chunked_upload(admin, vid, name_b, b"b" * 32, dek, epoch=1, file_id=fid_b)
         assert got_a == fid_a and got_b == fid_b, "server must honour the client-supplied file ids"
 
         enc_a = _psql(f"SELECT enc_name FROM files WHERE id='{fid_a}'")
@@ -130,8 +130,8 @@ def test_zk_v1_name_is_transposable_control(admin):
     try:
         dek = os.urandom(32)
         name_a, name_b = unique("va"), unique("vb")
-        fid_a = zk_chunked_upload(admin, vid, name_a, b"a" * 16, dek, epoch=1)
-        fid_b = zk_chunked_upload(admin, vid, name_b, b"b" * 16, dek, epoch=1)
+        fid_a = zk_chunked_upload(admin, vid, name_a, b"a" * 32, dek, epoch=1)
+        fid_b = zk_chunked_upload(admin, vid, name_b, b"b" * 32, dek, epoch=1)
 
         # Age the two rows back to the unbound form (obj_id omitted => v1).
         for fid, nm in ((fid_a, name_a), (fid_b, name_b)):

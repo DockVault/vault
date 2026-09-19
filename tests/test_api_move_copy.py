@@ -241,7 +241,7 @@ def test_zk_vault_copy_is_refused_both_directions(admin):
     zk = create_zk_vault(admin, name=unique("zk"))
     dek = bytes(range(32))
     std_file = _upload(admin, std["id"], unique("s") + ".txt", b"standard bytes")
-    zk_file = zk_chunked_upload(admin, zk["id"], unique("z") + ".txt", b"zk-ciphertext-bytes", dek)
+    zk_file = zk_chunked_upload(admin, zk["id"], unique("z") + ".txt", b"zk-ciphertext-bytes" * 2, dek)
     try:
         # Standard file INTO a ZK vault → refused (dest cannot be re-encrypted server-side).
         r = admin.post(f"/vaults/{std['id']}/files/{std_file}/copy",

@@ -712,7 +712,7 @@ def test_zk_seal_names_migrates_legacy_plaintext(admin):
         # Create a sealed file, then force it back to a LEGACY plaintext shape in the DB to
         # stand in for a row written before this feature existed.
         legacy = unique("LEGACY") + ".txt"
-        fid = zk_chunked_upload(admin, vid, legacy, b"y" * 16, dek, epoch=1)
+        fid = zk_chunked_upload(admin, vid, legacy, b"y" * 32, dek, epoch=1)
         _zk_db_scalar(
             f"UPDATE files SET original_name='{legacy}', \"name\"='{legacy}', enc_name=NULL, "
             f"enc_mime=NULL, name_bi=NULL WHERE id='{fid}'; SELECT '1'"
@@ -791,7 +791,7 @@ def test_zk_rename_rejects_plaintext_and_unsealed(admin):
         vid = create_zk_vault(admin)["id"]
     try:
         dek = _os.urandom(32)
-        fid = zk_chunked_upload(admin, vid, unique("o") + ".txt", b"x" * 16, dek, epoch=1)
+        fid = zk_chunked_upload(admin, vid, unique("o") + ".txt", b"x" * 32, dek, epoch=1)
         nm = unique("new") + ".txt"
         # plaintext new_name present -> 400
         assert admin.put(f"/vaults/{vid}/files/{fid}/rename", json={
@@ -875,7 +875,7 @@ def test_zk_seal_names_ignores_unsealed_marker(admin):
     try:
         dek = _os.urandom(32)
         legacy = unique("L") + ".txt"
-        fid = zk_chunked_upload(admin, vid, legacy, b"y" * 16, dek, epoch=1)
+        fid = zk_chunked_upload(admin, vid, legacy, b"y" * 32, dek, epoch=1)
         _zk_db_scalar(
             f"UPDATE files SET original_name='{legacy}', \"name\"='{legacy}', enc_name=NULL, "
             f"name_bi=NULL WHERE id='{fid}'; SELECT '1'"
@@ -908,7 +908,7 @@ def test_zk_seal_names_works_on_password_protected_vault(admin):
         dek = _os.urandom(32)
         legacy = unique("PWLEG") + ".txt"
         # upload (with password) then force it back to a legacy plaintext shape
-        fid = _zk_pw_upload(admin, vid, legacy, b"z" * 16, dek, pw)
+        fid = _zk_pw_upload(admin, vid, legacy, b"z" * 32, dek, pw)
         _zk_db_scalar(
             f"UPDATE files SET original_name='{legacy}', \"name\"='{legacy}', enc_name=NULL, "
             f"name_bi=NULL WHERE id='{fid}'; SELECT '1'"
@@ -989,6 +989,8 @@ def test_zk_name_crypto_parity_with_browser_lib():
 def _zk_pw_upload(client, vid, name, content, dek, pw, epoch=1):
     """zk_chunked_upload variant that carries the vault password header on every call."""
     import uuid as _uuid
+    from conftest import require_zk_first_chunk
+    require_zk_first_chunk(content)
     PW = {"X-Vault-Password": pw}
     obj_id = str(_uuid.uuid4())
     init = client.post(f"/vaults/{vid}/uploads", headers=PW, json={

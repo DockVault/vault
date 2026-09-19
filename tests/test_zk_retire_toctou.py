@@ -90,7 +90,7 @@ def test_zk_rename_serializes_with_retire(admin):
         vid = create_zk_vault(admin, name=unique("zk"))["id"]
     try:
         dek = os.urandom(32)
-        fid = zk_chunked_upload(admin, vid, unique("orig") + ".txt", b"x" * 16, dek, epoch=1)
+        fid = zk_chunked_upload(admin, vid, unique("orig") + ".txt", b"x" * 32, dek, epoch=1)
         newname = unique("ren") + ".txt"
         payload = {"enc_name": zk_encrypt_name(newname, dek, vid, "name", 1, obj_id=fid),
                    "name_bi": zk_name_blind_index(newname, dek, vid, 1)}

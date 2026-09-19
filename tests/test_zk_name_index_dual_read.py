@@ -58,6 +58,8 @@ def _rekey_to(admin, vid, from_v, to_v):
 def _upload_named(admin, vid, name, dek, content, epoch, candidates=None):
     """A single-chunk ZK upload of a FIXED name at a given epoch, optionally sending the candidate
     match set. Returns the file id."""
+    from conftest import require_zk_first_chunk
+    require_zk_first_chunk(content)   # a declared-token session is refused a shorter first chunk
     obj_id = str(uuid.uuid4())
     init = {
         "total_size": len(content), "total_chunks": 1, "chunk_size": 5 * 1024 * 1024,
@@ -120,13 +122,13 @@ def test_candidates_replace_a_pre_rotation_file_instead_of_duplicating_it(admin,
     bi2 = zk_name_blind_index(name, dek, vid, 2)
     assert bi1 != bi2, "the two epochs must produce different indices, or there is nothing to fix"
 
-    _upload_named(admin, vid, name, dek, b"epoch-1 content", epoch=1)
+    _upload_named(admin, vid, name, dek, b"epoch-1 content" * 2, epoch=1)
     assert _count_named(vid, [bi1, bi2]) == 1
 
     _rekey_to(admin, vid, 1, 2)
 
     # The client sends every epoch's candidate; the current-epoch value is the stored one.
-    _upload_named(admin, vid, name, dek, b"epoch-2 content", epoch=2, candidates=[bi1, bi2])
+    _upload_named(admin, vid, name, dek, b"epoch-2 content" * 2, epoch=2, candidates=[bi1, bi2])
 
     # Exactly one row for this name survives — the epoch-1 file was replaced, not duplicated.
     assert _count_named(vid, [bi1, bi2]) == 1, "the pre-rotation file was not replaced"
@@ -146,9 +148,9 @@ def test_without_candidates_the_pre_rotation_file_is_still_missed(admin, zk_vaul
     bi1 = zk_name_blind_index(name, dek, vid, 1)
     bi2 = zk_name_blind_index(name, dek, vid, 2)
 
-    _upload_named(admin, vid, name, dek, b"epoch-1 content", epoch=1)
+    _upload_named(admin, vid, name, dek, b"epoch-1 content" * 2, epoch=1)
     _rekey_to(admin, vid, 1, 2)
-    _upload_named(admin, vid, name, dek, b"epoch-2 content", epoch=2)  # no candidates
+    _upload_named(admin, vid, name, dek, b"epoch-2 content" * 2, epoch=2)  # no candidates
 
     # Two rows, one per epoch's index — the duplicate the candidate path prevents.
     assert _count_named(vid, [bi1, bi2]) == 2, "without candidates the clash should be missed"
@@ -179,9 +181,9 @@ def test_rename_into_a_pre_rotation_name_is_caught_with_candidates(admin, zk_vau
     keep_bi1 = zk_name_blind_index(keep, dek, vid, 1)
     keep_bi2 = zk_name_blind_index(keep, dek, vid, 2)
 
-    _upload_named(admin, vid, keep, dek, b"the original keep", epoch=1)
+    _upload_named(admin, vid, keep, dek, b"the original keep" * 2, epoch=1)
     _rekey_to(admin, vid, 1, 2)
-    other_id = _upload_named(admin, vid, other, dek, b"a second file", epoch=2)
+    other_id = _upload_named(admin, vid, other, dek, b"a second file" * 3, epoch=2)
 
     # With candidates covering epoch 1, renaming `other` -> `keep` is caught (400/409).
     r = _rename(admin, vid, other_id, keep, dek, epoch=2, candidates=[keep_bi1, keep_bi2])
@@ -200,9 +202,9 @@ def test_rename_without_candidates_still_misses_the_pre_rotation_name(admin, zk_
     other = unique("otherc") + ".txt"
     keep_bi1 = zk_name_blind_index(keep, dek, vid, 1)
 
-    _upload_named(admin, vid, keep, dek, b"original", epoch=1)
+    _upload_named(admin, vid, keep, dek, b"original" * 4, epoch=1)
     _rekey_to(admin, vid, 1, 2)
-    other_id = _upload_named(admin, vid, other, dek, b"second", epoch=2)
+    other_id = _upload_named(admin, vid, other, dek, b"second" * 5, epoch=2)
 
     r = _rename(admin, vid, other_id, keep, dek, epoch=2)  # no candidates
     assert r.status_code == 200, r.text
