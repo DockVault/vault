@@ -2306,29 +2306,45 @@ class ECCCryptoLibrary {
     /**
      * Re-open an interrupted encryption of the SAME plaintext, to seal the frames still missing.
      *
-     * `state` is what a session's own resumeState() returned -- the writer's record of an attempt
-     * it minted, not a token a caller composed. Each frame authenticates alone under its index, so
-     * sealing only the missing ones under the same token yields a file that opens; what must never
-     * happen is two DIFFERENT plaintexts sharing a token (their frames would substitute for one
-     * another). So this refuses outright when the blob is not the size the attempt was opened
-     * with, and the caller is expected to have checked the frames already delivered against
-     * frameMac() before trusting that the content is the same. Anything that does not check out
-     * is a new attempt: call startContentV2Encryption and open a new upload.
+     * `state` is what a session's own resumeState() returned, together with the per-frame MACs the
+     * caller kept as frames were sealed (`frameMacs`, indexed by frame, null where none was sealed)
+     * -- the writer's record of an attempt it minted, not a token a caller composed. Each frame
+     * authenticates alone under its index, so sealing only the missing ones under the same token
+     * yields a file that opens; what must never happen is two DIFFERENT plaintexts sharing a token
+     * (their frames would substitute for one another at equal indices).
+     *
+     * Size alone does not rule that out -- two different files can be the same size, and a File
+     * handle can point at edited bytes -- so the resumed session ENFORCES the stored MACs itself:
+     * sealFrame(i) computes the frame's MAC anyway, and refuses (CONTENT_INVALID) to emit a frame
+     * whose plaintext is not what that index was first sealed from. A forged list cannot steer it,
+     * since forging a MAC needs the vault key. Frames the server already holds are never re-sealed,
+     * so the caller still re-reads those with frameMac() before trusting them. Anything that does
+     * not check out is a new attempt: startContentV2Encryption, and a new upload.
      */
     async resumeContentV2Encryption(blob, vaultDEK, context, state) {
         const W = 'resumeContentV2Encryption';
         try {
             const s = state || {};
             if (s.v !== 1 || typeof s.blobId !== 'string' || !/^[0-9a-f]{32}$/.test(s.blobId)
-                    || !Number.isSafeInteger(s.totalPlaintext)) {
+                    || !Number.isSafeInteger(s.totalPlaintext) || !Number.isSafeInteger(s.totalChunks)
+                    || !Number.isSafeInteger(s.chunkSize) || s.chunkSize <= 0
+                    || !Array.isArray(s.frameMacs) || s.frameMacs.length > s.totalChunks
+                    || !s.frameMacs.every(m => m == null
+                        || (typeof m === 'string' && /^[0-9a-f]{64}$/.test(m)))) {
                 this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.state');
+            }
+            // The framing the attempt was opened with, re-derived rather than trusted: a stored
+            // chunk size that is merely in range would otherwise silently reshape every frame.
+            if (Math.max(1, Math.ceil(s.totalPlaintext / s.chunkSize)) !== s.totalChunks) {
+                this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.totalChunks');
             }
             if (!blob || blob.size !== s.totalPlaintext) {
                 this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.size');
             }
             const token = new Uint8Array(16);
             for (let i = 0; i < 16; i++) token[i] = parseInt(s.blobId.substr(i * 2, 2), 16);
-            return await this._v2ContentSession(W, blob, vaultDEK, context, s.chunkSize, token);
+            return await this._v2ContentSession(
+                W, blob, vaultDEK, context, s.chunkSize, token, s.frameMacs.slice());
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, W);
         }
@@ -2339,7 +2355,7 @@ class ECCCryptoLibrary {
      * read from the blob, sealed, handed back and forgotten.
      * @private
      */
-    async _v2ContentSession(W, blob, vaultDEK, context, chunkSizeIn, blobIdBytes) {
+    async _v2ContentSession(W, blob, vaultDEK, context, chunkSizeIn, blobIdBytes, expectedMacs) {
         if (!blob || typeof blob.slice !== 'function'
             || !Number.isSafeInteger(blob.size) || blob.size < 0) {
             this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, W + '.blob');
@@ -2389,16 +2405,23 @@ class ECCCryptoLibrary {
             header: () => new Uint8Array(t.fileHeader),
             frameLength: (i) => OVER + plainLength(at(i)),
             // One read serves both: the sealed frame to send, and the keyed MAC of its PLAINTEXT
-            // that a later resume checks the same file against.
+            // that a later resume checks the same file against. On a RESUMED session the MAC is
+            // checked BEFORE anything is sealed: a frame whose plaintext is not what this index was
+            // first sealed from is never emitted under the reused token.
             sealFrame: (i) => guard(async () => {
                 at(i);
-                let plain = null;
-                const f = await this._sealV2Frame(key, t, totals, n, i,
-                    async () => { plain = await read(i); return plain; });
-                return { frame: this._concatBytes([f.nonce, f.sealed]), mac: await mac(i, plain) };
+                const plain = await read(i);
+                const m = await mac(i, plain);
+                if (expectedMacs && expectedMacs[i] != null && expectedMacs[i] !== m) {
+                    this._fail(CRYPTO_ERROR_CODES.CONTENT_INVALID, W + '.frameChanged');
+                }
+                const f = await this._sealV2Frame(key, t, totals, n, i, () => plain);
+                return { frame: this._concatBytes([f.nonce, f.sealed]), mac: m };
             }),
             frameMac: (i) => guard(async () => mac(at(i), await read(i))),
-            resumeState: () => ({ v: 1, blobId: blobIdHex, chunkSize, totalPlaintext: total }),
+            resumeState: () => ({
+                v: 1, blobId: blobIdHex, chunkSize, totalPlaintext: total, totalChunks: n,
+            }),
         });
     }
 

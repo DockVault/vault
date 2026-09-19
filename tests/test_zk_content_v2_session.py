@@ -114,30 +114,68 @@ def test_a_resumed_session_reseals_a_missing_frame_into_a_file_that_still_opens(
     # writer's own state. Fresh nonce, same token: each frame authenticates alone under its index.
     out = _node(f"""
   const s1 = await lib.startContentV2Encryption(new Blob([plain]), dek, CTX, {{ chunkSize: {CHUNK} }});
-  const state = JSON.parse(JSON.stringify(s1.resumeState()));
   const f0 = await s1.sealFrame(0), f2 = await s1.sealFrame(2);
+  // What an uploader keeps: the writer's state plus the MACs of the frames it sealed (1 never was).
+  const state = JSON.parse(JSON.stringify({{ ...s1.resumeState(), frameMacs: [f0.mac, null, f2.mac] }}));
   const s2 = await lib.resumeContentV2Encryption(new Blob([plain]), dek, CTX, state);
   const f1 = await s2.sealFrame(1);
+  const again0 = await s2.sealFrame(0);              // same plaintext as first sealed: allowed
   const bytes = Buffer.concat([s1.header(), f0.frame, f1.frame, f2.frame].map(p => Buffer.from(p)));
   const back = new Uint8Array(await lib.decryptFileV2(new Uint8Array(bytes), dek, CTX));
   const other = new Uint8Array(plain.length - 1);
+  const resume = (blob, st) => codeOf(() => lib.resumeContentV2Encryption(blob, dek, CTX, st));
   console.log(JSON.stringify({{
     opens: hex(back) === hex(plain), sameToken: s2.blobId === s1.blobId,
-    sameHeader: hex(s2.header()) === hex(s1.header()),
-    macStable: (await s2.frameMac(1)) === f1.mac && (await s1.frameMac(0)) === f0.mac,
-    wrongSize: await codeOf(() => lib.resumeContentV2Encryption(new Blob([other]), dek, CTX, state)),
-    badState: await codeOf(() => lib.resumeContentV2Encryption(new Blob([plain]), dek, CTX,
-                                                               {{ v: 1, blobId: 'zz', totalPlaintext: plain.length }})),
-    noState: await codeOf(() => lib.resumeContentV2Encryption(new Blob([plain]), dek, CTX, null)),
+    sameHeader: hex(s2.header()) === hex(s1.header()), totalChunks: state.totalChunks,
+    macStable: (await s2.frameMac(1)) === f1.mac && again0.mac === f0.mac,
+    wrongSize: await resume(new Blob([other]), state),
+    badToken: await resume(new Blob([plain]), {{ ...state, blobId: 'zz' }}),
+    noState: await resume(new Blob([plain]), null),
+    noMacList: await resume(new Blob([plain]), s1.resumeState()),
+    longMacList: await resume(new Blob([plain]), {{ ...state, frameMacs: [null, null, null, null] }}),
+    badMac: await resume(new Blob([plain]), {{ ...state, frameMacs: ['nothex'] }}),
+    wrongTotalChunks: await resume(new Blob([plain]), {{ ...state, totalChunks: state.totalChunks + 1 }}),
+    reshapedChunkSize: await resume(new Blob([plain]), {{ ...state, chunkSize: {CHUNK} * 2 }}),
     badIndex: await codeOf(() => s1.sealFrame(3)),
   }}));
 """)
     assert out["opens"] is True and out["sameToken"] is True and out["sameHeader"] is True
-    assert out["macStable"] is True
-    # A different-size file is never sealed under the old token; a malformed state is refused.
+    assert out["macStable"] is True and out["totalChunks"] == 3
+    # A different-size file is never sealed under the old token; a malformed state is refused --
+    # including one with no MAC list at all, which has nothing to hold the content to.
     assert out["wrongSize"] == "INVALID_INPUT"
-    assert out["badState"] == "INVALID_INPUT" and out["noState"] == "INVALID_INPUT"
+    assert out["badToken"] == "INVALID_INPUT" and out["noState"] == "INVALID_INPUT"
+    assert out["noMacList"] == "INVALID_INPUT" and out["longMacList"] == "INVALID_INPUT"
+    assert out["badMac"] == "INVALID_INPUT"
+    # The framing is re-derived, not trusted: a chunk size that is merely in range, or a frame
+    # count that does not follow from it, would silently reshape every frame.
+    assert out["wrongTotalChunks"] == "INVALID_INPUT"
+    assert out["reshapedChunkSize"] == "INVALID_INPUT"
     assert out["badIndex"] == "INVALID_INPUT"
+
+
+def test_a_resumed_session_refuses_to_seal_a_same_size_file_with_different_content():
+    # The hazard is not a different SIZE -- it is two different files of the SAME size sharing a
+    # token, whose frames would substitute for one another at equal indices. The resumed session
+    # holds each frame to the MAC it was first sealed under and refuses to emit one that changed.
+    # (mutation: drop the MAC comparison in sealFrame -> red.)
+    out = _node(f"""
+  const s1 = await lib.startContentV2Encryption(new Blob([plain]), dek, CTX, {{ chunkSize: {CHUNK} }});
+  const macs = []; for (let i = 0; i < s1.totalChunks; i++) macs.push((await s1.sealFrame(i)).mac);
+  const edited = new Uint8Array(plain); edited[{CHUNK} + 5] ^= 0x01;      // same size, frame 1 differs
+  const s2 = await lib.resumeContentV2Encryption(new Blob([edited]), dek, CTX,
+                                                 {{ ...s1.resumeState(), frameMacs: macs }});
+  console.log(JSON.stringify({{
+    unchangedFrame: await codeOf(() => s2.sealFrame(0)),
+    changedFrame: await codeOf(() => s2.sealFrame(1)),
+    // A forged list cannot steer it: a MAC needs the vault key, so a made-up value just refuses.
+    forged: await codeOf(async () => (await lib.resumeContentV2Encryption(new Blob([edited]), dek, CTX,
+        {{ ...s1.resumeState(), frameMacs: [macs[0], 'ab'.repeat(32), macs[2]] }})).sealFrame(1)),
+  }}));
+""")
+    assert out["unchangedFrame"] is None
+    assert out["changedFrame"] == "CONTENT_INVALID"
+    assert out["forged"] == "CONTENT_INVALID"
 
 
 def test_the_frame_mac_is_keyed_per_frame_and_per_attempt_never_a_bare_digest():
@@ -147,7 +185,7 @@ def test_the_frame_mac_is_keyed_per_frame_and_per_attempt_never_a_bare_digest():
   const s2 = await lib.startContentV2Encryption(blob, dek, CTX, {{ chunkSize: {CHUNK} }});
   const dek2 = await webcrypto.subtle.generateKey(
       {{ name: 'AES-GCM', length: 256 }}, true, ['encrypt', 'decrypt']);
-  const s3 = await lib.resumeContentV2Encryption(blob, dek2, CTX, s1.resumeState());
+  const s3 = await lib.resumeContentV2Encryption(blob, dek2, CTX, {{ ...s1.resumeState(), frameMacs: [] }});
   const same = new Uint8Array({CHUNK} * 2);           // two identical all-zero frames
   const sz = await lib.startContentV2Encryption(new Blob([same]), dek, CTX, {{ chunkSize: {CHUNK} }});
   console.log(JSON.stringify({{
