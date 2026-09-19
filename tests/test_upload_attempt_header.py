@@ -68,8 +68,10 @@ def test_the_header_is_28_bytes_with_the_token_last():
     (HEADER[:27] + b"\x00", DECLARED, True),                    # last token byte differs
     (HEADER[:20], DECLARED, True),                              # v2 prefix but a split/short header
     (HEADER[:6], DECLARED, True),
-    (b"\x8a" * 28, DECLARED, False),                            # the SMALLEST legacy body (12-byte nonce +
-                                                                # 16-byte tag) is exactly 28: still accepted
+    # The SMALLEST legacy body is a 12-byte nonce + a 16-byte tag = exactly 28, the same number as
+    # the v2 header by arithmetic, not coincidence of design: if either the nonce or the tag length
+    # ever changes, this row and the 28-byte bar in the module have to be re-examined together.
+    (b"\x8a" * 28, DECLARED, False),
     (b"\x8a" * 4096, DECLARED, False),                          # legacy whole-file format: a random nonce
     (b"DVZ2\x02\x01" + b"\x00" * 22, DECLARED, False),          # another v2 purpose (a wrap), not content
     (b"DVZ1\x02\x04" + b"\x00" * 22, DECLARED, False),

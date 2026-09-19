@@ -17081,6 +17081,10 @@ def _session_payload(session: ChunkedUploadSession, received: int) -> dict:
         'mime_type': session.mime_type,
         'total_chunks': total,
         'chunks_received': received,
+        # The bytes the server holds for this session, the same count each chunk write reports.
+        # A client that replaces something only once EVERYTHING has arrived needs the byte count
+        # as well as the chunk count, and may reach that point without having sent a chunk itself.
+        'bytes_received': session.bytes_received or 0,
         'folder_id': str(session.folder_id) if session.folder_id else None,
         'percent': round(received * 100 / total, 1) if total else 0,
         # Which principal opened it. The owner may cancel any session on their account, and

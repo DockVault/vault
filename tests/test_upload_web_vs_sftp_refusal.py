@@ -117,13 +117,19 @@ def test_the_v2_zk_upload_refuses_over_threshold_before_encrypting_when_buffered
     assert v2.count("zkUploadDecision(") == 1, "more than one call to the decision helper in the v2 branch"
     guard_at = v2.index(_UPLOAD_GUARD_CALL)
     guard_end = guard_at + len(_UPLOAD_GUARD_CALL)
-    # Refuses BEFORE encryption.
-    assert "encryptBlobV2(" not in v2[:guard_at], "encryption is reached before the refusal guard"
-    # The per-entry exit is `continue;`, NOT `return;` (a return abandons the whole batch, discarding
-    # files already sealed), and it comes before the writer call.
+    # Refuses BEFORE encryption. The file is now sealed as it uploads, so this branch seals NOTHING:
+    # no writer is called here at all, nothing is read, no whole ciphertext is built and no attempt
+    # token is minted out here (the uploader's writer session mints it). What is left to order is
+    # the hand-off to the uploader, which must come after the refusal's exit.
+    for never in ("encryptBlobV2(", "startContentV2Encryption(", "encryptFile(", ".arrayBuffer(",
+                  "new File(", "zkNewBlobId(", "entry.blobId"):
+        assert never not in v2, f"the v2 upload branch still does work up front: {never}"
+    # The per-entry exit is `continue;`, NOT `return;` (a return abandons the whole batch), and it
+    # comes before the entry is handed to the uploader.
     continue_at = v2.index("continue;", guard_end)
-    writer_at = v2.index("encryptBlobV2(")
-    assert continue_at < writer_at, "the per-entry refusal must `continue` before encryptBlobV2"
+    writer_at = v2.index("entry.zkPlain = {")
+    assert v2.count("entry.zkPlain = {") == 1
+    assert continue_at < writer_at, "the per-entry refusal must `continue` before the entry is handed on"
     guard_block = v2[guard_at:continue_at]
     assert "return;" not in guard_block, "the guard exits with `return;` -- that abandons the batch"
     # It RECORDS the refusal and never touches the array the for-of is walking (a splice would skip
@@ -185,65 +191,208 @@ process.stdout.write(JSON.stringify(cases));
     assert r["null-over"] == "refuse"               # null !== 'streaming' -> refuse
 
 
-def test_a_refused_entry_and_its_destructive_steps_are_dropped_before_the_enqueue():
-    # The refusal record is enacted ONCE, after the seal loop and before the single enqueue, keyed by
-    # ENTRY IDENTITY: refused entries leave toUpload, their overwrite deletes leave toDelete, and
-    # their in-flight cancels are pruned from cancelVictims. Order: filter -> cancels -> deletes ->
-    # enqueue, so nothing destructive runs before the batch is sealed-and-filtered and the enqueue is
-    # last.
+def _uploader_method(js: str, name: str) -> str:
+    # One method of the upload manager, comment-stripped: from its definition to the next method at
+    # the same indentation.
+    start = js.index(f"    {name}(")
+    m = re.search(r"\n    (?:async )?_?[A-Za-z]\w*\([^)]*\) \{\n", js[start + 1:])
+    assert m, f"could not find the end of {name}"
+    return _strip_line_comments(js[start:start + 1 + m.start()])
+
+
+def test_upload_files_does_nothing_destructive_and_drops_a_refused_entry_before_the_enqueue():
+    # DELIBERATE RE-PIN. This used to pin an ORDER inside uploadFiles (filter, then cancels, then
+    # deletes, then the enqueue), because "ready" meant "sealed" and the batch was sealed up front.
+    # Files are now sealed as they upload, so that order would pass while a transfer that died
+    # halfway had already cost its original. The guarantee is restated per entry: uploadFiles does
+    # NOTHING destructive at all -- each entry carries what it replaces, and the uploader fires it
+    # for that entry alone (pinned below). What stays here is the smoke alarm.
     code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
-    assert "toUpload = toUpload.filter(e => !refused.has(e))" in code, "refused entries are not removed from the batch"
-    assert "toDelete = toDelete.filter(t => !refused.has(t.entry))" in code, "a refused overwrite's delete is not dropped by entry"
-    assert "cancelVictims.filter(v => !refused.has(v.entry))" in code, "a refused replacement's in-flight cancel is not pruned by entry"
-    seal_loop = code[code.index("for (const entry of toUpload)"):
-                     code.index("toUpload = toUpload.filter(e => !refused.has(e))")]
-    assert ".splice(" not in seal_loop, "the seal loop splices the array it is walking"
-    filter_at = code.index("toUpload = toUpload.filter(e => !refused.has(e))")
-    cancel_at = code.index("uploadManager.cancel(v.itemId)")
-    delete_at = code.index("/files/${target.id}/delete")
-    enqueue_at = code.index("uploadManager.enqueueNamed(toUpload)")
-    assert filter_at < cancel_at < delete_at < enqueue_at, (
-        "destructive steps must run after the refusal filter and before the single enqueue")
+    for destructive in ("/delete", "uploadManager.cancel(", ".cancel("):
+        assert destructive not in code, f"uploadFiles performs a destructive step again: {destructive}"
+    # The refusal record is enacted ONCE, after the loop and before the single enqueue, by entry
+    # identity; the loop never splices the array it walks. (mutation: drop the filter, or move it
+    # below the enqueue -> red; splice inside the loop -> red.)
+    drop = "if (refused.size) toUpload = toUpload.filter(e => !refused.has(e));"
+    assert code.count(drop) == 1, "refused entries are not removed from the batch exactly once"
+    assert code.count("uploadManager.enqueueNamed(toUpload)") == 1
+    assert code.index(drop) < code.index("uploadManager.enqueueNamed(toUpload)")
+    seal_loop = code[code.index("for (const entry of toUpload) {\n                    const mime"):code.index(drop)]
+    assert ".splice(" not in seal_loop, "the loop splices the array it is walking"
 
 
-def test_destructive_steps_are_keyed_by_entry_identity_not_name():
-    # One drop can carry two files of the same name (both take the overwrite branch over one committed
-    # original). Keying the refusal / stuck filters by NAME would drop both originals' steps while a
-    # replacement still uploaded -- two rows under one name in a vault whose names the server cannot
-    # see. Every destructive record carries its ENTRY and is filtered by identity.
-    # (mutation: filter toDelete or the stuck set by `.name` -> red.)
+def test_what_an_entry_replaces_travels_on_the_entry_and_each_entry_resolves_its_own_victims():
+    # One drop can carry two files of the same name. Anything keyed by NAME makes them share a
+    # fate, so what an entry replaces is recorded on the entry object itself -- a refused entry is
+    # never enqueued, and its destructive step leaves with it by construction.
     code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
-    assert "toDelete.push({ id, name: file.name, entry })" in code, "the overwrite delete is not tied to its entry"
-    assert "toCancelReq.push({ name: file.name, entry })" in code, "the in-flight cancel request is not tied to its entry"
-    assert "toDelete = toDelete.filter(t => !refused.has(t.entry))" in code
-    # The failed-delete 'stuck' set drops replacements by ENTRY too, not by name.
-    assert "new Set(survived.map(t => t.entry))" in code, "the failed-delete stuck set is keyed by name, not entry"
-    assert "toUpload.filter(e => !stuck.has(e))" in code
+    assert code.count("entry.replaces = id ? { deleteId: id } : { inFlightName: file.name };") == 1
+    # Every entry resolves ALL the live uploads of its name, by item id, itself. Binding a victim to
+    # the FIRST matching request (`find`) loses the second entry's cancel when the first is refused.
+    # (mutation: restore a `find` that pairs one victim to one request -> red.)
+    resolve = code[code.index("for (const entry of toUpload) {\n        if (!entry.replaces"):]
+    resolve = resolve[:resolve.index("\n    }\n") + 6]
+    assert "entry.replaces.cancelItemIds = [...uploadManager.items.values()]" in resolve
+    assert ".filter(it =>" in resolve and ".map(it => it.id)" in resolve
+    assert ".find(" not in resolve, "a victim is paired to a single request again"
+    # RACE: ids are resolved BEFORE any async sealing work, so a later drop of the same name is never
+    # mistaken for the upload the user chose to replace. (mutation: move the resolution below the
+    # loop -> red.)
+    assert code.index("entry.replaces.cancelItemIds =") < code.index("for (const entry of toUpload) {\n                    const mime")
 
 
-def test_in_flight_cancel_victims_are_resolved_before_sealing():
-    # RACE (a): sealing is async, so a second drop of the same name can enqueue a NEW live item while
-    # we seal. Resolving victims to item IDS (stable identities) happens BEFORE the seal loop; only
-    # the cancel CALLS are deferred. A name-matched scan run after the loop would cancel that
-    # bystander. (mutation: move the cancelVictims scan below the seal loop -> red.)
-    code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
-    scan_at = code.index("cancelVictims.push({ itemId: it.id")
-    seal_at = code.index("for (const entry of toUpload)")
-    call_at = code.index("uploadManager.cancel(v.itemId)")
-    assert scan_at < seal_at, "the in-flight victim scan must resolve item ids before the seal loop"
-    assert seal_at < call_at, "the cancel calls must be deferred until after sealing"
+def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everything():
+    # THE FIRE POINT. An original is deleted, and an in-flight upload cancelled, only when the server
+    # holds EVERY chunk and exactly the declared bytes -- after the last chunk, before the commit.
+    # (mutation: fire before the send loop -> red; fire after /complete -> red; drop the
+    # holds-everything check -> red.)
+    js = APPJS.read_text(encoding="utf-8")
+    run = _uploader_method(js, "async _run")
+    send_at = run.index("/chunks/${i}`")
+    holds_at = run.index("if (!(await this._serverHoldsAll(it))) {")
+    fire_at = run.index("if (!(await this._fireReplacement(it))) return;")
+    complete_at = run.index("/complete`")
+    assert send_at < holds_at < fire_at < complete_at, "the destructive step is not at the fire point"
+    assert run.count("this._fireReplacement(it)") == 1 and js.count("this._fireReplacement(it)") == 1
+    assert "if (it.replaces && !it.replacesFired) {" in run
+    # "Holds everything" is the server's OWN count: every chunk, and exactly the declared bytes.
+    holds = _uploader_method(js, "async _serverHoldsAll")
+    assert "return !!s.complete && s.bytes_received === it.totalSize;" in holds
 
 
-def test_a_victim_that_completed_during_sealing_drops_its_replacement():
-    # RACE (b): a victim that finished while we sealed can no longer be cancelled without deleting a
-    # file that already landed. Treat it like a failed overwrite delete -- drop that replacement so
-    # both copies do not land. (mutation: drop the stuck handling -> a completed victim's replacement
-    # stays in the batch -> red.)
-    code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
-    assert "if (!it || !_pendingUpload(it)) { cancelStuck.add(v.entry); continue; }" in code, (
-        "a no-longer-pending victim is not detected")
-    assert "catch (_) { cancelStuck.add(v.entry); }" in code, "a failed cancel is not treated as stuck"
-    assert "toUpload = toUpload.filter(e => !cancelStuck.has(e))" in code, "stuck replacements are not dropped from the batch"
+def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
+    # Never a bare count, never silence: each message names the file, says which copy is on the
+    # server now, and what did not happen. (mutation: a count-only toast -> red.)
+    fire = _uploader_method(APPJS.read_text(encoding="utf-8"), "async _fireReplacement")
+    messages = re.findall(r"_dropReplacement\(it, `(.*?)`\);", fire, re.S)
+    assert len(messages) == 2, "expected one drop message per way a replacement can fail"
+    for msg in messages:
+        assert '"${name}"' in msg, f"a dropped replacement does not name the file: {msg}"
+        assert "not uploaded" in msg, f"the message does not say what did not happen: {msg}"
+        assert ".size" not in msg and ".length" not in msg, f"the message is a bare count: {msg}"
+    # A victim that FINISHED FIRST is told apart from one that was cancelled (both leave the tray):
+    # the landed set is the difference, and landing first drops the replacement, not the landed file.
+    assert "if (this._landed.has(vid)) {" in fire
+    assert fire.index("if (this._landed.has(vid)) {") < fire.index("await this.cancel(vid);")
+    assert 'showInfo(`The earlier upload of "${name}" was cancelled and replaced by this one.`)' in fire
+
+
+def test_a_file_sealed_as_it_uploads_has_no_raw_file_to_send_and_one_session_per_transfer():
+    js = APPJS.read_text(encoding="utf-8")
+    # FAIL CLOSED by construction: `file` is what the send loop slices and sends verbatim, and for a
+    # sealed-as-it-uploads item the only handle there is is the PLAINTEXT -- so it is never put there.
+    # (mutation: keep `file` for such an item -> red.)
+    enqueue = _uploader_method(js, "enqueueNamed")
+    assert "file: zkPlain ? null : file," in enqueue
+    assert "zkPlain: zkPlain || null, zkPipelined: !!zkPlain, zkStream: null, frameMacs: null," in enqueue
+    run = _uploader_method(js, "async _run")
+    raw = run.index("const blob = it.file.slice(start, Math.min(start + it.chunkSize, it.file.size));")
+    branch = run.index("if (it.zkPipelined) {\n")
+    assert branch < run.index("} else {", branch) < raw, "the raw slice is not the non-pipelined branch"
+    # ONE writer session per in-flight upload: opened when THAT transfer starts, never per file in
+    # the drop, and only ever by STARTING an encryption (a continued one goes through the MAC-checked
+    # reopen). (mutation: open sessions in uploadFiles -> red; let _openZkStream resume -> red.)
+    assert js.count("startContentV2Encryption(") == 1
+    opener = _uploader_method(js, "async _openZkStream")
+    assert "it.zkStream = await lib.startContentV2Encryption(it.zkPlain.file, dek, ctx);" in opener
+    assert "resumeContentV2Encryption(" not in opener
+    assert opener.index("if (it.sessionId) {") < opener.index("startContentV2Encryption(")
+    assert "if (it.zkPipelined && !it.zkStream) await this._openZkStream(it);" in run
+    assert js.count("this._openZkStream(it)") == 1
+    # The attempt token declared to the server IS the session's -- one mint, read once.
+    assert "it.blobId = it.zkStream.blobId;" in opener
+    # And the session ends with its transfer.
+    assert "it.zkStream = null; it.zkPlain = null;" in run
+
+
+def test_an_upload_chunk_is_sealed_whole_and_its_macs_are_on_disk_before_it_is_sent():
+    js = APPJS.read_text(encoding="utf-8")
+    run = _uploader_method(js, "async _run")
+    # An UPLOAD CHUNK is the unit of sealing and re-sealing: sealed whole, in one call, every time it
+    # is sent -- a retry never re-seals part of an index. sealFrame is called nowhere else.
+    seal = "buf = await this._sealUploadChunk(it, i);"
+    assert run.count(seal) == 1 and js.count("this._sealUploadChunk(") == 1
+    assert js.count(".sealFrame(") == 1
+    chunk = _uploader_method(js, "async _sealUploadChunk")
+    assert "const [first, last] = zkUploadChunkFrames(index, it.zkStream.totalChunks, ZK_FRAMES_PER_UPLOAD_CHUNK);" in chunk
+    assert "const parts = index === 0 ? [it.zkStream.header()] : [];" in chunk
+    assert "for (let f = first; f < last; f++) {" in chunk and "it.frameMacs[f] = sealed.mac;" in chunk
+    # ORDER: each frame's MAC is persisted BEFORE its bytes go out, so the server never holds a frame
+    # the record cannot vouch for. (mutation: move the persist after the send -> red.)
+    persist = "await this._persistResume(it);"
+    assert run.count(persist) == 1
+    assert run.index(seal) < run.index(persist) < run.index("/chunks/${i}`")
+
+
+def test_a_continued_upload_rereads_every_held_frame_and_anything_unverified_is_a_new_attempt():
+    reopen = _uploader_method(APPJS.read_text(encoding="utf-8"), "async _reopenPipelined")
+    # The FULL stored record goes to the writer (state and MAC list together, from one record).
+    assert "const st = it.zkResume;" in reopen
+    assert "resumeContentV2Encryption(file, dek," in reopen and "dekEpoch: it.zkKeyVersion }, st);" in reopen
+    # Every frame the SERVER holds is read again and held to its stored MAC; a held frame with NO
+    # stored MAC is a MISMATCH, never a skip. (mutation: `if (want && ...)` -> a skip -> red.)
+    assert "for (const index of held) {" in reopen
+    assert "if (!want || (await session.frameMac(f)) !== want) {" in reopen
+    # No list, a different size, a refused state or a changed frame: a NEW attempt, never a merge.
+    assert "if (!st || !Array.isArray(st.frameMacs) || file.size !== st.totalPlaintext) {" in reopen
+    assert reopen.count("this._restartAsNewAttempt(it, file)") == 3
+    # And never a comparison of a freshly computed ciphertext digest with a stored one.
+    assert "sha256Hex" not in reopen and "chunk_checksums" not in reopen
+    restart = _uploader_method(APPJS.read_text(encoding="utf-8"), "async _restartAsNewAttempt")
+    assert "method: 'DELETE'" in restart and "await zkUploadStore.delete(it.sessionId);" in restart
+    assert "it.sessionId = null; it.zkResume = null; it.zkStream = null; it.frameMacs = null;" in restart
+
+
+def test_upload_chunks_are_whole_frames_and_add_up_to_the_declared_length():
+    # The alignment, run offline: every upload chunk is a whole number of sealed frames -- chunk 0
+    # the 28-byte header plus frames, later chunks frames only, the last short -- and the chunks add
+    # up to exactly the ciphertext length the session declares. (mutation: change the chunk size by
+    # one byte -> red.)
+    node = shutil.which("node")
+    assert node, "Node is required: the upload plan must not be skipped"
+    js = APPJS.read_text(encoding="utf-8")
+    fns = []
+    for name in ("zkUploadPlan", "zkUploadChunkFrames"):
+        m = re.search(r"function " + name + r"\([^)]*\) \{.*?\n\}", js, re.S)
+        assert m, name
+        fns.append(m.group(0))
+    m = re.search(r"const ZK_FRAMES_PER_UPLOAD_CHUNK = (\d+);", js)
+    assert m and int(m.group(1)) == 4
+    harness = "\n".join(fns) + """
+const M = 4, CHUNK = 1048576, OVER = 28, HEADER = 28, FRAME = CHUNK + OVER;
+const out = [];
+for (const plain of [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 4 * CHUNK, 4 * CHUNK + 1, 9 * CHUNK + 123]) {
+    const frames = Math.max(1, Math.ceil(plain / CHUNK));
+    const cipher = HEADER + plain + OVER * frames;
+    const plan = zkUploadPlan(FRAME, frames, cipher, M);
+    let sum = 0, seen = 0; const lens = [];
+    for (let i = 0; i < plan.totalChunks; i++) {
+        const [first, last] = zkUploadChunkFrames(i, frames, M);
+        let len = i === 0 ? HEADER : 0;
+        for (let f = first; f < last; f++) len += OVER + (Math.min((f + 1) * CHUNK, plain) - f * CHUNK);
+        seen += last - first; sum += len; lens.push(len);
+    }
+    out.push({ plain, plan, sum, cipher, seen, frames, lens });
+}
+process.stdout.write(JSON.stringify(out));
+"""
+    done = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    for row in json.loads(done.stdout):
+        plan = row["plan"]
+        assert plan["chunkSize"] == 4 * (1048576 + 28) == 4194416      # an exact multiple of one frame
+        assert plan["totalSize"] == row["cipher"] == row["sum"], row   # the chunks ARE the declared file
+        assert row["seen"] == row["frames"], row                        # every frame, exactly once
+        lens = row["lens"]
+        assert len(lens) == plan["totalChunks"]
+        if len(lens) > 1:
+            assert lens[0] == 4194416 + 28 == 4194444                   # chunk 0 carries the header too
+            assert all(n == 4194416 for n in lens[1:-1])
+            assert 0 < lens[-1] <= 4194416
+    # And the uploader takes its declared shape from that plan, with the writer's own overhead.
+    opener = _uploader_method(js, "async _openZkStream")
+    assert "zkUploadPlan(it.zkStream.chunkSize + lib.V2_CONTENT_CHUNK_OVERHEAD," in opener
+    assert "it.zkStream.totalChunks, it.zkStream.ciphertextLength, ZK_FRAMES_PER_UPLOAD_CHUNK);" in opener
 
 
 def test_no_zero_knowledge_refusal_path_names_the_sftp_sync_path():

@@ -15687,6 +15687,10 @@ const transferGate = new TransferGate(5);
 
 const uploadManager = {
     items: new Map(),   // uploadId -> item
+    // Ids of uploads that COMMITTED. A finished row leaves `items` a few seconds later, and so does
+    // a cancelled one -- so "gone" cannot tell a later replacement whether the upload it meant to
+    // replace finished first or was cancelled. This can.
+    _landed: new Set(),
     seq: 0,
 
     // Logout scrub (finding F-R015-004): drop the tray's items + its DOM WITHOUT cancelling — cancel()
@@ -15750,12 +15754,24 @@ const uploadManager = {
         if (!entries || !entries.length || !state.currentVault) return;
         const vaultId = state.currentVault.id;
         const folderId = state.currentFolderId || null;
-        for (const { file, name, keyVersion, encName, encMime, nameBi, nameBiCandidates, clientFileId, blobId }
+        for (const { file, name, keyVersion, encName, encMime, nameBi, nameBiCandidates, clientFileId, blobId,
+                      zkPlain, replaces }
                 of entries) {
             const id = this._newId();
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             this.items.set(id, {
-                id, file, vaultId, folderId,
+                id, vaultId, folderId,
+                // A file sealed AS IT UPLOADS carries no `file` at all: `file` is what the send loop
+                // slices and sends verbatim, and for such an item the only handle there is is the
+                // PLAINTEXT. Keeping it out of `file` makes a raw send of it impossible by
+                // construction rather than by a check someone has to remember. It lives in
+                // `zkPlain`, which only the writer session ever reads.
+                file: zkPlain ? null : file,
+                zkPlain: zkPlain || null, zkPipelined: !!zkPlain, zkStream: null, frameMacs: null,
+                // What this upload replaces, fired for THIS item once the server holds all of it.
+                replaces: replaces || null,
+                // Until the session opens, the size shown is the plaintext's; the declared totals
+                // are the session's (the exact ciphertext length), set when the transfer starts.
                 fileName: name || file.name, totalSize: file.size,
                 totalChunks, chunkSize: CHUNK_SIZE,
                 sessionId: null, received: new Set(),
@@ -15824,6 +15840,31 @@ const uploadManager = {
             if (zk) {
                 // Zero-knowledge: resume only if we still hold the encrypted bytes locally.
                 const rec = await zkUploadStore.get(s.session_id);
+                if (rec && rec.pipelined && rec.resume) {
+                    // Sealed as it uploaded: no ciphertext was ever kept here, only the writer's
+                    // note of the attempt and the per-frame MACs. Continuing needs the FILE again;
+                    // it is checked against those MACs before the old token is reused.
+                    const id = this._newId();
+                    this.items.set(id, {
+                        id, file: null, zkPlain: null, zkStream: null, zkPipelined: true,
+                        zkResume: rec.resume, frameMacs: null, replaces: null,
+                        vaultId, folderId: s.folder_id || null,
+                        fileName: s.file_name
+                            || `(encrypted upload · ${String(s.session_id).slice(0, 8)})`,
+                        totalSize: s.total_size,
+                        totalChunks: s.total_chunks, chunkSize: rec.chunkSize || CHUNK_SIZE,
+                        sessionId: s.session_id, received: new Set(),
+                        status: 'needs-file', error: null, paused: true, cancelled: false,
+                        percent: s.percent || 0, isZk: true,
+                        zkKeyVersion: rec.keyVersion != null ? rec.keyVersion : null,
+                        encName: rec.encName || null, encMime: rec.encMime || null, nameBi: rec.nameBi || null,
+                        nameBiCandidates: rec.nameBiCandidates || null,
+                        clientFileId: rec.clientFileId || null,
+                        blobId: rec.blobId || null,
+                        resumeCreatedAt: rec.createdAt || null,
+                    });
+                    continue;
+                }
                 if (rec && rec.blob) {
                     const id = this._newId();
                     this.items.set(id, {
@@ -15948,45 +15989,73 @@ const uploadManager = {
         it.received = new Set(data.received_chunks || []);
         if (data.chunk_size) it.chunkSize = data.chunk_size;
 
-        // Zero-knowledge: persist the already-encrypted ciphertext so a reload can
-        // resume this exact session by replaying the same bytes. Only ciphertext is
-        // stored — never the DEK or plaintext. Done before the first chunk goes out,
-        // so even an early reload is resumable. Fails soft if IndexedDB is unavailable.
-        if (it.isZk && it.file) {
-            const res = await zkUploadStore.put({
-                sessionId: it.sessionId,
-                vaultId: it.vaultId,
-                // No fileName and no mimeType. The sealed encName/encMime/nameBi below carry the
-                // same information for the only consumer that needs it -- a re-init after the
-                // server expires the session -- and they carry it encrypted.
-                totalSize: it.totalSize,
-                folderId: it.folderId,
-                keyVersion: it.zkKeyVersion != null ? it.zkKeyVersion : null,
-                totalChunks: it.totalChunks,
-                chunkSize: it.chunkSize,
-                // A neutral Blob, never the File. The bytes are the same ciphertext either
-                // way; the File wrapper is what carried the plaintext name and MIME onto disk.
-                blob: zkUploadStore.neutralBlob(it.file),
-                schema: zkUploadStore.schemaVersion(),
-                // The encrypted name/MIME + blind index, so a re-init after a server-side
-                // session expiry (410) re-declares the same name without the plaintext.
-                encName: it.encName || null,
-                encMime: it.encMime || null,
-                nameBi: it.nameBi || null,
-                // Persist the candidate set too, or a resumed upload's re-init would lose it and
-                // silently drop back to single-value matching after a reload.
-                nameBiCandidates: it.nameBiCandidates || null,
-                // ZK v2: the id the name was sealed under. Without it, a resumed upload would
-                // complete under a fresh server id and the v2 name would be undecryptable.
-                clientFileId: it.clientFileId || null,
-                // And which attempt produced the blob above. A resume must re-declare it or the
-                // server will not let it continue -- correctly, since it could not prove these
-                // bytes belong to that session.
-                blobId: it.blobId || null,
-                createdAt: Date.now(),
-            });
-            this._noteResumePersistence(it, res);
+        // Zero-knowledge: persist what a reload needs to continue this exact session. Done before
+        // the first chunk goes out, so even an early reload is resumable. Fails soft if IndexedDB
+        // is unavailable.
+        if (it.isZk && (it.file || it.zkStream)) {
+            this._noteResumePersistence(it, await this._persistResume(it));
         }
+    },
+
+    // The ONE record a zero-knowledge upload keeps in browser storage, in one of two shapes.
+    //
+    // Sealed up front (the legacy whole-file writer): the record holds the CIPHERTEXT, and a resume
+    // replays those same bytes. Only ciphertext is stored -- never the DEK or plaintext.
+    //
+    // Sealed as it uploads: there is no ciphertext to keep, and the plaintext is never written
+    // here. The record holds the writer's own note of the attempt (its token and framing) and one
+    // KEYED MAC per frame -- so a later resume can check it has been handed the same file, frame by
+    // frame, before reusing the token. Keyed on purpose: an unkeyed digest of the plaintext, on disk,
+    // would let anyone holding this profile test a candidate file against it. The list is bounded
+    // by ZK_RESUME_MAX_FRAMES; past it the upload still completes but is not resumable.
+    _resumeRecord(it) {
+        const rec = {
+            sessionId: it.sessionId,
+            vaultId: it.vaultId,
+            // No fileName and no mimeType. The sealed encName/encMime/nameBi below carry the
+            // same information for the only consumer that needs it -- a re-init after the
+            // server expires the session -- and they carry it encrypted.
+            totalSize: it.totalSize,
+            folderId: it.folderId,
+            keyVersion: it.zkKeyVersion != null ? it.zkKeyVersion : null,
+            totalChunks: it.totalChunks,
+            chunkSize: it.chunkSize,
+            schema: zkUploadStore.schemaVersion(),
+            // The encrypted name/MIME + blind index, so a re-init after a server-side
+            // session expiry (410) re-declares the same name without the plaintext.
+            encName: it.encName || null,
+            encMime: it.encMime || null,
+            nameBi: it.nameBi || null,
+            // Persist the candidate set too, or a resumed upload's re-init would lose it and
+            // silently drop back to single-value matching after a reload.
+            nameBiCandidates: it.nameBiCandidates || null,
+            // ZK v2: the id the name was sealed under. Without it, a resumed upload would
+            // complete under a fresh server id and the v2 name would be undecryptable.
+            clientFileId: it.clientFileId || null,
+            // And which attempt produced these bytes. A resume must re-declare it or the
+            // server will not let it continue -- correctly, since it could not prove these
+            // bytes belong to that session.
+            blobId: it.blobId || null,
+            createdAt: it.resumeCreatedAt || (it.resumeCreatedAt = Date.now()),
+        };
+        if (it.zkPipelined) {
+            // The writer's state and the MAC list TOGETHER, in this one record: a list that could
+            // be stored apart from its state could be paired with the wrong one.
+            rec.pipelined = true;
+            rec.resume = { ...it.zkStream.resumeState(), frameMacs: it.frameMacs.slice() };
+        } else {
+            // A neutral Blob, never the File. The bytes are the same ciphertext either
+            // way; the File wrapper is what carried the plaintext name and MIME onto disk.
+            rec.blob = zkUploadStore.neutralBlob(it.file);
+        }
+        return rec;
+    },
+
+    async _persistResume(it) {
+        if (it.zkPipelined && it.zkStream.totalChunks > ZK_RESUME_MAX_FRAMES) {
+            return { ok: false, tooLarge: true };
+        }
+        return zkUploadStore.put(this._resumeRecord(it));
     },
 
     // React to a zkUploadStore.put result. On success the upload is resumable across a
@@ -15997,6 +16066,13 @@ const uploadManager = {
     _noteResumePersistence(it, res) {
         if (!res || res.ok) { it.resumePersisted = true; it.resumeWarning = null; return; }
         it.resumePersisted = false;
+        if (res.tooLarge) {
+            it.resumeWarning = "This file is too large to be saved for resuming — it will still finish "
+                + "uploading, but can't be continued after a reload.";
+            try { showWarning(it.resumeWarning); } catch (_) { /* toast optional */ }
+            try { this.render(); } catch (_) { /* a render hiccup must not fail the upload */ }
+            return;
+        }
         if (res.unavailable) {
             // "Unavailable" has two very different causes. Private mode or an old browser is the
             // documented quiet degrade. Another TAB holding the previous schema open is not: the
@@ -16031,7 +16107,7 @@ const uploadManager = {
     // Drive an item from wherever it is to completion (honouring pause/cancel).
     async run(id) {
         const it = this.items.get(id);
-        if (!it || !it.file) return;
+        if (!it || !(it.file || it.zkPlain)) return;
         // Queued rather than started. The slot is held for the whole transfer and given back
         // however it ends, so a failure cannot cost one permanently.
         return transferGate.run(() => this._run(id));
@@ -16039,7 +16115,7 @@ const uploadManager = {
 
     async _run(id) {
         const it = this.items.get(id);
-        if (!it || !it.file) return;
+        if (!it || !(it.file || it.zkPlain)) return;
         // Never drive two uploaders against the same server session at once (a duplicate
         // restored item would race chunk PUTs + the server's byte accounting). If another
         // item already owns this session and is active, drop this duplicate.
@@ -16058,6 +16134,11 @@ const uploadManager = {
         it.error = null;
         this.render();
         try {
+            // ONE writer session per in-flight upload, opened when THIS transfer starts and dropped
+            // when it ends -- never one per file in the drop. It is what mints the attempt token
+            // and knows the exact ciphertext length, so it has to exist before the upload session
+            // is declared.
+            if (it.zkPipelined && !it.zkStream) await this._openZkStream(it);
             if (!it.sessionId) {
                 await this._init(it);
             } else if (it.needsServerSync) {
@@ -16121,9 +16202,23 @@ const uploadManager = {
                 if (it.paused) { it.status = 'paused'; this.render(); return; }
                 if (it.received.has(i)) continue;
 
-                const start = i * it.chunkSize;
-                const blob = it.file.slice(start, Math.min(start + it.chunkSize, it.file.size));
-                const buf = await blob.arrayBuffer();
+                let buf;
+                if (it.zkPipelined) {
+                    // An UPLOAD CHUNK is the unit of sealing and of re-sealing. Sealing a frame twice
+                    // yields two valid frames for one index under one token; what must never reach
+                    // the server is a chunk that is part one sealing and part another. So a chunk is
+                    // sealed whole, here, every time it is sent: a retry of index i re-seals ALL of
+                    // index i, never the tail of it.
+                    buf = await this._sealUploadChunk(it, i);
+                    // Each frame's MAC is on disk BEFORE its bytes go out. The other order leaves a
+                    // window in which the server holds a frame the record cannot vouch for, and a
+                    // resume could neither verify that frame nor safely seal it again.
+                    await this._persistResume(it);
+                } else {
+                    const start = i * it.chunkSize;
+                    const blob = it.file.slice(start, Math.min(start + it.chunkSize, it.file.size));
+                    buf = await blob.arrayBuffer();
+                }
                 const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/chunks/${i}`, {
                     method: 'PUT',
                     headers: { ...this._vaultHeaders(), 'Content-Type': 'application/octet-stream' },
@@ -16140,7 +16235,24 @@ const uploadManager = {
                     throw new Error(typeof e.detail === 'string' ? e.detail : `Chunk ${i + 1} failed`);
                 }
                 it.received.add(i);
+                // The server's own count after this chunk: what the fire point below goes by.
+                it.lastPut = await r.json().catch(() => null);
                 this.render();
+            }
+
+            // THE FIRE POINT. What this upload replaces -- an original to delete, an in-flight
+            // upload to cancel -- is touched only now: the server holds EVERY chunk and exactly the
+            // declared number of bytes, and the next request commits. Not when the transfer starts
+            // (one that died halfway would already have cost the original), and not after the
+            // commit (a name rule could then refuse the finalize while the original still stood in
+            // the way). Per entry: this item's step, for this item's bytes.
+            if (it.replaces && !it.replacesFired) {
+                if (!(await this._serverHoldsAll(it))) {
+                    throw new Error('Could not confirm that the whole upload arrived, so nothing '
+                                  + 'was replaced. Resume to try again.');
+                }
+                if (!(await this._fireReplacement(it))) return;   // dropped, and said so by name
+                it.replacesFired = true;
             }
 
             it.status = 'completing';
@@ -16192,7 +16304,9 @@ const uploadManager = {
                 const d = e.detail;
                 throw new Error(typeof d === 'string' ? d : (d && d.message) || 'Finalising failed');
             }
-            if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);  // committed — drop the saved ciphertext
+            if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);  // committed — drop the saved record
+            it.zkStream = null; it.zkPlain = null;   // the writer session ends with its transfer
+            this._landed.add(id);
             it.status = 'done';
             this.render();
             // Refresh the file list so the new file appears; drop the row shortly after.
@@ -16206,6 +16320,176 @@ const uploadManager = {
         }
     },
 
+    // Open the writer session for a file that is sealed as it uploads, and take the upload's
+    // declared shape FROM it. This only ever STARTS an encryption -- a new token for a new upload
+    // session. Continuing an interrupted one is _reopenPipelined's job alone, because that is the
+    // path that re-reads the frames the server already holds before the old token is reused; an
+    // item that already has a server session but no writer session must not mint a second token
+    // into it, so that state is refused here rather than papered over.
+    async _openZkStream(it) {
+        if (it.sessionId) {
+            throw new Error('This upload lost its encryption session. Resume it and pick the file '
+                          + 'again to continue.');
+        }
+        const lib = eccLib();
+        const dek = await zkGetVaultDek(it.vaultId, it.zkKeyVersion);
+        const ctx = { vaultId: it.vaultId, objectId: it.clientFileId, dekEpoch: it.zkKeyVersion };
+        it.zkStream = await lib.startContentV2Encryption(it.zkPlain.file, dek, ctx);
+        // The attempt token declared to the server IS the session's: one mint, read once, here.
+        it.blobId = it.zkStream.blobId;
+        if (!it.frameMacs) it.frameMacs = new Array(it.zkStream.totalChunks).fill(null);
+        const plan = zkUploadPlan(it.zkStream.chunkSize + lib.V2_CONTENT_CHUNK_OVERHEAD,
+            it.zkStream.totalChunks, it.zkStream.ciphertextLength, ZK_FRAMES_PER_UPLOAD_CHUNK);
+        it.totalSize = plan.totalSize; it.totalChunks = plan.totalChunks; it.chunkSize = plan.chunkSize;
+    },
+
+    // Seal ONE upload chunk: the file header first if this is chunk 0, then its whole frames.
+    // Nothing is kept past the return -- the memory held is this one chunk.
+    async _sealUploadChunk(it, index) {
+        if (!it.zkStream) {
+            throw new Error('This upload lost its encryption session and cannot send anything. '
+                          + 'Resume it to continue.');
+        }
+        const [first, last] = zkUploadChunkFrames(index, it.zkStream.totalChunks, ZK_FRAMES_PER_UPLOAD_CHUNK);
+        const parts = index === 0 ? [it.zkStream.header()] : [];
+        for (let f = first; f < last; f++) {
+            const sealed = await it.zkStream.sealFrame(f);
+            it.frameMacs[f] = sealed.mac;
+            parts.push(sealed.frame);
+        }
+        return new Blob(parts);
+    },
+
+    // Does the server hold every chunk of this upload, and exactly the bytes it declared? Answered
+    // from the server's own count -- the reply to the last chunk, or the session itself when this
+    // run sent nothing (everything had already arrived).
+    async _serverHoldsAll(it) {
+        let s = it.lastPut;
+        if (!s || !s.complete) {
+            try {
+                const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+                    { headers: this._vaultHeaders() });
+                if (!r.ok) return false;
+                const d = await r.json();
+                s = { complete: (d.received_chunks || []).length >= it.totalChunks,
+                      bytes_received: d.bytes_received };
+            } catch (_) { return false; }
+        }
+        return !!s.complete && s.bytes_received === it.totalSize;
+    },
+
+    // Fire what this upload replaces. Returns false when the replacement was dropped instead --
+    // always with a message that names the file, says which copy is on the server now, and says
+    // what did not happen. Never a bare count, never silence.
+    async _fireReplacement(it) {
+        const name = it.fileName;
+        const r = it.replaces;
+        if (r.deleteId) {
+            let gone = false;
+            try {
+                const d = await fetch(`${API_BASE}/vaults/${it.vaultId}/files/${r.deleteId}/delete`,
+                    { method: 'POST', headers: this._vaultHeaders() });
+                gone = d.ok || d.status === 404;   // already gone is gone
+            } catch (_) { gone = false; }
+            if (!gone) {
+                await this._dropReplacement(it, `Could not replace "${name}": the existing file could `
+                    + `not be removed, so it is unchanged and the new copy was not uploaded.`);
+                return false;
+            }
+        }
+        let cancelled = false;
+        for (const vid of (r.cancelItemIds || [])) {
+            let victim = this.items.get(vid);
+            // A victim that is finalising settles one way or the other within moments; cancelling
+            // it mid-commit could delete a file that is about to land. Wait it out, briefly.
+            for (let n = 0; victim && victim.status === 'completing' && n < 150; n++) {
+                await new Promise(res => setTimeout(res, 200));
+                victim = this.items.get(vid);
+            }
+            if (this._landed.has(vid)) {
+                await this._dropReplacement(it, `"${name}" was already uploaded by the earlier transfer, `
+                    + `which finished first; the new copy was not uploaded.`);
+                return false;
+            }
+            if (victim && !victim.cancelled && victim.status !== 'error') {
+                await this.cancel(vid);
+                cancelled = true;
+            }
+        }
+        if (cancelled) {
+            try { showInfo(`The earlier upload of "${name}" was cancelled and replaced by this one.`); } catch (_) {}
+        }
+        return true;
+    },
+
+    async _dropReplacement(it, message) {
+        await this.cancel(it.id);   // our own session and record; nothing of ours is committed
+        showError(message);
+    },
+
+    // Continue an interrupted sealed-as-it-uploads transfer with the file the user picked again.
+    //
+    // The handle is not the file: it can point at edited bytes while the size still matches. So
+    // every frame the SERVER already holds is READ AGAIN from this file and held to the MAC stored
+    // when it was first sealed. A held frame with no stored MAC counts as a mismatch, never as a
+    // skip -- the record cannot vouch for it. Because the MAC key is derived under the attempt's
+    // own transcript, a list from a different attempt cannot be silently accepted either: it can
+    // only cause a refusal. Anything that does not check out becomes a NEW attempt under a new
+    // token and a new session -- the old token is never reused for content it was not minted for.
+    async _reopenPipelined(it, file) {
+        const st = it.zkResume;
+        try {
+            if (!st || !Array.isArray(st.frameMacs) || file.size !== st.totalPlaintext) {
+                return await this._restartAsNewAttempt(it, file);
+            }
+            let held = [];
+            const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+                { headers: this._vaultHeaders() });
+            if (s.ok) held = (await s.json()).received_chunks || [];
+            const lib = eccLib();
+            const dek = await zkGetVaultDek(it.vaultId, it.zkKeyVersion);
+            const session = await lib.resumeContentV2Encryption(file, dek,
+                { vaultId: it.vaultId, objectId: it.clientFileId, dekEpoch: it.zkKeyVersion }, st);
+            for (const index of held) {
+                const [first, last] = zkUploadChunkFrames(index, session.totalChunks, ZK_FRAMES_PER_UPLOAD_CHUNK);
+                for (let f = first; f < last; f++) {
+                    const want = st.frameMacs[f];
+                    if (!want || (await session.frameMac(f)) !== want) {
+                        return await this._restartAsNewAttempt(it, file);
+                    }
+                }
+            }
+            it.zkPlain = { file }; it.zkStream = session; it.frameMacs = st.frameMacs.slice();
+            it.blobId = session.blobId;
+            it.received = new Set(held);
+            it.needsServerSync = false;
+            this.run(it.id);
+        } catch (e) {
+            if (isCodedCryptoError(e) && (e.code === 'INVALID_INPUT' || e.code === 'CONTENT_INVALID')) {
+                return this._restartAsNewAttempt(it, file);
+            }
+            showError(isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock')
+                                           : 'This upload could not be continued.');
+        }
+    },
+
+    // Not the same file, or nothing to check it against: a NEW encryption under a NEW token in a
+    // NEW upload session. The old session is discarded first; it never adopts these bytes.
+    async _restartAsNewAttempt(it, file) {
+        try {
+            await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+                { method: 'DELETE', headers: this._vaultHeaders() });
+        } catch (_) { /* best effort; the server also refuses a different token on that session */ }
+        if (it.sessionId) await zkUploadStore.delete(it.sessionId);
+        it.sessionId = null; it.zkResume = null; it.zkStream = null; it.frameMacs = null;
+        it.blobId = null; it.lastPut = null; it.resumeCreatedAt = null;
+        it.received = new Set(); it.needsServerSync = false;
+        it.zkPlain = { file };
+        try { showInfo(`"${file.name}" is not the same as the interrupted upload, so it is being `
+                     + `uploaded again from the start.`); } catch (_) {}
+        this.run(it.id);
+    },
+
     pause(id) {
         const it = this.items.get(id);
         if (it) { it.paused = true; if (it.status === 'uploading') it.status = 'pausing'; this.render(); }
@@ -16214,11 +16498,13 @@ const uploadManager = {
     resume(id) {
         const it = this.items.get(id);
         if (!it) return;
-        if (!it.file) {
-            // Zero-knowledge: the ciphertext lives only in this browser's IndexedDB. If
-            // it isn't here (another device/browser, or storage cleared) we can't replay
-            // the exact bytes and re-encrypting won't match — so re-picking is futile.
-            if (it.isZk) {
+        if (!it.file && !it.zkPlain) {
+            // Zero-knowledge, sealed up front: the ciphertext lives only in this browser's
+            // IndexedDB. If it isn't here (another device/browser, or storage cleared) we can't
+            // replay the exact bytes and re-encrypting won't match — so re-picking is futile.
+            // Sealed as it uploaded is the other case: nothing but the file can continue it, and
+            // the pick below is checked frame by frame before the old token is reused.
+            if (it.isZk && !it.zkPipelined) {
                 showError("This zero-knowledge upload can't be resumed here — the encrypted data isn't available on this device or browser. Cancel it and upload the file again.");
                 return;
             }
@@ -16247,6 +16533,7 @@ const uploadManager = {
             // Defense-in-depth: zero-knowledge resume runs from the IndexedDB ciphertext
             // (see resume()), never by re-picking the plaintext — re-feeding plaintext here
             // would bypass the encrypt-before-upload hook and produce a fresh-IV mismatch.
+            if (it.zkPipelined) { await this._reopenPipelined(it, file); return; }
             const v = (state.currentVault && state.currentVault.id === it.vaultId) ? state.currentVault : null;
             if ((v && isZkVault(v)) || it.isZk) {
                 showError("This zero-knowledge upload can't be resumed here — the encrypted data isn't available on this device or browser. Cancel it and upload the file again.");
@@ -16525,6 +16812,34 @@ function zkUploadDecision(size, sink, threshold) {
     return (sink !== 'streaming' && size > threshold) ? 'refuse' : 'seal';
 }
 
+// How a zero-knowledge file sealed frame by frame is cut into upload chunks. A sealed FRAME is
+// the unit a reader authenticates (a nonce, the ciphertext, a tag), and every upload chunk is a
+// WHOLE number of frames: chunk 0 is the 28-byte file header plus the first frames, every later
+// chunk is frames only, the last may be short. Cutting the byte stream at a round number instead
+// would let a frame straddle two chunks, and a resume that re-sealed only the missing chunk would
+// then leave that frame half old nonce, half new -- a file that uploads and cannot be opened.
+const ZK_FRAMES_PER_UPLOAD_CHUNK = 4;
+// The resume record keeps one 32-byte keyed MAC per frame (64 hex characters; about 64 KiB per
+// GiB at the default 1 MiB frame). Past this many frames the list is not kept at all: the upload
+// still completes, it just cannot be continued after a reload.
+const ZK_RESUME_MAX_FRAMES = 16384;
+
+// Pure: the declared upload shape for a session. `frameBytes` is one FULL sealed frame (the
+// writer's chunk size plus its nonce-and-tag overhead).
+function zkUploadPlan(frameBytes, totalFrames, ciphertextLength, framesPerChunk) {
+    return {
+        chunkSize: framesPerChunk * frameBytes,
+        totalChunks: Math.max(1, Math.ceil(totalFrames / framesPerChunk)),
+        totalSize: ciphertextLength,
+    };
+}
+
+// Pure: the frames [first, last) that upload chunk `index` carries.
+function zkUploadChunkFrames(index, totalFrames, framesPerChunk) {
+    const first = index * framesPerChunk;
+    return [first, Math.min(first + framesPerChunk, totalFrames)];
+}
+
 // Public entry point kept for existing callers (button + drag-drop). Resolves any
 // filename collisions in the current folder before enqueueing.
 async function uploadFiles(files) {
@@ -16543,7 +16858,7 @@ async function uploadFiles(files) {
     // carries the plaintext name the user chose, so this also covers zero-knowledge vaults, where
     // the server never sees the name. An in-flight name has no committed id to delete: choosing
     // "replace" for one cancels that in-flight upload and uploads the new file in its place (see
-    // toCancelReq below), rather than pushing a second copy that would race the first.
+    // `entry.replaces` below), rather than pushing a second copy that would race the first.
     //
     // Only NOT-YET-COMMITTED statuses count. A finished ('done') upload has already refreshed the
     // file list (loadVaultFiles runs on completion), so its name is in state.currentFiles if it is
@@ -16557,8 +16872,10 @@ async function uploadFiles(files) {
         if (it.fileName) existing.add(it.fileName);
     }
     let toUpload = [];   // {file, name}
-    let toDelete = [];   // {id, name, entry} originals to remove (overwrite) -- keyed by ENTRY for the filters
-    const toCancelReq = [];   // {name, entry} in-flight uploads the user chose to replace (victims resolved below)
+    // What an entry REPLACES travels on the entry itself (`entry.replaces`), not in a list beside
+    // the batch: the uploader fires it for that one entry, and only once the server holds all of
+    // that entry's bytes. An entry that is refused, or whose upload never gets that far, takes its
+    // destructive step with it -- there is no parallel list to fall out of step.
     const refused = new Set();   // entries refused per-file (over-threshold in a non-streaming context)
     let blanket = null;    // {action} once "apply to all" is chosen
 
@@ -16577,21 +16894,16 @@ async function uploadFiles(files) {
         if (choice.action === 'skip') continue;
         if (choice.action === 'overwrite') {
             const id = idByName.get(file.name);
-            // Tie each destructive record to THIS entry object, not just its name: one drop can
-            // carry two files of the same name (both reach the overwrite branch over one committed
-            // original), and a per-NAME filter on a later refusal or a failed delete would drop both
-            // originals' steps while a replacement still uploaded -- two rows under one name in a
-            // vault whose names the server cannot see. Identity is what the toUpload filter uses.
+            // What this entry replaces is recorded ON the entry, so it is tied to this entry object
+            // and not merely to its name: one drop can carry two files of the same name (both reach
+            // this branch over one committed original), and anything keyed by name would make them
+            // share a fate -- one refused, and the other's original is left in place while it still
+            // uploads: two rows under one name in a vault whose names the server cannot see.
             const entry = { file, name: file.name };
+            // A committed row is removed; with none, the name is held by an upload still IN FLIGHT
+            // and "replace" means cancel THAT upload, so the two copies can't both finish.
+            entry.replaces = id ? { deleteId: id } : { inFlightName: file.name };
             toUpload.push(entry);
-            if (id) {
-                toDelete.push({ id, name: file.name, entry });
-            } else {
-                // No committed row -- the name is held by an upload still IN FLIGHT. "Replace"
-                // means replace THAT upload: cancel it (below) before enqueuing this one, so a
-                // second copy of the same name can't race it and both land.
-                toCancelReq.push({ name: file.name, entry });
-            }
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
             name = uniqueUploadName(name, existing);
@@ -16600,20 +16912,20 @@ async function uploadFiles(files) {
         }
     }
 
-    // Resolve the in-flight victims to cancel NOW, by identity, before any async sealing runs: a
-    // second drop of the same name while we seal would enqueue a NEW live item, and a name-matched
-    // scan run later would cancel that bystander the user never chose to replace. Item ids are
-    // stable identities; names are not. Only the cancel CALLS are deferred (below, before the
-    // enqueue), so a refusal can still prune a victim before it is cancelled.
-    const cancelVictims = [];   // {itemId, entry}
-    if (toCancelReq.length) {
-        for (const it of uploadManager.items.values()) {
-            if (it.vaultId !== state.currentVault.id) continue;
-            if ((it.folderId || null) !== _curFolder) continue;
-            if (!_pendingUpload(it)) continue;
-            const req = toCancelReq.find(r => r.name === it.fileName);
-            if (req) cancelVictims.push({ itemId: it.id, entry: req.entry });
-        }
+    // Resolve each entry's in-flight victims NOW, by identity, before any async work runs: a second
+    // drop of the same name a moment later would enqueue a NEW live item, and a name-matched scan
+    // run later would cancel that bystander the user never chose to replace. Item ids are stable
+    // identities; names are not. Every entry resolves its OWN list -- two entries of one name both
+    // get the victim, so refusing one of them cannot lose the other's cancel. Only the cancel CALL
+    // is deferred: the uploader makes it for that entry, once the server holds all of its bytes.
+    for (const entry of toUpload) {
+        if (!entry.replaces || !entry.replaces.inFlightName) continue;
+        entry.replaces.cancelItemIds = [...uploadManager.items.values()]
+            .filter(it => it.vaultId === state.currentVault.id
+                && (it.folderId || null) === _curFolder
+                && _pendingUpload(it)
+                && it.fileName === entry.replaces.inFlightName)
+            .map(it => it.id);
     }
 
     if (toUpload.length) {
@@ -16677,21 +16989,14 @@ async function uploadFiles(files) {
                             refused.add(entry);
                             continue;
                         }
-                        // Chunk-framed content, encrypted FROM THE FILE rather than from a copy of
-                        // it. Reading the file first would put the plaintext in the heap, the
-                        // sealed copy would join it, and a large upload would peak near three
-                        // times the file for no reason -- the writer only ever needs one chunk at
-                        // a time, and everything the header binds is known from the file's size.
-                        //
-                        // The token comes back FROM the writer, which is why the legacy branch
-                        // below mints its own instead of both sharing one line: under this branch
-                        // the token is sealed into the file's header, and a value minted out here
-                        // could drift from the one the bytes actually carry.
-                        const written = await lib.encryptBlobV2(entry.file, dek, {
-                            vaultId: vid, objectId: clientFileId, dekEpoch: keyVersion,
-                        });
-                        entry.blobId = written.blobId;
-                        enc = written.blob;
+                        // NOTHING is read or sealed here. Sealing the whole batch up front made memory
+                        // scale with the drop, and even one file's ciphertext was materialised whole
+                        // before its first byte went out. The uploader opens ONE writer session for
+                        // this entry when its transfer starts, seals a frame, sends it, and forgets
+                        // it -- so the entry carries the plaintext handle and what the transcript
+                        // binds, and no attempt token yet: the token is minted by that session, and
+                        // the value declared to the server is read from it, never minted out here.
+                        entry.zkPlain = { file: entry.file, objectId: clientFileId, dekEpoch: keyVersion };
                     } else {
                         // The legacy writer takes the whole plaintext and has no chunked form, so
                         // this branch still reads the file. No silent whole-file read for a large
@@ -16706,8 +17011,11 @@ async function uploadFiles(files) {
                         }
                         entry.blobId = zkNewBlobId();
                         enc = await lib.encryptFile(await entry.file.arrayBuffer(), dek);
+                        // The one place a whole ciphertext is materialised, and it is this branch's
+                        // alone: the legacy writer has no framed form, which is why it keeps its
+                        // ceiling above.
+                        entry.file = new File([enc], entry.name, { type: mime });
                     }
-                    entry.file = new File([enc], entry.name, { type: mime });
                     entry.keyVersion = keyVersion;
                     entry.encName = await lib.encryptName(entry.name, dek, vid, 'name', keyVersion, clientFileId);
                     entry.nameBi = await lib.nameBlindIndex(entry.name, dek, vid, keyVersion);
@@ -16731,73 +17039,17 @@ async function uploadFiles(files) {
         }
 
         // Per-entry refusal recorded refusals during the loop (it never touched the walked array).
-        // Enact them ONCE now, before anything destructive runs, keyed by ENTRY IDENTITY so two
-        // same-named files don't share a fate: drop the refused entries from the batch, and drop the
-        // destructive steps that belong to them -- a refused overwrite must not delete the original
-        // it cannot replace, and a refused replacement must not cancel the in-flight upload it cannot
-        // replace (a fresh same-page upload of that name is still in flight, and cancelling it for a
-        // replacement that never comes loses that work in progress and its local ciphertext). The
-        // cancel victims are pruned by the same record just before the cancel calls.
-        if (refused.size) {
-            toUpload = toUpload.filter(e => !refused.has(e));
-            toDelete = toDelete.filter(t => !refused.has(t.entry));
-        }
+        // Enact them ONCE now: a refused entry leaves the batch here and is never enqueued. What it
+        // would have replaced travels on the entry (`entry.replaces`), so it leaves with it -- a
+        // refused overwrite cannot delete the original it will not replace, and a refused
+        // replacement cannot cancel the in-flight upload it will not replace.
+        if (refused.size) toUpload = toUpload.filter(e => !refused.has(e));
 
-        // Cancel the in-flight victims resolved earlier -- the CALLS are deferred to here (after
-        // sealing, and after the refusal record has pruned them) but still BEFORE the enqueue, so a
-        // name's old and new copies can't both finish. A victim that COMPLETED while we sealed can
-        // no longer be cancelled without deleting a file that already landed; treat it like a failed
-        // overwrite delete -- drop that replacement and say so, rather than let both copies land.
-        const _victims = cancelVictims.filter(v => !refused.has(v.entry));
-        if (_victims.length) {
-            const cancelStuck = new Set();
-            for (const v of _victims) {
-                const it = uploadManager.items.get(v.itemId);
-                if (!it || !_pendingUpload(it)) { cancelStuck.add(v.entry); continue; }
-                try { await uploadManager.cancel(v.itemId); } catch (_) { cancelStuck.add(v.entry); }
-            }
-            if (cancelStuck.size) {
-                toUpload = toUpload.filter(e => !cancelStuck.has(e));
-                showError(`Could not replace ${cancelStuck.size} in-flight upload`
-                          + `${cancelStuck.size === 1 ? '' : 's'} that finished first; `
-                          + `${cancelStuck.size === 1 ? 'it was' : 'they were'} left as uploaded.`);
-            }
-        }
-
-        // The originals go LAST, and only for replacements that are ready to send.
-        //
-        // They used to go first, "so the new upload doesn't collide" -- before the replacement was
-        // encrypted, and with the result of the delete discarded. Any failure in between lost the
-        // original with nothing to recover from, and the failure is not exotic: the encryption
-        // above ends in `return`, so one file throwing abandoned the whole batch after every
-        // original had already been deleted.
-        if (toDelete.length) {
-            const survived = [];
-            for (const target of toDelete) {
-                let gone = false;
-                try {
-                    const r = await fetch(
-                        `${API_BASE}/vaults/${state.currentVault.id}/files/${target.id}/delete`,
-                        { method: 'POST', headers: uploadManager._vaultHeaders() });
-                    gone = r.ok;
-                } catch (_) {
-                    gone = false;
-                }
-                if (!gone) survived.push(target);
-            }
-            if (survived.length) {
-                // The original is still there, so uploading its replacement under the same name
-                // would either be refused or produce a duplicate. Better to say so and change
-                // nothing than to guess: the user still has their file.
-                const stuck = new Set(survived.map(t => t.entry));
-                toUpload = toUpload.filter(e => !stuck.has(e));
-                showError(`Could not replace ${survived.length} existing file`
-                          + `${survived.length === 1 ? '' : 's'}; `
-                          + `the original${survived.length === 1 ? '' : 's'} are unchanged.`);
-            }
-            await loadVaultFiles();
-        }
-
+        // NOTHING DESTRUCTIVE HAPPENS HERE. The delete of an original, and the cancel of an in-flight
+        // upload, used to run before the batch was enqueued -- but once a file is sealed as it
+        // uploads, "ready" no longer means "sealed", and a transfer that died halfway would already
+        // have cost the original. Each entry's step is fired by the uploader, for that entry alone,
+        // once the server holds every one of its bytes and just before it is committed.
         if (toUpload.length) uploadManager.enqueueNamed(toUpload);
     }
 }

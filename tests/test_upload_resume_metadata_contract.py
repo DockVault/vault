@@ -28,16 +28,24 @@ def test_the_writer_itself_never_sends_plaintext_metadata() -> None:
     sensitivity to the writer, so the writer gets checked directly.
     """
     app = APP_JS.read_text(encoding="utf-8")
-    marker = "const res = await zkUploadStore.put({"
+    # The ONE place a resume record is built; everything that reaches browser storage is in here.
+    marker = "    _resumeRecord(it) {"
     assert app.count(marker) == 1, "the resume-record writer moved; re-anchor this guard"
+    assert app.count("zkUploadStore.put(") == 1, "a second writer to the resume store appeared"
     call = app[app.index(marker):]
-    call = call[: call.index("});") + 3]
+    call = call[: call.index("    async _persistResume(it) {")]
+    # Code only: the builder's own comments discuss the very names it must not persist.
+    call = "\n".join(ln for ln in call.splitlines() if not ln.lstrip().startswith("//"))
 
     assert "fileName:" not in call, f"the writer persists a plaintext filename again:\n{call}"
     assert "mimeType:" not in call, f"the writer persists a plaintext MIME again:\n{call}"
-    # And it must hand over a neutral blob rather than the File it holds.
-    assert "blob: zkUploadStore.neutralBlob(" in call, call
-    assert "blob: it.file" not in call, call
+    # Sealed up front: it must hand over a neutral blob rather than the File it holds.
+    assert "rec.blob = zkUploadStore.neutralBlob(" in call, call
+    assert "blob: it.file" not in call and "rec.blob = it.file" not in call, call
+    # Sealed as it uploads: the only file handle there is is the PLAINTEXT, and it never goes to
+    # disk -- that shape stores the writer's state and the keyed per-frame MACs, and nothing else.
+    assert "zkPlain" not in call, f"the plaintext handle reaches the resume record:\n{call}"
+    assert "rec.resume = { ...it.zkStream.resumeState(), frameMacs: it.frameMacs.slice() };" in call, call
 
 
 def test_a_failed_record_migration_cannot_kill_the_whole_upgrade() -> None:
