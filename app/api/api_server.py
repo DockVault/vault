@@ -72,6 +72,7 @@ from app.services.streaming_upload import receive_bounded, ChunkTooLarge, EmptyB
 from app.core.upload_chunk_crypto import (
     seal_stream_to_file, sealed_plaintext_size, open_staged_chunk, StagedChunkError,
 )
+from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -17622,8 +17623,12 @@ async def upload_chunk(
         # to this session+index) so no raw chunk is ever readable on the staging volume; `remaining`
         # still bounds PLAINTEXT bytes and `chunk_digest` is still over the plaintext, so the
         # ChunkTooLarge/EmptyBody contract and the resume digest are unchanged.
+        # Chunk 0 of a zero-knowledge upload carries the file's cleartext header; keep its first
+        # bytes as they stream past (the body is never held whole) for the token comparison below.
+        _peek = HeadPeek(request.stream()) if (chunk_index == 0 and session.blob_id) else None
         _written, chunk_digest = await seal_stream_to_file(
-            request.stream(), tmp_path, remaining, session.id, chunk_index)
+            _peek if _peek is not None else request.stream(),
+            tmp_path, remaining, session.id, chunk_index)
     except ChunkTooLarge:
         # The body reached disk before it could be measured, which is the trade for not holding it
         # in memory. It is bounded by `remaining` -- disk this session was already approved to
@@ -17631,6 +17636,21 @@ async def upload_chunk(
         raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
     except EmptyBody:
         raise HTTPException(status_code=400, detail="Empty chunk")
+
+    # The token this session DECLARED must be the token the file's header CARRIES. A client that
+    # re-minted on a resume, or fed the two from different reads, would otherwise upload a file that
+    # completes and can never be opened. Refused BEFORE the chunk is published, so a mismatched
+    # chunk 0 is never counted as received and the upload cannot complete on it.
+    if _peek is not None and header_token_mismatch(bytes(_peek.head), session.blob_id):
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=409, detail={
+            "code": "upload_attempt_mismatch",
+            "message": ("This upload's first chunk does not belong to the encryption it declared. "
+                        "Nothing has been stored for it; start the upload again."),
+        })
 
     # Everything from here is under the per-session row lock (SELECT ... FOR UPDATE). It already
     # existed to serialize the counter update; publishing the chunk needs it for the same reason.
