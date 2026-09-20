@@ -87,7 +87,10 @@ def test_a_zero_knowledge_download_returns_the_stored_ciphertext(admin):
         ensure_ecc_keypair(admin)
         vault = create_zk_vault(admin, name=unique("zkparity"))
         try:
-            for size in (1, MB - 1, MB, MB + 1, 3 * MB + 7):
+            # The smallest case is 28 bytes, not 1: that is the smallest body a zero-knowledge upload
+            # can really have (a 12-byte nonce plus a 16-byte tag), and the server refuses a shorter
+            # first chunk for a session that declared an attempt token. The window-edge points stay.
+            for size in (28, MB - 1, MB, MB + 1, 3 * MB + 7):
                 body = bytes((i * 29 + 3) % 256 for i in range(min(size, 65536)))
                 body = (body * (size // len(body) + 1))[:size]
                 file_id = zk_chunked_upload(

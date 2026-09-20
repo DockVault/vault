@@ -16199,7 +16199,9 @@ const uploadManager = {
 
             for (let i = 0; i < it.totalChunks; i++) {
                 if (it.cancelled) return;
-                if (it.paused) { it.status = 'paused'; this.render(); return; }
+                // A cancel the server refused stops this loop the same way, but its row already says
+                // why; calling it "paused" here would replace that with nothing.
+                if (it.paused) { if (it.status !== 'error') it.status = 'paused'; this.render(); return; }
                 if (it.received.has(i)) continue;
 
                 let buf;
@@ -16412,7 +16414,14 @@ const uploadManager = {
                 return false;
             }
             if (victim && !victim.cancelled && victim.status !== 'error') {
-                await this.cancel(vid);
+                // A cancel the server did not confirm leaves the earlier upload alive. Committing
+                // beside it is the both-copies outcome this step exists to prevent, so it is treated
+                // exactly like a victim that finished first: OUR replacement is dropped, by name.
+                if (!(await this.cancel(vid))) {
+                    await this._dropReplacement(it, `Could not cancel the earlier upload of "${name}"; `
+                        + `the new copy was not uploaded.`);
+                    return false;
+                }
                 cancelled = true;
             }
         }
@@ -16560,21 +16569,38 @@ const uploadManager = {
         input.click();
     },
 
+    // Cancel an upload. Resolves TRUE only when it is really gone: there was no server session,
+    // or the server confirmed the delete (or no longer had it). The answer used to be discarded --
+    // the DELETE's status was never read -- so a refused cancel looked like a cancel: the row
+    // vanished, the server session stayed, and a caller replacing that upload went on to commit
+    // beside it without a word.
     async cancel(id) {
         const it = this.items.get(id);
-        if (!it) return;
+        if (!it) return true;
         it.cancelled = true;
         it.paused = true;
         if (it.sessionId) {
+            let gone = false;
             try {
-                await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, {
+                const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, {
                     method: 'DELETE', headers: this._vaultHeaders(),
                 });
-            } catch (_) {}
-            if (it.isZk) await zkUploadStore.delete(it.sessionId);  // drop the saved ciphertext
+                gone = r.ok || r.status === 404;   // already gone is gone
+            } catch (_) { gone = false; }
+            if (!gone) {
+                // The server still holds the session, so the row stays -- with its saved record,
+                // which is still what could continue it -- and says so, where it can be retried.
+                it.cancelled = false;
+                it.status = 'error';
+                it.error = 'Could not cancel this upload — the server did not confirm it. Try again.';
+                this.render();
+                return false;
+            }
+            if (it.isZk) await zkUploadStore.delete(it.sessionId);  // drop the saved record
         }
         this.items.delete(id);
         this.render();
+        return true;
     },
 
     _percent(it) {
@@ -16611,11 +16637,23 @@ const uploadManager = {
     // when this changes (a status transition) -- never per progress tick -- so a persisting Resume
     // button keeps its identity, hover and focus instead of flickering as it did when the whole tray
     // was re-rendered on every received chunk.
+    // Can this row be continued by picking its file again? ONE answer for the three places that
+    // ask -- which buttons, their signature, and the sentence under the name -- because they used
+    // to each ask `!it.isZk` on their own, and when a zero-knowledge upload that IS continued by
+    // picking the file arrived, the resume existed and nothing offered it: the row showed Cancel
+    // alone, beside a sentence telling the user to cancel, and Cancel destroys the upload.
+    //
+    // Standard uploads re-pick. A zero-knowledge upload sealed AS IT UPLOADED re-picks too: its
+    // record holds the writer's state and the frame MACs, and the pick is checked against them. One
+    // sealed UP FRONT cannot: only the ciphertext could continue it, and it is not on this device.
+    _canRepick(it) {
+        return it.status === 'needs-file' && (!it.isZk || !!it.zkPipelined);
+    },
     _controlSig(it) {
         const s = [];
         if (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing') s.push('pause');
         if (it.status === 'paused' || it.status === 'error') s.push('resume');
-        if (it.status === 'needs-file' && !it.isZk) s.push('resume-text');
+        if (this._canRepick(it)) s.push('resume-text');
         if (it.status !== 'done') s.push('cancel');
         return s.join(',');
     },
@@ -16638,9 +16676,10 @@ const uploadManager = {
         const st = it.status;
         if (st === 'uploading' || st === 'queued' || st === 'completing' || st === 'pausing') add('pause', 'pause', 'Pause');
         if (st === 'paused' || st === 'error') add('resume', 'play', 'Resume');
-        // Standard vaults resume by re-selecting the file; a ZK item with no local ciphertext offers
-        // only Cancel (+ the note below).
-        if (st === 'needs-file' && !it.isZk) add('resume', null, null, 'Resume…');
+        // Anything that can be continued by re-selecting the file gets the button that does it; a
+        // zero-knowledge item sealed up front, with no local ciphertext, offers only Cancel (+ the
+        // note below).
+        if (this._canRepick(it)) add('resume', null, null, 'Resume…');
         if (st !== 'done') add('cancel', 'x', 'Cancel');
     },
     _renderSub(sub, it) {
@@ -16649,9 +16688,14 @@ const uploadManager = {
         if (it.status === 'error') { sub.className = 'up-error'; sub.replaceChildren(document.createTextNode(it.error || 'Upload failed')); return; }
         sub.className = 'up-sub';
         if (it.status === 'needs-file') {
-            sub.replaceChildren(document.createTextNode(it.isZk
-                ? 'Encrypted data isn\'t on this device — cancel and upload again'
-                : 'Paused — click Resume and re-select the file'));
+            // Each sentence is true of its own case -- the middle one must never be shown for an
+            // upload that CAN be continued, since following it throws the upload away.
+            sub.replaceChildren(document.createTextNode(
+                !this._canRepick(it)
+                    ? 'Encrypted data isn\'t on this device — cancel and upload again'
+                    : it.isZk
+                        ? 'Paused — click Resume and pick the file again to continue this encrypted upload'
+                        : 'Paused — click Resume and re-select the file'));
             return;
         }
         const parts = [document.createTextNode(`${this._statusLabel(it.status)} · ${pct}% · ${size}`)];

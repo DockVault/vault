@@ -314,7 +314,9 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     # server now, and what did not happen. (mutation: a count-only toast -> red.)
     fire = _uploader_method(APPJS.read_text(encoding="utf-8"), "async _fireReplacement")
     messages = re.findall(r"_dropReplacement\(it, `(.*?)`\);", fire, re.S)
-    assert len(messages) == 2, "expected one drop message per way a replacement can fail"
+    # Three ways: the old file could not be removed, the earlier upload finished first, and the
+    # earlier upload could not be cancelled (the server did not confirm it).
+    assert len(messages) == 3, "expected one drop message per way a replacement can fail"
     for msg in messages:
         assert '"${name}"' in msg, f"a dropped replacement does not name the file: {msg}"
         assert "not uploaded" in msg, f"the message does not say what did not happen: {msg}"
@@ -322,7 +324,7 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     # A victim that FINISHED FIRST is told apart from one that was cancelled (both leave the tray):
     # the landed set is the difference, and landing first drops the replacement, not the landed file.
     assert "if (this._landed.has(vid)) {" in fire
-    assert fire.index("if (this._landed.has(vid)) {") < fire.index("await this.cancel(vid);")
+    assert fire.index("if (this._landed.has(vid)) {") < fire.index("if (!(await this.cancel(vid))) {")
     assert 'showInfo(`The earlier upload of "${name}" was cancelled and replaced by this one.`)' in fire
 
 
