@@ -16380,12 +16380,21 @@ const uploadManager = {
         return !!s.complete && s.bytes_received === it.totalSize;
     },
 
-    // Fire what this upload replaces. Returns false when the replacement was dropped instead --
-    // always with a message that names the file, says which copy is on the server now, and says
-    // what did not happen. Never a bare count, never silence.
+    // Fire what this upload replaces. Returns false when the replacement did not go ahead. Either
+    // it was dropped -- always with a message that names the file, says which copy is on the server
+    // now, and says what did not happen; never a bare count, never silence -- or the user withdrew
+    // it while this step was waiting, and then NOTHING it replaces is touched.
     async _fireReplacement(it) {
         const name = it.fileName;
         const r = it.replaces;
+        // Cancelled by the user since this step began. Its row keeps Pause and Cancel throughout
+        // (the status only becomes 'completing' after this step), and the wait below can last many
+        // seconds, so this is read again before EVERY destructive step: an upload the user has
+        // withdrawn must not delete a file or cancel another upload on its way out. A cancel the
+        // server refused clears `cancelled` and leaves 'error' -- and this run began as 'uploading',
+        // so 'error' here can only mean that.
+        const withdrawn = () => it.cancelled || it.status === 'error';
+        if (withdrawn()) return false;
         if (r.deleteId) {
             let gone = false;
             try {
@@ -16408,15 +16417,23 @@ const uploadManager = {
                 await new Promise(res => setTimeout(res, 200));
                 victim = this.items.get(vid);
             }
+            if (withdrawn()) return false;
             if (this._landed.has(vid)) {
                 await this._dropReplacement(it, `"${name}" was already uploaded by the earlier transfer, `
                     + `which finished first; the new copy was not uploaded.`);
                 return false;
             }
-            if (victim && !victim.cancelled && victim.status !== 'error') {
-                // A cancel the server did not confirm leaves the earlier upload alive. Committing
-                // beside it is the both-copies outcome this step exists to prevent, so it is treated
-                // exactly like a victim that finished first: OUR replacement is dropped, by name.
+            // Every victim still in the tray is cancelled -- one whose row shows an ERROR too. An
+            // errored upload is not a dead one: its server session is still open and its row offers
+            // Resume, and an earlier upload that finishes AFTER this one replaces it by name, so
+            // the user's newer pick would be silently overwritten with the older bytes. (A refused
+            // cancel is one way a victim comes to be in 'error', which is why skipping those made a
+            // retry of a dropped replacement commit straight past a live victim.) Only a victim
+            // that is already cancelled, or gone from the tray, is passed over.
+            if (victim && !victim.cancelled) {
+                // A cancel the server did not confirm leaves the earlier upload alive, able to
+                // finish later and overwrite this one. So it is treated exactly like a victim that
+                // finished first: OUR replacement is dropped, by name.
                 if (!(await this.cancel(vid))) {
                     await this._dropReplacement(it, `Could not cancel the earlier upload of "${name}"; `
                         + `the new copy was not uploaded.`);
@@ -16431,9 +16448,20 @@ const uploadManager = {
         return true;
     },
 
+    // Said FIRST: removing our own session is a round trip with no bound on it, and the user
+    // should not wait on it to learn what happened to their file.
     async _dropReplacement(it, message) {
-        await this.cancel(it.id);   // our own session and record; nothing of ours is committed
         showError(message);
+        // Our own session and record; nothing of ours is committed. The same fault that refused
+        // the victim's cancel a moment ago can refuse this one, and then our data is still on the
+        // server and the row stays. What keeps that safe is not this row's state but the fire
+        // point: Resume re-enters it, it cancels everything this upload replaces all over again,
+        // and it never commits past a victim it could not cancel.
+        if (!(await this.cancel(it.id))) {
+            it.error = 'Not uploaded, but its data could not be removed from the server — '
+                     + 'Cancel to remove it, or Resume to try replacing again.';
+            this.render();
+        }
     },
 
     // Continue an interrupted sealed-as-it-uploads transfer with the file the user picked again.
@@ -16573,10 +16601,11 @@ const uploadManager = {
     // or the server confirmed the delete (or no longer had it). The answer used to be discarded --
     // the DELETE's status was never read -- so a refused cancel looked like a cancel: the row
     // vanished, the server session stayed, and a caller replacing that upload went on to commit
-    // beside it without a word.
+    // without a word -- leaving the earlier upload able to finish later and overwrite it.
     async cancel(id) {
         const it = this.items.get(id);
         if (!it) return true;
+        const waitingForFile = it.status === 'needs-file';
         it.cancelled = true;
         it.paused = true;
         if (it.sessionId) {
@@ -16591,8 +16620,15 @@ const uploadManager = {
                 // The server still holds the session, so the row stays -- with its saved record,
                 // which is still what could continue it -- and says so, where it can be retried.
                 it.cancelled = false;
-                it.status = 'error';
-                it.error = 'Could not cancel this upload — the server did not confirm it. Try again.';
+                if (waitingForFile) {
+                    // Still waiting for its file, and still continued by picking it: an 'error' row
+                    // would swap that control for a Resume that cannot work without the file. The
+                    // row is left exactly as it was and the refusal is said beside it.
+                    showError(`Could not cancel "${it.fileName}" — the server did not confirm it. Try again.`);
+                } else {
+                    it.status = 'error';
+                    it.error = 'Could not cancel this upload — the server did not confirm it. Try again.';
+                }
                 this.render();
                 return false;
             }
