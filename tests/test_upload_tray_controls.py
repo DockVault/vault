@@ -312,6 +312,11 @@ def test_which_victims_are_cancelled_and_which_are_passed_over():
     fresh(victim({ status: 'error', cancelled: true, sessionId: null }), ours()); await um._run('o'); out.alreadyCancelled = snap();
     fresh(ours()); await um._run('o'); out.goneFromTray = snap();
     fresh(victim({ status: 'done' }), ours()); um._noteLanded(um.items.get('v')); await um._run('o'); out.landed = snap();
+    // A row's `order` and a landing's stamp are minted from ONE counter, and that is the whole of
+    // how "landed after our drop" is known. So here ours is minted FROM the counter -- the last
+    // row the tray made -- and the landing follows at once, with nothing minted in between.
+    fresh(victim({ status: 'done' })); um.items.set('o', ours({ order: ++um.seq }));
+    um._noteLanded(um.items.get('v')); await um._run('o'); out.landedRightAfterOurDrop = snap();
     // ... but one that landed BEFORE ours was dropped is the committed file the user chose to replace.
     fresh(victim({ status: 'done' }), ours({ order: 900, replaces: { deleteId: 'F' } }));
     um._noteLanded(um.items.get('v')); await um._run('o'); out.landedBeforeOurDrop = snap();
@@ -330,6 +335,13 @@ def test_which_victims_are_cancelled_and_which_are_passed_over():
     assert COMPLETE not in landed["log"] and DEL_OLD not in landed["log"], landed
     assert landed["log"][0].startswith('toast error "X" was already uploaded by the earlier transfer')
     assert landed["log"][1:] == [DEL_NEW] and landed["o"] is None
+    # A landing must be stamped with a NEW tick of the counter, not the current one: stamped with
+    # the current one it equals the `order` of the row minted last, reads as "not after", and a
+    # chosen replacement commits past the file that landed first. Every other case here hand-picks
+    # orders far from the counter, which is how that survived. (mutation: `at: this.seq` -> red.)
+    right_after = out["landedRightAfterOurDrop"]
+    assert COMPLETE not in right_after["log"] and right_after["log"][1:] == [DEL_NEW], right_after
+    assert right_after["log"][0].startswith('toast error "X" was already uploaded by the earlier transfer')
     assert out["landedBeforeOurDrop"]["log"] == [DEL_FILE, COMPLETE], out["landedBeforeOurDrop"]
     # Paused, or waiting for its file (rebuilt from the server, so its `order` says nothing): live.
     for key in ("paused", "waiting"):

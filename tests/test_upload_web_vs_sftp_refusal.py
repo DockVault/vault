@@ -371,12 +371,13 @@ const uploadManager = { items: new Map(), enqueueNamed(entries) { enqueued.push(
 """ + unique + _upload_files_src(js) + """
 const row = (extra) => Object.assign({ id: 'r', order: 1, vaultId: 'V', folderId: null, fileName: 'X',
     status: 'uploading', cancelled: false, sessionId: 's' }, extra);
-const pick = async (rowExtra, zk) => {
+const pick = async (rowExtra, zk, fileName) => {
     asked.length = 0; enqueued.length = 0;
     state.currentVault = { id: 'V', zk: !!zk };
     uploadManager.items = new Map(rowExtra ? [['r', row(rowExtra)]] : []);
-    await uploadFiles([{ name: 'X', size: 5, type: '' }]);
-    return { asked: asked.slice(), replaces: enqueued.map(e => e.replaces || null) };
+    await uploadFiles([{ name: fileName || 'X', size: 5, type: '' }]);
+    return { asked: asked.slice(), replaces: enqueued.map(e => e.replaces || null),
+             names: enqueued.map(e => e.name) };
 };
 (async () => {
     const out = {
@@ -390,6 +391,9 @@ const pick = async (rowExtra, zk) => {
         zkRestored: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:X', status: 'needs-file' }, true),
         zkOldEpoch: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi-old:X', status: 'paused' }, true),
         zkOtherName: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:Y', status: 'needs-file' }, true),
+        // A file REALLY named like the placeholder a restored zero-knowledge row shows.
+        zkPlaceholder: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:Y', status: 'needs-file' },
+                                  true, '(encrypted upload)'),
     };
     out.errors = errors;
     process.stdout.write(JSON.stringify(out));
@@ -400,8 +404,8 @@ const pick = async (rowExtra, zk) => {
     assert done.returncode == 0, done.stdout + done.stderr
     out = json.loads(done.stdout)
     assert out["errors"] == []
-    held = {"asked": ["X"], "replaces": [{"deleteId": None}]}
-    free = {"asked": [], "replaces": [None]}
+    held = {"asked": ["X"], "replaces": [{"deleteId": None}], "names": ["X"]}
+    free = {"asked": [], "replaces": [None], "names": ["X"]}
     assert out["free"] == free
     # (mutation: leave 'error' out of the held names again -> no question, nothing replaced -> red.)
     assert out["failed"] == held and out["waiting"] == held and out["paused"] == held, out
@@ -409,6 +413,11 @@ const pick = async (rowExtra, zk) => {
     # (mutation: remove the blind-index arm -> the restored rows are invisible -> red.)
     assert out["zkRestored"] == held and out["zkOldEpoch"] == held, out
     assert out["zkOtherName"] == free
+    # The placeholder is not a name. The resolver knows that (the table above); the staging SET
+    # has to know it too, or a file really called that is asked about a conflict that does not
+    # exist -- and the same set feeds the auto-rename. (mutation: add every row's fileName to the
+    # set, placeholder or not -> the question is asked -> red.)
+    assert out["zkPlaceholder"] == {"asked": [], "replaces": [None], "names": ["(encrypted upload)"]}, out["zkPlaceholder"]
 
 
 def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everything():
