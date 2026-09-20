@@ -221,73 +221,194 @@ def test_upload_files_does_nothing_destructive_and_drops_a_refused_entry_before_
     assert ".splice(" not in seal_loop, "the loop splices the array it is walking"
 
 
-def test_what_an_entry_replaces_travels_on_the_entry_and_each_entry_resolves_its_own_victims():
-    # One drop can carry two files of the same name. Anything keyed by NAME makes them share a
-    # fate, so what an entry replaces is recorded on the entry object itself -- a refused entry is
-    # never enqueued, and its destructive step leaves with it by construction.
+RESOLVER = ("_nameKeys", "_sameName", "_samePlace", "_holdsName", "_sameNameRows", "_earlier",
+            "_liveRivals")
+
+
+def _resolver_src(js: str) -> str:
+    # The uploader's name resolver, lifted verbatim (comment-stripped), as object-literal members.
+    return "".join(_uploader_method(js, name) for name in RESOLVER)
+
+
+def test_what_an_entry_replaces_travels_on_the_entry_and_names_no_upload():
+    # DELIBERATE RE-PIN. This used to pin that every entry noted, by item id, the uploads in flight
+    # under its name before any sealing began. Ids noted at the drop turned out to be the hole: they
+    # miss a row already in 'error', a row waiting for its file (rebuilt under a new id on every
+    # refresh), and an upload in flight beside a committed file -- and each miss ends with an older
+    # upload overwriting the newer pick by name. The guarantee is restated: the entry says only
+    # that it REPLACES (and which committed row); WHICH uploads that means is resolved by the
+    # uploader at its fire point, from the tray as it is then (pinned in the table below and,
+    # behaviourally, in test_upload_tray_controls.py).
+    #
+    # What stays from the old pin: it travels ON the entry, so two files of one name in one drop
+    # do not share a fate, and a refused entry takes its destructive step with it.
     code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
-    assert code.count("entry.replaces = id ? { deleteId: id } : { inFlightName: file.name };") == 1
-    # Every entry resolves ALL the live uploads of its name, by item id, itself. Binding a victim to
-    # the FIRST matching request (`find`) loses the second entry's cancel when the first is refused.
-    # (mutation: restore a `find` that pairs one victim to one request -> red.)
-    resolve = code[code.index("for (const entry of toUpload) {\n        if (!entry.replaces"):]
-    resolve = resolve[:resolve.index("\n    }\n") + 6]
-    assert "entry.replaces.cancelItemIds = [...uploadManager.items.values()]" in resolve
-    assert ".filter(it =>" in resolve and ".map(it => it.id)" in resolve
-    assert ".find(" not in resolve, "a victim is paired to a single request again"
-    # RACE: ids are resolved BEFORE any async sealing work, so a later drop of the same name is never
-    # mistaken for the upload the user chose to replace. (mutation: move the resolution below the
-    # loop -> red.)
-    assert code.index("entry.replaces.cancelItemIds =") < code.index("for (const entry of toUpload) {\n                    const mime")
+    assert code.count("entry.replaces = { deleteId: id || null };") == 1
+    for gone in ("cancelItemIds", "inFlightName", ".map(it => it.id)", "_pendingUpload"):
+        assert gone not in code, f"uploadFiles notes uploads by id again: {gone}"
+    # One question decides whether a picked name is taken, and it asks the uploader's resolver.
+    assert code.count("if (!_nameIsHeld(file)) {") == 1
+    assert code.count("uploadManager._sameNameRows({") == 1
+    assert "if (!existing.has(file.name)) {" not in code
+    # Zero-knowledge: each picked name's blind index exists BEFORE the question is asked, or a row
+    # restored after a reload (placeholder name, index only) could not be recognised.
+    # (mutation: derive it after the conflict loop -> red.)
+    assert code.index("_picked.set(file, {") < code.index("const _nameIsHeld = (file) =>") \
+        < code.index("await resolveUploadConflict(file.name, autoName)")
 
 
-def test_every_live_upload_of_the_name_is_a_victim_run_against_the_shipped_scan():
-    # The textual pin above catches a `.find`, but not a truncation that keeps `.filter` (say
-    # `.slice(0, 1)`): the ALL-matches property has to be shown, not spelled. So the shipped scan is
-    # lifted out of uploadFiles verbatim, with the shipped pending-predicate, and run under Node over
-    # a tray holding TWO live uploads of one name. Both must become victims of EVERY entry that
-    # replaces that name -- and nothing else may: not another name, not a finished or cancelled
-    # upload, not another vault or folder. (mutation: `.slice(0, 1)` -> red; `.find` -> red.)
+def test_who_an_upload_replaces_run_against_the_shipped_resolver():
+    # DELIBERATE RE-PIN of the behavioural victims scan: the shipped resolver, lifted verbatim and
+    # run under Node over one tray. The guarantee: EVERY earlier upload of the name that can still
+    # finish is a rival, whatever its row says -- and nothing else is.
     node = shutil.which("node")
-    assert node, "Node is required: the victim scan must not be skipped"
-    js = APPJS.read_text(encoding="utf-8")
-    pending = re.search(r"const _pendingUpload = \(it\) => [^\n]*;", js)
-    assert pending, "the pending-upload predicate moved"
-    start = js.index("    for (const entry of toUpload) {\n        if (!entry.replaces || !entry.replaces.inFlightName) continue;")
-    scan = js[start:js.index("\n    }\n", start) + 6]
+    assert node, "Node is required: the resolver must not be skipped"
     harness = """
-const state = { currentVault: { id: 'V' } };
-const _curFolder = null;
-""" + pending.group(0) + """
-const mk = (id, name, extra) => Object.assign(
-    { id, vaultId: 'V', folderId: null, fileName: name, status: 'uploading', cancelled: false }, extra || {});
-const uploadManager = { items: new Map([
-    ['a', mk('a', 'X')], ['b', mk('b', 'X', { status: 'queued' })],   // two LIVE uploads of X
-    ['c', mk('c', 'Y')],                                              // another name
-    ['d', mk('d', 'X', { status: 'done' })],                          // finished
-    ['e', mk('e', 'X', { status: 'error' })],                         // failed
-    ['f', mk('f', 'X', { cancelled: true })],                         // cancelled
-    ['g', mk('g', 'X', { vaultId: 'OTHER' })],                        // another vault
-    ['h', mk('h', 'X', { folderId: 'F2' })],                          // another folder
-]) };
-const toUpload = [
-    { name: 'X', replaces: { inFlightName: 'X' } },
-    { name: 'X', replaces: { inFlightName: 'X' } },                   // a second entry of the same name
-    { name: 'Z', replaces: { deleteId: '1' } },                       // replaces a committed row: no scan
-    { name: 'Q' },                                                    // replaces nothing
+const um = { items: new Map(),
+""" + _resolver_src(APPJS.read_text(encoding="utf-8")) + """
+};
+const mk = (id, order, extra) => Object.assign({ id, order, vaultId: 'V', folderId: null, fileName: 'X',
+    status: 'uploading', cancelled: false, sessionId: 's-' + id }, extra || {});
+const rows = [
+    mk('early', 1), mk('queued', 2, { status: 'queued', sessionId: null }),   // two live uploads of X
+    mk('paused', 3, { status: 'paused' }), mk('failed', 4, { status: 'error' }),
+    mk('finalising', 5, { status: 'completing' }),
+    mk('midCancel', 6, { cancelled: true }),                                  // its own DELETE still out
+    mk('ME', 10, { replaces: { deleteId: null } }),
+    mk('twin', 11, { replaces: { deleteId: null } }),                         // same drop, same name
+    mk('bystander', 12),                                                      // dropped AFTER us
+    mk('waiting', 9000, { status: 'needs-file', restored: true }),            // re-keyed: order is new
+    mk('unordered', undefined),                                               // put in the tray by hand
+    mk('otherName', 1, { fileName: 'Y' }), mk('done', 1, { status: 'done' }),
+    mk('dead', 1, { cancelled: true, sessionId: null, status: 'error' }),     // provably gone
+    mk('otherVault', 1, { vaultId: 'W' }), mk('otherFolder', 1, { folderId: 'F2' }),
 ];
-""" + scan + """
-process.stdout.write(JSON.stringify(
-    toUpload.map(e => (e.replaces && e.replaces.cancelItemIds) ? e.replaces.cancelItemIds : null)));
+um.items = new Map(rows.map(r => [r.id, r]));
+const ids = (list) => list.map(r => r.id).sort();
+const out = { me: ids(um._liveRivals(um.items.get('ME'))), twin: ids(um._liveRivals(um.items.get('twin'))),
+              bystander: ids(um._liveRivals(um.items.get('bystander'))) };
+
+// Zero-knowledge: a row restored after a reload has a placeholder for a name and only its index.
+const zk = (id, order, extra) => mk(id, order, Object.assign({ isZk: true }, extra));
+um.items = new Map([
+    zk('sameIndex', 9001, { restored: true, fileName: '(encrypted upload)', nameBi: 'bi-now' }),
+    zk('oldEpoch', 9002, { restored: true, fileName: '(encrypted upload)', nameBi: 'bi-old' }),
+    zk('otherIndex', 9003, { restored: true, fileName: '(encrypted upload)', nameBi: 'bi-else' }),
+    zk('noRecord', 9004, { restored: true, fileName: '(encrypted upload)' }),
+    zk('ZME', 10, { fileName: 'X', nameBi: 'bi-now', nameBiCandidates: ['bi-old', 'bi-now'] }),
+    zk('literal', 11, { fileName: '(encrypted upload)', nameBi: 'bi-literal' }),  // a file really named that
+].map(r => [r.id, r]));
+out.zk = ids(um._liveRivals(um.items.get('ZME')));
+out.literal = ids(um._liveRivals(um.items.get('literal')));
+
+// Two RESTORED rows of one name: exactly one of the pair is the earlier -- the OLDER session. The
+// server lists newest first, so the rebuild hands the newer row the LOWER order.
+um.items = new Map([mk('older', 701, { restored: true, startedAt: 1000 }),
+                    mk('newer', 700, { restored: true, startedAt: 2000 })].map(r => [r.id, r]));
+out.pair = { older: ids(um._liveRivals(um.items.get('older'))), newer: ids(um._liveRivals(um.items.get('newer'))) };
+// ... and with nothing to tell them apart in time, `order` still makes exactly one the earlier.
+um.items = new Map([mk('t1', 5, { restored: true, startedAt: 7 }), mk('t2', 6, { restored: true, startedAt: 7 })].map(r => [r.id, r]));
+out.tie = { t1: ids(um._liveRivals(um.items.get('t1'))), t2: ids(um._liveRivals(um.items.get('t2'))) };
+process.stdout.write(JSON.stringify(out));
 """
-    done = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8",
+                          timeout=60)
     assert done.returncode == 0, done.stdout + done.stderr
-    first, second, committed, plain = json.loads(done.stdout)
-    assert sorted(first) == ["a", "b"], f"not every live upload of the name is a victim: {first}"
-    # The second entry of the same name resolves its OWN full list: refusing the first must not
-    # cost the second its cancel.
-    assert sorted(second) == ["a", "b"], second
-    assert committed is None and plain is None
+    out = json.loads(done.stdout)
+    # EVERY earlier upload of the name that can still finish -- uploading, queued, paused, FAILED,
+    # finalising, one with its own cancel still in flight, and one waiting for its file whose
+    # `order` is brand new because the tray rebuilt it. (mutations: `.slice(0, 1)` / `[0]` on the
+    # list -> red; leave 'error' out again -> red; rows rebuilt from the server no longer count as
+    # earlier -> 'waiting' is lost -> red; pass over a row that reads `cancelled` -> red.)
+    # And a row with no `order` at all: not a later drop, so earlier -- never "not earlier than
+    # anything", which would pass it over for ever. (mutation: compare the raw `order` -> red.)
+    assert out["me"] == sorted(["early", "queued", "paused", "failed", "finalising", "midCancel", "waiting",
+                                "unordered"]), out["me"]
+    # THE BYSTANDER: a same-name upload dropped AFTER ours is never our victim -- it saw our name as
+    # taken, and ITS fire point deals with us. (mutation: drop the order test -> red.)
+    assert "bystander" not in out["me"] and "twin" not in out["me"]
+    assert "ME" in out["bystander"] and "twin" in out["bystander"]
+    # Two files of one name in ONE drop: the second replaces the first as well -- one name, one
+    # file -- and the first does not see the second.
+    assert "ME" in out["twin"] and len(out["twin"]) == len(out["me"]) + 1
+    # By blind index, across a key rotation too (the candidates), and ONLY by index for a restored
+    # row: its placeholder is not a name, so a file really called that does not match it, and a row
+    # with no saved record matches nothing. (mutation: remove the index arm -> [] -> red; match
+    # restored rows on their placeholder -> 'literal' finds four -> red.)
+    assert out["zk"] == ["oldEpoch", "sameIndex"], out["zk"]
+    assert out["literal"] == [], out["literal"]
+    # (mutations: every restored row is earlier than every other -> both lists full -> red; tell
+    # two restored rows apart by `order` alone -> the NEWER is named the earlier -> red.)
+    assert out["pair"] == {"older": [], "newer": ["older"]}, out["pair"]
+    assert out["tie"] == {"t1": [], "t2": ["t1"]}, out["tie"]
+
+
+def test_a_name_held_by_a_failed_or_waiting_upload_asks_the_question_run_against_upload_files():
+    # The shipped uploadFiles, run under Node. A row that FAILED, or is waiting for its file, used
+    # to be left out of the names that are taken: the same name then went up beside it with no
+    # question asked and nothing to replace, and resuming the older one later overwrote the newer
+    # file by name. And on a zero-knowledge vault a row restored after a reload can be recognised
+    # only by its blind index, which therefore has to exist before the question is asked.
+    node = shutil.which("node")
+    assert node, "Node is required: the staging path must not be skipped"
+    js = APPJS.read_text(encoding="utf-8")
+    unique = js[js.index("function uniqueUploadName(name, existing) {"):js.index("function resolveUploadConflict(")]
+    harness = """
+const asked = [], enqueued = [], errors = [];
+const state = { currentVault: { id: 'V', zk: false }, currentFolderId: null, currentFiles: [], downloadSink: 'streaming' };
+const showError = (m) => errors.push(m);
+const isZkVault = (v) => !!v.zk;
+const resolveUploadConflict = async (name, autoName) => { asked.push(name); return { action: 'overwrite' }; };
+const zkGetCurrentDekVersion = async () => 2, zkGetVaultDek = async () => 'dek';
+const eccLib = () => ({ ZK_CONTENT_WRITE_V2: true, nameBlindIndex: async (n) => 'bi:' + n,
+                        encryptName: async () => 'sealed' });
+const zkUploadNameCandidates = async (lib, n) => ['bi-old:' + n, 'bi:' + n];
+const zkNewObjId = () => 'obj', zkUploadDecision = () => 'seal', MAX_BUFFERED_DOWNLOAD_BYTES = 1, formatBytes = null;
+const isCodedCryptoError = () => false, safeMessageForCode = () => '';
+const uploadManager = { items: new Map(), enqueueNamed(entries) { enqueued.push(...entries); },
+""" + _resolver_src(js) + """
+};
+""" + unique + _upload_files_src(js) + """
+const row = (extra) => Object.assign({ id: 'r', order: 1, vaultId: 'V', folderId: null, fileName: 'X',
+    status: 'uploading', cancelled: false, sessionId: 's' }, extra);
+const pick = async (rowExtra, zk) => {
+    asked.length = 0; enqueued.length = 0;
+    state.currentVault = { id: 'V', zk: !!zk };
+    uploadManager.items = new Map(rowExtra ? [['r', row(rowExtra)]] : []);
+    await uploadFiles([{ name: 'X', size: 5, type: '' }]);
+    return { asked: asked.slice(), replaces: enqueued.map(e => e.replaces || null) };
+};
+(async () => {
+    const out = {
+        free: await pick(null),
+        failed: await pick({ status: 'error' }),
+        waiting: await pick({ status: 'needs-file', restored: true }),
+        paused: await pick({ status: 'paused' }),
+        done: await pick({ status: 'done' }),
+        dead: await pick({ status: 'error', cancelled: true, sessionId: null }),
+        elsewhere: await pick({ folderId: 'F2' }),
+        zkRestored: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:X', status: 'needs-file' }, true),
+        zkOldEpoch: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi-old:X', status: 'paused' }, true),
+        zkOtherName: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:Y', status: 'needs-file' }, true),
+    };
+    out.errors = errors;
+    process.stdout.write(JSON.stringify(out));
+})().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+"""
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8",
+                          timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    assert out["errors"] == []
+    held = {"asked": ["X"], "replaces": [{"deleteId": None}]}
+    free = {"asked": [], "replaces": [None]}
+    assert out["free"] == free
+    # (mutation: leave 'error' out of the held names again -> no question, nothing replaced -> red.)
+    assert out["failed"] == held and out["waiting"] == held and out["paused"] == held, out
+    assert out["done"] == free and out["dead"] == free and out["elsewhere"] == free, out
+    # (mutation: remove the blind-index arm -> the restored rows are invisible -> red.)
+    assert out["zkRestored"] == held and out["zkOldEpoch"] == held, out
+    assert out["zkOtherName"] == free
 
 
 def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everything():
@@ -303,7 +424,9 @@ def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everyth
     complete_at = run.index("/complete`")
     assert send_at < holds_at < fire_at < complete_at, "the destructive step is not at the fire point"
     assert run.count("this._fireReplacement(it)") == 1 and js.count("this._fireReplacement(it)") == 1
-    assert "if (it.replaces && !it.replacesFired) {" in run
+    # For EVERY upload that has something to fire -- a choice the user made, or an earlier upload
+    # of its name still alive -- and once per upload.
+    assert run.count("if (!it.replacesFired && (it.replaces || this._liveRivals(it).length)) {") == 1
     # "Holds everything" is the server's OWN count: every chunk, and exactly the declared bytes.
     holds = _uploader_method(js, "async _serverHoldsAll")
     assert "return !!s.complete && s.bytes_received === it.totalSize;" in holds
@@ -321,10 +444,11 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
         assert '"${name}"' in msg, f"a dropped replacement does not name the file: {msg}"
         assert "not uploaded" in msg, f"the message does not say what did not happen: {msg}"
         assert ".size" not in msg and ".length" not in msg, f"the message is a bare count: {msg}"
-    # A victim that FINISHED FIRST is told apart from one that was cancelled (both leave the tray):
-    # the landed set is the difference, and landing first drops the replacement, not the landed file.
-    assert "if (this._landed.has(vid)) {" in fire
-    assert fire.index("if (this._landed.has(vid)) {") < fire.index("if (!(await this.cancel(vid))) {")
+    # An earlier upload that FINISHED FIRST is told apart from one that was cancelled (both leave
+    # the tray): what landed is noted apart from the rows, by the name it held, and landing first
+    # drops the replacement, not the landed file. It is read before any cancel on every turn.
+    assert fire.count("if (it.replaces && this._landedSince(it)) {") == 1
+    assert fire.index("if (it.replaces && this._landedSince(it)) {") < fire.index("await this.cancel(rival.id, true)")
     assert 'showInfo(`The earlier upload of "${name}" was cancelled and replaced by this one.`)' in fire
 
 

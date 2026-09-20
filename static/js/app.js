@@ -15687,10 +15687,11 @@ const transferGate = new TransferGate(5);
 
 const uploadManager = {
     items: new Map(),   // uploadId -> item
-    // Ids of uploads that COMMITTED. A finished row leaves `items` a few seconds later, and so does
-    // a cancelled one -- so "gone" cannot tell a later replacement whether the upload it meant to
-    // replace finished first or was cancelled. This can.
-    _landed: new Set(),
+    // What COMMITTED: the name each finished upload held, and when (see _noteLanded). A finished
+    // row leaves `items` a few seconds later, and so does a cancelled one -- so "gone" cannot tell
+    // a later replacement whether the upload it meant to replace finished first or was cancelled.
+    // This can.
+    _landed: [],
     seq: 0,
 
     // Logout scrub (finding F-R015-004): drop the tray's items + its DOM WITHOUT cancelling — cancel()
@@ -15737,7 +15738,7 @@ const uploadManager = {
             const id = this._newId();
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             this.items.set(id, {
-                id, file, vaultId, folderId,
+                id, order: this.seq, file, vaultId, folderId,
                 fileName: file.name, totalSize: file.size,
                 totalChunks, chunkSize: CHUNK_SIZE,
                 sessionId: null, received: new Set(),
@@ -15760,7 +15761,7 @@ const uploadManager = {
             const id = this._newId();
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             this.items.set(id, {
-                id, vaultId, folderId,
+                id, order: this.seq, vaultId, folderId,
                 // A file sealed AS IT UPLOADS carries no `file` at all: `file` is what the send loop
                 // slices and sends verbatim, and for such an item the only handle there is is the
                 // PLAINTEXT. Keeping it out of `file` makes a raw send of it impossible by
@@ -15846,7 +15847,8 @@ const uploadManager = {
                     // it is checked against those MACs before the old token is reused.
                     const id = this._newId();
                     this.items.set(id, {
-                        id, file: null, zkPlain: null, zkStream: null, zkPipelined: true,
+                        id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                        file: null, zkPlain: null, zkStream: null, zkPipelined: true,
                         zkResume: rec.resume, frameMacs: null, replaces: null,
                         vaultId, folderId: s.folder_id || null,
                         fileName: s.file_name
@@ -15868,7 +15870,8 @@ const uploadManager = {
                 if (rec && rec.blob) {
                     const id = this._newId();
                     this.items.set(id, {
-                        id, file: rec.blob, vaultId, folderId: s.folder_id || null,
+                        id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                        file: rec.blob, vaultId, folderId: s.folder_id || null,
                         // Neither side has a plaintext name to offer: the server never had one
                         // for a zero-knowledge session, and the local record deliberately no
                         // longer keeps one. Decrypting the sealed name needs the vault DEK, and
@@ -15901,7 +15904,8 @@ const uploadManager = {
                 // as resumable-but-stuck; resume() explains it can't be replayed here.
                 const id = this._newId();
                 this.items.set(id, {
-                    id, file: null, vaultId, folderId: s.folder_id || null,
+                    id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                    file: null, vaultId, folderId: s.folder_id || null,
                     fileName: s.file_name || '(encrypted upload)', totalSize: s.total_size,
                     totalChunks: s.total_chunks, chunkSize: CHUNK_SIZE,
                     sessionId: s.session_id, received: new Set(),
@@ -15914,7 +15918,8 @@ const uploadManager = {
             // Standard vault: resumable by re-selecting the source file.
             const id = this._newId();
             this.items.set(id, {
-                id, file: null, vaultId, folderId: s.folder_id || null,
+                id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                file: null, vaultId, folderId: s.folder_id || null,
                 fileName: s.file_name, totalSize: s.total_size,
                 totalChunks: s.total_chunks, chunkSize: CHUNK_SIZE,
                 sessionId: s.session_id, received: new Set(),
@@ -16248,7 +16253,15 @@ const uploadManager = {
             // (one that died halfway would already have cost the original), and not after the
             // commit (a name rule could then refuse the finalize while the original still stood in
             // the way). Per entry: this item's step, for this item's bytes.
-            if (it.replaces && !it.replacesFired) {
+            //
+            // For EVERY upload, not only one the user chose "replace" for. What an upload replaces
+            // is not kept across a reload, so a replacement and the upload it was replacing both
+            // come back as plain rows waiting for their files; continue the newer one and it would
+            // commit beside the older one's open session, which overwrites it by name whenever it
+            // is continued later. The server makes any upload of a taken name a replacement
+            // anyway, so cancelling the earlier ones here decides only WHICH copy is kept -- the
+            // newer pick -- and says so. An upload with nothing to fire goes straight on, as ever.
+            if (!it.replacesFired && (it.replaces || this._liveRivals(it).length)) {
                 if (!(await this._serverHoldsAll(it))) {
                     throw new Error('Could not confirm that the whole upload arrived, so nothing '
                                   + 'was replaced. Resume to try again.');
@@ -16256,6 +16269,9 @@ const uploadManager = {
                 if (!(await this._fireReplacement(it))) return;   // dropped, and said so by name
                 it.replacesFired = true;
             }
+            // Cancelled while the last request of that step was still out: its row may already
+            // be gone, and an upload the user withdrew is not committed behind their back.
+            if (it.cancelled || it.status === 'error') return;
 
             it.status = 'completing';
             this.render();
@@ -16308,7 +16324,7 @@ const uploadManager = {
             }
             if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);  // committed — drop the saved record
             it.zkStream = null; it.zkPlain = null;   // the writer session ends with its transfer
-            this._landed.add(id);
+            this._noteLanded(it);
             it.status = 'done';
             this.render();
             // Refresh the file list so the new file appears; drop the row shortly after.
@@ -16380,13 +16396,94 @@ const uploadManager = {
         return !!s.complete && s.bytes_received === it.totalSize;
     },
 
+    // ---- Which uploads hold the same name in the same place ------------------------------------
+    //
+    // ONE resolver, asked at the two moments that matter: when a file is picked (is its name
+    // taken? -- the conflict dialog) and at the fire point (what has to be cancelled before this
+    // one may commit?). The server replaces a file BY NAME when another of that name is committed,
+    // so an earlier upload of the name that can still finish would later overwrite the user's
+    // newer pick with older bytes. Rows are therefore matched by what they ARE at that moment, not
+    // by ids noted when the file was dropped. An id noted early misses a row that was already in
+    // 'error' then; a row waiting for its file, because those are rebuilt under NEW ids every time
+    // the tray is refreshed from the server; and an upload in flight beside a committed file.
+    //
+    // A name is matched in the clear where the row has one and by blind index where it does not: a
+    // zero-knowledge upload restored after a reload shows a placeholder, since the server never
+    // had its name, but its saved record kept the index. Two limits, both needing the server and
+    // so not solvable here: a restored zero-knowledge row with NO saved record carries neither a
+    // name nor an index and matches nothing; and what an upload replaces is not kept across a
+    // reload, so a restored replacement comes back as a plain upload.
+    _nameKeys(it) {
+        const keys = [];
+        if (it.fileName && !(it.isZk && it.restored)) keys.push('n:' + it.fileName);
+        if (it.nameBi) keys.push('b:' + it.nameBi);
+        for (const c of (it.nameBiCandidates || [])) keys.push('b:' + c);
+        return keys;
+    },
+    _sameName(a, b) {
+        const mine = new Set(this._nameKeys(a));
+        return this._nameKeys(b).some(k => mine.has(k));
+    },
+    _samePlace(a, b) {
+        return a.vaultId === b.vaultId && (a.folderId || null) === (b.folderId || null);
+    },
+    // A row holds its name until it is finished (from then on the file list holds it) or provably
+    // gone: cancelled, with no server session left. Paused, failed, waiting for its file,
+    // finalising, even with a cancel of its own still in flight -- every one of those can finish.
+    _holdsName(o) {
+        return o.status !== 'done' && !(o.cancelled && !o.sessionId);
+    },
+    _sameNameRows(probe) {
+        return [...this.items.values()].filter(o => o !== probe && o.id !== probe.id
+            && this._samePlace(o, probe) && this._holdsName(o) && this._sameName(o, probe));
+    },
+    // EARLIER than `it`, which is what makes a row something `it` replaces. A row the user dropped
+    // AFTER this one is never its victim -- that later drop saw this name as taken, and ITS fire
+    // point deals with this one. Rows rebuilt from the server are sessions this tab did not start,
+    // so they count as earlier than anything dropped here. Between TWO of them `order` says
+    // nothing true: it is new on every refresh, and the server lists sessions newest first, so it
+    // would name the newer one as the earlier. What the server says about when each session was
+    // opened decides instead, and `order` only breaks a tie -- so exactly one of any pair is the
+    // earlier, and it is the older one.
+    //
+    // A row with no `order` at all was not put in the tray by a drop in this tab, so it cannot be
+    // a LATER drop: it counts as earliest, rather than comparing as "not earlier than anything"
+    // and being passed over for ever.
+    _earlier(o, it) {
+        if (!!o.restored !== !!it.restored) return !!o.restored;
+        if (o.restored && (o.startedAt || 0) !== (it.startedAt || 0)) {
+            return (o.startedAt || 0) < (it.startedAt || 0);
+        }
+        const at = (row) => (typeof row.order === 'number' ? row.order : 0);
+        return at(o) < at(it);
+    },
+    _liveRivals(it) {
+        return this._sameNameRows(it).filter(o => this._earlier(o, it));
+    },
+    // A finished row leaves the tray seconds later, so what LANDED is noted apart from the rows:
+    // the name it held, and when. An upload of that name which was dropped BEFORE that moment has
+    // been overtaken. One that was dropped after it chose to replace the committed file knowingly.
+    _noteLanded(it) {
+        this._landed.push({ vaultId: it.vaultId, folderId: it.folderId || null, isZk: it.isZk,
+            restored: it.restored, fileName: it.fileName, nameBi: it.nameBi,
+            nameBiCandidates: it.nameBiCandidates, at: ++this.seq });
+        if (this._landed.length > 200) this._landed.shift();
+    },
+    _landedSince(it) {
+        return this._landed.some(l => l.at > it.order && this._samePlace(l, it) && this._sameName(l, it));
+    },
+
     // Fire what this upload replaces. Returns false when the replacement did not go ahead. Either
     // it was dropped -- always with a message that names the file, says which copy is on the server
     // now, and says what did not happen; never a bare count, never silence -- or the user withdrew
     // it while this step was waiting, and then NOTHING it replaces is touched.
     async _fireReplacement(it) {
         const name = it.fileName;
-        const r = it.replaces;
+        // The user's explicit choice, if they made one. Without it this step still cancels the
+        // earlier uploads of the name, but it neither deletes a committed file (the server's own
+        // replace-by-name deals with that one) nor stands aside for an upload that landed first:
+        // nobody asked for this one to give way, and committing it is what always happened.
+        const r = it.replaces || {};
         // Cancelled by the user since this step began. Its row keeps Pause and Cancel throughout
         // (the status only becomes 'completing' after this step), and the wait below can last many
         // seconds, so this is read again before EVERY destructive step: an upload the user has
@@ -16394,7 +16491,46 @@ const uploadManager = {
         // server refused clears `cancelled` and leaves 'error' -- and this run began as 'uploading',
         // so 'error' here can only mean that.
         const withdrawn = () => it.cancelled || it.status === 'error';
-        if (withdrawn()) return false;
+        // THE EARLIER UPLOADS FIRST, the committed original after them. A cancel that is refused
+        // then costs nothing -- the original is still there -- where the other order would have
+        // deleted the original and then uploaded nothing in its place.
+        //
+        // The rivals are resolved AGAIN on every turn, never held across an await: a row waiting
+        // for its file is rebuilt under a new id whenever the tray refreshes, and one noted before
+        // a wait would look "gone" after it while its server session was as alive as ever.
+        let cancelled = false;
+        let waited = 0;
+        for (let turn = 0; ; turn++) {
+            if (withdrawn()) return false;
+            if (it.replaces && this._landedSince(it)) {
+                await this._dropReplacement(it, `"${name}" was already uploaded by the earlier transfer, `
+                    + `which finished first; the new copy was not uploaded.`);
+                return false;
+            }
+            const rival = this._liveRivals(it)[0];
+            if (!rival) break;
+            // One that is finalising settles one way or the other within moments, and cancelling
+            // it mid-commit could delete a file that is about to land. One whose OWN cancel is in
+            // flight is not gone yet either -- that cancel can still be refused, and then it is as
+            // resumable as before. Both are waited out, briefly; past the wait it gets our cancel,
+            // which is the same idempotent DELETE, and only a confirmed one counts.
+            const settling = rival.status === 'completing' || (rival.cancelled && !!rival.sessionId);
+            if (settling && waited < 150) {
+                waited++;
+                await new Promise(res => setTimeout(res, 200));
+                continue;
+            }
+            // Whatever its row says -- uploading, paused, waiting for its file, or an ERROR: an
+            // errored upload is not a dead one, its session is still open and its row offers
+            // Resume. A cancel the server did not confirm leaves it able to finish later and
+            // overwrite this one, so OUR replacement is dropped, by name.
+            if (turn >= 1000 || !(await this.cancel(rival.id, true))) {
+                await this._dropReplacement(it, `Could not cancel the earlier upload of "${name}"; `
+                    + `the new copy was not uploaded.`);
+                return false;
+            }
+            cancelled = true;
+        }
         if (r.deleteId) {
             let gone = false;
             try {
@@ -16403,60 +16539,36 @@ const uploadManager = {
                 gone = d.ok || d.status === 404;   // already gone is gone
             } catch (_) { gone = false; }
             if (!gone) {
+                if (cancelled) {
+                    try { showInfo(`The earlier upload of "${name}" was cancelled.`); } catch (_) {}
+                }
                 await this._dropReplacement(it, `Could not replace "${name}": the existing file could `
                     + `not be removed, so it is unchanged and the new copy was not uploaded.`);
                 return false;
             }
         }
-        let cancelled = false;
-        for (const vid of (r.cancelItemIds || [])) {
-            let victim = this.items.get(vid);
-            // A victim that is finalising settles one way or the other within moments; cancelling
-            // it mid-commit could delete a file that is about to land. Wait it out, briefly.
-            for (let n = 0; victim && victim.status === 'completing' && n < 150; n++) {
-                await new Promise(res => setTimeout(res, 200));
-                victim = this.items.get(vid);
-            }
-            if (withdrawn()) return false;
-            if (this._landed.has(vid)) {
-                await this._dropReplacement(it, `"${name}" was already uploaded by the earlier transfer, `
-                    + `which finished first; the new copy was not uploaded.`);
-                return false;
-            }
-            // Every victim still in the tray is cancelled -- one whose row shows an ERROR too. An
-            // errored upload is not a dead one: its server session is still open and its row offers
-            // Resume, and an earlier upload that finishes AFTER this one replaces it by name, so
-            // the user's newer pick would be silently overwritten with the older bytes. (A refused
-            // cancel is one way a victim comes to be in 'error', which is why skipping those made a
-            // retry of a dropped replacement commit straight past a live victim.) Only a victim
-            // that is already cancelled, or gone from the tray, is passed over.
-            if (victim && !victim.cancelled) {
-                // A cancel the server did not confirm leaves the earlier upload alive, able to
-                // finish later and overwrite this one. So it is treated exactly like a victim that
-                // finished first: OUR replacement is dropped, by name.
-                if (!(await this.cancel(vid))) {
-                    await this._dropReplacement(it, `Could not cancel the earlier upload of "${name}"; `
-                        + `the new copy was not uploaded.`);
-                    return false;
-                }
-                cancelled = true;
-            }
-        }
+        // ... and once more AFTER the last destructive request: a Cancel clicked while that
+        // request was out must not be answered with a commit.
+        if (withdrawn()) return false;
         if (cancelled) {
             try { showInfo(`The earlier upload of "${name}" was cancelled and replaced by this one.`); } catch (_) {}
         }
         return true;
     },
 
-    // Said FIRST: removing our own session is a round trip with no bound on it, and the user
-    // should not wait on it to learn what happened to their file.
+    // Said FIRST, and the row says it too BEFORE our own session is removed: that is a round trip
+    // with no bound on it, and a row left reading "Uploading 100%" for as long as it takes is a
+    // row telling the user the opposite of what happened.
     async _dropReplacement(it, message) {
         showError(message);
+        it.status = 'error';
+        it.error = 'Not uploaded — removing its data from the server…';
+        this.render();
         // Our own session and record; nothing of ours is committed. The same fault that refused
-        // the victim's cancel a moment ago can refuse this one, and then our data is still on the
-        // server and the row stays. What keeps that safe is not this row's state but the fire
-        // point: Resume re-enters it, it cancels everything this upload replaces all over again,
-        // and it never commits past a victim it could not cancel.
+        // an earlier upload's cancel a moment ago can refuse this one, and then our data is still
+        // on the server and the row stays. What keeps that safe is not this row's state but the
+        // fire point: Resume re-enters it, it resolves and cancels everything this upload replaces
+        // all over again, and it never commits past one it could not cancel.
         if (!(await this.cancel(it.id))) {
             it.error = 'Not uploaded, but its data could not be removed from the server — '
                      + 'Cancel to remove it, or Resume to try replacing again.';
@@ -16602,10 +16714,12 @@ const uploadManager = {
     // the DELETE's status was never read -- so a refused cancel looked like a cancel: the row
     // vanished, the server session stayed, and a caller replacing that upload went on to commit
     // without a word -- leaving the earlier upload able to finish later and overwrite it.
-    async cancel(id) {
+    //
+    // `forReplacement`: a newer upload of the same name is asking, not the user -- the row then
+    // says so, instead of reporting the failure of a cancel the user never made.
+    async cancel(id, forReplacement) {
         const it = this.items.get(id);
         if (!it) return true;
-        const waitingForFile = it.status === 'needs-file';
         it.cancelled = true;
         it.paused = true;
         if (it.sessionId) {
@@ -16620,14 +16734,25 @@ const uploadManager = {
                 // The server still holds the session, so the row stays -- with its saved record,
                 // which is still what could continue it -- and says so, where it can be retried.
                 it.cancelled = false;
-                if (waitingForFile) {
-                    // Still waiting for its file, and still continued by picking it: an 'error' row
-                    // would swap that control for a Resume that cannot work without the file. The
-                    // row is left exactly as it was and the refusal is said beside it.
-                    showError(`Could not cancel "${it.fileName}" — the server did not confirm it. Try again.`);
+                // Decided on what the row is NOW, not on what it was when the cancel began: the
+                // request has no bound on it, and a row waiting for its file keeps its re-pick
+                // control the whole time. Re-picked meanwhile, it is 'uploading' with nothing
+                // driving it (the run stopped on `cancelled`), and leaving THAT as it was would
+                // strand it with no control that works.
+                if (it.status === 'needs-file') {
+                    // Still waiting for its file. An 'error' row would still open the picker for a
+                    // row that can be re-picked, but it would lose the sentence saying what the row
+                    // is waiting for -- and for one sealed up front, whose data is not on this
+                    // device, its Resume only ever answers with an error. So the row is left
+                    // exactly as it was and the refusal is said beside it.
+                    showError(forReplacement
+                        ? `A newer upload of "${it.fileName}" could not cancel this one — the server did not confirm it.`
+                        : `Could not cancel "${it.fileName}" — the server did not confirm it. Try again.`);
                 } else {
                     it.status = 'error';
-                    it.error = 'Could not cancel this upload — the server did not confirm it. Try again.';
+                    it.error = forReplacement
+                        ? 'A newer upload of this name tried to replace this one, but the server did not confirm the cancel.'
+                        : 'Could not cancel this upload — the server did not confirm it. Try again.';
                 }
                 this.render();
                 return false;
@@ -16930,27 +17055,52 @@ async function uploadFiles(files) {
 
     const existing = new Set((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => i.name));
     const idByName = new Map((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => [i.name, i.id]));
-    // A name that is CURRENTLY UPLOADING into THIS folder is taken too. Without this, a second pick
+    // A name that an upload into THIS folder still HOLDS is taken too. Without this, a second pick
     // of the same file races the first and both land (the reported "uploaded twice"), and a single
     // re-pick while the first is still in flight wouldn't prompt because the name isn't in the file
-    // list yet — the bug where a single-file re-upload silently added a duplicate while a multi-file
-    // batch (which also dedupes within itself) appeared to "always prompt". The in-flight item
-    // carries the plaintext name the user chose, so this also covers zero-knowledge vaults, where
-    // the server never sees the name. An in-flight name has no committed id to delete: choosing
-    // "replace" for one cancels that in-flight upload and uploads the new file in its place (see
-    // `entry.replaces` below), rather than pushing a second copy that would race the first.
+    // list yet. Choosing "replace" for such a name cancels that upload and puts the new file in its
+    // place (see `entry.replaces` below), rather than pushing a second copy that would race it.
     //
-    // Only NOT-YET-COMMITTED statuses count. A finished ('done') upload has already refreshed the
-    // file list (loadVaultFiles runs on completion), so its name is in state.currentFiles if it is
-    // still there — and NOT here, so a re-upload after that file was deleted is correctly free.
-    const _curFolder = state.currentFolderId || null;
-    const _pendingUpload = (it) => it.status !== 'error' && it.status !== 'done' && !it.cancelled;
+    // HOLDS means "can still finish": the uploader's own resolver decides, and it counts a row that
+    // failed, is paused, or is waiting for its file. Those used to be left out, so the same name
+    // went up beside one with no question asked -- and when the older one was resumed later, the
+    // server replaced the newer file with it by name. A finished ('done') upload does not count:
+    // it has already refreshed the file list, so its name is in state.currentFiles if it is still
+    // there -- and NOT here, so a re-upload after that file was deleted is correctly free.
+    const _place = { vaultId: state.currentVault.id, folderId: state.currentFolderId || null };
     for (const it of uploadManager.items.values()) {
-        if (it.vaultId !== state.currentVault.id) continue;
-        if ((it.folderId || null) !== _curFolder) continue;
-        if (!_pendingUpload(it)) continue;
-        if (it.fileName) existing.add(it.fileName);
+        if (!uploadManager._samePlace(it, _place) || !uploadManager._holdsName(it)) continue;
+        // In the clear only where the row really has the name (a restored zero-knowledge row shows
+        // a placeholder); this set also feeds the auto-rename, which works on real names.
+        if (it.fileName && !(it.isZk && it.restored)) existing.add(it.fileName);
     }
+    // Zero-knowledge: a row restored after a reload can only be recognised by its blind index, so
+    // each picked name's index is derived HERE, ahead of the question. It costs nothing new -- the
+    // key is fetched moments later anyway, and the vault is unlocked or nothing could be uploaded.
+    const _zkVault = isZkVault(state.currentVault);
+    const _picked = new Map();   // picked file -> { nameBi, nameBiCandidates }
+    if (_zkVault) {
+        try {
+            const vid = state.currentVault.id;
+            const keyVersion = await zkGetCurrentDekVersion(vid);
+            const dek = await zkGetVaultDek(vid, keyVersion);
+            const lib = eccLib();
+            for (const file of arr) {
+                _picked.set(file, {
+                    nameBi: await lib.nameBlindIndex(file.name, dek, vid, keyVersion),
+                    nameBiCandidates: await zkUploadNameCandidates(lib, file.name, vid, keyVersion, dek),
+                });
+            }
+        } catch (e) {
+            showError(isCodedCryptoError(e)
+                ? safeMessageForCode(e.code, 'unlock')
+                : 'Zero-knowledge encryption failed.');
+            return;
+        }
+    }
+    const _nameIsHeld = (file) => existing.has(file.name) || uploadManager._sameNameRows({
+        id: null, ..._place, isZk: _zkVault, fileName: file.name, ...(_picked.get(file) || {}),
+    }).length > 0;
     let toUpload = [];   // {file, name}
     // What an entry REPLACES travels on the entry itself (`entry.replaces`), not in a list beside
     // the batch: the uploader fires it for that one entry, and only once the server holds all of
@@ -16960,7 +17110,7 @@ async function uploadFiles(files) {
     let blanket = null;    // {action} once "apply to all" is chosen
 
     for (const file of arr) {
-        if (!existing.has(file.name)) {
+        if (!_nameIsHeld(file)) {
             toUpload.push({ file, name: file.name });
             existing.add(file.name);
             continue;
@@ -16980,9 +17130,11 @@ async function uploadFiles(files) {
             // share a fate -- one refused, and the other's original is left in place while it still
             // uploads: two rows under one name in a vault whose names the server cannot see.
             const entry = { file, name: file.name };
-            // A committed row is removed; with none, the name is held by an upload still IN FLIGHT
-            // and "replace" means cancel THAT upload, so the two copies can't both finish.
-            entry.replaces = id ? { deleteId: id } : { inFlightName: file.name };
+            // A committed row of the name, if there is one, is removed. The UPLOADS that hold the
+            // name are not listed here at all: the uploader resolves them itself at its fire point,
+            // from the tray as it is then -- so a committed file AND an upload in flight beside it
+            // are both dealt with, where naming one or the other here lost the second.
+            entry.replaces = { deleteId: id || null };
             toUpload.push(entry);
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
@@ -16990,22 +17142,6 @@ async function uploadFiles(files) {
             toUpload.push({ file, name });
             existing.add(name);
         }
-    }
-
-    // Resolve each entry's in-flight victims NOW, by identity, before any async work runs: a second
-    // drop of the same name a moment later would enqueue a NEW live item, and a name-matched scan
-    // run later would cancel that bystander the user never chose to replace. Item ids are stable
-    // identities; names are not. Every entry resolves its OWN list -- two entries of one name both
-    // get the victim, so refusing one of them cannot lose the other's cancel. Only the cancel CALL
-    // is deferred: the uploader makes it for that entry, once the server holds all of its bytes.
-    for (const entry of toUpload) {
-        if (!entry.replaces || !entry.replaces.inFlightName) continue;
-        entry.replaces.cancelItemIds = [...uploadManager.items.values()]
-            .filter(it => it.vaultId === state.currentVault.id
-                && (it.folderId || null) === _curFolder
-                && _pendingUpload(it)
-                && it.fileName === entry.replaces.inFlightName)
-            .map(it => it.id);
     }
 
     if (toUpload.length) {
@@ -17122,7 +17258,7 @@ async function uploadFiles(files) {
         // Enact them ONCE now: a refused entry leaves the batch here and is never enqueued. What it
         // would have replaced travels on the entry (`entry.replaces`), so it leaves with it -- a
         // refused overwrite cannot delete the original it will not replace, and a refused
-        // replacement cannot cancel the in-flight upload it will not replace.
+        // replacement cannot cancel the earlier upload it will not replace.
         if (refused.size) toUpload = toUpload.filter(e => !refused.has(e));
 
         // NOTHING DESTRUCTIVE HAPPENS HERE. The delete of an original, and the cancel of an in-flight
