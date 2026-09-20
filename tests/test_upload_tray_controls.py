@@ -117,7 +117,7 @@ SERVER = """
 const API_BASE = '';
 const state = { currentVault: null };
 const log = [];                                  // requests AND toasts, in the order they happened
-const server = { refuse: new Set(), unreachable: new Set(), onGet: null };
+const server = { refuse: new Set(), unreachable: new Set(), stalled: new Set(), onGet: null };
 const calls = () => log.filter(e => !e.startsWith('toast'));
 const toasts = () => log.filter(e => e.startsWith('toast'));
 const fetch = async (url, opts) => {
@@ -126,6 +126,7 @@ const fetch = async (url, opts) => {
     const sess = url.split('/uploads/')[1] || '';
     if (method === 'DELETE') {
         if (server.unreachable.has(sess)) throw new Error('network');
+        if (server.stalled.has(sess)) return new Promise(() => {});      // never answers
         return server.refuse.has(sess) ? { ok: false, status: 500 } : { ok: true, status: 204 };
     }
     if (method === 'GET') {
@@ -156,10 +157,11 @@ const sent = (id, sessionId, extra) => ({ id, vaultId: 'V', sessionId, fileName:
 const victim = (extra) => sent('v', 'old-sess', extra);
 const ours = (extra) => sent('o', 'new-sess', { replaces: { cancelItemIds: ['v'] }, ...extra });
 const fresh = (...its) => { log.length = 0; records.length = 0; timers.length = 0; um._landed = new Set();
-    server.refuse = new Set(); server.unreachable = new Set(); server.onGet = null;
+    server.refuse = new Set(); server.unreachable = new Set(); server.stalled = new Set(); server.onGet = null;
     um.items = new Map(its.map(it => [it.id, it])); };
 const row = (id) => { const it = um.items.get(id);
     return it ? { status: it.status, cancelled: it.cancelled, error: it.error || null } : null; };
+const halted = (id) => { const it = um.items.get(id); return !!(it && it.cancelled && it.paused); };
 const snap = () => ({ log: log.slice(), records: records.slice(), v: row('v'), o: row('o') });
 const out = {};
 (async () => {
@@ -254,6 +256,29 @@ def test_a_retry_after_BOTH_cancels_were_refused_never_commits_past_a_live_victi
     healed = out["retryRecovered"]
     assert healed["log"] == [DEL_OLD, REPLACED, COMPLETE], healed
     assert healed["v"] is None and healed["o"]["status"] == "done"
+
+
+def test_our_own_cancel_that_never_answers_still_says_what_happened_and_never_commits():
+    # The other shape of the same fault, seen live: the DELETE for OUR session is not refused, it
+    # simply never comes back (fetch has no timeout). The message used to wait on that round trip,
+    # so the tray showed two rows for one name and not a word about either.
+    out = _serve("""
+    fresh(victim(), ours()); server.refuse.add('old-sess'); server.stalled.add('new-sess');
+    um._run('o');                                          // never settles: not awaited
+    await settle(); await settle();
+    out.stalled = snap(); out.halted = halted('o');
+    """)
+    r = out["stalled"]
+    # Said already, by name, with our DELETE still outstanding. (mutation: say it after -> the log
+    # ends at the DELETE and there is no message at all -> red.)
+    assert r["log"] == [DEL_OLD, DROPPED, DEL_NEW], r
+    assert COMPLETE not in r["log"]
+    # The victim's row says its cancel failed. Ours is what a cancel in flight looks like -- marked
+    # cancelled and halted, so neither the send loop nor the fire point can carry it to a commit --
+    # and it is not yet an 'error' row, because nothing has been refused yet.
+    assert r["v"] == {"status": "error", "cancelled": False, "error": REFUSED_ROW}, r
+    assert r["o"] == {"status": "uploading", "cancelled": True, "error": None} and out["halted"] is True, r
+    assert r["records"] == []
 
 
 def test_which_victims_are_cancelled_and_which_are_passed_over():
