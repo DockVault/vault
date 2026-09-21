@@ -33,6 +33,7 @@ scope; the per-vault password is not (and cannot be) re-prompted over SFTP. This
 matches the design doc, which lists Standard (incl. password-protected) vaults as
 SFTP-capable.
 """
+import functools
 import os
 import signal
 import socket
@@ -73,6 +74,7 @@ from app.services.vault_service import FileNotFoundError as VaultFileNotFoundErr
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
 from app.sftp.host_key import generate_ed25519_host_key, load_host_key
+from app.sftp import heartbeat
 from app.sftp.upload_assembler import UploadAssembler, AssemblerError
 from app.core.session_hash_utils import hash_session_token
 from app.core.safe_log import safe_event
@@ -240,6 +242,28 @@ class _PathNotFound(Exception):
     pass
 
 
+# A live upload's same-name marker is refreshed by its writes, at most once per TTL divided by
+# this. So the marker is guaranteed to outlive the LAST WRITE by TTL - TTL/divisor, and that has to
+# cover the longest the write-progress watchdog can take to fail a stalled upload: a window that
+# had already cleared, then a whole empty one, then one sweep interval. Otherwise there are
+# seconds in which an upload that is stalled but not yet failed has lost its name, and a second
+# upload of that name is let in to lose at commit instead of being refused at open. At the
+# defaults: 300 - 300/6 = 250 s, against 2 x 120 + 5 = 245 s. (A test holds the relation.)
+_MARKER_REFRESH_DIVISOR = 6
+
+
+def _gone_when_it_returns(close):
+    """However a handle's close() ends -- committed, discarded, or with an error on the way -- the
+    handle no longer holds its thread once it has returned. See _Liveness."""
+    @functools.wraps(close)
+    def closing(self):
+        try:
+            return close(self)
+        finally:
+            _liveness.stopped(self)
+    return closing
+
+
 class VaultSFTPHandle(paramiko.SFTPHandle):
     """
     A single open-file handle.
@@ -336,7 +360,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
     def write(self, offset: int, data: bytes):
         # Heartbeat the in-flight marker so a slow-but-live transfer's marker (and its
         # same-name lock) does not lapse to the TTL mid-upload. Throttled to at most once per
-        # TTL/3, so a hot write loop is not one Redis op per write; best-effort, never affects
+        # TTL/6 (_MARKER_REFRESH_DIVISOR), so a hot write loop is not one Redis op per write; best-effort, never affects
         # the write result.
         self._refresh_marker()
         if self.stream is not None:
@@ -388,7 +412,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         if not self.upload_marker_ref:
             return
         now = time.monotonic()
-        if now - self._marker_last_refresh < max(1, upload_marker.marker_ttl_seconds() // 3):
+        if now - self._marker_last_refresh < max(1, upload_marker.marker_ttl_seconds() // _MARKER_REFRESH_DIVISOR):
             return
         self._marker_last_refresh = now
         upload_marker.refresh(*self.upload_marker_ref)
@@ -401,8 +425,14 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         connection, without saying this first, commits the partial bytes as a complete file."""
         self.interrupted = True
         if self.stream is not None:
+            # One that had ALREADY failed for a reason of its own keeps that reason -- it was
+            # logged when it happened -- and its discard is not then reported as an interruption.
+            if not self.stream._failed:
+                self.stream._cut_short = True
             self.stream._failed = True
+        _liveness.stopping(self)
 
+    @_gone_when_it_returns
     def close(self):
         # Claimed BEFORE anything else: from here on the watchdog leaves this handle alone. A
         # sweep that has already decided this handle is stalled must not act on that decision
@@ -511,6 +541,10 @@ class _WriteProgressWatchdog:
     until the filesystem answers; it unwinds, and the upload is discarded, only then.
     """
 
+    # The longest the loop sleeps between sweeps. The marker's refresh interval is sized against
+    # it: see _MARKER_REFRESH_DIVISOR.
+    MAX_SWEEP_SECONDS = 5
+
     def __init__(self):
         self._lock = threading.Lock()
         self._handles = weakref.WeakSet()
@@ -589,7 +623,8 @@ class _WriteProgressWatchdog:
         window and a quarter of when it began."""
         while stop is None or not stop.is_set():
             window = settings.sftp_write_progress_timeout_seconds
-            time.sleep(max(1, min(5, (window or 20) // 4)))
+            time.sleep(max(1, min(self.MAX_SWEEP_SECONDS, (window or 20) // 4)))
+            _liveness.turning('write-progress')
             try:
                 self.sweep()
             except Exception as e:  # noqa: BLE001 -- the watchdog must outlive any one bad handle
@@ -597,6 +632,108 @@ class _WriteProgressWatchdog:
 
 
 _write_progress = _WriteProgressWatchdog()
+
+
+class _Liveness:
+    """What the heartbeat file (app/sftp/heartbeat.py) stands for. The container healthcheck reads
+    that file's age, so the file is touched only while ALL of this holds:
+
+      * every loop that must keep turning has turned recently -- the accept loop, which wakes on a
+        timeout precisely so that it can say so, and the write-progress watchdog when it runs. A
+        loop that is blocked (a full stdout pipe, a lock nobody releases) is a server that holds
+        its port and serves nobody, which a check of the bound port reports as healthy for ever;
+      * no upload that was told to stop is still holding its thread long afterwards. Ending an
+        upload takes moments, unless the thread is inside a storage write that does not return --
+        the limit the watchdog documents. That is a storage fault, nothing outside the process can
+        see it, and it clears by itself: when the storage answers, close() runs and the beats
+        resume.
+
+    The heartbeat has a thread of its own; if that thread dies the file goes stale, which is the
+    right answer. Nothing here touches storage, the database or Redis, so the heartbeat cannot be
+    wedged by the faults it exists to report.
+    """
+
+    # A loop that has not turned for this long is not turning. The accept loop wakes every
+    # heartbeat.BEAT_SECONDS and the watchdog sweeps at least that often.
+    SILENT_AFTER_SECONDS = 30
+    # An upload told to stop is gone in moments. This long afterwards, its thread is stuck.
+    UNWIND_GRACE_SECONDS = 30
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._turned = {}
+        self._stopping = weakref.WeakKeyDictionary()
+        self._reported = None
+
+    def turning(self, loop, now=None):
+        """A loop says it has come round again. Its first call is what enrols it: from then on
+        its silence is a fault."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._turned[loop] = now
+
+    def stopping(self, handle, now=None):
+        """An upload has been told to stop. Only the FIRST telling counts: a handle the watchdog
+        failed is marked again by its own close(), and that must not restart the clock."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._stopping.setdefault(handle, now)
+
+    def stopped(self, handle):
+        with self._lock:
+            self._stopping.pop(handle, None)
+
+    def fault(self, now=None):
+        """None while the server is alive; otherwise a short token saying why it is not."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            turned = dict(self._turned)
+            stopping = list(self._stopping.values())
+        for loop in sorted(turned):
+            if now - turned[loop] >= self.SILENT_AFTER_SECONDS:
+                return loop + '-silent'
+        if any(now - since >= self.UNWIND_GRACE_SECONDS for since in stopping):
+            return 'upload-not-unwinding'
+        return None
+
+    def pulse(self, now=None, path=None):
+        """One turn of the heartbeat thread: touch the file if, and only if, the server is alive.
+        Returns the fault (None = beat written). A change of state is logged once, not per turn."""
+        fault = self.fault(now)
+        if fault is None:
+            try:
+                heartbeat.beat(path)
+            except OSError:
+                fault = 'heartbeat-unwritable'
+        if fault != self._reported:
+            self._reported = fault
+            # One literal per reason: an event code is never assembled at run time.
+            if fault is None:
+                safe_event('liveness.restored')
+            elif fault == 'accept-loop-silent':
+                safe_event('liveness.lost.accept-loop-silent')
+            elif fault == 'write-progress-silent':
+                safe_event('liveness.lost.write-progress-silent')
+            elif fault == 'upload-not-unwinding':
+                safe_event('liveness.lost.upload-not-unwinding')
+            else:
+                safe_event('liveness.lost.heartbeat-unwritable')
+        return fault
+
+    def run(self, stop=None):
+        stop = threading.Event() if stop is None else stop
+        while not stop.is_set():
+            try:
+                self.pulse()
+            except Exception as e:  # noqa: BLE001 -- a beat that cannot be decided is a missed beat
+                try:
+                    safe_event('liveness.pulse-failed', e)
+                except Exception:  # noqa: BLE001
+                    pass
+            stop.wait(heartbeat.BEAT_SECONDS)
+
+
+_liveness = _Liveness()
 
 
 class _StreamingUpload:
@@ -633,6 +770,7 @@ class _StreamingUpload:
         self._file_info = None
         self._started = False
         self._failed = False      # over-limit / bad-order / write error -> discard at close
+        self._cut_short = False   # failed from OUTSIDE (the handle's mark_interrupted), not by itself
 
     # -- write path ---------------------------------------------------------
     def _ensure_started(self):
@@ -691,7 +829,7 @@ class _StreamingUpload:
     # -- close path ---------------------------------------------------------
     def close(self):
         if self._failed:
-            if getattr(self._handle, "interrupted", False):
+            if self._cut_short:
                 safe_event('upload.discarded.interrupted')
             self._abort()
             return
@@ -2316,6 +2454,9 @@ def start_sftp_server():
     # The write-progress watchdog (0 disables it). See _WriteProgressWatchdog.
     if settings.sftp_write_progress_timeout_seconds and settings.sftp_write_progress_timeout_seconds > 0:
         threading.Thread(target=_write_progress.run, daemon=True, name="sftp-write-progress").start()
+        # Enrolled HERE, by whoever started it, and not by the thread's own first turn: a
+        # watchdog that never gets going is then missed like one that stopped.
+        _liveness.turning('write-progress')
         safe_event('write-progress-watchdog.started',
                    window_seconds=settings.sftp_write_progress_timeout_seconds,
                    floor_bytes=settings.sftp_write_progress_min_bytes)
@@ -2325,6 +2466,10 @@ def start_sftp_server():
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((settings.sftp_host, settings.sftp_port))
     server_socket.listen(10)
+    # accept() wakes this often with nothing to accept, so that the loop can say it is still
+    # turning (see _Liveness). Only the LISTENING socket has the timeout: an accepted connection
+    # does not inherit it.
+    server_socket.settimeout(heartbeat.BEAT_SECONDS)
 
     safe_event('server.listening', port=settings.sftp_port)
 
@@ -2345,7 +2490,12 @@ def start_sftp_server():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    _liveness.turning('accept-loop')
+    # It stops with the server: a process on its way out is not one to call healthy.
+    threading.Thread(target=_liveness.run, args=(_stop,), daemon=True, name="sftp-heartbeat").start()
+
     while not _stop.is_set():
+        _liveness.turning('accept-loop')
         try:
             client_socket, client_address = server_socket.accept()
 
@@ -2383,6 +2533,10 @@ def start_sftp_server():
                 safe_event('connection.thread.spawn.failed', e, peer=client_address)
                 continue
 
+        except socket.timeout:
+            # Nobody connected in this interval; round again. (It is an OSError too, so it has
+            # to come before the branch below, which is for a socket closed under us.)
+            continue
         except KeyboardInterrupt:
             safe_event('server.shutting-down')
             break

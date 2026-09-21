@@ -3337,3 +3337,19 @@ def test_update_pull_leg_persists_the_image_only_after_a_successful_pull():
     # And no .env write precedes the pull in this leg (the regression this guards against).
     pull_call = leg.index('self._run_dc("pull"')
     assert '_set_env_key(self._env_path(), "DOCKVAULT_IMAGE", image)' not in leg[:pull_call]
+
+
+def test_build_env_lines_writes_the_marker_ttl_only_when_it_is_not_the_default():
+    base = {
+        "server_name": "localhost", "encryption_key": dv.gen_fernet_key(),
+        "jwt_secret_key": dv.gen_hex(32), "vault_db_password": dv.gen_hex(16),
+        "redis_password": dv.gen_hex(24), "admin_username": "admin",
+        "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234",
+        "compose_profiles": "combined", "run_sftp": True,
+    }
+    # the default (300) is never written: a normal install does not mention it
+    env = dv.parse_env("\n".join(dv.build_env_lines(dict(base, upload_marker_ttl_seconds=300))))
+    assert "UPLOAD_MARKER_TTL_SECONDS" not in env
+    # 900 was the default once. An operator who asks for it now is asking for something, and gets it.
+    env2 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, upload_marker_ttl_seconds=900))))
+    assert env2["UPLOAD_MARKER_TTL_SECONDS"] == "900"

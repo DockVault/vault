@@ -4,8 +4,10 @@ SFTP carries no total size. The server cannot tell a finished upload from one th
 by looking at the bytes: the only sign of completion there is, is the client's CLOSE. The handle's
 close() is also what commits an upload -- and it is reached two ways that look alike from inside:
 the client's CLOSE, and the cleanup paramiko runs over every handle still open when a connection
-goes (a disconnect, an abort, a transport torn down). A client's CLOSE takes the handle out of
-paramiko's table first, so the cleanup only ever reaches the uploads that were NOT finished.
+goes (a disconnect, an abort, a transport torn down). A client's CLOSE calls close() and THEN takes
+the handle out of paramiko's table, so the cleanup only ever reaches the uploads that were NOT
+finished -- and it runs on the same thread as the requests, after the last of them, so no client
+CLOSE can ever be in progress once the session has been announced as over.
 
 Those used to be finalized like any other: a dropped connection committed its partial bytes as a
 complete file, and where overwriting was allowed it replaced the good file of that name with the
@@ -19,6 +21,7 @@ import os
 from pathlib import Path
 
 import paramiko
+import paramiko.server
 import paramiko.sftp_server
 import pytest
 
@@ -148,6 +151,28 @@ def test_a_caller_that_ends_a_transfer_says_so_before_it_closes_anything(monkeyp
     assert took == [] and ctx.exits == ["discard"]
 
 
+def test_a_streaming_discard_is_logged_as_an_interruption_only_when_that_is_the_cause(monkeypatch):
+    codes = []
+    monkeypatch.setattr(mod, "safe_event", lambda code, *a, **k: codes.append(code))
+    # Cut short from outside: that IS the cause, and the log says so.
+    interface = _interface()
+    handle, stream, _ = _streaming(interface, monkeypatch)
+    _cleanup_as_paramiko_does(interface, [handle])
+    assert codes == ["upload.discarded.interrupted"]
+    # One that had already failed for a reason of its own (over the size limit, here) and THEN lost
+    # its connection: the real cause was logged when it happened. Calling the discard an
+    # interruption would send whoever reads the log looking for a network fault.
+    del codes[:]
+    interface = _interface()
+    handle, stream, _ = _streaming(interface, monkeypatch)
+    ctx = stream._ctx
+    stream._max_bytes = 4
+    assert handle.write(0, b"more than four bytes") == paramiko.SFTP_FAILURE
+    _cleanup_as_paramiko_does(interface, [handle])
+    assert "upload.discarded.interrupted" not in codes
+    assert ctx.exits == ["discard"] and handle.interrupted is True
+
+
 # ---- what the above rests on ------------------------------------------------------------------------
 
 def test_a_read_handle_is_untouched_by_the_end_of_the_session():
@@ -163,10 +188,18 @@ def test_paramiko_announces_the_end_of_the_session_before_it_closes_what_is_left
     # handles first would silently turn the fix off. Read from the installed library.
     src = inspect.getsource(paramiko.sftp_server.SFTPServer.finish_subsystem)
     assert src.index("self.server.session_ended()") < src.index("for f in self.file_table.values():")
-    # ... and a client's CLOSE takes the handle OUT of that table, so the cleanup never sees it.
+    # ... and a client's CLOSE closes the handle and THEN takes it out of that table, so the cleanup
+    # never sees an upload the client finished.
     process = inspect.getsource(paramiko.sftp_server.SFTPServer._process)
     close_branch = process[process.index("CMD_CLOSE"):]
-    assert "del self.file_table[handle]" in close_branch[:close_branch.index("CMD_READ")]
+    close_branch = close_branch[:close_branch.index("CMD_READ")]
+    assert close_branch.index("self.file_table[handle].close()") < close_branch.index("del self.file_table[handle]")
+    # What makes a false discard impossible is not that order but the THREAD: the cleanup runs on
+    # the thread that served the requests, after the request loop has returned. So while any
+    # client CLOSE is inside close(), the session cannot yet have been announced as over.
+    run = inspect.getsource(paramiko.server.SubsystemHandler._run)
+    assert run.index("self.start_subsystem(") < run.index("self.finish_subsystem()")
+    assert "Thread(" not in run and "Thread(" not in src
 
 
 def test_both_places_a_write_handle_is_made_give_it_its_session():

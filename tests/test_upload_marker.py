@@ -330,3 +330,45 @@ def test_breaker_open_skips_place_fails_open_listing_empty_remove_inert(monkeypa
 
 def test_marker_ttl_is_readable_and_positive():
     assert um.marker_ttl_seconds() > 0
+
+
+def test_the_default_ttl_is_one_number_wherever_it_is_written():
+    # It is 300 now that a stalled upload's marker is removed by the write-progress watchdog, and
+    # the TTL only reaps a marker nothing was left alive to remove. The number lives in the
+    # settings, in this module's own fallback, and in the example environment file.
+    from pathlib import Path
+    from app.core.config import Settings
+    fields = Settings.model_fields
+    assert fields["upload_marker_ttl_seconds"].default == 300
+    assert um._DEFAULT_TTL_SECONDS == 300
+    example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    lines = [ln for ln in example.splitlines() if ln.startswith("UPLOAD_MARKER_TTL_SECONDS=")]
+    assert lines == ["UPLOAD_MARKER_TTL_SECONDS=300"]
+
+
+def test_a_stalled_upload_keeps_its_name_until_the_watchdog_has_failed_it():
+    # Both sides, from the shipped constants. The marker is refreshed by writes, at most once per
+    # TTL/divisor, so it is GUARANTEED only TTL - TTL/divisor past the last write. The watchdog
+    # works in fixed windows, so from the last write it can take: the rest of a window that has
+    # already cleared (up to a whole one), then a whole empty window, then one sweep interval.
+    # If the first is shorter than the second, there are seconds in which a stalled upload has
+    # lost its name but is not yet failed, and a second upload of that name is admitted -- to
+    # lose at the unique index, instead of being refused at open with the holder named.
+    #
+    # At the defaults this is 250 s against 245 s. FIVE SECONDS IS ALL THE MARGIN THERE IS: a
+    # longer window has to come with a longer TTL (or a larger divisor), and this is the test
+    # that says so.
+    from app.core.config import Settings
+    from app.sftp import sftp_server as srv
+    ttl = Settings.model_fields["upload_marker_ttl_seconds"].default
+    window = Settings.model_fields["sftp_write_progress_timeout_seconds"].default
+    guaranteed = ttl - ttl // srv._MARKER_REFRESH_DIVISOR
+    slowest_verdict = 2 * window + srv._WriteProgressWatchdog.MAX_SWEEP_SECONDS
+    assert guaranteed >= slowest_verdict, (guaranteed, slowest_verdict)
+
+
+def test_the_fallback_ttl_is_used_when_the_setting_is_unusable(monkeypatch):
+    monkeypatch.setattr(um.settings, "upload_marker_ttl_seconds", 0)
+    assert um.marker_ttl_seconds() == 300
+    monkeypatch.setattr(um.settings, "upload_marker_ttl_seconds", 45)
+    assert um.marker_ttl_seconds() == 45

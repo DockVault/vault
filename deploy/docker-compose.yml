@@ -193,12 +193,13 @@ services:
       # does not mount one).
       SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
     command: ["python", "-m", "app.sftp.sftp_server"]
-    # This service runs SFTP, not the HTTP API. Check the port is bound via
-    # /proc (port 2222 = hex 08AE) instead of opening a socket — a raw TCP
-    # connect makes paramiko log "Error reading SSH protocol banner" on every
-    # probe.
+    # This service runs SFTP, not the HTTP API. The server touches a heartbeat file every few
+    # seconds while it is actually alive (accepting, its watchdog turning, no upload stuck in a
+    # storage write), and the check reads that file's age: app/sftp/heartbeat.py. A bound port
+    # says only that the process once started; and nothing opens a socket here — a raw TCP
+    # connect makes paramiko log "Error reading SSH protocol banner" on every probe.
     healthcheck:
-      test: ["CMD-SHELL", "grep -q ':08AE' /proc/net/tcp"]
+      test: ["CMD", "python", "-B", "-m", "app.sftp.heartbeat"]
       interval: 30s
       timeout: 5s
       retries: 5

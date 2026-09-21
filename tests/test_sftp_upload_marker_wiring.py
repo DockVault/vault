@@ -127,3 +127,42 @@ def test_the_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
     assert resolve(named, "id", scoped) == "another member"        # scoped -> neutral, no name
     noname = _DB(SimpleNamespace(username=None, email="bob@example.com"))
     assert resolve(noname, "id", member) == "another member"       # no username -> neutral, NEVER email
+
+
+def test_a_live_upload_refreshes_its_marker_once_per_sixth_of_the_ttl(monkeypatch):
+    # Behavioural, on the real handle. The interval is what bounds how long the marker is
+    # guaranteed to outlive the last write (see test_upload_marker: the relation with the
+    # write-progress watchdog), so it is held to the number, from both sides.
+    import os
+    import time
+    from app.sftp import sftp_server as srv
+    monkeypatch.setattr(srv.upload_marker, "marker_ttl_seconds", lambda: 300)
+    refreshed = []
+    monkeypatch.setattr(srv.upload_marker, "refresh", lambda *ref: refreshed.append(ref))
+    handle = srv.VaultSFTPHandle(flags=os.O_WRONLY)
+    handle.upload_marker_ref = ("vault", "folder", "name", "token")
+    handle._marker_last_refresh = time.monotonic() - 45          # under a sixth of 300 s: not yet
+    handle._refresh_marker()
+    assert refreshed == []
+    handle._marker_last_refresh = time.monotonic() - 51          # past it: now
+    handle._refresh_marker()
+    assert refreshed == [("vault", "folder", "name", "token")]
+    handle._refresh_marker()                                     # and not again straight away
+    assert len(refreshed) == 1
+
+
+def test_the_watchdog_never_sleeps_longer_between_sweeps_than_the_marker_arithmetic_allows(monkeypatch):
+    # However long the window, the loop sleeps at most MAX_SWEEP_SECONDS: the other number the
+    # marker's refresh interval is sized against. No upload is involved; the loop is turned once.
+    import threading
+    import time
+    from types import SimpleNamespace
+    from app.sftp import sftp_server as srv
+    stop = threading.Event()
+    slept = []
+    clock = SimpleNamespace(monotonic=time.monotonic, sleep=lambda s: (slept.append(s), stop.set()))
+    monkeypatch.setattr(srv, "time", clock)
+    monkeypatch.setattr(srv, "_liveness", srv._Liveness())
+    monkeypatch.setattr(srv.settings, "sftp_write_progress_timeout_seconds", 86400)
+    srv._WriteProgressWatchdog().run(stop)
+    assert slept == [srv._WriteProgressWatchdog.MAX_SWEEP_SECONDS] and slept[0] <= 5

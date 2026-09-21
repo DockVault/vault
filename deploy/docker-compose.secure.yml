@@ -323,20 +323,21 @@ services:
       SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
       ENVIRONMENT: production
     command: ["python", "-m", "app.sftp.sftp_server"]
-    # This service runs SFTP, not the HTTP API. Check the port is bound via
-    # /proc (port 2222 = hex 08AE) instead of opening a socket — a raw TCP
-    # connect makes paramiko log "Error reading SSH protocol banner" on every
-    # probe.
+    # This service runs SFTP, not the HTTP API. The server touches a heartbeat file every few
+    # seconds while it is actually alive (accepting, its watchdog turning, no upload stuck in a
+    # storage write), and the check reads that file's age: app/sftp/heartbeat.py. A bound port
+    # says only that the process once started; and nothing opens a socket here — a raw TCP
+    # connect makes paramiko log "Error reading SSH protocol banner" on every probe.
     healthcheck:
-      test: ["CMD-SHELL", "grep -q ':08AE' /proc/net/tcp"]
+      test: ["CMD", "python", "-B", "-m", "app.sftp.heartbeat"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 15s
     ports:
       # HOST-side SFTP port is configurable via SFTP_HOST_PORT in .env (default
-      # 2322); the container-internal port stays 2222 (the healthcheck greps
-      # ':08AE' = 2222, and the app binds SFTP_PORT=2222 below). Set e.g.
+      # 2322); the container-internal port stays 2222 (the app binds
+      # SFTP_PORT=2222 above). Set e.g.
       # SFTP_HOST_PORT=2200 in .env to avoid a clash and open it in the Azure NSG.
       - "${SFTP_HOST_PORT:-2322}:2222"
     depends_on:
@@ -354,7 +355,8 @@ services:
       - vault_keys:/app/keys
     # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
     # storage/keys are volumes; this service doesn't mount the logs volume, so
-    # /app/logs, /app/certs, and /tmp ride tmpfs.
+    # /app/logs, /app/certs, and /tmp ride tmpfs. (/tmp is also where the healthcheck's
+    # heartbeat file lives: without a writable one, set SFTP_HEARTBEAT_FILE.)
     # mode=1777 for the same reason as vault-api above: a non-root process must be
     # able to write these on a Linux engine that defaults compose tmpfs to root:0755.
     security_opt:

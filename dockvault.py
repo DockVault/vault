@@ -450,9 +450,9 @@ def build_env_lines(cfg):
     # write-open publishes so the web listing shows "uploading by <member>" and a same-name upload
     # is refused. Removed explicitly on close and refreshed during a live transfer, so this only
     # reaps a marker left by a killed client. Written only when the operator set a non-default value
-    # (default 900); a normal install never mentions it and an existing value is preserved below.
+    # (default 300); a normal install never mentions it and an existing value is preserved below.
     if sftp_active and cfg.get("upload_marker_ttl_seconds") not in (None, "") \
-            and int(cfg["upload_marker_ttl_seconds"]) != 900:
+            and int(cfg["upload_marker_ttl_seconds"]) != 300:
         bare("UPLOAD_MARKER_TTL_SECONDS", int(cfg["upload_marker_ttl_seconds"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")

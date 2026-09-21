@@ -29,7 +29,7 @@ from app.core.security import (
 )
 
 _KEY_PREFIX = "upload_marker"
-_DEFAULT_TTL_SECONDS = 900
+_DEFAULT_TTL_SECONDS = 300
 
 # Sentinel: the read-through guard was open (Redis unavailable) so the op was SKIPPED. Distinct from
 # a real result, so a caller can fail OPEN instead of mistaking "unknown" for "not held" / "no rows".
