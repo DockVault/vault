@@ -1,17 +1,19 @@
-"""A buffered zero-knowledge download keeps its pieces as they come, and makes ONE Blob of them.
+"""A buffered zero-knowledge download: what it returns, and what it never returns.
 
 When a chunk-framed file cannot be streamed to disk it is decrypted a record at a time and the
-pieces are held until the end. Each piece used to be wrapped in a Blob of its own as it arrived. A
-Blob built in memory is copied into the browser process at once, so the file was paid for there
-while the pieces were still coming in -- measured at about 440 MiB on a 250 MiB file, against
-nothing when the pieces are kept as they are and made into one Blob at the end.
+pieces are held until the end, each wrapped in a Blob of its own as it arrives. Keeping the pieces as
+plain bytes and building one Blob at the end was tried and MEASURED (250 MiB, three downloads each
+way, bytes identical throughout): the browser process ends with one copy of the file either way --
+the Blob that is saved has to exist whole -- and the page paid for a second copy until the end,
+about 295 MiB against about 70. So the Blob per piece is the shipped shape, and changing it again
+is a decision to take with numbers.
 
-That is safe only because of two things the reader does, and both are held here by RUNNING the
-shipped functions against the real decryptor: every piece it hands out is a buffer of its own
-(never one it reuses), and it hands a piece out only after that record's tag has verified.
+What the tests below hold does not depend on that shape, and was not covered before: the two
+buffered reads are RUN against the real decryptor. What comes back is the file, made of exactly the
+pieces in order; a damaged record stops the read and nothing of the file is returned; and the
+reader hands out every piece as a buffer of its own, only after that record's tag has verified.
 """
 import json
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -134,9 +136,10 @@ def test_a_piece_is_kept_only_after_its_record_has_verified_and_nothing_of_a_bad
 
 
 def test_every_piece_the_reader_hands_out_is_a_buffer_of_its_own():
-    # What makes keeping the piece itself safe. Wrapping each piece in a Blob COPIED it at once, so a
-    # reader that reused one buffer for every record would have gone unnoticed; kept as they are,
-    # three pieces sharing a buffer would all read as the last record.
+    # A property of the READER that anything keeping a piece past the callback depends on -- the
+    # streamed path transfers each piece to the download as it comes. Wrapping a piece in a Blob
+    # copies it at once, so the buffered reads would not notice a reader that reused one buffer
+    # for every record; this does.
     out = _run("""
   const kept = [];
   await lib.decryptBlobV2(new Blob([cipher]), dek, CTX, p => { kept.push(p); });
@@ -151,12 +154,15 @@ def test_every_piece_the_reader_hands_out_is_a_buffer_of_its_own():
     assert out == {"blob": True, "stream": True, "stillRight": True}, out
 
 
-def test_neither_buffered_site_wraps_a_piece_in_a_blob():
-    # The source half, comment-stripped: the piece is pushed as it is, and each site builds ONE Blob.
-    # (mutation: `parts.push(new Blob([p]))` again at either site -> red.)
+def test_each_buffered_site_wraps_a_piece_in_a_blob_as_it_arrives():
+    # The source half, comment-stripped: the measured shape. A piece is wrapped as it arrives, so it
+    # leaves the page then, and the pieces are joined once at the end.
+    # (mutation: push the raw piece at either site -> red. It is byte-for-byte the same download;
+    # what differs is a copy of the whole file held by the page until the end -- which only a
+    # measurement shows, and did.)
     js = APP_JS.read_text(encoding="utf-8")
     for head in SITES:
         code = _code(_fn(js, head))
-        assert code.count("p => { parts.push(p); }") == 1, head
-        assert "new Blob([p])" not in code and not re.search(r"parts\.push\(\s*new Blob", code), head
+        assert code.count("p => { parts.push(new Blob([p])); }") == 1, head
+        assert "parts.push(p)" not in code, head
         assert code.count("new Blob(parts, { type })") == 1, head
