@@ -226,36 +226,6 @@ def test_an_encrypted_upload_without_an_object_id_is_not_completed():
     )
 
 
-@pytest.mark.unit
-def test_the_unencrypted_queue_path_refuses_a_zero_knowledge_vault():
-    """It builds an entry with no encryption flag, so the request would carry a plaintext name.
-
-    Nothing calls it today, which is exactly why it is worth closing: a future caller would look
-    entirely reasonable and the leak would be silent.
-
-    Asserting the guard's SHAPE, not its presence. Inverting the comparison -- refusing ordinary
-    vaults and permitting encrypted ones, the exact opposite of the intent -- passed the earlier
-    version of this test, as did turning the throw into a console warning.
-    """
-    from pathlib import Path
-    app_js = (Path(__file__).resolve().parents[1] / "static" / "js" / "app.js").read_text(
-        encoding="utf-8")
-    body = app_js.split("    enqueueFiles(files) {", 1)[1].split("\n    },", 1)[0]
-
-    guard = body[body.index("if (isZkVault"):]
-    guard = guard[:guard.index("}") + 1]
-    assert guard.startswith("if (isZkVault(state.currentVault))"), (
-        f"the guard does not refuse encrypted vaults -- it may be inverted: {guard!r}"
-    )
-    assert "throw" in guard, "the guard warns instead of stopping, so the upload proceeds anyway"
-    # The queue-entry FIELD, not the substring: the guard's own helper is called isZkVault, and
-    # checking for a bare "isZk" started matching that instead of what it was written to catch.
-    assert "isZk:" not in body, (
-        "this path now sets an encryption flag on its queue entry -- if it genuinely encrypts, the "
-        "guard above should go and this test with it; if it does not, the flag is a lie"
-    )
-
-
 @pytest.mark.integration
 def test_an_encrypted_upload_is_protected_too(admin):
     """The vault type this change exists for, and the one nothing here covered.

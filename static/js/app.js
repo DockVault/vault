@@ -13174,7 +13174,9 @@ async function zkGetVaultIndexKey(vaultId) {
     if (cached) return cached;
     // "No key" is remembered too (as `false`): this is asked once per picked NAME, and a vault
     // without one used to cost a request every time. Minting one overwrites the entry, and the
-    // whole cache goes with the keys when the vault is locked.
+    // whole cache goes with the keys in zkResetKeys() -- the idle lock, "lock all", and sign-out.
+    // (There is no lock of a single vault; a key rotation drops that vault's DEKs only, and this
+    // key does not rotate.)
     if (cached === false) return null;
     const resp = await apiRequest(`/ecc/vaults/${vaultId}/index-key`, { silent: true });
     if (!resp || !resp.index_key) {              // no key minted for this vault yet
@@ -15710,6 +15712,9 @@ const uploadManager = {
         // What landed names files of the account that just signed out. `seq` is NOT reset: it
         // only ever has to keep counting upwards.
         this._landed = [];
+        // A commit already on its way when the account signs out still comes back -- into a tray
+        // that now belongs to whoever signs in next. It checks this before it writes anything down.
+        this._epoch = (this._epoch || 0) + 1;
         try { this.render(); } catch (_) {}
         const tray = document.getElementById('upload-tray');
         if (tray) tray.remove();
@@ -15725,42 +15730,9 @@ const uploadManager = {
 
     _newId() { return `up_${Date.now()}_${++this.seq}`; },
 
-    // Enqueue freshly-picked File objects for the current vault/folder.
-    enqueueFiles(files) {
-        if (!files || !files.length || !state.currentVault) return;
-        // This path builds a queue entry with no encryption flag and no object id. The upload
-        // would not actually get far -- the server refuses a zero-knowledge upload arriving
-        // without an encrypted name -- but the request that gets refused carries the file's
-        // PLAINTEXT NAME, to a server whose whole promise is that it never sees one.
-        //
-        // Nothing calls this today. Refusing here rather than deleting it keeps the sibling
-        // paths' shape intact while making the gap impossible to reintroduce by accident: a
-        // future caller gets a loud stop rather than a leak on a path that looks fine.
-        // Throws rather than returning: a future caller has to catch this to show it, the way
-        // the sibling upload paths throw inside `run()` and render the message into the tray.
-        if (isZkVault(state.currentVault)) {
-            throw new Error('This upload path does not encrypt and cannot be used for a '
-                          + 'zero-knowledge vault.');
-        }
-        const vaultId = state.currentVault.id;
-        const folderId = state.currentFolderId || null;
-        for (const file of files) {
-            const id = this._newId();
-            const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-            this.items.set(id, {
-                id, order: this.seq, file, vaultId, folderId,
-                fileName: file.name, totalSize: file.size,
-                totalChunks, chunkSize: CHUNK_SIZE,
-                sessionId: null, received: new Set(),
-                status: 'queued', error: null, paused: false, cancelled: false,
-            });
-            this.run(id); // fire-and-forget; each item drives itself
-        }
-        this.render();
-    },
-
-    // Like enqueueFiles but each entry carries an explicit target name (used by
-    // the upload-conflict resolver for auto-rename / rename).
+    // Enqueue picked files, each under an explicit target name (the upload-conflict resolver's
+    // auto-rename / rename land here too). The ONE way a picked file enters the tray: a second,
+    // unencrypting path used to sit beside this one with no caller, refusing zero-knowledge vaults.
     // `place` is where the batch was PREPARED for -- the folder the names were checked against and
     // the vault whose key sealed them -- not wherever the user has navigated to since.
     enqueueNamed(entries, place) {
@@ -15782,6 +15754,11 @@ const uploadManager = {
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             this.items.set(id, {
                 id, order: this.seq, vaultId, folderId,
+                // When it was dropped, by this machine's clock: a stand-in for the server's word on
+                // when its session was opened, which replaces it then. Without it a row that never
+                // got as far as a session (still queued, or failed first) had no time at all, and
+                // beside a row rebuilt from the server it simply counted as the later of the two.
+                startedAt: Date.now(), startedLocal: true,
                 // A file sealed AS IT UPLOADS carries no `file` at all: `file` is what the send loop
                 // slices and sends verbatim, and for such an item the only handle there is is the
                 // PLAINTEXT. Keeping it out of `file` makes a raw send of it impossible by
@@ -15877,7 +15854,7 @@ const uploadManager = {
                     // it is checked against those MACs before the old token is reused.
                     const id = this._newId();
                     this.items.set(id, {
-                        id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                        id, order: this.seq, restored: true, startedAt: this._serverMs(s.created_at),
                         file: null, zkPlain: null, zkStream: null, zkPipelined: true,
                         zkResume: rec.resume, frameMacs: null, replaces: null,
                         vaultId, folderId: s.folder_id || null,
@@ -15900,7 +15877,7 @@ const uploadManager = {
                 if (rec && rec.blob) {
                     const id = this._newId();
                     this.items.set(id, {
-                        id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                        id, order: this.seq, restored: true, startedAt: this._serverMs(s.created_at),
                         file: rec.blob, vaultId, folderId: s.folder_id || null,
                         // Neither side has a plaintext name to offer: the server never had one
                         // for a zero-knowledge session, and the local record deliberately no
@@ -15934,7 +15911,7 @@ const uploadManager = {
                 // as resumable-but-stuck; resume() explains it can't be replayed here.
                 const id = this._newId();
                 this.items.set(id, {
-                    id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                    id, order: this.seq, restored: true, startedAt: this._serverMs(s.created_at),
                     file: null, vaultId, folderId: s.folder_id || null,
                     fileName: s.file_name || '(encrypted upload)', totalSize: s.total_size,
                     totalChunks: s.total_chunks, chunkSize: CHUNK_SIZE,
@@ -15948,7 +15925,7 @@ const uploadManager = {
             // Standard vault: resumable by re-selecting the source file.
             const id = this._newId();
             this.items.set(id, {
-                id, order: this.seq, restored: true, startedAt: Date.parse(s.created_at) || 0,
+                id, order: this.seq, restored: true, startedAt: this._serverMs(s.created_at),
                 file: null, vaultId, folderId: s.folder_id || null,
                 fileName: s.file_name, totalSize: s.total_size,
                 totalChunks: s.total_chunks, chunkSize: CHUNK_SIZE,
@@ -15978,6 +15955,15 @@ const uploadManager = {
             const row = this.items.get(id);
             if (row) this._start(row);
         }
+    },
+
+    // The server writes its times in UTC with no zone on them, and a zoneless time is read by the
+    // browser as LOCAL -- fine between two of the server's own stamps, hours wrong against this
+    // machine's clock. Read as what it is, it can stand beside a stamp taken here. 0 = not known.
+    _serverMs(text) {
+        if (typeof text !== 'string' || !text) return 0;
+        const zoned = text.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(text);
+        return Date.parse(zoned ? text : text + 'Z') || 0;
     },
 
     async _init(it) {
@@ -16028,7 +16014,11 @@ const uploadManager = {
         // server's list shares with a row dropped here (see _earlier). 0 means unknown.
         // Kept from the FIRST session this row opened: re-opening one the server expired does not
         // change when the upload began, and must not turn an earlier upload into a later one.
-        it.startedAt = it.startedAt || Date.parse(data.created_at) || 0;
+        // (A stamp taken HERE at the drop is only a stand-in until this moment, and gives way.)
+        if (!it.startedAt || it.startedLocal) {
+            it.startedAt = this._serverMs(data.created_at) || it.startedAt || 0;
+            it.startedLocal = false;
+        }
         it.received = new Set(data.received_chunks || []);
         if (data.chunk_size) it.chunkSize = data.chunk_size;
 
@@ -16201,6 +16191,7 @@ const uploadManager = {
         // paused. (`paused` is cleared by whoever ASKS for a start -- see _start -- never here, or a
         // Pause on a queued row would be a button that does nothing.)
         if (it.paused) { it.status = 'paused'; this.render(); return; }
+        const epoch = this._epoch || 0;
         it._running = true;
         it.status = 'uploading';
         it.error = null;
@@ -16415,7 +16406,7 @@ const uploadManager = {
             }
             if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);  // committed — drop the saved record
             it.zkStream = null; it.zkPlain = null;   // the writer session ends with its transfer
-            this._noteLanded(it);
+            this._noteLanded(it, epoch);
             it.status = 'done';
             this.render();
             if (it.replacedCount) {
@@ -16620,10 +16611,16 @@ const uploadManager = {
     // The user continues a restored row (Resume / picking its file again) while the tray shows an
     // earlier upload of the same name: that is the moment it becomes a replacement, for exactly
     // those rows. NOT on an automatic resume -- nobody was shown anything then.
+    //
+    // Also when a NEWER upload of the name has already landed: continuing this older one would
+    // commit, and the server would replace the newer file with it by name. As a replacement it
+    // reaches the step that asks, and stands aside there, by name.
     _adoptRivals(it) {
         if (it.replaces) return;
         const rivals = this._liveRivals(it);
-        if (rivals.length) it.replaces = { deleteId: null, known: this._knownFrom(rivals) };
+        if (rivals.length || (it.restored && this._landedSince(it))) {
+            it.replaces = { deleteId: null, known: this._knownFrom(rivals) };
+        }
     },
     _liveRivals(it) {
         return this._sameNameRows(it).filter(o => this._earlier(o, it));
@@ -16634,10 +16631,11 @@ const uploadManager = {
     // A finished row leaves the tray seconds later, so what LANDED is noted apart from the rows:
     // the name it held, and when. An upload of that name which was dropped BEFORE that moment has
     // been overtaken. One that was dropped after it chose to replace the committed file knowingly.
-    _noteLanded(it) {
+    _noteLanded(it, epoch) {
+        if (epoch !== undefined && epoch !== (this._epoch || 0)) return;   // the account has signed out since
         this._landed.push({ vaultId: it.vaultId, folderId: it.folderId || null, isZk: it.isZk,
             restored: it.restored, fileName: it.fileName, nameBi: it.nameBi,
-            nameBiCandidates: it.nameBiCandidates, at: ++this.seq });
+            nameBiCandidates: it.nameBiCandidates, startedAt: it.startedAt || 0, at: ++this.seq });
         // Bounded, but never at the cost of an answer still owed: a landing is only forgotten
         // once no live replacement was dropped before it (those still have to ask about it).
         const owed = Math.min(...[...this.items.values()].filter(o => o.replaces && o.status !== 'done')
@@ -16648,8 +16646,14 @@ const uploadManager = {
             this._landed = this._landed.filter(l => !drop.has(l));
         }
     },
+    //
+    // For a row dropped here, "since" is this tab's own count. A row rebuilt from the server has no
+    // place in that count (it is rebuilt, and renumbered, on every refresh), so for one of those the
+    // question is put in time: has an upload of the name that BEGAN LATER than this one landed?
     _landedSince(it) {
-        return this._landed.some(l => l.at > it.order && this._samePlace(l, it) && this._sameName(l, it));
+        const since = (l) => (it.restored ? (!!l.startedAt && !!it.startedAt && l.startedAt > it.startedAt)
+                                          : l.at > it.order);
+        return this._landed.some(l => since(l) && this._samePlace(l, it) && this._sameName(l, it));
     },
 
     // Fire what this upload replaces. Returns false when the replacement did not go ahead. Either
@@ -16698,8 +16702,11 @@ const uploadManager = {
             if (held()) { sayCancelled(); return false; }
             if (this._landedSince(it)) {
                 sayCancelled();
-                await this._dropReplacement(it, `"${name}" was already uploaded by the earlier transfer, `
-                    + `which finished first; the new copy was not uploaded.`);
+                const overtaken = it.restored
+                    ? `A newer upload of "${name}" has already finished, so this older copy was not uploaded.`
+                    : `"${name}" was already uploaded by the earlier transfer, which finished first; `
+                        + `the new copy was not uploaded.`;
+                await this._dropReplacement(it, overtaken);
                 return false;
             }
             const rival = this._rivalsToCancel(it)[0];
@@ -16857,14 +16864,28 @@ const uploadManager = {
 
     pause(id) {
         const it = this.items.get(id);
-        if (it) { it.paused = true; if (it.status === 'uploading') it.status = 'pausing'; this.render(); }
+        // A row still waiting for its slot is 'paused' at once -- there is nothing to wind down --
+        // so that it SHOWS Resume; left as 'queued' it went on offering Pause, and nothing else.
+        if (it) {
+            it.paused = true;
+            if (it.status === 'uploading') it.status = 'pausing';
+            else if (it.status === 'queued') it.status = 'paused';
+            this.render();
+        }
     },
 
     resume(id) {
         const it = this.items.get(id);
         if (!it) return;
         // Already running, already queued to run, or its cancel is out: nothing for a Resume to do.
-        if (it._running || it._pending || it.cancelled) return;
+        if (it._running || it.cancelled) return;
+        // Paused while it was still queued, and resumed while it still is: its run is already in
+        // the queue, so nothing new is queued -- but the pause is lifted, or the run whose slot
+        // then comes would find the row paused and leave it there, a Resume that did nothing.
+        if (it._pending) {
+            if (it.paused) { it.paused = false; it.status = 'queued'; this.render(); }
+            return;
+        }
         this._adoptRivals(it);
         if (!it.file && !it.zkPlain) {
             // Zero-knowledge, sealed up front: the ciphertext lives only in this browser's
@@ -17561,7 +17582,10 @@ async function uploadFiles(files) {
         // this one unchecked, so the batch is refused rather than moved.
         if (!state.currentVault || state.currentVault.id !== _place.vaultId
                 || (state.currentFolderId || null) !== _place.folderId) {
-            showError('The folder changed while the upload was being prepared — drop the files again.');
+            const vaultGone = !state.currentVault || state.currentVault.id !== _place.vaultId;
+            showError(vaultGone
+                ? 'The vault was closed or changed while the upload was being prepared — open it and drop the files again.'
+                : 'The folder changed while the upload was being prepared — drop the files again.');
             return;
         }
         if (toUpload.length) uploadManager.enqueueNamed(toUpload, _place);

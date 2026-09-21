@@ -195,7 +195,7 @@ LIFTED = ("async _run(id) {", "async _serverHoldsAll(it) {", "async _fireReplace
           "async _dropReplacement(it, message) {", "async cancel(id, forReplacement) {",
           "_nameKeys(it) {", "_sameName(a, b) {", "_samePlace(a, b) {", "_holdsName(o) {",
           "_sameNameRows(probe) {", "_earlier(o, it) {", "_liveRivals(it) {",
-          "_noteLanded(it) {", "_landedSince(it) {",
+          "_noteLanded(it, epoch) {", "_landedSince(it) {",
           "_knownFrom(rows) {", "_isKnown(it, o) {", "_adoptRivals(it) {", "_rivalsToCancel(it) {",
           "async _abandonSession(it) {", "resume(id) {", "reset() {", "_canRepick(it) {", "_controlSig(it) {",
           "_start(it) {", "_rowForPick(was) {")
@@ -980,11 +980,25 @@ def test_pause_on_a_row_that_is_still_queued_holds_when_its_slot_comes():
     const drain = async () => { for (const start of transferGate.q.splice(0)) await start(); };
     fresh(sent('o', 'new-sess', { status: 'queued', received: new Set(), lastPut: null, chunkSize: 10,
         file: { size: 10, slice: () => ({ arrayBuffer: async () => new ArrayBuffer(10) }) } }));
-    um.run('o'); um.pause('o'); out.whileQueued = row('o');
+    um.run('o'); um.pause('o'); out.whileQueued = row('o'); out.offers = um._controlSig(um.items.get('o'));
     await drain(); out.slotCame = snap();
     um.resume('o'); await drain(); out.resumed = snap();
+    // Paused while queued AND resumed while still queued: the run already in the queue is the one
+    // that goes -- nothing new is queued -- and it must find the row un-paused when its slot comes.
+    fresh(sent('o', 'new-sess', { status: 'queued', received: new Set(), lastPut: null, chunkSize: 10,
+        file: { size: 10, slice: () => ({ arrayBuffer: async () => new ArrayBuffer(10) }) } }));
+    um.run('o'); um.pause('o'); um.resume('o');
+    out.stillQueued = { queued: transferGate.q.length, row: row('o'), offers: um._controlSig(um.items.get('o')) };
+    await drain(); out.ranWhenTheSlotCame = snap();
     """)
-    assert out["whileQueued"]["status"] == "queued"
+    # Paused at once, so that the row SHOWS Resume: left 'queued' it went on offering only Pause.
+    # (mutation: leave a queued row's status alone -> 'queued', offering 'pause,cancel' -> red.)
+    assert out["whileQueued"]["status"] == "paused" and out["offers"] == "resume,cancel", out
+    # (mutation: Resume on a row whose run is queued does nothing at all -> the slot comes, the row
+    # is still paused, and the log is empty -> red.)
+    assert out["stillQueued"] == {"queued": 1, "row": {"status": "queued", "cancelled": False, "error": None},
+                                  "offers": "pause,cancel"}, out["stillQueued"]
+    assert out["ranWhenTheSlotCame"]["log"] == ["PUT /vaults/V/uploads/new-sess/chunks/0", COMPLETE], out["ranWhenTheSlotCame"]
     # (mutation: clear `paused` when the run starts -> the PUT and the commit are in this log -> red.)
     assert out["slotCame"]["log"] == [] and out["slotCame"]["o"]["status"] == "paused", out["slotCame"]
     assert out["resumed"]["log"] == ["PUT /vaults/V/uploads/new-sess/chunks/0", COMPLETE] and out["resumed"]["o"]["status"] == "done"
@@ -1019,6 +1033,71 @@ def test_a_picked_file_goes_to_the_row_that_holds_the_session_now():
     assert out["gone"]["rows"] == [] and len(out["gone"]["log"]) == 1, out["gone"]
     assert out["gone"]["log"][0].startswith('toast error "X" is no longer in the upload list, so nothing was uploaded.')
     assert out["same"] == ran and out["pickingCleared"] is True
+
+
+def test_a_commit_that_outlives_a_sign_out_writes_nothing_into_the_next_tray():
+    out = _serve("""
+    fresh(sent('o', 'new-sess'));
+    let answer; server.completes = [new Promise(res => { answer = res; })];
+    const running = um._run('o'); await settle();               // the commit is out
+    um.reset();                                                  // the account signs out
+    answer({ ok: true, status: 200, json: async () => ({}) }); await running;
+    out.afterSignOut = { landed: um._landed.length, log: log.slice() };
+    fresh(sent('o', 'new-sess')); await um._run('o'); out.ordinary = um._landed.map(l => l.fileName);
+    """)
+    # (mutation: record the landing whatever has happened since -> the next account's tray knows a
+    # file name of the last one -> red.)
+    assert out["afterSignOut"] == {"landed": 0, "log": [COMPLETE]}, out["afterSignOut"]
+    assert out["ordinary"] == ["X"]
+
+
+def test_an_older_upload_continued_after_a_newer_one_of_the_name_landed_stands_aside():
+    # After a reload both come back as rows waiting for their files. The user continues the NEWER
+    # one and it lands. Continuing the OLDER one afterwards used to commit it, and the server
+    # replaced the newer file with it by name: the older bytes winning, silently.
+    out = _serve("""
+    const pair = () => fresh(
+        sent('v', 'old-sess', { status: 'needs-file', file: null, restored: true, order: 61, startedAt: 1000 }),
+        sent('o', 'new-sess', { status: 'needs-file', file: null, restored: true, order: 60, startedAt: 2000 }));
+    pair(); um.items.delete('v'); um.items.get('o').file = {}; await um._run('o');   // the newer one lands, alone
+    um.items.set('v', sent('v', 'old-sess', { status: 'needs-file', file: null, restored: true, order: 900, startedAt: 1000 }));
+    log.length = 0; um.resume('v'); out.adopted = !!um.items.get('v').replaces;
+    um.items.get('v').file = {}; await um._run('v'); out.olderAfterNewer = snap();
+    // The other way round is the ordinary case: the older landed, the newer is continued, and wins.
+    fresh(sent('v', 'old-sess', { restored: true, order: 61, startedAt: 1000 })); await um._run('v');
+    um.items.set('o', sent('o', 'new-sess', { status: 'needs-file', file: null, restored: true, order: 900, startedAt: 2000 }));
+    log.length = 0; um.resume('o'); um.items.get('o').file = {}; await um._run('o'); out.newerAfterOlder = snap();
+    """)
+    # (mutation: never ask what landed for a row rebuilt from the server -> the older one commits -> red.)
+    assert out["adopted"] is True
+    assert out["olderAfterNewer"]["log"] == [
+        "reselect v", 'toast error A newer upload of "X" has already finished, so this older copy was not uploaded.',
+        DEL_OLD], out["olderAfterNewer"]
+    assert out["newerAfterOlder"]["log"] == ["reselect o", COMPLETE], out["newerAfterOlder"]
+
+
+def test_two_files_of_one_name_in_one_drop_end_as_one_file_whichever_gets_there_first():
+    # The second of the pair knows the first (it is added when the batch is enqueued); the first does
+    # not know the second, and must not: a relation that ran both ways would have each cancel the
+    # other. One direction is enough, because the second cannot LAND while the first is alive --
+    # every order below ends with exactly one commit, and says which.
+    out = _serve("""
+    const E1 = () => sent('e1', 'e1-sess', { order: 1, replaces: chose('F') });
+    const E2 = () => sent('e2', 'e2-sess', { order: 2, replaces: { deleteId: 'F', known: { sessions: [], items: ['e1'] } } });
+    const commits = () => log.filter(e => e.endsWith('/complete'));
+    fresh(E1(), E2()); await um._run('e2'); await um._run('e1'); out.secondFirst = { log: log.slice(), commits: commits() };
+    fresh(E1(), E2()); await um._run('e1'); await um._run('e2'); out.firstFirst = { log: log.slice(), commits: commits() };
+    fresh(E1(), E2()); um.items.get('e1').status = 'completing';               // the first is mid-commit
+    const waiting = um._run('e2'); await settle(); out.parked = timers.length;
+    um._noteLanded(um.items.get('e1')); um.items.get('e1').status = 'done'; flush(); await waiting;
+    out.together = { log: log.slice(), commits: commits() };
+    """)
+    C1, C2 = "POST /vaults/V/uploads/e1-sess/complete", "POST /vaults/V/uploads/e2-sess/complete"
+    assert out["secondFirst"]["commits"] == [C2] and out["secondFirst"]["log"][0] == "DELETE /vaults/V/uploads/e1-sess"
+    overtaken = 'toast error "X" was already uploaded by the earlier transfer, which finished first; the new copy was not uploaded.'
+    assert out["firstFirst"]["commits"] == [C1] and overtaken in out["firstFirst"]["log"], out["firstFirst"]
+    assert out["firstFirst"]["log"].count(DEL_FILE) == 1                       # the original is deleted once
+    assert out["parked"] == 1 and out["together"]["commits"] == [] and overtaken in out["together"]["log"], out["together"]
 
 
 def test_a_refused_cancel_leaves_a_row_that_is_waiting_for_its_file_as_it_was():
@@ -1107,7 +1186,7 @@ def test_the_source_half_on_code_only():
     FIRED = "const fired = await this._fireReplacement(it);"
     assert run.count(FIRED) == 1 and run.count("if (!fired) return;") == 1
     # ... and the claim is made only after the commit: past `/complete`, past the landing.
-    assert run.index("/complete`") < run.index("this._noteLanded(it);") < run.index("replaced by this one.")
+    assert run.index("/complete`") < run.index("this._noteLanded(it, epoch);") < run.index("replaced by this one.")
     assert run.count("if (it.cancelled || it.status === 'error') return;") == 1
     # Twice: at the run's entry (a row paused while it waited for a slot stays paused -- and the flag
     # is NOT cleared there, or Pause on a queued row would do nothing), and after the fire step.
@@ -1116,12 +1195,13 @@ def test_the_source_half_on_code_only():
     assert run.index(FIRED) \
         < run.index("if (it.cancelled || it.status === 'error') return;") \
         < run.rindex("if (it.paused) { it.status = 'paused'; this.render(); return; }") < run.index("/complete`")
-    # resume() stands down for a row that is running, QUEUED to run, or being cancelled. The queued
-    # half is source-only by construction: run() refuses a second queued run on its own, so nothing
-    # observable changes when resume() stops looking -- it is there so that a Resume does not even
-    # adopt rivals for a run that is not going to happen. Likewise the send loop's read of
-    # `cancelled` before the commit: every cancel also sets `paused`, which the next line reads.
-    assert _code(js, "resume(id) {").count("if (it._running || it._pending || it.cancelled) return;") == 1
+    # resume() stands down for a row that is running or being cancelled. For one whose run is QUEUED
+    # it queues nothing more -- but it lifts a pause, so the queued run goes when its slot comes
+    # (behaviourally pinned in the queued-pause test). The send loop's read of `cancelled` before
+    # the commit is source-only by construction: every cancel also sets `paused`, read on the next line.
+    resume = _code(js, "resume(id) {")
+    assert resume.count("if (it._running || it.cancelled) return;") == 1 and resume.count("if (it._pending) {") == 1
+    assert resume.index("if (it._pending) {") < resume.index("this._adoptRivals(it);")
     ENTRY = "if (it.cancelled || it._running || it.status === 'done') return;"
     assert run.count(ENTRY) == 1 and run.index("it._pending = false;") < run.index(ENTRY) < run.index("it.status = 'uploading';")
     assert run.count("if (it.cancelled) { await this._abandonSession(it); return; }") == 2

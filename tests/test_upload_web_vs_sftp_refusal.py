@@ -469,6 +469,13 @@ const pick = async (rowExtra, zk, fileNames) => {
     errors.length = 0; state.currentFolderId = null; wander = 'F2';
     out.drifted = await pick({ status: 'paused' }); out.driftErrors = errors.slice();
     wander = null; state.currentFolderId = null;
+    // ... or CLOSES the vault, or opens another: that is said as what it is.
+    errors.length = 0; uploadManager.items = new Map([['r', row({ status: 'paused' })]]);
+    state.currentVault = { id: 'V', zk: false }; asked.length = 0; enqueued.length = 0;
+    const leaving = uploadFiles([{ name: 'X', size: 5, type: '' }]);
+    state.currentVault = { id: 'ANOTHER', zk: false }; await leaving;
+    out.vaultChanged = { enqueued: enqueued.length, errors: errors.slice() };
+    state.currentVault = { id: 'V', zk: false };
     process.stdout.write(JSON.stringify(out));
 })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
@@ -506,6 +513,9 @@ const pick = async (rowExtra, zk, fileNames) => {
     # (mutation: remove the place check -> the entry is enqueued, with its `replaces` -> red.)
     assert out["drifted"] == {"asked": ["X"], "replaces": [], "names": []}, out["drifted"]
     assert out["driftErrors"] == ["The folder changed while the upload was being prepared — drop the files again."]
+    # (mutation: one sentence for both -> "the folder changed" for a vault that was closed -> red.)
+    assert out["vaultChanged"] == {"enqueued": 0, "errors": [
+        "The vault was closed or changed while the upload was being prepared — open it and drop the files again."]}, out["vaultChanged"]
     # The placeholder is not a name. The resolver knows that (the table above); the staging SET
     # has to know it too, or a file really called that is asked about a conflict that does not
     # exist -- and the same set feeds the auto-rename. (mutation: add every row's fileName to the
@@ -543,9 +553,11 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     runs = re.findall(r"(?:`[^`]*`\s*\+\s*)*`[^`]*`", fire)
     messages = ["".join(re.findall(r"`([^`]*)`", r)) for r in runs]
     messages = [m for m in messages if "not uploaded" in m]
-    # Four ways: the old file could not be removed; an earlier upload finished first; the earlier
-    # upload could not be cancelled; and -- after one that WAS cancelled -- ANOTHER could not be.
-    assert len(messages) == 4, messages
+    # Five ways: the old file could not be removed; an earlier upload finished first; for an OLDER
+    # row the user continued, a NEWER upload of the name had already finished; the earlier upload
+    # could not be cancelled; and -- after one that WAS cancelled -- ANOTHER could not be.
+    assert len(messages) == 5, messages
+    assert sum(m.startswith("A newer upload of") for m in messages) == 1
     assert sum(m.startswith("Another earlier upload of") for m in messages) == 1
     for msg in messages:
         assert '"${name}"' in msg, f"a dropped replacement does not name the file: {msg}"
@@ -791,24 +803,40 @@ const API_BASE = '';
 let reply;
 const fetch = async () => ({ ok: true, json: async () => reply });
 const um = { _vaultHeaders() { return {}; },
-""" + _uploader_method(js, "async _init") + """
+""" + _uploader_method(js, "_serverMs") + _uploader_method(js, "async _init") + """
 };
 const open = async (created_at) => { reply = { session_id: 'S', received_chunks: [], created_at };
     const it = { vaultId: 'V', isZk: false, fileName: 'X', file: { type: '' }, totalSize: 1, totalChunks: 1, chunkSize: 1, folderId: null };
     await um._init(it); return it.startedAt; };
 (async () => process.stdout.write(JSON.stringify({
-    stamped: await open('2026-01-02T03:04:05'), same: Date.parse('2026-01-02T03:04:05'),
+    stamped: await open('2026-01-02T03:04:05'), same: Date.parse('2026-01-02T03:04:05Z'),
+    zoned: await open('2026-01-02T05:04:05+02:00'), zulu: await open('2026-01-02T03:04:05Z'),
+    standIn: await (async () => { reply = { session_id: 'S', received_chunks: [], created_at: '2026-01-02T03:04:05' };
+        const it = { startedAt: 123, startedLocal: true, vaultId: 'V', isZk: false, fileName: 'X', file: { type: '' }, totalSize: 1, totalChunks: 1, chunkSize: 1, folderId: null };
+        await um._init(it); return [it.startedAt, it.startedLocal]; })(),
     missing: await open(undefined), nonsense: await open('not a time'),
     reopened: await (async () => { reply = { session_id: 'S', received_chunks: [], created_at: '2026-01-02T03:04:05' };
         const it = { vaultId: 'V', isZk: false, fileName: 'X', file: { type: '' }, totalSize: 1, totalChunks: 1, chunkSize: 1, folderId: null };
         await um._init(it); reply = { ...reply, session_id: 'reopened-sess', created_at: '2026-03-04T05:06:07' };
         it.sessionId = null; await um._init(it); return [it.sessionId, it.startedAt]; })() })))();
 """
-    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    # Run FAR from UTC, wherever this suite runs: read as local time, the server's zoneless text is
+    # right only on a machine that happens to be in UTC -- which is exactly where CI is.
+    import os
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60,
+                          env={**os.environ, "TZ": "Pacific/Kiritimati"})
     assert done.returncode == 0, done.stdout + done.stderr
     out = json.loads(done.stdout)
     # (mutation: drop the stamp from _init -> undefined -> red.) 0 means "not known", never a time.
+    # The server's zoneless text is UTC, and is read as UTC -- whatever zone this machine is in -- so
+    # it can stand beside a stamp taken here. (mutation: parse it as the browser would, as LOCAL
+    # time -> hours off anywhere but UTC -> red wherever the suite runs off UTC; the zoned forms
+    # below hold it everywhere.)
     assert out["stamped"] == out["same"] and out["stamped"] > 0
+    assert out["zoned"] == out["same"] and out["zulu"] == out["same"]
+    # A stamp taken HERE at the drop is a stand-in, and gives way to the server's.
+    # (mutation: keep the stand-in -> [123, true] -> red.)
+    assert out["standIn"] == [out["same"], False], out["standIn"]
     assert out["missing"] == 0 and out["nonsense"] == 0
     # A session the server expired is re-opened under a new id -- but WHEN THE UPLOAD BEGAN does not
     # change, or an earlier upload would turn into a later one and stop being cancelled.
@@ -878,11 +906,13 @@ const fetch = async () => ({ ok: true, json: async () => listed });
 const um = { items: new Map(), seq: 0, started: [], render() {}, _vaultHeaders() { return {}; },
     run(id) { const r = this.items.get(id); this.started.push([r.sessionId, r.paused]); },
     _newId() { return 'up_' + (++this.seq); },
-""" + "".join(_uploader_method(js, n) for n in ("enqueueFiles", "enqueueNamed", "_start", "async _refreshResumableInner")) + """
+""" + "".join(_uploader_method(js, n) for n in ("enqueueNamed", "_start", "_serverMs", "async _refreshResumableInner")) + """
 };
 const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 5, total_chunks: 1, folder_id: null, created_at });
 (async () => {
-    um.enqueueFiles([{ name: 'a', size: 5 }]); um.enqueueNamed([{ file: { size: 5 }, name: 'b' }], { vaultId: 'V', folderId: null });
+    const before = Date.now();
+    um.enqueueNamed([{ file: { size: 5 }, name: 'a' }, { file: { size: 5 }, name: 'b' }], { vaultId: 'V', folderId: null });
+    const dropped = [...um.items.values()].map(r => [r.startedLocal, r.startedAt >= before && r.startedAt <= Date.now()]);
     // Rows the refresh must judge: only a REBUILT one, not running, whose session is no longer listed, goes.
     const old = (id, extra) => um.items.set(id, Object.assign({ id, vaultId: 'V', fileName: 'Z', sessionId: 'gone-' + id, status: 'error' }, extra));
     old('deadRestored', { restored: true }); old('runningRestored', { restored: true, status: 'uploading' });
@@ -899,8 +929,8 @@ const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 
     um.started.length = 0; zkVault = true; saved = { blob: { size: 5 }, chunkSize: 5 };
     listed = [sess('saved-here', '2026-01-03T00:00:00')];
     await um._refreshResumableInner();
-    process.stdout.write(JSON.stringify({ rows, autoStarted: um.started,
-        newer: Date.parse('2026-01-02T00:00:00'), older: Date.parse('2026-01-01T00:00:00') }));
+    process.stdout.write(JSON.stringify({ rows, autoStarted: um.started, dropped,
+        newer: Date.parse('2026-01-02T00:00:00Z'), older: Date.parse('2026-01-01T00:00:00Z') }));
 })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
     done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
@@ -910,7 +940,10 @@ const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 
     # (mutation: start the automatic resume through run() alone -> the row is still paused when its
     # slot comes, and it sits there for ever -> red.)
     assert out["autoStarted"] == [["saved-here", False]], out["autoStarted"]
-    # Both enqueues stamp `order` from the one counter, and neither row claims to be rebuilt.
+    # A row dropped here carries a stand-in time from this machine's clock, marked as such, until the
+    # server says when its session was opened. (mutation: no stand-in -> [undefined, false] -> red.)
+    assert out["dropped"] == [[True, True], [True, True]], out["dropped"]
+    # The enqueue stamps `order` from the one counter, and neither row claims to be rebuilt.
     assert [rows["up_1"]["order"], rows["up_2"]["order"]] == [1, 2]
     assert not rows["up_1"]["restored"] and not rows["up_2"]["restored"]
     # (mutation: remove the purge -> 'deadRestored' stays, holding its name -> red.)
