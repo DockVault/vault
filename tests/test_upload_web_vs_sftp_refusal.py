@@ -215,14 +215,14 @@ def test_upload_files_does_nothing_destructive_and_drops_a_refused_entry_before_
     # below the enqueue -> red; splice inside the loop -> red.)
     drop = "if (refused.size) toUpload = toUpload.filter(e => !refused.has(e));"
     assert code.count(drop) == 1, "refused entries are not removed from the batch exactly once"
-    assert code.count("uploadManager.enqueueNamed(toUpload)") == 1
-    assert code.index(drop) < code.index("uploadManager.enqueueNamed(toUpload)")
+    assert code.count("uploadManager.enqueueNamed(toUpload, _place)") == 1 and code.count("enqueueNamed(") == 1
+    assert code.index(drop) < code.index("uploadManager.enqueueNamed(toUpload, _place)")
     seal_loop = code[code.index("for (const entry of toUpload) {\n                    const mime"):code.index(drop)]
     assert ".splice(" not in seal_loop, "the loop splices the array it is walking"
 
 
 RESOLVER = ("_nameKeys", "_sameName", "_samePlace", "_holdsName", "_sameNameRows", "_earlier",
-            "_liveRivals")
+            "_knownFrom", "_isKnown", "_liveRivals", "_rivalsToCancel")
 
 
 def _resolver_src(js: str) -> str:
@@ -243,7 +243,9 @@ def test_what_an_entry_replaces_travels_on_the_entry_and_names_no_upload():
     # What stays from the old pin: it travels ON the entry, so two files of one name in one drop
     # do not share a fate, and a refused entry takes its destructive step with it.
     code = _strip_line_comments(_upload_files_src(APPJS.read_text(encoding="utf-8")))
-    assert code.count("entry.replaces = { deleteId: id || null };") == 1
+    # ... and WHICH uploads may be cancelled for it is fixed at the user's answer: the rows the tray
+    # holds under that name at that moment, and no others.
+    assert code.count("entry.replaces = { deleteId: id || null, known: uploadManager._knownFrom(_holders(file)) };") == 1
     for gone in ("cancelItemIds", "inFlightName", ".map(it => it.id)", "_pendingUpload"):
         assert gone not in code, f"uploadFiles notes uploads by id again: {gone}"
     # One question decides whether a picked name is taken, and it asks the uploader's resolver.
@@ -306,9 +308,29 @@ out.literal = ids(um._liveRivals(um.items.get('literal')));
 um.items = new Map([mk('older', 701, { restored: true, startedAt: 1000 }),
                     mk('newer', 700, { restored: true, startedAt: 2000 })].map(r => [r.id, r]));
 out.pair = { older: ids(um._liveRivals(um.items.get('older'))), newer: ids(um._liveRivals(um.items.get('newer'))) };
-// ... and with nothing to tell them apart in time, `order` still makes exactly one the earlier.
-um.items = new Map([mk('t1', 5, { restored: true, startedAt: 7 }), mk('t2', 6, { restored: true, startedAt: 7 })].map(r => [r.id, r]));
-out.tie = { t1: ids(um._liveRivals(um.items.get('t1'))), t2: ids(um._liveRivals(um.items.get('t2'))) };
+// ... and with nothing to tell them apart in time, the LIST does: newest first, so the row rebuilt
+// LAST (the higher order) is the older session.
+um.items = new Map([mk('listedFirst', 5, { restored: true, startedAt: 7 }), mk('listedLast', 6, { restored: true, startedAt: 7 })].map(r => [r.id, r]));
+out.tie = { listedFirst: ids(um._liveRivals(um.items.get('listedFirst'))), listedLast: ids(um._liveRivals(um.items.get('listedLast'))) };
+// ONE CLOCK once a restored row is in the pair: the server's word on when each session was opened.
+const clock = (mine, theirs) => { um.items = new Map([mk('ME', 10, mine), mk('restored', 9000, Object.assign({ restored: true }, theirs))].map(r => [r.id, r]));
+    return ids(um._liveRivals(um.items.get('ME'))); };
+out.clock = { openedLaterElsewhere: clock({ startedAt: 1000 }, { startedAt: 2000 }),
+              openedEarlier: clock({ startedAt: 2000 }, { startedAt: 1000 }),
+              noStampOnOurs: clock({}, { startedAt: 2000 }), noStampOnTheirs: clock({ startedAt: 1000 }, {}),
+              sameMoment: clock({ startedAt: 1000 }, { startedAt: 1000 }) };
+// Two rows dropped HERE: the drop order, whatever their sessions' clocks say (a session the server
+// expired is re-opened, and re-stamped, long after a later drop's).
+um.items = new Map([mk('first', 1, { startedAt: 9000 }), mk('second', 2, { startedAt: 1000 })].map(r => [r.id, r]));
+out.inTab = { first: ids(um._liveRivals(um.items.get('first'))), second: ids(um._liveRivals(um.items.get('second'))) };
+// What the user was shown, by session and -- where it had none yet -- by row.
+um.items = new Map([mk('shownBySession', 1), mk('shownByRow', 2, { sessionId: null }), mk('neverShown', 3),
+                    mk('ME', 10)].map(r => [r.id, r]));
+const me = um.items.get('ME');
+me.replaces = { deleteId: null, known: um._knownFrom([um.items.get('shownBySession'), um.items.get('shownByRow')]) };
+um.items.get('shownByRow').sessionId = 's-late';            // it gains its session afterwards
+out.known = { recorded: me.replaces.known, toCancel: ids(um._rivalsToCancel(me)), live: ids(um._liveRivals(me)) };
+me.replaces = null; out.known.withoutAChoice = ids(um._rivalsToCancel(me));
 process.stdout.write(JSON.stringify(out));
 """
     done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8",
@@ -340,7 +362,20 @@ process.stdout.write(JSON.stringify(out));
     # (mutations: every restored row is earlier than every other -> both lists full -> red; tell
     # two restored rows apart by `order` alone -> the NEWER is named the earlier -> red.)
     assert out["pair"] == {"older": [], "newer": ["older"]}, out["pair"]
-    assert out["tie"] == {"t1": [], "t2": ["t1"]}, out["tie"]
+    # (mutation: `<` on the tie -> the NEWER session is named the earlier -> red.)
+    assert out["tie"] == {"listedFirst": ["listedLast"], "listedLast": []}, out["tie"]
+    # A session opened LATER somewhere else and restored into this tray is NOT earlier than an
+    # upload already running here. (mutation: the restored flag decides before the clocks -> red.)
+    assert out["clock"] == {"openedLaterElsewhere": [], "openedEarlier": ["restored"],
+                            "noStampOnOurs": ["restored"], "noStampOnTheirs": ["restored"],
+                            "sameMoment": ["restored"]}, out["clock"]
+    # (mutation: let the clocks decide between two rows dropped here -> red.)
+    assert out["inTab"] == {"first": [], "second": ["first"]}, out["inTab"]
+    # (mutation: drop the shown-to-the-user filter -> 'neverShown' is cancelled -> red.)
+    assert out["known"]["recorded"] == {"sessions": ["s-shownBySession"], "items": ["shownByRow"]}
+    assert out["known"]["live"] == ["neverShown", "shownByRow", "shownBySession"]
+    assert out["known"]["toCancel"] == ["shownByRow", "shownBySession"], out["known"]
+    assert out["known"]["withoutAChoice"] == []
 
 
 def test_a_name_held_by_a_failed_or_waiting_upload_asks_the_question_run_against_upload_files():
@@ -354,18 +389,20 @@ def test_a_name_held_by_a_failed_or_waiting_upload_asks_the_question_run_against
     js = APPJS.read_text(encoding="utf-8")
     unique = js[js.index("function uniqueUploadName(name, existing) {"):js.index("function resolveUploadConflict(")]
     harness = """
-const asked = [], enqueued = [], errors = [];
+const asked = [], enqueued = [], errors = [], placed = [];
 const state = { currentVault: { id: 'V', zk: false }, currentFolderId: null, currentFiles: [], downloadSink: 'streaming' };
 const showError = (m) => errors.push(m);
 const isZkVault = (v) => !!v.zk;
-const resolveUploadConflict = async (name, autoName) => { asked.push(name); return { action: 'overwrite' }; };
+let wander = null;                                         // where the user walks to while being asked
+const resolveUploadConflict = async (name, autoName) => { asked.push(name);
+    if (wander) state.currentFolderId = wander; return { action: 'overwrite' }; };
 const zkGetCurrentDekVersion = async () => 2, zkGetVaultDek = async () => 'dek';
 const eccLib = () => ({ ZK_CONTENT_WRITE_V2: true, nameBlindIndex: async (n) => 'bi:' + n,
                         encryptName: async () => 'sealed' });
 const zkUploadNameCandidates = async (lib, n) => ['bi-old:' + n, 'bi:' + n];
 const zkNewObjId = () => 'obj', zkUploadDecision = () => 'seal', MAX_BUFFERED_DOWNLOAD_BYTES = 1, formatBytes = null;
 const isCodedCryptoError = () => false, safeMessageForCode = () => '';
-const uploadManager = { items: new Map(), enqueueNamed(entries) { enqueued.push(...entries); },
+const uploadManager = { items: new Map(), enqueueNamed(entries, place) { enqueued.push(...entries); placed.push(place); },
 """ + _resolver_src(js) + """
 };
 """ + unique + _upload_files_src(js) + """
@@ -395,7 +432,13 @@ const pick = async (rowExtra, zk, fileName) => {
         zkPlaceholder: await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:Y', status: 'needs-file' },
                                   true, '(encrypted upload)'),
     };
-    out.errors = errors;
+    out.errors = errors.slice();
+    out.place = placed[0];
+    // The user walks into another folder while the question is up: the names were checked against
+    // the folder they LEFT, so nothing is enqueued anywhere.
+    errors.length = 0; state.currentFolderId = null; wander = 'F2';
+    out.drifted = await pick({ status: 'paused' }); out.driftErrors = errors.slice();
+    wander = null; state.currentFolderId = null;
     process.stdout.write(JSON.stringify(out));
 })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
@@ -404,7 +447,7 @@ const pick = async (rowExtra, zk, fileName) => {
     assert done.returncode == 0, done.stdout + done.stderr
     out = json.loads(done.stdout)
     assert out["errors"] == []
-    held = {"asked": ["X"], "replaces": [{"deleteId": None}], "names": ["X"]}
+    held = {"asked": ["X"], "replaces": [{"deleteId": None, "known": {"sessions": ["s"], "items": []}}], "names": ["X"]}
     free = {"asked": [], "replaces": [None], "names": ["X"]}
     assert out["free"] == free
     # (mutation: leave 'error' out of the held names again -> no question, nothing replaced -> red.)
@@ -413,6 +456,10 @@ const pick = async (rowExtra, zk, fileName) => {
     # (mutation: remove the blind-index arm -> the restored rows are invisible -> red.)
     assert out["zkRestored"] == held and out["zkOldEpoch"] == held, out
     assert out["zkOtherName"] == free
+    assert out["place"] == {"vaultId": "V", "folderId": None}
+    # (mutation: remove the place check -> the entry is enqueued, with its `replaces` -> red.)
+    assert out["drifted"] == {"asked": ["X"], "replaces": [], "names": []}, out["drifted"]
+    assert out["driftErrors"] == ["The folder changed while the upload was being prepared — drop the files again."]
     # The placeholder is not a name. The resolver knows that (the table above); the staging SET
     # has to know it too, or a file really called that is asked about a conflict that does not
     # exist -- and the same set feeds the auto-rename. (mutation: add every row's fileName to the
@@ -433,9 +480,9 @@ def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everyth
     complete_at = run.index("/complete`")
     assert send_at < holds_at < fire_at < complete_at, "the destructive step is not at the fire point"
     assert run.count("this._fireReplacement(it)") == 1 and js.count("this._fireReplacement(it)") == 1
-    # For EVERY upload that has something to fire -- a choice the user made, or an earlier upload
-    # of its name still alive -- and once per upload.
-    assert run.count("if (!it.replacesFired && (it.replaces || this._liveRivals(it).length)) {") == 1
+    # Only for an upload that REPLACES (the user's answer, or a restored row the user continued
+    # beside an earlier one), and on EVERY pass through here -- no latch across runs.
+    assert run.count("if (it.replaces) {") == 1 and "replacesFired" not in js
     # "Holds everything" is the server's OWN count: every chunk, and exactly the declared bytes.
     holds = _uploader_method(js, "async _serverHoldsAll")
     assert "return !!s.complete && s.bytes_received === it.totalSize;" in holds
@@ -456,9 +503,12 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     # An earlier upload that FINISHED FIRST is told apart from one that was cancelled (both leave
     # the tray): what landed is noted apart from the rows, by the name it held, and landing first
     # drops the replacement, not the landed file. It is read before any cancel on every turn.
-    assert fire.count("if (it.replaces && this._landedSince(it)) {") == 1
-    assert fire.index("if (it.replaces && this._landedSince(it)) {") < fire.index("await this.cancel(rival.id, true)")
-    assert 'showInfo(`The earlier upload of "${name}" was cancelled and replaced by this one.`)' in fire
+    assert fire.count("if (this._landedSince(it)) {") == 1
+    assert fire.index("if (this._landedSince(it)) {") < fire.index("await this.cancel(rival.id, true)")
+    # The cancels that happened are said on every way out, counted, and by name.
+    assert 'cancelled === 1 ? `The earlier upload of "${name}" was`' in fire
+    assert '`${cancelled} earlier uploads of "${name}" were`' in fire
+    assert fire.count("sayCancelled(false);") == 7 and fire.count("sayCancelled(true);") == 1
 
 
 def test_a_file_sealed_as_it_uploads_has_no_raw_file_to_send_and_one_session_per_transfer():
@@ -627,3 +677,82 @@ def test_the_state_literal_does_not_initialise_the_download_sink():
     assert "downloadSink:" not in code, (
         "the download sink is initialised as an object-literal field; a default defeats the "
         "fail-closed guard")
+
+
+def test_two_files_of_one_name_in_one_drop_and_where_a_batch_lands_run_against_enqueue_named():
+    # The first of two same-name files is not in the tray when the question is answered for the
+    # second, so it cannot be among the rows "shown" then; it is added when the batch is enqueued.
+    # And the batch lands where it was PREPARED for, not wherever the user is now.
+    node = shutil.which("node")
+    assert node, "Node is required"
+    js = APPJS.read_text(encoding="utf-8")
+    harness = """
+const CHUNK_SIZE = 10;
+const state = { currentVault: { id: 'ELSEWHERE' }, currentFolderId: 'NOW' };
+const um = { items: new Map(), seq: 0, started: [], run(id) { this.started.push(id); }, render() {},
+    _newId() { return 'up_' + (++this.seq); },
+""" + _uploader_method(js, "enqueueNamed") + """
+};
+const shown = { sessions: ['s-old'], items: [] };
+um.enqueueNamed([
+    { file: { size: 5 }, name: 'X', replaces: { deleteId: 'F', known: shown } },
+    { file: { size: 5 }, name: 'Y' },
+    { file: { size: 5 }, name: 'X', replaces: { deleteId: 'F', known: shown } },
+], { vaultId: 'V', folderId: 'F1' });
+const rows = [...um.items.values()];
+process.stdout.write(JSON.stringify({ replaces: rows.map(r => r.replaces), orders: rows.map(r => r.order),
+    places: rows.map(r => [r.vaultId, r.folderId]), shownUntouched: shown }));
+"""
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    first, other, second = out["replaces"]
+    assert first == {"deleteId": "F", "known": {"sessions": ["s-old"], "items": []}}
+    assert other is None
+    # (mutation: do not add the earlier entry of the same batch -> the twin is never cancelled -> red.)
+    assert second == {"deleteId": "F", "known": {"sessions": ["s-old"], "items": ["up_1"]}}, second
+    assert out["shownUntouched"] == {"sessions": ["s-old"], "items": []}      # each row its own copy
+    assert out["orders"] == [1, 2, 3]
+    # (mutation: read the place from `state` again -> red.)
+    assert out["places"] == [["V", "F1"]] * 3, out["places"]
+
+
+def test_a_row_dropped_here_takes_its_clock_from_the_server_when_its_session_opens():
+    node = shutil.which("node")
+    assert node, "Node is required"
+    js = APPJS.read_text(encoding="utf-8")
+    harness = """
+const API_BASE = '';
+let reply;
+const fetch = async () => ({ ok: true, json: async () => reply });
+const um = { _vaultHeaders() { return {}; },
+""" + _uploader_method(js, "async _init") + """
+};
+const open = async (created_at) => { reply = { session_id: 'S', received_chunks: [], created_at };
+    const it = { vaultId: 'V', isZk: false, fileName: 'X', file: { type: '' }, totalSize: 1, totalChunks: 1, chunkSize: 1, folderId: null };
+    await um._init(it); return it.startedAt; };
+(async () => process.stdout.write(JSON.stringify({
+    stamped: await open('2026-01-02T03:04:05'), same: Date.parse('2026-01-02T03:04:05'),
+    missing: await open(undefined), nonsense: await open('not a time') })))();
+"""
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    # (mutation: drop the stamp from _init -> undefined -> red.) 0 means "not known", never a time.
+    assert out["stamped"] == out["same"] and out["stamped"] > 0
+    assert out["missing"] == 0 and out["nonsense"] == 0
+
+
+def test_the_server_says_when_a_session_was_opened_in_the_answer_that_opens_it():
+    # The client half is above; this is the server half, read from the syntax tree (the live answer
+    # is the integration lane's): the dict `init_chunked_upload` returns carries 'created_at', taken
+    # from the SESSION ROW -- so a continued session answers with its original moment, not now.
+    import ast
+    tree = ast.parse((ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "init_chunked_upload")
+    returned = [n.value for n in ast.walk(fn) if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)]
+    assert returned, "init_chunked_upload no longer returns a dict literal"
+    final = returned[-1]
+    keys = {k.value: v for k, v in zip(final.keys, final.values) if isinstance(k, ast.Constant)}
+    assert "session_id" in keys and "created_at" in keys
+    assert "session.created_at" in ast.unparse(keys["created_at"]), ast.unparse(keys["created_at"])

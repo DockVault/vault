@@ -17525,6 +17525,11 @@ async def init_chunked_upload(
         # local copy still matches before skipping them.
         'chunk_checksums': _chunk_hashes(sdir),
         'expires_at': session.expires_at.isoformat() if session.expires_at else None,
+        # When this session was opened, in the same form the session list gives it. A client that
+        # has to tell which of two uploads of one name is the earlier needs one clock for both, and
+        # a row it started itself otherwise has none. For a continued session this is the original
+        # moment, not now.
+        'created_at': session.created_at.isoformat() if session.created_at else None,
     }
 
 
