@@ -13269,8 +13269,17 @@ async function zkMaybeDecryptBlob(blob, vault, keyVersion = null, fileId = null)
     // of this code.
     const head = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
     if (lib.decryptBlobV2 && lib._inspectV2Header(head) === 'UNSUPPORTED') {
+        // The pieces are kept AS THEY COME and made into ONE Blob at the end. Each used to be
+        // wrapped in a Blob of its own as it arrived, and a Blob built in memory is copied into the
+        // browser process at once: measured on a 250 MiB file, that held about 440 MiB THERE
+        // while the pieces came in, against nothing for this. What remains at the end is the
+        // saved Blob itself -- one copy of the file, which has to exist to be saved.
+        //
+        // Safe to keep the piece itself: the reader hands out a NEW buffer for every record (the
+        // decryptor's own result), never one it reuses or wipes -- and only after that record's
+        // tag has verified, which is the only moment anything is pushed here.
         const parts = [];
-        await lib.decryptBlobV2(blob, dek, context, p => { parts.push(new Blob([p])); });
+        await lib.decryptBlobV2(blob, dek, context, p => { parts.push(p); });
         return new Blob(parts, { type });
     }
 
@@ -13623,8 +13632,10 @@ async function zkMaybeDecryptResponse(response, vault, keyVersion = null, fileId
 
     const { dek, context } = await zkResolveKey(vault, keyVersion, fileId);
     const type = response.headers.get('Content-Type') || 'application/octet-stream';
+    // The pieces as they come, ONE Blob at the end -- see zkMaybeDecryptBlob for why, and for why
+    // keeping the piece itself is safe.
     const parts = [];
-    await lib.decryptStreamV2(stream, declared, dek, context, p => { parts.push(new Blob([p])); });
+    await lib.decryptStreamV2(stream, declared, dek, context, p => { parts.push(p); });
     return new Blob(parts, { type });
 }
 
