@@ -104,7 +104,9 @@ class Settings(BaseSettings):
     # limit. timeout 0 disables the watchdog; min_bytes 0 means any byte at all counts (a pure
     # no-progress timer, which a trickle defeats). LIMIT: a write blocked inside the storage layer
     # cannot be interrupted -- the upload is marked and the connection closed at once, but that
-    # thread is only freed when the filesystem answers.
+    # thread is only freed when the filesystem answers. SCOPE: the unit that is closed is the
+    # CONNECTION, not the one upload -- so a second upload running on the same connection is
+    # discarded along with the stalled one rather than committed half-written.
     sftp_write_progress_timeout_seconds: int = Field(default=120)
     sftp_write_progress_min_bytes: int = Field(default=65536)
     # Memory-bounded streaming upload. When on, an SFTP upload is encrypted and persisted

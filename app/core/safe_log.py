@@ -28,6 +28,7 @@ import re
 _SAFE_FIELDS = frozenset({
     "vault", "file", "session", "user",     # identifiers (UUIDs, or an 8-char session prefix)
     "bytes", "limit", "removed", "port",    # magnitudes
+    "window_seconds", "floor_bytes", "accepted_bytes",   # the write-progress watchdog's numbers
     "peer", "signal",                       # network / process facts
 })
 

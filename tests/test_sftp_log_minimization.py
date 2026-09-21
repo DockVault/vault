@@ -354,3 +354,39 @@ def test_every_event_code_is_a_literal() -> None:
                 "it would print whatever it interpolated"
             )
     assert checked >= 45, f"only inspected {checked} call sites; the walk is not finding them"
+
+
+@pytest.mark.unit
+def test_every_field_a_call_site_passes_actually_survives_the_whitelist() -> None:
+    """The direction the rest of this file never checks: that an intended field is PRINTED.
+
+    Dropping an unknown field is the safe direction and the emitter does it silently, which is
+    right -- but silently is also how a call site loses its diagnostics without anyone noticing.
+    Every field test above is a negative: it proves a bad field cannot get out. None of them can
+    tell a working call site from one whose every number is thrown away, so an event can ship as
+    a bare code with nothing on it and the whole suite stays green. It did: the write-progress
+    watchdog's three numbers were dropped by exactly this gap. The emitter's own docstring
+    promises "a test enumerates the call sites so a mistyped field is caught there" -- this is
+    that test, and it walks every writer into the log rather than a list of four.
+    """
+    import ast
+
+    events = _load_events()
+    checked = 0
+    for path in sorted((ROOT / "app").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) != "safe_event":
+                continue
+            for keyword in node.keywords:
+                # `exc` is the emitter's own parameter (the exception class), not a log field.
+                if keyword.arg is None or keyword.arg == "exc":
+                    continue
+                checked += 1
+                assert keyword.arg in events._SAFE_FIELDS, (
+                    f"{path.relative_to(ROOT)}:{node.lineno}: passes '{keyword.arg}', which is not "
+                    "whitelisted -- it is computed at the call site and then silently dropped"
+                )
+    assert checked >= 30, f"only inspected {checked} fields; the walk is not finding them"

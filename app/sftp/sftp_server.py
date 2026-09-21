@@ -287,6 +287,13 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # Write progress, for the watchdog: bytes accepted since the current window began.
         self._progress_bytes = 0
         self._progress_window_start = 0.0
+        # close() and the watchdog can reach this handle at the same moment: the sweep decides a
+        # handle is stalled, and the client's CLOSE arrives before the sweep acts on its decision.
+        # Whoever takes this lock first wins, and a handle that has BEGUN CLOSING is never failed.
+        # The upload it is committing is one the client finished, and failing it would discard a
+        # complete file while paramiko answers that same CLOSE with SFTP_OK regardless.
+        self._close_lock = threading.Lock()
+        self._closing = False
         # The SFTP interface of the session this handle belongs to (set in open()); it is what
         # knows that the session has ended.
         self._interface = None
@@ -397,6 +404,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             self.stream._failed = True
 
     def close(self):
+        # Claimed BEFORE anything else: from here on the watchdog leaves this handle alone. A
+        # sweep that has already decided this handle is stalled must not act on that decision
+        # while the client's own CLOSE is committing the upload.
+        with self._close_lock:
+            self._closing = True
         # Remove the in-flight upload marker FIRST, on every close path -- a graceful client
         # CLOSE and the paramiko subsystem-finish that closes open handles on any
         # disconnect/abort both land here. Best-effort (never raises); a skip leaves the TTL.
@@ -537,14 +549,22 @@ class _WriteProgressWatchdog:
         for handle in watched:
             if handle.interrupted or self.verdict(handle, now, window, floor) == 'ok':
                 continue
-            self._fail(handle, window, floor)
-            failed.append(handle)
+            if self._fail(handle, window, floor):
+                failed.append(handle)
         return failed
 
     def _fail(self, handle, window, floor):
         accepted = handle._progress_bytes
-        # FIRST, before anything is closed: from here on, whatever closes this handle discards it.
-        handle.mark_interrupted()
+        # The snapshot above was taken under the set's lock, but the decision was made outside it,
+        # so the client's own CLOSE can land in that gap. A handle that has BEGUN CLOSING is left
+        # alone: it is committing an upload the client finished, paramiko answers that CLOSE with
+        # SFTP_OK whatever we do here, and marking it now would discard a complete file silently.
+        with handle._close_lock:
+            if handle._closing:
+                return False
+            # FIRST, before anything is closed: from here on, whatever closes this handle discards
+            # it. Set under the same lock close() takes, so exactly one of the two paths wins.
+            handle.mark_interrupted()
         self.forget(handle)
         # The same-name lock goes now rather than when close() gets round to it: if the handler
         # thread is stuck in a storage write, that could be a long time, and the upload holding
@@ -562,6 +582,7 @@ class _WriteProgressWatchdog:
                 transport.close()
             except Exception as e:  # noqa: BLE001
                 safe_event('upload.stalled.close-failed', e)
+        return True
 
     def run(self, stop=None):
         """The watchdog thread. Sweeps a few times per window, so a stall is caught within about a
