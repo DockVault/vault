@@ -69,7 +69,14 @@ const codeOf = async fn => {{
   const hex = b => Buffer.from(b).toString('hex');
   const open = async bytes => new Uint8Array(await lib.decryptFileV2(new Uint8Array(bytes), dek, CTX));
   const item = s => ({{ zkStream: s, frameMacs: new Array(s.totalChunks).fill(null) }});
-  const chunkBytes = async (it, i) => Buffer.from(await (await uploader._sealUploadChunk(it, i)).arrayBuffer());
+  // What the seal hands to fetch. Its KIND is recorded, because that decides which process holds
+  // the copy: a Blob built in memory is copied into the browser process and stays there.
+  const kinds = [];
+  const chunkBytes = async (it, i) => {{
+    const body = await uploader._sealUploadChunk(it, i);
+    kinds.push(body && body.constructor ? body.constructor.name : typeof body);
+    return body instanceof Uint8Array ? Buffer.from(body) : Buffer.from(await body.arrayBuffer());
+  }};
 {script}
 }})().catch(e => {{ process.stderr.write('HARNESS ' + (e && e.stack || e)); process.exit(1); }});
 """
@@ -82,7 +89,12 @@ const codeOf = async fn => {{
 def test_the_chunks_the_uploader_sends_are_whole_frames_and_open_as_the_declared_file():
     out = _node(f"""
   const s = await lib.startContentV2Encryption(new Blob([plain]), dek, CTX, {{ chunkSize: {CHUNK} }});
-  const it = item(s);
+  // The same session, with every part it hands out written down as it goes.
+  const handedOut = [];
+  const recording = {{ totalChunks: s.totalChunks,
+    header: () => {{ const h = s.header(); handedOut.push(Buffer.from(h)); return h; }},
+    sealFrame: async f => {{ const r = await s.sealFrame(f); handedOut.push(Buffer.from(r.frame)); return r; }} }};
+  const it = item(recording);
   const plan = zkUploadPlan(s.chunkSize + lib.V2_CONTENT_CHUNK_OVERHEAD, s.totalChunks,
                             s.ciphertextLength, ZK_FRAMES_PER_UPLOAD_CHUNK);
   const chunks = [];
@@ -95,6 +107,7 @@ def test_the_chunks_the_uploader_sends_are_whole_frames_and_open_as_the_declared
     onlyChunk0HasHeader: chunks.slice(1).every(c => c.subarray(0, 4).toString('latin1') !== 'DVZ2'),
     macs: it.frameMacs.filter(m => typeof m === 'string' && m.length === 64).length,
     frames: s.totalChunks,
+    kinds, parts: handedOut.length, sameBytesAsTheParts: Buffer.concat(handedOut).equals(whole),
   }}));
 """)
     assert out["frames"] == 10 and out["plan"]["totalChunks"] == 3
@@ -107,6 +120,11 @@ def test_the_chunks_the_uploader_sends_are_whole_frames_and_open_as_the_declared
     assert out["headerToken"] == out["blobId"] and out["onlyChunk0HasHeader"] is True
     # A MAC is recorded for every frame sealed.
     assert out["macs"] == out["frames"] == 10
+    # Each chunk is handed over as PLAIN BYTES -- one Uint8Array, never a Blob of the parts -- and
+    # those bytes are the parts, in order, nothing added or dropped (the header and the ten frames).
+    # (mutation: `return new Blob(parts)` again -> the kinds are 'Blob' -> red.)
+    assert out["kinds"] == ["Uint8Array"] * 3, out["kinds"]
+    assert out["parts"] == 11 and out["sameBytesAsTheParts"] is True
 
 
 def test_a_continued_upload_reseals_a_whole_missing_chunk_under_the_same_token():

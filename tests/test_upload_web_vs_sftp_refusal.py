@@ -575,6 +575,19 @@ def test_a_file_sealed_as_it_uploads_has_no_raw_file_to_send_and_one_session_per
     raw = run.index("const blob = it.file.slice(start, Math.min(start + it.chunkSize, it.file.size));")
     branch = run.index("if (it.zkPipelined) {\n")
     assert branch < run.index("} else {", branch) < raw, "the raw slice is not the non-pipelined branch"
+    # ... and that slice IS the request body. Read into an ArrayBuffer first, each chunk sat in the
+    # page's memory until its request was over and the collector got to it; handed over as it is,
+    # the browser streams it from the file and nothing holds it. So: nothing between the slice and
+    # the PUT reads it, and nothing in the SEND LOOP reads a slice at all. (The one other
+    # `.arrayBuffer()` in the run is the resume re-check, BEFORE the loop: one chunk at a time, and
+    # only for chunks the server already holds.) (mutation: `buf = await blob.arrayBuffer()` -> red.)
+    put = run.index("/chunks/${i}`")
+    assert run[raw:put].count("buf = blob;") == 1 and ".arrayBuffer(" not in run[raw:put]
+    loop = run.index("for (let i = 0; i < it.totalChunks; i++) {")
+    assert loop < raw and ".arrayBuffer(" not in run[loop:put]
+    assert run.count(".arrayBuffer(") == 1 and run.index(".arrayBuffer(") < loop
+    # The reference is dropped as soon as the request is over.
+    assert run.index("body: buf,") < run.index("buf = null;") < run.index("if (r.status === 410)")
     # ONE writer session per in-flight upload: opened when THAT transfer starts, never per file in
     # the drop, and only ever by STARTING an encryption (a continued one goes through the MAC-checked
     # reopen). (mutation: open sessions in uploadFiles -> red; let _openZkStream resume -> red.)

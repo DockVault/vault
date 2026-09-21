@@ -16292,13 +16292,20 @@ const uploadManager = {
                 } else {
                     const start = i * it.chunkSize;
                     const blob = it.file.slice(start, Math.min(start + it.chunkSize, it.file.size));
-                    buf = await blob.arrayBuffer();
+                    // The SLICE is the body. Reading it into an ArrayBuffer first put one chunk-sized
+                    // buffer per request into this page's memory, each alive until its request was
+                    // done and then until the collector got to it -- measured at three times the
+                    // file on a 64 MiB upload. A slice handed over as it is holds nothing here or
+                    // anywhere: the browser streams it from the file, with its length known, and
+                    // the same bytes arrive (faster). The server reads a stream either way.
+                    buf = blob;
                 }
                 const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/chunks/${i}`, {
                     method: 'PUT',
                     headers: { ...this._vaultHeaders(), 'Content-Type': 'application/octet-stream' },
                     body: buf,
                 });
+                buf = null;   // the request is over: nothing here keeps this chunk's bytes alive
                 if (r.status === 410) {  // session expired server-side — restart it
                     // Drop the stale ciphertext record; _init re-persists under the new session id.
                     if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);
@@ -16492,7 +16499,17 @@ const uploadManager = {
             it.frameMacs[f] = sealed.mac;
             parts.push(sealed.frame);
         }
-        return new Blob(parts);
+        // ONE Uint8Array, not a Blob of the parts. A Blob built in memory is copied into the
+        // BROWSER process's blob storage, and it stays there after this page has let go of it --
+        // about one whole file, measured, and not given back by a collection. Plain bytes are held
+        // by this page only while their request is out, and then they are the collector's. (These
+        // bytes exist nowhere else: they were sealed a moment ago, so there is no file to slice.)
+        let total = 0;
+        for (const part of parts) total += part.byteLength;
+        const chunk = new Uint8Array(total);
+        let at = 0;
+        for (const part of parts) { chunk.set(part, at); at += part.byteLength; }
+        return chunk;
     },
 
     // Does the server hold every chunk of this upload, and exactly the bytes it declared? Answered

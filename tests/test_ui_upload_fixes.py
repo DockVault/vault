@@ -176,6 +176,44 @@ def test_replace_on_an_in_flight_name_cancels_it_not_duplicates(page: Page, admi
 
 
 @pytest.mark.ui
+def test_a_file_of_several_chunks_lands_byte_for_byte(page: Page, admin, admin_creds):
+    """The page hands each chunk to the network as a SLICE OF THE FILE, not as bytes it has read
+    into memory first. That is a change in what the browser is given, not in what it should send:
+    the server must end up with exactly the file. Three chunks, the last one short, so a slice
+    taken at the wrong offset, a chunk sent twice, or a tail cut at the chunk size all show."""
+    import hashlib
+
+    v = admin.create_vault(name=unique("upbytes"))
+    vid = v["id"]
+    name = unique("three-chunks") + ".bin"
+    size = 2 * 5 * 1024 * 1024 + 123_457                   # two full 5 MiB chunks and a short third
+    block = bytes((i * 31 + 7) % 251 for i in range(65521))   # a prime length: no chunk repeats another
+    body = (block * (size // len(block) + 1))[:size]
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        _open_vault(page, vid)
+        page.set_input_files("#file-upload-input",
+                             files=[{"name": name, "mimeType": "application/octet-stream", "buffer": body}])
+
+        def listed():
+            return [it for it in admin.get(f"/vaults/{vid}/files").json()["items"]
+                    if it["type"] == "file" and it["name"] == name]
+        for _ in range(240):                                 # up to 60 s: three real PUTs and a commit
+            if listed():
+                break
+            page.wait_for_timeout(250)
+        rows = listed()
+        assert len(rows) == 1, rows
+        got = admin.get(f"/vaults/{vid}/files/{rows[0]['id']}/download")
+        assert got.status_code == 200, got.text[:200]
+        assert len(got.content) == size
+        assert hashlib.sha256(got.content).hexdigest() == hashlib.sha256(body).hexdigest(), \
+            "the file the server holds is not the file that was picked"
+    finally:
+        admin.delete_vault(vid)
+
+
+@pytest.mark.ui
 def test_tray_control_survives_a_progress_tick(page: Page, admin, admin_creds):
     """The upload tray patches in place: a control button keeps its identity across a render that
     only changed progress, instead of being destroyed and recreated every chunk (the flicker). The
