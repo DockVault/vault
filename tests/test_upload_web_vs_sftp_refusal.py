@@ -250,13 +250,19 @@ def test_what_an_entry_replaces_travels_on_the_entry_and_names_no_upload():
         assert gone not in code, f"uploadFiles notes uploads by id again: {gone}"
     # One question decides whether a picked name is taken, and it asks the uploader's resolver.
     assert code.count("if (!_nameIsHeld(file)) {") == 1
-    assert code.count("uploadManager._sameNameRows({") == 1
+    # ... twice over: the question itself, and the "keep both" name, which has to be free among the
+    # rows that can only be told by index as well.
+    assert code.count("uploadManager._sameNameRows({") == 2
+    assert code.count("const autoName = await _uniqueName(file.name);") == 1
+    assert code.count("name = await _uniqueName(name);") == 1
+    assert "= uniqueUploadName(file.name, existing)" not in code
     assert "if (!existing.has(file.name)) {" not in code
     # Zero-knowledge: each picked name's blind index exists BEFORE the question is asked, or a row
     # restored after a reload (placeholder name, index only) could not be recognised.
     # (mutation: derive it after the conflict loop -> red.)
-    assert code.index("_picked.set(file, {") < code.index("const _nameIsHeld = (file) =>") \
-        < code.index("await resolveUploadConflict(file.name, autoName)")
+    assert code.index("for (const file of arr) _picked.set(file, await _indexOf(file.name));") \
+        < code.index("const _nameIsHeld = (file) =>") \
+        < code.index("await resolveUploadConflict(file.name, autoName, _heldBy(file))")
 
 
 def test_who_an_upload_replaces_run_against_the_shipped_resolver():
@@ -389,15 +395,16 @@ def test_a_name_held_by_a_failed_or_waiting_upload_asks_the_question_run_against
     js = APPJS.read_text(encoding="utf-8")
     unique = js[js.index("function uniqueUploadName(name, existing) {"):js.index("function resolveUploadConflict(")]
     harness = """
-const asked = [], enqueued = [], errors = [], placed = [];
+const asked = [], enqueued = [], errors = [], placed = [], offered = [], heldBy = [];
+let derived = 0, answer = 'overwrite';
 const state = { currentVault: { id: 'V', zk: false }, currentFolderId: null, currentFiles: [], downloadSink: 'streaming' };
 const showError = (m) => errors.push(m);
 const isZkVault = (v) => !!v.zk;
 let wander = null;                                         // where the user walks to while being asked
-const resolveUploadConflict = async (name, autoName) => { asked.push(name);
-    if (wander) state.currentFolderId = wander; return { action: 'overwrite' }; };
+const resolveUploadConflict = async (name, autoName, by) => { asked.push(name); offered.push(autoName); heldBy.push(by);
+    if (wander) state.currentFolderId = wander; return { action: answer, name: autoName }; };
 const zkGetCurrentDekVersion = async () => 2, zkGetVaultDek = async () => 'dek';
-const eccLib = () => ({ ZK_CONTENT_WRITE_V2: true, nameBlindIndex: async (n) => 'bi:' + n,
+const eccLib = () => ({ ZK_CONTENT_WRITE_V2: true, nameBlindIndex: async (n) => { derived++; return 'bi:' + n; },
                         encryptName: async () => 'sealed' });
 const zkUploadNameCandidates = async (lib, n) => ['bi-old:' + n, 'bi:' + n];
 const zkNewObjId = () => 'obj', zkUploadDecision = () => 'seal', MAX_BUFFERED_DOWNLOAD_BYTES = 1, formatBytes = null;
@@ -408,11 +415,12 @@ const uploadManager = { items: new Map(), enqueueNamed(entries, place) { enqueue
 """ + unique + _upload_files_src(js) + """
 const row = (extra) => Object.assign({ id: 'r', order: 1, vaultId: 'V', folderId: null, fileName: 'X',
     status: 'uploading', cancelled: false, sessionId: 's' }, extra);
-const pick = async (rowExtra, zk, fileName) => {
+const pick = async (rowExtra, zk, fileNames) => {
     asked.length = 0; enqueued.length = 0;
     state.currentVault = { id: 'V', zk: !!zk };
     uploadManager.items = new Map(rowExtra ? [['r', row(rowExtra)]] : []);
-    await uploadFiles([{ name: fileName || 'X', size: 5, type: '' }]);
+    const names = [].concat(fileNames || 'X');
+    await uploadFiles(names.map(name => ({ name, size: 5, type: '' })));
     return { asked: asked.slice(), replaces: enqueued.map(e => e.replaces || null),
              names: enqueued.map(e => e.name) };
 };
@@ -434,6 +442,25 @@ const pick = async (rowExtra, zk, fileName) => {
     };
     out.errors = errors.slice();
     out.place = placed[0];
+    // SEVERAL files in one pick.
+    const zkRow = { isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:b', status: 'needs-file' };
+    out.secondHeldByIndex = await pick(zkRow, true, ['a', 'b']);
+    out.twoOfOneName = await pick(null, false, ['X', 'X']);
+    // THE COST: an index per picked name is derived only when a restored zero-knowledge row is there
+    // to be recognised by it (the sealing itself derives one per file either way).
+    derived = 0; await pick(null, true, ['a', 'b']); out.derivedEmptyTray = derived;
+    derived = 0; await pick({ isZk: true, fileName: 'other' }, true, ['a', 'b']); out.derivedInTabRowOnly = derived;
+    derived = 0; await pick(zkRow, true, ['a', 'c']); out.derivedWithRestoredRow = derived;
+    // WHAT holds the name decides the wording of the question.
+    heldBy.length = 0; await pick({ status: 'paused' }); out.heldByUpload = heldBy.slice();
+    state.currentFiles = [{ type: 'file', name: 'X', id: 'F' }];
+    heldBy.length = 0; out.committed = await pick(null); out.heldByFile = heldBy.slice();
+    // "KEEP BOTH" on a zero-knowledge vault: the first free name in the clear is one a restored row
+    // already holds by index, so the NEXT one is offered.
+    state.currentFiles = [{ type: 'file', name: 'report.pdf', id: 'F' }]; answer = 'autorename'; offered.length = 0;
+    out.keepBoth = await pick({ isZk: true, restored: true, fileName: '(encrypted upload)', nameBi: 'bi:report - 1.pdf', status: 'needs-file' },
+                              true, 'report.pdf');
+    out.offered = offered.slice(); answer = 'overwrite'; state.currentFiles = [];
     // The user walks into another folder while the question is up: the names were checked against
     // the folder they LEFT, so nothing is enqueued anywhere.
     errors.length = 0; state.currentFolderId = null; wander = 'F2';
@@ -457,6 +484,22 @@ const pick = async (rowExtra, zk, fileName) => {
     assert out["zkRestored"] == held and out["zkOldEpoch"] == held, out
     assert out["zkOtherName"] == free
     assert out["place"] == {"vaultId": "V", "folderId": None}
+    shown = {"sessions": ["s"], "items": []}
+    # The SECOND of two picked files is the one held, by index: only it is asked about.
+    assert out["secondHeldByIndex"] == {"asked": ["b"], "replaces": [None, {"deleteId": None, "known": shown}],
+                                        "names": ["a", "b"]}, out["secondHeldByIndex"]
+    # Two files of one name: the first takes the name, so the second is asked.
+    two = out["twoOfOneName"]
+    assert two["asked"] == ["X"] and two["replaces"] == [None, {"deleteId": None, "known": {"sessions": [], "items": []}}], two
+    # (mutation: derive an index for every pick on a zero-knowledge vault -> 4 -> red.)
+    assert out["derivedEmptyTray"] == 2 and out["derivedInTabRowOnly"] == 2, out
+    assert out["derivedWithRestoredRow"] == 4
+    # (mutation: always say 'file' -> red.)
+    assert out["heldByUpload"] == ["upload"] and out["heldByFile"] == ["file"]
+    assert out["committed"]["replaces"] == [{"deleteId": "F", "known": {"sessions": [], "items": []}}]
+    # (mutation: choose the "keep both" name against the names in the clear only -> 'report - 1.pdf',
+    # which the restored row holds -> red.)
+    assert out["offered"] == ["report - 2.pdf"] and out["keepBoth"]["names"] == ["report - 2.pdf"], out
     # (mutation: remove the place check -> the entry is enqueued, with its `replaces` -> red.)
     assert out["drifted"] == {"asked": ["X"], "replaces": [], "names": []}, out["drifted"]
     assert out["driftErrors"] == ["The folder changed while the upload was being prepared — drop the files again."]
@@ -756,3 +799,115 @@ def test_the_server_says_when_a_session_was_opened_in_the_answer_that_opens_it()
     keys = {k.value: v for k, v in zip(final.keys, final.values) if isinstance(k, ast.Constant)}
     assert "session_id" in keys and "created_at" in keys
     assert "session.created_at" in ast.unparse(keys["created_at"]), ast.unparse(keys["created_at"])
+
+
+def test_the_question_says_what_holds_the_name_run_against_the_shipped_dialog():
+    node = shutil.which("node")
+    assert node, "Node is required"
+    js = APPJS.read_text(encoding="utf-8")
+    fn = js[js.index("function resolveUploadConflict(name, autoName, heldBy) {"):js.index("async function uploadFiles(files) {")]
+    harness = """
+const els = {};
+const el = (id) => els[id] || (els[id] = { id, textContent: '', value: '', checked: false, disabled: false,
+    addEventListener() {}, removeEventListener() {}, focus() {}, select() {},
+    querySelectorAll: () => [], querySelector: () => null, classList: { add() {}, remove() {} } });
+const document = { getElementById: el };
+""" + fn + """
+const ask = (by) => { resolveUploadConflict('X', 'X - 1', by);
+    return [els['uc-title'].textContent, els['uc-what'].textContent, els['uc-replace-label'].textContent]; };
+process.stdout.write(JSON.stringify({ upload: ask('upload'), file: ask('file'), unsaid: ask(undefined) }));
+"""
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    # (mutation: ignore what holds the name -> "already exists" for a file nobody can find -> red.)
+    assert out["upload"] == ["File is still uploading", "is still being uploaded to this folder.",
+                             "Replace the upload in progress"], out["upload"]
+    existing = ["File already exists", "already exists in this folder.", "Replace the existing file"]
+    assert out["file"] == existing and out["unsaid"] == existing      # and it is set back every time
+    # The page has the three places the wording goes.
+    html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('id="uc-title"', 'id="uc-what"', 'id="uc-replace-label"'):
+        assert html.count(anchor) == 1, anchor
+
+
+def test_the_tray_as_the_shipped_producers_build_it():
+    # Everything about which upload is the earlier rests on three fields, so they are read here off
+    # the rows the SHIPPED code builds: the rebuild from the server's list, and the two enqueues.
+    node = shutil.which("node")
+    assert node, "Node is required"
+    js = APPJS.read_text(encoding="utf-8")
+    harness = """
+const API_BASE = '', CHUNK_SIZE = 10;
+const state = { currentVault: { id: 'V' }, currentFolderId: null };
+const isZkVault = () => false;
+const zkUploadStore = { get: async () => null, allForVault: async () => [] };
+let listed = [];
+const fetch = async () => ({ ok: true, json: async () => listed });
+const um = { items: new Map(), seq: 0, run() {}, render() {}, _vaultHeaders() { return {}; },
+    _newId() { return 'up_' + (++this.seq); },
+""" + "".join(_uploader_method(js, n) for n in ("enqueueFiles", "enqueueNamed", "async _refreshResumableInner")) + """
+};
+const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 5, total_chunks: 1, folder_id: null, created_at });
+(async () => {
+    um.enqueueFiles([{ name: 'a', size: 5 }]); um.enqueueNamed([{ file: { size: 5 }, name: 'b' }], { vaultId: 'V', folderId: null });
+    // Rows the refresh must judge: only a REBUILT one, not running, whose session is no longer listed, goes.
+    const old = (id, extra) => um.items.set(id, Object.assign({ id, vaultId: 'V', fileName: 'Z', sessionId: 'gone-' + id, status: 'error' }, extra));
+    old('deadRestored', { restored: true }); old('runningRestored', { restored: true, status: 'uploading' });
+    old('droppedHere', {}); old('listedRestored', { restored: true, sessionId: 'kept' });
+    listed = [sess('newer', '2026-01-02T00:00:00'), sess('older', '2026-01-01T00:00:00'), sess('kept', '2026-01-01T00:00:00')];
+    await um._refreshResumableInner();
+    const rows = [...um.items.values()].map(r => ({ id: r.id, sessionId: r.sessionId || null, order: r.order, restored: !!r.restored,
+        startedAt: r.startedAt || 0, status: r.status }));
+    process.stdout.write(JSON.stringify({ rows, newer: Date.parse('2026-01-02T00:00:00'), older: Date.parse('2026-01-01T00:00:00') }));
+})().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+"""
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    rows = {r["id"]: r for r in out["rows"]}
+    # Both enqueues stamp `order` from the one counter, and neither row claims to be rebuilt.
+    assert [rows["up_1"]["order"], rows["up_2"]["order"]] == [1, 2]
+    assert not rows["up_1"]["restored"] and not rows["up_2"]["restored"]
+    # (mutation: remove the purge -> 'deadRestored' stays, holding its name -> red.)
+    assert "deadRestored" not in rows
+    assert {"runningRestored", "droppedHere", "listedRestored"} <= set(rows)
+    # The rebuild: restored, stamped with the server's word, and `order` following the list --
+    # newest first, which is why `order` alone must never decide between two of them.
+    by_session = {r["sessionId"]: r for r in out["rows"] if r["sessionId"] in ("newer", "older")}
+    assert by_session["newer"]["restored"] and by_session["older"]["restored"]
+    assert by_session["newer"]["startedAt"] == out["newer"] and by_session["older"]["startedAt"] == out["older"]
+    assert by_session["newer"]["order"] < by_session["older"]["order"]
+    assert by_session["newer"]["status"] == "needs-file"
+    assert not any(r["sessionId"] == "kept" and r["id"] != "listedRestored" for r in out["rows"]), "a listed session was rebuilt twice"
+
+
+def test_a_vault_with_no_index_key_is_asked_about_it_once():
+    node = shutil.which("node")
+    assert node, "Node is required"
+    js = APPJS.read_text(encoding="utf-8")
+    start = js.index("async function zkGetVaultIndexKey(vaultId) {")
+    fn = js[start:js.index("\n}\n", start) + 3]
+    harness = """
+const zkState = { vaultIndexKeys: {} };
+let requests = 0, reply = {};
+const apiRequest = async () => { requests++; return reply; };
+const zkEnsureUnlocked = async () => 'priv';
+const eccLib = () => ({ unwrapNameIndexKeyV2: async () => 'KEY' });
+""" + fn + """
+(async () => {
+    const out = {};
+    for (let k = 0; k < 20; k++) out.none = await zkGetVaultIndexKey('V');
+    out.requestsForNone = requests;
+    zkState.vaultIndexKeys = {};                       // the vault is locked: the cache goes with the keys
+    reply = { index_key: 'w', ephemeral_public_key: 'e', recipient_user_id: 'u' }; requests = 0;
+    for (let k = 0; k < 20; k++) out.key = await zkGetVaultIndexKey('V');
+    out.requestsForKey = requests;
+    process.stdout.write(JSON.stringify(out));
+})();
+"""
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    # (mutation: do not remember "no key" -> 20 requests -> red.)
+    assert out == {"none": None, "requestsForNone": 1, "key": "KEY", "requestsForKey": 1}, out

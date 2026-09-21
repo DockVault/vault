@@ -13172,8 +13172,15 @@ async function zkMintOwnIndexKey(vaultId) {
 async function zkGetVaultIndexKey(vaultId) {
     const cached = zkState.vaultIndexKeys[vaultId];
     if (cached) return cached;
+    // "No key" is remembered too (as `false`): this is asked once per picked NAME, and a vault
+    // without one used to cost a request every time. Minting one overwrites the entry, and the
+    // whole cache goes with the keys when the vault is locked.
+    if (cached === false) return null;
     const resp = await apiRequest(`/ecc/vaults/${vaultId}/index-key`, { silent: true });
-    if (!resp || !resp.index_key) return null;   // no key minted for this vault yet
+    if (!resp || !resp.index_key) {              // no key minted for this vault yet
+        zkState.vaultIndexKeys[vaultId] = false;
+        return null;
+    }
     const priv = await zkEnsureUnlocked();
     const K = await eccLib().unwrapNameIndexKeyV2(
         resp.index_key, resp.ephemeral_public_key, priv,
@@ -15847,6 +15854,15 @@ const uploadManager = {
         );
         const zk = isZkVault(state.currentVault);
         const serverIds = new Set(sessions.map(s => s.session_id));
+        // A row rebuilt from the server whose session the server no longer lists (it finished
+        // elsewhere, expired, or was cancelled from another tab) cannot be continued any more. Left
+        // in the tray it would go on HOLDING its name: asking about a conflict that is not there,
+        // and standing as an earlier upload to be cancelled. One that is running is left to find
+        // out for itself; rows dropped in this tab are never touched here.
+        for (const [id, it] of this.items) {
+            if (it.vaultId === vaultId && it.restored && it.sessionId && !serverIds.has(it.sessionId)
+                    && it.status !== 'uploading' && it.status !== 'completing') this.items.delete(id);
+        }
         const toResume = [];
         for (const s of sessions) {
             if (activeSessionIds.has(s.session_id)) continue; // already being uploaded here
@@ -16131,6 +16147,12 @@ const uploadManager = {
         if (!it || !(it.file || it.zkPlain)) return;
         // Queued rather than started. The slot is held for the whole transfer and given back
         // however it ends, so a failure cannot cost one permanently.
+        //
+        // ONE queued run per row. The in-flight mark only exists once a run has STARTED; while the
+        // gate is full a second Resume (or a refresh's automatic resume beside the user's) would
+        // queue a second run behind the first, to start after it had finished.
+        if (it._pending) return;
+        it._pending = true;
         return transferGate.run(() => this._run(id));
     },
 
@@ -16154,7 +16176,13 @@ const uploadManager = {
         // is happening to it, and a run would overwrite both and then stop on `cancelled` anyway.
         // And ONE run per row: a second entry (a double click on Resume, a refresh's auto-resume
         // racing the user's) would send a second commit for the same session.
-        if (it.cancelled || it._running) return;
+        //
+        // And never on a row that has LANDED: it stays in the tray for a few seconds after its
+        // commit, and a run queued behind the one that finished it would otherwise start it over --
+        // asking about a session the server has already finalised, and reporting an error for a
+        // file that is safely there.
+        it._pending = false;
+        if (it.cancelled || it._running || it.status === 'done') return;
         it._running = true;
         it.status = 'uploading';
         it.paused = false;
@@ -16743,8 +16771,8 @@ const uploadManager = {
     resume(id) {
         const it = this.items.get(id);
         if (!it) return;
-        // Already running, or its cancel is out: nothing for a Resume to do.
-        if (it._running || it.cancelled) return;
+        // Already running, already queued to run, or its cancel is out: nothing for a Resume to do.
+        if (it._running || it._pending || it.cancelled) return;
         this._adoptRivals(it);
         if (!it.file && !it.zkPlain) {
             // Zero-knowledge, sealed up front: the ciphertext lives only in this browser's
@@ -17059,11 +17087,19 @@ function uniqueUploadName(name, existing) {
 
 // Ask the user how to resolve a filename collision. Resolves to
 // {action: 'autorename'|'overwrite'|'rename'|'skip', name, applyAll}.
-function resolveUploadConflict(name, autoName) {
+// `heldBy`: 'file' when a committed file has the name, 'upload' when only an upload still in the
+// tray does. "Already exists" is not true of the second, and "replace the existing file" would be
+// an offer to replace something the user cannot find in the folder.
+function resolveUploadConflict(name, autoName, heldBy) {
     return new Promise((resolve) => {
         const modal = document.getElementById('upload-conflict-modal');
         if (!modal) { resolve({ action: 'autorename', name: autoName }); return; }
         document.getElementById('uc-name').textContent = name;
+        const uploading = heldBy === 'upload';
+        const say = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+        say('uc-title', uploading ? 'File is still uploading' : 'File already exists');
+        say('uc-what', uploading ? 'is still being uploaded to this folder.' : 'already exists in this folder.');
+        say('uc-replace-label', uploading ? 'Replace the upload in progress' : 'Replace the existing file');
         document.getElementById('uc-auto').textContent = autoName;
         const renameInput = document.getElementById('uc-rename');
         const applyAll = document.getElementById('uc-applyall');
@@ -17177,20 +17213,25 @@ async function uploadFiles(files) {
     // Zero-knowledge: a row restored after a reload can only be recognised by its blind index, so
     // each picked name's index is derived HERE, ahead of the question. It costs nothing new -- the
     // key is fetched moments later anyway, and the vault is unlocked or nothing could be uploaded.
+    //
+    // Only when it can matter: a row dropped in this tab has its name in the clear, so an index is
+    // needed only if the tray holds a RESTORED zero-knowledge row in this folder.
     const _zkVault = isZkVault(state.currentVault);
     const _picked = new Map();   // picked file -> { nameBi, nameBiCandidates }
-    if (_zkVault) {
+    let _indexOf = null;         // name -> { nameBi, nameBiCandidates }, once the key is at hand
+    const _byIndexOnly = [...uploadManager.items.values()].some(it => it.isZk && it.restored
+        && uploadManager._samePlace(it, _place) && uploadManager._holdsName(it));
+    if (_zkVault && _byIndexOnly) {
         try {
             const vid = state.currentVault.id;
             const keyVersion = await zkGetCurrentDekVersion(vid);
             const dek = await zkGetVaultDek(vid, keyVersion);
             const lib = eccLib();
-            for (const file of arr) {
-                _picked.set(file, {
-                    nameBi: await lib.nameBlindIndex(file.name, dek, vid, keyVersion),
-                    nameBiCandidates: await zkUploadNameCandidates(lib, file.name, vid, keyVersion, dek),
-                });
-            }
+            _indexOf = async (name) => ({
+                nameBi: await lib.nameBlindIndex(name, dek, vid, keyVersion),
+                nameBiCandidates: await zkUploadNameCandidates(lib, name, vid, keyVersion, dek),
+            });
+            for (const file of arr) _picked.set(file, await _indexOf(file.name));
         } catch (e) {
             showError(isCodedCryptoError(e)
                 ? safeMessageForCode(e.code, 'unlock')
@@ -17202,6 +17243,24 @@ async function uploadFiles(files) {
         id: null, ..._place, isZk: _zkVault, fileName: file.name, ...(_picked.get(file) || {}),
     });
     const _nameIsHeld = (file) => existing.has(file.name) || _holders(file).length > 0;
+    // WHAT holds it, for the wording of the question: a committed file, or only an upload.
+    const _heldBy = (file) => idByName.has(file.name) ? 'file' : 'upload';
+    // "Keep both": a name free among the names in the clear AND among the restored rows that can
+    // only be told by index -- or the offered name could be one such a row already holds, and the
+    // two would meet at the server, which replaces by index.
+    const _uniqueName = async (name) => {
+        let candidate = uniqueUploadName(name, existing);
+        if (!_indexOf) return candidate;
+        const tried = new Set(existing);
+        for (let n = 0; n < 1000; n++) {
+            const held = uploadManager._sameNameRows({ id: null, ..._place, isZk: true,
+                fileName: candidate, ...(await _indexOf(candidate)) }).length > 0;
+            if (!held) return candidate;
+            tried.add(candidate);
+            candidate = uniqueUploadName(name, tried);
+        }
+        return candidate;
+    };
     let toUpload = [];   // {file, name}
     // What an entry REPLACES travels on the entry itself (`entry.replaces`), not in a list beside
     // the batch: the uploader fires it for that one entry, and only once the server holds all of
@@ -17216,10 +17275,10 @@ async function uploadFiles(files) {
             existing.add(file.name);
             continue;
         }
-        const autoName = uniqueUploadName(file.name, existing);
+        const autoName = await _uniqueName(file.name);
         let choice = blanket;
         if (!choice) {
-            choice = await resolveUploadConflict(file.name, autoName);
+            choice = await resolveUploadConflict(file.name, autoName, _heldBy(file));
             if (choice.applyAll && choice.action !== 'rename') blanket = { action: choice.action };
         }
         if (choice.action === 'skip') continue;
@@ -17242,7 +17301,7 @@ async function uploadFiles(files) {
             toUpload.push(entry);
         } else {
             let name = (choice.action === 'rename' && choice.name) ? choice.name : autoName;
-            name = uniqueUploadName(name, existing);
+            name = await _uniqueName(name);
             toUpload.push({ file, name });
             existing.add(name);
         }

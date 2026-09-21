@@ -41,6 +41,8 @@ def _node(harness: str) -> dict:
     done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True,
                           encoding="utf-8", timeout=60, cwd=str(ROOT))
     assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip(), ("the harness ended without writing its result: a run it was waiting on "
+                                 "never settled (parked on a timer or a request nothing released)")
     return json.loads(done.stdout)
 
 
@@ -619,9 +621,30 @@ def test_the_fire_point_under_the_conditions_nothing_else_exercised():
     server.completes = [{ ok: false, status: 503, json: async () => ({ detail: 'try later' }) }];
     await um._run('o'); out.commitFailed = snap();
     log.length = 0; um.resume('o'); await um.lastRun; out.thenResumed = snap();
-    // ONE RUN PER ROW: two entries at once send one commit.
+    // ONE RUN PER ROW: a second entry returns at once, while the first is still out, and only one
+    // commit is ever sent. (Without the mark the second entry is a full run of its own: it finds
+    // the earlier upload mid-cancel and WAITS for it -- so it is given every chance to finish here,
+    // rather than being left parked, which would end the harness with nothing written.)
+    fresh(victim(), ours({ lastPut: null })); server.park.add('old-sess');
+    const firstRun = um._run('o'); await settle();
+    let secondReturned = false; const secondRun = um._run('o').then(() => { secondReturned = true; });
+    await settle(); out.secondReturnedAtOnce = secondReturned; out.whileFirstIsOut = log.slice();
+    server.parked.get('old-sess')({ ok: true, status: 204 });
+    for (let k = 0; k < 6; k++) { await settle(); flush(); }
+    await firstRun; await secondRun; out.twice = snap();
+    // (f) The commit is REFUSED after the earlier upload was really cancelled: an error row with the
+    // server's reason, no crash, and Resume goes through the step again.
     fresh(victim(), ours({ lastPut: null }));
-    await Promise.all([um._run('o'), um._run('o')]); out.twice = snap();
+    server.completes = [{ ok: false, status: 409, json: async () => ({ detail: 'name rule' }) },
+                        { ok: false, status: 410, json: async () => ({ detail: { message: 'session expired' } }) }];
+    await um._run('o'); out.refused409 = snap();
+    log.length = 0; um.resume('o'); await um.lastRun; out.refused410 = snap();
+    log.length = 0; um.resume('o'); await um.lastRun; out.thenAccepted = snap();
+    // (c) An upload with NOTHING to fire, cancelled while its last chunk's answer is being read.
+    fresh(sent('o', 'new-sess', { received: new Set(), lastPut: null, chunkSize: 10,
+        file: { size: 10, slice: () => ({ arrayBuffer: async () => new ArrayBuffer(10) }) } }));
+    server.puts = [{ ok: true, status: 200, json: async () => { await um.cancel('o'); return { complete: true, bytes_received: 10 }; } }];
+    await um._run('o'); out.cancelledInLastPut = snap();
     """)
     # (mutation: the restart drops what the upload replaces -> the file delete is missing -> red.)
     assert out["expiredOnce"]["log"] == [
@@ -647,8 +670,21 @@ def test_the_fire_point_under_the_conditions_nothing_else_exercised():
     # delete -> red.) The file is already gone by then; "gone" is an answer, not a failure.
     assert out["thenResumed"]["log"] == ["GET /vaults/V/uploads/new-sess", DEL_FILE, COMPLETE], out["thenResumed"]
     assert out["thenResumed"]["o"]["status"] == "done"
-    # (mutation: remove the in-flight mark -> two GETs, two DELETEs, two commits -> red.)
+    # (mutation: remove the in-flight mark -> the second entry does not return, and sends a GET of
+    # its own -> red here, and two commits below.)
+    assert out["secondReturnedAtOnce"] is True
+    assert out["whileFirstIsOut"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD], out["whileFirstIsOut"]
     assert out["twice"]["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, REPLACED, COMPLETE], out["twice"]
+    r409 = out["refused409"]
+    assert r409["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, REPLACED, COMPLETE], r409
+    assert r409["o"] == {"status": "error", "cancelled": False, "error": "name rule"} and r409["v"] is None, r409
+    assert out["refused410"]["log"] == ["GET /vaults/V/uploads/new-sess", COMPLETE], out["refused410"]
+    assert out["refused410"]["o"]["error"] == "session expired"
+    assert out["thenAccepted"]["log"] == ["GET /vaults/V/uploads/new-sess", COMPLETE] and out["thenAccepted"]["o"]["status"] == "done"
+    # (mutation: remove the send loop's own read before the commit -> the commit is sent -> red.
+    # The fire step never runs for this row, so nothing else could hold it.)
+    last = out["cancelledInLastPut"]
+    assert last["log"] == ["PUT /vaults/V/uploads/new-sess/chunks/0", DEL_NEW] and last["o"] is None, last
 
 
 def test_every_way_out_says_the_cancels_that_happened_and_counts_them():
@@ -727,6 +763,38 @@ def test_what_landed_is_forgotten_at_sign_out_but_never_while_an_answer_is_owed(
     assert out["afterReset"] == {"landed": 0, "items": 0, "seq": True}, out["afterReset"]
 
 
+def test_two_resume_clicks_behind_a_full_gate_are_one_run_and_a_landed_row_is_never_run_again():
+    # The in-flight mark guards two runs that are both STARTED. Behind a full transfer gate neither
+    # has started: two Resume clicks used to queue two runs, the first committed, and the second
+    # then started on a row that had already landed -- a GET for a finalised session, and an error
+    # row for a file that was safely there.
+    js = APP_JS.read_text(encoding="utf-8")
+    shipped_run = _method(js, "async run(id) {").replace("    async run(id) {", "    async shippedRun(id) {", 1)
+    out = _node(SERVER % ("".join(_method(js, h) for h in LIFTED) + shipped_run, """
+    globalThis.transferGate = { q: [], run(fn) { return new Promise(res => this.q.push(() => fn().then(res))); } };
+    um.run = um.shippedRun;
+    fresh(ours({ status: 'paused', paused: true, lastPut: null }));
+    um.resume('o'); um.resume('o');                              // two clicks while the gate is full
+    out.queued = transferGate.q.length;
+    for (const start of transferGate.q.splice(0)) await start();
+    out.twoClicks = snap();
+    log.length = 0; await um._run('o'); out.runOnALandedRow = { log: log.slice(), row: row('o') };
+    // ... and the mark is given back, so a row that fails can be resumed again.
+    fresh(ours({ status: 'paused', paused: true }));
+    server.completes = [{ ok: false, status: 503, json: async () => ({ detail: 'later' }) }];
+    um.resume('o'); for (const start of transferGate.q.splice(0)) await start();
+    um.resume('o'); out.requeued = transferGate.q.length;
+    for (const start of transferGate.q.splice(0)) await start(); out.secondAttempt = row('o');
+    """))
+    # (mutation: no mark on a QUEUED run -> two are queued -> red.)
+    assert out["queued"] == 1, out["queued"]
+    assert out["twoClicks"]["log"] == ["GET /vaults/V/uploads/new-sess", COMPLETE], out["twoClicks"]
+    assert out["twoClicks"]["o"]["status"] == "done"
+    # (mutation: let a run start on a landed row -> a second GET and a second commit -> red.)
+    assert out["runOnALandedRow"] == {"log": [], "row": {"status": "done", "cancelled": False, "error": None}}, out["runOnALandedRow"]
+    assert out["requeued"] == 1 and out["secondAttempt"]["status"] == "done", out
+
+
 def test_a_refused_cancel_leaves_a_row_that_is_waiting_for_its_file_as_it_was():
     # An 'error' row swaps the re-pick control for a plain Resume, which cannot work without the
     # file. The row is left alone and the refusal is said beside it, by name.
@@ -736,7 +804,13 @@ def test_a_refused_cancel_leaves_a_row_that_is_waiting_for_its_file_as_it_was():
         server.refuse.add('wait-sess');
         out[key] = { answer: await um.cancel('w'), row: row('w'), log: log.slice(), records: records.slice() };
     }
+    fresh(sent('w', 'wait-sess', { status: 'needs-file', file: null })); server.refuse.add('wait-sess');
+    out.askedByANewerUpload = { answer: await um.cancel('w', true), row: row('w'), log: log.slice() };
     """)
+    by = out["askedByANewerUpload"]
+    # (mutation: report it as the user's own cancel on this branch too -> red.)
+    assert by["answer"] is False and by["row"] == {"status": "needs-file", "cancelled": False, "error": None}, by
+    assert by["log"][1] == 'toast error A newer upload of "X" could not cancel this one — the server did not confirm it.', by
     for key in ("standard", "sealedAsItUploads"):
         r = out[key]
         assert r["answer"] is False
@@ -753,6 +827,10 @@ def _code(js: str, head: str) -> str:
 
 def test_the_source_half_on_code_only():
     js = APP_JS.read_text(encoding="utf-8")
+    # What landed is a LIST of records (name, place, when) -- a set of row ids cannot answer "did
+    # this NAME land after I was dropped", and `.some` on a Set is a crash at the fire point.
+    manager = js[js.index("const uploadManager = {"):js.index("    reset() {")]
+    assert manager.count("    _landed: [],\n") == 1 and "new Set()" not in manager
     cancel = _code(js, "async cancel(id, forReplacement) {")
     assert cancel.count("gone = r.ok || r.status === 404;") == 1
     assert "if (!gone) {" in cancel and cancel.index("if (!gone) {") < cancel.index("this.items.delete(id);")
@@ -800,8 +878,14 @@ def test_the_source_half_on_code_only():
     assert run.index("if (!(await this._fireReplacement(it))) return;") \
         < run.index("if (it.cancelled || it.status === 'error') return;") \
         < run.index("if (it.paused) { it.status = 'paused'; this.render(); return; }") < run.index("/complete`")
-    assert run.count("if (it.cancelled || it._running) return;") == 1
-    assert run.index("if (it.cancelled || it._running) return;") < run.index("it.status = 'uploading';")
+    # resume() stands down for a row that is running, QUEUED to run, or being cancelled. The queued
+    # half is source-only by construction: run() refuses a second queued run on its own, so nothing
+    # observable changes when resume() stops looking -- it is there so that a Resume does not even
+    # adopt rivals for a run that is not going to happen. Likewise the send loop's read of
+    # `cancelled` before the commit: every cancel also sets `paused`, which the next line reads.
+    assert _code(js, "resume(id) {").count("if (it._running || it._pending || it.cancelled) return;") == 1
+    ENTRY = "if (it.cancelled || it._running || it.status === 'done') return;"
+    assert run.count(ENTRY) == 1 and run.index("it._pending = false;") < run.index(ENTRY) < run.index("it.status = 'uploading';")
     assert run.count("if (it.cancelled) { await this._abandonSession(it); return; }") == 2
     # The run re-enters ITSELF when the commit reports missing chunks; the mark is given up first,
     # or that retry would be turned away by the guard meant for a second, foreign entry.

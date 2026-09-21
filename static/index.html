@@ -3944,14 +3944,14 @@
             <div id="upload-conflict-modal" class="modal">
                 <div class="modal-content" style="max-width: 480px;">
                     <div class="modal-header">
-                        <h3><svg class="icon"><use href="#i-alert-triangle"/></svg> File already exists</h3>
+                        <h3><svg class="icon"><use href="#i-alert-triangle"/></svg> <span id="uc-title">File already exists</span></h3>
                         <button class="close-modal-btn modal-close" id="uc-close" aria-label="Close">×</button>
                     </div>
                     <div class="modal-body">
-                        <p class="mb-md">A file named <strong id="uc-name" class="mono"></strong> already exists in this folder.</p>
+                        <p class="mb-md">A file named <strong id="uc-name" class="mono"></strong> <span id="uc-what">already exists in this folder.</span></p>
                         <div class="form-group">
                             <label class="radio-row"><input type="radio" name="uc-action" value="autorename" checked><span>Keep both — save as <span id="uc-auto" class="mono"></span></span></label>
-                            <label class="radio-row"><input type="radio" name="uc-action" value="overwrite"><span>Replace the existing file</span></label>
+                            <label class="radio-row"><input type="radio" name="uc-action" value="overwrite"><span id="uc-replace-label">Replace the existing file</span></label>
                             <label class="radio-row"><input type="radio" name="uc-action" value="rename"><span>Rename to:</span></label>
                             <input type="text" id="uc-rename" class="form-control mt-xs" disabled>
                         </div>
