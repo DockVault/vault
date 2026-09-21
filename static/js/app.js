@@ -16406,6 +16406,11 @@ const uploadManager = {
             }
             if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);  // committed — drop the saved record
             it.zkStream = null; it.zkPlain = null;   // the writer session ends with its transfer
+            // The account signed out while this commit was on its way. The file is committed, and
+            // that is all: the tray now belongs to whoever signs in next, so nothing is written
+            // down, nothing is drawn, and nothing is SAID -- a message here would name the last
+            // account's file on the next person's screen.
+            if (epoch !== (this._epoch || 0)) return;
             this._noteLanded(it, epoch);
             it.status = 'done';
             this.render();
@@ -16421,7 +16426,7 @@ const uploadManager = {
             if (it.cancelled) return;
             it.status = 'error';
             it.error = err.message || String(err);
-            this.render();
+            if (epoch === (this._epoch || 0)) this.render();   // not into a tray that is someone else's now
         } finally {
             it._running = false;
         }

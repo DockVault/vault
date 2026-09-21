@@ -1044,11 +1044,37 @@ def test_a_commit_that_outlives_a_sign_out_writes_nothing_into_the_next_tray():
     answer({ ok: true, status: 200, json: async () => ({}) }); await running;
     out.afterSignOut = { landed: um._landed.length, log: log.slice() };
     fresh(sent('o', 'new-sess')); await um._run('o'); out.ordinary = um._landed.map(l => l.fileName);
+    // A REPLACEMENT: what it replaced is said after its commit -- but not to the next person. And
+    // the tray is not drawn again for a row that is no longer anyone's.
+    let renders = 0; um.render = () => { renders++; };
+    fresh(victim(), ours());
+    let late; server.completes = [new Promise(res => { late = res; })];
+    const replacing = um._run('o'); await settle(); await settle();
+    um.reset(); renders = 0; const said = log.length;
+    late({ ok: true, status: 200, json: async () => ({}) }); await replacing;
+    out.replacement = { landed: um._landed.length, saidAfter: log.slice(said), renders, before: log.slice(0, said) };
+    // The same for a commit that FAILS after the sign-out: its error row is nobody's to draw.
+    fresh(sent('o', 'new-sess'));
+    let failing; server.completes = [new Promise(res => { failing = res; })];
+    const doomed = um._run('o'); await settle();
+    um.reset(); renders = 0;
+    failing({ ok: false, status: 503, json: async () => ({ detail: 'later' }) }); await doomed;
+    out.failedAfter = renders;
+    // The landing's OWN check, asked directly: a stale epoch records nothing, the current one does.
+    fresh(); um._noteLanded({ vaultId: 'V', fileName: 'stale' }, (um._epoch || 0) - 1); out.staleNoted = um._landed.length;
+    um._noteLanded({ vaultId: 'V', fileName: 'now' }, um._epoch || 0); out.currentNoted = um._landed.length;
     """)
     # (mutation: record the landing whatever has happened since -> the next account's tray knows a
     # file name of the last one -> red.)
     assert out["afterSignOut"] == {"landed": 0, "log": [COMPLETE]}, out["afterSignOut"]
     assert out["ordinary"] == ["X"]
+    r = out["replacement"]
+    assert r["before"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE], r
+    # (mutation: only the landing looks at the sign-out -> "...was replaced by this one", naming the
+    # last account's file, on the next person's screen, and a render -> red.)
+    assert r["saidAfter"] == [] and r["renders"] == 0 and r["landed"] == 0, r
+    assert out["failedAfter"] == 0
+    assert out["staleNoted"] == 0 and out["currentNoted"] == 1
 
 
 def test_an_older_upload_continued_after_a_newer_one_of_the_name_landed_stands_aside():
