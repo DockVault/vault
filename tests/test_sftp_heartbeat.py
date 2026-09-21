@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import gc
+import json
 import os
 import socket
 import subprocess
@@ -81,6 +82,24 @@ def test_a_beat_does_not_write_through_a_link_left_at_its_name(tmp_path):
     with pytest.raises(OSError):
         heartbeat.beat(str(link))
     assert victim.read_bytes() == b"precious"
+
+
+def test_a_beat_asks_the_kernel_not_to_follow_a_link_on_every_platform_that_can(tmp_path, monkeypatch):
+    # The test above is the behaviour, and it can only run where symlinks and O_NOFOLLOW exist --
+    # which is not this development host. An untested flag is one that gets tidied away by
+    # someone who cannot see why it is there, so the request itself is pinned everywhere: the
+    # flag bit, when the platform defines it, is in the flags beat() opens the file with.
+    opened = []
+    real_open = os.open
+    nofollow = 0x20000                                   # any bit will do; the real one where it exists
+    monkeypatch.setattr(os, "O_NOFOLLOW", nofollow, raising=False)
+
+    def spy(path, flags, *rest):
+        opened.append(flags)
+        return real_open(path, flags & ~nofollow, *rest)  # the host's open() need not know the bit
+    monkeypatch.setattr(os, "open", spy)
+    heartbeat.beat(str(tmp_path / "hb"))
+    assert len(opened) == 1 and opened[0] & nofollow, "beat() opened its file without O_NOFOLLOW"
 
 
 def test_the_check_needs_nothing_but_the_standard_library():
@@ -413,6 +432,92 @@ def test_the_wake_up_is_handled_before_the_branch_for_a_closed_socket():
     assert names.index("socket.timeout") < names.index("OSError")
     wake = next(h for h in tries[0].handlers if _handler_names(h) == ["socket.timeout"])
     assert [type(s) for s in wake.body] == [ast.Continue]
+
+
+_DISABLED_WATCHDOG_SERVER = r'''
+import json, os, socket, sys, threading, time
+from types import SimpleNamespace
+from app.sftp import heartbeat
+from app.sftp import sftp_server as mod
+
+port, hb, host_key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+os.environ[heartbeat.HEARTBEAT_FILE_ENV] = hb
+# The clock the server reads, with a hand on it. Real time carries on underneath (the file's
+# mtime, the beat interval); only what the loops stamp and what the fault is judged against move.
+offset = [0.0]
+mod.time = SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0], sleep=time.sleep, time=time.time)
+heartbeat.BEAT_SECONDS = 0.05
+handlers = {}
+mod.safe_event = lambda *a, **k: None
+mod._sweep_sftp_tmp = lambda: None
+mod.listen_for_terminations = lambda: None
+mod.signal.signal = lambda signum, handler: handlers.setdefault(signum, handler)
+mod.settings.sftp_host = "127.0.0.1"
+mod.settings.sftp_port = port
+mod.settings.sftp_host_key_path = host_key
+mod.settings.sftp_write_progress_timeout_seconds = 0          # the watchdog is OFF
+
+def mtime():
+    try:
+        return os.stat(hb).st_mtime_ns
+    except OSError:
+        return None
+
+def until(pred, seconds=15):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return False
+
+server = threading.Thread(target=mod.start_sftp_server, daemon=True)
+server.start()
+out = {}
+try:
+    out["started"] = until(lambda: mtime() is not None and handlers)
+    first = mtime()
+    out["beating"] = until(lambda: mtime() != first)
+    # Now well past the point at which any loop that was enrolled and never turned is silent.
+    offset[0] = mod._Liveness.SILENT_AFTER_SECONDS + 1
+    time.sleep(0.3)                                    # several beat intervals at the new time
+    before = mtime()
+    out["still_beating"] = until(lambda: mtime() != before)
+    out["fault"] = mod._liveness.fault()
+    out["fresh"] = heartbeat.is_fresh()
+    out["threads"] = sorted(t.name for t in threading.enumerate() if t.name.startswith("sftp-"))
+finally:
+    for h in handlers.values():
+        h(15, None)
+    server.join(15)
+print(json.dumps(out))
+'''
+
+
+def test_a_server_with_the_watchdog_switched_off_stays_healthy(tmp_path):
+    # SFTP_WRITE_PROGRESS_TIMEOUT_SECONDS=0 is documented: it disables the watchdog. Then no
+    # watchdog thread exists, so it can never turn -- and if it were enrolled anyway (at startup,
+    # at import, in the liveness object's own constructor, "so silence is caught from t=0") its
+    # permanent silence would be a fault, the beats would stop half a minute after every start,
+    # and Docker would restart the container for ever on a supported configuration. The loop is
+    # enrolled ONLY when it is started, and this holds that.
+    #
+    # In a fresh interpreter, so an enrolment at import time cannot hide behind the test
+    # instance; judged by what the container sees -- the file keeps being beaten and the check
+    # passes -- not by the liveness object's tables.
+    port = _free_port()
+    hb = tmp_path / "hb"
+    r = subprocess.run([sys.executable, "-c", _DISABLED_WATCHDOG_SERVER, str(port), str(hb),
+                        str(tmp_path / "host_key")],
+                       cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["started"] and out["beating"], out
+    assert out["threads"] == ["sftp-heartbeat"], out             # no watchdog thread at all
+    assert out["fault"] is None, "a server with the watchdog off was called dead: %r" % out
+    assert out["still_beating"] and out["fresh"], out
+    # ...and the container's own check, on the file that server left behind, agrees.
+    assert _run_the_check("deploy/docker-compose.yml", hb) == 0
 
 
 def test_the_watchdog_loop_says_it_is_turning(monkeypatch, live):
