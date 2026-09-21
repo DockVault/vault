@@ -15847,7 +15847,8 @@ const uploadManager = {
 
         // Drop stale needs-file rows for this vault, then re-add from the server.
         for (const [id, it] of this.items) {
-            if (it.vaultId === vaultId && it.status === 'needs-file') this.items.delete(id);
+            // (Not one the user is in the middle of continuing: see _reselect.)
+            if (it.vaultId === vaultId && it.status === 'needs-file' && !it.picking) this.items.delete(id);
         }
         const activeSessionIds = new Set(
             [...this.items.values()].filter(it => it.sessionId).map(it => it.sessionId)
@@ -15973,7 +15974,10 @@ const uploadManager = {
         }
 
         this.render();
-        for (const id of toResume) this.run(id);  // fire-and-forget; each drives itself
+        for (const id of toResume) {               // fire-and-forget; each drives itself
+            const row = this.items.get(id);
+            if (row) this._start(row);
+        }
     },
 
     async _init(it) {
@@ -16022,7 +16026,9 @@ const uploadManager = {
         it.sessionId = data.session_id;
         // When the SERVER says this session was opened: the one clock a row rebuilt from the
         // server's list shares with a row dropped here (see _earlier). 0 means unknown.
-        it.startedAt = Date.parse(data.created_at) || 0;
+        // Kept from the FIRST session this row opened: re-opening one the server expired does not
+        // change when the upload began, and must not turn an earlier upload into a later one.
+        it.startedAt = it.startedAt || Date.parse(data.created_at) || 0;
         it.received = new Set(data.received_chunks || []);
         if (data.chunk_size) it.chunkSize = data.chunk_size;
 
@@ -16142,6 +16148,14 @@ const uploadManager = {
     },
 
     // Drive an item from wherever it is to completion (honouring pause/cancel).
+    // A start somebody ASKED for -- Resume, a re-picked file, the automatic resume of a restored
+    // row -- as opposed to a queued run whose slot has come. It is what un-pauses a row.
+    _start(it) {
+        it.paused = false;
+        it.refills = 0;
+        return this.run(it.id);
+    },
+
     async run(id) {
         const it = this.items.get(id);
         if (!it || !(it.file || it.zkPlain)) return;
@@ -16183,9 +16197,12 @@ const uploadManager = {
         // file that is safely there.
         it._pending = false;
         if (it.cancelled || it._running || it.status === 'done') return;
+        // Paused while it was still waiting for a slot: the slot has come, and the row stays
+        // paused. (`paused` is cleared by whoever ASKS for a start -- see _start -- never here, or a
+        // Pause on a queued row would be a button that does nothing.)
+        if (it.paused) { it.status = 'paused'; this.render(); return; }
         it._running = true;
         it.status = 'uploading';
-        it.paused = false;
         it.error = null;
         this.render();
         try {
@@ -16317,7 +16334,11 @@ const uploadManager = {
                     throw new Error('Could not confirm that the whole upload arrived, so nothing '
                                   + 'was replaced. Resume to try again.');
                 }
-                if (!(await this._fireReplacement(it))) return;   // dropped, withdrawn or paused
+                const fired = await this._fireReplacement(it);
+                if (!fired) return;   // dropped, withdrawn or paused
+                // Remembered on the row, not said yet: nothing has been replaced until the commit
+                // below succeeds, and that may be a later pass than this one.
+                it.replacedCount = (it.replacedCount || 0) + fired.cancelled;
             }
             // Cancelled while the last request of that step was still out: its row may already
             // be gone, and an upload the user withdrew is not committed behind their back. Paused:
@@ -16350,8 +16371,18 @@ const uploadManager = {
                 // 409 incomplete: re-sync received list from the detail and retry.
                 if (c.status === 409 && e.detail && e.detail.missing_chunks) {
                     for (const m of e.detail.missing_chunks) it.received.delete(m);
+                    // Retried IN THE SLOT THIS RUN ALREADY HOLDS. Asking the gate for another one
+                    // from inside it nests them -- the outer slot is not given back until the inner
+                    // run settles -- and a handful of uploads doing that at once leave the whole
+                    // tab, downloads included, with no slot to give. And not for ever: a server that
+                    // keeps reporting parts missing gets a row the user can act on.
+                    it.refills = (it.refills || 0) + 1;
+                    if (it.refills > 3) {
+                        throw new Error('The server kept reporting parts of this upload as missing. '
+                                      + 'Resume to try again.');
+                    }
                     it._running = false;   // this run is over; the retry is a run of its own
-                    return this.run(id);
+                    return await this._run(id);
                 }
                 // 409 stale ZK epoch: the vault was re-keyed mid-upload. The buffered
                 // ciphertext was encrypted under the old DEK and can't be salvaged (we
@@ -16380,6 +16411,11 @@ const uploadManager = {
             this._noteLanded(it);
             it.status = 'done';
             this.render();
+            if (it.replacedCount) {
+                const n = it.replacedCount; it.replacedCount = 0;
+                try { showInfo(n === 1 ? `The earlier upload of "${it.fileName}" was replaced by this one.`
+                                       : `${n} earlier uploads of "${it.fileName}" were replaced by this one.`); } catch (_) {}
+            }
             // Refresh the file list so the new file appears; drop the row shortly after.
             if (state.currentVault && state.currentVault.id === it.vaultId) await loadVaultFiles();
             setTimeout(() => { this.items.delete(id); this.render(); }, 4000);
@@ -16396,12 +16432,26 @@ const uploadManager = {
     // A row cancelled while its session was being OPENED had no session to delete at that moment;
     // the one that then arrives is deleted here, or it would come back on the next refresh as a
     // resumable upload nobody started. Best effort: the same idempotent DELETE as any cancel.
+    //
+    // The answer is READ. If the server does not confirm it, the session is alive and the row --
+    // already taken out of the tray as cancelled -- is put back, the way cancel() leaves a row whose
+    // cancel was refused: an upload that cannot be cancelled must not also become invisible.
     async _abandonSession(it) {
         if (!it.sessionId) return;
+        let gone = false;
         try {
-            await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+            const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
                 { method: 'DELETE', headers: this._vaultHeaders() });
-        } catch (_) { /* best effort */ }
+            gone = r.ok || r.status === 404;
+        } catch (_) { gone = false; }
+        if (!gone) {
+            it.cancelled = false;
+            it.status = 'error';
+            it.error = 'Could not cancel this upload — the server did not confirm it. Try again.';
+            this.items.set(it.id, it);
+            this.render();
+            return;
+        }
         if (it.isZk) { try { await zkUploadStore.delete(it.sessionId); } catch (_) {} }
     },
 
@@ -16537,9 +16587,13 @@ const uploadManager = {
     // that turns up later (a refresh restoring a session opened elsewhere) was never part of that
     // decision: it is left alone, not cancelled, not waited for. By session where the row had
     // one, by row id where it had not yet (a row that gains its session later still matches).
+    //
+    // BOTH handles are kept for every row. A session the server expired is re-opened under a new
+    // id by the row that owns it, and a row known only by its session would stop being known at
+    // that moment -- and the replacement would commit straight past it.
     _knownFrom(rows) {
         return { sessions: rows.filter(o => o.sessionId).map(o => o.sessionId),
-                 items: rows.filter(o => !o.sessionId).map(o => o.id) };
+                 items: rows.map(o => o.id) };
     },
     _isKnown(it, o) {
         const k = it.replaces && it.replaces.known;
@@ -16606,11 +16660,13 @@ const uploadManager = {
         // How many earlier uploads THIS pass cancelled. Every way out says so when it is not
         // zero: a cancel that happened is never left for the user to discover.
         let cancelled = 0;
-        const sayCancelled = (andReplaced) => {
+        // Only THAT they were cancelled. Whether this upload replaced them is not known here: the
+        // commit comes after this step and can still fail, and "replaced by this one" beside a red
+        // row is a claim about something that did not happen.
+        const sayCancelled = () => {
             if (!cancelled) return;
-            const what = cancelled === 1 ? `The earlier upload of "${name}" was`
-                                         : `${cancelled} earlier uploads of "${name}" were`;
-            try { showInfo(andReplaced ? `${what} cancelled and replaced by this one.` : `${what} cancelled.`); } catch (_) {}
+            try { showInfo(cancelled === 1 ? `The earlier upload of "${name}" was cancelled.`
+                                           : `${cancelled} earlier uploads of "${name}" were cancelled.`); } catch (_) {}
         };
         // THE EARLIER UPLOADS FIRST, the committed original after them. A cancel that is refused
         // then costs nothing -- the original is still there -- where the other order would have
@@ -16621,10 +16677,10 @@ const uploadManager = {
         // a wait would look "gone" after it while its server session was as alive as ever.
         let waited = 0;
         for (let turn = 0; ; turn++) {
-            if (withdrawn()) { sayCancelled(false); return false; }
-            if (held()) { sayCancelled(false); return false; }
+            if (withdrawn()) { sayCancelled(); return false; }
+            if (held()) { sayCancelled(); return false; }
             if (this._landedSince(it)) {
-                sayCancelled(false);
+                sayCancelled();
                 await this._dropReplacement(it, `"${name}" was already uploaded by the earlier transfer, `
                     + `which finished first; the new copy was not uploaded.`);
                 return false;
@@ -16649,11 +16705,22 @@ const uploadManager = {
             // Resume. A cancel the server did not confirm leaves it able to finish later and
             // overwrite this one, so OUR replacement is dropped, by name. (Never our own session:
             // the resolver leaves it out, and this is the last line of that defence.)
-            if (turn >= 1000 || (rival.sessionId && rival.sessionId === it.sessionId)
+            //
+            // And one whose session is STILL being opened after the wait is not cancelled by taking
+            // its row away: there is nothing on the server to delete yet, the session will exist a
+            // moment later, and "cancelled" would be a claim with no request behind it. It counts
+            // as one that could not be cancelled.
+            const opening = !rival.sessionId && rival.status === 'uploading';
+            if (turn >= 1000 || opening || (rival.sessionId && rival.sessionId === it.sessionId)
                     || !(await this.cancel(rival.id, true))) {
-                sayCancelled(false);
-                await this._dropReplacement(it, `Could not cancel the earlier upload of "${name}"; `
-                    + `the new copy was not uploaded.`);
+                sayCancelled();
+                // After a cancel that DID happen, "the earlier upload" twice over would be two
+                // definite sentences about one thing that contradict each other.
+                const refused = cancelled
+                    ? `Another earlier upload of "${name}" could not be cancelled and is still in progress, `
+                        + `so the new copy was not uploaded.`
+                    : `Could not cancel the earlier upload of "${name}"; the new copy was not uploaded.`;
+                await this._dropReplacement(it, refused);
                 return false;
             }
             cancelled++;
@@ -16666,7 +16733,7 @@ const uploadManager = {
                 gone = d.ok || d.status === 404;   // already gone is gone
             } catch (_) { gone = false; }
             if (!gone) {
-                sayCancelled(false);
+                sayCancelled();
                 await this._dropReplacement(it, `Could not replace "${name}": the existing file could `
                     + `not be removed, so it is unchanged and the new copy was not uploaded.`);
                 return false;
@@ -16674,10 +16741,17 @@ const uploadManager = {
         }
         // ... and once more AFTER the last destructive request: a Cancel clicked while that
         // request was out must not be answered with a commit, nor a Pause.
-        if (withdrawn()) { sayCancelled(false); return false; }
-        if (held()) { sayCancelled(false); return false; }
-        sayCancelled(true);
-        return true;
+        if (withdrawn()) { sayCancelled(); return false; }
+        if (held()) { sayCancelled(); return false; }
+        sayCancelled();
+        // An earlier upload of the name that was NOT ours to cancel -- the user was never shown it
+        // -- is still there. Leaving it alone is right; leaving it unmentioned is not: it can finish
+        // later and replace the copy that is about to be committed.
+        if (this._liveRivals(it).length) {
+            try { showWarning(`Another upload of "${name}" is still in progress and may replace this copy `
+                            + `when it finishes.`); } catch (_) {}
+        }
+        return { cancelled };
     },
 
     // Said FIRST, and the row says it too BEFORE our own session is removed: that is a round trip
@@ -16737,7 +16811,7 @@ const uploadManager = {
             it.blobId = session.blobId;
             it.received = new Set(held);
             it.needsServerSync = false;
-            this.run(it.id);
+            this._start(it);
         } catch (e) {
             if (isCodedCryptoError(e) && (e.code === 'INVALID_INPUT' || e.code === 'CONTENT_INVALID')) {
                 return this._restartAsNewAttempt(it, file);
@@ -16761,7 +16835,7 @@ const uploadManager = {
         it.zkPlain = { file };
         try { showInfo(`"${file.name}" is not the same as the interrupted upload, so it is being `
                      + `uploaded again from the start.`); } catch (_) {}
-        this.run(it.id);
+        this._start(it);
     },
 
     pause(id) {
@@ -16788,13 +16862,13 @@ const uploadManager = {
             this._reselect(id);  // standard vault: re-pick the source file
             return;
         }
-        this.run(id);
+        this._start(it);
     },
 
     // Ask the user to re-pick the source file for a server-side resumable session.
     _reselect(id) {
-        const it = this.items.get(id);
-        if (!it) return;
+        const was = this.items.get(id);
+        if (!was) return;
         let input = document.getElementById('upload-reselect-input');
         if (!input) {
             input = document.createElement('input');
@@ -16807,34 +16881,54 @@ const uploadManager = {
         input.onchange = async (e) => {
             const file = e.target.files && e.target.files[0];
             if (!file) return;
-            // Defense-in-depth: zero-knowledge resume runs from the IndexedDB ciphertext
-            // (see resume()), never by re-picking the plaintext — re-feeding plaintext here
-            // would bypass the encrypt-before-upload hook and produce a fresh-IV mismatch.
-            if (it.zkPipelined) { await this._reopenPipelined(it, file); return; }
-            const v = (state.currentVault && state.currentVault.id === it.vaultId) ? state.currentVault : null;
-            if ((v && isZkVault(v)) || it.isZk) {
-                showError("This zero-knowledge upload can't be resumed here — the encrypted data isn't available on this device or browser. Cancel it and upload the file again.");
+            // The chooser can stay open for as long as the user likes, and the tray is rebuilt
+            // from the server meanwhile: every row waiting for its file is taken out and put back
+            // under a NEW id. The row this was opened for may be gone, so the pick goes to the row
+            // that holds its session NOW -- and if none does, that is said, not swallowed.
+            const it = this._rowForPick(was);
+            if (!it) {
+                showError(`"${was.fileName}" is no longer in the upload list, so nothing was uploaded. `
+                        + `Open the vault again to see what can still be continued.`);
                 return;
             }
-            if (file.size !== it.totalSize) {
-                showError(`That file doesn't match "${it.fileName}" (different size). Pick the original file to resume.`);
-                return;
-            }
-            if (file.name !== it.fileName) {
-                showWarning(`Resuming with a differently-named file ("${file.name}"). Make sure it's the same content.`);
-            }
-            it.file = file;
-            it.received = new Set();  // re-sync from server below
-            try {
-                const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, { headers: this._vaultHeaders() });
-                if (s.ok) {
-                    const sd = await s.json();
-                    it.received = new Set(sd.received_chunks || []);
-                }
-            } catch (_) {}
-            this.run(it.id);
+            this._adoptRivals(it);   // the user is continuing THIS row, beside whatever the tray shows now
+            it.picking = true;       // ... and the tray must not rebuild it under them while it is checked
+            try { await this._continueWith(it, file); } finally { it.picking = false; }
         };
         input.click();
+    },
+    _rowForPick(was) {
+        if (this.items.get(was.id) === was) return was;
+        return [...this.items.values()].find(o => was.sessionId && o.sessionId === was.sessionId)
+            || this.items.get(was.id) || null;
+    },
+    async _continueWith(it, file) {
+        // Defense-in-depth: zero-knowledge resume runs from the IndexedDB ciphertext
+        // (see resume()), never by re-picking the plaintext — re-feeding plaintext here
+        // would bypass the encrypt-before-upload hook and produce a fresh-IV mismatch.
+        if (it.zkPipelined) { await this._reopenPipelined(it, file); return; }
+        const v = (state.currentVault && state.currentVault.id === it.vaultId) ? state.currentVault : null;
+        if ((v && isZkVault(v)) || it.isZk) {
+            showError("This zero-knowledge upload can't be resumed here — the encrypted data isn't available on this device or browser. Cancel it and upload the file again.");
+            return;
+        }
+        if (file.size !== it.totalSize) {
+            showError(`That file doesn't match "${it.fileName}" (different size). Pick the original file to resume.`);
+            return;
+        }
+        if (file.name !== it.fileName) {
+            showWarning(`Resuming with a differently-named file ("${file.name}"). Make sure it's the same content.`);
+        }
+        it.file = file;
+        it.received = new Set();  // re-sync from server below
+        try {
+            const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, { headers: this._vaultHeaders() });
+            if (s.ok) {
+                const sd = await s.json();
+                it.received = new Set(sd.received_chunks || []);
+            }
+        } catch (_) {}
+        this._start(it);
     },
 
     // Cancel an upload. Resolves TRUE only when it is really gone: there was no server session,

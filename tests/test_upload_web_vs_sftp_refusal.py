@@ -378,7 +378,10 @@ process.stdout.write(JSON.stringify(out));
     # (mutation: let the clocks decide between two rows dropped here -> red.)
     assert out["inTab"] == {"first": [], "second": ["first"]}, out["inTab"]
     # (mutation: drop the shown-to-the-user filter -> 'neverShown' is cancelled -> red.)
-    assert out["known"]["recorded"] == {"sessions": ["s-shownBySession"], "items": ["shownByRow"]}
+    # BOTH handles for every row: a session the server expired is re-opened under a new id by the
+    # row that owns it, and a row known by its session alone would stop being known just then.
+    # (mutation: file a row that has a session under `sessions` only -> red here and in the run.)
+    assert out["known"]["recorded"] == {"sessions": ["s-shownBySession"], "items": ["shownBySession", "shownByRow"]}
     assert out["known"]["live"] == ["neverShown", "shownByRow", "shownBySession"]
     assert out["known"]["toCancel"] == ["shownByRow", "shownBySession"], out["known"]
     assert out["known"]["withoutAChoice"] == []
@@ -474,7 +477,7 @@ const pick = async (rowExtra, zk, fileNames) => {
     assert done.returncode == 0, done.stdout + done.stderr
     out = json.loads(done.stdout)
     assert out["errors"] == []
-    held = {"asked": ["X"], "replaces": [{"deleteId": None, "known": {"sessions": ["s"], "items": []}}], "names": ["X"]}
+    held = {"asked": ["X"], "replaces": [{"deleteId": None, "known": {"sessions": ["s"], "items": ["r"]}}], "names": ["X"]}
     free = {"asked": [], "replaces": [None], "names": ["X"]}
     assert out["free"] == free
     # (mutation: leave 'error' out of the held names again -> no question, nothing replaced -> red.)
@@ -484,7 +487,7 @@ const pick = async (rowExtra, zk, fileNames) => {
     assert out["zkRestored"] == held and out["zkOldEpoch"] == held, out
     assert out["zkOtherName"] == free
     assert out["place"] == {"vaultId": "V", "folderId": None}
-    shown = {"sessions": ["s"], "items": []}
+    shown = {"sessions": ["s"], "items": ["r"]}
     # The SECOND of two picked files is the one held, by index: only it is asked about.
     assert out["secondHeldByIndex"] == {"asked": ["b"], "replaces": [None, {"deleteId": None, "known": shown}],
                                         "names": ["a", "b"]}, out["secondHeldByIndex"]
@@ -519,7 +522,8 @@ def test_the_destructive_step_fires_per_entry_only_when_the_server_holds_everyth
     run = _uploader_method(js, "async _run")
     send_at = run.index("/chunks/${i}`")
     holds_at = run.index("if (!(await this._serverHoldsAll(it))) {")
-    fire_at = run.index("if (!(await this._fireReplacement(it))) return;")
+    fire_at = run.index("const fired = await this._fireReplacement(it);")
+    assert run.index("if (!fired) return;") > fire_at
     complete_at = run.index("/complete`")
     assert send_at < holds_at < fire_at < complete_at, "the destructive step is not at the fire point"
     assert run.count("this._fireReplacement(it)") == 1 and js.count("this._fireReplacement(it)") == 1
@@ -535,10 +539,14 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     # Never a bare count, never silence: each message names the file, says which copy is on the
     # server now, and what did not happen. (mutation: a count-only toast -> red.)
     fire = _uploader_method(APPJS.read_text(encoding="utf-8"), "async _fireReplacement")
-    messages = re.findall(r"_dropReplacement\(it, `(.*?)`\);", fire, re.S)
-    # Three ways: the old file could not be removed, the earlier upload finished first, and the
-    # earlier upload could not be cancelled (the server did not confirm it).
-    assert len(messages) == 3, "expected one drop message per way a replacement can fail"
+    # Every sentence that ends in "not uploaded", pieced together from its template parts.
+    runs = re.findall(r"(?:`[^`]*`\s*\+\s*)*`[^`]*`", fire)
+    messages = ["".join(re.findall(r"`([^`]*)`", r)) for r in runs]
+    messages = [m for m in messages if "not uploaded" in m]
+    # Four ways: the old file could not be removed; an earlier upload finished first; the earlier
+    # upload could not be cancelled; and -- after one that WAS cancelled -- ANOTHER could not be.
+    assert len(messages) == 4, messages
+    assert sum(m.startswith("Another earlier upload of") for m in messages) == 1
     for msg in messages:
         assert '"${name}"' in msg, f"a dropped replacement does not name the file: {msg}"
         assert "not uploaded" in msg, f"the message does not say what did not happen: {msg}"
@@ -549,9 +557,10 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     assert fire.count("if (this._landedSince(it)) {") == 1
     assert fire.index("if (this._landedSince(it)) {") < fire.index("await this.cancel(rival.id, true)")
     # The cancels that happened are said on every way out, counted, and by name.
-    assert 'cancelled === 1 ? `The earlier upload of "${name}" was`' in fire
-    assert '`${cancelled} earlier uploads of "${name}" were`' in fire
-    assert fire.count("sayCancelled(false);") == 7 and fire.count("sayCancelled(true);") == 1
+    assert 'cancelled === 1 ? `The earlier upload of "${name}" was cancelled.`' in fire
+    assert '`${cancelled} earlier uploads of "${name}" were cancelled.`' in fire
+    # ... and ONLY the cancels: what was replaced is said after the commit, by the run, never here.
+    assert fire.count("sayCancelled();") == 8 and "replaced by this one" not in fire
 
 
 def test_a_file_sealed_as_it_uploads_has_no_raw_file_to_send_and_one_session_per_transfer():
@@ -776,7 +785,11 @@ const open = async (created_at) => { reply = { session_id: 'S', received_chunks:
     await um._init(it); return it.startedAt; };
 (async () => process.stdout.write(JSON.stringify({
     stamped: await open('2026-01-02T03:04:05'), same: Date.parse('2026-01-02T03:04:05'),
-    missing: await open(undefined), nonsense: await open('not a time') })))();
+    missing: await open(undefined), nonsense: await open('not a time'),
+    reopened: await (async () => { reply = { session_id: 'S', received_chunks: [], created_at: '2026-01-02T03:04:05' };
+        const it = { vaultId: 'V', isZk: false, fileName: 'X', file: { type: '' }, totalSize: 1, totalChunks: 1, chunkSize: 1, folderId: null };
+        await um._init(it); reply = { ...reply, session_id: 'reopened-sess', created_at: '2026-03-04T05:06:07' };
+        it.sessionId = null; await um._init(it); return [it.sessionId, it.startedAt]; })() })))();
 """
     done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert done.returncode == 0, done.stdout + done.stderr
@@ -784,6 +797,10 @@ const open = async (created_at) => { reply = { session_id: 'S', received_chunks:
     # (mutation: drop the stamp from _init -> undefined -> red.) 0 means "not known", never a time.
     assert out["stamped"] == out["same"] and out["stamped"] > 0
     assert out["missing"] == 0 and out["nonsense"] == 0
+    # A session the server expired is re-opened under a new id -- but WHEN THE UPLOAD BEGAN does not
+    # change, or an earlier upload would turn into a later one and stop being cancelled.
+    # (mutation: stamp again on every open -> the later time -> red.)
+    assert out["reopened"] == ["reopened-sess", out["same"]], out["reopened"]
 
 
 def test_the_server_says_when_a_session_was_opened_in_the_answer_that_opens_it():
@@ -840,13 +857,15 @@ def test_the_tray_as_the_shipped_producers_build_it():
     harness = """
 const API_BASE = '', CHUNK_SIZE = 10;
 const state = { currentVault: { id: 'V' }, currentFolderId: null };
-const isZkVault = () => false;
-const zkUploadStore = { get: async () => null, allForVault: async () => [] };
+let zkVault = false, saved = null;
+const isZkVault = () => zkVault;
+const zkUploadStore = { get: async () => saved, allForVault: async () => [] };
 let listed = [];
 const fetch = async () => ({ ok: true, json: async () => listed });
-const um = { items: new Map(), seq: 0, run() {}, render() {}, _vaultHeaders() { return {}; },
+const um = { items: new Map(), seq: 0, started: [], render() {}, _vaultHeaders() { return {}; },
+    run(id) { const r = this.items.get(id); this.started.push([r.sessionId, r.paused]); },
     _newId() { return 'up_' + (++this.seq); },
-""" + "".join(_uploader_method(js, n) for n in ("enqueueFiles", "enqueueNamed", "async _refreshResumableInner")) + """
+""" + "".join(_uploader_method(js, n) for n in ("enqueueFiles", "enqueueNamed", "_start", "async _refreshResumableInner")) + """
 };
 const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 5, total_chunks: 1, folder_id: null, created_at });
 (async () => {
@@ -855,23 +874,41 @@ const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 
     const old = (id, extra) => um.items.set(id, Object.assign({ id, vaultId: 'V', fileName: 'Z', sessionId: 'gone-' + id, status: 'error' }, extra));
     old('deadRestored', { restored: true }); old('runningRestored', { restored: true, status: 'uploading' });
     old('droppedHere', {}); old('listedRestored', { restored: true, sessionId: 'kept' });
-    listed = [sess('newer', '2026-01-02T00:00:00'), sess('older', '2026-01-01T00:00:00'), sess('kept', '2026-01-01T00:00:00')];
+    old('otherVault', { restored: true, vaultId: 'W' }); old('finalising', { restored: true, status: 'completing' });
+    old('beingPicked', { restored: true, status: 'needs-file', sessionId: 'kept2', picking: true });
+    listed = [sess('newer', '2026-01-02T00:00:00'), sess('older', '2026-01-01T00:00:00'), sess('kept', '2026-01-01T00:00:00'),
+              sess('kept2', '2026-01-01T00:00:00')];
     await um._refreshResumableInner();
     const rows = [...um.items.values()].map(r => ({ id: r.id, sessionId: r.sessionId || null, order: r.order, restored: !!r.restored,
         startedAt: r.startedAt || 0, status: r.status }));
-    process.stdout.write(JSON.stringify({ rows, newer: Date.parse('2026-01-02T00:00:00'), older: Date.parse('2026-01-01T00:00:00') }));
+    // A zero-knowledge session whose ciphertext IS saved here is resumed automatically. Its row is
+    // built paused, and a run no longer un-pauses a row by itself -- so the automatic resume has to.
+    um.started.length = 0; zkVault = true; saved = { blob: { size: 5 }, chunkSize: 5 };
+    listed = [sess('saved-here', '2026-01-03T00:00:00')];
+    await um._refreshResumableInner();
+    process.stdout.write(JSON.stringify({ rows, autoStarted: um.started,
+        newer: Date.parse('2026-01-02T00:00:00'), older: Date.parse('2026-01-01T00:00:00') }));
 })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
     done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert done.returncode == 0, done.stdout + done.stderr
     out = json.loads(done.stdout)
     rows = {r["id"]: r for r in out["rows"]}
+    # (mutation: start the automatic resume through run() alone -> the row is still paused when its
+    # slot comes, and it sits there for ever -> red.)
+    assert out["autoStarted"] == [["saved-here", False]], out["autoStarted"]
     # Both enqueues stamp `order` from the one counter, and neither row claims to be rebuilt.
     assert [rows["up_1"]["order"], rows["up_2"]["order"]] == [1, 2]
     assert not rows["up_1"]["restored"] and not rows["up_2"]["restored"]
     # (mutation: remove the purge -> 'deadRestored' stays, holding its name -> red.)
     assert "deadRestored" not in rows
     assert {"runningRestored", "droppedHere", "listedRestored"} <= set(rows)
+    # Another vault's rows are not this refresh's business, and one that is FINALISING is left to
+    # finish. (mutations: drop the vault clause / the 'completing' clause -> red.)
+    assert {"otherVault", "finalising"} <= set(rows)
+    # A row the user is in the middle of continuing is not rebuilt under them.
+    # (mutation: rebuild it anyway -> its id is gone -> red.)
+    assert "beingPicked" in rows and sum(1 for r in out["rows"] if r["sessionId"] == "kept2") == 1
     # The rebuild: restored, stamped with the server's word, and `order` following the list --
     # newest first, which is why `order` alone must never decide between two of them.
     by_session = {r["sessionId"]: r for r in out["rows"] if r["sessionId"] in ("newer", "older")}

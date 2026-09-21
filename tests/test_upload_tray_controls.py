@@ -156,6 +156,7 @@ const zkUploadStore = { delete: async (id) => { records.push(id); } };
 const document = { getElementById: () => null };
 const showError = (m) => log.push('toast error ' + m);
 const showInfo = (m) => log.push('toast info ' + m);
+const showWarning = (m) => log.push('toast warning ' + m);
 const loadVaultFiles = async () => {};
 const um = {
     items: new Map(), _landed: [], seq: 100, _vaultHeaders() { return {}; }, render() {},
@@ -196,19 +197,25 @@ LIFTED = ("async _run(id) {", "async _serverHoldsAll(it) {", "async _fireReplace
           "_sameNameRows(probe) {", "_earlier(o, it) {", "_liveRivals(it) {",
           "_noteLanded(it) {", "_landedSince(it) {",
           "_knownFrom(rows) {", "_isKnown(it, o) {", "_adoptRivals(it) {", "_rivalsToCancel(it) {",
-          "async _abandonSession(it) {", "resume(id) {", "reset() {", "_canRepick(it) {", "_controlSig(it) {")
+          "async _abandonSession(it) {", "resume(id) {", "reset() {", "_canRepick(it) {", "_controlSig(it) {",
+          "_start(it) {", "_rowForPick(was) {")
 
 DEL_OLD, DEL_NEW = "DELETE /vaults/V/uploads/old-sess", "DELETE /vaults/V/uploads/new-sess"
 COMPLETE = "POST /vaults/V/uploads/new-sess/complete"
 DROPPED = 'toast error Could not cancel the earlier upload of "X"; the new copy was not uploaded.'
-REPLACED = 'toast info The earlier upload of "X" was cancelled and replaced by this one.'
-REPLACED_2 = 'toast info 2 earlier uploads of "X" were cancelled and replaced by this one.'
+# Said only AFTER a commit that succeeded -- never at the step that cancels, which comes before it.
+REPLACED = 'toast info The earlier upload of "X" was replaced by this one.'
+REPLACED_2 = 'toast info 2 earlier uploads of "X" were replaced by this one.'
+CANCELLED_2 = 'toast info 2 earlier uploads of "X" were cancelled.'
+WARN_OTHER = 'toast warning Another upload of "X" is still in progress and may replace this copy when it finishes.'
 REFUSED_ROW = "Could not cancel this upload — the server did not confirm it. Try again."
 # ... and when it was a newer upload asking, not the user, the row does not report a cancel they never made.
 REPLACER_REFUSED_ROW = ("A newer upload of this name tried to replace this one, but the server did not "
                         "confirm the cancel.")
 STRANDED_ROW = ("Not uploaded, but its data could not be removed from the server — "
                 "Cancel to remove it, or Resume to try replacing again.")
+DROPPED_ANOTHER = ('toast error Another earlier upload of "X" could not be cancelled and is still in progress, '
+                   'so the new copy was not uploaded.')
 REMOVING_ROW = "Not uploaded — removing its data from the server…"
 DEL_FILE = "POST /vaults/V/files/F/delete"
 CANCELLED_ONLY = 'toast info The earlier upload of "X" was cancelled.'
@@ -247,7 +254,7 @@ def test_a_cancel_the_server_refused_drops_the_replacement_by_name_and_never_com
         # OUR upload is what is dropped.
         assert r["o"] is None
     ok = out["confirmed"]
-    assert ok["log"] == [DEL_OLD, REPLACED, COMPLETE] and ok["v"] is None and ok["o"]["status"] == "done", ok
+    assert ok["log"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED] and ok["v"] is None and ok["o"]["status"] == "done", ok
     # Nothing to cancel on the server is a cancel that worked.
     assert out["noSession"] is True and out["noSuchItem"] is True
 
@@ -260,7 +267,7 @@ def test_already_gone_is_gone():
                   "sess === 'old-sess' ? { ok: false, status: 404 }")
     gone = _node(harness)["gone"]
     # (mutation: 404 no longer counts -> the replacement is dropped -> red.)
-    assert gone["log"] == [DEL_OLD, REPLACED, COMPLETE] and gone["v"] is None, gone
+    assert gone["log"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED] and gone["v"] is None, gone
 
 
 def test_a_retry_after_BOTH_cancels_were_refused_never_commits_past_a_live_victim():
@@ -271,9 +278,9 @@ def test_a_retry_after_BOTH_cancels_were_refused_never_commits_past_a_live_victi
     out = _serve("""
     fresh(victim(), ours()); server.refuse.add('old-sess'); server.refuse.add('new-sess');
     await um._run('o'); out.first = snap();
-    log.length = 0; await um._run('o'); out.retryStillDown = snap();          // the user clicks Resume
+    log.length = 0; um.resume('o'); await um.lastRun; out.retryStillDown = snap();   // the user clicks Resume
     log.length = 0; server.refuse.clear();
-    await um._run('o'); out.retryRecovered = snap();                          // ... and again, later
+    um.resume('o'); await um.lastRun; out.retryRecovered = snap();            // ... and again, later
     """)
     first = out["first"]
     assert first["log"] == [DEL_OLD, DROPPED, DEL_NEW] and COMPLETE not in first["log"], first
@@ -289,7 +296,7 @@ def test_a_retry_after_BOTH_cancels_were_refused_never_commits_past_a_live_victi
     assert again["v"]["status"] == "error" and again["o"]["error"] == STRANDED_ROW
     # The server recovers: now the victim really is cancelled FIRST, and only then the commit.
     healed = out["retryRecovered"]
-    assert healed["log"] == [DEL_OLD, REPLACED, COMPLETE], healed
+    assert healed["log"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED], healed
     assert healed["v"] is None and healed["o"]["status"] == "done"
 
 
@@ -337,7 +344,7 @@ def test_which_victims_are_cancelled_and_which_are_passed_over():
     """)
     # An errored upload that never opened a session can still be resumed into one: its row goes.
     e = out["erroredNoSession"]
-    assert e["log"] == [REPLACED, COMPLETE] and e["v"] is None, e
+    assert e["log"] == [CANCELLED_ONLY, COMPLETE, REPLACED] and e["v"] is None, e
     # Already cancelled (its session is gone and it can never run again), or no longer in the tray.
     for key in ("alreadyCancelled", "goneFromTray"):
         assert out[key]["log"] == [COMPLETE], out[key]
@@ -357,7 +364,7 @@ def test_which_victims_are_cancelled_and_which_are_passed_over():
     assert out["landedBeforeOurDrop"]["log"] == [DEL_FILE, COMPLETE], out["landedBeforeOurDrop"]
     # Paused, or waiting for its file (rebuilt from the server, so its `order` says nothing): live.
     for key in ("paused", "waiting"):
-        assert out[key]["log"] == [DEL_OLD, REPLACED, COMPLETE] and out[key]["v"] is None, out[key]
+        assert out[key]["log"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED] and out[key]["v"] is None, out[key]
 
 
 def test_a_replacement_the_user_cancelled_fires_nothing_on_its_way_out():
@@ -418,11 +425,11 @@ def test_a_row_rebuilt_under_a_new_id_is_still_cancelled():
     # (mutation: resolve the rivals once, before the loop, and look them up by id -> the re-keyed
     # row is never cancelled and the log is the commit alone -> red.)
     b = out["beforeFire"]
-    assert b["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, REPLACED, COMPLETE], b
+    assert b["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED], b
     assert out["beforeFireRows"] == ["o"]
     assert out["parked"] == 1, "the run never reached the wait, so this proved nothing"
     d = out["duringWait"]
-    assert d["log"] == ["DELETE /vaults/V/uploads/a-sess", DEL_OLD, REPLACED_2, COMPLETE], d
+    assert d["log"] == ["DELETE /vaults/V/uploads/a-sess", DEL_OLD, CANCELLED_2, COMPLETE, REPLACED_2], d
     assert out["duringWaitRows"] == ["o"]
 
 
@@ -436,7 +443,7 @@ def test_a_committed_file_and_an_upload_in_flight_are_both_dealt_with_uploads_fi
     both(); server.refuse.add('old-sess'); await um._run('o'); out.cancelRefused = snap();
     both(); server.refuse.add('file'); await um._run('o'); out.deleteRefused = snap();
     """)
-    assert out["ok"]["log"] == [DEL_OLD, DEL_FILE, REPLACED, COMPLETE], out["ok"]
+    assert out["ok"]["log"] == [DEL_OLD, DEL_FILE, CANCELLED_ONLY, COMPLETE, REPLACED], out["ok"]
     # A refused cancel costs NOTHING: no delete request was ever made, so the original stands.
     # (mutation: delete the file first again -> the delete is in this log -> red.)
     assert out["cancelRefused"]["log"] == [DEL_OLD, DROPPED, DEL_NEW], out["cancelRefused"]
@@ -473,7 +480,7 @@ def test_an_earlier_upload_whose_own_cancel_is_in_flight_is_not_taken_for_gone()
     # alone -> red on the parked count and on every log below.)
     assert out["refused"]["log"] == [DEL_OLD, DROPPED, DEL_NEW], out["refused"]
     assert out["confirmed"]["log"] == [COMPLETE], out["confirmed"]
-    assert out["neverSettles"]["log"] == [DEL_OLD, REPLACED, COMPLETE], out["neverSettles"]
+    assert out["neverSettles"]["log"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED], out["neverSettles"]
 
 
 def test_after_a_reload_the_newer_of_two_rows_of_one_name_still_cancels_the_older():
@@ -495,8 +502,8 @@ def test_after_a_reload_the_newer_of_two_rows_of_one_name_still_cancels_the_olde
     fresh(sent('o', 'new-sess', { lastPut: null })); await um._run('o'); out.alone = snap();
     """)
     # (mutation: do not adopt at the user's Resume -> the older row survives the pair -> red.)
-    assert out["adopted"] == {"deleteId": None, "known": {"sessions": ["old-sess"], "items": []}}, out["adopted"]
-    assert out["newerContinued"]["log"] == ["reselect o", DEL_OLD, REPLACED, COMPLETE], out["newerContinued"]
+    assert out["adopted"] == {"deleteId": None, "known": {"sessions": ["old-sess"], "items": ["v"]}}, out["adopted"]
+    assert out["newerContinued"]["log"] == ["reselect o", DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED], out["newerContinued"]
     assert out["newerContinued"]["v"] is None
     # The older one is nobody's replacement: it commits, the newer row stays, and continuing THAT
     # later replaces it by name -- the newer pick still wins.
@@ -526,11 +533,13 @@ def test_only_a_row_the_tray_showed_the_user_is_ever_cancelled():
     await um._run('o'); out.ownTwin = snap();
     """)
     # (mutation: drop the shown-to-the-user filter -> the session opened elsewhere is DELETEd -> red.)
-    assert out["olderElsewhere"]["log"] == [DEL_OLD, REPLACED, COMPLETE], out["olderElsewhere"]
+    # ... but not left unmentioned: it can finish later and replace the copy being committed.
+    # (mutation: say nothing about an earlier upload that was not ours to cancel -> red.)
+    assert out["olderElsewhere"]["log"] == [DEL_OLD, CANCELLED_ONLY, WARN_OTHER, COMPLETE, REPLACED], out["olderElsewhere"]
     assert out["laterElsewhere"]["log"] == [COMPLETE], out["laterElsewhere"]
     for key in ("xOlder", "xLater"):
         assert out[key] == {"status": "needs-file", "cancelled": False, "error": None}, out[key]
-    assert out["knownByRow"]["log"] == ["DELETE /vaults/V/uploads/q-sess", REPLACED, COMPLETE], out["knownByRow"]
+    assert out["knownByRow"]["log"] == ["DELETE /vaults/V/uploads/q-sess", CANCELLED_ONLY, COMPLETE, REPLACED], out["knownByRow"]
     # (mutation: remove the same-session test from the resolver -> our own session is DELETEd, or
     # ours is dropped -> red.) One commit, and no DELETE of the session it commits.
     assert out["ownTwin"]["log"] == [COMPLETE], out["ownTwin"]
@@ -553,7 +562,7 @@ def test_a_row_whose_cancel_is_out_offers_no_resume_and_gets_it_back_when_the_ca
     server.parked.get('wait-sess')({ ok: false, status: 500 });
     out.answer = await cancelling; out.after = um._controlSig(um.items.get('w')); out.rowAfter = row('w');
     server.park.clear(); log.length = 0;
-    um.resume('w'); um.items.get('w').file = {}; await um._run('w'); out.resumed = snap();
+    um.resume('w'); um.items.get('w').file = {}; um._start(um.items.get('w')); await um.lastRun; out.resumed = snap();
     """)
     assert out["before"] == "resume-text,cancel"
     # (mutations: offer the re-pick while the cancel is out -> red; let a run touch a cancelled
@@ -612,8 +621,8 @@ def test_the_fire_point_under_the_conditions_nothing_else_exercised():
     um.items.get('v').status = 'uploading'; flush(); await running; out.pausedMeanwhile = snap();
     log.length = 0; um.resume('o'); await um.lastRun; out.pausedThenResumed = snap();
     // Paused while the LAST destructive request is out: that request is not undone, but no commit.
-    fresh(ours({ replaces: chose('F') })); server.park.add('file');
-    const last = um._run('o'); await settle();
+    fresh(victim(), ours({ replaces: chose('F') })); server.park.add('file');
+    const last = um._run('o'); await settle(); await settle();
     Object.assign(um.items.get('o'), { paused: true, status: 'pausing' });
     server.parked.get('file')({ ok: true, status: 200 }); await last; out.pausedDuringDelete = snap();
     // NO LATCH ACROSS RUNS: the commit fails; Resume resolves everything again and commits.
@@ -649,7 +658,7 @@ def test_the_fire_point_under_the_conditions_nothing_else_exercised():
     # (mutation: the restart drops what the upload replaces -> the file delete is missing -> red.)
     assert out["expiredOnce"]["log"] == [
         "PUT /vaults/V/uploads/new-sess/chunks/0", "init", "PUT /vaults/V/uploads/renewed-sess/chunks/0",
-        DEL_OLD, DEL_FILE, REPLACED, "POST /vaults/V/uploads/renewed-sess/complete"], out["expiredOnce"]
+        DEL_OLD, DEL_FILE, CANCELLED_ONLY, "POST /vaults/V/uploads/renewed-sess/complete", REPLACED], out["expiredOnce"]
     # (mutation: go on when the server does not hold everything -> the DELETE is in this log -> red.)
     held = out["notAllHeld"]
     assert held["log"] == ["GET /vaults/V/uploads/new-sess"], held
@@ -661,8 +670,11 @@ def test_the_fire_point_under_the_conditions_nothing_else_exercised():
     # first log -> red.)
     paused = out["pausedMeanwhile"]
     assert paused["log"] == [] and paused["o"]["status"] == "paused" and paused["v"]["status"] == "uploading", paused
-    assert out["pausedThenResumed"]["log"] == [DEL_OLD, REPLACED, COMPLETE], out["pausedThenResumed"]
-    assert out["pausedDuringDelete"]["log"] == [DEL_FILE] and out["pausedDuringDelete"]["o"]["status"] == "paused"
+    assert out["pausedThenResumed"]["log"] == [DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED], out["pausedThenResumed"]
+    # The cancel that happened is said; nothing is committed and nothing is claimed as replaced.
+    # (mutation: stop reading the pause after the last destructive request -> the commit -> red.)
+    assert out["pausedDuringDelete"]["log"] == [DEL_OLD, DEL_FILE, CANCELLED_ONLY], out["pausedDuringDelete"]
+    assert out["pausedDuringDelete"]["o"]["status"] == "paused"
     failed = out["commitFailed"]
     assert failed["log"] == ["GET /vaults/V/uploads/new-sess", DEL_FILE, COMPLETE], failed
     assert failed["o"] == {"status": "error", "cancelled": False, "error": "try later"}, failed
@@ -674,13 +686,16 @@ def test_the_fire_point_under_the_conditions_nothing_else_exercised():
     # its own -> red here, and two commits below.)
     assert out["secondReturnedAtOnce"] is True
     assert out["whileFirstIsOut"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD], out["whileFirstIsOut"]
-    assert out["twice"]["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, REPLACED, COMPLETE], out["twice"]
+    assert out["twice"]["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, CANCELLED_ONLY, COMPLETE, REPLACED], out["twice"]
     r409 = out["refused409"]
-    assert r409["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, REPLACED, COMPLETE], r409
+    # (mutation: claim the replacement at the step, before the commit -> "replaced by this one"
+    # beside an error row -> red.)
+    assert r409["log"] == ["GET /vaults/V/uploads/new-sess", DEL_OLD, CANCELLED_ONLY, COMPLETE], r409
     assert r409["o"] == {"status": "error", "cancelled": False, "error": "name rule"} and r409["v"] is None, r409
     assert out["refused410"]["log"] == ["GET /vaults/V/uploads/new-sess", COMPLETE], out["refused410"]
     assert out["refused410"]["o"]["error"] == "session expired"
-    assert out["thenAccepted"]["log"] == ["GET /vaults/V/uploads/new-sess", COMPLETE] and out["thenAccepted"]["o"]["status"] == "done"
+    # ... said exactly once, by the pass whose commit succeeded -- two passes after the cancel.
+    assert out["thenAccepted"]["log"] == ["GET /vaults/V/uploads/new-sess", COMPLETE, REPLACED] and out["thenAccepted"]["o"]["status"] == "done"
     # (mutation: remove the send loop's own read before the commit -> the commit is sent -> red.
     # The fire step never runs for this row, so nothing else could hold it.)
     last = out["cancelledInLastPut"]
@@ -703,9 +718,12 @@ def test_every_way_out_says_the_cancels_that_happened_and_counts_them():
     out.resumeWhileRemoving = { log: log.slice(), row: row('o'), sig: um._controlSig(um.items.get('o')) };
     """)
     S = lambda n: f"DELETE /vaults/V/uploads/s{n}"
-    assert out["three"]["log"] == [S(1), S(2), S(3), 'toast info 3 earlier uploads of "X" were cancelled and replaced by this one.', COMPLETE], out["three"]
+    assert out["three"]["log"] == [S(1), S(2), S(3), 'toast info 3 earlier uploads of "X" were cancelled.', COMPLETE,
+                                   'toast info 3 earlier uploads of "X" were replaced by this one.'], out["three"]
     # (mutation: say nothing about a cancel that happened on the way out -> red.)
-    assert out["secondRefused"]["log"] == [S(1), S(2), CANCELLED_ONLY, DROPPED, DEL_NEW], out["secondRefused"]
+    # ... and the two sentences are not both about "the earlier upload": one WAS cancelled, ANOTHER
+    # could not be. (mutation: the single-refusal wording here too -> red.)
+    assert out["secondRefused"]["log"] == [S(1), S(2), CANCELLED_ONLY, DROPPED_ANOTHER, DEL_NEW], out["secondRefused"]
     assert out["withdrawnAfterOne"]["log"] == [S(1), DEL_NEW, CANCELLED_ONLY], out["withdrawnAfterOne"]
     # (mutation: let a run start on a cancelled row -> its text is wiped -> red.)
     r = out["resumeWhileRemoving"]
@@ -730,13 +748,41 @@ def test_a_rival_cancelled_while_its_session_is_being_opened_leaves_no_orphan_se
     holdInit();
     const again = um._run('q'); await settle();
     out.cancelAnswer = await um.cancel('q'); opened(); await again; out.cancelledDuringInit = snap();
+    // The same for a ZERO-KNOWLEDGE row: the record `_init` saved for that session goes with it.
+    fresh(sent('q', null, { order: 1, status: 'queued', received: new Set(), lastPut: null, isZk: true }));
+    holdInit(); const zkRun = um._run('q'); await settle();
+    await um.cancel('q'); opened(); await zkRun; out.zkCancelledDuringInit = snap();
+    // ... and when the server REFUSES that delete, the session is alive: the row comes BACK.
+    fresh(sent('q', null, { order: 1, status: 'queued', received: new Set(), lastPut: null }));
+    holdInit(); server.refuse.add('q-sess'); const refusedRun = um._run('q'); await settle();
+    await um.cancel('q'); out.goneMeanwhile = row('q'); opened(); await refusedRun;
+    out.abandonRefused = { log: log.slice(), row: row('q') };
+    // A rival whose session NEVER finishes opening: past the wait it is not "cancelled" by taking
+    // its row away -- nothing was deleted, and the session will exist a moment later.
+    fresh(sent('q', null, { order: 1, status: 'queued', received: new Set(), lastPut: null }),
+          ours({ replaces: { deleteId: null, known: { sessions: [], items: ['q'] } } }));
+    holdInit(); um._run('q'); await settle();
+    const stuck = um._run('o');
+    for (let k = 0; k < 220; k++) { await settle(); flush(); }
+    await stuck; out.stuckInit = snap(); out.stuckRival = row('q');
     """)
+    assert out["zkCancelledDuringInit"]["log"] == ["init", "DELETE /vaults/V/uploads/q-sess"]
+    assert out["zkCancelledDuringInit"]["records"] == ["q-sess"], out["zkCancelledDuringInit"]
+    # (mutation: do not read the abandon's answer -> the row stays gone while its session lives -> red.)
+    assert out["goneMeanwhile"] is None
+    assert out["abandonRefused"] == {"log": ["init", "DELETE /vaults/V/uploads/q-sess"],
+                                     "row": {"status": "error", "cancelled": False, "error": REFUSED_ROW}}, out["abandonRefused"]
+    # (mutation: count a rival with no session as cancelled -> its row is taken away, "was cancelled"
+    # is said with no request behind it, and ours commits -> red.)
+    stuck = out["stuckInit"]
+    assert stuck["log"] == ["init", DROPPED, DEL_NEW], stuck
+    assert out["stuckRival"] == {"status": "uploading", "cancelled": False, "error": None} and stuck["o"] is None
     assert out["parked"] == 1, "ours did not wait for the rival's session to exist"
     # Our wait ends once the session exists; then it gets a REAL delete. (The rival's own run then
     # fails in this harness, which gives it no file to slice: an error row WITH a session -- which
     # is still a rival, and still gets the delete.)
     assert "DELETE /vaults/V/uploads/q-sess" in out["openedInTime"]["log"], out["openedInTime"]
-    assert out["openedInTime"]["log"][-2:] == [REPLACED, COMPLETE]
+    assert out["openedInTime"]["log"][-3:] == [CANCELLED_ONLY, COMPLETE, REPLACED]
     # (mutation: do not read `cancelled` after the session is opened -> no DELETE, an orphan -> red.)
     assert out["cancelAnswer"] is True
     assert out["cancelledDuringInit"]["log"] == ["init", "DELETE /vaults/V/uploads/q-sess"], out["cancelledDuringInit"]
@@ -871,6 +917,110 @@ def test_a_row_whose_cancel_is_out_is_DRAWN_that_way_at_once():
     assert out["dropped"] == {"buttons": ["cancel"], "sub": REMOVING_ROW}, out["dropped"]
 
 
+def test_an_earlier_upload_stays_known_when_its_session_is_re_opened():
+    # The server expires a session; the row that owns it opens another under a new id. A row known
+    # to a replacement only by its SESSION stopped being known at that moment, and the replacement
+    # committed straight past a live earlier upload of the name -- the one thing this step is for.
+    out = _serve("""
+    const pairKnownAsTheProductRecordsIt = () => { fresh(victim(), ours());
+        um.items.get('o').replaces = { deleteId: null, known: um._knownFrom([um.items.get('v')]) }; };
+    pairKnownAsTheProductRecordsIt(); out.recorded = um.items.get('o').replaces.known;
+    const a = um.items.get('v'); a.sessionId = null; await um._init(a);        // as the 410 restart does
+    out.stillToCancel = um._rivalsToCancel(um.items.get('o')).map(r => r.id);
+    log.length = 0; await um._run('o'); out.afterRestart = snap();
+    """)
+    assert out["recorded"] == {"sessions": ["old-sess"], "items": ["v"]}, out["recorded"]
+    # (mutation: keep only the session for a row that has one -> [] here, and the commit alone below -> red.)
+    assert out["stillToCancel"] == ["v"]
+    assert out["afterRestart"]["log"] == ["DELETE /vaults/V/uploads/renewed-sess", CANCELLED_ONLY, COMPLETE, REPLACED], out["afterRestart"]
+
+
+def _gated(js: str, scenarios: str, extra=()) -> dict:
+    # The SHIPPED run() and pause(), so the transfer gate is really in the path.
+    shipped = _method(js, "async run(id) {").replace("    async run(id) {", "    async shippedRun(id) {", 1)
+    methods = "".join(_method(js, h) for h in LIFTED + ("pause(id) {",) + tuple(extra)) + shipped
+    return _node(SERVER % (methods, "    um.run = um.shippedRun;\n" + scenarios))
+
+
+def test_a_commit_that_reports_parts_missing_is_retried_in_the_slot_it_holds_and_not_for_ever():
+    # The retry used to ask the gate for ANOTHER slot from inside the one it held. The outer slot is
+    # not given back until the inner run settles, so each round nested one deeper; a handful of
+    # uploads doing that at once left the whole tab -- downloads too -- with no slot to give.
+    js = APP_JS.read_text(encoding="utf-8")
+    out = _gated(js, """
+    globalThis.transferGate = { active: 0, deepest: 0, async run(fn) { this.active++;
+        this.deepest = Math.max(this.deepest, this.active); try { return await fn(); } finally { this.active--; } } };
+    const missing = () => ({ ok: false, status: 409, json: async () => ({ detail: { missing_chunks: [0] } }) });
+    const whole = () => sent('o', 'new-sess', { chunkSize: 10, file: { size: 10, slice: () => ({ arrayBuffer: async () => new ArrayBuffer(10) }) } });
+    fresh(whole()); server.completes = [missing()];
+    await um.run('o'); out.once = snap(); out.onceDeepest = transferGate.deepest;
+    transferGate.deepest = 0;
+    fresh(whole()); server.completes = [missing(), missing(), missing(), missing(), missing()];
+    await um.run('o'); out.always = snap(); out.alwaysDeepest = transferGate.deepest; out.activeAfter = transferGate.active;
+    out.resumable = !um.items.get('o')._pending && !um.items.get('o')._running;
+    """)
+    PUT = "PUT /vaults/V/uploads/new-sess/chunks/0"
+    assert out["once"]["log"] == [COMPLETE, PUT, COMPLETE] and out["once"]["o"]["status"] == "done", out["once"]
+    # (mutation: retry through the gate again -> two slots deep -> red. The LOG is identical either
+    # way, which is how this went unseen: it is the nesting that is asserted.)
+    assert out["onceDeepest"] == 1 and out["alwaysDeepest"] == 1, out
+    # Bounded: three refills, then a row the user can act on -- never left 'completing'.
+    always = out["always"]
+    assert always["log"] == [COMPLETE, PUT, COMPLETE, PUT, COMPLETE, PUT, COMPLETE], always
+    assert always["o"]["status"] == "error" and always["o"]["error"].startswith("The server kept reporting parts"), always
+    assert out["activeAfter"] == 0 and out["resumable"] is True
+
+
+def test_pause_on_a_row_that_is_still_queued_holds_when_its_slot_comes():
+    # Pause left a queued row's status alone, and the run cleared `paused` as it started -- so the
+    # button did nothing and the file went up anyway.
+    js = APP_JS.read_text(encoding="utf-8")
+    out = _gated(js, """
+    globalThis.transferGate = { q: [], run(fn) { return new Promise(res => this.q.push(() => fn().then(res))); } };
+    const drain = async () => { for (const start of transferGate.q.splice(0)) await start(); };
+    fresh(sent('o', 'new-sess', { status: 'queued', received: new Set(), lastPut: null, chunkSize: 10,
+        file: { size: 10, slice: () => ({ arrayBuffer: async () => new ArrayBuffer(10) }) } }));
+    um.run('o'); um.pause('o'); out.whileQueued = row('o');
+    await drain(); out.slotCame = snap();
+    um.resume('o'); await drain(); out.resumed = snap();
+    """)
+    assert out["whileQueued"]["status"] == "queued"
+    # (mutation: clear `paused` when the run starts -> the PUT and the commit are in this log -> red.)
+    assert out["slotCame"]["log"] == [] and out["slotCame"]["o"]["status"] == "paused", out["slotCame"]
+    assert out["resumed"]["log"] == ["PUT /vaults/V/uploads/new-sess/chunks/0", COMPLETE] and out["resumed"]["o"]["status"] == "done"
+
+
+def test_a_picked_file_goes_to_the_row_that_holds_the_session_now():
+    # The chooser stays open as long as the user likes, and the tray is rebuilt from the server
+    # meanwhile: every row waiting for its file comes back under a NEW id. The pick used to be
+    # handed to the row the chooser was opened for -- by then an object in no list -- and nothing
+    # happened, silently.
+    js = APP_JS.read_text(encoding="utf-8")
+    out = _node(SERVER % ("".join(_method(js, h) for h in LIFTED + ("_reselect(id) {", "async _continueWith(it, file) {")), """
+    const input = { style: {}, value: '', click() {} };
+    Object.assign(document, { getElementById: (id) => (id === 'upload-reselect-input' ? input : null) });
+    globalThis.isZkVault = () => false;
+    const waiting = (id) => sent(id, 'old-sess', { status: 'needs-file', file: null, restored: true, paused: true });
+    const pick = () => input.onchange({ target: { files: [{ name: 'X', size: 10 }] } });
+    // Rebuilt under a new id between the click and the pick.
+    fresh(waiting('k1')); um._reselect('k1');
+    const old = um.items.get('k1'); um.items.delete('k1'); um.items.set('k2', { ...old, id: 'k2' });
+    await pick(); await um.lastRun; out.rebuilt = { log: log.slice(), rows: [...um.items.keys()], status: um.items.get('k2').status };
+    // Gone altogether (its session finished or was cancelled elsewhere): said, not swallowed.
+    fresh(waiting('k1')); um._reselect('k1'); um.items.delete('k1');
+    await pick(); out.gone = { log: log.slice(), rows: [...um.items.keys()] };
+    // Untouched meanwhile: the row the chooser was opened for.
+    fresh(waiting('k1')); um._reselect('k1'); await pick(); await um.lastRun; out.same = log.slice();
+    out.pickingCleared = !um.items.get('k1').picking;
+    """))
+    ran = ["GET /vaults/V/uploads/old-sess", "POST /vaults/V/uploads/old-sess/complete"]
+    # (mutation: hand the pick to the row the chooser was opened for -> nothing happens -> red.)
+    assert out["rebuilt"] == {"log": ran, "rows": ["k2"], "status": "done"}, out["rebuilt"]
+    assert out["gone"]["rows"] == [] and len(out["gone"]["log"]) == 1, out["gone"]
+    assert out["gone"]["log"][0].startswith('toast error "X" is no longer in the upload list, so nothing was uploaded.')
+    assert out["same"] == ran and out["pickingCleared"] is True
+
+
 def test_a_refused_cancel_leaves_a_row_that_is_waiting_for_its_file_as_it_was():
     # An 'error' row swaps the re-pick control for a plain Resume, which cannot work without the
     # file. The row is left alone and the refusal is said beside it, by name.
@@ -915,7 +1065,11 @@ def test_the_source_half_on_code_only():
     # No row is passed over for what its status says: the resolver decides who is a rival, and the
     # only thing the fire step asks of one is whether it is still settling.
     assert "victim" not in fire and "cancelItemIds" not in fire and "this.items.get(" not in fire
-    assert fire.count("const rival = this._rivalsToCancel(it)[0];") == 1 and "_liveRivals" not in fire
+    assert fire.count("const rival = this._rivalsToCancel(it)[0];") == 1
+    # The WIDER list is read once, at the very end, and only to SAY that an earlier upload which was
+    # not ours to cancel is still there -- never to decide what is cancelled.
+    assert fire.count("this._liveRivals(it)") == 1
+    assert fire.index("this._liveRivals(it)") > fire.index("/delete`") and "showWarning(" in fire
     assert fire.count("|| !(await this.cancel(rival.id, true))) {") == 1
     assert fire.count("(rival.sessionId && rival.sessionId === it.sessionId)") == 1
     assert "replacesFired" not in js
@@ -923,10 +1077,12 @@ def test_the_source_half_on_code_only():
     # on the turn that finds no rival left, before the file delete, with no await in between.
     assert fire.count("const withdrawn = () => it.cancelled || it.status === 'error';") == 1
     # ... once per turn, and once more after the last destructive request.
-    W, H = "if (withdrawn()) { sayCancelled(false); return false; }", "if (held()) { sayCancelled(false); return false; }"
+    W, H = "if (withdrawn()) { sayCancelled(); return false; }", "if (held()) { sayCancelled(); return false; }"
+    # Nothing in this step claims a REPLACEMENT: the commit comes after it and can still fail.
+    assert "replaced by this one" not in fire and fire.count("return { cancelled };") == 1
     assert fire.count(W) == 2 and fire.count(H) == 2
     assert fire.rindex(W) > fire.index("/delete`") and fire.rindex(H) > fire.rindex(W)
-    assert fire.rindex(H) < fire.rindex("return true;")     # the last one: the closure above has its own
+    assert fire.rindex(H) < fire.index("return { cancelled };")
     loop = fire.index("for (let turn = 0; ; turn++) {")
     assert loop < fire.index(W) < fire.index(H) < fire.index("if (this._landedSince(it)) {") \
         < fire.index("const rival = this._rivalsToCancel(it)[0];") < fire.index("if (!rival) break;") \
@@ -948,12 +1104,18 @@ def test_the_source_half_on_code_only():
     assert run.index("if (it.paused) { if (it.status !== 'error')") < run.index("/chunks/${i}`")
     # And a dropped or withdrawn replacement returns before the commit -- read once more by the
     # run itself, after the step and before the commit.
-    assert run.count("if (!(await this._fireReplacement(it))) return;") == 1
+    FIRED = "const fired = await this._fireReplacement(it);"
+    assert run.count(FIRED) == 1 and run.count("if (!fired) return;") == 1
+    # ... and the claim is made only after the commit: past `/complete`, past the landing.
+    assert run.index("/complete`") < run.index("this._noteLanded(it);") < run.index("replaced by this one.")
     assert run.count("if (it.cancelled || it.status === 'error') return;") == 1
-    assert run.count("if (it.paused) { it.status = 'paused'; this.render(); return; }") == 1
-    assert run.index("if (!(await this._fireReplacement(it))) return;") \
+    # Twice: at the run's entry (a row paused while it waited for a slot stays paused -- and the flag
+    # is NOT cleared there, or Pause on a queued row would do nothing), and after the fire step.
+    assert run.count("if (it.paused) { it.status = 'paused'; this.render(); return; }") == 2 and "it.paused = false" not in run
+    assert run.index("if (it.paused) { it.status = 'paused'; this.render(); return; }") < run.index("it._running = true;")
+    assert run.index(FIRED) \
         < run.index("if (it.cancelled || it.status === 'error') return;") \
-        < run.index("if (it.paused) { it.status = 'paused'; this.render(); return; }") < run.index("/complete`")
+        < run.rindex("if (it.paused) { it.status = 'paused'; this.render(); return; }") < run.index("/complete`")
     # resume() stands down for a row that is running, QUEUED to run, or being cancelled. The queued
     # half is source-only by construction: run() refuses a second queued run on its own, so nothing
     # observable changes when resume() stops looking -- it is there so that a Resume does not even
@@ -965,7 +1127,9 @@ def test_the_source_half_on_code_only():
     assert run.count("if (it.cancelled) { await this._abandonSession(it); return; }") == 2
     # The run re-enters ITSELF when the commit reports missing chunks; the mark is given up first,
     # or that retry would be turned away by the guard meant for a second, foreign entry.
-    retry = run.index("return this.run(id);")
+    # ... and it is retried IN THE SLOT THIS RUN HOLDS: never through the gate again from inside it.
+    assert "this.run(id)" not in run
+    retry = run.index("return await this._run(id);")
     assert run.rindex("it._running = false;", 0, retry) > run.index("missing_chunks")
     assert run.count("} finally {\n            it._running = false;\n        }") == 1
     # The refusal is decided on the row as it is THEN; no snapshot of it is taken at entry.
