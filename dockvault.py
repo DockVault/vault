@@ -427,6 +427,10 @@ def build_env_lines(cfg):
         ("sftp_max_connections", "SFTP_MAX_CONNECTIONS", 100),
         ("sftp_max_connections_per_ip", "SFTP_MAX_CONNECTIONS_PER_IP", 10),
         ("sftp_auth_grace_seconds", "SFTP_AUTH_GRACE_SECONDS", 30),
+        # The write-progress watchdog's window and floor (see .env.example), same rule: only a
+        # non-default value is written.
+        ("sftp_write_progress_timeout_seconds", "SFTP_WRITE_PROGRESS_TIMEOUT_SECONDS", 120),
+        ("sftp_write_progress_min_bytes", "SFTP_WRITE_PROGRESS_MIN_BYTES", 65536),
     ):
         if sftp_active and cfg.get(_cfg_key) not in (None, "") and int(cfg[_cfg_key]) != _default:
             bare(_env_name, int(cfg[_cfg_key]))
@@ -1214,6 +1218,10 @@ def new_set_config(current_env, new_prefix, new_id):
         "sftp_max_connections": (current_env.get("SFTP_MAX_CONNECTIONS") or "").strip() or None,
         "sftp_max_connections_per_ip": (current_env.get("SFTP_MAX_CONNECTIONS_PER_IP") or "").strip() or None,
         "sftp_auth_grace_seconds": (current_env.get("SFTP_AUTH_GRACE_SECONDS") or "").strip() or None,
+        "sftp_write_progress_timeout_seconds":
+            (current_env.get("SFTP_WRITE_PROGRESS_TIMEOUT_SECONDS") or "").strip() or None,
+        "sftp_write_progress_min_bytes":
+            (current_env.get("SFTP_WRITE_PROGRESS_MIN_BYTES") or "").strip() or None,
         # Keep an SFTP streaming-upload choice (raw, so an explicit "false" rollback survives; default
         # is ON), the reorder window, and the memory ceiling across a fresh volume set.
         "sftp_streaming_upload": (current_env.get("SFTP_STREAMING_UPLOAD") or "").strip() or None,

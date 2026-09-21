@@ -37,6 +37,7 @@ import os
 import signal
 import socket
 import threading
+import weakref
 import posixpath
 import tempfile
 import mimetypes
@@ -283,6 +284,9 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # sign of an incomplete upload there is -- and an interrupted one is discarded, exactly like
         # an over-limit or a failed one. See close().
         self.interrupted = False
+        # Write progress, for the watchdog: bytes accepted since the current window began.
+        self._progress_bytes = 0
+        self._progress_window_start = 0.0
         # The SFTP interface of the session this handle belongs to (set in open()); it is what
         # knows that the session has ended.
         self._interface = None
@@ -329,7 +333,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # the write result.
         self._refresh_marker()
         if self.stream is not None:
-            return self.stream.write(offset, data)
+            result = self.stream.write(offset, data)
+            if result == paramiko.SFTP_OK:
+                self._progress_bytes += len(data)      # accepted: this is what progress means
+            return result
         if self.writefile is None:
             return paramiko.SFTP_OP_UNSUPPORTED
         # In-stream size bound: reject any write that would push the buffered file past the
@@ -346,6 +353,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         try:
             self.writefile.seek(offset)
             self.writefile.write(data)
+            self._progress_bytes += len(data)          # accepted: this is what progress means
             return paramiko.SFTP_OK
         except Exception as e:  # noqa: BLE001
             # The buffer write failed (a full staging tmpfs is the expected cause). Mark the
@@ -395,6 +403,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         if self.upload_marker_ref:
             upload_marker.remove(*self.upload_marker_ref)
             self.upload_marker_ref = None
+        _write_progress.forget(self)
         # A CLOSE FROM THE CLIENT, OR THE CLEANUP OF A CONNECTION THAT HAS GONE? They arrive here
         # alike, and they must not be treated alike. A client's CLOSE takes the handle out of
         # paramiko's table, so the only handles the cleanup ever reaches are the ones the client
@@ -462,6 +471,111 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                     os.remove(self.writepath)
             except Exception:  # noqa: BLE001
                 pass
+
+
+class _WriteProgressWatchdog:
+    """Fails an upload that has stopped making progress, so it cannot hold its resources for ever.
+
+    After authentication nothing else bounds a connection: a client that opens a file for writing
+    and then sends nothing keeps its thread, its SSH transport and its connection slot until it
+    chooses to leave; one that sends a byte now and then also keeps the same-name lock alive, since
+    every write refreshes it. So each open write handle is watched, in windows of
+    ``sftp_write_progress_timeout_seconds``: a window in which FEWER than
+    ``sftp_write_progress_min_bytes`` were accepted fails the handle. One rule covers both cases --
+    nothing at all, and a trickle.
+
+    What is measured is BYTES THE SERVER ACCEPTED in ``write()``, never how long the transfer has
+    taken and never records flushed to storage (a record is 1 MiB: a genuinely slow link would go
+    minutes without completing one while making steady progress). A slow upload is never failed
+    for being slow; only one that falls below the floor for a whole window.
+
+    Failing a handle is: mark it interrupted FIRST (close() commits an upload unless it has been
+    told not to), release its same-name lock, then close the transport, which the client sees as a
+    failure. The session's own teardown then closes the handle -- discarding the upload -- and
+    releases the connection slot, as it does for any connection that ends.
+
+    THE LIMIT: a write that is blocked inside the storage layer cannot be interrupted from here.
+    The handle is marked and the connection is closed at once, but the thread stays in that write
+    until the filesystem answers; it unwinds, and the upload is discarded, only then.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._handles = weakref.WeakSet()
+
+    def watch(self, handle, now=None):
+        handle._progress_window_start = time.monotonic() if now is None else now
+        handle._progress_bytes = 0
+        with self._lock:
+            self._handles.add(handle)
+
+    def forget(self, handle):
+        with self._lock:
+            self._handles.discard(handle)
+
+    @staticmethod
+    def verdict(handle, now, window, floor):
+        """'ok' while the window is still open or was cleared; 'stalled' for a window that closed
+        below the floor. A cleared window starts the next one. floor 0 = any byte at all counts."""
+        if now - handle._progress_window_start < window:
+            return 'ok'
+        if handle._progress_bytes >= max(1, floor):
+            handle._progress_window_start = now
+            handle._progress_bytes = 0
+            return 'ok'
+        return 'stalled'
+
+    def sweep(self, now=None, window=None, floor=None):
+        window = settings.sftp_write_progress_timeout_seconds if window is None else window
+        floor = settings.sftp_write_progress_min_bytes if floor is None else floor
+        if not window or window <= 0:
+            return []
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            watched = list(self._handles)
+        failed = []
+        for handle in watched:
+            if handle.interrupted or self.verdict(handle, now, window, floor) == 'ok':
+                continue
+            self._fail(handle, window, floor)
+            failed.append(handle)
+        return failed
+
+    def _fail(self, handle, window, floor):
+        accepted = handle._progress_bytes
+        # FIRST, before anything is closed: from here on, whatever closes this handle discards it.
+        handle.mark_interrupted()
+        self.forget(handle)
+        # The same-name lock goes now rather than when close() gets round to it: if the handler
+        # thread is stuck in a storage write, that could be a long time, and the upload holding
+        # the name is already dead. (Token-guarded and idempotent; close() finding it gone is fine.)
+        ref, handle.upload_marker_ref = handle.upload_marker_ref, None
+        if ref:
+            upload_marker.remove(*ref)
+        safe_event('upload.stalled', window_seconds=window, floor_bytes=floor, accepted_bytes=accepted)
+        try:
+            transport = handle._sftp_server.sock.get_transport()
+        except Exception:  # noqa: BLE001 -- no protocol handler wired (or it has already gone)
+            transport = None
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception as e:  # noqa: BLE001
+                safe_event('upload.stalled.close-failed', e)
+
+    def run(self, stop=None):
+        """The watchdog thread. Sweeps a few times per window, so a stall is caught within about a
+        window and a quarter of when it began."""
+        while stop is None or not stop.is_set():
+            window = settings.sftp_write_progress_timeout_seconds
+            time.sleep(max(1, min(5, (window or 20) // 4)))
+            try:
+                self.sweep()
+            except Exception as e:  # noqa: BLE001 -- the watchdog must outlive any one bad handle
+                safe_event('upload.watchdog.sweep-failed', e)
+
+
+_write_progress = _WriteProgressWatchdog()
 
 
 class _StreamingUpload:
@@ -1322,6 +1436,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 if _upload_marker_ref:
                     upload_marker.remove(*_upload_marker_ref)
                 return paramiko.SFTP_FAILURE
+            _write_progress.watch(handle)
             return handle
 
         # Buffer the plaintext to a temp file; encrypt + persist at close().
@@ -1350,6 +1465,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         handle.finalizer = self._make_upload_finalizer(
             vault_id, folder_id, filename, can_overwrite
         )
+        _write_progress.watch(handle)
         return handle
 
     def _authorize_upload_persist(self, db, vault_id, folder_id, size):
@@ -2175,6 +2291,13 @@ def start_sftp_server():
     termination_thread = threading.Thread(target=listen_for_terminations, daemon=True)
     termination_thread.start()
     safe_event('termination-listener.started')
+
+    # The write-progress watchdog (0 disables it). See _WriteProgressWatchdog.
+    if settings.sftp_write_progress_timeout_seconds and settings.sftp_write_progress_timeout_seconds > 0:
+        threading.Thread(target=_write_progress.run, daemon=True, name="sftp-write-progress").start()
+        safe_event('write-progress-watchdog.started',
+                   window_seconds=settings.sftp_write_progress_timeout_seconds,
+                   floor_bytes=settings.sftp_write_progress_min_bytes)
 
     # Create server socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

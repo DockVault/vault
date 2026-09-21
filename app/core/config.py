@@ -92,6 +92,21 @@ class Settings(BaseSettings):
     sftp_max_connections: int = Field(default=100)
     sftp_max_connections_per_ip: int = Field(default=10)
     sftp_auth_grace_seconds: int = Field(default=30)
+    # Write-progress watchdog. AFTER authentication nothing else bounds a connection: a client that
+    # opens a file for writing and then sends nothing holds its thread, its SSH transport and its
+    # connection slot for as long as it likes, and one that sends a byte now and then also keeps the
+    # same-name lock alive. Each open upload is watched in windows of
+    # sftp_write_progress_timeout_seconds; a window in which fewer than
+    # sftp_write_progress_min_bytes were ACCEPTED fails that upload (it is discarded and the
+    # connection is closed). What is measured is bytes accepted, never elapsed time: the default
+    # floor, 65536 bytes per 120 s, is about 0.5 KiB/s, which a genuinely slow link clears by orders
+    # of magnitude, and a client pacing itself just above it is still bounded by the per-file size
+    # limit. timeout 0 disables the watchdog; min_bytes 0 means any byte at all counts (a pure
+    # no-progress timer, which a trickle defeats). LIMIT: a write blocked inside the storage layer
+    # cannot be interrupted -- the upload is marked and the connection closed at once, but that
+    # thread is only freed when the filesystem answers.
+    sftp_write_progress_timeout_seconds: int = Field(default=120)
+    sftp_write_progress_min_bytes: int = Field(default=65536)
     # Memory-bounded streaming upload. When on, an SFTP upload is encrypted and persisted
     # record-by-record as it arrives instead of being buffered whole to the .sftp_tmp staging tmpfs,
     # so in-process memory is bounded to one 1 MiB record plus the reorder window regardless of file
