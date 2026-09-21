@@ -795,6 +795,82 @@ def test_two_resume_clicks_behind_a_full_gate_are_one_run_and_a_landed_row_is_ne
     assert out["requeued"] == 1 and out["secondAttempt"]["status"] == "done", out
 
 
+DRAWN = ("render() {", "_patchRow(row, it) {", "_buildRow(it) {", "_renderSub(sub, it) {", "_buildControls(el, it) {",
+         "_percent(it) {", "_statusLabel(status) {")
+
+MINI_DOM = """
+    // A DOM just big enough for the shipped render(): what is asserted below is what is DRAWN.
+    const mk = (tag) => { const e = { tag, children: [], attrs: {}, className: '', textContent: '', style: {}, title: '',
+        classList: { add(c) { e.className = (e.className + ' ' + c).trim(); },
+                     remove(c) { e.className = e.className.split(' ').filter(x => x !== c).join(' '); } },
+        setAttribute(k, v) { e.attrs[k] = String(v); }, getAttribute(k) { return e.attrs[k]; },
+        appendChild(c) { e.children.push(c); c.parent = e; return c; }, append(...cs) { cs.forEach(c => e.appendChild(c)); },
+        replaceChildren(...cs) { e.children = []; cs.forEach(c => e.appendChild(c)); },
+        remove() { if (e.parent) e.parent.children = e.parent.children.filter(x => x !== e); },
+        addEventListener(ev, fn) { e.on = fn; },
+        querySelector(sel) { const wanted = sel.split('data-up-row="')[1].split('"')[0];
+            return e.children.find(c => c.attrs && c.attrs['data-up-row'] === wanted) || null; },
+        querySelectorAll() { return e.children.filter(c => (c.className || '').split(' ').includes('up-row')); } };
+        return e; };
+    let tray = null;
+    Object.assign(document, { createElement: mk, createTextNode: (text) => ({ text }),
+        body: { appendChild(t) { tray = t; } }, getElementById: (id) => (id === 'upload-tray' ? tray : null) });
+    globalThis.window = {}; globalThis.formatBytes = undefined;
+    um._iconEl = (name) => ({ icon: name });
+    const drawn = (id) => { const r = tray && tray._body && tray._body.children.find(c => c.attrs['data-up-row'] === id);
+        return r ? { buttons: r._controls.children.map(b => b.attrs['data-up-action'] + (b.textContent ? ':' + b.textContent : '')),
+                     sub: r._sub.children.map(c => c.text).join(''),
+                     click: (action) => { const b = r._controls.children.find(x => x.attrs['data-up-action'] === action); if (b) b.on(); return !!b; } } : null; };
+    const seen = (id) => { const d = drawn(id); return d ? { buttons: d.buttons, sub: d.sub } : null; };
+"""
+
+
+def test_a_row_whose_cancel_is_out_is_DRAWN_that_way_at_once():
+    # Found by clicking: the state of a row whose cancel was out was right, and what was on the
+    # screen was not. cancel() marked the row and then waited for the server without drawing it, and
+    # a row waiting for its file gets no other render -- so it kept the Resume it had before, a
+    # button that did nothing, for as long as the request hung. The model was already pinned; this
+    # reads the tray as the shipped render() draws it.
+    js = APP_JS.read_text(encoding="utf-8")
+    out = _node(SERVER % ("".join(_method(js, h) for h in LIFTED + DRAWN), MINI_DOM + """
+    fresh(sent('w', 'wait-sess', { status: 'needs-file', file: null, paused: true }));
+    um.render(); out.before = seen('w');
+    server.park.add('wait-sess');
+    const cancelling = um.cancel('w'); await settle();
+    out.during = seen('w'); out.resumeWasThere = drawn('w').click('resume'); out.logDuring = log.slice();
+    server.parked.get('wait-sess')({ ok: false, status: 500 }); await cancelling;
+    out.refused = seen('w'); out.toasts = toasts();
+    out.pickerWorksAgain = drawn('w').click('resume'); out.logAfter = log.slice(-1);
+    // A row that is uploading, cancelled by the user, the request hanging: the same.
+    fresh(sent('u', 'u-sess', { received: new Set() })); um.render(); server.park.add('u-sess');
+    const c2 = um.cancel('u'); await settle(); out.uploadingDuring = seen('u');
+    server.parked.get('u-sess')({ ok: true, status: 204 }); await c2; out.uploadingAfter = seen('u');
+    // A DROPPED replacement says more about itself than "Cancelling", and keeps saying it.
+    fresh(victim(), ours()); um.render(); server.refuse.add('old-sess'); server.park.add('new-sess');
+    um._run('o'); await settle(); await settle(); out.dropped = seen('o');
+    // A row that is `cancelled` for good with NO request out (its session is already gone: the
+    // vault key changed under it) keeps saying why -- nothing is being cancelled any more.
+    fresh(sent('k', null, { status: 'error', cancelled: true, error: 'The vault key changed during upload' }));
+    um.render(); out.keyChanged = seen('k');
+    """))
+    # (mutation: say "Cancelling" for every cancelled row, request or none -> it would say so for ever -> red.)
+    assert out["keyChanged"] == {"buttons": ["cancel"], "sub": "The vault key changed during upload"}, out["keyChanged"]
+    sentence = "Paused — click Resume and re-select the file"
+    assert out["before"] == {"buttons": ["resume:Resume…", "cancel"], "sub": sentence}, out["before"]
+    # (mutation: do not draw the row when it is marked -> the stale Resume is still in the tray,
+    # under the old sentence -> red.)
+    assert out["during"] == {"buttons": ["cancel"], "sub": "Cancelling…"}, out["during"]
+    assert out["resumeWasThere"] is False and out["logDuring"] == ["DELETE /vaults/V/uploads/wait-sess"]
+    # Refused: the picker and its sentence are back on the screen, and the refusal is said.
+    assert out["refused"] == {"buttons": ["resume:Resume…", "cancel"], "sub": sentence}, out["refused"]
+    assert out["toasts"] == ['toast error Could not cancel "X" — the server did not confirm it. Try again.']
+    assert out["pickerWorksAgain"] is True and out["logAfter"] == ["reselect w"]
+    assert out["uploadingDuring"] == {"buttons": ["cancel"], "sub": "Cancelling…"}, out["uploadingDuring"]
+    assert out["uploadingAfter"] is None
+    # (mutation: say "Cancelling" on a dropped row too -> red.)
+    assert out["dropped"] == {"buttons": ["cancel"], "sub": REMOVING_ROW}, out["dropped"]
+
+
 def test_a_refused_cancel_leaves_a_row_that_is_waiting_for_its_file_as_it_was():
     # An 'error' row swaps the re-pick control for a plain Resume, which cannot work without the
     # file. The row is left alone and the refusal is said beside it, by name.

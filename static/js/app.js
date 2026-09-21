@@ -16685,6 +16685,7 @@ const uploadManager = {
     // row telling the user the opposite of what happened.
     async _dropReplacement(it, message) {
         showError(message);
+        it.dropped = true;
         it.status = 'error';
         it.error = 'Not uploaded — removing its data from the server…';
         this.render();
@@ -16850,6 +16851,11 @@ const uploadManager = {
         it.cancelled = true;
         it.paused = true;
         if (it.sessionId) {
+            // Drawn NOW, before the request goes out. The controls follow the row's state, but only
+            // a render applies them -- and a row that is waiting for its file gets no other render,
+            // so it went on showing the Resume it had before, a button that did nothing, for as
+            // long as the request took.
+            this.render();
             let gone = false;
             try {
                 const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, {
@@ -16939,7 +16945,9 @@ const uploadManager = {
     },
     _controlSig(it) {
         const s = [];
-        if (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing') s.push('pause');
+        // A row whose own cancel is out offers Cancel and nothing else: not Resume, not the re-pick,
+        // and not Pause either -- there is nothing left of it to pause.
+        if (!it.cancelled && (it.status === 'uploading' || it.status === 'queued' || it.status === 'completing' || it.status === 'pausing')) s.push('pause');
         if ((it.status === 'paused' || it.status === 'error') && !it.cancelled) s.push('resume');
         if (this._canRepick(it)) s.push('resume-text');
         if (it.status !== 'done') s.push('cancel');
@@ -16962,7 +16970,7 @@ const uploadManager = {
             el.appendChild(b);
         };
         const st = it.status;
-        if (st === 'uploading' || st === 'queued' || st === 'completing' || st === 'pausing') add('pause', 'pause', 'Pause');
+        if (!it.cancelled && (st === 'uploading' || st === 'queued' || st === 'completing' || st === 'pausing')) add('pause', 'pause', 'Pause');
         // Not while its own cancel is out: there is nothing a Resume could do for it.
         if ((st === 'paused' || st === 'error') && !it.cancelled) add('resume', 'play', 'Resume');
         // Anything that can be continued by re-selecting the file gets the button that does it; a
@@ -16974,6 +16982,14 @@ const uploadManager = {
     _renderSub(sub, it) {
         const pct = this._percent(it);
         const size = formatBytes ? formatBytes(it.totalSize) : `${it.totalSize} B`;
+        // Its own cancel is out. Whatever the row said before is no longer what is happening to it;
+        // a refusal brings the old wording back, and a confirmed cancel takes the row away. (A
+        // replacement that was dropped says more than this about itself, and keeps saying it.)
+        if (it.cancelled && it.sessionId && !it.dropped) {
+            sub.className = 'up-sub';
+            sub.replaceChildren(document.createTextNode('Cancelling…'));
+            return;
+        }
         if (it.status === 'error') { sub.className = 'up-error'; sub.replaceChildren(document.createTextNode(it.error || 'Upload failed')); return; }
         sub.className = 'up-sub';
         if (it.status === 'needs-file') {
