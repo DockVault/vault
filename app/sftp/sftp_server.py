@@ -278,6 +278,14 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # overlimit, this marks the upload for discard at close so a truncated buffer is never
         # finalized -- an SFTP close cannot report failure, so the discard is the only signal.
         self.write_failed = False
+        # The upload was INTERRUPTED: this handle is being closed by the connection's cleanup, not
+        # by the client. SFTP carries no total size, so "the client never sent CLOSE" is the ONLY
+        # sign of an incomplete upload there is -- and an interrupted one is discarded, exactly like
+        # an over-limit or a failed one. See close().
+        self.interrupted = False
+        # The SFTP interface of the session this handle belongs to (set in open()); it is what
+        # knows that the session has ended.
+        self._interface = None
         # Back-reference to the paramiko SFTP protocol handler, set on an upload handle in open().
         # A raw int status return (e.g. SFTP_FAILURE) carries only paramiko's default word "Failure";
         # setting a pending description here lets _send_status attach a message that names the actual
@@ -370,6 +378,16 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         self._marker_last_refresh = now
         upload_marker.refresh(*self.upload_marker_ref)
 
+    def mark_interrupted(self):
+        """This upload will not be completed: whatever closes the handle next must DISCARD it.
+
+        Set BEFORE anything is closed. close() is the only place an upload is committed, and it
+        commits unless it is told not to -- so a caller that ends a transfer by closing the
+        connection, without saying this first, commits the partial bytes as a complete file."""
+        self.interrupted = True
+        if self.stream is not None:
+            self.stream._failed = True
+
     def close(self):
         # Remove the in-flight upload marker FIRST, on every close path -- a graceful client
         # CLOSE and the paramiko subsystem-finish that closes open handles on any
@@ -377,6 +395,16 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         if self.upload_marker_ref:
             upload_marker.remove(*self.upload_marker_ref)
             self.upload_marker_ref = None
+        # A CLOSE FROM THE CLIENT, OR THE CLEANUP OF A CONNECTION THAT HAS GONE? They arrive here
+        # alike, and they must not be treated alike. A client's CLOSE takes the handle out of
+        # paramiko's table, so the only handles the cleanup ever reaches are the ones the client
+        # never closed -- the incomplete uploads. Finalizing those committed a TRUNCATED file as
+        # if it were whole, and where overwriting is allowed it replaced the good file of that
+        # name with the truncated one. paramiko announces the end of the session (session_ended)
+        # before it closes what is left, which is what tells the two apart.
+        if (self.writefile is not None or self.stream is not None) \
+                and self._interface is not None and getattr(self._interface, "_session_over", False):
+            self.mark_interrupted()
         # Read mode: release the blob. Held for the life of the handle, so a client that opens a
         # file and leaves is the case this matters for.
         if self.reader is not None:
@@ -414,6 +442,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                 # The upload exceeded the per-file max mid-stream: discard it (don't persist),
                 # leaving any existing same-name file intact. The temp buffer is removed below.
                 safe_event('upload.discarded.too-large', limit=self.max_bytes)
+            elif self.interrupted:
+                # The connection went before the client closed the file: what is here is a
+                # truncated upload. Discard it; any existing file of that name is left intact.
+                safe_event('upload.discarded.interrupted')
             elif self.write_failed:
                 # A buffer write failed mid-stream (e.g. the staging tmpfs filled): the buffer is
                 # truncated, so discard it rather than finalize partial bytes. Any existing
@@ -524,6 +556,8 @@ class _StreamingUpload:
     # -- close path ---------------------------------------------------------
     def close(self):
         if self._failed:
+            if getattr(self._handle, "interrupted", False):
+                safe_event('upload.discarded.interrupted')
             self._abort()
             return
         try:
@@ -607,6 +641,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
     def __init__(self, server: 'SFTPServer', *args, **kwargs):
         super().__init__(server, *args, **kwargs)
         self.server = server
+        # Set by session_ended(): from then on, a handle being closed is being cleaned up after a
+        # connection that has gone, not closed by its client. See VaultSFTPHandle.close().
+        self._session_over = False
 
     # -- principal / scope helpers ------------------------------------------
     # Temp-credential scope attributes (plain, non-ORM-mapped) attached at auth.
@@ -944,7 +981,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         pass
 
     def session_ended(self):
-        pass
+        # paramiko calls this FIRST when the SFTP subsystem finishes -- a disconnect, an abort, a
+        # transport torn down -- and only then closes the handles still open. Those are uploads
+        # whose client never sent CLOSE: recorded here so their close() discards them.
+        self._session_over = True
 
     # -- directory listing --------------------------------------------------
     def list_folder(self, path: str):
@@ -1261,6 +1301,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         if settings.sftp_streaming_upload:
             handle = VaultSFTPHandle(flags=os.O_WRONLY)
             handle.max_bytes = _eff_max
+            handle._interface = self
             handle._sftp_server = getattr(self, "_sftp_server", None)
             handle.upload_marker_ref = _upload_marker_ref
             # Clamp the reorder window to the in-process memory ceiling, so no client write pattern
@@ -1303,6 +1344,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         handle.max_bytes = _eff_max
         # Let an in-stream refusal (over-limit / staging-full) carry a descriptive status instead of
         # paramiko's bare "Failure". _sftp_server is the protocol handler, wired by _MessageSFTPServer.
+        handle._interface = self
         handle._sftp_server = getattr(self, "_sftp_server", None)
         handle.upload_marker_ref = _upload_marker_ref
         handle.finalizer = self._make_upload_finalizer(

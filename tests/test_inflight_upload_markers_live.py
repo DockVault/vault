@@ -270,6 +270,15 @@ def test_a_sigkilled_client_removes_the_marker_before_the_ttl(admin, temp_vault)
                 break
             time.sleep(0.5)
         assert gone, "a SIGKILLed client's marker did not clear before the TTL"
+        # ... and NOTHING was committed under the name. The client was killed before it could send
+        # CLOSE, so what the server held was a truncated upload -- and SFTP carries no total size,
+        # so the missing CLOSE is the only sign of that there is. The same teardown that clears the
+        # marker used to FINALIZE those bytes as a complete file (and replace a good file of that
+        # name with them).
+        time.sleep(1.0)     # the discard runs in the same close() as the marker removal, just after it
+        committed = [i for i in _web_items(admin, temp_vault["id"])
+                     if i.get("name") == name and not i.get("in_progress")]
+        assert committed == [], "a killed client's partial upload was committed as a file: %r" % committed
     finally:
         if proc.poll() is None:
             proc.kill()
