@@ -16495,17 +16495,16 @@ const uploadManager = {
             it.frameMacs[f] = sealed.mac;
             parts.push(sealed.frame);
         }
-        // ONE Uint8Array, not a Blob of the parts. A Blob built in memory is copied into the
-        // BROWSER process's blob storage, and it stays there after this page has let go of it --
-        // about one whole file, measured, and not given back by a collection. Plain bytes are held
-        // by this page only while their request is out, and then they are the collector's. (These
-        // bytes exist nowhere else: they were sealed a moment ago, so there is no file to slice.)
-        let total = 0;
-        for (const part of parts) total += part.byteLength;
-        const chunk = new Uint8Array(total);
-        let at = 0;
-        for (const part of parts) { chunk.set(part, at); at += part.byteLength; }
-        return chunk;
+        // A Blob of the parts -- and deliberately so, for now. A Blob built in memory is copied into
+        // the BROWSER process's blob storage and stays there after this page has let go of it:
+        // measured at about one whole file over an upload. Handing over the same bytes as ONE
+        // Uint8Array instead was tried, and measured: it freed that copy exactly as expected
+        // (about 1 GiB down to 50 MiB on a 1 GiB file), but THIS page then held about two files'
+        // worth and did not give them back under forced collection -- retained, not waiting to be
+        // collected -- so the total went up, not down. An isolated probe of the same body type
+        // releases it, so something on this path holds a reference that has not been found. Until
+        // it is, the browser process's one copy is the lesser cost, and this stays a Blob.
+        return new Blob(parts);
     },
 
     // Does the server hold every chunk of this upload, and exactly the bytes it declared? Answered

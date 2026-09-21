@@ -70,7 +70,7 @@ const codeOf = async fn => {{
   const open = async bytes => new Uint8Array(await lib.decryptFileV2(new Uint8Array(bytes), dek, CTX));
   const item = s => ({{ zkStream: s, frameMacs: new Array(s.totalChunks).fill(null) }});
   // What the seal hands to fetch. Its KIND is recorded, because that decides which process holds
-  // the copy: a Blob built in memory is copied into the browser process and stays there.
+  // the copy -- and the choice between the two was made by measurement, not by taste.
   const kinds = [];
   const chunkBytes = async (it, i) => {{
     const body = await uploader._sealUploadChunk(it, i);
@@ -120,10 +120,14 @@ def test_the_chunks_the_uploader_sends_are_whole_frames_and_open_as_the_declared
     assert out["headerToken"] == out["blobId"] and out["onlyChunk0HasHeader"] is True
     # A MAC is recorded for every frame sealed.
     assert out["macs"] == out["frames"] == 10
-    # Each chunk is handed over as PLAIN BYTES -- one Uint8Array, never a Blob of the parts -- and
-    # those bytes are the parts, in order, nothing added or dropped (the header and the ten frames).
-    # (mutation: `return new Blob(parts)` again -> the kinds are 'Blob' -> red.)
-    assert out["kinds"] == ["Uint8Array"] * 3, out["kinds"]
+    # Each chunk is handed over as a BLOB of the parts. One Uint8Array was tried and MEASURED: it
+    # freed the browser process's copy of the file, and the page then retained about two files'
+    # worth that a forced collection did not release -- a higher total. Until what holds them is
+    # found the Blob is the shipped shape, and changing it again is a decision to take with
+    # numbers, not in passing. (mutation: hand over one Uint8Array again -> red.)
+    assert out["kinds"] == ["Blob"] * 3, out["kinds"]
+    # And it is a Blob of EXACTLY the parts, in order: the header and the ten frames, nothing added
+    # or dropped. (mutation: `new Blob(parts.slice(1))` -> red here, and it no longer opens.)
     assert out["parts"] == 11 and out["sameBytesAsTheParts"] is True
 
 
