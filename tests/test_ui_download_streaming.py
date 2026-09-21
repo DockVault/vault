@@ -70,8 +70,11 @@ def test_every_refusal_aborts_the_connection_by_construction():
     refuse_def = body[body.index("const _refuseTooLarge = () => {"):]
     refuse_def = refuse_def[:refuse_def.index("showError(")]
     assert "_dlAbort.abort();" in refuse_def, "the refusal must abort the fetch before showing the message"
-    # The refusal is used on every path: pre-fetch guard + both false-branches (+ the final backstop).
-    assert body.count("_refuseTooLarge()") >= 3
+    # The refusal is CALLED from four places: the pre-fetch guard, both streamed-false branches, the
+    # final backstop. That it is called says nothing about whether any of those calls can be
+    # REACHED -- `false &&` in front of all three identical conditions leaves this count exactly as
+    # it is. Whether each site refuses is shown by running it: test_download_refusal_sites.py.
+    assert body.count("_refuseTooLarge();") == 4
     # The refusal names the administrator action (LOW: not just "open over https").
     assert "ask an administrator to serve the site over https" in body
 

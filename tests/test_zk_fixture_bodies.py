@@ -9,6 +9,15 @@ every other: that is how a dozen call sites went unnoticed behind the one that s
 The helpers refuse a short body at run time, but those tests need a running stack. This is the
 half that needs nothing: every call site that passes a LITERAL body is read from the source and
 measured here, in the offline lane.
+
+WHAT THE SCAN BELOW DOES NOT PROVE. For a request body that declares an attempt token, the syntax
+tree is read for a call to ``require_zk_first_chunk`` in the enclosing function, placed before the
+statement that declares the token. That shows the guard EXISTS and runs FIRST. It does not show
+that the guard's argument is the body that then goes out: ``require_zk_first_chunk(b"x" * 64)``
+beside a helper that PUTs a short body passes this scan (shown by making exactly that change).
+Following the value through the function would cost more than it protects. What covers the gap is
+the run-time assertion in the helpers, where the argument IS the body being sent, and the server's
+own 409 in the integration lane.
 """
 import ast
 from pathlib import Path
