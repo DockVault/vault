@@ -55,21 +55,37 @@ FLOOR = 40_000
 T0 = 10_000.0
 
 
-def _handle(*, stream=None):
-    """A write handle in the shape the open path leaves one -- minus what no watchdog code reads.
+class _StagingFile:
+    """Stands in for the staging file on the buffered path.
+
+    The watchdog reads exactly one thing about it -- whether it is None -- and that is what tells
+    an UPLOAD handle from a download one. It is never written to here.
+    """
+
+
+def _handle(*, stream=None, reader=None):
+    """A handle in the shape the open path leaves one -- minus what no watchdog code reads.
+
+    Exactly one of `stream` / `writefile` is set on an upload handle, as in the product; passing
+    `reader` instead makes a DOWNLOAD handle, which is neither and must never be watched.
 
     The interface stands in for the session: the only thing the close path asks it is whether the
     session is over. Using the real 700-line class here would couple every test in this file to
     an unrelated constructor.
     """
-    handle = VaultSFTPHandle(flags=os.O_WRONLY)
+    handle = VaultSFTPHandle(flags=os.O_RDONLY if reader is not None else os.O_WRONLY)
     handle._interface = types.SimpleNamespace(_session_over=False)
-    handle.stream = stream
+    if reader is not None:
+        handle.reader = reader
+    elif stream is not None:
+        handle.stream = stream
+    else:
+        handle.writefile = _StagingFile()
     return handle
 
 
-def _watched(dog, *, at=T0, stream=None):
-    handle = _handle(stream=stream)
+def _watched(dog, *, at=T0, stream=None, reader=None):
+    handle = _handle(stream=stream, reader=reader)
     dog.watch(handle, now=at)
     return handle
 
@@ -388,6 +404,26 @@ def test_both_upload_branches_watch_the_handle_before_returning_it():
         f"only {len(paired)} of the 2 upload branches watch the handle immediately before "
         "returning it"
     )
+
+
+def test_a_download_handle_is_refused_even_if_something_asks_for_it(monkeypatch):
+    """A negative property, turned into a refusal the code holds rather than an absence.
+
+    Nothing was watching downloads, and nothing said they must not be. A download accrues no
+    progress -- there is nothing for the client to send -- so a watched one is stalled by
+    definition the moment its first window closes: marked for discard, announced to the operator
+    as a stalled UPLOAD, and its connection closed. Every download slower than one window would
+    die. Both call sites are uploads today, so the source pin above cannot see this; the guard
+    makes the rule true of any future one. (mutation: drop the guard in watch() -> red.)
+    """
+    _quiet(monkeypatch)
+    dog = _WriteProgressWatchdog()
+    download = _watched(dog, reader=object())
+    upload = _watched(dog)
+
+    assert download not in dog._handles, "a download handle was accepted for watching"
+    assert set(dog.sweep(now=T0 + WINDOW, window=WINDOW, floor=FLOOR)) == {upload}
+    assert download.interrupted is False, "a download was failed for not uploading anything"
 
 
 def test_the_server_starts_the_watchdog_thread_once_and_only_when_it_is_enabled():

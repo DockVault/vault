@@ -550,6 +550,14 @@ class _WriteProgressWatchdog:
         self._handles = weakref.WeakSet()
 
     def watch(self, handle, now=None):
+        # UPLOADS ONLY, enforced here rather than trusted of the callers. A download handle never
+        # accrues progress -- there is nothing for the client to send -- so a watched one is
+        # stalled by definition once its first window closes: marked for discard, announced to the
+        # operator as a stalled UPLOAD, and its connection closed. Every download slower than a
+        # window would die. Both call sites are uploads today, but "watch every handle at open()"
+        # is a plausible edit and nothing else in this file would notice it.
+        if handle.writefile is None and handle.stream is None:
+            return
         handle._progress_window_start = time.monotonic() if now is None else now
         handle._progress_bytes = 0
         with self._lock:
@@ -619,8 +627,15 @@ class _WriteProgressWatchdog:
         return True
 
     def run(self, stop=None):
-        """The watchdog thread. Sweeps a few times per window, so a stall is caught within about a
-        window and a quarter of when it began."""
+        """The watchdog thread, sweeping a few times per window.
+
+        DETECTION LATENCY, because the obvious estimate is wrong by a factor of two. A window is
+        judged only when it CLOSES, so a stall that begins just after a window cleared the floor
+        costs a whole FURTHER window: up to 2 * window + MAX_SWEEP_SECONDS, about 245 s at the
+        defaults -- not the ~150 s that "a sweep every quarter-window" suggests. A client that
+        sends 1 MiB and then stops is exactly that case. Anything that must outlive detection --
+        the same-name upload marker's TTL above all -- has to be sized against that sum, which is
+        why the TTL and its refresh divisor are pinned against it and not against one window."""
         while stop is None or not stop.is_set():
             window = settings.sftp_write_progress_timeout_seconds
             time.sleep(max(1, min(self.MAX_SWEEP_SECONDS, (window or 20) // 4)))
