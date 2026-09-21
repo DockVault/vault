@@ -112,28 +112,65 @@ def test_single_file_reupload_of_an_existing_name_prompts(page: Page, admin, adm
 def test_replace_on_an_in_flight_name_cancels_it_not_duplicates(page: Page, admin, admin_creds):
     """Choosing "Replace" on a name that is still UPLOADING cancels that in-flight upload and
     uploads the new file in its place, instead of adding a second copy of the same name (which
-    would race the first and both land -- the exact bug via the Replace affordance)."""
+    would race the first and both land -- the exact bug via the Replace affordance).
+
+    The earlier upload here is REAL: a session opened on the server, and the tray row is the one
+    the page itself builds for it. A hand-made row with no session is a shape the page cannot
+    produce on its own -- an upload that is 'uploading' with no session is one whose session is
+    being opened, which a replacement rightly WAITS for -- and a row removed from the tray proves
+    nothing about the server. So what is asserted is the server's side of the cancel as well.
+    """
     v = admin.create_vault(name=unique("uprepl"))
+    vid = v["id"]
     try:
+        opened = admin.post(f"/vaults/{vid}/uploads", json={
+            "file_name": "dup.txt", "total_size": 5, "total_chunks": 1, "chunk_size": 5 * 1024 * 1024})
+        assert opened.status_code == 200, opened.text
+        sid = opened.json()["session_id"]
+        assert admin.get(f"/vaults/{vid}/uploads/{sid}").json()["status"] == "active"
+
         _login(page, admin_creds["username"], admin_creds["password"])
-        _open_vault(page, v["id"])
+        _open_vault(page, vid)
+        # Opening the vault rebuilds the tray from the server's sessions: wait for THAT row, then
+        # mark it as being sent (what the tab uploading it would show). Everything else about it --
+        # its session, its place in the order, when the server says it was opened -- is the page's.
+        page.wait_for_function(
+            "(sid) => [...uploadManager.items.values()].some(it => it.sessionId === sid && it.fileName === 'dup.txt')",
+            arg=sid, timeout=10000)
         page.evaluate(
-            """() => {
-                uploadManager.items.set('inflight_dup', {
-                    id: 'inflight_dup', vaultId: state.currentVault.id,
-                    folderId: state.currentFolderId || null, fileName: 'dup.txt',
-                    totalSize: 5, totalChunks: 1, chunkSize: 5, received: new Set(),
-                    status: 'uploading', cancelled: false, isZk: false, sessionId: null });
+            """(sid) => {
+                for (const it of uploadManager.items.values()) {
+                    if (it.sessionId === sid) { it.status = 'uploading'; it.paused = false; }
+                }
+                uploadManager.render();
                 const f = new File([new Blob(['hello'])], 'dup.txt', { type: 'text/plain' });
-                uploadFiles([f]);
-            }"""
+                uploadFiles([f]);  // not awaited: it parks on the conflict modal
+            }""",
+            sid,
         )
         expect(page.locator("#upload-conflict-modal")).to_be_visible(timeout=8000)
         page.check('input[name="uc-action"][value="overwrite"]')
         page.click("#uc-confirm")
-        # The in-flight synthetic upload is cancelled (removed), not left to double up.
-        page.wait_for_function("() => !uploadManager.items.has('inflight_dup')", timeout=8000)
-        assert page.evaluate("() => !uploadManager.items.has('inflight_dup')")
+
+        # The earlier upload's row goes -- by SESSION, since rows are rebuilt under new ids.
+        page.wait_for_function(
+            "(sid) => ![...uploadManager.items.values()].some(it => it.sessionId === sid)",
+            arg=sid, timeout=8000)
+        # ... and it went because the server was told: the session is cancelled there and no longer
+        # offered as resumable. A row merely dropped from the tray would leave it 'active'.
+        after = admin.get(f"/vaults/{vid}/uploads/{sid}")
+        assert after.status_code == 404 or after.json()["status"] == "cancelled", after.text
+        assert all(x["session_id"] != sid for x in admin.get(f"/vaults/{vid}/uploads").json())
+
+        # And the new file lands ONCE under the name.
+        def listed():
+            return [it["name"] for it in admin.get(f"/vaults/{vid}/files").json()["items"]
+                    if it["type"] == "file"]
+        for _ in range(32):
+            if listed().count("dup.txt") >= 1:
+                break
+            page.wait_for_timeout(250)
+        assert listed().count("dup.txt") == 1, listed()
     finally:
         admin.delete_vault(v["id"])
 
