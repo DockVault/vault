@@ -86,12 +86,24 @@ class Settings(BaseSettings):
     # worker thread + a paramiko Transport per accepted TCP connection; without a ceiling a flood of
     # connections that never authenticate ties up threads and Transports through the handshake window.
     # sftp_max_connections caps total live handler threads; sftp_max_connections_per_ip caps one
-    # source IP's in-flight share; sftp_auth_grace_seconds bounds how long a pre-auth connection is
-    # held (paramiko banner + auth timeout) before it is dropped. 0 on any of these disables that
-    # particular limit. Blast radius of the gap is one tenant container's SFTP availability only.
+    # source IP's PRE-AUTH share -- connections that have not yet authenticated, which is what a
+    # flood is made of, so it is small and a connection leaves it the moment it authenticates;
+    # sftp_auth_grace_seconds bounds how long a pre-auth connection is held (paramiko banner + auth
+    # timeout) before it is dropped. 0 on any of these disables that particular limit. Blast radius
+    # of the gap is one tenant container's SFTP availability only.
     sftp_max_connections: int = Field(default=100)
     sftp_max_connections_per_ip: int = Field(default=10)
     sftp_auth_grace_seconds: int = Field(default=30)
+    # The per-address cap on AUTHENTICATED sessions, separate from the pre-auth one above: a fleet
+    # of devices behind one NAT all authenticate from one address, and with a single per-address cap
+    # sized against a flood (10), the tenth device found the door shut by the first nine. The
+    # arithmetic this is sized against, from the device caps below: max_devices_per_user (10) x
+    # max_device_sync_creds_per_device (10) = 100 credentials PER ACCOUNT -- so 50 is below one
+    # account's whole fleet, and holds only because a sync connection is short-lived (the desktop
+    # releases each credential at run-end) and not every credential holds a connection at once. An
+    # office fronting several accounts through one address, or one that does, raises this; it can
+    # never exceed sftp_max_connections, which caps everything. 0 disables it.
+    sftp_max_authenticated_per_ip: int = Field(default=50)
     # Write-progress watchdog. AFTER authentication nothing else bounds a connection: a client that
     # opens a file for writing and then sends nothing holds its thread, its SSH transport and its
     # connection slot for as long as it likes, and one that sends a byte now and then also keeps the

@@ -64,7 +64,12 @@ def is_member_grade_viewer(viewer, vault_id=None) -> bool:
     `_share_vault_scope` for it; a member never does). Stated positively on purpose. "Not scoped"
     is the wrong direction for a disclosure gate: None, an anonymous receiver, a device principal,
     a principal type that does not exist yet -- none of them is scoped, and every one of them
-    would read as member-grade. The web listing's uploader-identity gate asks this too."""
+    would read as member-grade. The web listing's uploader-identity gate asks this too.
+
+    The type check is strict ON PURPOSE. A legitimate member arriving as something other than a
+    User instance -- a proxy, a dict, a detached row from some future path -- reads as "another
+    member": the answer degrades to the neutral name, never to disclosure. Do not "fix" that by
+    loosening the check; give the new path a real User."""
     from app.core.models import User
     from app.core.temp_scope import is_scoped
     if not isinstance(viewer, User):

@@ -426,6 +426,7 @@ def build_env_lines(cfg):
     for _cfg_key, _env_name, _default in (
         ("sftp_max_connections", "SFTP_MAX_CONNECTIONS", 100),
         ("sftp_max_connections_per_ip", "SFTP_MAX_CONNECTIONS_PER_IP", 10),
+        ("sftp_max_authenticated_per_ip", "SFTP_MAX_AUTHENTICATED_PER_IP", 50),
         ("sftp_auth_grace_seconds", "SFTP_AUTH_GRACE_SECONDS", 30),
         # The write-progress watchdog's window and floor (see .env.example), same rule: only a
         # non-default value is written.
@@ -1217,6 +1218,7 @@ def new_set_config(current_env, new_prefix, new_id):
         # Keep any custom SFTP connection-admission limits across a fresh volume set too.
         "sftp_max_connections": (current_env.get("SFTP_MAX_CONNECTIONS") or "").strip() or None,
         "sftp_max_connections_per_ip": (current_env.get("SFTP_MAX_CONNECTIONS_PER_IP") or "").strip() or None,
+        "sftp_max_authenticated_per_ip": (current_env.get("SFTP_MAX_AUTHENTICATED_PER_IP") or "").strip() or None,
         "sftp_auth_grace_seconds": (current_env.get("SFTP_AUTH_GRACE_SECONDS") or "").strip() or None,
         "sftp_write_progress_timeout_seconds":
             (current_env.get("SFTP_WRITE_PROGRESS_TIMEOUT_SECONDS") or "").strip() or None,

@@ -94,20 +94,42 @@ transport_lock = threading.Lock()
 # window with nothing metering raw connections. These gate at accept() time, before a thread or
 # Transport is created, and drop the connection when a limit is hit.
 class _ConnectionAdmission:
-    """Non-blocking pre-auth admission for SFTP connections (the SSH MaxStartups equivalent).
+    """Non-blocking admission for SFTP connections, in two stages.
 
-    ``max_total`` caps live connections overall; ``max_per_ip`` caps one source IP's in-flight share.
-    Either being <= 0 disables that limit. :meth:`admit` reserves a slot (False when a ceiling is
-    reached); every True MUST be paired with exactly one :meth:`release`, so callers release in a
-    ``finally``. Thread-safe: the accept loop and every worker thread share one instance.
+    ``max_total`` caps live connections overall, authenticated or not. Per source address there are
+    TWO caps, because one number could not serve both purposes: ``max_per_ip`` caps the connections
+    from one address that have NOT YET authenticated (the SSH MaxStartups equivalent -- a flood of
+    connections that never send credentials must not hold threads and transports through the
+    handshake window, so this is small); ``max_authenticated_per_ip`` caps the SESSIONS from one
+    address that have. A fleet of devices behind one NAT authenticates from one address, and with a
+    single per-address cap sized against a flood, the tenth device's sync found the door shut by the
+    first nine -- while the flood the cap was for had never needed the authenticated slots at all.
+    Any cap <= 0 disables that limit.
+
+    :meth:`admit` reserves a pre-auth slot (False when a ceiling is reached); :meth:`authenticated`
+    moves a connection to the authenticated bucket once its credentials have been accepted (False
+    when THAT ceiling is reached: the caller closes the connection, and the slot is still the
+    pre-auth one). Every True from admit() MUST be paired with exactly one :meth:`release`, telling
+    it which bucket the connection was in, so callers release in a ``finally``. Thread-safe: the
+    accept loop and every worker thread share one instance.
     """
 
-    def __init__(self, max_total: int, max_per_ip: int):
+    def __init__(self, max_total: int, max_per_ip: int, max_authenticated_per_ip: int = 0):
         self._max_per_ip = max_per_ip
+        self._max_authenticated_per_ip = max_authenticated_per_ip
         self._sem = (threading.BoundedSemaphore(max_total)
                      if max_total and max_total > 0 else None)
-        self._per_ip: Dict[str, int] = {}
+        self._per_ip: Dict[str, int] = {}              # pre-auth, per address
+        self._authenticated: Dict[str, int] = {}       # authenticated sessions, per address
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _bump(table: Dict[str, int], ip: str, by: int) -> None:
+        remaining = table.get(ip, 0) + by
+        if remaining <= 0:
+            table.pop(ip, None)
+        else:
+            table[ip] = remaining
 
     def admit(self, ip: str) -> bool:
         if self._sem is not None and not self._sem.acquire(blocking=False):
@@ -121,20 +143,32 @@ class _ConnectionAdmission:
                 self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
         return True
 
-    def release(self, ip: str) -> None:
-        if self._max_per_ip and self._max_per_ip > 0:
-            with self._lock:
-                remaining = self._per_ip.get(ip, 0) - 1
-                if remaining <= 0:
-                    self._per_ip.pop(ip, None)
-                else:
-                    self._per_ip[ip] = remaining
+    def authenticated(self, ip: str) -> bool:
+        """The connection has authenticated: it leaves the pre-auth count (freeing that slot for
+        the next handshake from this address) and joins the authenticated count -- unless THAT cap
+        is reached, in which case it stays where it was and the caller must close it."""
+        with self._lock:
+            if self._max_authenticated_per_ip and self._max_authenticated_per_ip > 0 \
+                    and self._authenticated.get(ip, 0) >= self._max_authenticated_per_ip:
+                return False
+            if self._max_per_ip and self._max_per_ip > 0:
+                self._bump(self._per_ip, ip, -1)
+            self._bump(self._authenticated, ip, +1)
+        return True
+
+    def release(self, ip: str, authenticated: bool = False) -> None:
+        with self._lock:
+            if authenticated:
+                self._bump(self._authenticated, ip, -1)
+            elif self._max_per_ip and self._max_per_ip > 0:
+                self._bump(self._per_ip, ip, -1)
         if self._sem is not None:
             self._sem.release()
 
 
 _connection_admission = _ConnectionAdmission(
-    settings.sftp_max_connections, settings.sftp_max_connections_per_ip)
+    settings.sftp_max_connections, settings.sftp_max_connections_per_ip,
+    settings.sftp_max_authenticated_per_ip)
 
 # Where incoming uploads are buffered (plaintext) before being pushed through the
 # encryption pipeline at handle close. The path sits inside the storage volume, but the compose
@@ -2598,6 +2632,7 @@ def handle_sftp_client(
     transport = None
     server = None
 
+    _slot_authenticated = False   # which admission bucket the finally releases
     try:
         # Create SSH transport. Refuse SWEET32-vulnerable 3DES-CBC, all CBC ciphers, and
         # MD5/SHA1 (incl. truncated -96) MACs so an active downgrade or a hostile/misconfigured
@@ -2640,6 +2675,13 @@ def handle_sftp_client(
             safe_event('channel.open.failed', peer=client_address)
             return
 
+        # Authenticated: this connection leaves the pre-auth count for its address and takes an
+        # authenticated slot -- refused when that address already holds its share of sessions.
+        if not _connection_admission.authenticated(client_address[0]):
+            safe_event('connection.rejected.overcap-authenticated', peer=client_address)
+            return
+        _slot_authenticated = True
+
         # Register transport in global registry if authenticated (key-auth sessions
         # are created in check_channel_request, so session_token is set by now). Keyed by the
         # token's hash — the same value the DB stores and the termination signal carries — so a
@@ -2681,9 +2723,10 @@ def handle_sftp_client(
         if transport:
             transport.close()
 
-        # Release the pre-auth admission slot reserved for this connection in the accept loop. In
-        # the finally so it frees on every path -- normal close, exception, or an early return.
-        _connection_admission.release(client_address[0])
+        # Release the admission slot reserved for this connection in the accept loop -- the
+        # authenticated one if it got that far, else the pre-auth one. In the finally so it frees
+        # on every path: normal close, exception, or an early return.
+        _connection_admission.release(client_address[0], authenticated=_slot_authenticated)
 
 
 if __name__ == '__main__':
