@@ -933,9 +933,9 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
 _HALF = 5 * 1024 * 1024        # one browser chunk (CHUNK_SIZE); two chunks make the file
 
 
-def _interrupt_reload_and_repick(page, vid, name, first_half, second_half, repick_second_half,
+def _interrupt_reload_and_repick(page, admin, vid, name, first_half, second_half, repick_second_half,
                                  after_reload_js="() => {}"):
-    """Returns {"puts": [...chunk indexes re-sent after the re-pick], "stored": bytes}."""
+    """Returns {"puts": [...chunk indexes sent after the re-pick], "sid": the session id}."""
     # 1. Drop the file; the wire fails chunk 1's PUT once, so the run stops with chunk 0 landed.
     page.evaluate("""() => {
         const real = window.fetch;
@@ -1002,8 +1002,15 @@ def _interrupt_reload_and_repick(page, vid, name, first_half, second_half, repic
     chooser.value.set_files({"name": name, "mimeType": "application/octet-stream",
                              "buffer": first_half + repick_second_half})
 
-    # 4. It finishes and the file lands.
-    expect(page.locator("#upload-tray")).to_contain_text("Done", timeout=60000)
+    # 4. It finishes and the file lands. Synchronised on the LISTING, which is durable and is the
+    # claim: the tray's "Done" is a transient the tray clears a few seconds after, and a wait on it
+    # is a race by construction (one run of this waited 118 polls on an already-hidden tray).
+    for _ in range(240):
+        if any(f.get("name") == name for f in admin.get(f"/vaults/{vid}/files").json()["items"]):
+            break
+        page.wait_for_timeout(250)
+    else:
+        raise AssertionError(f"{name} never appeared in the listing after the re-pick")
     return {"puts": page.evaluate("() => window.__puts"), "sid": sid}
 
 
@@ -1028,7 +1035,7 @@ def test_a_resumed_upload_re_sends_the_parts_that_changed(logged_in: Page, admin
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
 
         a, b, z = b"A" * _HALF, b"B" * _HALF, b"Z" * _HALF
-        out = _interrupt_reload_and_repick(page, vid, "edited.bin", a, b, z)
+        out = _interrupt_reload_and_repick(page, admin, vid, "edited.bin", a, b, z)
         # Only the chunk the server already held is checked; it no longer matches, so it goes
         # again -- and ONLY it: chunk 0 still matches and is not re-sent.
         assert out["puts"] == [1], f"the re-pick sent {out['puts']}, not exactly the chunk that changed"
@@ -1075,7 +1082,7 @@ def test_a_resume_with_no_recorded_digests_re_sends_everything(logged_in: Page, 
                 return r;
             };
         }"""
-        out = _interrupt_reload_and_repick(page, vid, "legacy.bin", a, b, z, after_reload_js=strip_digests)
+        out = _interrupt_reload_and_repick(page, admin, vid, "legacy.bin", a, b, z, after_reload_js=strip_digests)
         # Nothing can vouch for chunk 0, so it goes again too.
         assert sorted(out["puts"]) == [0, 1], f"with no digests every held chunk must be re-sent; sent {out['puts']}"
 
