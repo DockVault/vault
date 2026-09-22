@@ -148,6 +148,7 @@ const _fetch = async (url, opts) => {
     }
     if (method === 'GET') {
         if (server.onGet) server.onGet();
+        if (server.getFails) return { ok: false, status: 500, json: async () => ({}) };
         return { ok: true, status: 200, json: async () => (server.held || { received_chunks: [0], bytes_received: 10 }) };
     }
     if (method === 'PUT') {
@@ -191,7 +192,7 @@ const ours = (extra) => sent('o', 'new-sess', { order: 2, replaces: chose(), ...
 const fresh = (...its) => { log.length = 0; records.length = 0; timers.length = 0; um._landed = []; um._aborts = new Set(); um.seq = 100;
     server.refuse = new Set(); server.unreachable = new Set(); server.stalled = new Set(); server.onGet = null;
     server.park = new Set(); server.parked = new Map(); server.puts = []; server.held = null;
-    server.onInit = null; server.completes = []; server.onRequest = null; signals.length = 0;
+    server.onInit = null; server.completes = []; server.onRequest = null; signals.length = 0; server.getFails = false;
     um.items = new Map(its.map(it => [it.id, it])); };
 const row = (id) => { const it = um.items.get(id);
     return it ? { status: it.status, cancelled: it.cancelled, error: it.error || null } : null; };

@@ -88,3 +88,36 @@ def test_the_re_pick_path_defers_to_the_runs_check_instead_of_trusting_the_list(
     assert cont.index("it.needsServerSync = true;") < cont.index("this._start(it);")
     run = strip_comments(_method(js, "async _run(id) {"))
     assert run.index("} else if (it.needsServerSync) {") < run.index("chunk_checksums") < run.index("sha256Hex(")
+
+
+@pytest.mark.parametrize("answer", ["non-ok", "throws"])
+def test_when_the_server_cannot_be_asked_every_chunk_is_sent_again(answer):
+    # The sync's answer is what the run checks against; when there is none -- the session GET
+    # answers non-ok, or the request fails -- there is nothing to check against and every chunk goes
+    # again, as the catch in the run promises. That promise rests on the re-pick having CLEARED the
+    # received set first: left as it was, it still holds the previous attempt's indices, the run
+    # skips them with no digest compared (there is no detail to compare against), and the edited
+    # file is spliced onto the previous attempt's chunks through the error path instead of the
+    # happy one. (mutation: drop `it.received = new Set();` from the re-pick -> red, both legs.)
+    out = _serve("""
+    globalThis.isZkVault = () => false;
+    const bytes = (s) => new TextEncoder().encode(s);
+    // The row as the tray held it before the re-pick: the previous attempt's indices still on it.
+    const it = { id: 'r', order: 1, vaultId: 'V', folderId: null, sessionId: 'r-sess', fileName: 'edited.bin', file: null,
+        isZk: false, totalSize: 20, totalChunks: 2, chunkSize: 10, received: new Set([0, 1]), lastPut: null,
+        status: 'needs-file', error: null, paused: false, cancelled: false, replaces: null };
+    fresh(it);
+    // The session GET: answered non-ok, or failing outright.
+    server.getFails = true;
+    if (%s) server.onRequest = async (m, url) => { if (m === 'GET' && url.endsWith('/uploads/r-sess')) throw new TypeError('network'); };
+    server.puts = [0, 1].map(() => ({ ok: true, status: 200, json: async () => ({ complete: true, bytes_received: 20 }) }));
+    const picked = new Blob([bytes('AAAAAAAAAA'), bytes('ZZZZZZZZZZ')]);
+    Object.defineProperty(picked, 'name', { value: 'edited.bin' });
+    await um._continueWith(it, picked);
+    await um.lastRun;
+    out.log = log.slice(); out.status = it.status; out.error = it.error || null;
+    """ % ("true" if answer == "throws" else "false"),
+        extra=("async _continueWith(it, file) {",))
+    puts = sorted(e for e in out["log"] if e.startswith("PUT "))
+    assert puts == ["PUT /vaults/V/uploads/r-sess/chunks/0", "PUT /vaults/V/uploads/r-sess/chunks/1"], out["log"]
+    assert out["status"] == "done", out
