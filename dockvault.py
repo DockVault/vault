@@ -5078,13 +5078,21 @@ def build_parser():
 
 
 def unbuffer_stdout(stream=None):
-    """Line-buffer stdout so progress lines appear WHEN THEY HAPPEN. Python block-buffers stdout in
-    8 KB chunks whenever it is not a terminal (a pipe, `tee`, a CI log, an MSYS/mintty console), which
-    makes a long docker step look frozen and then dumps everything at once. Best-effort: a stream
-    without reconfigure() (Python < 3.7 / a replaced stdout) is left alone."""
+    """Line-buffer stdout so progress lines appear WHEN THEY HAPPEN, and make it able to print
+    anything the tool has to show.
+
+    Python block-buffers stdout in 8 KB chunks whenever it is not a terminal (a pipe, `tee`, a CI
+    log, an MSYS/mintty console), which makes a long docker step look frozen and then dumps
+    everything at once. And on a Windows console stdout is often cp1252, which cannot encode an em
+    dash or a curly quote: the upgrade matrix is a published document whose version notes and
+    vulnerability titles are printed raw (clean_matrix_text strips control characters, not
+    legitimate ones), so one such character in a note crashed the plan printout with a
+    UnicodeEncodeError half-way through. UTF-8 prints everything a note can carry, and `replace`
+    means a stream that still cannot show a character prints a marker for it rather than dying.
+    Best-effort: a stream without reconfigure() (Python < 3.7 / a replaced stdout) is left alone."""
     stream = sys.stdout if stream is None else stream
     try:
-        stream.reconfigure(line_buffering=True)
+        stream.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
         return True
     except Exception:  # noqa: BLE001 - buffering is cosmetic; never fail startup over it
         return False

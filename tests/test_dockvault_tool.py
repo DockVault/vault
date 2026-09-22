@@ -3353,3 +3353,31 @@ def test_build_env_lines_writes_the_marker_ttl_only_when_it_is_not_the_default()
     # 900 was the default once. An operator who asks for it now is asking for something, and gets it.
     env2 = dv.parse_env("\n".join(dv.build_env_lines(dict(base, upload_marker_ttl_seconds=900))))
     assert env2["UPLOAD_MARKER_TTL_SECONDS"] == "900"
+
+
+def test_unbuffer_stdout_makes_a_cp1252_console_able_to_print_a_matrix_note():
+    # A Windows console stdout is often cp1252, which cannot encode an em dash or a curly quote; the
+    # upgrade matrix's notes and vulnerability titles are printed raw (clean_matrix_text strips
+    # control characters, not legitimate ones), and one such character crashed the plan printout
+    # half-way through with a UnicodeEncodeError. The tool's stdout setup now reconfigures the
+    # encoding too. Driven on a real text stream that starts as cp1252: before the fix it raises on
+    # the write; after it, the line prints, and a character even UTF-8 cannot carry... does not exist,
+    # so `replace` is held by a stream re-narrowed to ASCII afterwards.
+    note = "v0.31.0 — fixes ‘stall’ handling for ≥ 2 devices"       # em dash, curly quotes, ≥
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    with pytest.raises(UnicodeEncodeError):                           # the console as it was
+        stream.write(note); stream.flush()
+    raw.seek(0); raw.truncate()
+    assert dv.unbuffer_stdout(stream) is True
+    stream.write(note + "\n"); stream.flush()
+    printed = raw.getvalue().decode("utf-8").replace("\r\n", "\n")   # the wrapper's newline is the OS's
+    assert printed == note + "\n"                                     # printed whole, as UTF-8
+    assert stream.line_buffering is True                              # the original purpose is kept
+    # A stream that STILL cannot show a character prints a marker for it rather than dying: the
+    # same setup with `replace` is what makes that so. Held on an ASCII stream re-set the same way.
+    raw2 = io.BytesIO()
+    narrow = io.TextIOWrapper(raw2, encoding="ascii", errors="strict")
+    narrow.reconfigure(line_buffering=True, errors="replace")        # what unbuffer_stdout sets, minus the utf-8
+    narrow.write(note + "\n"); narrow.flush()
+    assert raw2.getvalue().replace(b"\r\n", b"\n") == b"v0.31.0 ? fixes ?stall? handling for ? 2 devices\n"
