@@ -15768,6 +15768,21 @@ const uploadManager = {
         return fetch(url, signal ? { ...(opts || {}), signal } : (opts || {}));
     },
 
+    // A request that belongs to no upload RUN -- the tray's own refresh -- still belongs to an
+    // ACCOUNT, so it goes through the same door on a throwaway run: stamped with the current epoch
+    // and registered for abort, so a sign-out refuses it if it has not left and tears it down if it
+    // has. Its answer names the previous account's in-flight filenames, which is exactly what must
+    // not arrive in the next account's tray.
+    _transientRun() {
+        const run = { _epoch: this._epoch || 0, _abort: new AbortController() };
+        this._aborts.add(run._abort);
+        return run;
+    },
+
+    _endTransientRun(run) {
+        try { this._aborts.delete(run._abort); } catch (_) { /* nothing to release */ }
+    },
+
     _signedOutError() {
         const e = new Error('The account signed out while this upload was running.');
         e.signedOut = true;
@@ -15872,11 +15887,16 @@ const uploadManager = {
         if (!state.currentVault) return;
         const vaultId = state.currentVault.id;
         let sessions = [];
+        const probe = this._transientRun();
         try {
-            const r = await fetch(`${API_BASE}/vaults/${vaultId}/uploads`, { headers: this._vaultHeaders() });
+            const r = await this._send(probe, `${API_BASE}/vaults/${vaultId}/uploads`,
+                { headers: this._vaultHeaders() });
             if (!r.ok) return;
             sessions = await r.json();
-        } catch (_) { return; }
+        } catch (_) { return; } finally { this._endTransientRun(probe); }
+        // The account may have signed out while the listing was in flight: its rows name the
+        // previous account's files, so they are dropped rather than drawn for whoever is here now.
+        if (this._stale(probe)) return;
 
         // Drop stale needs-file rows for this vault, then re-add from the server.
         for (const [id, it] of this.items) {
@@ -16901,7 +16921,7 @@ const uploadManager = {
                 return await this._restartAsNewAttempt(it, file);
             }
             let held = [];
-            const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+            const s = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
                 { headers: this._vaultHeaders() });
             if (s.ok) held = (await s.json()).received_chunks || [];
             const lib = eccLib();
@@ -16935,7 +16955,7 @@ const uploadManager = {
     // NEW upload session. The old session is discarded first; it never adopts these bytes.
     async _restartAsNewAttempt(it, file) {
         try {
-            await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+            await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
                 { method: 'DELETE', headers: this._vaultHeaders() });
         } catch (_) { /* best effort; the server also refuses a different token on that session */ }
         if (it.sessionId) await zkUploadStore.delete(it.sessionId);

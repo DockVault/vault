@@ -202,6 +202,11 @@ const eccLib = () => lib;
 %s
 const um = {
     _vaultHeaders() { return {}; },
+    // Every request the manager makes goes through the gate, this one included: the harness lifts
+    // the real one rather than stubbing it, so a reopen that bypassed it would not be exercised here.
+    _epoch: 0, _aborts: new Set(),
+    _stale(it) { return it._epoch !== undefined && it._epoch !== (this._epoch || 0); },
+    _send(it, url, opts) { if (this._stale(it)) throw new Error('signed out'); return fetch(url, opts); },
     _restartAsNewAttempt(it, file) { log.push('restart'); this.restarted = { it: it.id, file: file.bytes }; },
     _start(it) { log.push('start'); this.started = it.id; },
 %s

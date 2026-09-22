@@ -908,12 +908,20 @@ const state = { currentVault: { id: 'V' }, currentFolderId: null };
 let zkVault = false, saved = null;
 const isZkVault = () => zkVault;
 const zkUploadStore = { get: async () => saved, allForVault: async () => [] };
-let listed = [];
-const fetch = async () => ({ ok: true, json: async () => listed });
+let listed = [], signOutDuringFetch = false;
+const fetch = async () => {
+    // A sign-out that lands while the listing is in flight, when the test asks for one.
+    if (signOutDuringFetch) { um._epoch = (um._epoch || 0) + 1; }
+    return { ok: true, json: async () => listed };
+};
 const um = { items: new Map(), seq: 0, started: [], render() {}, _vaultHeaders() { return {}; },
     run(id) { const r = this.items.get(id); this.started.push([r.sessionId, r.paused]); },
     _newId() { return 'up_' + (++this.seq); },
-""" + "".join(_uploader_method(js, n) for n in ("enqueueNamed", "_start", "_serverMs", "async _refreshResumableInner")) + """
+    _epoch: 0, _aborts: new Set(),
+""" + "".join(_uploader_method(js, n) for n in (
+        "enqueueNamed", "_start", "_serverMs", "async _refreshResumableInner",
+        # the one door every request goes through, and the throwaway run a non-run request uses
+        "_stale", "_send", "_signedOutError", "_transientRun", "_endTransientRun")) + """
 };
 const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 5, total_chunks: 1, folder_id: null, created_at });
 (async () => {
@@ -936,7 +944,15 @@ const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 
     um.started.length = 0; zkVault = true; saved = { blob: { size: 5 }, chunkSize: 5 };
     listed = [sess('saved-here', '2026-01-03T00:00:00')];
     await um._refreshResumableInner();
-    process.stdout.write(JSON.stringify({ rows, autoStarted: um.started, dropped,
+    // A sign-out DURING the listing: its rows name the previous account's files, so none of them
+    // may be drawn for whoever is at the keyboard now, and the throwaway run's controller is gone.
+    const autoStarted = um.started.slice();   // captured before the next leg reuses the array
+    um.items.clear(); um.started.length = 0; zkVault = false; saved = null;
+    signOutDuringFetch = true;
+    listed = [sess('after-signout', '2026-01-04T00:00:00')];
+    await um._refreshResumableInner();
+    const afterSignOut = { rows: [...um.items.values()].length, aborts: um._aborts.size };
+    process.stdout.write(JSON.stringify({ rows, autoStarted, dropped, afterSignOut,
         newer: Date.parse('2026-01-02T00:00:00Z'), older: Date.parse('2026-01-01T00:00:00Z') }));
 })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
@@ -971,6 +987,12 @@ const sess = (id, created_at) => ({ session_id: id, file_name: 'X', total_size: 
     assert by_session["newer"]["status"] == "needs-file"
     assert not any(r["sessionId"] == "kept" and r["id"] != "listedRestored" for r in out["rows"]), "a listed session was rebuilt twice"
 
+
+    # The refresh's request is not a RUN's, but it is an ACCOUNT's: a sign-out while it is in
+    # flight must leave nothing of the previous account in the next one's tray, and must not leave
+    # the throwaway run's controller behind either. (mutation: drop the staleness check after the
+    # listing -> the row is re-added -> red; drop the _endTransientRun -> the controller leaks.)
+    assert out["afterSignOut"] == {"rows": 0, "aborts": 0}, out["afterSignOut"]
 
 def test_a_vault_with_no_index_key_is_asked_about_it_once():
     node = shutil.which("node")

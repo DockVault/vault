@@ -213,17 +213,24 @@ def test_the_next_account_uploads_normally_and_the_first_accounts_run_is_gone():
     assert out["nextStatus"] == "done"
 
 
-def test_the_gate_and_the_controller_are_the_only_way_a_run_reaches_the_network():
-    # The source half, as a smoke alarm beside the driven tests above: on comment-free code, the
-    # run's path has no bare fetch left, and every request goes through the one gate.
-    from pathlib import Path
+def test_the_gate_and_the_controller_are_the_only_way_the_manager_reaches_the_network():
+    # This test used to name SIX methods and check each for a bare fetch. That is an allowlist: the
+    # two methods it did not name -- the pipelined reopen's GET and the restart's DELETE -- carried
+    # the live token past the gate, with no epoch and no abort signal, and were invisible to it BY
+    # CONSTRUCTION. So did a third, the tray refresh, which is not a run's request at all.
+    #
+    # The rule is now a COUNT, which cannot be defeated by adding a seventh name: the whole
+    # uploadManager literal holds exactly ONE `fetch(`, and it is inside the gate.
     from _js_source import strip_comments
     from test_upload_tray_controls import _method, APP_JS
-    js = APP_JS.read_text(encoding="utf-8")
-    for head in ("async _run(id) {", "async _serverHoldsAll(it) {", "async _fireReplacement(it) {",
-                 "async cancel(id, forReplacement) {", "async _abandonSession(it) {", "async _init(it) {"):
-        body = strip_comments(_method(js, head))
-        assert "await fetch(" not in body and " fetch(" not in body.replace("this._send(", ""), head
+    js = strip_comments(APP_JS.read_text(encoding="utf-8"))
+    start = js.index("const uploadManager = {")
+    manager = js[start:js.index("\n};", start)]
+    assert manager.count("fetch(") == 1, (
+        "every request the manager makes goes through _send; found %d fetch( in the manager"
+        % manager.count("fetch(")
+    )
+    assert "fetch(" in strip_comments(_method(js, "_send(it, url, opts, onBehalfOf) {"))
     send = strip_comments(_method(js, "_send(it, url, opts, onBehalfOf) {"))
     assert send.index("if (this._stale(run)) throw") < send.index("return fetch(")
     reset = strip_comments(_method(js, "reset() {"))
