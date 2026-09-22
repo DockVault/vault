@@ -979,7 +979,10 @@ def _interrupt_reload_and_repick(page, vid, name, first_half, second_half, repic
     page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
     page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
     expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
-    expect(page.locator("#upload-tray")).to_contain_text("Resumable", timeout=10000)
+    # The rebuilt row: what it TELLS the user (the sentence the tray shows for a Standard row waiting
+    # for its file) and what it OFFERS (the re-pick button). The status label is not asserted -- it
+    # is not what the row renders for this state, and only a run of this test showed that.
+    expect(page.locator("#upload-tray")).to_contain_text("click Resume and re-select the file", timeout=10000)
     expect(page.locator('#upload-tray button[data-up-action="resume"]')).to_be_visible(timeout=10000)
     # Count what the re-pick sends, and let a scenario shape the wire (e.g. strip the digests).
     page.evaluate("""() => {
