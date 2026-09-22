@@ -571,7 +571,7 @@ def test_a_dropped_replacement_names_the_file_and_says_what_did_not_happen():
     # the tray): what landed is noted apart from the rows, by the name it held, and landing first
     # drops the replacement, not the landed file. It is read before any cancel on every turn.
     assert fire.count("if (this._landedSince(it)) {") == 1
-    assert fire.index("if (this._landedSince(it)) {") < fire.index("await this.cancel(rival.id, true)")
+    assert fire.index("if (this._landedSince(it)) {") < fire.index("await this.cancel(rival.id, it)")
     # The cancels that happened are said on every way out, counted, and by name.
     assert 'cancelled === 1 ? `The earlier upload of "${name}" was cancelled.`' in fire
     assert '`${cancelled} earlier uploads of "${name}" were cancelled.`' in fire
@@ -807,7 +807,7 @@ const API_BASE = '';
 let reply;
 const fetch = async () => ({ ok: true, json: async () => reply });
 const um = { _vaultHeaders() { return {}; },
-""" + _uploader_method(js, "_serverMs") + _uploader_method(js, "async _init") + """
+""" + "".join(_uploader_method(js, n) for n in ("_serverMs", "async _init", "_stale", "_send", "_signedOutError")) + """
 };
 const open = async (created_at) => { reply = { session_id: 'S', received_chunks: [], created_at };
     const it = { vaultId: 'V', isZk: false, fileName: 'X', file: { type: '' }, totalSize: 1, totalChunks: 1, chunkSize: 1, folderId: null };

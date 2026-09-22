@@ -119,15 +119,26 @@ def test_the_three_gates_share_one_answer():
 
 SERVER = """
 const API_BASE = '';
+const ZK_RESUME_MAX_FRAMES = 16384;
 const state = { currentVault: null };
 const log = [];                                  // requests AND toasts, in the order they happened
 const server = { refuse: new Set(), unreachable: new Set(), stalled: new Set(), onGet: null,
     park: new Set(), parked: new Map(), puts: [], held: null, onInit: null, completes: [] };
 const calls = () => log.filter(e => !e.startsWith('toast'));
 const toasts = () => log.filter(e => e.startsWith('toast'));
-const fetch = async (url, opts) => {
+const signals = [];                              // the signal each request was sent with, in order
+const abortable = (p, signal) => !signal ? p : new Promise((res, rej) => {
+    const abort = () => { const e = new Error('aborted'); e.name = 'AbortError'; rej(e); };
+    if (signal.aborted) return abort();
+    signal.addEventListener('abort', abort);
+    Promise.resolve(p).then(res, rej);
+});
+const fetch = (url, opts) => abortable(_fetch(url, opts), opts && opts.signal);
+const _fetch = async (url, opts) => {
     const method = (opts && opts.method) || 'GET';
     log.push(method + ' ' + url);
+    signals.push(opts && opts.signal);
+    if (server.onRequest) await server.onRequest(method, url);
     const sess = url.split('/uploads/')[1] || '';
     if (method === 'DELETE') {
         if (server.unreachable.has(sess)) throw new Error('network');
@@ -154,14 +165,14 @@ const setTimeout = (fn) => { timers.push(fn); };
 const flush = () => { while (timers.length) timers.shift()(); };
 const settle = () => new Promise(r => setImmediate(r));
 const records = [];
-const zkUploadStore = { delete: async (id) => { records.push(id); } };
+const zkUploadStore = { delete: async (id) => { records.push(id); }, put: async (rec) => { records.push('put ' + rec.sessionId); return { ok: true }; } };
 const document = { getElementById: () => null };
 const showError = (m) => log.push('toast error ' + m);
 const showInfo = (m) => log.push('toast info ' + m);
 const showWarning = (m) => log.push('toast warning ' + m);
 const loadVaultFiles = async () => {};
 const um = {
-    items: new Map(), _landed: [], seq: 100, _vaultHeaders() { return {}; }, render() {},
+    items: new Map(), _landed: [], _aborts: new Set(), seq: 100, _vaultHeaders() { return {}; }, render() {},
     run(id) { return (this.lastRun = this._run(id)); },
     async _init(it) { log.push('init'); if (server.onInit) await server.onInit(it); it.sessionId = it.sessionId || 'renewed-sess'; },
     _reselect(id) { log.push('reselect ' + id); },
@@ -177,10 +188,10 @@ const victim = (extra) => sent('v', 'old-sess', { order: 1, ...extra });
 const SHOWN = { sessions: ['old-sess', 'a-sess', 'w-sess', 's1', 's2', 's3'], items: ['v', 'q'] };
 const chose = (deleteId) => ({ deleteId: deleteId || null, known: SHOWN });
 const ours = (extra) => sent('o', 'new-sess', { order: 2, replaces: chose(), ...extra });
-const fresh = (...its) => { log.length = 0; records.length = 0; timers.length = 0; um._landed = []; um.seq = 100;
+const fresh = (...its) => { log.length = 0; records.length = 0; timers.length = 0; um._landed = []; um._aborts = new Set(); um.seq = 100;
     server.refuse = new Set(); server.unreachable = new Set(); server.stalled = new Set(); server.onGet = null;
     server.park = new Set(); server.parked = new Map(); server.puts = []; server.held = null;
-    server.onInit = null; server.completes = [];
+    server.onInit = null; server.completes = []; server.onRequest = null; signals.length = 0;
     um.items = new Map(its.map(it => [it.id, it])); };
 const row = (id) => { const it = um.items.get(id);
     return it ? { status: it.status, cancelled: it.cancelled, error: it.error || null } : null; };
@@ -200,7 +211,10 @@ LIFTED = ("async _run(id) {", "async _serverHoldsAll(it) {", "async _fireReplace
           "_noteLanded(it, epoch) {", "_landedSince(it) {",
           "_knownFrom(rows) {", "_isKnown(it, o) {", "_adoptRivals(it) {", "_rivalsToCancel(it) {",
           "async _abandonSession(it) {", "resume(id) {", "reset() {", "_canRepick(it) {", "_controlSig(it) {",
-          "_start(it) {", "_rowForPick(was) {")
+          "_start(it) {", "_rowForPick(was) {",
+          # the run's account: every request and every toast on the run's path asks it
+          "_stale(it) {", "_send(it, url, opts, onBehalfOf) {", "_signedOutError() {", "_signedOut(err, it) {", "_say(it, fn) {",
+          "async _persistResume(it) {")
 
 DEL_OLD, DEL_NEW = "DELETE /vaults/V/uploads/old-sess", "DELETE /vaults/V/uploads/new-sess"
 COMPLETE = "POST /vaults/V/uploads/new-sess/complete"
@@ -1163,7 +1177,8 @@ def test_the_source_half_on_code_only():
     # What landed is a LIST of records (name, place, when) -- a set of row ids cannot answer "did
     # this NAME land after I was dropped", and `.some` on a Set is a crash at the fire point.
     manager = js[js.index("const uploadManager = {"):js.index("    reset() {")]
-    assert manager.count("    _landed: [],\n") == 1 and "new Set()" not in manager
+    assert manager.count("    _landed: [],\n") == 1 and "_landed: new Set()" not in manager
+    assert "_landed = new Set()" not in js[js.index("const uploadManager = {"):js.index("    _vaultHeaders() {")]
     cancel = _code(js, "async cancel(id, forReplacement) {")
     assert cancel.count("gone = r.ok || r.status === 404;") == 1
     assert "if (!gone) {" in cancel and cancel.index("if (!gone) {") < cancel.index("this.items.delete(id);")
@@ -1177,12 +1192,13 @@ def test_the_source_half_on_code_only():
     # not ours to cancel is still there -- never to decide what is cancelled.
     assert fire.count("this._liveRivals(it)") == 1
     assert fire.index("this._liveRivals(it)") > fire.index("/delete`") and "showWarning(" in fire
-    assert fire.count("|| !(await this.cancel(rival.id, true))) {") == 1
+    assert fire.count("|| !(await this.cancel(rival.id, it))) {") == 1
     assert fire.count("(rival.sessionId && rival.sessionId === it.sessionId)") == 1
     assert "replacesFired" not in js
     # Withdrawn is read at the top of EVERY turn -- so before each cancel, after each wait, and,
     # on the turn that finds no rival left, before the file delete, with no await in between.
-    assert fire.count("const withdrawn = () => it.cancelled || it.status === 'error';") == 1
+    # ... and a sign-out counts as withdrawn: the account the step would act for is gone.
+    assert fire.count("const withdrawn = () => it.cancelled || it.status === 'error' || this._stale(it);") == 1
     # ... once per turn, and once more after the last destructive request.
     W, H = "if (withdrawn()) { sayCancelled(); return false; }", "if (held()) { sayCancelled(); return false; }"
     # Nothing in this step claims a REPLACEMENT: the commit comes after it and can still fail.
@@ -1193,12 +1209,12 @@ def test_the_source_half_on_code_only():
     loop = fire.index("for (let turn = 0; ; turn++) {")
     assert loop < fire.index(W) < fire.index(H) < fire.index("if (this._landedSince(it)) {") \
         < fire.index("const rival = this._rivalsToCancel(it)[0];") < fire.index("if (!rival) break;") \
-        < fire.index("await this.cancel(rival.id, true)") < fire.index("if (r.deleteId) {")
+        < fire.index("await this.cancel(rival.id, it)") < fire.index("if (r.deleteId) {")
     # `break` is the ONLY way out of the loop that goes on, and nothing is awaited between the
     # loop's end and the delete request -- so the read at the top of that last turn still holds.
     assert fire.count("break;") == 1
     after_loop = fire[fire.index("            cancelled++;\n        }\n"):fire.index("/delete`")]
-    assert after_loop.count("await ") == 1 and "await fetch(" in after_loop
+    assert after_loop.count("await ") == 1 and "await this._send(it, " in after_loop
     drop = _code(js, "async _dropReplacement(it, message) {")
     assert drop.index("showError(message);") < drop.index("it.status = 'error';") \
         < drop.index("if (!(await this.cancel(it.id))) {")
@@ -1239,7 +1255,7 @@ def test_the_source_half_on_code_only():
     assert "this.run(id)" not in run
     retry = run.index("return await this._run(id);")
     assert run.rindex("it._running = false;", 0, retry) > run.index("missing_chunks")
-    assert run.count("} finally {\n            it._running = false;\n        }") == 1
+    assert run.count("} finally {\n            this._aborts.delete(it._abort);\n            it._running = false;\n        }") == 1
     # The refusal is decided on the row as it is THEN; no snapshot of it is taken at entry.
     assert "waitingForFile" not in cancel and cancel.count("if (it.status === 'needs-file') {") == 1
     assert cancel.index("it.cancelled = false;") < cancel.index("if (it.status === 'needs-file') {")

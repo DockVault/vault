@@ -15710,19 +15710,27 @@ const uploadManager = {
     // This can.
     _landed: [],
     seq: 0,
+    // One controller per run in flight; reset() aborts them all. See _send.
+    _aborts: new Set(),
 
     // Logout scrub (finding F-R015-004): drop the tray's items + its DOM WITHOUT cancelling — cancel()
     // fires a server DELETE per session, and on logout we only want to clear this browser's view so the
     // next user on a shared tab can't see the prior user's upload tray. render() with an empty Map
     // takes the "nothing in flight" branch; then remove the body-level tray element outright.
     reset() {
+        // The account is gone; the runs are not. Every request a run makes carries the LIVE token,
+        // so a run that outlives the sign-out would go on -- and, at its fire point, delete the
+        // last account's original UNDER THE NEXT ACCOUNT'S TOKEN, audited as them. Two things stop
+        // it, because one covers only half: the epoch below refuses every request a run has not
+        // yet made (checked in _send, in front of EACH one), and this abort tears down the ones
+        // already on the wire, so the answer to a request that has left is never acted on either.
+        this._epoch = (this._epoch || 0) + 1;
+        for (const ctl of this._aborts) { try { ctl.abort(); } catch (_) {} }
+        this._aborts.clear();
         try { this.items.clear(); } catch (_) {}
         // What landed names files of the account that just signed out. `seq` is NOT reset: it
         // only ever has to keep counting upwards.
         this._landed = [];
-        // A commit already on its way when the account signs out still comes back -- into a tray
-        // that now belongs to whoever signs in next. It checks this before it writes anything down.
-        this._epoch = (this._epoch || 0) + 1;
         try { this.render(); } catch (_) {}
         const tray = document.getElementById('upload-tray');
         if (tray) tray.remove();
@@ -15737,6 +15745,46 @@ const uploadManager = {
     },
 
     _newId() { return `up_${Date.now()}_${++this.seq}`; },
+
+    // Has the account that started this run signed out since? (`_epoch` is stamped on the item
+    // by _run; an item that has never run is judged by nothing and is never stale.)
+    _stale(it) {
+        return it._epoch !== undefined && it._epoch !== (this._epoch || 0);
+    },
+
+    // EVERY request a run makes goes through here, so the question "is this still that account's
+    // run?" is asked in front of each one and nowhere else. It is asked BEFORE the request, since
+    // the token the request would carry is whoever is signed in NOW; and the request is tied to
+    // the run's controller, so a sign-out mid-flight aborts it rather than letting its answer
+    // arrive into the next account's session. A request refused here throws an error the run
+    // recognises as "signed out" and leaves quietly: no row, no toast, no record.
+    //
+    // `onBehalfOf` is the run this request serves when it is not the item's own -- the cancel of
+    // an earlier upload is made for the upload that replaces it.
+    _send(it, url, opts, onBehalfOf) {
+        const run = onBehalfOf || it;
+        if (this._stale(run)) throw this._signedOutError();
+        const signal = run._abort ? run._abort.signal : undefined;
+        return fetch(url, signal ? { ...(opts || {}), signal } : (opts || {}));
+    },
+
+    _signedOutError() {
+        const e = new Error('The account signed out while this upload was running.');
+        e.signedOut = true;
+        return e;
+    },
+
+    _signedOut(err, it) {
+        return !!((err && (err.signedOut || err.name === 'AbortError')) || this._stale(it));
+    },
+
+    // Every toast a run shows goes through here: nothing is said on behalf of an account that has
+    // signed out. A toast naming the last account's file on the next person's screen is a
+    // disclosure to whoever is at the keyboard -- which is exactly who is there in this scenario.
+    _say(it, fn) {
+        if (this._stale(it)) return;
+        try { fn(); } catch (_) { /* toast optional */ }
+    },
 
     // Enqueue picked files, each under an explicit target name (the upload-conflict resolver's
     // auto-rename / rename land here too). The ONE way a picked file enters the tray: a second,
@@ -15975,7 +16023,7 @@ const uploadManager = {
     },
 
     async _init(it) {
-        const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads`, {
+        const r = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads`, {
             method: 'POST',
             headers: { ...this._vaultHeaders(), 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -16093,6 +16141,9 @@ const uploadManager = {
     },
 
     async _persistResume(it) {
+        // The store was cleared at sign-out; a run still going must not write the last account's
+        // record back into it.
+        if (this._stale(it)) return { ok: false, signedOut: true };
         if (it.zkPipelined && it.zkStream.totalChunks > ZK_RESUME_MAX_FRAMES) {
             return { ok: false, tooLarge: true };
         }
@@ -16105,6 +16156,8 @@ const uploadManager = {
     // shows the upload will still finish but can't be resumed. IndexedDB being entirely
     // unavailable (private mode etc.) is the documented graceful degrade and stays quiet.
     _noteResumePersistence(it, res) {
+        // Not written because the account signed out: not a storage problem, and not a word.
+        if (res && res.signedOut) return;
         if (!res || res.ok) { it.resumePersisted = true; it.resumeWarning = null; return; }
         it.resumePersisted = false;
         if (res.tooLarge) {
@@ -16200,6 +16253,9 @@ const uploadManager = {
         // Pause on a queued row would be a button that does nothing.)
         if (it.paused) { it.status = 'paused'; this.render(); return; }
         const epoch = this._epoch || 0;
+        it._epoch = epoch;
+        it._abort = new AbortController();
+        this._aborts.add(it._abort);
         it._running = true;
         it.status = 'uploading';
         it.error = null;
@@ -16218,7 +16274,7 @@ const uploadManager = {
                 // so we only replay the missing ones.
                 let detail = null;
                 try {
-                    const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, { headers: this._vaultHeaders() });
+                    const s = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, { headers: this._vaultHeaders() });
                     if (s.ok) { detail = await s.json(); it.received = new Set(detail.received_chunks || []); }
                 } catch (_) { /* fall back to re-sending all chunks (server is idempotent) */ }
                 it.needsServerSync = false;
@@ -16299,7 +16355,7 @@ const uploadManager = {
                     // the same bytes arrive (faster). The server reads a stream either way.
                     buf = blob;
                 }
-                const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/chunks/${i}`, {
+                const r = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/chunks/${i}`, {
                     method: 'PUT',
                     headers: { ...this._vaultHeaders(), 'Content-Type': 'application/octet-stream' },
                     body: buf,
@@ -16365,7 +16421,7 @@ const uploadManager = {
                               + 'completed. Nothing was lost -- please add the file again.');
             }
             const zkComplete = it.isZk && it.clientFileId;
-            const c = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/complete`, {
+            const c = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}/complete`, {
                 method: 'POST',
                 headers: zkComplete
                     ? { ...this._vaultHeaders(), 'Content-Type': 'application/json' }
@@ -16398,7 +16454,7 @@ const uploadManager = {
                 // under the current key).
                 if (c.status === 409 && e.detail && e.detail.code === 'stale_zk_epoch') {
                     try {
-                        await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+                        await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
                             { method: 'DELETE', headers: this._vaultHeaders() });
                     } catch (_) { /* best effort */ }
                     if (it.isZk && it.sessionId) await zkUploadStore.delete(it.sessionId);  // ciphertext unsalvageable
@@ -16424,18 +16480,22 @@ const uploadManager = {
             this.render();
             if (it.replacedCount) {
                 const n = it.replacedCount; it.replacedCount = 0;
-                try { showInfo(n === 1 ? `The earlier upload of "${it.fileName}" was replaced by this one.`
-                                       : `${n} earlier uploads of "${it.fileName}" were replaced by this one.`); } catch (_) {}
+                this._say(it, () => showInfo(n === 1 ? `The earlier upload of "${it.fileName}" was replaced by this one.`
+                                                      : `${n} earlier uploads of "${it.fileName}" were replaced by this one.`));
             }
             // Refresh the file list so the new file appears; drop the row shortly after.
             if (state.currentVault && state.currentVault.id === it.vaultId) await loadVaultFiles();
             setTimeout(() => { this.items.delete(id); this.render(); }, 4000);
         } catch (err) {
+            // Signed out while running: the run stops where it was, and writes nothing down -- the
+            // tray it would write into is the next account's.
+            if (this._signedOut(err, it)) return;
             if (it.cancelled) return;
             it.status = 'error';
             it.error = err.message || String(err);
-            if (epoch === (this._epoch || 0)) this.render();   // not into a tray that is someone else's now
+            this.render();
         } finally {
+            this._aborts.delete(it._abort);
             it._running = false;
         }
     },
@@ -16451,7 +16511,7 @@ const uploadManager = {
         if (!it.sessionId) return;
         let gone = false;
         try {
-            const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+            const r = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
                 { method: 'DELETE', headers: this._vaultHeaders() });
             gone = r.ok || r.status === 404;
         } catch (_) { gone = false; }
@@ -16522,7 +16582,7 @@ const uploadManager = {
         let s = it.lastPut;
         if (!s || !s.complete) {
             try {
-                const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
+                const r = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`,
                     { headers: this._vaultHeaders() });
                 if (!r.ok) return false;
                 const d = await r.json();
@@ -16681,7 +16741,7 @@ const uploadManager = {
         // withdrawn must not delete a file or cancel another upload on its way out. A cancel the
         // server refused clears `cancelled` and leaves 'error' -- and this run began as 'uploading',
         // so 'error' here can only mean that.
-        const withdrawn = () => it.cancelled || it.status === 'error';
+        const withdrawn = () => it.cancelled || it.status === 'error' || this._stale(it);
         // PAUSED is not withdrawn: nothing is said and nothing of ours is dropped. But no further
         // destructive step is taken either; the row waits as 'paused', and Resume comes back here.
         const held = () => {
@@ -16698,8 +16758,8 @@ const uploadManager = {
         // row is a claim about something that did not happen.
         const sayCancelled = () => {
             if (!cancelled) return;
-            try { showInfo(cancelled === 1 ? `The earlier upload of "${name}" was cancelled.`
-                                           : `${cancelled} earlier uploads of "${name}" were cancelled.`); } catch (_) {}
+            this._say(it, () => showInfo(cancelled === 1 ? `The earlier upload of "${name}" was cancelled.`
+                                                          : `${cancelled} earlier uploads of "${name}" were cancelled.`));
         };
         // THE EARLIER UPLOADS FIRST, the committed original after them. A cancel that is refused
         // then costs nothing -- the original is still there -- where the other order would have
@@ -16748,7 +16808,7 @@ const uploadManager = {
             // as one that could not be cancelled.
             const opening = !rival.sessionId && rival.status === 'uploading';
             if (turn >= 1000 || opening || (rival.sessionId && rival.sessionId === it.sessionId)
-                    || !(await this.cancel(rival.id, true))) {
+                    || !(await this.cancel(rival.id, it))) {
                 sayCancelled();
                 // After a cancel that DID happen, "the earlier upload" twice over would be two
                 // definite sentences about one thing that contradict each other.
@@ -16764,7 +16824,7 @@ const uploadManager = {
         if (r.deleteId) {
             let gone = false;
             try {
-                const d = await fetch(`${API_BASE}/vaults/${it.vaultId}/files/${r.deleteId}/delete`,
+                const d = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/files/${r.deleteId}/delete`,
                     { method: 'POST', headers: this._vaultHeaders() });
                 gone = d.ok || d.status === 404;   // already gone is gone
             } catch (_) { gone = false; }
@@ -16784,8 +16844,8 @@ const uploadManager = {
         // -- is still there. Leaving it alone is right; leaving it unmentioned is not: it can finish
         // later and replace the copy that is about to be committed.
         if (this._liveRivals(it).length) {
-            try { showWarning(`Another upload of "${name}" is still in progress and may replace this copy `
-                            + `when it finishes.`); } catch (_) {}
+            this._say(it, () => showWarning(`Another upload of "${name}" is still in progress and may replace this copy `
+                                         + `when it finishes.`));
         }
         return { cancelled };
     },
@@ -16794,6 +16854,9 @@ const uploadManager = {
     // with no bound on it, and a row left reading "Uploading 100%" for as long as it takes is a
     // row telling the user the opposite of what happened.
     async _dropReplacement(it, message) {
+        // Signed out meanwhile: nothing is said and nothing is requested (the cancel below is
+        // refused by _send); the row is in a tray that is no longer this account's.
+        if (this._stale(it)) return;
         showError(message);
         it.dropped = true;
         it.status = 'error';
@@ -16992,6 +17055,9 @@ const uploadManager = {
     async cancel(id, forReplacement) {
         const it = this.items.get(id);
         if (!it) return true;
+        // When it is a newer upload cancelling this one, `forReplacement` is that upload: the
+        // request is made for ITS run, and refused if that run's account has signed out.
+        const onBehalfOf = (forReplacement && typeof forReplacement === 'object') ? forReplacement : undefined;
         it.cancelled = true;
         it.paused = true;
         if (it.sessionId) {
@@ -17002,9 +17068,9 @@ const uploadManager = {
             this.render();
             let gone = false;
             try {
-                const r = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, {
+                const r = await this._send(it, `${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, {
                     method: 'DELETE', headers: this._vaultHeaders(),
-                });
+                }, onBehalfOf);
                 gone = r.ok || r.status === 404;   // already gone is gone
             } catch (_) { gone = false; }
             if (!gone) {
@@ -17022,9 +17088,9 @@ const uploadManager = {
                     // is waiting for -- and for one sealed up front, whose data is not on this
                     // device, its Resume only ever answers with an error. So the row is left
                     // exactly as it was and the refusal is said beside it.
-                    showError(forReplacement
+                    this._say(onBehalfOf || it, () => showError(forReplacement
                         ? `A newer upload of "${it.fileName}" could not cancel this one — the server did not confirm it.`
-                        : `Could not cancel "${it.fileName}" — the server did not confirm it. Try again.`);
+                        : `Could not cancel "${it.fileName}" — the server did not confirm it. Try again.`));
                 } else {
                     it.status = 'error';
                     it.error = forReplacement
