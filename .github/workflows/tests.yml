@@ -210,8 +210,14 @@ jobs:
               browser.close()
           PY
 
+      # faulthandler_timeout: pytest's built-in watchdog. If ONE test runs past this many seconds,
+      # every thread's stack in the test process is dumped to this log -- and the test goes on. The
+      # slowest legitimate module here takes about two minutes; a suite that has hung three times
+      # deserves a standing instrument that says WHERE it is stuck, not only that it is. Without it a
+      # hang is a log of dots until the job cap, which also loses the JUnit report below (the file is
+      # written at session end, which a capped run never reaches).
       - name: Run the full test suite
-        run: python -m pytest --maxfail=1 --junitxml=pytest-results.xml
+        run: python -m pytest --maxfail=1 --junitxml=pytest-results.xml -o faulthandler_timeout=300
 
       # Keep the JUnit report -- it holds the per-test durations for all ~4,000 tests. Uploaded
       # always (not only on failure), before the audit step below, so it survives a failing run too:
@@ -522,8 +528,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # On anything but success. `failure()` alone skipped exactly the case that most needs the
+      # logs: a job killed by its cap is `cancelled`, not `failure`, and three capped runs left no
+      # container log at all. `!success()` runs for a failure and for a cancel, and stays quiet on
+      # a green run.
       - name: Container logs
-        if: failure()
+        if: ${{ !success() }}
         run: docker compose logs --no-color --tail=400
 
       - name: Tear the stack down
