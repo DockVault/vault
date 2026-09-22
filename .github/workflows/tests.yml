@@ -528,12 +528,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # On anything but success. `failure()` alone skipped exactly the case that most needs the
-      # logs: a job killed by its cap is `cancelled`, not `failure`, and three capped runs left no
-      # container log at all. `!success()` runs for a failure and for a cancel, and stays quiet on
-      # a green run.
+      # On a failure AND on a cancel, quiet on green. `failure()` alone skipped exactly the case that
+      # most needs the logs: a job killed by its cap is `cancelled`, not `failure`, and three capped
+      # runs left no container log at all. Not `!success()`, tempting as it reads: once a job is
+      # cancelled GitHub skips every remaining step unless its condition NAMES `always()` or
+      # `cancelled()` -- a condition that merely evaluates true is not enough -- so the
+      # cancel-aware function has to be spelled out here for the step to run at all.
       - name: Container logs
-        if: ${{ !success() }}
+        if: ${{ failure() || cancelled() }}
         run: docker compose logs --no-color --tail=400
 
       - name: Tear the stack down
