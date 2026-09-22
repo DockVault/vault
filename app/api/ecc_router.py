@@ -31,6 +31,7 @@ from app.core.temp_scope import (
 from app.core.key_wrap_algorithms import (
     DIRECT_DEK_ALGO,
     DIRECT_DEK_ALGOS,
+    NAME_INDEX_ALGO,
     classify as _classify_algo,
 )
 from app.core.zk_temp_access import (
@@ -1060,6 +1061,10 @@ async def put_vault_index_key(
             user_id=uid,
             encrypted_index_key=wrap.encrypted_index_key,
             ephemeral_public_key=wrap.ephemeral_public_key,
+            # The bytes are a v2 name-index wrap (the client's wrapNameIndexKeyV2 is ungated), and
+            # the label must say so: omitted, the column default is a MEMBER-KEY label, and an
+            # index row wearing it is a direct DEK wrap to any query that filters by kind.
+            wrapping_algorithm=NAME_INDEX_ALGO,
             granted_by=current_user.id,
         ))
     try:

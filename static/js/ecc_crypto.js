@@ -1326,7 +1326,11 @@ class ECCCryptoLibrary {
         // Reserved bytes are a breaking-change channel, not an extension channel: a non-zero
         // value means bytes this build cannot reason about, so it is malformed rather than new.
         if (reserved !== 0) return 'INVALID';
-        if (purpose < 0x01 || purpose > 0x04) return 'INVALID';
+        // Every purpose the grammar defines (0x01-0x06: the member-key and content wraps, the
+        // name-index key, the link token). This helper answers "is it a v2 envelope at all", so
+        // a purpose that exists must not read as malformed just because no caller of this helper
+        // inspects it today; the reader for each purpose checks the byte itself.
+        if (purpose < 0x01 || purpose > 0x06) return 'INVALID';
         // Any version, including a future one, is "we recognise this and cannot read it".
         if (version < 0x02) return 'INVALID';
         return 'UNSUPPORTED';

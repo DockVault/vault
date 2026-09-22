@@ -21863,6 +21863,22 @@ def _backfill_notelink_tokens():
               f"boot completes the migration: {e}")
 
 
+def _relabel_name_index_keys():
+    """Give every name-index-key row the label that names its bytes (a v2 name-index wrap), where the
+    write site used to leave the column default -- a member-key label (idempotent; a marker makes it a
+    no-op after the first run). Nothing reads the column today, so the only cost of a failure is the
+    mislabel persisting until a later boot. Logic lives in app.core.name_index_label_migration."""
+    try:
+        from app.core.database import get_db_context
+        from app.core.name_index_label_migration import relabel_name_index_keys
+        with get_db_context() as db:
+            relabelled = relabel_name_index_keys(db)
+        if relabelled:
+            print(f"[OK] Relabelled {relabelled} name-index-key wrap(s) with the name-index label")
+    except Exception as e:  # noqa: BLE001 -- never block boot; the migration retries next boot
+        print(f"⚠ name-index-key relabel skipped: {e}")
+
+
 def _backfill_file_checksums():
     """Seal any legacy plaintext file content checksums at rest (idempotent, batched). Covers every
     file (ZK + Standard). Best-effort: never block boot. Logic lives in app.core.file_migrations."""
@@ -22087,6 +22103,7 @@ async def lifespan(app: FastAPI):
     _backfill_file_checksums()          # seal any legacy plaintext file content checksums at rest
     _purge_audit_log_names()            # strip residual plaintext names from legacy audit-log rows
     _backfill_notelink_tokens()         # hash legacy plaintext note-link tokens at rest
+    _relabel_name_index_keys()          # name-index-key rows: the label that names their bytes
     _release_finished_cred_slots()      # free cap slots of credentials finished before this upgrade
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _admin_bootstrap_status = _seed_admin_user()

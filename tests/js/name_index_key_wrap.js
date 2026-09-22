@@ -104,6 +104,18 @@ async function main() {
     // The wrap is the same fixed 68 bytes as the direct DEK wrap.
     note(good.length === lib.V2_DIRECT_WRAP_BYTES, `wrap is ${lib.V2_DIRECT_WRAP_BYTES} bytes (got ${good.length})`);
 
+    // The general header inspector recognises this wrap as a v2 envelope: a purpose the grammar
+    // defines must not read as MALFORMED just because none of the inspector's callers looks at it
+    // today. (It used to whitelist 0x01-0x04 only, so a real index-key or link-token wrap was
+    // 'INVALID' -- "not a payload at all" -- to any future caller that asked.)
+    note(lib._inspectV2Header(good) === 'UNSUPPORTED', 'the header inspector reads an index-key wrap (0x05) as a v2 envelope');
+    const linkTok = good.slice(); linkTok[5] = lib.V2_PURPOSE_LINK_TOKEN;
+    note(lib._inspectV2Header(linkTok) === 'UNSUPPORTED', 'the header inspector reads a link-token purpose (0x06) as a v2 envelope');
+    const beyond = good.slice(); beyond[5] = 0x07;
+    const none = good.slice(); none[5] = 0x00;
+    note(lib._inspectV2Header(beyond) === 'INVALID' && lib._inspectV2Header(none) === 'INVALID',
+        'a purpose the grammar does not define (0x00, 0x07) is still malformed to the inspector');
+
     if (failures) { console.error(`${failures} failure(s)`); process.exit(1); }
     console.log('index-key wrap round-trips, is bound to (vault, recipient), and cannot be swapped with a DEK wrap');
 }

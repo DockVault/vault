@@ -48,3 +48,13 @@ def test_bound_to_the_recipient_and_the_vault(out: str) -> None:
 def test_structural_checks_before_key_work(out: str) -> None:
     assert "ok   a wrong length is rejected" in out, out
     assert "ok   a non-zero reserved byte is rejected" in out, out
+
+
+def test_the_general_header_inspector_knows_every_purpose_the_grammar_defines(out: str) -> None:
+    """A latent trap, not a live one: no caller of _inspectV2Header sees an index-key or link-token
+    wrap today, but the helper reads as general and used to answer 'INVALID' (not a payload at
+    all) for two purposes the grammar defines. Now every defined purpose is a v2 envelope to it, and
+    an undefined one is still malformed."""
+    assert "ok   the header inspector reads an index-key wrap (0x05) as a v2 envelope" in out, out
+    assert "ok   the header inspector reads a link-token purpose (0x06) as a v2 envelope" in out, out
+    assert "ok   a purpose the grammar does not define (0x00, 0x07) is still malformed to the inspector" in out, out

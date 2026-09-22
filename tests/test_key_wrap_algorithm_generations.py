@@ -37,11 +37,16 @@ from app.core.key_wrap_algorithms import (
     DIRECT_DEK_ALGO_V1,
     DIRECT_DEK_ALGO_V2,
     DIRECT_DEK_ALGOS,
+    NAME_INDEX_ALGO,
+    NAME_INDEX_ALGOS,
     TEAMPRIV_ALGO,
     TEAMPRIV_ALGO_V1,
     TEAMPRIV_ALGO_V2,
     TEAMPRIV_ALGOS,
     classify,
+    is_direct_dek,
+    is_name_index,
+    is_teampriv,
 )
 
 _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
@@ -54,14 +59,18 @@ _CRYPTO_JS = os.path.join(os.path.dirname(_APP), "static", "js", "ecc_crypto.js"
 # =================================================================================================
 
 @pytest.mark.unit
-def test_the_two_vocabularies_are_disjoint():
-    """A label naming both kinds would make one filter match the other's rows.
+def test_the_vocabularies_are_pairwise_disjoint():
+    """A label naming two kinds would make one filter match the other's rows.
 
-    The two kinds sit on different epoch axes, so the prune would then apply one axis's floor to
-    the other axis's rows -- deleting a team-private wrap needed to unwrap a live DEK epoch, which
-    locks the whole vault out with nothing on the server able to undo it.
+    The two member-key kinds sit on different epoch axes, so the prune would then apply one
+    axis's floor to the other axis's rows -- deleting a team-private wrap needed to unwrap a live
+    DEK epoch, which locks the whole vault out with nothing on the server able to undo it. The
+    name-index kind has no epoch at all, so a shared label there would put epoch-less rows in
+    front of an epoch filter.
     """
     assert not (DIRECT_DEK_ALGOS & TEAMPRIV_ALGOS)
+    assert not (NAME_INDEX_ALGOS & DIRECT_DEK_ALGOS)
+    assert not (NAME_INDEX_ALGOS & TEAMPRIV_ALGOS)
 
 
 @pytest.mark.unit
@@ -74,6 +83,7 @@ def test_what_we_write_is_something_we_accept():
     """
     assert DIRECT_DEK_ALGO in DIRECT_DEK_ALGOS
     assert TEAMPRIV_ALGO in TEAMPRIV_ALGOS
+    assert NAME_INDEX_ALGO in NAME_INDEX_ALGOS
 
 
 @pytest.mark.unit
@@ -84,6 +94,26 @@ def test_an_unregistered_label_classifies_as_unknown_rather_than_as_a_guess():
     assert classify(None) is None
     assert classify(TEAMPRIV_ALGO) == "teampriv"
     assert classify(DIRECT_DEK_ALGO) == "direct"
+    assert classify(NAME_INDEX_ALGO) == "name_index"
+
+
+@pytest.mark.unit
+def test_the_index_key_write_site_stamps_a_name_index_label_and_never_a_member_key_one():
+    """The name-index wrap is a THIRD kind. Its write site used to omit the label and take the
+    column default -- a member-key label -- so every index row was a direct DEK wrap to any query
+    that filters by kind. The fix is a label of its own, not an existing constant: stamping
+    DIRECT_DEK_ALGO_V2 there would fix the generation and keep the kind wrong.
+    """
+    router = open(os.path.join(_APP, "api", "ecc_router.py"), encoding="utf-8").read()
+    flat = re.sub(r"\s+", " ", router)
+    sites = [m.start() for m in re.finditer(r"(?<!class )VaultMemberIndexKey\(", flat)]
+    assert sites, "the index-key write site moved"
+    for at in sites:
+        call = flat[at:flat.index("))", at)]
+        assert "wrapping_algorithm=NAME_INDEX_ALGO" in call, call[:160]
+    # And that label is a name-index label and NOT a member-key label of either kind.
+    assert is_name_index(NAME_INDEX_ALGO)
+    assert not is_direct_dek(NAME_INDEX_ALGO) and not is_teampriv(NAME_INDEX_ALGO)
 
 
 @pytest.mark.unit
@@ -266,8 +296,10 @@ def test_every_member_key_construction_sets_the_label_explicitly():
     missing = []
     for path, src in _app_sources():
         flat = re.sub(r"\s+", " ", src)
-        # `class VaultMemberKey(Base)` is the declaration, not a construction.
-        for m in re.finditer(r"(?<!class )VaultMemberKey\(", flat):
+        # `class VaultMemberKey(Base)` is the declaration, not a construction. The index-key table
+        # has the same column with the same (member-key) default, so its constructions are held
+        # to the same rule.
+        for m in re.finditer(r"(?<!class )VaultMember(?:Index)?Key\(", flat):
             depth, i = 0, m.end() - 1
             while i < len(flat):
                 if flat[i] == "(":
@@ -279,7 +311,7 @@ def test_every_member_key_construction_sets_the_label_explicitly():
                 i += 1
             call = flat[m.end():i]
             if "wrapping_algorithm" not in call:
-                missing.append(f"{os.path.relpath(path, _APP)}: VaultMemberKey({call[:90]}...")
+                missing.append(f"{os.path.relpath(path, _APP)}: {flat[m.start():m.end()]}{call[:90]}...")
     assert not missing, (
         "pass wrapping_algorithm explicitly; omitting it falls back to the column default:\n  "
         + "\n  ".join(missing)

@@ -7,6 +7,15 @@ discriminator between two completely different kinds of row that share one table
   * a *team private* wrap — the team keypair's private half, wrapped to one member, keyed by
     the entirely separate TEAM epoch.
 
+A THIRD kind lives in its own table (`VaultMemberIndexKey`): the per-vault *name-index key*,
+wrapped to one member exactly like a direct DEK on the wire but with its own purpose byte, and
+carrying NO epoch at all. It is registered here, with its own label, for the same reason the other
+two are: a query that filters by membership in one of these sets must never sweep up a row of
+another kind, and an inventory that asks "which rows are legacy AES-KW wraps?" must not be told
+yes about rows that are v2. Stamping an index row with a member-key label -- as the write site
+once did by omission, taking the column default -- would have made it indistinguishable from a
+direct DEK wrap to any such query, which is the axis-crossing this module exists to prevent.
+
 The two live on different version axes, so mixing them up does not merely mislabel a row: it
 applies one axis's floor to the other axis's rows. That is why every query that touches this
 table pairs the label with a `key_version`, and why the stale-key prune's `db.delete()` filters
@@ -64,19 +73,28 @@ DIRECT_DEK_ALGO_LEGACY = 'ECDH-AES-256-GCM'
 # queries accept these alongside generation 1, because the failure mode of a late widening is silent.
 DIRECT_DEK_ALGO_V2 = 'ECDH-P384-AES-GCM-DIRECT-V2'
 TEAMPRIV_ALGO_V2 = 'ECDH-P384-AES-GCM-TEAMPRIV-V2'
+# The name-index key has only ever been wrapped by the v2 writer (the table and the wrap shipped in
+# the same release), so it has one generation and no legacy label of its own. Rows written before
+# this label existed carry the column default -- a member-key label that was never true of them --
+# and a marker-guarded boot migration relabels them (app/core/name_index_label_migration.py).
+NAME_INDEX_ALGO_V2 = 'ECDH-P384-AES-GCM-NAMEIDX-V2'
 
 # --- what we accept --------------------------------------------------------------------------
 DIRECT_DEK_ALGOS = frozenset({DIRECT_DEK_ALGO_LEGACY, DIRECT_DEK_ALGO_V1, DIRECT_DEK_ALGO_V2})
 TEAMPRIV_ALGOS = frozenset({TEAMPRIV_ALGO_V1, TEAMPRIV_ALGO_V2})
-ALL_KNOWN_ALGOS = DIRECT_DEK_ALGOS | TEAMPRIV_ALGOS
+NAME_INDEX_ALGOS = frozenset({NAME_INDEX_ALGO_V2})
+ALL_KNOWN_ALGOS = DIRECT_DEK_ALGOS | TEAMPRIV_ALGOS | NAME_INDEX_ALGOS
 
-# The two kinds must never share a label; if they did, one filter would match the other's rows
-# and the prune would apply the wrong epoch floor to them.
-assert not (DIRECT_DEK_ALGOS & TEAMPRIV_ALGOS), "a label cannot name both kinds of wrap"
+# No two kinds may share a label; if they did, one filter would match another's rows -- the prune
+# would apply the wrong epoch floor to them, or sweep up index rows that have no epoch at all.
+assert not (DIRECT_DEK_ALGOS & TEAMPRIV_ALGOS), "a label cannot name both kinds of member-key wrap"
+assert not (NAME_INDEX_ALGOS & (DIRECT_DEK_ALGOS | TEAMPRIV_ALGOS)), \
+    "a name-index label cannot name a member-key wrap"
 
 # --- what we write ----------------------------------------------------------------------------
 DIRECT_DEK_ALGO = DIRECT_DEK_ALGO_V2
 TEAMPRIV_ALGO = TEAMPRIV_ALGO_V2
+NAME_INDEX_ALGO = NAME_INDEX_ALGO_V2
 
 
 def is_direct_dek(label) -> bool:
@@ -89,8 +107,14 @@ def is_teampriv(label) -> bool:
     return label in TEAMPRIV_ALGOS
 
 
+def is_name_index(label) -> bool:
+    """True if `label` names a name-index-key wrap."""
+    return label in NAME_INDEX_ALGOS
+
+
 def classify(label):
-    """Return `'direct'`, `'teampriv'`, or `None` for a label this build does not know.
+    """Return `'direct'`, `'teampriv'`, `'name_index'`, or `None` for a label this build does not
+    know.
 
     `None` is a real answer, not an error: a row written by a newer build is exactly the case
     this module exists to keep visible. Callers must decide what to do about it rather than
@@ -100,4 +124,6 @@ def classify(label):
         return 'direct'
     if label in TEAMPRIV_ALGOS:
         return 'teampriv'
+    if label in NAME_INDEX_ALGOS:
+        return 'name_index'
     return None
