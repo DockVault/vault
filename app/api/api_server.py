@@ -266,6 +266,23 @@ def _external_scheme(request: StarletteRequest) -> str:
     return request.url.scheme
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Whether a browser treats plain HTTP to this host as a secure context -- the browsers' own
+    rule (a "potentially trustworthy" origin), not a shorter list of our own: ``localhost`` and any
+    host ENDING in ``.localhost`` (with or without a trailing dot), and any loopback ADDRESS in any
+    spelling -- 127.0.0.0/8, ``::1`` long or short, a v4 address mapped into v6. An exact-match list had a
+    ``vault.localhost`` deployment resolving buffered downloads for a reason that was not true: the
+    browser on that origin has WebCrypto and can register the worker."""
+    import ipaddress
+    h = (host or "").strip().lower().rstrip(".")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 # Comprehensive security headers middleware
 # The largest a single resumable chunk may be. A chunk request stages to the transient _uploads/
 # buffer BEFORE the per-session counter is committed, so without a per-request size bound K
@@ -5124,7 +5141,8 @@ def _resolved_download_sink(request: Request, db: Session, user: User) -> dict:
     The secure-context question is answered from the externally-visible scheme, honouring
     X-Forwarded-Proto from a trusted proxy -- the same helper the security headers use -- because
     a deployment behind a TLS-terminating proxy IS a secure context to the browser even though
-    uvicorn saw plain HTTP. Loopback counts too: browsers treat it as trustworthy.
+    uvicorn saw plain HTTP. Loopback counts too, in every form the browsers accept (see
+    :func:`_is_loopback_host`): they treat it as trustworthy.
     """
     from app.core.models import SystemSetting, UserPreference
 
@@ -5135,7 +5153,7 @@ def _resolved_download_sink(request: Request, db: Session, user: User) -> dict:
     user_pref = (pref_row.preferences or {}).get("download_sink") if pref_row else None
 
     host = (request.url.hostname or "").lower()
-    secure = _external_scheme(request) == "https" or host in ("localhost", "127.0.0.1", "::1")
+    secure = _external_scheme(request) == "https" or _is_loopback_host(host)
 
     return _download_sink.describe_download_sink(org_policy, user_pref, secure_context=secure)
 
