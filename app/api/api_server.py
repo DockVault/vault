@@ -16124,10 +16124,14 @@ async def list_vault_files(
 def _member_grade_principal(user, vault_id) -> bool:
     """True ONLY for a genuine owner/member/group principal on this vault -- NOT a scoped temp
     credential and NOT a share-claim recipient. Used to decide whether to reveal org-member
-    identities (creator/last-modifier usernames): a restricted principal (scoped cred OR share
-    recipient) must never learn them. is_scoped() catches temp sessions; a share access stamps
-    _share_vault_scope for the vault (a real member never does), which catches share recipients --
-    the gap that let a share recipient read the names when the check was is_scoped() alone."""
+    identities (creator/last-modifier usernames): a restricted principal (a temporary credential of
+    any kind OR a share recipient) must never learn them.
+
+    ONE LINE, DELIBERATELY. The rule itself lives in is_member_grade_viewer, which the same-name
+    refusal doors ask too, so the listing, /info and both refusal doors cannot drift apart. Do not
+    reimplement the decision here: an inline copy that asked the narrower question (is_scoped, which
+    is False for a LEGACY credential carrying no scope) would re-open the hole for these two
+    endpoints only, and would keep every share test green while doing it."""
     from app.core.upload_marker import is_member_grade_viewer
     return is_member_grade_viewer(user, vault_id)
 

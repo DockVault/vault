@@ -51,7 +51,7 @@ def test_modified_by_column_ddl_endpoint_and_wiring():
     assert "modified_by_name" in api
 
     # the modifier name is gated to GENUINE members in BOTH the listing and the info endpoint (a
-    # scoped temp cred OR a share recipient must not learn org member identities).
+    # temporary credential of any kind OR a share recipient must not learn org member identities).
     assert api.count("_member_grade_principal(current_user") >= 2, \
         "modifier-name exposure not gated on _member_grade_principal in both paths"
 
@@ -63,6 +63,34 @@ def test_modified_by_column_ddl_endpoint_and_wiring():
     assert 'data-sort-key="modified_by"' in idx
     assert 'data-sort-key="size"' in idx
     assert 'id="file-info-modal"' in idx
+
+
+@pytest.mark.unit
+def test_the_identity_gate_these_endpoints_ask_refuses_every_temporary_credential():
+    # The count above holds the WIRING (both endpoints ask the gate) and the share tests below hold
+    # the OUTCOME for a share recipient. What neither holds is the gate's own decision: the one line
+    # that delegates to the shared rule. Reimplemented inline asking the narrower question --
+    # is_scoped, which is False for a LEGACY credential carrying no scope -- the count still passes,
+    # every share test still passes, and org member usernames leak to that credential from these two
+    # endpoints. So the decision is driven here, with the credential shapes that question gets wrong.
+    import _bare_api_env
+    _bare_api_env.set_bare_api_env()
+    from app.api import api_server as S
+    from app.core.models import User
+
+    member = User(username="member")
+    assert S._member_grade_principal(member, "vault-1") is True          # the control
+
+    scoped = User(username="scoped"); scoped._is_temp_session = True
+    scoped._temp_scope = {"pages": ["vaults"]}
+    legacy = User(username="legacy"); legacy._is_temp_session = True; legacy._temp_scope = None
+    empty = User(username="empty"); empty._is_temp_session = True; empty._temp_scope = {}
+    for cred in (scoped, legacy, empty):
+        assert S._member_grade_principal(cred, "vault-1") is False, cred.username
+
+    guest = User(username="guest"); guest._share_vault_scope = {"vault-1": {}}
+    assert S._member_grade_principal(guest, "vault-1") is False          # a share recipient, as before
+    assert S._member_grade_principal(guest, "vault-2") is True           # but only on the shared vault
 
 
 # --------------------------------------------------------------------------- api lane
@@ -171,6 +199,34 @@ def test_share_recipient_does_not_see_member_usernames(admin, temp_user_client):
         assert body["checksum_sha256"] == hashlib.sha256(content).hexdigest()
     finally:
         admin.delete_vault(v["id"])
+
+
+def test_a_temporary_credential_is_told_no_usernames_by_the_listing_or_info(admin, temp_vault):
+    """The endpoint-level half of the gate above, against a REAL temporary credential.
+
+    The share-recipient tests cover the other restricted principal; this covers the one the gate
+    was getting wrong. A credential minted here carries a scope, so it is refused by either reading
+    of the rule -- what this adds is that the two endpoints actually withhold the names end to end,
+    rather than that the predicate says they should."""
+    content = b"who touched this"
+    fid = _upload(admin, temp_vault["id"], unique("tempcred") + ".txt", content)
+    created = admin.post("/auth/temp-credentials", json={"note": unique("infogate")})
+    assert created.status_code == 200, created.text
+    cred = created.json()
+    sess = ApiClient()
+    sess.login(cred["temp_username"], cred["credential"])
+    try:
+        items = sess.get(f"/vaults/{temp_vault['id']}/files").json()["items"]
+        entry = next((i for i in items if i["id"] == fid), None)
+        if entry is not None:                       # the listing may be refused outright; either is fine
+            assert entry.get("modified_by_name") is None, "the listing named a member to a temp credential"
+        info = sess.get(f"/vaults/{temp_vault['id']}/files/{fid}/info")
+        if info.status_code == 200:
+            body = info.json()
+            assert body["created_by"] is None and body["modified_by"] is None, \
+                "/info named a member to a temporary credential"
+    finally:
+        admin.post(f"/temp-creds/{cred['temp_username']}/delete")
 
 
 def test_view_only_share_recipient_gets_no_hash(admin, temp_user_client):
