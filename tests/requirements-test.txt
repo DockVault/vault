@@ -42,6 +42,9 @@ pytest>=9.1.1,<10.0
 requests>=2.34.2
 playwright>=1.62.0
 pytest-playwright>=0.9.0
+# A per-test deadline (pytest.ini `timeout`), so a future live module is bounded for free instead
+# of hand-summing one from its call timeouts -- a hung test costs the deadline, not the job cap.
+pytest-timeout>=2.4.0
 websocket-client>=1.9.0
 
 # Static analysis. Pinned exactly: it runs in CI as a gate, so moving it changes what the

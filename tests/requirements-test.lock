@@ -37,6 +37,11 @@ charset-normalizer==3.4.9
     # via requests
 click==8.4.2
     # via pip-tools
+colorama==0.4.6
+    # via
+    #   build
+    #   click
+    #   pytest
 cryptography==50.0.0
     # via
     #   -r tests/requirements-test.txt
@@ -69,7 +74,7 @@ invoke==3.0.3
 license-expression==30.4.4
     # via cyclonedx-python-lib
 markdown==3.10.3
-    # via -r requirements-test.txt
+    # via -r tests/requirements-test.txt
 markdown-it-py==4.2.0
     # via rich
 mdurl==0.1.2
@@ -124,6 +129,7 @@ pyee==13.0.1
     # via playwright
 pygments==2.20.0
     # via
+    #   -r tests/requirements-test.txt
     #   pytest
     #   rich
 pyjwt==2.13.0
@@ -141,9 +147,12 @@ pytest==9.1.1
     #   -r tests/requirements-test.txt
     #   pytest-base-url
     #   pytest-playwright
+    #   pytest-timeout
 pytest-base-url==2.1.0
     # via pytest-playwright
 pytest-playwright==0.9.0
+    # via -r tests/requirements-test.txt
+pytest-timeout==2.4.0
     # via -r tests/requirements-test.txt
 python-dotenv==1.2.2
     # via
