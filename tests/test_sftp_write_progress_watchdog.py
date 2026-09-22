@@ -74,7 +74,12 @@ def _handle(*, stream=None, reader=None):
     an unrelated constructor.
     """
     handle = VaultSFTPHandle(flags=os.O_RDONLY if reader is not None else os.O_WRONLY)
-    handle._interface = types.SimpleNamespace(_session_over=False)
+    # The session token is deliberately LONGER than the prefix that goes into a log line, so a
+    # test asserting the prefix cannot be satisfied by printing the whole thing.
+    handle._interface = types.SimpleNamespace(
+        _session_over=False,
+        server=types.SimpleNamespace(session_token="sess1234efgh5678"),
+    )
     if reader is not None:
         handle.reader = reader
     elif stream is not None:
@@ -638,7 +643,57 @@ def test_the_stalled_event_carries_its_numbers_and_nothing_else(monkeypatch, tmp
     assert "accepted_bytes=17" in line, line
     assert f"window_seconds={WINDOW}" in line, line
     assert f"floor_bytes={FLOOR}" in line, line
+    assert "session=sess1234" in line, line
     assert "secret" not in line and "tmp" not in line and ".pdf" not in line, line
+    # The session token is IDENTIFYING, so only its prefix goes out -- the same slice every other
+    # session line in this server uses. The rest of it must not appear.
+    assert "sess1234efgh" not in line, line
+
+
+def test_the_stalled_event_separates_what_was_sent_from_what_the_window_saw(monkeypatch):
+    """The number an operator will act on, and the one that would mislead them.
+
+    A client that sends a megabyte and then stops is reaped on an EMPTY window, so the window
+    count is 0 -- measured live, exactly that. Reported alone it reads as a client that opened a
+    file and never sent anything, which is a different fault with a different cause and a
+    different person to ask. The two numbers together ARE the diagnosis.
+    (mutation: report the window count as `bytes` too -> red.)
+    """
+    written = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: written.append(" ".join(map(str, a))))
+
+    dog = _WriteProgressWatchdog()
+    sent_then_stopped = _watched(dog)
+    sent_then_stopped._progress_total = 1048576      # a megabyte arrived ...
+    sent_then_stopped._progress_bytes = 0            # ... and then nothing, for a whole window
+
+    dog.sweep(now=T0 + WINDOW, window=WINDOW, floor=FLOOR)
+
+    line = next(w for w in written if w.startswith("event upload.stalled"))
+    assert "bytes=1048576" in line, line
+    assert "accepted_bytes=0" in line, line
+
+
+def test_every_accepted_write_counts_towards_the_total_on_both_paths(tmp_path):
+    # The total is only worth printing if it is kept on both upload shapes, and only for bytes the
+    # server actually took -- a refused write is not something the client sent successfully.
+    streaming = _handle(stream=_FakeStream(paramiko.SFTP_OK))
+    streaming.write(0, b"a" * 2048)
+    streaming.write(2048, b"b" * 1024)
+    assert streaming._progress_total == 3072
+
+    refused = _handle(stream=_FakeStream(paramiko.SFTP_FAILURE))
+    refused.write(0, b"c" * 2048)
+    assert refused._progress_total == 0
+
+    buffered = _handle()
+    buffered.writepath = str(tmp_path / "staged")
+    buffered.writefile = open(buffered.writepath, "wb")
+    try:
+        buffered.write(0, b"d" * 4096)
+        assert buffered._progress_total == 4096
+    finally:
+        buffered.writefile.close()
 
 
 # ---- what counts as progress ---------------------------------------------------------------------

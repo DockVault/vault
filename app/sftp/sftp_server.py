@@ -311,6 +311,11 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # Write progress, for the watchdog: bytes accepted since the current window began.
         self._progress_bytes = 0
         self._progress_window_start = 0.0
+        # Everything accepted on this handle, for the operator rather than for the decision. The
+        # window count alone is misleading in the exact case an operator most wants to understand:
+        # a client that sends a megabyte and then stops is reaped on an EMPTY window, so the event
+        # says nothing was accepted, and it reads as a client that never sent anything.
+        self._progress_total = 0
         # close() and the watchdog can reach this handle at the same moment: the sweep decides a
         # handle is stalled, and the client's CLOSE arrives before the sweep acts on its decision.
         # Whoever takes this lock first wins, and a handle that has BEGUN CLOSING is never failed.
@@ -367,6 +372,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             result = self.stream.write(offset, data)
             if result == paramiko.SFTP_OK:
                 self._progress_bytes += len(data)      # accepted: this is what progress means
+                self._progress_total += len(data)
             return result
         if self.writefile is None:
             return paramiko.SFTP_OP_UNSUPPORTED
@@ -385,6 +391,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
             self.writefile.seek(offset)
             self.writefile.write(data)
             self._progress_bytes += len(data)          # accepted: this is what progress means
+            self._progress_total += len(data)
             return paramiko.SFTP_OK
         except Exception as e:  # noqa: BLE001
             # The buffer write failed (a full staging tmpfs is the expected cause). Mark the
@@ -597,6 +604,19 @@ class _WriteProgressWatchdog:
 
     def _fail(self, handle, window, floor):
         accepted = handle._progress_bytes
+        total = handle._progress_total
+        # WHICH upload, and whose. Without it the operator is told that AN upload stalled and has
+        # no way to reach the one it was: the whole point of the event is to be acted on. The
+        # session prefix is what every other line in this server identifies a client by, it is a
+        # short slice of an opaque token rather than a name, and it is what ties this line to the
+        # session lines around it.
+        # The slice stays AT the call site below, not here: a static test requires every call site
+        # that logs a session to show its truncation, and hiding it behind a variable would defeat
+        # that check while looking tidier.
+        try:
+            token = handle._interface.server.session_token or ''
+        except Exception:  # noqa: BLE001 -- an event must never be the thing that raises
+            token = ''
         # The snapshot above was taken under the set's lock, but the decision was made outside it,
         # so the client's own CLOSE can land in that gap. A handle that has BEGUN CLOSING is left
         # alone: it is committing an upload the client finished, paramiko answers that CLOSE with
@@ -614,7 +634,12 @@ class _WriteProgressWatchdog:
         ref, handle.upload_marker_ref = handle.upload_marker_ref, None
         if ref:
             upload_marker.remove(*ref)
-        safe_event('upload.stalled', window_seconds=window, floor_bytes=floor, accepted_bytes=accepted)
+        # `bytes` is everything this upload ever sent; `accepted_bytes` is what arrived in the
+        # window that failed it. They are usually different and the difference is the diagnosis:
+        # 0 and 0 is a client that opened a file and went away, while 1048576 and 0 is one that
+        # sent a megabyte and then stopped. Reporting only the second reads as the first.
+        safe_event('upload.stalled', session=token[:8] or None, bytes=total,
+                   window_seconds=window, floor_bytes=floor, accepted_bytes=accepted)
         try:
             transport = handle._sftp_server.sock.get_transport()
         except Exception:  # noqa: BLE001 -- no protocol handler wired (or it has already gone)

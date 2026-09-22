@@ -106,7 +106,10 @@ class Settings(BaseSettings):
     # cannot be interrupted -- the upload is marked and the connection closed at once, but that
     # thread is only freed when the filesystem answers. SCOPE: the unit that is closed is the
     # CONNECTION, not the one upload -- so a second upload running on the same connection is
-    # discarded along with the stalled one rather than committed half-written.
+    # discarded along with the stalled one rather than committed half-written, and measured live,
+    # THAT client is told nothing at all: the stalled handle's client sees a closed socket, but a
+    # healthy sibling's transport simply goes inactive with no error. "My upload vanished without
+    # a message" is a real report, and it comes from the user whose upload was fine.
     sftp_write_progress_timeout_seconds: int = Field(default=120)
     sftp_write_progress_min_bytes: int = Field(default=65536)
     # Memory-bounded streaming upload. When on, an SFTP upload is encrypted and persisted
