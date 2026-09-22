@@ -51,7 +51,7 @@ def test_the_guard_is_fail_open_and_member_grade():
     # username only to a member-grade viewer, "another member" to a scoped credential, never an
     # email) -- this site no longer looks the name up itself. The rule's behaviour is pinned beside
     # it in test_upload_marker.py.
-    assert "_um.holder_display_name(db, _holder, current_user)" in seg
+    assert "_um.holder_display_name(db, _holder, current_user, vault_id)" in seg
     assert 'getattr(_u, "username"' not in seg
 
 

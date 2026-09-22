@@ -400,14 +400,33 @@ def test_a_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
     # gated it. Both doors now ask this one function. (mutation: drop the is_scoped gate -> the
     # scoped case names alice -> red. mutation: fall back to the email -> red.)
     from types import SimpleNamespace
-    member = SimpleNamespace(_is_temp_session=False, _temp_scope=None)                   # interactive member
-    scoped = SimpleNamespace(_is_temp_session=True, _temp_scope={"pages": ["vaults"]})   # scoped credential
+    from app.core.models import User
+    member = User(username="viewer")                                                     # a real member row
+    scoped = User(username="temp"); scoped._is_temp_session = True; scoped._temp_scope = {"pages": ["vaults"]}
     alice = SimpleNamespace(username="alice", email="alice@example.com")
     assert um.holder_display_name(_NameDB(alice), "id", member) == "alice"
     assert um.holder_display_name(_NameDB(alice), "id", scoped) == "another member"
     assert um.holder_display_name(_NameDB(SimpleNamespace(username=None, email="b@x")), "id", member) == "another member"
     assert um.holder_display_name(_NameDB(None), "id", member) == "another member"
     assert um.holder_display_name(_NameDB(raise_=True), "id", member) == "another member"   # never a 500
+    # A share recipient for THIS vault is not member-grade on it (a share access stamps the scope).
+    guest = User(username="guest"); guest._share_vault_scope = {"vault-1": {}}
+    assert um.holder_display_name(_NameDB(alice), "id", guest, "vault-1") == "another member"
+    assert um.holder_display_name(_NameDB(alice), "id", guest, "vault-2") == "alice"
+
+
+def test_the_disclosure_gate_is_stated_positively_so_an_unknown_viewer_learns_nothing():
+    # "Not a scoped credential" is the wrong direction for a disclosure gate: None, an anonymous
+    # receiver, a device principal, a principal type that does not exist yet -- none of them is
+    # scoped, and every one of them would read as member-grade and be told the username. The gate
+    # says what it means: a real User row, not scoped, not a share recipient. (mutation: the gate
+    # back to `not is_scoped(viewer)` -> both legs name alice -> red.)
+    from types import SimpleNamespace
+    alice = SimpleNamespace(username="alice", email="alice@example.com")
+    assert um.holder_display_name(_NameDB(alice), "id", None) == "another member"
+    receiver_like = SimpleNamespace(token_hash="x", owner_id="o")            # a receiver, not a User
+    assert um.holder_display_name(_NameDB(alice), "id", receiver_like) == "another member"
+    assert um.is_member_grade_viewer(None) is False and um.is_member_grade_viewer(receiver_like) is False
 
 
 def test_both_doors_ask_the_one_rule_and_neither_looks_the_name_up_itself():
@@ -419,11 +438,11 @@ def test_both_doors_ask_the_one_rule_and_neither_looks_the_name_up_itself():
                     if not ln.lstrip().startswith("#"))
     site = api[api.index("_holder = _um.holder(vault_id, folder_uuid, body.file_name)"):]
     site = site[:site.index("raise HTTPException(")]
-    assert "_who = _um.holder_display_name(db, _holder, current_user)" in site
+    assert "_who = _um.holder_display_name(db, _holder, current_user, vault_id)" in site   # the vault too: share recipients
     assert "username" not in site and "User).filter" not in site, site
     sftp = "\n".join(ln for ln in (root / "app/sftp/sftp_server.py").read_text(encoding="utf-8").splitlines()
                      if not ln.lstrip().startswith("#"))
-    body = sftp[sftp.index("def _resolve_member_name(db, member_id, viewer):"):]
+    body = sftp[sftp.index("def _resolve_member_name(db, member_id, viewer, vault_id=None):"):]
     body = body[:body.index("\n    def ", 10)]
-    assert "return upload_marker.holder_display_name(db, member_id, viewer)" in body
+    assert "return upload_marker.holder_display_name(db, member_id, viewer, vault_id)" in body
     assert "is_scoped" not in body and "username" not in body.split('"""')[-1]

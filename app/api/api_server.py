@@ -16094,10 +16094,8 @@ def _member_grade_principal(user, vault_id) -> bool:
     recipient) must never learn them. is_scoped() catches temp sessions; a share access stamps
     _share_vault_scope for the vault (a real member never does), which catches share recipients --
     the gap that let a share recipient read the names when the check was is_scoped() alone."""
-    from app.core.temp_scope import is_scoped
-    if is_scoped(user):
-        return False
-    return str(vault_id) not in (getattr(user, "_share_vault_scope", None) or {})
+    from app.core.upload_marker import is_member_grade_viewer
+    return is_member_grade_viewer(user, vault_id)
 
 
 def _has_vault_cap(user, vault_id, cap: str) -> bool:
@@ -17346,7 +17344,7 @@ async def init_chunked_upload(
         from app.core import upload_marker as _um
         _holder = _um.holder(vault_id, folder_uuid, body.file_name)
         if isinstance(_holder, str):
-            _who = _um.holder_display_name(db, _holder, current_user)
+            _who = _um.holder_display_name(db, _holder, current_user, vault_id)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"'{body.file_name}' is currently being uploaded by {_who}")

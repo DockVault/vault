@@ -41,7 +41,7 @@ def test_a_same_name_conflict_is_refused_and_names_the_holder():
     body = _open_write_body()
     # A holder id (a str) means the name is in flight: refuse, and name the member in the status.
     assert "isinstance(_marker_outcome, str)" in body
-    assert "_resolve_member_name(db, _marker_outcome, user)" in body   # gated on the refusing principal
+    assert "_resolve_member_name(db, _marker_outcome, user, vault_id)" in body   # gated on the refusing principal, for THIS vault
     assert "is currently being uploaded by" in body
     # The refusal returns a denied status (not a silent success).
     ref = body[body.index("isinstance(_marker_outcome, str)"):]
@@ -118,9 +118,10 @@ def test_the_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
         def first(self):
             return self._user
 
+    from app.core.models import User
     resolve = SFTPServerInterface._resolve_member_name
-    member = SimpleNamespace(_is_temp_session=False, _temp_scope=None)              # interactive member
-    scoped = SimpleNamespace(_is_temp_session=True, _temp_scope={"pages": ["vaults"]})  # scoped cred
+    member = User(username="viewer")                                               # a real member row
+    scoped = User(username="temp"); scoped._is_temp_session = True; scoped._temp_scope = {"pages": ["vaults"]}
 
     named = _DB(SimpleNamespace(username="alice", email="alice@example.com"))
     assert resolve(named, "id", member) == "alice"                 # member-grade -> username

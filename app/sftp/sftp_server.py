@@ -981,11 +981,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             srv._pending_status_desc = desc
 
     @staticmethod
-    def _resolve_member_name(db, member_id, viewer):
+    def _resolve_member_name(db, member_id, viewer, vault_id=None):
         """Display name for the marker holder in a same-name refusal: the one rule both doors use
-        (upload_marker.holder_display_name) -- the username only to a member-grade viewer, a
-        neutral "another member" to a scoped credential and on any lookup miss."""
-        return upload_marker.holder_display_name(db, member_id, viewer)
+        (upload_marker.holder_display_name) -- the username only to a demonstrably member-grade
+        viewer, a neutral "another member" to everyone else and on any lookup miss."""
+        return upload_marker.holder_display_name(db, member_id, viewer, vault_id)
 
     def _load_principal(self, db) -> Optional[User]:
         """Load the authenticated principal FRESH in the given session.
@@ -1593,7 +1593,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if isinstance(_marker_outcome, str):
                 self._set_pending_status(
                     "'%s' is currently being uploaded by %s"
-                    % (filename, self._resolve_member_name(db, _marker_outcome, user)))
+                    % (filename, self._resolve_member_name(db, _marker_outcome, user, vault_id)))
                 return paramiko.SFTP_PERMISSION_DENIED
             _upload_marker_ref = ((vault_id, folder_id, filename, _marker_token)
                                   if _marker_outcome is None else None)

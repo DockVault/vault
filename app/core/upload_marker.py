@@ -58,19 +58,36 @@ _CAD_REFRESH = (
     "return 0")
 
 
-def holder_display_name(db, member_id, viewer) -> str:
-    """How a same-name refusal names the member whose upload holds the name -- ONE rule for every
-    door. The holder's USERNAME is revealed only to a MEMBER-GRADE viewer (an interactive member),
-    gated exactly like the web listing's uploader identity; a scoped credential -- most SFTP
-    uploaders, and any temporary web credential -- gets a neutral "another member", and an email is
-    never used. Best-effort: a lookup miss or failure also reads as "another member", so a refusal
-    never 500s on a name lookup.
-
-    The SFTP refusal had this gate and the web refusal did not: the same sentence named the holder
-    to ANY caller there, including a scoped credential that could learn a member's username from a
-    file name it was refused. Both doors call this now."""
+def is_member_grade_viewer(viewer, vault_id=None) -> bool:
+    """True ONLY for a viewer DEMONSTRABLY member-grade on this vault: a real User row, not a scoped
+    temporary credential, and not a share-claim recipient for the vault (a share access stamps
+    `_share_vault_scope` for it; a member never does). Stated positively on purpose. "Not scoped"
+    is the wrong direction for a disclosure gate: None, an anonymous receiver, a device principal,
+    a principal type that does not exist yet -- none of them is scoped, and every one of them
+    would read as member-grade. The web listing's uploader-identity gate asks this too."""
+    from app.core.models import User
     from app.core.temp_scope import is_scoped
+    if not isinstance(viewer, User):
+        return False
     if is_scoped(viewer):
+        return False
+    if vault_id is not None and str(vault_id) in (getattr(viewer, "_share_vault_scope", None) or {}):
+        return False
+    return True
+
+
+def holder_display_name(db, member_id, viewer, vault_id=None) -> str:
+    """How a same-name refusal names the member whose upload holds the name -- ONE rule for every
+    door. The holder's USERNAME is revealed only to a viewer that is_member_grade_viewer says is
+    member-grade; everyone and everything else -- a scoped credential (most SFTP uploaders, any
+    temporary web credential), a share recipient, an anonymous surface, no viewer at all -- gets a
+    neutral "another member", and an email is never used. Best-effort: a lookup miss or failure also
+    reads as "another member", so a refusal never 500s on a name lookup.
+
+    The SFTP refusal had a gate and the web refusal did not: the same sentence named the holder to
+    ANY caller there, including a scoped credential that could learn a member's username from a file
+    name it was refused. Both doors call this now."""
+    if not is_member_grade_viewer(viewer, vault_id):
         return "another member"
     try:
         from app.core.models import User
