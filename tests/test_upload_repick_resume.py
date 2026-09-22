@@ -50,7 +50,7 @@ def _repick(second_half: bytes, held=(0, 1), digests=None) -> dict:
     await um.lastRun;
     out.log = log.slice(); out.status = it.status; out.error = it.error || null;
     out.changed = it.changedLocally || 0; out.received = [...it.received].sort();
-    """ % (list(held), json.dumps(digests.get("A")), json.dumps(digests.get("B")), second_half.decode()), extra=("async _continueWith(it, file) {",))
+    """ % (list(held), json.dumps(digests.get("A")), json.dumps(digests.get("B")), second_half.decode()), extra=("async _continueWith(it, file) {", "async _continueWithInner(it, file) {"))
 
 
 def test_a_re_picked_file_edited_to_the_same_length_has_its_changed_chunk_sent_again():
@@ -83,7 +83,14 @@ def test_the_re_pick_path_defers_to_the_runs_check_instead_of_trusting_the_list(
     # Smoke alarm on comment-free code: the re-pick sets the flag the run's sync branch reads, and
     # no longer fetches the list on its own.
     js = APP_JS.read_text(encoding="utf-8")
-    cont = strip_comments(_method(js, "async _continueWith(it, file) {"))
+    # The re-pick is now two methods: a wrapper that puts the row under the account's lock before
+    # anything leaves, and the body. Both are read -- the wrapper for the stamping and for the fact
+    # that it makes no request of its own, the body for the flag and the order.
+    wrap = strip_comments(_method(js, "async _continueWith(it, file) {"))
+    assert "it._epoch = this._epoch || 0;" in wrap and "this._aborts.add(it._abort);" in wrap
+    assert wrap.index("it._epoch") < wrap.index("_continueWithInner"), "stamped after the first await"
+    assert "fetch(" not in wrap and "_send(" not in wrap
+    cont = strip_comments(_method(js, "async _continueWithInner(it, file) {"))
     assert "it.needsServerSync = true;" in cont and "fetch(" not in cont and "_send(" not in cont
     assert cont.index("it.needsServerSync = true;") < cont.index("this._start(it);")
     run = strip_comments(_method(js, "async _run(id) {"))
@@ -117,7 +124,7 @@ def test_when_the_server_cannot_be_asked_every_chunk_is_sent_again(answer):
     await um.lastRun;
     out.log = log.slice(); out.status = it.status; out.error = it.error || null;
     """ % ("true" if answer == "throws" else "false"),
-        extra=("async _continueWith(it, file) {",))
+        extra=("async _continueWith(it, file) {", "async _continueWithInner(it, file) {"))
     puts = sorted(e for e in out["log"] if e.startswith("PUT "))
     assert puts == ["PUT /vaults/V/uploads/r-sess/chunks/0", "PUT /vaults/V/uploads/r-sess/chunks/1"], out["log"]
     assert out["status"] == "done", out

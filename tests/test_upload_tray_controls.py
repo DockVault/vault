@@ -1030,7 +1030,7 @@ def test_a_picked_file_goes_to_the_row_that_holds_the_session_now():
     # handed to the row the chooser was opened for -- by then an object in no list -- and nothing
     # happened, silently.
     js = APP_JS.read_text(encoding="utf-8")
-    out = _node(SERVER % ("".join(_method(js, h) for h in LIFTED + ("_reselect(id) {", "async _continueWith(it, file) {")), """
+    out = _node(SERVER % ("".join(_method(js, h) for h in LIFTED + ("_reselect(id) {", "async _continueWith(it, file) {", "async _continueWithInner(it, file) {")), """
     const input = { style: {}, value: '', click() {} };
     Object.assign(document, { getElementById: (id) => (id === 'upload-reselect-input' ? input : null) });
     globalThis.isZkVault = () => false;

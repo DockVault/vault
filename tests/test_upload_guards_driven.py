@@ -190,11 +190,22 @@ REOPEN = """
 const API_BASE = '';
 const said = [], log = [];
 const showError = (m) => said.push(m);
+const showWarning = (m) => said.push(m), showInfo = (m) => said.push(m);
+const state = { currentVault: null }, isZkVault = () => false;
+const zkUploadStore = { delete: async () => {} };
 const isCodedCryptoError = (e) => !!(e && e.code), safeMessageForCode = () => 'coded';
 const zkGetVaultDek = async () => 'dek';
 const ZK_FRAMES_PER_UPLOAD_CHUNK = 2;
 let held = [];                                    // what the server says it holds
-const fetch = async (url) => { log.push('GET ' + url); return { ok: true, json: async () => ({ received_chunks: held }) }; };
+let signOutDuringGet = false, duringGet = null;
+const fetch = async (url, opts) => {
+    log.push(((opts && opts.method) || 'GET') + ' ' + url);
+    if (!opts || opts.method !== 'DELETE') {
+        duringGet = um._aborts.size;          // looked at WHILE the request is in flight
+        if (signOutDuringGet) { um._epoch = (um._epoch || 0) + 1; }
+    }
+    return { ok: true, json: async () => ({ received_chunks: held }) };
+};
 // The writer session for a given file: its frame MACs are a function of the file's bytes.
 const lib = { resumeContentV2Encryption: async (file, dek, ctx, st) => ({ totalChunks: 6, blobId: 'blob-' + file.bytes,
     frameMac: async (f) => file.bytes + ':' + f }) };
@@ -207,7 +218,10 @@ const um = {
     _epoch: 0, _aborts: new Set(),
     _stale(it) { return it._epoch !== undefined && it._epoch !== (this._epoch || 0); },
     _send(it, url, opts) { if (this._stale(it)) throw new Error('signed out'); return fetch(url, opts); },
-    _restartAsNewAttempt(it, file) { log.push('restart'); this.restarted = { it: it.id, file: file.bytes }; },
+    _restartAsNewAttempt(it, file) { log.push('restart'); this.restarted = { it: it.id, file: file.bytes };
+        // The shipped restart's first act is a DELETE of the old session, through the gate.
+        return this._send(it, '/vaults/' + it.vaultId + '/uploads/' + it.sessionId,
+            { method: 'DELETE' }).then(() => log.push('DELETE sent'), () => log.push('DELETE refused')); },
     _start(it) { log.push('start'); this.started = it.id; },
 %s
 };
@@ -232,7 +246,10 @@ const recordOfA = () => ({ totalPlaintext: 100, frameMacs: [0, 1, 2, 3, 4, 5].ma
 def _reopen(scenarios: str) -> dict:
     js = _js()
     frames = _function(js, "function zkUploadChunkFrames(index, totalFrames, framesPerChunk) {")
-    return _node(REOPEN % (frames, _method(js, "async _reopenPipelined(it, file) {"), scenarios))
+    bodies = (_method(js, "async _reopenPipelined(it, file) {")
+              + _method(js, "async _continueWith(it, file) {")
+              + _method(js, "async _continueWithInner(it, file) {"))
+    return _node(REOPEN % (frames, bodies, scenarios))
 
 
 def test_a_resume_handed_a_different_file_becomes_a_new_attempt_and_never_continues_under_the_old_token():
@@ -258,9 +275,12 @@ def test_a_resume_handed_a_different_file_becomes_a_new_attempt_and_never_contin
         r = out[key]
         assert r["restarted"] == {"it": "r", "file": "A" if key == "unvouched" else "B"}, (key, r)
         assert r["started"] is None and r["continued"] is False and r["received"] == [], (key, r)
-        assert r["log"][-1] == "restart" and r["log"].count("start") == 0, (key, r)
+        # The stub logs the restart and then makes the DELETE the real one makes, through the
+        # gate; what matters here is that the restart happened and nothing was continued.
+        assert "restart" in r["log"] and r["log"].count("start") == 0, (key, r)
     rs = out["resized"]
-    assert rs["restarted"] == {"it": "r", "file": "A"} and rs["log"] == ["restart"], rs
+    assert rs["restarted"] == {"it": "r", "file": "A"}, rs
+    assert rs["log"][0] == "restart" and "GET" not in " ".join(rs["log"]), rs
     n = out["nothingHeld"]
     assert n["started"] == "r" and n["restarted"] is None, n
 
@@ -321,3 +341,55 @@ def test_the_stripped_application_still_parses_and_holds_no_comment():
         assert r.returncode == 0, r.stderr[-1500:]
     finally:
         Path(f.name).unlink(missing_ok=True)
+
+
+def test_a_re_pick_is_under_the_accounts_lock_before_its_first_request_leaves():
+    # THE HOLE THIS CLOSES. The whole re-pick chain -- the reopen's GET, the full-file MAC re-read it
+    # waits on, the restart's DELETE -- runs BEFORE `_run`, which is where a row is normally stamped
+    # with its epoch and controller. An unstamped row is judged by nothing (`_stale` treats a missing
+    # epoch as "never ran", which is correct for a row that genuinely has not) and has no controller
+    # to abort, so routing those requests through the gate put them through the door without putting
+    # them behind the lock. It is the ordinary case: the tray is rebuilt from the server while the
+    # chooser is open, so any re-pick that outlives one rebuild lands on a rebuilt row.
+    #
+    # Pinned on the OBSERVABLE, not on the stamp: a pin that only checked `it._epoch !== undefined`
+    # would pass a stamp assigned too late. The account signs out DURING the reopen's GET; what must
+    # not happen is the DELETE leaving afterwards.
+    out = _reopen("""
+    // The file does not match the record, so the chain reaches _restartAsNewAttempt and its DELETE.
+    signOutDuringGet = true;
+    const it = { id: 'r', vaultId: 'V', sessionId: 'old-sess', clientFileId: 'obj', zkKeyVersion: 1,
+        zkPipelined: true, zkResume: recordOfA(), received: new Set(), needsServerSync: true };
+    held = [0];
+    await um._continueWith(it, { size: 100, bytes: 'B' });
+    out.signedOutMidGet = { log: log.slice(), aborts: um._aborts.size };
+
+    // The control: the same chain with nobody signing out sends its DELETE. Without this, "no
+    // DELETE" above could mean the chain never got there at all.
+    signOutDuringGet = false; um._epoch = 0; log.length = 0;
+    const it2 = { id: 'r2', vaultId: 'V', sessionId: 'old-sess', clientFileId: 'obj', zkKeyVersion: 1,
+        zkPipelined: true, zkResume: recordOfA(), received: new Set(), needsServerSync: true };
+    await um._continueWith(it2, { size: 100, bytes: 'B' });
+    out.control = { log: log.slice(), aborts: um._aborts.size };
+    """)
+    signed_out = out["signedOutMidGet"]
+    # Not one DELETE of any kind: the gate refuses it before it is built, which is the point --
+    # the previous account's session must not be deleted under the next account's token.
+    assert not [e for e in signed_out["log"] if e.startswith("DELETE")], signed_out
+    # The controller the re-pick registered is released when it ends, either way.
+    assert signed_out["aborts"] == 0 and out["control"]["aborts"] == 0, out
+    assert "DELETE sent" in out["control"]["log"], out["control"]
+
+
+def test_a_re_pick_registers_a_controller_a_sign_out_can_abort():
+    # The other half of the lock, and the one the epoch cannot cover: a request already ON THE WIRE
+    # when the account signs out. reset() aborts every registered controller, so the re-pick's must
+    # be in that set WHILE its request is in flight -- pinned by looking during the GET, not after.
+    out = _reopen("""
+    const it = { id: 'r', vaultId: 'V', sessionId: 'old-sess', clientFileId: 'obj', zkKeyVersion: 1,
+        zkPipelined: true, zkResume: recordOfA(), received: new Set(), needsServerSync: true };
+    held = [0]; duringGet = null;
+    await um._continueWith(it, { size: 100, bytes: 'A' });
+    out.duringGet = duringGet;
+    """)
+    assert out["duringGet"] == 1, "no controller was registered while the re-pick's request was in flight"

@@ -17047,6 +17047,29 @@ const uploadManager = {
             || this.items.get(was.id) || null;
     },
     async _continueWith(it, file) {
+        // THE ROW IS PUT UNDER THE ACCOUNT'S LOCK BEFORE ANY REQUEST LEAVES. Everything below --
+        // the pipelined reopen's GET, the whole-file frame-MAC re-read it waits on, the restart's
+        // DELETE -- happens BEFORE _run is reached, and _run is where a row is normally stamped. An
+        // unstamped row is judged by nothing (`_stale` treats a missing epoch as "never ran", which
+        // is right for a row that has genuinely never run) and has no controller for reset() to
+        // abort, so routing those requests through the gate put them through the door without
+        // putting them behind the lock. This is the ordinary case, not an edge one: the tray is
+        // rebuilt from the server while the file chooser is open, so any re-pick that outlives one
+        // rebuild lands on a REBUILT row that has never run. Stamped here, before the first await,
+        // the epoch refuses every later request of a signed-out account and the controller tears
+        // down whatever is already on the wire. _run re-stamps with the same epoch and a fresh
+        // controller; this one is released when the re-pick ends.
+        it._epoch = this._epoch || 0;
+        it._abort = new AbortController();
+        this._aborts.add(it._abort);
+        try {
+            return await this._continueWithInner(it, file);
+        } finally {
+            this._aborts.delete(it._abort);
+        }
+    },
+
+    async _continueWithInner(it, file) {
         // Defense-in-depth: zero-knowledge resume runs from the IndexedDB ciphertext
         // (see resume()), never by re-picking the plaintext — re-feeding plaintext here
         // would bypass the encrypt-before-upload hook and produce a fresh-IV mismatch.
