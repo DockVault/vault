@@ -25,7 +25,7 @@ def _reset():
     R._cb_record_success()
     with R._cb_lock:
         R._cb_probe_thread = None
-        R._cb_last_attempt_at = time.time()
+        R._cb_last_attempt_at = R._cb_monotonic()
     yield
     R._cb_record_success()
 

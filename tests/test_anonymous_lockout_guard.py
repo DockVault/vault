@@ -38,7 +38,7 @@ def _open_breaker_with_a_tripwire_redis(monkeypatch):
     R._cb_record_success()
     with R._cb_lock:
         R._cb_probe_thread = None
-        R._cb_last_attempt_at = time.time()
+        R._cb_last_attempt_at = R._cb_monotonic()
     # Point the lockout helpers' client at a tripwire, then open the breaker: a correct guard never
     # reaches the client.
     fake = _NeverTouchedRedis()

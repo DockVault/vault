@@ -224,8 +224,9 @@ class RateLimiterUnavailable(Exception):
 # short-timeout connection, and closes the breaker only on success (else it stays open and tries
 # again). No foreground request ever pays the discovery stall; the server recovers while idle rather
 # than on a victim request; and a plain sleep is enough for a caller to wait the breaker out. It is a
-# thread (not an event-loop task) so the API and the SFTP process behave the same, one per process
-# (guarded by a lock), and a daemon so process shutdown never waits on it. Process-local state.
+# thread (not an event-loop task) so the API and the SFTP process behave the same, one OWNER per
+# process (guarded by a lock; a hung one is replaced, see _cb_is_open), and a daemon so process
+# shutdown never waits on it. Process-local state.
 _CB_FAIL_THRESHOLD = 1
 # Cooldown the breaker stays open before each health probe. Long enough to outlast a burst, short
 # enough that rate limiting resumes promptly once Redis recovers.
@@ -235,51 +236,95 @@ _CB_COOLDOWN_SECONDS = 10
 _CB_PROBE_TIMEOUT_SECONDS = 1.0
 _cb_consecutive_failures = 0
 _cb_open = False                 # True while the breaker is skipping Redis
-_cb_lock = threading.Lock()      # guards the open flag, the failure count and the single probe thread
-_cb_probe_thread = None          # the one background probe thread while open, else None/dead
-_cb_last_attempt_at = 0.0        # when a probe last tried (or the breaker last opened); staleness stamp
+_cb_lock = threading.Lock()      # guards the open flag, the failure count, the probe slot and the stamp
+_cb_probe_thread = None          # the probe thread that OWNS the slot while open, else None/dead
+_cb_probe_threads: list = []     # every probe thread started and not yet seen dead (bounds replacements)
+_cb_last_attempt_at = 0.0        # MONOTONIC stamp: when the owning probe last tried / the breaker opened
+_cb_probe_cap_logged = False     # the replacement cap has been logged for this open period
 # The breaker has no timer and the probe is its only closer, and while open no foreground caller
 # records failures -- so ANY state of "open with no working probe" is permanent, not transient. That
 # can arise three ways: a Thread.start() that raised (thread exhaustion), a probe hung inside a
 # connect whose DNS lookup the socket timeout does not bound, or a failure racing the probe's exit.
 # The exit race is fixed structurally (see _cb_probe_loop); the other two are covered by a STATE
 # backstop rather than a patch per path: every probe attempt stamps _cb_last_attempt_at, and if the
-# breaker is open with no attempt in a long while, _cb_is_open unwedges it. Kept well above the
-# cooldown so a healthy probe (which stamps every cooldown, even against a down Redis) never trips it.
+# breaker is open with no attempt in a long while, _cb_is_open unwedges it -- by starting a probe,
+# NEVER by letting a foreground caller touch Redis. The foreground client's connect is as unbounded
+# as the probe's (the resolver runs before the socket timeout applies), so a foreground re-probe
+# would have been the very on-loop stall this design exists to remove, once per stale period. So
+# the whole "cannot wedge open" property now rests on being able to START a thread: every stale
+# period either a live probe attempts, or a new one is started; a start that raises is retried next
+# period. Kept well above the cooldown so a healthy probe (which stamps every cooldown, even against
+# a down Redis) never trips it.
 _CB_PROBE_STALE_SECONDS = 6 * _CB_COOLDOWN_SECONDS
+# A probe stuck in a hung connect is ALIVE, so it is replaced rather than restarted: a new thread
+# takes the slot and the stuck one, no longer the owner, exits by itself when it finally wakes. Each
+# stale period that still finds the owner stuck would start another, so under an hour-long resolver
+# hang that is a leak with no ceiling -- every one parked in the same getaddrinfo, each holding a
+# socket attempt, all racing on the lock when they wake. This is the ceiling: a replacement starts
+# only while fewer than this many probe threads are alive (enough to cover one hung generation);
+# past it the breaker keeps skipping and logs once. A leak with a ceiling, not a self-cleaning one.
+_CB_MAX_PROBE_THREADS = 3
+
+
+def _cb_monotonic() -> float:
+    """The clock the staleness stamp is written and compared with: monotonic, so a wall-clock step
+    (NTP, a VM resume) can neither fake a stale probe -- which would start a needless replacement --
+    nor hide a dead one for the length of a backward jump. The callers' ``now`` is wall-clock and
+    drives the sliding-window arithmetic only. One function so every writer of the stamp and its one
+    reader share a source; a test may replace it."""
+    return time.monotonic()
+
+
+def _cb_live_probe_threads_locked() -> list:
+    """Prune the probe threads seen dead and return the live ones. The caller holds ``_cb_lock``."""
+    _cb_probe_threads[:] = [t for t in _cb_probe_threads if t.is_alive()]
+    return list(_cb_probe_threads)
 
 
 def _cb_is_open(now: float) -> bool:
-    """Whether to skip Redis right now.
+    """Whether to skip Redis right now. ``now`` (wall-clock) is accepted for the call sites' sake and
+    is NOT what staleness is judged by -- see :func:`_cb_monotonic`.
 
     Fast path: the background probe, not the caller, closes the breaker, so no foreground request
-    touches the socket to rediscover an outage. But an "open with no working probe" state would be
-    permanent (see the module note), so when the breaker has been open with no probe attempt for
-    longer than ``_CB_PROBE_STALE_SECONDS`` this unwedges it: it restarts a probe that has died or
-    never started (and stays skipping), or -- if a probe is alive but stuck (a hung connect) -- lets
-    THIS one caller re-probe Redis directly (returns False), a bounded once-per-stale-period stall
-    that is the price of never wedging. The stamp is reset so only one caller pays it per period."""
-    global _cb_probe_thread, _cb_last_attempt_at
+    touches the socket to rediscover an outage -- and that holds on EVERY path: this never returns
+    False while the breaker is open. But an "open with no working probe" state would be permanent
+    (see the module note), so when the breaker has been open with no probe attempt for longer than
+    ``_CB_PROBE_STALE_SECONDS`` this unwedges it, still skipping: it restarts a probe that has died
+    or never started, or -- if the owning probe is alive but stuck (a hung connect) -- starts a
+    REPLACEMENT into the slot, bounded by ``_CB_MAX_PROBE_THREADS``. The stamp is reset so only one
+    caller acts per period; a start that raised leaves the slot as it was, and the next period tries
+    again."""
+    global _cb_probe_thread, _cb_last_attempt_at, _cb_probe_cap_logged
     if not _cb_open:
         return False
-    if now - _cb_last_attempt_at <= _CB_PROBE_STALE_SECONDS:
+    mono = _cb_monotonic()
+    if mono - _cb_last_attempt_at <= _CB_PROBE_STALE_SECONDS:
         return True
     with _cb_lock:
         if not _cb_open:
             return False
-        if now - _cb_last_attempt_at <= _CB_PROBE_STALE_SECONDS:
+        if mono - _cb_last_attempt_at <= _CB_PROBE_STALE_SECONDS:
             return True  # another caller refreshed the stamp while we waited on the lock
-        _cb_last_attempt_at = now  # only one caller acts per stale period
+        _cb_last_attempt_at = mono  # only one caller acts per stale period
         if _cb_probe_thread is None or not _cb_probe_thread.is_alive():
             # The probe died or never started: restart it (start errors are swallowed inside
             # _cb_ensure_probe_locked, which leaves the slot None to retry) and keep skipping.
             _cb_probe_thread = None
             _cb_ensure_probe_locked()
             return True
-        # A probe is alive but has not attempted in a stale period -- it is stuck (e.g. a hung DNS
-        # lookup). Let this one caller re-probe Redis the old way so recovery is not hostage to it.
-        logger.warning("rate-limiter breaker probe appears stuck; allowing one foreground re-probe")
-        return False
+        # The owning probe is alive but has not attempted in a stale period -- it is stuck (e.g. a
+        # hung DNS lookup). Replace it, within the ceiling; never let a caller re-probe in the
+        # foreground.
+        if len(_cb_live_probe_threads_locked()) >= _CB_MAX_PROBE_THREADS:
+            if not _cb_probe_cap_logged:
+                _cb_probe_cap_logged = True
+                logger.warning("rate-limiter breaker probe appears stuck and the replacement ceiling "
+                               "(%d threads) is reached; skipping Redis until one recovers",
+                               _CB_MAX_PROBE_THREADS)
+            return True
+        logger.warning("rate-limiter breaker probe appears stuck; starting a replacement probe")
+        _cb_start_probe_locked()
+        return True
 
 
 def redis_circuit_open() -> bool:
@@ -289,10 +334,11 @@ def redis_circuit_open() -> bool:
 
 def _cb_record_success() -> None:
     """Redis is proven healthy (a live op, or the background probe, succeeded): close the breaker."""
-    global _cb_consecutive_failures, _cb_open
+    global _cb_consecutive_failures, _cb_open, _cb_probe_cap_logged
     with _cb_lock:
         _cb_consecutive_failures = 0
         _cb_open = False
+        _cb_probe_cap_logged = False
 
 
 def _cb_record_failure(now: float) -> None:
@@ -304,30 +350,39 @@ def _cb_record_failure(now: float) -> None:
         _cb_consecutive_failures += 1
         if _cb_consecutive_failures >= _CB_FAIL_THRESHOLD:
             if not _cb_open:
-                _cb_last_attempt_at = now
+                _cb_last_attempt_at = _cb_monotonic()
             _cb_open = True
             _cb_ensure_probe_locked()
 
 
 def _cb_ensure_probe_locked() -> None:
-    """Start the single background probe thread if the slot is empty. The caller holds ``_cb_lock``.
+    """Start the background probe thread if the slot is empty. The caller holds ``_cb_lock``.
 
     Keys on the slot being None -- which only a cleanly exiting probe sets, under this same lock --
     NOT on ``is_alive()``. A thread stays alive for a moment after it has decided to exit; a failure
     racing into that window must still get a probe, and the None slot (set atomically with the exit
     decision) is the one consistent signal for "no probe is running or about to"."""
-    global _cb_probe_thread
     if _cb_probe_thread is not None:
         return
+    _cb_start_probe_locked()
+
+
+def _cb_start_probe_locked() -> bool:
+    """Start a probe thread and make it the slot's owner, superseding whatever was there. The caller
+    holds ``_cb_lock``; the new thread's first act is to take that same lock, so it cannot observe
+    the slot before it is written. Returns False, with the slot untouched, if the start raised."""
+    global _cb_probe_thread
     thread = threading.Thread(target=_cb_probe_loop, name="redis-cb-probe", daemon=True)
     try:
         thread.start()
     except Exception:  # noqa: BLE001 — thread exhaustion must not escape into the request path
-        # Leave the slot None so this never wedges: the next failure, or the staleness backstop in
-        # _cb_is_open, retries the start rather than the breaker sitting open with no probe.
+        # Leave the slot as it was so this never wedges: the next failure, or the staleness backstop
+        # in _cb_is_open, retries the start rather than the breaker sitting open with no probe.
         logger.warning("rate-limiter breaker probe thread could not be started; will retry")
-        return
+        return False
     _cb_probe_thread = thread
+    _cb_probe_threads.append(thread)
+    return True
 
 
 def _cb_ping() -> None:
@@ -350,10 +405,14 @@ def _cb_probe_attempt() -> bool:
     False (the breaker stays open). Split out from the loop so a test can drive one attempt.
 
     Stamps the staleness clock before the ping, so a probe that then hangs inside the ping (a connect
-    whose DNS lookup the socket timeout does not bound) still lets _cb_is_open notice it went stale."""
+    whose DNS lookup the socket timeout does not bound) still lets _cb_is_open notice it went stale.
+    Only the slot's OWNER stamps: a superseded probe that finally wakes must not refresh the clock,
+    or one hung generation waking once per period could hold the backstop off forever. Its SUCCESS is
+    still recorded -- a ping that succeeded now is current news, whoever ran it."""
     global _cb_last_attempt_at
     with _cb_lock:
-        _cb_last_attempt_at = time.time()
+        if _cb_probe_thread is None or _cb_probe_thread is threading.current_thread():
+            _cb_last_attempt_at = _cb_monotonic()
     try:
         _cb_ping()
     except Exception:
@@ -375,10 +434,18 @@ def _cb_probe_loop() -> None:
     fresh probe. Without that, a probe could decide to exit while a racing failure re-opened the
     breaker and started nothing -- leaving it open forever, since no foreground caller touches the
     socket to record another failure. Sleeping before the probe also means a breaker a live success
-    closed during the wait exits without a ping."""
+    closed during the wait exits without a ping.
+
+    Ownership gates the exit and the slot write together, in that same critical section: a probe
+    that was REPLACED while stuck (see _cb_is_open) finds the slot owned by another thread when it
+    wakes and leaves at once, touching nothing -- it can neither clear a slot a newer probe has
+    claimed (the exit race, re-opened from the other side) nor keep probing beside it."""
     global _cb_probe_thread
+    me = threading.current_thread()
     while True:
         with _cb_lock:
+            if _cb_probe_thread is not me:
+                return  # superseded: the slot belongs to a replacement
             if not _cb_open:
                 _cb_probe_thread = None
                 return
