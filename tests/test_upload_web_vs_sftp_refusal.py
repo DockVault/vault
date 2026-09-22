@@ -47,9 +47,12 @@ def test_the_guard_is_fail_open_and_member_grade():
     # holder() returns SKIPPED on an outage (not a str) -> the isinstance(str) refusal is skipped ->
     # the upload proceeds. The comment states fail-open; the code shape enforces it.
     assert "fail-OPEN" in seg
-    # The member name falls back to the neutral "another member", never leaks more than the username.
-    assert '"another member"' in seg
-    assert 'getattr(_u, "username", None) or "another member"' in seg
+    # The holder is named by the ONE rule both doors share (upload_marker.holder_display_name: the
+    # username only to a member-grade viewer, "another member" to a scoped credential, never an
+    # email) -- this site no longer looks the name up itself. The rule's behaviour is pinned beside
+    # it in test_upload_marker.py.
+    assert "_um.holder_display_name(db, _holder, current_user)" in seg
+    assert 'getattr(_u, "username"' not in seg
 
 
 def test_the_client_refuses_a_legacy_zk_whole_file_encrypt_above_the_threshold():
