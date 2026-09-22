@@ -385,3 +385,51 @@ def test_the_coroutines_run_even_when_a_loop_is_already_running_in_this_thread()
     finally:
         asyncio.events._set_running_loop(None)
         loop.close()
+
+
+# ---- the live pin's guard, armed ---------------------------------------------------------------------------
+
+def test_the_live_controls_guard_gives_up_within_its_bound_when_the_container_is_not_there():
+    # The live pin (tests/test_upload_stream_pool_live.py) opens a transaction inside the API
+    # container as its positive control, and SKIPS with a reason when the container cannot run it.
+    # A guard is only real once its trigger has been made to happen: point it at a container that
+    # does not exist and it must come back -- with a reason, inside the bound -- rather than block.
+    # (The first version blocked on an unbounded readline one line before its skip, and took a
+    # 45-minute job with it.) Needs no stack: docker refuses at once, or is absent, and either is a
+    # reason.
+    import time
+    from conftest import unique
+    from test_upload_stream_pool_live import open_transaction_in_container
+    started = time.monotonic()
+    name = "no-such-container-" + unique("x")
+    proc, reason = open_transaction_in_container(name, ready_timeout=8)
+    took = time.monotonic() - started
+    assert proc is None and reason, (proc, reason)
+    assert took < 8 + 15, "the control did not give up inside its bound: %.1fs" % took
+    assert name in reason or "docker" in reason.lower(), reason
+
+
+@pytest.mark.parametrize("child", ["silent", "wrong-word"])
+def test_the_live_controls_guard_gives_up_on_a_child_that_starts_and_never_says_open(child):
+    # The hazard that actually took the job: the child STARTS (docker is there, the container is
+    # there) and then never prints -- a stuck import, a stuck connect. And its cousin: it prints
+    # the wrong thing, with the real reason on stderr. Both must come back inside the bound, with
+    # the child killed and stderr in the reason.
+    import sys
+    import time
+    from test_upload_stream_pool_live import open_transaction_in_container
+    if child == "silent":
+        script = "import time; time.sleep(60)"
+    else:
+        script = ("import sys, time; sys.stderr.write('ImportError: no such module' + chr(10)); "
+                  "print('nope', flush=True); time.sleep(60)")
+    started = time.monotonic()
+    proc, reason = open_transaction_in_container("ignored", ready_timeout=3,
+                                                 command=[sys.executable, "-c", script])
+    took = time.monotonic() - started
+    assert proc is None and reason, (proc, reason)
+    assert took < 3 + 12, "the control did not give up inside its bound: %.1fs" % took
+    if child == "silent":
+        assert "never printed 'open' within 3s" in reason, reason
+    else:
+        assert "printed 'nope'" in reason and "ImportError: no such module" in reason, reason
