@@ -291,6 +291,24 @@ def _best_effort_cache(code: str, op) -> None:
         safe_event(code, exc=e)
 
 
+# How long a fail-closed deny lasts when the DB fallback cannot establish the count: long enough to
+# bound a spray during a Redis+DB double failure, short enough that a transient hiccup recovers.
+_FAIL_CLOSED_DENY_SECONDS = 5
+
+
+def _epoch(when: datetime) -> float:
+    """A naive-UTC row timestamp as epoch seconds. The column is TIMESTAMP WITHOUT TIME ZONE and
+    every value in it is UTC, so the tz is attached rather than guessed from the local zone."""
+    return when.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _window_reset(win_start, window: int, now: datetime) -> float:
+    """When the throttle window that began at `win_start` resets, as epoch seconds. A missing
+    win_start means the row could not say, so the window is treated as starting now -- the longest
+    honest wait, which `retry_after_seconds` then caps at the window."""
+    return _epoch(win_start if win_start is not None else now) + window
+
+
 class AuthService:
     """Service for authentication operations."""
     
@@ -1681,7 +1699,7 @@ class AuthService:
         Raises RateLimitExceededError if the limit is exceeded; returns rate
         limit info (for response headers) otherwise.
         """
-        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
 
         # The admin 'Max Login Attempts' / 'Login window' settings override the env defaults when
         # configured (bounded + fail-safe-to-deployment via the rate-limit registry).
@@ -1757,7 +1775,7 @@ class AuthService:
         early and without spending a slot. That bucket is charged at the SFTP door, never at the
         mint, so a mint-time caller has no other way to learn its sync-auth standing.
         Returns (rate_limited, retry_after_seconds)."""
-        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
         limit = rate_limit_settings.effective("rate_limit_device_sync_attempts")
         window = rate_limit_settings.effective("rate_limit_device_sync_window_seconds")
         try:
@@ -1934,8 +1952,13 @@ class AuthService:
         Timestamps are naive UTC to match the column type (TIMESTAMP WITHOUT TIME
         ZONE) and so the window comparison happens entirely inside Postgres.
         """
+        from app.core.rate_limiter import retry_after_seconds
         now = datetime.utcnow()
         cutoff = now - timedelta(seconds=window)
+        # A short deny used when the fallback can't establish the count -- long enough to bound a
+        # spray during the Redis+DB double-failure, short enough that a transient hiccup recovers.
+        fail_closed_retry = retry_after_seconds(_epoch(now) + _FAIL_CLOSED_DENY_SECONDS,
+                                                window, _epoch(now))
         try:
             tbl = RateLimitRecord.__table__
             # On conflict: if the stored window has expired, restart it (count=1,
@@ -1963,22 +1986,18 @@ class AuthService:
                 # attempt that dropped to this DB fallback can be attributed to its path.
                 row = redis_guard.timed_db(
                     "_db_throttle_hit", lambda: db.execute(stmt).first())  # commits on exit
-            # A short deny used when the fallback can't establish the count -- long
-            # enough to bound a spray during the Redis+DB double-failure, short
-            # enough that a transient hiccup recovers quickly.
-            fail_closed_retry = max(1, min(window, 5))
             if row is None:
                 return False, fail_closed_retry
             count, win_start = row[0], row[1]
             if count > limit:
-                elapsed = (now - win_start).total_seconds() if win_start else 0
-                return False, max(1, int(window - elapsed))
+                return False, retry_after_seconds(_window_reset(win_start, window, now), window,
+                                                  _epoch(now))
             return True, 0
         except Exception:
             # Fail CLOSED: with Redis already down, silently allowing here would
             # disable login throttling entirely. Deny briefly; the DB account
             # lockout remains the final backstop.
-            return False, max(1, min(window, 5))
+            return False, fail_closed_retry
     
     @staticmethod
     def _db_throttle_peek(identifier: str, action: str, limit: int, window: int) -> Tuple[bool, int]:
@@ -1991,10 +2010,12 @@ class AuthService:
         _db_throttle_hit does: this path runs precisely when Redis is already down, and a silent
         'not limited' here would under-report a real block. A pure SELECT in its own short-lived
         session -- no write, nothing to commit."""
+        from app.core.rate_limiter import retry_after_seconds
         from sqlalchemy import select
         now = datetime.utcnow()
         cutoff = now - timedelta(seconds=window)
-        fail_closed_retry = max(1, min(window, 5))
+        fail_closed_retry = retry_after_seconds(_epoch(now) + _FAIL_CLOSED_DENY_SECONDS,
+                                                window, _epoch(now))
         try:
             tbl = RateLimitRecord.__table__
             stmt = select(tbl.c.attempt_count, tbl.c.window_start).where(
@@ -2010,8 +2031,8 @@ class AuthService:
             if win_start is None or win_start < cutoff:
                 return False, 0
             if count >= limit:
-                elapsed = (now - win_start).total_seconds()
-                return True, max(1, int(window - elapsed))
+                return True, retry_after_seconds(_window_reset(win_start, window, now), window,
+                                                 _epoch(now))
             return False, 0
         except Exception:
             # Fail CLOSED, like _db_throttle_hit: with Redis already down, a silent 'not limited'

@@ -244,6 +244,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _account_lock_retry_after(locked_until, now=None) -> int:
+    """How long to tell a locked-out caller to wait, in seconds.
+
+    Through the one helper, like every other Retry-After: floored at a second, because 0 would say
+    "retry now" into a lock that is still in force, and capped at the lockout's own length, so a
+    clock step cannot promise a wait longer than any lock this deployment can impose. A configured
+    0 means a PERMANENT lock, which reaches this only through a locked_until left by an earlier
+    setting, so the cap falls back to the longest lockout the settings allow rather than to nothing.
+    """
+    from app.core import rate_limit_settings as _rl
+    minutes = int(_rl.effective("lockout_duration"))
+    window = (minutes if minutes > 0 else 1440) * 60
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    return retry_after_seconds(locked_until.timestamp(), window, now)
+
+
 def _external_scheme(request: StarletteRequest) -> str:
     """The externally-visible request scheme, honouring X-Forwarded-Proto only from a trusted proxy.
 
@@ -5977,7 +5993,8 @@ async def login(
             if locked_until is not None:
                 if locked_until.tzinfo is None:
                     locked_until = locked_until.replace(tzinfo=timezone.utc)
-                secs = max(0, int((locked_until - datetime.now(timezone.utc)).total_seconds()))
+                secs = _account_lock_retry_after(locked_until)
+                # Minutes for the sentence only, rounded up from the wait above; not a second wait.
                 mins = max(1, (secs + 59) // 60)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,

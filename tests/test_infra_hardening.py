@@ -177,13 +177,28 @@ def test_sftp_key_clear_resets_db_fallback_row():
 
 
 @pytest.mark.unit
-def test_login_and_sftp_throttles_fail_closed():
+def test_login_and_sftp_throttles_fail_closed(monkeypatch):
     # Both the DB-fallback login throttle and the SFTP key-offer throttle must fail CLOSED on a Redis
     # outage -- they used to fail OPEN (silently disabling throttling while Redis was down).
+    #
+    # The login half is DRIVEN rather than read: this test used to assert the exact expression the
+    # deny was spelled with, so rewriting that expression -- even into one of identical value --
+    # reddened it while the behaviour was untouched. What must hold is the outcome: the fallback
+    # denies, and names a wait the caller can act on.
     auth = _read("app/services/auth_service.py")
     assert "Fails CLOSED" in auth, "the DB throttle fallback docstring should state fail-closed"
-    assert "return False, max(1, min(window, 5))" in auth, \
-        "the DB throttle must deny (not allow) on its own error"
+    from app.services import auth_service as A
+    from app.services.auth_service import AuthService
+
+    def _boom():
+        raise RuntimeError("the DB is down too")
+
+    monkeypatch.setattr(A, "get_db_context", _boom)
+    allowed, retry = AuthService._db_throttle_hit("id-1", "login_user", 5, 300)
+    assert allowed is False, "the DB throttle must deny (not allow) on its own error"
+    assert retry >= 1, "a deny must name a wait the caller can act on"
+    over, peek_retry = AuthService._db_throttle_peek("id-1", "login_user", 5, 300)
+    assert over is True and peek_retry >= 1, "the peek must report limited on its own error"
     sftp = _read("app/sftp/sftp_server.py")
     body = sftp[sftp.index("def _sftp_key_throttled"):sftp.index("def _sftp_key_clear")]
     assert "fail_open=False" in body, "the SFTP key throttle must ask the limiter to fail closed"

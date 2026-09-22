@@ -166,32 +166,149 @@ def test_the_middleware_emits_the_same_clamped_value(monkeypatch):
     assert resp.headers["retry-after"] == str(rule_window), resp.headers["retry-after"]
 
 
-def test_no_emission_rolls_its_own_arithmetic_anywhere_in_the_application():
-    # Repo-wide, and with no exemption list: an exemption is a hole that outlives its reason. Every
-    # subtraction of the clock from a reset is the helper's; every Retry-After header and every
-    # RateLimitExceeded is built from a value the helper produced. Comments are stripped first so a
-    # commented-out old shape neither passes nor fails this.
-    import re
+def test_no_emission_computes_its_own_wait_anywhere_in_the_application():
+    # WHAT THIS CHECKS, and what it deliberately does not. The property we want is "every value that
+    # reaches a Retry-After header, or a RateLimitExceeded, came from the helper". That is whole-
+    # program provenance: it crosses functions (a throttle returns a tuple its caller passes on) and
+    # an exception object (the 503 handler emits exc.retry_after, built three modules away), so
+    # expressing it statically means writing a dataflow engine that would red on innocent
+    # refactors. The previous version of this test pretended otherwise: it swept for the SPELLING
+    # `reset - int(` and for arithmetic on the emission's own line, and called that total. It was
+    # not -- it missed a floor-of-ZERO Retry-After on the account-lockout 403, where the arithmetic
+    # sat on the line ABOVE the header, and two fail-closed waits in the DB throttle fallbacks.
+    # (That is the same lesson twice: a pin that enumerates what it can see checks only that.)
+    #
+    # So the static half is narrowed to a property it can actually hold, everywhere and with no
+    # exemptions: THE EMISSION PASSES A VALUE, IT NEVER COMPUTES ONE. No Retry-After value and no
+    # retry_after= argument may contain arithmetic, a clamp, or a conditional of its own. The
+    # provenance half is pinned BEHAVIOURALLY, one test per emission family, below.
+    import ast
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "app"
-    raw = []
-    emissions = 0
+    offences, emissions, constructions = [], 0, 0
     for py in sorted(root.rglob("*.py")):
-        code = "\n".join(ln for ln in py.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
-        for m in re.finditer(r"reset[a-z_]*\s*-\s*int\(", code):
-            line = code[:m.start()].count("\n") + 1
-            if "def retry_after_seconds" not in code[max(0, m.start() - 600):m.start()]:
-                raw.append("%s:%d" % (py.relative_to(root.parent), line))
-        for ln in code.splitlines():
-            if '"Retry-After"' in ln and "=" in ln:
-                emissions += 1
-                # The header stringifies a value: the helper's call, or a name carrying what the
-                # helper produced (`retry_after`, `_retry`, an exception's field). What it must
-                # never hold is arithmetic of its own.
-                assert not any(tok in ln for tok in (" - ", "max(", "min(")), \
-                    "%s: a Retry-After with its own arithmetic: %s" % (py.name, ln.strip())
-    assert raw == [], "raw retry-after arithmetic remains at: %s" % raw
-    assert emissions >= 20, "the sweep found fewer header emissions than there are (%d)" % emissions
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+
+        def computes(node):
+            return any(isinstance(n, (ast.BinOp, ast.IfExp, ast.Compare)) or
+                       (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                        and n.func.id in ("max", "min", "abs", "round"))
+                       for n in ast.walk(node))
+
+        for node in ast.walk(tree):
+            values = []
+            if isinstance(node, ast.Dict):
+                values += [v for k, v in zip(node.keys, node.values)
+                           if isinstance(k, ast.Constant) and k.value == "Retry-After"]
+                emissions += len(values)
+            if isinstance(node, ast.Call):
+                kw = [k.value for k in node.keywords if k.arg == "retry_after"]
+                values += kw
+                constructions += len(kw)
+            for v in values:
+                # The helper's OWN call may of course contain the arithmetic it exists to own.
+                src = ast.unparse(v)
+                if "retry_after_seconds(" in src:
+                    continue
+                if computes(v):
+                    offences.append("%s:%d: %s" % (py.relative_to(root.parent), v.lineno, src[:80]))
+    assert offences == [], (
+        "a Retry-After emission computing its own wait; call retry_after_seconds and pass it:\n  "
+        + "\n  ".join(offences))
+    # The sweep is only as good as its reach: if these counts collapse, it is finding nothing.
+    assert emissions >= 20, emissions
+    assert constructions >= 5, constructions
+
+
+def _fake_db(monkeypatch, row):
+    """Point the DB-fallback throttles at one row, the way test_device_sync_preflight does."""
+    import contextlib
+    from app.services import auth_service as A
+
+    class _Exec:
+        def __init__(self, row):
+            self._row = row
+
+        def first(self):
+            return self._row
+
+    class _DB:
+        def execute(self, stmt):
+            return _Exec(row)
+
+    @contextlib.contextmanager
+    def _ctx():
+        yield _DB()
+
+    monkeypatch.setattr(A, "get_db_context", _ctx)
+
+
+@pytest.mark.parametrize("fn", ["_db_throttle_hit", "_db_throttle_peek"])
+def test_a_throttle_window_that_starts_in_the_future_never_asks_for_more_than_the_window(monkeypatch, fn):
+    # The emission family the old sweep could not see. Both DB fallbacks derived the wait from the
+    # window's start, floored at 1 and capped at NOTHING -- so a window_start in the future (a clock
+    # step, a replica's clock, a row written by a host running ahead) handed the caller a wait longer
+    # than the window the limit is even defined over. The helper caps it; here the product is driven
+    # with such a row and the answer is held inside [1, window].
+    from datetime import datetime, timedelta
+    from app.services.auth_service import AuthService
+    window = 300
+    ahead = datetime.utcnow() + timedelta(seconds=10 * window)     # the row's clock runs ahead
+    _fake_db(monkeypatch, (99, ahead))
+    allowed_or_over, retry = getattr(AuthService, fn)("id-1", "act", 5, window)
+    assert 1 <= retry <= window, (fn, retry)
+
+
+@pytest.mark.parametrize("fn", ["_db_throttle_hit", "_db_throttle_peek"])
+def test_a_fail_closed_deny_is_also_inside_the_window(monkeypatch, fn):
+    # The other half of the same family: when the fallback cannot establish the count it denies for
+    # a fixed short while. That value is emitted to the same callers, so it obeys the same bound --
+    # including when the window itself is shorter than the fixed deny.
+    from app.services import auth_service as A
+    from app.services.auth_service import AuthService
+
+    def _boom():
+        raise RuntimeError("db down too")
+
+    monkeypatch.setattr(A, "get_db_context", _boom)
+    for window in (300, 2):                                        # a window shorter than the deny
+        _, retry = getattr(AuthService, fn)("id-1", "act", 5, window)
+        assert 1 <= retry <= window, (fn, window, retry)
+
+
+def test_a_locked_account_is_never_told_to_retry_immediately_or_past_the_lock(monkeypatch):
+    # The account-lockout 403 carried `max(0, ...)`: a lock whose end had just passed, or a clock a
+    # second ahead, emitted "Retry-After: 0" -- retry now, into a lock still in force. And nothing
+    # capped it, so a stale locked_until from a longer-lockout era promised a wait no lock this
+    # deployment can impose. Driven on the helper the endpoint now calls.
+    from datetime import datetime, timedelta, timezone
+    import _bare_api_env
+    _bare_api_env.set_bare_api_env()
+    from app.api import api_server as S
+    from app.core import rate_limit_settings
+    monkeypatch.setattr(rate_limit_settings, "effective", lambda key: 30 if key == "lockout_duration" else 5)
+    window = 30 * 60
+    now = datetime.now(timezone.utc)
+    assert S._account_lock_retry_after(now + timedelta(minutes=10)) == pytest.approx(600, abs=2)
+    assert S._account_lock_retry_after(now - timedelta(seconds=1)) == 1      # never 0
+    assert S._account_lock_retry_after(now + timedelta(days=7)) == window    # capped at the lock
+    # A permanent-lock setting (0) still caps, at the longest lockout the settings allow.
+    monkeypatch.setattr(rate_limit_settings, "effective", lambda key: 0 if key == "lockout_duration" else 5)
+    assert S._account_lock_retry_after(now + timedelta(days=7)) == 1440 * 60
+
+
+def test_the_fixed_waits_emitted_as_headers_are_positive_and_are_their_own_window():
+    # The remaining emission family is a CONSTANT wait -- the anonymous-surface lockout windows and
+    # the transfer-admission slot retry. A constant cannot drift out of range, but it can be set to
+    # zero or negative by an edit, which is the same "retry now" defect; and each is emitted as the
+    # whole window it belongs to, so it is its own cap.
+    import _bare_api_env
+    _bare_api_env.set_bare_api_env()
+    from app.api import api_server as S
+    from app.core import auth_offload
+    for value in (S._NOTELINK_FAIL_WINDOW, S._PUBLINK_FAIL_WINDOW, S._RECV_FAIL_WINDOW,
+                  auth_offload._SLOT_RETRY_AFTER_SECONDS):
+        assert isinstance(value, int) and value >= 1, value
 
 
 def test_at_a_site_with_two_limiters_the_refusing_one_decides_both_the_reset_and_the_window():
