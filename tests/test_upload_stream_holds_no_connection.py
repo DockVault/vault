@@ -1,0 +1,355 @@
+"""A chunk write holds no database connection while the client sends the body.
+
+Both chunk endpoints resolve and authorise on the request's one Session, whose first query checks
+a pool connection out for the transaction that begins there; they then stream the body at the
+client's pace -- unbounded by design -- and only afterwards lock, publish and commit. A slow client
+was a pool slot held for its whole transfer, and enough of them starved every other request.
+
+Now the read transaction ends before the first byte of body is read (``_release_db_before_streaming``),
+and a short transaction after the body re-validates and publishes. The engine here is Postgres-only,
+so these tests drive the endpoint functions themselves with a STAND-IN Session that models what the
+real one does with its connection: the first query checks one out, rollback/commit/close return it,
+and -- the part that bites -- touching an attribute of an instance the ended transaction expired
+refreshes it, which is a checkout. The body is a slow async stream that samples the checkout count
+at every piece. The stand-in was validated as an instrument by running it against the code as it
+was before this change, where it reports the connection held throughout (see the record).
+"""
+from __future__ import annotations
+
+import asyncio
+import uuid
+from pathlib import Path
+
+import pytest
+
+from _bare_api_env import set_bare_api_env  # noqa: E402
+
+set_bare_api_env()
+
+import app.api.api_server as S  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+
+# ---- the instrument -----------------------------------------------------------------------------------
+
+class _Pool:
+    """How many connections the request's Session has out, and what the stream saw."""
+    def __init__(self):
+        self.checked_out = 0
+        self.seen_during_stream = []
+        self.transactions = 0
+
+    def out(self):
+        self.checked_out += 1
+        self.transactions += 1
+
+    def back(self):
+        assert self.checked_out > 0, "returned a connection that was not out"
+        self.checked_out -= 1
+
+
+class _Row:
+    """An ORM instance: reading an attribute after the transaction that loaded it has ended is a
+    lazy refresh, which checks a connection out (that is what SQLAlchemy does with expire_on_commit
+    and a rollback alike)."""
+    def __init__(self, session, **fields):
+        object.__setattr__(self, "_session", session)
+        object.__setattr__(self, "_fields", dict(fields))
+        object.__setattr__(self, "_expired", False)
+
+    def __getattr__(self, name):
+        fields = object.__getattribute__(self, "_fields")
+        if name not in fields:
+            raise AttributeError(name)
+        if object.__getattribute__(self, "_expired"):
+            object.__getattribute__(self, "_session")._begin()     # the refresh
+            object.__setattr__(self, "_expired", False)
+        return fields[name]
+
+    def __setattr__(self, name, value):
+        object.__getattribute__(self, "_fields")[name] = value
+
+
+class _Query:
+    def __init__(self, session, models):
+        self.session, self.models = session, models
+
+    def filter(self, *a, **k):
+        return self
+
+    def join(self, *a, **k):
+        return self
+
+    def with_for_update(self):
+        self.session.locked = True
+        return self
+
+    def first(self):
+        return self.session.rows_for(self.models[0])
+
+    def all(self):
+        r = self.first()
+        return [r] if r is not None else []
+
+    def count(self):
+        return 0
+
+
+class _StandInSession:
+    def __init__(self, pool, provider):
+        self.pool, self.provider = pool, provider
+        self._in_tx = False
+        self.loaded = []
+        self.locked = False
+
+    def _begin(self):
+        if not self._in_tx:
+            self._in_tx = True
+            self.pool.out()
+
+    def query(self, *models):
+        self._begin()
+        return _Query(self, models)
+
+    def rows_for(self, model):
+        row = self.provider(model, self)
+        if row is not None:
+            self.loaded.append(row)
+        return row
+
+    def _end(self):
+        if self._in_tx:
+            self._in_tx = False
+            self.pool.back()
+            for row in self.loaded:
+                object.__setattr__(row, "_expired", True)
+
+    def rollback(self):
+        self._end()
+
+    def commit(self):
+        self._end()
+
+    def close(self):
+        self._end()
+
+    def add(self, obj):
+        self._begin()
+
+    def refresh(self, obj):
+        self._begin()
+
+
+def _slow_body(pool, pieces=4):
+    async def gen():
+        for i in range(pieces):
+            await asyncio.sleep(0)
+            pool.seen_during_stream.append(pool.checked_out)
+            yield b"x" * 16
+    return gen()
+
+
+class _Request:
+    def __init__(self, body, headers=None):
+        self._body, self.headers = body, headers or {}
+
+    def stream(self):
+        return self._body
+
+
+async def _fake_seal(stream, dest_path, limit, session_id, chunk_index):
+    n = 0
+    async for piece in stream:
+        n += len(piece)
+    Path(dest_path).write_bytes(b"sealed" * 4)
+    return n, "digest"
+
+
+# ---- the receiver endpoint --------------------------------------------------------------------------------
+
+def _receiver_world(monkeypatch, tmp_path, pool, *, revalidate_ok=True, locked_status="active"):
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    state = {"resolutions": 0}
+
+    def provider(model, session):
+        if model is S.ChunkedUploadSession:
+            return _Row(session, id=sid, status=locked_status, vault_id=vid, total_chunks=3, total_size=48,
+                        bytes_received=0)
+        return None
+
+    db = _StandInSession(pool, provider)
+
+    def resolve(db_, token, session_id):
+        # The shipped resolver's six lookups on the request's Session, as one query on the stand-in.
+        state["resolutions"] += 1
+        row = db_.query(S.ChunkedUploadSession).first()
+        if state["resolutions"] > 1 and not revalidate_ok:
+            return None
+        vault = _Row(db_, id=vid)
+        return object(), row, vault, object()
+
+    monkeypatch.setattr(S, "_receiver_resolve_session", resolve)
+    monkeypatch.setattr(S, "PermissionService", lambda db_: object())
+    monkeypatch.setattr(S, "VaultService", lambda db_, ps: object())
+    monkeypatch.setattr(S, "_upload_session_dir", lambda vs, s: tmp_path / "sess")
+    monkeypatch.setattr(S, "seal_stream_to_file", _fake_seal)
+    monkeypatch.setattr(S, "sealed_plaintext_size", lambda p: 16)
+    monkeypatch.setattr(S, "_chunk_hash_path", lambda d, i: d / f".hash_{i:06d}")
+    return db, sid, state
+
+
+def test_the_receiver_chunk_write_holds_no_connection_while_the_body_streams(monkeypatch, tmp_path):
+    pool = _Pool()
+    db, sid, state = _receiver_world(monkeypatch, tmp_path, pool)
+    out = asyncio.run(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+    # (mutation: the release before the stream removed -> the stream sees 1 throughout -> red.
+    #  mutation: a scalar read from the expired row during the stream -> the refresh is a checkout
+    #  the stream sees -> red.)
+    assert pool.seen_during_stream == [0, 0, 0, 0], pool.seen_during_stream
+    # Published: the chunk is in place, the counters recomputed, and the last transaction ended.
+    assert out["received"] == 1 and out["total"] == 3 and (tmp_path / "sess" / "chunk_000001").exists()
+    assert pool.checked_out == 0
+    # Two transactions: the one before the body, and the short one after it.
+    assert pool.transactions == 2 and state["resolutions"] == 2
+
+
+def test_the_receiver_chunk_is_refused_and_not_published_when_the_binding_is_gone_after_the_stream(monkeypatch, tmp_path):
+    # Revoked / kill switch / owner locked out / session closed while the body streamed: the
+    # resolution runs again after the body and fails -> the uniform 404, the sealed bytes unlinked,
+    # nothing published, the counters untouched.
+    pool = _Pool()
+    db, sid, state = _receiver_world(monkeypatch, tmp_path, pool, revalidate_ok=False)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+    assert e.value.status_code == 404 and e.value.detail == "This upload is not available."
+    sess = tmp_path / "sess"
+    assert not (sess / "chunk_000001").exists(), "a refused chunk was published"
+    assert not list(sess.glob(".chunk_*.part")), "the refused bytes were left on disk"
+    assert pool.seen_during_stream == [0, 0, 0, 0] and state["resolutions"] == 2
+
+
+def test_the_receiver_chunk_is_refused_when_the_locked_row_is_no_longer_active(monkeypatch, tmp_path):
+    # The resolution passes but the row taken under the lock is not active any more (closed in the
+    # instant between): refused the same way. (mutation: the status check under the lock removed
+    # -> published -> red.)
+    pool = _Pool()
+    db, sid, _ = _receiver_world(monkeypatch, tmp_path, pool, locked_status="completed")
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+    assert e.value.status_code == 404
+    assert not (tmp_path / "sess" / "chunk_000001").exists()
+
+
+# ---- the authenticated endpoint ---------------------------------------------------------------------------
+
+def _auth_world(monkeypatch, tmp_path, pool, *, principal_ok=True, locked_status="active", other_user=False):
+    sid, vid, uid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    calls = {"judged": 0, "loads": 0}
+
+    def provider(model, session):
+        if model is S.ChunkedUploadSession:
+            calls["loads"] += 1
+            # The row as first loaded is active and this user's -- the request is admitted; what
+            # the LOCKED load after the body sees is the scenario's (closed, or another user's).
+            first = calls["loads"] == 1
+            return _Row(session, id=sid, status=("active" if first else locked_status), vault_id=vid,
+                        user_id=(uid if first or not other_user else uuid.uuid4()), folder_id=None,
+                        total_chunks=3, total_size=48, bytes_received=0, blob_id=None, expires_at=None)
+        return None
+
+    db = _StandInSession(pool, provider)
+    user = _Row(db, id=uid)
+
+    async def judge(credentials, db_):
+        calls["judged"] += 1
+        db_.query(S.User).first()          # the shipped dependency's lookups, on the same Session
+        if not principal_ok:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return user
+
+    class _VS:
+        def __init__(self, db_, ps):
+            pass
+
+        def get_vault(self, *a, **k):
+            db.query(S.Vault).first()
+            return _Row(db, id=vid)
+
+    monkeypatch.setattr(S, "get_current_user", judge)
+    monkeypatch.setattr(S, "PermissionService", lambda db_: object())
+    monkeypatch.setattr(S, "VaultService", _VS)
+    monkeypatch.setattr(S, "require_folder_scope", lambda *a, **k: None)
+    monkeypatch.setattr(S, "_session_principal", lambda u: True)
+    monkeypatch.setattr(S, "_upload_session_dir", lambda vs, s: tmp_path / "sess")
+    monkeypatch.setattr(S, "seal_stream_to_file", _fake_seal)
+    monkeypatch.setattr(S, "sealed_plaintext_size", lambda p: 16)
+    monkeypatch.setattr(S, "_chunk_hash_path", lambda d, i: d / f".hash_{i:06d}")
+    return db, sid, vid, user, calls
+
+
+def _raw(endpoint):
+    fn = endpoint
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
+def test_the_authenticated_chunk_write_holds_no_connection_while_the_body_streams(monkeypatch, tmp_path):
+    pool = _Pool()
+    db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool)
+    # As the request would have arrived: the principal already judged on this Session (one checkout).
+    asyncio.run(S.get_current_user(None, db))
+    req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
+    out = asyncio.run(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    assert pool.seen_during_stream == [0, 0, 0, 0], pool.seen_during_stream
+    assert out["received"] == 1 and (tmp_path / "sess" / "chunk_000001").exists()
+    assert pool.checked_out == 0 and pool.transactions == 2
+    # The principal was judged twice: once to admit the request, once after the body.
+    assert calls["judged"] == 2
+
+
+def test_the_authenticated_chunk_is_refused_when_the_principal_is_no_longer_valid_after_the_stream(monkeypatch, tmp_path):
+    # Deactivated, locked, session revoked or the temporary credential withdrawn while the body
+    # streamed: the same dependency that admitted the request refuses it now, with its 401; the
+    # sealed bytes are unlinked and nothing is published.
+    pool = _Pool()
+    db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool, principal_ok=False)
+    req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    assert e.value.status_code == 401
+    sess = tmp_path / "sess"
+    assert not (sess / "chunk_000001").exists() and not list(sess.glob(".chunk_*.part"))
+    assert calls["judged"] == 1 and pool.seen_during_stream == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("how", ["closed", "other-user"])
+def test_the_authenticated_chunk_is_refused_when_the_locked_row_is_not_this_active_session(monkeypatch, tmp_path, how):
+    pool = _Pool()
+    db, sid, vid, user, _ = _auth_world(monkeypatch, tmp_path, pool,
+                                        locked_status="completed" if how == "closed" else "active",
+                                        other_user=(how == "other-user"))
+    req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    assert e.value.status_code == (409 if how == "closed" else 404)
+    assert not (tmp_path / "sess" / "chunk_000001").exists()
+
+
+# ---- the shape, as a smoke alarm ----------------------------------------------------------------------------
+
+def test_the_boundary_sits_between_the_last_read_and_the_first_byte_in_both_endpoints():
+    import inspect
+    for fn in (S.receiver_upload_chunk, _raw(S.upload_chunk)):
+        src = "\n".join(ln for ln in inspect.getsource(fn).splitlines() if not ln.lstrip().startswith("#"))
+        release = src.index("_release_db_before_streaming(db)")
+        seal = src.index("await seal_stream_to_file(")
+        assert release < seal, fn.__name__
+        # Nothing between the boundary and the seal reads an ORM instance or the Session.
+        between = src[release:seal]
+        assert "session." not in between and "db." not in between and "current_user." not in between, between
+        # ... and the seal is handed the copied id, not the instance's.
+        assert "_sid, chunk_index)" in src[seal:seal + 200], fn.__name__

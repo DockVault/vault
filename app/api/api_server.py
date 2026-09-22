@@ -12221,13 +12221,20 @@ async def receiver_upload_chunk(
 
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
-    sdir = _upload_session_dir(vault_service, str(session.id))
+    # Everything the stream and the publish need, copied out of the loaded rows NOW -- see
+    # _release_db_before_streaming for why nothing below the boundary may read them again.
+    _sid = session.id
+    _total = session.total_chunks
+    _total_size = session.total_size
+    _bytes_before = session.bytes_received or 0
+    _vault_id = str(vault.id)
+    sdir = _upload_session_dir(vault_service, str(_sid))
     sdir.mkdir(parents=True, exist_ok=True)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
     already = chunk_path.exists()
     existing_size = sealed_plaintext_size(chunk_path) if already else 0
-    base_bytes = max(0, (session.bytes_received or 0) - existing_size)
-    remaining = min(session.total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)
+    base_bytes = max(0, _bytes_before - existing_size)
+    remaining = min(_total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)
 
     declared_len = request.headers.get("content-length")
     if declared_len is not None:
@@ -12239,20 +12246,48 @@ async def receiver_upload_chunk(
             raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
 
     tmp_path = sdir / f".chunk_{chunk_index:06d}.{uuid.uuid4().hex}.part"
+    # ---- THE BOUNDARY: no connection is held while the client sends. ----
+    _release_db_before_streaming(db)
     try:
         _written, chunk_digest = await seal_stream_to_file(
-            request.stream(), tmp_path, remaining, session.id, chunk_index)
+            request.stream(), tmp_path, remaining, _sid, chunk_index)
     except ChunkTooLarge:
         raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
     except EmptyBody:
         raise HTTPException(status_code=400, detail="Empty chunk")
 
+    # ---- The post-stream transaction: short by construction. ----
+    # The world may have moved while the body streamed: the receiver revoked, the kill switch
+    # flipped, the owner locked out, the session closed or expired. Those exist to STOP uploads,
+    # and a transfer already in flight must not land after them, so the whole resolution runs AGAIN
+    # here -- kill switch, receiver active, binding, session active, vault, the GATE 3 cross-check
+    # -- and then the row is taken under the lock and checked once more. A refusal publishes
+    # NOTHING: the sealed bytes are still a `.part` file, which is unlinked here; anything this
+    # session had already published stays in its staging dir until _sweep_orphaned_upload_chunks
+    # reclaims the abandoned session (idle-age based), so the bytes are accounted for, not leaked.
+    # The refusal is the surface's uniform 404: an anonymous caller is told nothing it was not told
+    # before, and a revoked receiver looks exactly like one that never existed.
+    revalidated = _receiver_resolve_session(db, token, session_id)
+    if revalidated is None or str(revalidated[1].id) != str(_sid) or str(revalidated[2].id) != _vault_id:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=404, detail="This upload is not available.")
+
     # Publish under the per-session row lock (same reasoning as the authenticated chunk write): the
     # rename + digest must be atomic against a concurrent re-send, and the counters are recomputed from
-    # the authoritative on-disk chunk set.
-    _total = session.total_chunks
+    # the authoritative on-disk chunk set. The locked row is read again for its state: it was
+    # resolved above without a lock, and the lock is what makes "still active" hold through the
+    # publish.
     locked = db.query(ChunkedUploadSession).filter(
-        ChunkedUploadSession.id == session.id).with_for_update().first()
+        ChunkedUploadSession.id == _sid).with_for_update().first()
+    if locked is None or locked.status != 'active':
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=404, detail="This upload is not available.")
     hash_path = _chunk_hash_path(sdir, chunk_index)
     try:
         hash_path.unlink()
@@ -16836,6 +16871,44 @@ def _upload_session_dir(vault_service: VaultService, session_id: str):
     return vault_service.storage_path / "_uploads" / session_id
 
 
+def _bearer_credentials(request: Request) -> HTTPAuthorizationCredentials:
+    """The bearer token this request carried, in the shape `get_current_user` takes -- so the
+    post-stream re-check of the principal runs the SAME code that admitted it."""
+    raw = request.headers.get("authorization") or ""
+    scheme, _, token = raw.partition(" ")
+    return HTTPAuthorizationCredentials(scheme=scheme, credentials=token.strip())
+
+
+def _release_db_before_streaming(db: Session) -> None:
+    """THE TRANSACTION BOUNDARY of a chunk write.
+
+    A chunk endpoint resolves and authorises on the request's ONE Session (the same one
+    `get_current_user` and the permission decorators used -- FastAPI hands every dependency in a
+    request the same instance), and its first query checked a pool connection out for the
+    transaction that began. Then it streams the body, at the CLIENT'S pace, and that pace is
+    unbounded by design: the per-chunk cap bounds bytes, not time. A connection held across that is
+    a pool slot held for as long as the client cares to dawdle -- and the pool is small (10 + 20
+    overflow) and shared with every login and every other request. Enough slow uploads and the
+    whole API waits on a client.
+
+    So the read transaction ENDS HERE, before the first byte of body is read, and its connection
+    goes back to the pool. After the body has arrived a new, short transaction re-validates and
+    publishes (see the callers). Two rules follow, and the second is the one that bites:
+
+      * COPY OUT EVERY SCALAR THE STREAM AND THE PUBLISH NEED BEFORE CALLING THIS. Ending the
+        transaction expires every instance the Session loaded; touching an attribute of one
+        afterwards refreshes it -- a query, a NEW connection checked out, possibly while the body
+        is still streaming, which is exactly the hold this exists to remove, back as an
+        intermittent leak under load.
+      * BETWEEN THIS AND THE POST-STREAM TRANSACTION, READ ONLY THOSE COPIES. Nothing in that
+        stretch may touch the Session or an instance loaded from it.
+
+    A rollback rather than a commit: nothing is pending (the callers write nothing before the
+    body), and "nothing to keep" is what this transaction ends with.
+    """
+    db.rollback()
+
+
 # Deployment-wide rowless-orphan reclaim grace: a chunk dir with no matching active-session
 # row in our snapshot is only reclaimed once it has aged past this. init commits the session
 # row and only THEN makes the dir, so a session that starts AFTER the sweep's row snapshot is
@@ -17570,7 +17643,15 @@ async def upload_chunk(
     if chunk_index < 0 or chunk_index >= session.total_chunks:
         raise HTTPException(status_code=400, detail=f"Invalid chunk index (0-{session.total_chunks - 1})")
 
-    sdir = _upload_session_dir(vault_service, str(session.id))
+    # Everything the stream and the publish need, copied out of the loaded rows NOW -- see
+    # _release_db_before_streaming for why nothing below the boundary may read them again.
+    _sid = session.id
+    _total = session.total_chunks
+    _total_size = session.total_size
+    _bytes_before = session.bytes_received or 0
+    _user_id = current_user.id
+    _blob_id = session.blob_id
+    sdir = _upload_session_dir(vault_service, str(_sid))
     sdir.mkdir(parents=True, exist_ok=True)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
     already = chunk_path.exists()
@@ -17583,13 +17664,13 @@ async def upload_chunk(
     # Bytes already buffered for this session EXCLUDING the index being written. Clamp at
     # 0: a crash between writing a chunk and committing the counter can leave bytes_received
     # undercounted, and base_bytes must never go negative (that would loosen the bound).
-    base_bytes = max(0, (session.bytes_received or 0) - existing_size)
+    base_bytes = max(0, _bytes_before - existing_size)
     # Bound each request to ONE chunk, not the whole remaining file. base_bytes is read before the
     # per-session row lock, so a stale (low) read would otherwise let K concurrent requests each
     # stage up to total_size into the _uploads/ buffer -- uncounted transient disk, a cross-tenant
     # DoS. min() caps the stream to the smaller of "bytes left in the file" and one chunk; a body
     # larger than that is refused (413 below). This is a size cap per piece, not a rate limit.
-    remaining = min(session.total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)  # bytes this index may add
+    remaining = min(_total_size - base_bytes, _MAX_UPLOAD_CHUNK_BYTES)  # bytes this index may add
 
     # Transient-disk-pressure guard. Raw chunks buffer on the persistent storage volume
     # until /complete streams them through the encryption pipeline. Bound the buffered
@@ -17634,10 +17715,12 @@ async def upload_chunk(
         # ChunkTooLarge/EmptyBody contract and the resume digest are unchanged.
         # Chunk 0 of a zero-knowledge upload carries the file's cleartext header; keep its first
         # bytes as they stream past (the body is never held whole) for the token comparison below.
-        _peek = HeadPeek(request.stream()) if (chunk_index == 0 and session.blob_id) else None
+        _peek = HeadPeek(request.stream()) if (chunk_index == 0 and _blob_id) else None
+        # ---- THE BOUNDARY: no connection is held while the client sends. ----
+        _release_db_before_streaming(db)
         _written, chunk_digest = await seal_stream_to_file(
             _peek if _peek is not None else request.stream(),
-            tmp_path, remaining, session.id, chunk_index)
+            tmp_path, remaining, _sid, chunk_index)
     except ChunkTooLarge:
         # The body reached disk before it could be measured, which is the trade for not holding it
         # in memory. It is bounded by `remaining` -- disk this session was already approved to
@@ -17650,7 +17733,7 @@ async def upload_chunk(
     # re-minted on a resume, or fed the two from different reads, would otherwise upload a file that
     # completes and can never be opened. Refused BEFORE the chunk is published, so a mismatched
     # chunk 0 is never counted as received and the upload cannot complete on it.
-    if _peek is not None and header_token_mismatch(bytes(_peek.head), session.blob_id):
+    if _peek is not None and header_token_mismatch(bytes(_peek.head), _blob_id):
         try:
             tmp_path.unlink()
         except OSError:
@@ -17672,10 +17755,38 @@ async def upload_chunk(
     # to the true total instead of racing a read-modify-write (a blind += double-counts a
     # same-index race; an absolute assignment clobbers a concurrent different-index write).
     # Mirrors the disk-authoritative /complete and the ZK-path locking.
-    _total = session.total_chunks
+    #
+    # ---- The post-stream transaction: short by construction. ----
+    # The world may have moved while the body streamed. The PRINCIPAL first: a user deactivated or
+    # locked, a session revoked (this deployment's revocation is durable), a temporary credential
+    # withdrawn -- each exists to stop what that principal was doing, and a transfer already in
+    # flight must not land after it. The same dependency that judged the request judges it again,
+    # against the same token: two indexed lookups (four for a temporary credential), and a refusal
+    # is the 401 it always gives. Then the SESSION, under the lock: still this user's, this vault's,
+    # and still active -- closed, expired or completed meanwhile is refused as it would have been
+    # before the bytes. A refusal publishes NOTHING: the sealed bytes are still a `.part` file,
+    # unlinked here; what this session had already published stays in its staging dir until
+    # _sweep_orphaned_upload_chunks reclaims the abandoned session, so the bytes are accounted for.
+    try:
+        await get_current_user(_bearer_credentials(request), db)
+    except HTTPException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     locked = db.query(ChunkedUploadSession).filter(
-        ChunkedUploadSession.id == session.id
+        ChunkedUploadSession.id == _sid
     ).with_for_update().first()
+    if (locked is None or str(locked.user_id) != str(_user_id) or str(locked.vault_id) != str(vault_id)
+            or locked.status != 'active'):
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        if locked is None or str(locked.user_id) != str(_user_id) or str(locked.vault_id) != str(vault_id):
+            raise HTTPException(status_code=404, detail="Upload session not found")
+        raise HTTPException(status_code=409, detail=f"Upload session is {locked.status}")
 
     hash_path = _chunk_hash_path(sdir, chunk_index)
     # A previous attempt's digest goes first. The lock keeps another request out, but a crash still

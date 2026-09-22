@@ -117,10 +117,12 @@ def _chunk_handler_src() -> str:
 
 def test_the_chunk_route_refuses_a_mismatched_chunk_zero_before_publishing_it():
     src = _chunk_handler_src()
-    # Only chunk 0 of a session that declared a token is peeked.
-    assert src.count("HeadPeek(request.stream()) if (chunk_index == 0 and session.blob_id) else None") == 1
+    # Only chunk 0 of a session that declared a token is peeked. The token is read from the copy
+    # taken before the transaction boundary, never from the session row (expired by then).
+    assert src.count("HeadPeek(request.stream()) if (chunk_index == 0 and _blob_id) else None") == 1
+    assert src.count("_blob_id = session.blob_id") == 1
     # The comparison is the declared token against the captured head, exactly once.
-    check = "if _peek is not None and header_token_mismatch(bytes(_peek.head), session.blob_id):"
+    check = "if _peek is not None and header_token_mismatch(bytes(_peek.head), _blob_id):"
     assert src.count(check) == 1
     # Refused BEFORE the staged chunk is renamed into place, so it is never counted as received and
     # the upload cannot complete on it. (mutation: move the check below the publish -> red; drop the
