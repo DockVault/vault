@@ -12294,67 +12294,66 @@ async def receiver_upload_chunk(
     except EmptyBody:
         raise HTTPException(status_code=400, detail="Empty chunk")
 
-    # ---- The post-stream transaction: short by construction. ----
-    # The world may have moved while the body streamed: the receiver revoked, the kill switch
-    # flipped, the owner locked out, the session closed or expired. Those exist to STOP uploads,
-    # and a transfer already in flight must not land after them, so the whole resolution runs AGAIN
-    # here -- kill switch, receiver active, binding, session active, vault, the GATE 3 cross-check
-    # -- and then the row is taken under the lock and checked once more. A refusal publishes
-    # NOTHING: the sealed bytes are still a `.part` file, which is unlinked here; anything this
-    # session had already published stays in its staging dir until _sweep_orphaned_upload_chunks
-    # reclaims the abandoned session (idle-age based), so the bytes are accounted for, not leaked.
-    # The refusal is the surface's uniform 404: an anonymous caller is told nothing it was not told
-    # before, and a revoked receiver looks exactly like one that never existed.
-    revalidated = _receiver_resolve_session(db, token, session_id)
-    if revalidated is None or str(revalidated[1].id) != str(_sid) or str(revalidated[2].id) != _vault_id:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise HTTPException(status_code=404, detail="This upload is not available.")
+    # ---- Below here the staged `.part` belongs to the `finally` at the end. ----
+    # Same rule as the authenticated chunk write, and for the same reason: the next statement is a
+    # DB touch, which raises OperationalError on a pool or lock timeout, and an exception list does
+    # not catch what it did not name. A leaked `.part` is invisible to the accounting (which globs
+    # `chunk_*`) and to the orphan sweep (which skips an active session), so it would survive until
+    # the whole session is reclaimed.
+    try:
+        # ---- The post-stream transaction: short by construction. ----
+        # The world may have moved while the body streamed: the receiver revoked, the kill switch
+        # flipped, the owner locked out, the session closed or expired. Those exist to STOP uploads,
+        # and a transfer already in flight must not land after them, so the whole resolution runs AGAIN
+        # here -- kill switch, receiver active, binding, session active, vault, the GATE 3 cross-check
+        # -- and then the row is taken under the lock and checked once more. A refusal publishes
+        # NOTHING: the sealed bytes are still a `.part` file, removed by the `finally`; anything this
+        # session had already published stays in its staging dir until _sweep_orphaned_upload_chunks
+        # reclaims the abandoned session (idle-age based), so the bytes are accounted for, not leaked.
+        # The refusal is the surface's uniform 404: an anonymous caller is told nothing it was not told
+        # before, and a revoked receiver looks exactly like one that never existed.
+        revalidated = _receiver_resolve_session(db, token, session_id)
+        if revalidated is None or str(revalidated[1].id) != str(_sid) or str(revalidated[2].id) != _vault_id:
+            raise HTTPException(status_code=404, detail="This upload is not available.")
 
-    # Publish under the per-session row lock (same reasoning as the authenticated chunk write): the
-    # rename + digest must be atomic against a concurrent re-send, and the counters are recomputed from
-    # the authoritative on-disk chunk set. The locked row is read again for its state: it was
-    # resolved above without a lock, and the lock is what makes "still active" hold through the
-    # publish.
-    locked = db.query(ChunkedUploadSession).filter(
-        ChunkedUploadSession.id == _sid).with_for_update().first()
-    if locked is None or locked.status != 'active':
+        # Publish under the per-session row lock (same reasoning as the authenticated chunk write): the
+        # rename + digest must be atomic against a concurrent re-send, and the counters are recomputed from
+        # the authoritative on-disk chunk set. The locked row is read again for its state: it was
+        # resolved above without a lock, and the lock is what makes "still active" hold through the
+        # publish.
+        locked = db.query(ChunkedUploadSession).filter(
+            ChunkedUploadSession.id == _sid).with_for_update().first()
+        if locked is None or locked.status != 'active':
+            raise HTTPException(status_code=404, detail="This upload is not available.")
+        hash_path = _chunk_hash_path(sdir, chunk_index)
         try:
-            tmp_path.unlink()
+            hash_path.unlink()
         except OSError:
             pass
-        raise HTTPException(status_code=404, detail="This upload is not available.")
-    hash_path = _chunk_hash_path(sdir, chunk_index)
-    try:
-        hash_path.unlink()
-    except OSError:
-        pass
-    try:
         os.replace(tmp_path, chunk_path)
-    except OSError:
+        try:
+            hash_path.write_text(chunk_digest, encoding='ascii')
+        except Exception:
+            pass
+
+        _present = sorted(sdir.glob("chunk_*"))
+        _bytes = sum(sealed_plaintext_size(_p) for _p in _present)
+        received = len(_present)
+        if locked is not None:
+            locked.bytes_received = _bytes
+            locked.chunks_received = received
+            locked.last_chunk_at = datetime.utcnow()
+        db.commit()
+        return {'received': received, 'total': _total, 'bytes_received': _bytes,
+                'percent': round(received * 100 / _total, 1) if _total else 0,
+                'complete': received >= _total}
+    finally:
+        # The one place the staged file is removed. A no-op after a successful os.replace, which has
+        # already consumed the name.
         try:
             tmp_path.unlink()
         except OSError:
             pass
-        raise
-    try:
-        hash_path.write_text(chunk_digest, encoding='ascii')
-    except Exception:
-        pass
-
-    _present = sorted(sdir.glob("chunk_*"))
-    _bytes = sum(sealed_plaintext_size(_p) for _p in _present)
-    received = len(_present)
-    if locked is not None:
-        locked.bytes_received = _bytes
-        locked.chunks_received = received
-        locked.last_chunk_at = datetime.utcnow()
-    db.commit()
-    return {'received': received, 'total': _total, 'bytes_received': _bytes,
-            'percent': round(received * 100 / _total, 1) if _total else 0,
-            'complete': received >= _total}
 
 
 @app.post("/receivers/{token}/upload-session/{session_id}/complete")
@@ -16915,6 +16914,74 @@ def _bearer_credentials(request: Request) -> HTTPAuthorizationCredentials:
     return HTTPAuthorizationCredentials(scheme=scheme, credentials=token.strip())
 
 
+def _vault_credential_fingerprint(db: Session, vault_id) -> Optional[str]:
+    """The vault's password credential as one value: its hash, or None when it has none.
+
+    Comparing this across a streamed body is how a mid-body change to the vault's password is
+    caught -- set, cleared, or rotated to a new value all move it, in either direction. Read from
+    the row, never returned to a caller.
+    """
+    row = db.query(Vault.password_hash).filter(Vault.id == vault_id).first()
+    return row[0] if row is not None else None
+
+
+async def _reauthorize_after_body(db: Session, request: Request, vault_id, folder_id,
+                                  password_hash_before: Optional[str], group_name: str,
+                                  cap: str) -> User:
+    """Re-establish, after a streamed body, what the pre-body guards established, and return the
+    principal the rest of the request must use.
+
+    A chunk upload releases its connection while the client sends, which can take minutes. Every
+    guard the request passed is a decision about a world that may have moved since: a membership
+    removed, a capability narrowed, a folder taken out of scope, an endpoint permission withdrawn,
+    a vault password rotated. Each of those exists to STOP what this principal is doing, so what
+    they stop must include a transfer already in flight. The receiver path re-runs its whole
+    resolution for the same reason; this is the authenticated path's equivalent.
+
+    The PRINCIPAL first -- a user deactivated or locked, a session revoked, a temporary credential
+    withdrawn -- then the endpoint permission, the vault capability, the vault's own access check
+    (membership, group access, temp-credential vault scope) and the folder scope. Each asks the
+    same helper the pre-body guard asked, so the second ask cannot drift from the first.
+
+    THE VAULT PASSWORD IS COMPARED, NOT RE-VERIFIED, and the difference is worth stating plainly.
+    Re-running the password gate would re-run an Argon2 verification AND a throttle round-trip per
+    chunk, against the failure bucket the vault's owner and its temporary holders share -- so an
+    ordinary large upload would look like a guessing run against the vault's own defence and could
+    throttle its legitimate users out of their own vault. A fix that can lock the owner out is a
+    worse defect than the window it closes. So this compares the stored credential with the one
+    captured before the body.
+
+    What the comparison PROVES: the credential the pre-body verification was made against is
+    unchanged. A password set, cleared, or rotated meanwhile is caught, including the transitions
+    to and from "no password at all".
+
+    What it does NOT prove: that the client has re-presented a valid password. Nothing here reads
+    the caller's header. The pre-body check verified it against a hash this comparison shows has
+    not changed since -- that is the whole claim, and it is weaker than a re-verification.
+
+    Its completeness rests on a per-set salt, so that setting the SAME password again still moves
+    the hash. That premise lives in another module, so it is pinned by a test rather than assumed
+    here: if the hashing ever became deterministic, this check would quietly weaken.
+    """
+    from app.core.endpoint_permissions import check_endpoint_permission
+    from app.core.temp_scope import require_cap
+
+    user = await get_current_user(_bearer_credentials(request), db)
+    check_endpoint_permission(db, user, group_name, {"vault_id": vault_id, "db": db})
+    require_cap(user, vault_id, cap)
+    permission_service = PermissionService(db)
+    vault_service = VaultService(db, permission_service)
+    # Membership, group access and the temp-credential vault scope. NOT the password gate: that is
+    # the comparison below, for the reason above.
+    vault_service.get_vault(vault_id, user, None, require_password=False)
+    if _vault_credential_fingerprint(db, vault_id) != password_hash_before:
+        raise HTTPException(status_code=409, detail=(
+            "This vault's password changed while the chunk was being sent. "
+            "Nothing has been stored for it; start the upload again."))
+    require_folder_scope(db, user, vault_id, folder_id)
+    return user
+
+
 def _release_db_before_streaming(db: Session) -> None:
     """THE TRANSACTION BOUNDARY of a chunk write.
 
@@ -17665,6 +17732,9 @@ async def upload_chunk(
     # A scoped credential may only write to a session whose target folder is in scope
     # (the session was created by the same shared user id, so re-check per surface).
     require_folder_scope(db, current_user, vault_id, session.folder_id)
+    # The vault's password CREDENTIAL as it stands now, to compare with after the body -- see
+    # _reauthorize_after_body for what that comparison proves and what it does not.
+    _vault_password_hash = _vault_credential_fingerprint(db, vault_id)
     if session.status != 'active':
         raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
     if session.expires_at and session.expires_at <= datetime.utcnow():
@@ -17682,6 +17752,7 @@ async def upload_chunk(
     _bytes_before = session.bytes_received or 0
     _user_id = current_user.id
     _blob_id = session.blob_id
+    _folder_id = session.folder_id
     sdir = _upload_session_dir(vault_service, str(_sid))
     sdir.mkdir(parents=True, exist_ok=True)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
@@ -17760,111 +17831,105 @@ async def upload_chunk(
     except EmptyBody:
         raise HTTPException(status_code=400, detail="Empty chunk")
 
-    # The token this session DECLARED must be the token the file's header CARRIES. A client that
-    # re-minted on a resume, or fed the two from different reads, would otherwise upload a file that
-    # completes and can never be opened. Refused BEFORE the chunk is published, so a mismatched
-    # chunk 0 is never counted as received and the upload cannot complete on it.
-    if _peek is not None and header_token_mismatch(bytes(_peek.head), _blob_id):
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise HTTPException(status_code=409, detail={
-            "code": "upload_attempt_mismatch",
-            "message": ("This upload's first chunk does not belong to the encryption it declared. "
-                        "Nothing has been stored for it; start the upload again."),
-        })
+    # ---- Below here the staged `.part` belongs to the `finally` at the end. ----
+    # Nothing on any path below unlinks it itself. os.replace consumes its name on the one path
+    # that publishes; every other exit must remove it -- a refusal, a cancelled request, or a pool
+    # or lock timeout, which is what the FIRST DB touch after the handback raises. Catching only
+    # HTTPException here is how it leaked: OperationalError went straight past. A leaked `.part` is
+    # invisible twice over -- the accounting globs `chunk_*`, which does not match
+    # `.chunk_NNNNNN.<hex>.part`, and the orphan sweep skips a session that is still active -- so it
+    # survives until the whole session is reclaimed. A `finally` cannot be defeated by a new raise
+    # in a way an exception list can.
+    try:
+        # The token this session DECLARED must be the token the file's header CARRIES. A client that
+        # re-minted on a resume, or fed the two from different reads, would otherwise upload a file that
+        # completes and can never be opened. Refused BEFORE the chunk is published, so a mismatched
+        # chunk 0 is never counted as received and the upload cannot complete on it.
+        if _peek is not None and header_token_mismatch(bytes(_peek.head), _blob_id):
+            raise HTTPException(status_code=409, detail={
+                "code": "upload_attempt_mismatch",
+                "message": ("This upload's first chunk does not belong to the encryption it declared. "
+                            "Nothing has been stored for it; start the upload again."),
+            })
 
-    # Everything from here is under the per-session row lock (SELECT ... FOR UPDATE). It already
-    # existed to serialize the counter update; publishing the chunk needs it for the same reason.
-    # A chunk and its digest are two filesystem operations, so two requests at one index can
-    # otherwise finish them interleaved and leave one request's bytes under the other's digest --
-    # which tells a resuming client that a copy the server no longer holds still matches. Holding
-    # the lock across the rename makes the pair atomic against the only writers that can collide,
-    # which are other requests in this same session. The counters are then recomputed from the
-    # AUTHORITATIVE on-disk chunk set, so concurrent PUTs -- even a same-index re-send -- converge
-    # to the true total instead of racing a read-modify-write (a blind += double-counts a
-    # same-index race; an absolute assignment clobbers a concurrent different-index write).
-    # Mirrors the disk-authoritative /complete and the ZK-path locking.
-    #
-    # ---- The post-stream transaction: short by construction. ----
-    # The world may have moved while the body streamed. The PRINCIPAL first: a user deactivated or
-    # locked, a session revoked (this deployment's revocation is durable), a temporary credential
-    # withdrawn -- each exists to stop what that principal was doing, and a transfer already in
-    # flight must not land after it. The same dependency that judged the request judges it again,
-    # against the same token: two indexed lookups (four for a temporary credential), and a refusal
-    # is the 401 it always gives. Then the SESSION, under the lock: still this user's, this vault's,
-    # and still active -- closed, expired or completed meanwhile is refused as it would have been
-    # before the bytes. A refusal publishes NOTHING: the sealed bytes are still a `.part` file,
-    # unlinked here; what this session had already published stays in its staging dir until
-    # _sweep_orphaned_upload_chunks reclaims the abandoned session, so the bytes are accounted for.
-    try:
-        await get_current_user(_bearer_credentials(request), db)
-    except HTTPException:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
-    locked = db.query(ChunkedUploadSession).filter(
-        ChunkedUploadSession.id == _sid
-    ).with_for_update().first()
-    if (locked is None or str(locked.user_id) != str(_user_id) or str(locked.vault_id) != str(vault_id)
-            or locked.status != 'active'):
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        if locked is None or str(locked.user_id) != str(_user_id) or str(locked.vault_id) != str(vault_id):
-            raise HTTPException(status_code=404, detail="Upload session not found")
-        raise HTTPException(status_code=409, detail=f"Upload session is {locked.status}")
+        # Everything from here is under the per-session row lock (SELECT ... FOR UPDATE). It already
+        # existed to serialize the counter update; publishing the chunk needs it for the same reason.
+        # A chunk and its digest are two filesystem operations, so two requests at one index can
+        # otherwise finish them interleaved and leave one request's bytes under the other's digest --
+        # which tells a resuming client that a copy the server no longer holds still matches. Holding
+        # the lock across the rename makes the pair atomic against the only writers that can collide,
+        # which are other requests in this same session. The counters are then recomputed from the
+        # AUTHORITATIVE on-disk chunk set, so concurrent PUTs -- even a same-index re-send -- converge
+        # to the true total instead of racing a read-modify-write (a blind += double-counts a
+        # same-index race; an absolute assignment clobbers a concurrent different-index write).
+        # Mirrors the disk-authoritative /complete and the ZK-path locking.
+        #
+        # ---- The post-stream transaction: short by construction. ----
+        # The world may have moved while the body streamed, so EVERY guard this request passed is
+        # asked again -- principal, endpoint permission, vault capability, vault access and scope,
+        # the vault's password credential, folder scope -- and only then the session row under the
+        # lock. See _reauthorize_after_body for what each re-check costs and, for the password, what
+        # comparing rather than re-verifying does and does not prove. A refusal publishes NOTHING:
+        # the sealed bytes are still a `.part` file, removed by the `finally`; what this session had
+        # already published stays in its staging dir until _sweep_orphaned_upload_chunks reclaims the
+        # abandoned session, so the bytes are accounted for.
+        await _reauthorize_after_body(db, request, vault_id, _folder_id, _vault_password_hash,
+                                      "FILE_UPLOAD", "file.upload")
+        locked = db.query(ChunkedUploadSession).filter(
+            ChunkedUploadSession.id == _sid
+        ).with_for_update().first()
+        if (locked is None or str(locked.user_id) != str(_user_id) or str(locked.vault_id) != str(vault_id)
+                or locked.status != 'active'):
+            if locked is None or str(locked.user_id) != str(_user_id) or str(locked.vault_id) != str(vault_id):
+                raise HTTPException(status_code=404, detail="Upload session not found")
+            raise HTTPException(status_code=409, detail=f"Upload session is {locked.status}")
 
-    hash_path = _chunk_hash_path(sdir, chunk_index)
-    # A previous attempt's digest goes first. The lock keeps another request out, but a crash still
-    # lands somewhere, and this order leaves a resuming client with no digest, so it re-sends. The
-    # other order leaves the new bytes under the old digest.
-    try:
-        hash_path.unlink()
-    except OSError:
-        pass
-    try:
+        hash_path = _chunk_hash_path(sdir, chunk_index)
+        # A previous attempt's digest goes first. The lock keeps another request out, but a crash still
+        # lands somewhere, and this order leaves a resuming client with no digest, so it re-sends. The
+        # other order leaves the new bytes under the old digest.
+        try:
+            hash_path.unlink()
+        except OSError:
+            pass
         # Renamed only once it is whole, so a dropped connection cannot leave a truncated chunk
         # under the name the assembler reads.
         os.replace(tmp_path, chunk_path)
-    except OSError:
+        # From what was actually written rather than from anything the client asserted, accumulated
+        # while the body streamed past. Best effort: a missing digest makes a resuming client re-send
+        # that chunk, which is slower and never wrong.
+        try:
+            hash_path.write_text(chunk_digest, encoding='ascii')
+        except Exception:  # noqa: BLE001 -- a missing digest costs a re-send, never the upload
+            pass
+
+        _present = sorted(sdir.glob("chunk_*"))
+        _bytes = 0
+        for _p in _present:
+            # PLAINTEXT bytes (sealed chunks report it from their header; legacy plaintext chunks report
+            # their on-disk size), so `bytes_received` stays comparable to the plaintext `total_size`.
+            _bytes += sealed_plaintext_size(_p)
+        received = len(_present)
+        if locked is not None:
+            locked.bytes_received = _bytes
+            locked.chunks_received = received
+            locked.last_chunk_at = datetime.utcnow()
+        db.commit()
+
+        return {
+            'received': received,
+            'total': _total,
+            'bytes_received': _bytes,
+            'percent': round(received * 100 / _total, 1) if _total else 0,
+            'complete': received >= _total,
+        }
+    finally:
+        # The one place the staged file is removed. A no-op after a successful os.replace, which has
+        # already consumed the name.
         try:
             tmp_path.unlink()
         except OSError:
             pass
-        raise
-    # From what was actually written rather than from anything the client asserted, accumulated
-    # while the body streamed past. Best effort: a missing digest makes a resuming client re-send
-    # that chunk, which is slower and never wrong.
-    try:
-        hash_path.write_text(chunk_digest, encoding='ascii')
-    except Exception:  # noqa: BLE001 -- a missing digest costs a re-send, never the upload
-        pass
-
-    _present = sorted(sdir.glob("chunk_*"))
-    _bytes = 0
-    for _p in _present:
-        # PLAINTEXT bytes (sealed chunks report it from their header; legacy plaintext chunks report
-        # their on-disk size), so `bytes_received` stays comparable to the plaintext `total_size`.
-        _bytes += sealed_plaintext_size(_p)
-    received = len(_present)
-    if locked is not None:
-        locked.bytes_received = _bytes
-        locked.chunks_received = received
-        locked.last_chunk_at = datetime.utcnow()
-    db.commit()
-
-    return {
-        'received': received,
-        'total': _total,
-        'bytes_received': _bytes,
-        'percent': round(received * 100 / _total, 1) if _total else 0,
-        'complete': received >= _total,
-    }
 
 
 @app.post("/vaults/{vault_id}/uploads/{session_id}/complete")

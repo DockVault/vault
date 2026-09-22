@@ -105,5 +105,17 @@ def test_the_chunk_route_refuses_a_mismatched_chunk_zero_before_publishing_it():
     publish_at = src.index("os.replace(tmp_path, chunk_path)")
     assert check_at < publish_at, "the token check runs after the chunk is published"
     refusal = src[check_at:publish_at]
-    assert "tmp_path.unlink()" in refusal and "status_code=409" in refusal
+    assert "status_code=409" in refusal
     assert '"code": "upload_attempt_mismatch"' in refusal
+    # The staged bytes are removed on this path as on every other one, but NOT here: this used to
+    # assert an inline `tmp_path.unlink()` in the refusal, which was one of four scattered copies,
+    # and the exit that leaked (a pool timeout raising OperationalError) had no copy at all. The
+    # endpoint now owns the staged file in a single `finally`, so what this asserts is that the
+    # refusal does NOT clean up for itself -- and the driven test in
+    # test_upload_stream_holds_no_connection.py is what proves the file is gone.
+    assert "tmp_path.unlink()" not in refusal, "the refusal cleans up inline again; the finally owns it"
+    # `src` is the handler, comment-stripped: exactly one place in it removes the staged file, and
+    # it is the finally the handler ends in.
+    assert src.count("tmp_path.unlink()") == 1, "exactly one place removes the staged file"
+    assert src.rstrip().endswith("pass"), "the handler must end in the finally that unlinks it"
+    assert src.index("finally:") > publish_at, "the cleanup must sit after the publish, not beside it"

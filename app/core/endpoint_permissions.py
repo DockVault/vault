@@ -91,58 +91,65 @@ def require_endpoint_permission(group_name: str):
 
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            current_user = kwargs.get("current_user")
-            db = kwargs.get("db")
-
-            if not current_user or not db:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required",
-                )
-
-            # Temporary-credential sessions are gated by their OWN scope and never
-            # inherit the admin bypass. A temp credential minted by an admin can use
-            # ordinary scoped groups because its creator has every group by role.
-            if getattr(current_user, "_is_temp_session", False):
-                from app.core.temp_scope import temp_session_allows_group
-
-                if not temp_session_allows_group(current_user, group_name, kwargs):
-                    _audit_endpoint_denial(db, current_user, group_name, "temp_credential_scope")
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail=f"Temporary credential scope does not permit this action ({group_name})",
-                    )
-                if current_user.role != RoleEnum.ADMIN and not _user_has_required_groups(
-                    db, current_user.id, group_name
-                ):
-                    _audit_endpoint_denial(db, current_user, group_name, "missing_required_group")
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail=(
-                            "You do not have permission to access this resource. "
-                            f"Required permission: {group_name}"
-                        ),
-                    )
-                return await func(*args, **kwargs)
-
-            if current_user.role == RoleEnum.ADMIN:
-                return await func(*args, **kwargs)
-
-            if not _user_has_required_groups(db, current_user.id, group_name):
-                _audit_endpoint_denial(db, current_user, group_name, "missing_required_group")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        "You do not have permission to access this resource. "
-                        f"Required permission: {group_name}"
-                    ),
-                )
-
+            check_endpoint_permission(kwargs.get("db"), kwargs.get("current_user"),
+                                      group_name, kwargs)
             return await func(*args, **kwargs)
 
         return wrapper
 
     return decorator
+
+
+def check_endpoint_permission(db, current_user, group_name: str, kwargs=None) -> None:
+    """Raise unless `current_user` may use `group_name` right now. The decorator's whole decision,
+    named so it can be asked AGAIN -- a long request (a chunk upload streaming a body) is judged
+    once before the body and must be judged once more before it publishes, against permissions that
+    may have been withdrawn while the bytes were arriving. One implementation, so the second ask
+    cannot drift from the first."""
+    kwargs = kwargs or {}
+    if not current_user or db is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    # Temporary-credential sessions are gated by their OWN scope and never
+    # inherit the admin bypass. A temp credential minted by an admin can use
+    # ordinary scoped groups because its creator has every group by role.
+    if getattr(current_user, "_is_temp_session", False):
+        from app.core.temp_scope import temp_session_allows_group
+
+        if not temp_session_allows_group(current_user, group_name, kwargs):
+            _audit_endpoint_denial(db, current_user, group_name, "temp_credential_scope")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Temporary credential scope does not permit this action ({group_name})",
+            )
+        if current_user.role != RoleEnum.ADMIN and not _user_has_required_groups(
+            db, current_user.id, group_name
+        ):
+            _audit_endpoint_denial(db, current_user, group_name, "missing_required_group")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "You do not have permission to access this resource. "
+                    f"Required permission: {group_name}"
+                ),
+            )
+        return
+
+    if current_user.role == RoleEnum.ADMIN:
+        return
+
+    if not _user_has_required_groups(db, current_user.id, group_name):
+        _audit_endpoint_denial(db, current_user, group_name, "missing_required_group")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You do not have permission to access this resource. "
+                f"Required permission: {group_name}"
+            ),
+        )
 
 
 def _ordered_with_dependencies(group_names: List[str]) -> List[str]:

@@ -38,11 +38,24 @@ def _handler_body():
 
 
 def _line_of(node, predicate):
-    """First line inside `node` whose expression tree satisfies `predicate`."""
-    for child in ast.walk(node):
-        if predicate(child):
-            return child.lineno
-    return None
+    """LOWEST line inside `node` whose expression tree satisfies `predicate`.
+
+    By line, not by walk order: ast.walk is breadth-first, so which matching node it reaches first
+    depends on the tree's SHAPE. Wrapping this handler's tail in a try/finally changed that shape
+    and made this helper return a `db.commit()` from an early branch instead of the one that ends
+    the locked region -- a green-to-red flip with no change to the property. The order this test is
+    about is the order in the file.
+    """
+    lines = [child.lineno for child in ast.walk(node) if predicate(child)]
+    return min(lines) if lines else None
+
+
+def _release_line(node, after):
+    """The commit that ENDS the locked region: the first one at a line after `after`. The handler
+    also commits in an early branch (an expired session), which is not this."""
+    lines = [child.lineno for child in ast.walk(node)
+             if _is_call_to(child, "commit") and child.lineno > after]
+    return min(lines) if lines else None
 
 
 def _is_call_to(node, attr):
@@ -59,7 +72,7 @@ def test_the_chunk_is_published_while_the_session_row_is_locked():
         lambda n: (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                    and n.func.attr == "replace"
                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "os"))
-    commit_line = _line_of(handler, lambda n: _is_call_to(n, "commit"))
+    commit_line = _release_line(handler, publish_line or 0)
 
     assert lock_line is not None, "the session row is no longer locked in this handler"
     assert publish_line is not None, "no os.replace -- the chunk is published some other way now"
@@ -77,7 +90,7 @@ def test_the_digest_is_written_in_the_same_locked_region():
 
     lock_line = _line_of(handler, lambda n: _is_call_to(n, "with_for_update"))
     digest_line = _line_of(handler, lambda n: _is_call_to(n, "write_text"))
-    commit_line = _line_of(handler, lambda n: _is_call_to(n, "commit"))
+    commit_line = _release_line(handler, digest_line or 0)
 
     assert digest_line is not None, "the chunk digest is no longer written by this handler"
     assert lock_line < digest_line < commit_line, (

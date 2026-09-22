@@ -248,7 +248,8 @@ def test_the_receiver_chunk_is_refused_when_the_locked_row_is_no_longer_active(m
 
 # ---- the authenticated endpoint ---------------------------------------------------------------------------
 
-def _auth_world(monkeypatch, tmp_path, pool, *, principal_ok=True, locked_status="active", other_user=False):
+def _auth_world(monkeypatch, tmp_path, pool, *, principal_ok=True, locked_status="active", other_user=False,
+                permission_ok=True, cap_ok=True, vault_ok=True, folder_ok=True, password_changed=False):
     sid, vid, uid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     calls = {"judged": 0, "loads": 0}
 
@@ -279,12 +280,44 @@ def _auth_world(monkeypatch, tmp_path, pool, *, principal_ok=True, locked_status
 
         def get_vault(self, *a, **k):
             db.query(S.Vault).first()
+            calls["vault"] = calls.get("vault", 0) + 1
+            # WITHDRAWN WHILE THE BODY STREAMED, so the FIRST call (which admits the request) must
+            # succeed and the second must not -- a stub that refused both would refuse before the
+            # body and prove nothing about the window this test exists for.
+            if not vault_ok and calls["vault"] > 1:
+                raise S.PermissionDeniedError("no longer a member")
             return _Row(db, id=vid)
 
     monkeypatch.setattr(S, "get_current_user", judge)
+    # The re-authorisation asks the same guards the pre-body path asked; the two it imports from
+    # their own modules are stubbed there, so a guard that stopped being asked shows up as a
+    # missing call rather than as an import error.
+    import app.core.endpoint_permissions as _ep
+    import app.core.temp_scope as _ts
+
+    def _perm(db_, user_, group, kwargs=None):
+        calls["permission"] = calls.get("permission", 0) + 1
+        if not permission_ok:
+            raise HTTPException(status_code=403, detail="Required permission: %s" % group)
+
+    def _cap(user_, vault_, cap):
+        calls["cap"] = calls.get("cap", 0) + 1
+        if not cap_ok:
+            raise HTTPException(status_code=403, detail="Temporary credential scope does not permit this action")
+
+    monkeypatch.setattr(_ep, "check_endpoint_permission", _perm)
+    monkeypatch.setattr(_ts, "require_cap", _cap)
     monkeypatch.setattr(S, "PermissionService", lambda db_: object())
     monkeypatch.setattr(S, "VaultService", _VS)
-    monkeypatch.setattr(S, "require_folder_scope", lambda *a, **k: None)
+    def _folder(db_, user_, vault_, folder_):
+        calls["folder"] = calls.get("folder", 0) + 1
+        if not folder_ok and calls["folder"] > 1:      # withdrawn mid-body, as above
+            raise S.PermissionDeniedError("Scope does not permit this folder")
+
+    monkeypatch.setattr(S, "require_folder_scope", _folder)
+    # The vault's password credential: the same value before and after unless the test moves it.
+    _fingerprints = iter(["hash-before", "hash-after" if password_changed else "hash-before"])
+    monkeypatch.setattr(S, "_vault_credential_fingerprint", lambda db_, v: next(_fingerprints, "hash-before"))
     monkeypatch.setattr(S, "_session_principal", lambda u: True)
     monkeypatch.setattr(S, "_upload_session_dir", lambda vs, s: tmp_path / "sess")
     monkeypatch.setattr(S, "seal_stream_to_file", _fake_seal)
@@ -441,3 +474,126 @@ def test_the_live_controls_guard_gives_up_on_a_child_that_starts_and_never_says_
         assert "never printed 'open' within 3s" in reason, reason
     else:
         assert "printed 'nope'" in reason and "ImportError: no such module" in reason, reason
+
+
+# ---- what the world may have changed while the body streamed -------------------------------------
+# The principal was already re-judged (above). These are the AUTHORISATION elements: each one exists
+# to stop what this principal is doing, so each must also stop a transfer already in flight. Every
+# leg asserts the same two things -- the request is refused, and nothing is left behind: no published
+# chunk, and no staged `.part` (the cleanup's property, asserted here rather than separately because
+# "refused" and "published nothing" are one claim).
+
+@pytest.mark.parametrize("withdrawn", [
+    "permission",     # the FILE_UPLOAD endpoint permission removed
+    "cap",            # the temporary credential's file.upload capability narrowed away
+    "vault",          # membership removed, or the vault taken out of a credential's scope
+    "folder",         # the target folder taken out of the credential's id scope
+    "password",       # the vault's password set, cleared or rotated
+])
+def test_an_authorisation_withdrawn_while_the_body_streamed_refuses_and_publishes_nothing(
+        monkeypatch, tmp_path, withdrawn):
+    pool = _Pool()
+    kw = {
+        "permission": {"permission_ok": False},
+        "cap": {"cap_ok": False},
+        "vault": {"vault_ok": False},
+        "folder": {"folder_ok": False},
+        "password": {"password_changed": True},
+    }[withdrawn]
+    db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool, **kw)
+    req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
+    # The vault and folder gates raise the domain error the app's handler turns into a 403 at the
+    # HTTP layer; the others raise the HTTPException directly. Either way the request is refused.
+    expected = S.PermissionDeniedError if withdrawn in ("vault", "folder") else HTTPException
+    with pytest.raises(expected) as e:
+        run_coroutine(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    if expected is HTTPException:
+        assert e.value.status_code == (409 if withdrawn == "password" else 403), (withdrawn, e.value.detail)
+    sess = tmp_path / "sess"
+    assert not (sess / "chunk_000001").exists(), withdrawn
+    assert not list(sess.glob(".chunk_*.part")), (withdrawn, "a staged .part survived the refusal")
+    # The body still streamed without holding a connection: the re-check is after it, not before.
+    assert pool.seen_during_stream == [0, 0, 0, 0], pool.seen_during_stream
+
+
+def test_every_guard_the_request_passed_is_asked_again_after_the_body(monkeypatch, tmp_path):
+    # Not "a refusal is possible" but "each one is actually consulted": the counts are the evidence
+    # that no element was quietly dropped from the re-check. (mutation: delete any one call from
+    # _reauthorize_after_body -> its count stays at 1 -> red.)
+    pool = _Pool()
+    db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool)
+    run_coroutine(S.get_current_user(None, db))
+    req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
+    run_coroutine(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    assert calls["judged"] == 2, calls            # the principal: once to admit, once after the body
+    assert calls["permission"] == 1, calls        # the endpoint permission (the decorator ran the first)
+    assert calls["cap"] == 1, calls
+    assert calls["vault"] == 2, calls             # vault access: pre-body, and again after
+    assert calls["folder"] == 2, calls
+
+
+def test_a_pool_or_lock_timeout_after_the_body_leaves_no_staged_bytes(monkeypatch, tmp_path):
+    # The path an exception list could not cover. The FIRST statement after the connection
+    # handback is a DB touch; a pool or lock timeout there raises OperationalError, which is not an
+    # HTTPException, so the old `except HTTPException` let it past and the sealed `.part` survived.
+    # It was invisible twice over: the accounting globs `chunk_*`, which does not match
+    # `.chunk_NNNNNN.<hex>.part`, and the orphan sweep skips a session that is still active.
+    from sqlalchemy.exc import OperationalError
+    pool = _Pool()
+    db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool)
+
+    async def _timeout(credentials, db_):
+        raise OperationalError("SELECT 1", {}, Exception("QueuePool limit reached, timed out"))
+
+    monkeypatch.setattr(S, "get_current_user", _timeout)
+    req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
+    with pytest.raises(OperationalError):
+        run_coroutine(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    sess = tmp_path / "sess"
+    assert not list(sess.glob(".chunk_*.part")), "the staged .part survived a pool timeout"
+    assert not (sess / "chunk_000001").exists()
+
+
+def test_the_credential_comparison_rests_on_a_salt_that_makes_the_same_password_hash_differently():
+    # THE HIDDEN PREMISE, made observable. The post-body check COMPARES the vault's stored password
+    # hash with the one captured before the body instead of re-verifying the caller's password (see
+    # _reauthorize_after_body for why: re-verifying would run an Argon2 KDF and a throttle round
+    # trip per chunk, against the bucket the vault's owner shares). That comparison catches a
+    # password re-set to the SAME value only because the hash is salted per set. The salt lives in
+    # another module; if it ever became deterministic, this check would silently weaken and nothing
+    # else would notice. So it is pinned here, beside the code that depends on it.
+    from app.core.security import hash_password, verify_password
+    first, second = hash_password("the same password"), hash_password("the same password")
+    assert first != second, "hashing is deterministic: a password re-set to the same value would be invisible"
+    assert verify_password("the same password", first) and verify_password("the same password", second)
+
+
+def test_the_receiver_path_also_leaves_no_staged_bytes_on_a_pool_or_lock_timeout(monkeypatch, tmp_path):
+    # The same defect, the same shape, on the other endpoint. Its first statement after the
+    # connection handback is the re-resolution -- a DB touch -- so a pool or lock timeout there took
+    # the same path past the same `except HTTPException`. Both endpoints now own the staged file in
+    # a finally; without this leg the receiver's version of the fix is unpinned, and a mutation that
+    # narrowed only that one would pass.
+    from sqlalchemy.exc import OperationalError
+    pool = _Pool()
+    db, sid, state = _receiver_world(monkeypatch, tmp_path, pool)
+
+    # The timeout must land on the re-resolution AFTER the body, not on the one that admits the
+    # request: raising on the first would refuse before a byte was staged, and the test would pass
+    # with no `.part` ever created -- green whatever the cleanup does.
+    real_resolve = S._receiver_resolve_session
+    seen = {"n": 0}
+
+    def _timeout(db_, token, session_id):
+        seen["n"] += 1
+        if seen["n"] > 1:
+            raise OperationalError("SELECT 1", {}, Exception("QueuePool limit reached, timed out"))
+        return real_resolve(db_, token, session_id)
+
+    monkeypatch.setattr(S, "_receiver_resolve_session", _timeout)
+    with pytest.raises(OperationalError):
+        run_coroutine(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+    sess = tmp_path / "sess"
+    assert seen["n"] == 2, "the timeout did not land on the re-resolution after the body"
+    assert not list(sess.glob(".chunk_*.part")), "the staged .part survived a pool timeout"
+    assert not (sess / "chunk_000001").exists()

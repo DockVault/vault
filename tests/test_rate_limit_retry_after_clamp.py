@@ -179,9 +179,15 @@ def test_no_emission_computes_its_own_wait_anywhere_in_the_application():
     # (That is the same lesson twice: a pin that enumerates what it can see checks only that.)
     #
     # So the static half is narrowed to a property it can actually hold, everywhere and with no
-    # exemptions: THE EMISSION PASSES A VALUE, IT NEVER COMPUTES ONE. No Retry-After value and no
-    # retry_after= argument may contain arithmetic, a clamp, or a conditional of its own. The
-    # provenance half is pinned BEHAVIOURALLY, one test per emission family, below.
+    # exemptions: THE EMISSION PASSES A VALUE, IT NEVER COMPUTES ONE -- an emitted value may only be
+    # a name, an attribute, or the helper's call, optionally inside str(). Stated as what is
+    # ALLOWED, because the same rule written as a list of computing shapes to reject is an allowlist
+    # again, and `str(int(delta.total_seconds()))` would walk past one.
+    #
+    # WHAT IT STILL DOES NOT CLOSE, and this must not be described as total: it constrains only the
+    # expression AT the emission. A wait computed badly three lines above and passed by name -- the
+    # account-lockout bug this test's predecessor missed -- satisfies it. The behavioural tests
+    # below are what catch that, one per emission family.
     import ast
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "app"
@@ -189,11 +195,25 @@ def test_no_emission_computes_its_own_wait_anywhere_in_the_application():
     for py in sorted(root.rglob("*.py")):
         tree = ast.parse(py.read_text(encoding="utf-8"))
 
-        def computes(node):
-            return any(isinstance(n, (ast.BinOp, ast.IfExp, ast.Compare)) or
-                       (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                        and n.func.id in ("max", "min", "abs", "round"))
-                       for n in ast.walk(node))
+        def passes_a_value(node):
+            """INVERTED, deliberately. Listing the shapes that COMPUTE (max, min, a subtraction,
+            ...) is an allowlist wearing different clothes: `str(int(delta.total_seconds()))`
+            computes a wait with no floor and no cap and names none of them, and any future local
+            helper walks past too. So this states what an emission MAY be, and everything else is
+            an offence: a plain name, an attribute of one (an exception's field), or the helper's
+            own call -- optionally wrapped in str(), which is how a header carries it."""
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str":
+                return len(node.args) == 1 and passes_a_value(node.args[0])
+            if isinstance(node, (ast.Name, ast.Attribute)):
+                return True
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)                     and node.func.id == "retry_after_seconds":
+                return True
+            # A call with NO arguments is a getter -- `self._retry_after()` -- which fetches a value
+            # exactly as a name or an attribute does. What it returns is the behavioural tests'
+            # business, like any other name; what matters here is that the emission itself did not
+            # compute. A call WITH arguments is where inline arithmetic hides (`int(d.seconds())`,
+            # `sum(parts)`), so it is refused.
+            return isinstance(node, ast.Call) and not node.args and not node.keywords
 
         for node in ast.walk(tree):
             values = []
@@ -210,7 +230,7 @@ def test_no_emission_computes_its_own_wait_anywhere_in_the_application():
                 src = ast.unparse(v)
                 if "retry_after_seconds(" in src:
                     continue
-                if computes(v):
+                if not passes_a_value(v):
                     offences.append("%s:%d: %s" % (py.relative_to(root.parent), v.lineno, src[:80]))
     assert offences == [], (
         "a Retry-After emission computing its own wait; call retry_after_seconds and pass it:\n  "
@@ -306,9 +326,15 @@ def test_the_fixed_waits_emitted_as_headers_are_positive_and_are_their_own_windo
     _bare_api_env.set_bare_api_env()
     from app.api import api_server as S
     from app.core import auth_offload
+    from app.core.transfer_admission import TransferAdmission
     for value in (S._NOTELINK_FAIL_WINDOW, S._PUBLINK_FAIL_WINDOW, S._RECV_FAIL_WINDOW,
                   auth_offload._SLOT_RETRY_AFTER_SECONDS):
         assert isinstance(value, int) and value >= 1, value
+    # The admission wait is fetched through a getter rather than named, so it is driven: whatever
+    # the configured wait, a caller is never told to retry immediately.
+    for wait in (0, -5, 1, 30):
+        adm = TransferAdmission(limit=1, max_waiting=1, wait_seconds=wait)
+        assert adm._retry_after() >= 1, wait
 
 
 def test_at_a_site_with_two_limiters_the_refusing_one_decides_both_the_reset_and_the_window():
