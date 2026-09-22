@@ -28,6 +28,9 @@ set_bare_api_env()
 
 import app.api.api_server as S  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
+# Not asyncio.run(): after the browser tests a loop is left running in the main thread for the
+# rest of the session, and this module sorts after them. See tests/_async_run.py.
+from _async_run import run_coroutine  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -204,7 +207,7 @@ def _receiver_world(monkeypatch, tmp_path, pool, *, revalidate_ok=True, locked_s
 def test_the_receiver_chunk_write_holds_no_connection_while_the_body_streams(monkeypatch, tmp_path):
     pool = _Pool()
     db, sid, state = _receiver_world(monkeypatch, tmp_path, pool)
-    out = asyncio.run(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+    out = run_coroutine(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
     # (mutation: the release before the stream removed -> the stream sees 1 throughout -> red.
     #  mutation: a scalar read from the expired row during the stream -> the refresh is a checkout
     #  the stream sees -> red.)
@@ -223,7 +226,7 @@ def test_the_receiver_chunk_is_refused_and_not_published_when_the_binding_is_gon
     pool = _Pool()
     db, sid, state = _receiver_world(monkeypatch, tmp_path, pool, revalidate_ok=False)
     with pytest.raises(HTTPException) as e:
-        asyncio.run(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+        run_coroutine(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
     assert e.value.status_code == 404 and e.value.detail == "This upload is not available."
     sess = tmp_path / "sess"
     assert not (sess / "chunk_000001").exists(), "a refused chunk was published"
@@ -238,7 +241,7 @@ def test_the_receiver_chunk_is_refused_when_the_locked_row_is_no_longer_active(m
     pool = _Pool()
     db, sid, _ = _receiver_world(monkeypatch, tmp_path, pool, locked_status="completed")
     with pytest.raises(HTTPException) as e:
-        asyncio.run(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
+        run_coroutine(S.receiver_upload_chunk("tok", sid, 1, _Request(_slow_body(pool)), db=db))
     assert e.value.status_code == 404
     assert not (tmp_path / "sess" / "chunk_000001").exists()
 
@@ -301,9 +304,9 @@ def test_the_authenticated_chunk_write_holds_no_connection_while_the_body_stream
     pool = _Pool()
     db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool)
     # As the request would have arrived: the principal already judged on this Session (one checkout).
-    asyncio.run(S.get_current_user(None, db))
+    run_coroutine(S.get_current_user(None, db))
     req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
-    out = asyncio.run(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+    out = run_coroutine(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
     assert pool.seen_during_stream == [0, 0, 0, 0], pool.seen_during_stream
     assert out["received"] == 1 and (tmp_path / "sess" / "chunk_000001").exists()
     assert pool.checked_out == 0 and pool.transactions == 2
@@ -319,7 +322,7 @@ def test_the_authenticated_chunk_is_refused_when_the_principal_is_no_longer_vali
     db, sid, vid, user, calls = _auth_world(monkeypatch, tmp_path, pool, principal_ok=False)
     req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
     with pytest.raises(HTTPException) as e:
-        asyncio.run(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+        run_coroutine(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
     assert e.value.status_code == 401
     sess = tmp_path / "sess"
     assert not (sess / "chunk_000001").exists() and not list(sess.glob(".chunk_*.part"))
@@ -334,7 +337,7 @@ def test_the_authenticated_chunk_is_refused_when_the_locked_row_is_not_this_acti
                                         other_user=(how == "other-user"))
     req = _Request(_slow_body(pool), headers={"authorization": "Bearer t"})
     with pytest.raises(HTTPException) as e:
-        asyncio.run(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
+        run_coroutine(_raw(S.upload_chunk)(vid, sid, 1, req, current_user=user, db=db, x_vault_password=None))
     assert e.value.status_code == (409 if how == "closed" else 404)
     assert not (tmp_path / "sess" / "chunk_000001").exists()
 
@@ -353,3 +356,32 @@ def test_the_boundary_sits_between_the_last_read_and_the_first_byte_in_both_endp
         assert "session." not in between and "db." not in between and "current_user." not in between, between
         # ... and the seal is handed the copied id, not the instance's.
         assert "_sid, chunk_index)" in src[seal:seal + 200], fn.__name__
+
+
+# ---- the way the coroutines are run --------------------------------------------------------------------------
+
+def test_the_coroutines_run_even_when_a_loop_is_already_running_in_this_thread():
+    # After the browser tests, an event loop is left running in the main thread for the rest of the
+    # session; this module sorts after them. `asyncio.run()` refuses in that state, and every local
+    # lane hides it (they deselect the browser tests). The same state is made here on purpose:
+    # `asyncio.run` must refuse, and the helper this module uses must not.
+    loop = asyncio.new_event_loop()
+    asyncio.events._set_running_loop(loop)
+    try:
+        async def two():
+            await asyncio.sleep(0)
+            return 2
+        refused = two()
+        with pytest.raises(RuntimeError, match="running event loop"):
+            asyncio.run(refused)
+        refused.close()                                   # never started; do not let it warn
+        assert run_coroutine(two()) == 2
+        # ... and an exception inside the coroutine comes back as itself, not as a thread's silence.
+        async def boom():
+            raise HTTPException(status_code=418, detail="teapot")
+        with pytest.raises(HTTPException) as e:
+            run_coroutine(boom())
+        assert e.value.status_code == 418
+    finally:
+        asyncio.events._set_running_loop(None)
+        loop.close()
