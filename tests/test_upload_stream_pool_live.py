@@ -13,11 +13,27 @@ An instrument that cannot see the fault it is meant to catch proves nothing by s
 Runs in CI's full-suite job against the live stack (no marker filter there); reaches the database
 through ``docker exec``, the way every other live module here does.
 
-EVERY blocking call in this module carries a timeout, and the test's hard bound is their sum:
-nothing here may hang a job that runs unattended. A test that hangs is worse than one that fails --
-the first run of this one blocked on an unbounded readline for eleven minutes, one line before the
-skip that was meant to catch that very case, the job hit its cap, and the junit artifact for the
-whole suite was never written.
+QUARANTINED: OPT-IN ONLY, via VAULT_POOL_PIN_LIVE=1. By default this module SKIPS at collection,
+before any fixture runs, so it is structurally incapable of holding the shared suite. The live
+measurement behind this claim has NOT BEEN TAKEN IN CI. The claim ships on the offline evidence in
+tests/test_upload_stream_holds_no_connection.py -- a stand-in Session whose instrument reported the
+connection held ([1, 1, 1, 1]) on the code before the change and released ([0, 0, 0, 0]) after it,
+plus eleven mutations -- and this test is a hand-run for a person against their own stack.
+
+WHAT IS KNOWN, for whoever picks it up: every blocking call in this module carries a timeout
+(the constants below; the child's stdout is pumped into a queue and waited on with a timeout; the
+poll, the control's exit and the PUT are bounded; the sampler never dies in a poll), their sum is
+about seven minutes worst case -- and the module still held a CI job for THIRTEEN minutes of total
+silence, so whatever blocks is OUTSIDE the calls bounded here. Three candidates, none excluded yet:
+(1) a conftest fixture this test pulls in that nobody bounded (`receivers_enabled`,
+`_require_running_container`, `_verify_url` all appear in its collection listing); (2) the
+docker exec / Popen interaction itself; (3) `requests`' `timeout=`, which bounds EACH SOCKET
+OPERATION and not the whole request -- a generator body against a slow reader can run for as long
+as the reader likes while every single operation stays inside the timeout. If (3) is it, every
+future live upload test that reaches for `timeout=` on a streamed body will believe something it
+does not mean; put a deadline on the body generator itself. The earlier history: the first version
+blocked on an unbounded readline one line before its skip and took a 45-minute job cap; that one is
+fixed and its guard is armed by three offline legs.
 """
 import os
 import queue
@@ -30,7 +46,14 @@ import pytest
 from conftest import unique  # noqa: E402
 from test_api_receiver_upload import _mk_receiver, _open, receivers_enabled  # noqa: F401,E402
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        os.environ.get("VAULT_POOL_PIN_LIVE") not in ("1", "true", "yes"),
+        reason="quarantined live measurement, NOT run in CI: set VAULT_POOL_PIN_LIVE=1 to hand-run it "
+               "against your own stack (it has held a shared job past its cap; see the module docstring)",
+    ),
+]
 
 _API_CONTAINER = os.environ.get("VAULT_API_CONTAINER", "vault-api")
 _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
