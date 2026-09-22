@@ -12,6 +12,11 @@ ceiling -- never by a foreground caller re-probing -- and staleness is judged on
 
 Timing is pinned by threads and events, never by a sleep in an assertion path: the probe's inter-
 attempt wait and its ping are seams a test replaces, and the recovery case joins the probe thread.
+Staleness is never written by a test: the module's one monotonic source is replaced by a clock the
+test ADVANCES, so whether the breaker has gone stale is computed by the product from the stamp the
+product wrote. A product that stops stamping, stamps wrongly, or gives up after a failed start then
+genuinely never goes stale here, and the test sees it -- a helper that rewrote the stamp would have
+supplied the stale state itself and hidden all three.
 """
 import threading
 import time
@@ -29,21 +34,42 @@ from app.core import rate_limiter as R
 pytestmark = pytest.mark.unit
 
 
+class _Clock:
+    """The module's monotonic source, under the test's control: it stands still until advanced."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 @pytest.fixture(autouse=True)
-def _reset_breaker():
-    """Every test starts and ends with a closed breaker and no tracked probe thread. A probe thread
-    a test started is joined by that test; a closed breaker makes any stray one exit at its next
-    wait."""
+def clock(monkeypatch):
+    """Every test starts and ends with a closed breaker, no tracked probe thread, and the module's
+    clock replaced by one only the test moves. A probe thread a test started is joined by that
+    test; a closed breaker makes any stray one exit at its next wait."""
+    c = _Clock()
+    monkeypatch.setattr(R, "_cb_monotonic", c)
+
     def _clear():
         R._cb_record_success()
         with R._cb_lock:
             R._cb_probe_thread = None
             R._cb_probe_threads[:] = []
             R._cb_probe_cap_logged = False
-            R._cb_last_attempt_at = R._cb_monotonic()  # fresh, so the staleness backstop stays dormant
+            R._cb_last_attempt_at = c()  # fresh, so the staleness backstop stays dormant
     _clear()
-    yield
+    yield c
     _clear()
+
+
+def _go_stale(clock):
+    """Let a stale period pass. The product's own stamp decides whether that made it stale."""
+    clock.advance(R._CB_PROBE_STALE_SECONDS + 1)
 
 
 def _raise_down():
@@ -166,7 +192,7 @@ def test_a_failure_racing_a_probe_success_does_not_strand_the_breaker_open(monke
     assert R._cb_probe_thread is None   # same thread throughout; a clean close freed the slot
 
 
-def test_a_failed_probe_start_does_not_escape_and_the_backstop_heals(monkeypatch):
+def test_a_failed_probe_start_does_not_escape_and_the_backstop_heals(monkeypatch, clock):
     # A Thread.start() that raises (thread exhaustion) must not 500 the request, and must not wedge:
     # the breaker opens with no probe, then the staleness backstop restarts one that heals.
     real_thread = R.threading.Thread
@@ -185,7 +211,7 @@ def test_a_failed_probe_start_does_not_escape_and_the_backstop_heals(monkeypatch
     monkeypatch.setattr(R.threading, "Thread", real_thread)
     monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
     monkeypatch.setattr(R, "_cb_ping", lambda: None)          # healthy once a probe can start
-    R._cb_last_attempt_at = R._cb_monotonic() - (R._CB_PROBE_STALE_SECONDS + 1)  # age it: go stale
+    _go_stale(clock)
     assert R._cb_is_open(time.time()) is True    # backstop restarts the probe and keeps skipping
     thread = R._cb_probe_thread
     assert thread is not None
@@ -193,7 +219,7 @@ def test_a_failed_probe_start_does_not_escape_and_the_backstop_heals(monkeypatch
     assert R._cb_open is False                    # the restarted probe healed it
 
 
-def test_a_dead_probe_is_restarted_by_the_staleness_backstop(monkeypatch):
+def test_a_dead_probe_is_restarted_by_the_staleness_backstop(monkeypatch, clock):
     # A probe whose loop crashes leaves a DEAD thread in the slot; the backstop restarts it.
     real_loop = R._cb_probe_loop
     state = {"crashed": False}
@@ -215,7 +241,7 @@ def test_a_dead_probe_is_restarted_by_the_staleness_backstop(monkeypatch):
     assert not first.is_alive()
     assert R._cb_open is True                     # a crashed probe closed nothing
 
-    R._cb_last_attempt_at = R._cb_monotonic() - (R._CB_PROBE_STALE_SECONDS + 1)
+    _go_stale(clock)
     assert R._cb_is_open(time.time()) is True     # dead slot -> backstop restarts, stays open
     second = R._cb_probe_thread
     assert second is not None and second is not first
@@ -262,10 +288,6 @@ class _Parking:
         gate.set()
 
 
-def _go_stale():
-    R._cb_last_attempt_at = R._cb_monotonic() - (R._CB_PROBE_STALE_SECONDS + 1)
-
-
 def _is_open_from_another_thread():
     """'No request path probes in the foreground', as a deterministic shape rather than a timing
     measurement: ask the breaker from a thread that is not the probe, and return exactly what a
@@ -278,7 +300,7 @@ def _is_open_from_another_thread():
     return out[0]
 
 
-def test_a_hung_probe_is_replaced_and_no_caller_is_ever_told_to_reprobe(monkeypatch):
+def test_a_hung_probe_is_replaced_and_no_caller_is_ever_told_to_reprobe(monkeypatch, clock):
     park = _Parking()
     monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
     monkeypatch.setattr(R, "_cb_ping", park.ping)
@@ -286,7 +308,7 @@ def test_a_hung_probe_is_replaced_and_no_caller_is_ever_told_to_reprobe(monkeypa
     first = R._cb_probe_thread
     park.wait_entered(first)
 
-    _go_stale()
+    _go_stale(clock)
     assert _is_open_from_another_thread() is True   # alive-but-stale: STILL skipping ...
     second = R._cb_probe_thread
     assert second is not None and second is not first and second.is_alive()  # ... a replacement owns the slot
@@ -295,7 +317,7 @@ def test_a_hung_probe_is_replaced_and_no_caller_is_ever_told_to_reprobe(monkeypa
     # possible; stale at the ceiling), is told to skip -- never False.
     for _ in range(3):
         assert _is_open_from_another_thread() is True
-        _go_stale()
+        _go_stale(clock)
         assert _is_open_from_another_thread() is True
 
     replacements = [t for t in R._cb_probe_threads if t is not first]
@@ -310,7 +332,7 @@ def test_a_hung_probe_is_replaced_and_no_caller_is_ever_told_to_reprobe(monkeypa
     assert not first.is_alive() and R._cb_open is False and R._cb_probe_thread is None
 
 
-def test_a_superseded_probe_neither_clears_the_slot_nor_keeps_probing(monkeypatch):
+def test_a_superseded_probe_neither_clears_the_slot_nor_keeps_probing(monkeypatch, clock):
     # Ownership gates the exit and the slot write together: the stuck thread, once replaced, must
     # leave the moment it wakes -- not clear the slot its replacement holds (the exit race, from the
     # other side), and not loop on beside it while the breaker is still open.
@@ -320,7 +342,7 @@ def test_a_superseded_probe_neither_clears_the_slot_nor_keeps_probing(monkeypatc
     R._cb_record_failure(time.time())
     first = R._cb_probe_thread
     park.wait_entered(first)
-    _go_stale()
+    _go_stale(clock)
     assert R._cb_is_open(time.time()) is True
     second = R._cb_probe_thread
     assert second is not first
@@ -336,7 +358,7 @@ def test_a_superseded_probe_neither_clears_the_slot_nor_keeps_probing(monkeypatc
     assert R._cb_open is False and R._cb_probe_thread is None
 
 
-def test_a_superseded_probe_does_not_refresh_the_stamp_but_its_success_still_counts(monkeypatch):
+def test_a_superseded_probe_does_not_refresh_the_stamp_but_its_success_still_counts(monkeypatch, clock):
     # The stamp is the backstop's only evidence that the OWNER is making progress. A superseded
     # thread waking once per period must not refresh it (that would hold the backstop off forever);
     # but a ping that succeeded now is current news whoever ran it, so its success closes the breaker.
@@ -344,8 +366,8 @@ def test_a_superseded_probe_does_not_refresh_the_stamp_but_its_success_still_cou
     with R._cb_lock:
         R._cb_open = True
         R._cb_probe_thread = threading.Thread(name="someone-else")  # the slot is owned by another
-    stamp = R._cb_monotonic() - 5
-    R._cb_last_attempt_at = stamp
+    stamp = R._cb_last_attempt_at
+    clock.advance(5)
     assert R._cb_probe_attempt() is True         # this thread is not the owner
     assert R._cb_last_attempt_at == stamp         # the stamp did not move
     assert R._cb_open is False                    # the success was recorded
@@ -354,10 +376,10 @@ def test_a_superseded_probe_does_not_refresh_the_stamp_but_its_success_still_cou
         R._cb_open = True
         R._cb_probe_thread = None
     R._cb_probe_attempt()
-    assert R._cb_last_attempt_at > stamp
+    assert R._cb_last_attempt_at == stamp + 5
 
 
-def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog):
+def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog, clock):
     # Each stale period that still finds the owner stuck would start another thread; under an
     # hour-long resolver hang that is an unbounded leak of threads parked in the same getaddrinfo.
     # N+2 stale periods must produce at most N live probe threads, and the ceiling is logged once.
@@ -370,7 +392,7 @@ def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog)
         R._cb_record_failure(time.time())
         park.wait_entered(R._cb_probe_thread)
         for _ in range(n + 2):
-            _go_stale()
+            _go_stale(clock)
             assert R._cb_is_open(time.time()) is True
             park.wait_entered(R._cb_probe_thread)
     threads = list(R._cb_probe_threads)
@@ -386,7 +408,7 @@ def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog)
         R._cb_record_failure(time.time())
         park.wait_entered(R._cb_probe_thread)
         for _ in range(n + 1):
-            _go_stale()
+            _go_stale(clock)
             assert R._cb_is_open(time.time()) is True
             park.wait_entered(R._cb_probe_thread)
     assert sum(1 for rec in caplog.records if "ceiling" in rec.getMessage()) == 2
@@ -397,7 +419,7 @@ def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog)
     assert R._cb_open is False
 
 
-def test_a_failed_replacement_start_keeps_skipping_and_the_next_period_heals(monkeypatch):
+def test_a_failed_replacement_start_keeps_skipping_and_the_next_period_heals(monkeypatch, clock):
     # With no foreground escape, the only closer is a thread, so "cannot wedge open" now rests on
     # being able to START one: a Thread.start() that raises on the stale path must not escape into
     # the request path, must leave the breaker skipping, and the NEXT stale period must try again
@@ -418,13 +440,13 @@ def test_a_failed_replacement_start_keeps_skipping_and_the_next_period_heals(mon
             raise RuntimeError("thread exhaustion")
 
     monkeypatch.setattr(R.threading, "Thread", _BadThread)
-    _go_stale()
+    _go_stale(clock)
     assert R._cb_is_open(time.time()) is True    # must NOT raise, must still skip
     assert R._cb_open is True and R._cb_probe_thread is first   # nothing replaced it; nothing wedged
     assert len(R._cb_probe_threads) == 1
 
     monkeypatch.setattr(R.threading, "Thread", real_thread)
-    _go_stale()
+    _go_stale(clock)
     assert R._cb_is_open(time.time()) is True    # the next period tries again ...
     second = R._cb_probe_thread
     assert second is not first
@@ -460,7 +482,34 @@ def test_a_wall_clock_jump_forward_does_not_fake_a_stale_probe(monkeypatch):
     assert R._cb_open is False
 
 
-def test_a_wall_clock_jump_backward_does_not_hide_a_dead_probe(monkeypatch):
+def test_opening_stamps_the_clock_so_the_backstop_counts_from_this_outage(monkeypatch, clock):
+    # The stamp from a previous outage may be ancient when the next one opens the breaker. Opening
+    # must stamp, or the backstop would count from the WRONG outage: a probe whose start raised at
+    # the open would be retried at once (and on every call until one starts) instead of one stale
+    # period later. Observed as start attempts: one at the open, none until a period has passed,
+    # then one more. (Invisible to a test whose fixture stamped "fresh" a moment before the open.)
+    starts = []
+
+    class _BadThread:
+        def __init__(self, *a, **k):
+            starts.append(1)
+
+        def start(self):
+            raise RuntimeError("thread exhaustion")
+
+    monkeypatch.setattr(R.threading, "Thread", _BadThread)
+    clock.advance(10 * R._CB_PROBE_STALE_SECONDS)   # a long quiet time since the fixture's stamp
+    R._cb_record_failure(time.time())                # opens: must stamp NOW; the start raises
+    assert R._cb_open is True and R._cb_probe_thread is None and len(starts) == 1
+    for _ in range(3):
+        assert R._cb_is_open(time.time()) is True
+    assert len(starts) == 1, "the backstop counted from the previous outage and retried at once"
+    _go_stale(clock)
+    assert R._cb_is_open(time.time()) is True
+    assert len(starts) == 2                          # one period after THIS open: retried
+
+
+def test_a_wall_clock_jump_backward_does_not_hide_a_dead_probe(monkeypatch, clock):
     real_loop = R._cb_probe_loop
     state = {"crashed": False}
 
@@ -477,7 +526,7 @@ def test_a_wall_clock_jump_backward_does_not_hide_a_dead_probe(monkeypatch):
     first = R._cb_probe_thread
     first.join(timeout=5)
     assert not first.is_alive() and R._cb_open is True
-    _go_stale()                                   # the monotonic stamp says: stale
+    _go_stale(clock)                                   # the monotonic stamp says: stale
     far_past = time.time() - 10 * R._CB_PROBE_STALE_SECONDS
     assert R._cb_is_open(far_past) is True       # a backward wall-clock step must not suppress the backstop
     second = R._cb_probe_thread
