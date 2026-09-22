@@ -360,31 +360,53 @@ def test_the_boundary_sits_between_the_last_read_and_the_first_byte_in_both_endp
 
 # ---- the way the coroutines are run --------------------------------------------------------------------------
 
-def test_the_coroutines_run_even_when_a_loop_is_already_running_in_this_thread():
+def test_the_coroutines_run_even_when_a_loop_is_already_running_in_the_calling_thread():
     # After the browser tests, an event loop is left running in the main thread for the rest of the
     # session; this module sorts after them. `asyncio.run()` refuses in that state, and every local
-    # lane hides it (they deselect the browser tests). The same state is made here on purpose:
-    # `asyncio.run` must refuse, and the helper this module uses must not.
-    loop = asyncio.new_event_loop()
-    asyncio.events._set_running_loop(loop)
-    try:
-        async def two():
-            await asyncio.sleep(0)
-            return 2
-        refused = two()
-        with pytest.raises(RuntimeError, match="running event loop"):
-            asyncio.run(refused)
-        refused.close()                                   # never started; do not let it warn
-        assert run_coroutine(two()) == 2
-        # ... and an exception inside the coroutine comes back as itself, not as a thread's silence.
-        async def boom():
-            raise HTTPException(status_code=418, detail="teapot")
-        with pytest.raises(HTTPException) as e:
-            run_coroutine(boom())
-        assert e.value.status_code == 418
-    finally:
-        asyncio.events._set_running_loop(None)
-        loop.close()
+    # lane hides it (they deselect the browser tests). The same state is made here on purpose --
+    # IN A WORKER THREAD. The running-loop slot is thread-local, and the main thread's slot belongs
+    # to Playwright's suspended dispatcher for the rest of the session: the first version of this
+    # test set and then cleared the MAIN thread's slot, after which the dispatcher's next callback
+    # raised "is not the running loop", the driver's reply never landed, and the session's
+    # browser.close() at teardown blocked until the job cap -- twice. Nothing here may touch the
+    # main thread's slot, and the last assertion holds that.
+    import threading
+    main_slot_before = asyncio.events._get_running_loop()
+    box = {}
+
+    def in_worker():
+        loop = asyncio.new_event_loop()
+        asyncio.events._set_running_loop(loop)          # this thread's slot only
+        try:
+            async def two():
+                await asyncio.sleep(0)
+                return 2
+            refused = two()
+            try:
+                asyncio.run(refused)
+                box["refused"] = False
+            except RuntimeError as e:
+                box["refused"] = "running event loop" in str(e)
+            refused.close()                             # never started; do not let it warn
+            box["ran"] = run_coroutine(two())
+            # ... and an exception inside the coroutine comes back as itself, not as a thread's silence.
+            async def boom():
+                raise HTTPException(status_code=418, detail="teapot")
+            try:
+                run_coroutine(boom())
+                box["raised"] = None
+            except HTTPException as e:
+                box["raised"] = e.status_code
+        finally:
+            asyncio.events._set_running_loop(None)
+            loop.close()
+
+    t = threading.Thread(target=in_worker)
+    t.start()
+    t.join(30)
+    assert not t.is_alive(), "the worker hung"
+    assert box == {"refused": True, "ran": 2, "raised": 418}, box
+    assert asyncio.events._get_running_loop() is main_slot_before, "the main thread's running-loop slot was touched"
 
 
 # ---- the live pin's guard, armed ---------------------------------------------------------------------------
