@@ -192,3 +192,23 @@ def test_no_emission_rolls_its_own_arithmetic_anywhere_in_the_application():
                     "%s: a Retry-After with its own arithmetic: %s" % (py.name, ln.strip())
     assert raw == [], "raw retry-after arithmetic remains at: %s" % raw
     assert emissions >= 20, "the sweep found fewer header emissions than there are (%d)" % emissions
+
+
+def test_at_a_site_with_two_limiters_the_refusing_one_decides_both_the_reset_and_the_window():
+    # Three endpoints run two limiters -- per user and per address -- and refuse if either says no.
+    # They used to pick the RESET from whichever refused and then compute the wait with the OTHER
+    # limiter's window on one arm (there was only one `window` name in scope), so the cap could come
+    # from the wrong budget. Now each arm pairs its reset with its own window. Pinned on the source
+    # of the three sites, comment-free: the `reset`/`_WINDOW` pairing on the user arm and the
+    # `reset_ip`/`_IP_WINDOW` pairing on the address arm, at every site, with no mixed pairing.
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    arms = re.findall(r"_retry = \(retry_after_seconds\(reset, (_[A-Z_]+_WINDOW)\) if not allowed\s*\n\s*"
+                      r"else retry_after_seconds\(reset_ip, (_[A-Z_]+_WINDOW)\)\)", code)
+    assert len(arms) == 3, arms
+    for user_window, ip_window in arms:
+        assert not user_window.endswith("_IP_WINDOW"), arms      # the user arm never uses the address budget
+        assert ip_window.endswith("_IP_WINDOW"), arms            # the address arm always uses its own
+    assert "_reset = reset if not allowed else reset_ip" not in code   # the one-name shape is gone
