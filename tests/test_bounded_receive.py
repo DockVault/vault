@@ -16,10 +16,10 @@ loop with a stream that looks at the destination as it is being read.
 file is the guard that runs everywhere, including where no cgroup is readable.
 """
 
-import asyncio
 import hashlib
 import io
-import threading
+
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 
 import pytest
 
@@ -33,41 +33,6 @@ pytestmark = pytest.mark.unit
 # on this interpreter, not the 8 KiB that is easy to assume, and a literal that silently fell under
 # it would turn every interleaving reading into a zero and the test into a passing tautology.
 PIECE = max(256 * 1024, io.DEFAULT_BUFFER_SIZE * 2)
-
-
-def _run(coro):
-    """Run an async body on a loop of its own, in a thread of its own.
-
-    `asyncio.run` refuses when a loop is already running in the calling thread, and in a single
-    invocation of the whole suite one IS running by the time this file is reached: Playwright's
-    sync API drives its loop on a greenlet in the main thread and never returns from it, and its
-    fixtures are session-scoped, so any browser-driven module that sorts before this one leaves the
-    thread's running-loop set for the rest of the process. These tests then fail for a reason that
-    has nothing to do with what they check. A unit test should not depend on ambient loop state at
-    all, so it brings its own thread — and still shuts the loop's async generators down, because
-    abandoning one mid-iteration is exactly what the refusal paths under test do.
-    """
-    outcome = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            outcome["value"] = loop.run_until_complete(coro)
-        except BaseException as exc:                # noqa: BLE001 - re-raised on the caller
-            outcome["error"] = exc
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                loop.close()
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join(timeout=60)
-    assert not thread.is_alive(), "the async body did not finish"
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("value")
 
 
 class _WatchingStream:
@@ -100,7 +65,7 @@ def test_each_piece_is_on_disk_before_the_next_is_asked_for(tmp_path):
     pieces = [bytes([i]) * PIECE for i in range(1, 6)]
     stream = _WatchingStream(pieces, dest)
 
-    written, digest = _run(receive_bounded(stream, dest, limit=10 * PIECE))
+    written, digest = run_coroutine(receive_bounded(stream, dest, limit=10 * PIECE))
 
     assert written == 5 * PIECE
     assert digest == hashlib.sha256(b"".join(pieces)).hexdigest()
@@ -120,7 +85,7 @@ def test_the_limit_stops_the_read_rather_than_the_write(tmp_path):
     stream = _WatchingStream(pieces, dest)
 
     with pytest.raises(ChunkTooLarge):
-        _run(receive_bounded(stream, dest, limit=2 * PIECE + 1))
+        run_coroutine(receive_bounded(stream, dest, limit=2 * PIECE + 1))
 
     assert stream.pieces_pulled == 3, (
         f"read {stream.pieces_pulled} of 10 pieces before refusing; the limit is being applied "
@@ -139,7 +104,7 @@ def test_a_refused_body_leaves_no_partial_file(tmp_path):
     stream = _WatchingStream([b"y" * PIECE] * 4, dest)
 
     with pytest.raises(ChunkTooLarge):
-        _run(receive_bounded(stream, dest, limit=PIECE))
+        run_coroutine(receive_bounded(stream, dest, limit=PIECE))
 
     assert not dest.exists(), "the partial file survived the refusal"
 
@@ -157,7 +122,7 @@ def test_a_stream_that_dies_mid_body_also_leaves_nothing(tmp_path):
             raise ConnectionResetError("client went away")
 
     with pytest.raises(ConnectionResetError):
-        _run(receive_bounded(_Dies(), dest, limit=100 * PIECE))
+        run_coroutine(receive_bounded(_Dies(), dest, limit=100 * PIECE))
 
     assert not dest.exists(), "a dropped connection left a partial chunk behind"
 
@@ -170,7 +135,7 @@ def test_a_body_exactly_at_the_limit_is_accepted(tmp_path):
     """
     dest = tmp_path / "chunk.part"
     pieces = [b"w" * PIECE, b"w" * PIECE]
-    written, _ = _run(receive_bounded(_WatchingStream(pieces, dest), dest, limit=2 * PIECE))
+    written, _ = run_coroutine(receive_bounded(_WatchingStream(pieces, dest), dest, limit=2 * PIECE))
     assert written == 2 * PIECE
     assert dest.read_bytes() == b"w" * 2 * PIECE
 
@@ -184,7 +149,7 @@ def test_an_empty_body_is_refused_and_leaves_nothing(tmp_path):
     """
     dest = tmp_path / "chunk.part"
     with pytest.raises(EmptyBody):
-        _run(receive_bounded(_WatchingStream([], dest), dest, limit=PIECE))
+        run_coroutine(receive_bounded(_WatchingStream([], dest), dest, limit=PIECE))
     assert not dest.exists(), "an empty body left a zero-length file behind"
 
 
@@ -192,5 +157,5 @@ def test_a_body_of_only_empty_pieces_counts_as_empty(tmp_path):
     """A stream can yield without carrying anything, and that is still nothing received."""
     dest = tmp_path / "chunk.part"
     with pytest.raises(EmptyBody):
-        _run(receive_bounded(_WatchingStream([b"", b"", b""], dest), dest, limit=PIECE))
+        run_coroutine(receive_bounded(_WatchingStream([b"", b"", b""], dest), dest, limit=PIECE))
     assert not dest.exists()

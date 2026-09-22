@@ -11,13 +11,14 @@ import threading
 import pytest
 
 from _bare_api_env import set_bare_api_env
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 
 pytestmark = pytest.mark.unit
 
 
 def _drive_login(S, body_dict, events, drain=False, done_event=None):
-    """Drive POST /auth/login through the ASGI app in-process on a fresh loop in its own thread — the
-    suite has no httpx/TestClient, so this speaks raw ASGI. Appends ("response", status) to the shared
+    """Drive POST /auth/login through the ASGI app in-process on a fresh loop in its own thread (via
+    the one loop helper, tests/_async_run.py) — the suite has no httpx/TestClient, so this speaks raw ASGI. Appends ("response", status) to the shared
     `events` list (the test's patched monitor appends its own ("record", thread) entry), so their
     ORDER is observable. Returns the loop thread's name. With drain=True and a `done_event`, waits
     deterministically for that event (set by the patched fire-and-forget broadcast) before the loop
@@ -46,23 +47,7 @@ def _drive_login(S, body_dict, events, drain=False, done_event=None):
             # loop closes. Bounded at 5 s so a genuine failure surfaces rather than hangs.
             await asyncio.get_running_loop().run_in_executor(None, done_event.wait, 5)
 
-    err = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_drive())
-        except BaseException as exc:  # noqa: BLE001
-            err["e"] = exc
-        finally:
-            loop.close()
-
-    t = threading.Thread(target=_worker)
-    t.start()
-    t.join(30)
-    assert not t.is_alive(), "the ASGI drive did not finish"
-    if "e" in err:
-        raise err["e"]
+    run_coroutine(_drive(), timeout=30)
     return holder.get("loop_thread")
 
 

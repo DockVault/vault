@@ -7,9 +7,7 @@ middleware, so nothing consulted the breaker there; a bare ping on the main clie
 its 2 s timeout once per tick. It now reports 'disconnected' with no socket while the breaker is open,
 and otherwise probes off the loop on the short-timeout client.
 """
-import asyncio
 import logging
-import threading
 import time
 
 import pytest
@@ -17,6 +15,7 @@ import pytest
 from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 
 from app.core import rate_limiter as R
 from app.core import redis_guard as G
@@ -53,33 +52,6 @@ def test_a_slow_limiter_eval_logs_the_warning_naming_the_function_not_the_key(ca
     assert "secret-key" not in msgs and "user:42" not in msgs  # the key is never logged
 
 
-def _run_coro_on_own_thread(coro_factory):
-    """Run an async callable on a FRESH event loop in ITS OWN THREAD and return its result.
-
-    Never asyncio.run()/get_event_loop().run_until_complete() in the test body: the full suite runs
-    under Playwright's already-running loop, where asyncio.run() raises "cannot be called from a
-    running event loop" (the offline lane, with no such loop, does not show it). This mirrors
-    _drive_login in test_login_handler_helpers.py."""
-    out = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            out["result"] = loop.run_until_complete(coro_factory())
-        except BaseException as exc:  # noqa: BLE001 — re-raised on the test thread below
-            out["error"] = exc
-        finally:
-            loop.close()
-
-    t = threading.Thread(target=_worker)
-    t.start()
-    t.join(30)
-    assert not t.is_alive(), "the health coroutine did not finish"
-    if "error" in out:
-        raise out["error"]
-    return out["result"]
-
-
 def test_health_reports_redis_disconnected_without_a_socket_while_the_breaker_is_open(monkeypatch):
     import app.api.api_server as S
     import app.core.health as H
@@ -97,7 +69,7 @@ def test_health_reports_redis_disconnected_without_a_socket_while_the_breaker_is
     monkeypatch.setattr(H, "check_schema_state", lambda: "complete")
 
     R._cb_record_failure(time.time())          # breaker open
-    body = _run_coro_on_own_thread(S.health_check)
+    body = run_coroutine(S.health_check())
 
     assert body["redis"] == "disconnected"      # honest report, no richer
     assert probe_calls == []                     # the socket was never touched on the loop

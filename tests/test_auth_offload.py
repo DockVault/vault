@@ -23,6 +23,7 @@ from fastapi import HTTPException
 from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 
 import app.core.auth_offload as ao
 from app.core.auth_offload import (
@@ -46,34 +47,6 @@ def _restore_offload_globals():
     process."""
     yield
     ao._auth_slots = asyncio.Semaphore(AUTH_OFFLOAD_LIMIT)
-
-
-def _run(coro):
-    """Run an async body on a loop of its own, in a thread of its own — the repo's pattern (see
-    test_transfer_admission._run). asyncio.run refuses when a loop is already running in the calling
-    thread, and in the single-invocation full suite Playwright's sync API leaves one running once any
-    browser-driven module sorts earlier; a unit test must not depend on that ambient state."""
-    outcome = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            outcome["value"] = loop.run_until_complete(coro)
-        except BaseException as exc:  # noqa: BLE001 — re-raised on the caller
-            outcome["error"] = exc
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                loop.close()
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join(timeout=60)
-    assert not thread.is_alive(), "the async body did not finish"
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("value")
 
 
 def _fresh_slots():
@@ -118,7 +91,7 @@ def test_auth_offload_slot_caps_concurrency_at_the_limit():
         await asyncio.gather(*tasks)
         return peak_while_held
 
-    peak = _run(run())
+    peak = run_coroutine(run())
     assert peak == AUTH_OFFLOAD_LIMIT, (
         f"peak concurrent offload slots was {peak}, expected exactly {AUTH_OFFLOAD_LIMIT} — the "
         f"slot semaphore is not bounding concurrency at its limit")
@@ -153,7 +126,7 @@ def test_the_slot_sheds_load_with_503_when_the_wait_exceeds_the_timeout(monkeypa
                 with pytest.raises(StopAsyncIteration):
                     await g.__anext__()  # release each slot
 
-    _run(run())
+    run_coroutine(run())
 
 
 def test_run_offloaded_preserves_contextvars_into_the_worker():
@@ -164,7 +137,7 @@ def test_run_offloaded_preserves_contextvars_into_the_worker():
         _probe.set("set-on-the-loop")
         return await run_offloaded(_probe.get)
 
-    assert _run(run()) == "set-on-the-loop", (
+    assert run_coroutine(run()) == "set-on-the-loop", (
         "the contextvar set on the loop was not visible inside the offloaded callable — "
         "run_in_executor dropped the context")
 
@@ -198,7 +171,7 @@ def test_run_offloaded_keeps_the_loop_free_under_a_blocking_burst():
         await hb
         return advanced
 
-    advanced = _run(run())
+    advanced = run_coroutine(run())
     # ~0.3 s of loop time at a 5 ms heartbeat is dozens of ticks when the loop is free; a direct call
     # freezes it for ~8 x 0.3 s and the heartbeat barely advances. 15 sits well between the two.
     assert advanced >= 15, (
@@ -229,7 +202,7 @@ def test_run_offloaded_uses_the_dedicated_executor():
     async def run():
         return await run_offloaded(lambda: threading.current_thread().name)
 
-    name = _run(run())
+    name = run_coroutine(run())
     assert name.startswith("auth-offload"), (
         f"offloaded work ran on thread {name!r}, not the dedicated 'auth-offload' pool")
 
@@ -267,7 +240,7 @@ def test_fire_offloop_caps_concurrent_side_effects_at_the_limit():
                 break
         return peak
 
-    peak = _run(run())
+    peak = run_coroutine(run())
     assert peak == FIRE_OFFLOOP_LIMIT, (
         f"peak concurrent side effects was {peak}, expected {FIRE_OFFLOOP_LIMIT}")
 
@@ -290,6 +263,6 @@ def test_fire_offloop_sheds_beyond_the_queue_cap():
         S._BG_TASKS.clear()
         return delta, fired["n"]
 
-    delta, fired = _run(run())
+    delta, fired = run_coroutine(run())
     assert delta == 1 and fired == 0, (
         f"side effect not shed at the queue cap: dropped_delta={delta}, fired={fired}")

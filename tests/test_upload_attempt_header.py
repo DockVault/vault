@@ -10,8 +10,8 @@ is never held whole), so both are tested without a request or a database; the ro
 on the handler's source. The live behaviour -- a mismatched chunk 0 never lets the upload complete --
 is the live lane.
 """
-import asyncio
-import threading
+
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 from pathlib import Path
 
 import pytest
@@ -28,32 +28,6 @@ API = ROOT / "app" / "api" / "api_server.py"
 TOKEN = bytes(range(16))
 DECLARED = TOKEN.hex()
 HEADER = b"DVZ2\x02\x04\x00\x00" + (1048576).to_bytes(4, "big") + TOKEN
-
-
-def _run(coro):
-    # A loop of its own, in a thread of its own: a unit test must not depend on ambient loop state
-    # (a browser-driven module earlier in one process leaves a loop running in the main thread).
-    out = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            out["v"] = loop.run_until_complete(coro)
-        except BaseException as exc:                # noqa: BLE001 - re-raised on the caller
-            out["e"] = exc
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                loop.close()
-
-    t = threading.Thread(target=_worker)
-    t.start()
-    t.join(timeout=30)
-    assert not t.is_alive(), "the async body did not finish"
-    if "e" in out:
-        raise out["e"]
-    return out.get("v")
 
 
 def test_the_header_is_28_bytes_with_the_token_last():
@@ -103,7 +77,7 @@ def test_the_head_is_captured_in_passing_and_the_body_is_untouched():
     whole = HEADER + b"x" * 100
     # One piece, the header split across pieces, a leading empty piece, and a body shorter than 28.
     for pieces in ([whole], [whole[:5], whole[5:20], whole[20:]], [b"", whole], [whole[:10]]):
-        got, head = _run(drain(pieces))
+        got, head = run_coroutine(drain(pieces))
         assert b"".join(got) == b"".join(pieces), "the peek altered the stream"
         assert head == b"".join(pieces)[:28]
 

@@ -10,7 +10,8 @@ slots are released twice or released by something that never took one.
 """
 
 import asyncio
-import threading
+
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 
 import pytest
 
@@ -20,44 +21,13 @@ from app.core.transfer_admission import TransferAdmission, TransferBusy
 pytestmark = pytest.mark.unit
 
 
-def _run(coro):
-    """Run an async body on a loop of its own, in a thread of its own.
-
-    `asyncio.run` refuses if a loop is already running in the calling thread, and in the full
-    integration lane something upstream leaves one running -- these tests then fail for a reason
-    that has nothing to do with what they are testing. A unit test should not depend on ambient
-    loop state at all, so it brings its own thread.
-    """
-    outcome = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            outcome["value"] = loop.run_until_complete(coro)
-        except BaseException as exc:                # noqa: BLE001 - re-raised on the caller
-            outcome["error"] = exc
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                loop.close()
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join(timeout=60)
-    assert not thread.is_alive(), "the async body did not finish"
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("value")
-
-
 def test_transfers_up_to_the_limit_are_admitted_immediately():
     async def _go():
         gate = TransferAdmission(limit=3, max_waiting=5, wait_seconds=5)
         for _ in range(3):
             await gate.acquire()
         assert gate.stats()["in_flight"] == 3
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_a_transfer_arriving_at_a_full_deployment_waits_rather_than_failing():
@@ -81,7 +51,7 @@ def test_a_transfer_arriving_at_a_full_deployment_waits_rather_than_failing():
         await asyncio.wait_for(waiter, timeout=2)
         assert admitted == [True], "the waiting transfer was never admitted"
         assert gate.stats()["waiting"] == 0
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_a_caller_that_waits_too_long_is_told_to_come_back():
@@ -95,7 +65,7 @@ def test_a_caller_that_waits_too_long_is_told_to_come_back():
 
         assert refused.value.retry_after >= 1, "a refusal without an interval is not actionable"
         assert refused.value.limit == 1
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_the_waiting_room_is_bounded_and_refuses_before_joining():
@@ -121,7 +91,7 @@ def test_the_waiting_room_is_bounded_and_refuses_before_joining():
         gate.release(first)
         second = await asyncio.wait_for(waiters[1], timeout=2)
         gate.release(second)
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_releasing_a_slot_nobody_took_does_not_raise_the_ceiling():
@@ -142,7 +112,7 @@ def test_releasing_a_slot_nobody_took_does_not_raise_the_ceiling():
         with pytest.raises(TransferBusy):
             await gate.acquire()
         assert gate.stats()["in_flight"] == 2
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_a_released_slot_is_reusable():
@@ -152,7 +122,7 @@ def test_a_released_slot_is_reusable():
             gate.release(await gate.acquire())
         assert gate.stats()["in_flight"] == 0
         await gate.acquire()          # still works after all that
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_the_limit_is_never_exceeded_under_a_burst():
@@ -178,7 +148,7 @@ def test_the_limit_is_never_exceeded_under_a_burst():
         assert peak <= 4, f"{peak} transfers ran at once against a limit of 4"
         assert gate.stats()["in_flight"] == 0
         assert gate.stats()["waiting"] == 0
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_a_limit_below_one_is_treated_as_one():
@@ -187,7 +157,7 @@ def test_a_limit_below_one_is_treated_as_one():
         gate = TransferAdmission(limit=0, max_waiting=0, wait_seconds=0.1)
         assert gate.limit == 1
         gate.release(await gate.acquire())
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_the_configuration_is_reported():
@@ -234,7 +204,7 @@ def test_the_counters_report_what_the_gate_actually_did():
         assert gate.stats()["admitted"] == 3, "a reused slot is still an admission"
         assert gate.stats()["peak_in_flight"] == 2, "one in flight is not a new peak"
         gate.release(third)
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_a_release_nobody_made_cannot_raise_the_ceiling_or_the_counters():
@@ -265,7 +235,7 @@ def test_a_release_nobody_made_cannot_raise_the_ceiling_or_the_counters():
         with pytest.raises(TransferBusy):
             await gate.acquire()
         gate.release(again)
-    _run(_go())
+    run_coroutine(_go())
 
 
 @pytest.mark.parametrize("configured,expected", [
@@ -295,7 +265,7 @@ def test_an_unusable_wait_still_produces_an_answer_a_client_can_act_on(configure
             assert refusal.value.retry_after >= 1
         finally:
             gate.release(held)
-    _run(_go())
+    run_coroutine(_go())
 
 
 def test_the_wait_ceiling_is_an_hour():

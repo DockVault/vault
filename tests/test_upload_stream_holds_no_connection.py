@@ -30,7 +30,7 @@ import app.api.api_server as S  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 # Not asyncio.run(): after the browser tests a loop is left running in the main thread for the
 # rest of the session, and this module sorts after them. See tests/_async_run.py.
-from _async_run import run_coroutine  # noqa: E402
+from _async_run import call_with_a_running_loop_in_a_worker, run_coroutine  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -369,43 +369,29 @@ def test_the_coroutines_run_even_when_a_loop_is_already_running_in_the_calling_t
     # test set and then cleared the MAIN thread's slot, after which the dispatcher's next callback
     # raised "is not the running loop", the driver's reply never landed, and the session's
     # browser.close() at teardown blocked until the job cap -- twice. Nothing here may touch the
-    # main thread's slot, and the last assertion holds that.
-    import threading
+    # main thread's slot: the worker with the running loop is the helper's own (the one place a
+    # test may set that slot, on a thread it owns), and the last assertion holds that.
     main_slot_before = asyncio.events._get_running_loop()
-    box = {}
+
+    async def two():
+        await asyncio.sleep(0)
+        return 2
+
+    async def boom():
+        raise HTTPException(status_code=418, detail="teapot")
 
     def in_worker():
-        loop = asyncio.new_event_loop()
-        asyncio.events._set_running_loop(loop)          # this thread's slot only
-        try:
-            async def two():
-                await asyncio.sleep(0)
-                return 2
-            refused = two()
-            try:
-                asyncio.run(refused)
-                box["refused"] = False
-            except RuntimeError as e:
-                box["refused"] = "running event loop" in str(e)
-            refused.close()                             # never started; do not let it warn
-            box["ran"] = run_coroutine(two())
-            # ... and an exception inside the coroutine comes back as itself, not as a thread's silence.
-            async def boom():
-                raise HTTPException(status_code=418, detail="teapot")
-            try:
-                run_coroutine(boom())
-                box["raised"] = None
-            except HTTPException as e:
-                box["raised"] = e.status_code
-        finally:
-            asyncio.events._set_running_loop(None)
-            loop.close()
+        refused = two()
+        with pytest.raises(RuntimeError, match="running event loop"):
+            asyncio.run(refused)
+        refused.close()                                 # never started; do not let it warn
+        ran = run_coroutine(two())
+        # ... and an exception inside the coroutine comes back as itself, not as a thread's silence.
+        with pytest.raises(HTTPException) as raised:
+            run_coroutine(boom())
+        return ran, raised.value.status_code
 
-    t = threading.Thread(target=in_worker)
-    t.start()
-    t.join(30)
-    assert not t.is_alive(), "the worker hung"
-    assert box == {"refused": True, "ran": 2, "raised": 418}, box
+    assert call_with_a_running_loop_in_a_worker(in_worker, timeout=30) == (2, 418)
     assert asyncio.events._get_running_loop() is main_slot_before, "the main thread's running-loop slot was touched"
 
 

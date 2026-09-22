@@ -12,13 +12,13 @@ including a straddle assembled through the real final-file codec.
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import os
 import secrets
 import struct
-import threading
+
+from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
 import uuid
 
 import pytest
@@ -59,46 +59,11 @@ async def _stream(*pieces):
         yield p
 
 
-def _run(coro):
-    """Run an async body on a loop of its own, in a thread of its own.
-
-    `asyncio.run` refuses when a loop is already running in the calling thread, and in a single
-    invocation of the whole suite one IS running by the time this file is reached: Playwright's
-    sync API drives its loop on a greenlet in the main thread and never returns from it, and its
-    fixtures are session-scoped, so any browser-driven module that sorts before this one leaves the
-    thread's running-loop set for the rest of the process. These tests then fail for a reason that
-    has nothing to do with what they check. A unit test should not depend on ambient loop state at
-    all, so it brings its own thread — and still shuts the loop's async generators down, because
-    abandoning one mid-iteration is exactly what the refusal paths under test do.
-    """
-    outcome = {}
-
-    def _worker():
-        loop = asyncio.new_event_loop()
-        try:
-            outcome["value"] = loop.run_until_complete(coro)
-        except BaseException as exc:                # noqa: BLE001 - re-raised on the caller
-            outcome["error"] = exc
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                loop.close()
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join(timeout=60)
-    assert not thread.is_alive(), "the async body did not finish"
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("value")
-
-
 def _seal(dest, body_pieces, session_id, chunk_index, limit=None):
     from app.core.upload_chunk_crypto import seal_stream_to_file
     body = b"".join(body_pieces)
     lim = len(body) if limit is None else limit
-    return _run(
+    return run_coroutine(
         seal_stream_to_file(_stream(*body_pieces), dest, lim, session_id, chunk_index))
 
 
