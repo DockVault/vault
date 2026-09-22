@@ -222,7 +222,11 @@ const um = {
         // The shipped restart's first act is a DELETE of the old session, through the gate.
         return this._send(it, '/vaults/' + it.vaultId + '/uploads/' + it.sessionId,
             { method: 'DELETE' }).then(() => log.push('DELETE sent'), () => log.push('DELETE refused')); },
-    _start(it) { log.push('start'); this.started = it.id; },
+    _start(it) { log.push('start'); this.started = it.id;
+        // The shipped _start schedules the run, which re-stamps the row with a controller of
+        // its OWN before the re-pick's finally runs. Modelled here because that ordering is
+        // what decides whether the finally releases the right one.
+        it._epoch = this._epoch || 0; it._abort = new AbortController(); this._aborts.add(it._abort); },
 %s
 };
 const attempt = async (fileBytes, serverHeld, record) => {
@@ -393,3 +397,30 @@ def test_a_re_pick_registers_a_controller_a_sign_out_can_abort():
     out.duringGet = duringGet;
     """)
     assert out["duringGet"] == 1, "no controller was registered while the re-pick's request was in flight"
+
+
+def test_after_a_re_pick_the_upload_is_still_reachable_by_a_sign_out():
+    # THE REGRESSION THIS CATCHES. The re-pick ends by starting the run, un-awaited, and the run
+    # re-stamps `it._abort` with a controller of its own before the re-pick's finally runs. A
+    # finally that released `it._abort` would therefore release the RUN's controller and leave its
+    # own in the set for ever: the upload would be unreachable by reset() for the rest of its life
+    # -- its epoch would still refuse requests not yet made, but nothing could tear down what was
+    # already on the wire, which is the half the controller exists for.
+    #
+    # Asserted on the OBSERVABLE -- can a sign-out still reach this upload -- rather than on which
+    # object a line names: the controller the row carries must be one reset() would abort.
+    out = _reopen("""
+    const it = { id: 'r', vaultId: 'V', sessionId: 'old-sess', clientFileId: 'obj', zkKeyVersion: 1,
+        zkPipelined: true, zkResume: recordOfA(), received: new Set(), needsServerSync: true };
+    held = [0];
+    await um._continueWith(it, { size: 100, bytes: 'A' });
+    out.afterRePick = {
+        started: um.started,                        // the run was started, so it re-stamped
+        rowsController: um._aborts.has(it._abort),  // what the row carries is what reset() aborts
+        stale: um._aborts.size,                     // and nothing dead was left behind
+    };
+    """)
+    a = out["afterRePick"]
+    assert a["started"] == "r", a
+    assert a["rowsController"] is True, "reset() can no longer abort this upload's requests"
+    assert a["stale"] == 1, ("a controller was left in the abort set for ever", a)

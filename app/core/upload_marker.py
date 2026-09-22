@@ -69,12 +69,18 @@ def is_member_grade_viewer(viewer, vault_id=None) -> bool:
     The type check is strict ON PURPOSE. A legitimate member arriving as something other than a
     User instance -- a proxy, a dict, a detached row from some future path -- reads as "another
     member": the answer degrades to the neutral name, never to disclosure. Do not "fix" that by
-    loosening the check; give the new path a real User."""
+    loosening the check; give the new path a real User.
+
+    ANY temporary session is refused, not just a SCOPED one. `is_scoped` answers a narrower
+    question -- a temp session carrying a non-legacy scope -- so a LEGACY credential, minted before
+    scopes existed and carrying none, is not "scoped" and used to read as member-grade here. That
+    is the widest credential of the lot reading as the most trusted principal, and it contradicted
+    what this gate's own docstring promised. The flag the mint sets is what is asked now, so a
+    credential whose scope is absent, empty or unrecognised is refused like every other."""
     from app.core.models import User
-    from app.core.temp_scope import is_scoped
     if not isinstance(viewer, User):
         return False
-    if is_scoped(viewer):
+    if getattr(viewer, "_is_temp_session", False):
         return False
     if vault_id is not None and str(vault_id) in (getattr(viewer, "_share_vault_scope", None) or {}):
         return False

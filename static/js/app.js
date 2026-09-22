@@ -17057,15 +17057,24 @@ const uploadManager = {
         // rebuilt from the server while the file chooser is open, so any re-pick that outlives one
         // rebuild lands on a REBUILT row that has never run. Stamped here, before the first await,
         // the epoch refuses every later request of a signed-out account and the controller tears
-        // down whatever is already on the wire. _run re-stamps with the same epoch and a fresh
-        // controller; this one is released when the re-pick ends.
+        // down whatever is already on the wire.
+        //
+        // The controller is held in a LOCAL, and that is what the finally releases. The re-pick
+        // ends by starting the run, un-awaited, and the run re-stamps `it._abort` with a controller
+        // of its own before this finally runs -- so releasing `it._abort` would release the RUN's
+        // controller and leave this one in the set for ever. The upload would then be unreachable
+        // by reset() for the rest of its life: its epoch would still refuse requests not yet made,
+        // but nothing could tear down what was already on the wire, which is the half the
+        // controller exists for. `it._abort` is left pointing at whatever stamped it last, so the
+        // run's reference is never dropped.
+        const ctl = new AbortController();
         it._epoch = this._epoch || 0;
-        it._abort = new AbortController();
-        this._aborts.add(it._abort);
+        it._abort = ctl;
+        this._aborts.add(ctl);
         try {
             return await this._continueWithInner(it, file);
         } finally {
-            this._aborts.delete(it._abort);
+            this._aborts.delete(ctl);
         }
     },
 

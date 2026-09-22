@@ -87,8 +87,15 @@ def test_the_re_pick_path_defers_to_the_runs_check_instead_of_trusting_the_list(
     # anything leaves, and the body. Both are read -- the wrapper for the stamping and for the fact
     # that it makes no request of its own, the body for the flag and the order.
     wrap = strip_comments(_method(js, "async _continueWith(it, file) {"))
-    assert "it._epoch = this._epoch || 0;" in wrap and "this._aborts.add(it._abort);" in wrap
+    assert "it._epoch = this._epoch || 0;" in wrap
     assert wrap.index("it._epoch") < wrap.index("_continueWithInner"), "stamped after the first await"
+    # The controller is added and released BY THE SAME NAME. Reading the row's field in the finally
+    # is what released the run's controller instead of this one (the run re-stamps that field before
+    # the finally runs); the behavioural pin for that lives in test_upload_guards_driven, and this
+    # is its smoke alarm: whatever is added is what is deleted, and it is not the row's field.
+    added = wrap[wrap.index("this._aborts.add("):].split(")")[0].split("(")[-1]
+    assert added and added != "it._abort", "the re-pick registers the row's field again"
+    assert "this._aborts.delete(%s);" % added in wrap, "a different object is released than was added"
     assert "fetch(" not in wrap and "_send(" not in wrap
     cont = strip_comments(_method(js, "async _continueWithInner(it, file) {"))
     assert "it.needsServerSync = true;" in cont and "fetch(" not in cont and "_send(" not in cont

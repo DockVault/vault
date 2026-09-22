@@ -226,10 +226,14 @@ def test_no_emission_computes_its_own_wait_anywhere_in_the_application():
                 values += kw
                 constructions += len(kw)
             for v in values:
-                # The helper's OWN call may of course contain the arithmetic it exists to own.
+                # NO FAST PATH. There used to be a line here that skipped any expression whose TEXT
+                # contained "retry_after_seconds(" -- which let `str(retry_after_seconds(...) - 1)`
+                # and `str(max(0, retry_after_seconds(...)))` past the predicate entirely, and so
+                # un-inverted the inversion on the line below it. A text shortcut in front of a
+                # structural rule is the allowlist again, in its most deceptive position: fourteen
+                # of the twenty-six emissions never reached the rule that was supposed to cover
+                # them. `passes_a_value` already accepts a bare helper call, inside str() or not.
                 src = ast.unparse(v)
-                if "retry_after_seconds(" in src:
-                    continue
                 if not passes_a_value(v):
                     offences.append("%s:%d: %s" % (py.relative_to(root.parent), v.lineno, src[:80]))
     assert offences == [], (

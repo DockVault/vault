@@ -128,6 +128,12 @@ def test_the_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
     assert resolve(named, "id", scoped) == "another member"        # scoped -> neutral, no name
     noname = _DB(SimpleNamespace(username=None, email="bob@example.com"))
     assert resolve(noname, "id", member) == "another member"       # no username -> neutral, NEVER email
+    # The SFTP door, driven with the same LEGACY credential the web door is driven with: a temp
+    # session carrying no scope at all. Both doors ask one rule, so both must refuse it -- and a
+    # source count of the two call sites could not tell, because `if True:` at either site keeps
+    # the count. (mutation: ask is_scoped in the shared rule -> this line names alice -> red.)
+    legacy = User(username="legacy"); legacy._is_temp_session = True; legacy._temp_scope = None
+    assert resolve(named, "id", legacy) == "another member"
 
 
 def test_a_live_upload_refreshes_its_marker_once_per_tenth_of_the_ttl(monkeypatch):

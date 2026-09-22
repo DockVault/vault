@@ -406,6 +406,15 @@ def test_a_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
     alice = SimpleNamespace(username="alice", email="alice@example.com")
     assert um.holder_display_name(_NameDB(alice), "id", member) == "alice"
     assert um.holder_display_name(_NameDB(alice), "id", scoped) == "another member"
+    # EVERY temporary credential, not only a scoped one. A LEGACY credential -- minted before
+    # scopes existed, so its scope is absent -- is the widest of the lot, and it used to read as
+    # member-grade here because the gate asked `is_scoped`, which is False for it. The gate's own
+    # docstring said "any temporary web credential" while the code said something narrower.
+    # (mutation: ask is_scoped again -> this line names alice -> red.)
+    legacy = User(username="legacy"); legacy._is_temp_session = True; legacy._temp_scope = None
+    assert um.holder_display_name(_NameDB(alice), "id", legacy) == "another member"
+    empty = User(username="empty"); empty._is_temp_session = True; empty._temp_scope = {}
+    assert um.holder_display_name(_NameDB(alice), "id", empty) == "another member"
     assert um.holder_display_name(_NameDB(SimpleNamespace(username=None, email="b@x")), "id", member) == "another member"
     assert um.holder_display_name(_NameDB(None), "id", member) == "another member"
     assert um.holder_display_name(_NameDB(raise_=True), "id", member) == "another member"   # never a 500
