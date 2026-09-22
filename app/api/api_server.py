@@ -41,7 +41,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, redis_probe_ping
 from app.core import vault_attempt_throttle
 from app.core import redis_guard
-from app.core.rate_limiter import redis_circuit_open
+from app.core.rate_limiter import redis_circuit_open, retry_after_seconds
 from app.core.auth_offload import (
     auth_offload_slot, run_offloaded, FIRE_OFFLOOP_LIMIT, _offload_executor)
 from app.core.chunk_cleanup import fail_chunk_session
@@ -3625,7 +3625,7 @@ async def send_test_email(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many test emails; please wait a moment.",
-            headers={"Retry-After": str(max(1, reset - int(_t.time())))},
+            headers={"Retry-After": str(retry_after_seconds(reset, 60))},
         )
 
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
@@ -4281,7 +4281,7 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed:
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, settings.rate_limit_api_auth_window))})
     if not invitations.pepper_ok(_invite_pepper()):
         raise HTTPException(status_code=503,
                             detail="Invitations are unavailable: the invite-token secret is not configured.")
@@ -4329,7 +4329,7 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
             raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
         if not allowed:
             raise HTTPException(status_code=429, detail="Too many requests.",
-                                headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                                headers={"Retry-After": str(retry_after_seconds(reset, 60))})
 
     # A global config error (pepper unset) is a 503 on BOTH public endpoints, consistent with GET —
     # not a per-token oracle (same answer for every token).
@@ -4653,7 +4653,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many requests; please wait a few minutes.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, settings.rate_limit_api_auth_window))})
     enabled, _ttl = _password_reset_policy(db)
     if enabled and _smtp_configured(db):
         user = _resolve_reset_user(db, body.identifier)
@@ -4776,7 +4776,7 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
                 import time as _t
                 raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                                     detail="Too many attempts; please wait.",
-                                    headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                                    headers={"Retry-After": str(retry_after_seconds(reset, win))})
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     r = _resolve_valid_reset_token(db, token)
@@ -4846,7 +4846,7 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
             raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
         if not allowed:
             raise HTTPException(status_code=429, detail="Too many requests.",
-                                headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                                headers={"Retry-After": str(retry_after_seconds(reset, 60))})
 
     pol = _account_policy(db)
 
@@ -5647,7 +5647,7 @@ async def second_factor_login_verify(
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
     if (pending.attempts or 0) >= _SF_LOGIN_MAX_ATTEMPTS:
         pending.consumed_at = datetime.now(timezone.utc)
         db.commit()
@@ -5786,7 +5786,7 @@ async def second_factor_step_up(
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
     req, _has = _sf_requirement_for(db, current_user, body.action)
     if req["must_enroll"]:
         raise HTTPException(status_code=403, detail={
@@ -7809,7 +7809,7 @@ async def request_email_change(
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many email-change requests; please wait a few minutes.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
     new_email = normalize_email(body.new_email)
     # Mint + send only for a genuinely new, unused address; otherwise return the same 202 with no
     # usable code, so this endpoint can't be used to probe which addresses are registered.
@@ -7869,7 +7869,7 @@ async def confirm_email_change(
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
     result = otp_service.verify(db, purpose="email_change", user_id=user.id, code=body.code,
                                 pepper=settings.jwt_secret_key)
     if not result.ok or not result.destination:
@@ -8446,7 +8446,7 @@ async def search_users(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many searches; please slow down.",
-            headers={"Retry-After": str(max(1, reset - int(_t.time())))},
+            headers={"Retry-After": str(retry_after_seconds(reset, 60))},
         )
 
     if not _manages_any_vault(db, current_user):
@@ -10289,9 +10289,10 @@ async def redeem_note_link(
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed or not allowed_ip:
-        _reset = reset if not allowed else reset_ip
+        _retry = (retry_after_seconds(reset, _NOTELINK_REDEEM_WINDOW) if not allowed
+                  else retry_after_seconds(reset_ip, _NOTELINK_REDEEM_IP_WINDOW))
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
+                            headers={"Retry-After": str(_retry)})
 
     def _audit(status, reason=None, link_id=None):
         try:
@@ -11094,9 +11095,10 @@ async def redeem_public_link(
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed or not allowed_ip:
-        _reset = reset if not allowed else reset_ip
+        _retry = (retry_after_seconds(reset, _PUBLINK_REDEEM_WINDOW) if not allowed
+                  else retry_after_seconds(reset_ip, _PUBLINK_REDEEM_IP_WINDOW))
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
+                            headers={"Retry-After": str(_retry)})
 
     def _audit(status, reason=None, link_id=None):
         try:
@@ -11247,7 +11249,7 @@ async def download_public_link(
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed_ip:
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, reset_ip - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset_ip, _PUBLINK_REDEEM_IP_WINDOW))})
 
     def _deny():
         raise HTTPException(status_code=404, detail="This file is not available.")
@@ -12018,9 +12020,10 @@ async def open_receiver_upload_session(
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed or not allowed_ip:
-        _reset = reset if not allowed else reset_ip
+        _retry = (retry_after_seconds(reset, _PUBLINK_REDEEM_WINDOW) if not allowed
+                  else retry_after_seconds(reset_ip, _PUBLINK_REDEEM_IP_WINDOW))
         raise HTTPException(status_code=429, detail="Too many requests.",
-                            headers={"Retry-After": str(max(1, _reset - int(_t.time())))})
+                            headers={"Retry-After": str(_retry)})
 
     def _audit(status, reason=None, rid=None):
         try:

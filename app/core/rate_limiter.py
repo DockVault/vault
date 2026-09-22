@@ -181,6 +181,22 @@ class RateLimitExceeded(Exception):
         super().__init__(self.message)
 
 
+def retry_after_seconds(reset_time, window, now=None) -> int:
+    """The Retry-After for a caller that IS over the limit: seconds until the window resets, never
+    less than 1 and never more than the window.
+
+    The floor: the reset can already be in the past by the time it is read -- the window expired
+    between the store's answer and this line, or the clocks differ -- and a client told "0", or a
+    NEGATIVE number, is being told something malformed (RFC 9110 delta-seconds is non-negative) and
+    may do anything with it. One second is the smallest honest answer. The cap: a reset further
+    away than one whole window is a clock artefact, not a wait the client owes. Every emission of
+    Retry-After in this codebase goes through here; the four in this module used to disagree three
+    different ways (floor 0 capped, floor 1 uncapped, no clamp at all, and a tuple arm).
+    """
+    now = time.time() if now is None else now
+    return max(1, min(int(window), int(reset_time) - int(now)))
+
+
 class RateLimiterUnavailable(Exception):
     """Raised when the Redis backing store is unavailable AND the caller asked to
     fail closed (``fail_open=False``).
@@ -554,7 +570,8 @@ return {over, tostring(reset_at)}
             # here truncates now with int(), so when the oldest entry's fractional second exceeds
             # now's the two roundings disagree and the raw value is window + 1. A retry-after must
             # never exceed the window it belongs to.
-            return over, (max(0, min(window, reset_at - int(now))) if over else 0)
+            # An over-limit peek is always >= 1, so a 0 here means exactly "not limited".
+            return over, (retry_after_seconds(reset_at, window, now) if over else 0)
         except Exception as e:
             # Do NOT trip the breaker here: this observer must not drive the state machine. Signal
             # unavailability so the caller uses the durable DB peek instead of trusting a blank read.
@@ -626,7 +643,7 @@ return {over, tostring(reset_at)}
         if not allowed:
             # Clamp to the window (see peek_rate_limit): the Lua ceils reset while this truncates
             # now, so the raw gap can be window + 1; a retry-after must never exceed its window.
-            retry_after = max(0, min(window, reset_time - int(time.time())))
+            retry_after = retry_after_seconds(reset_time, window)
             raise RateLimitExceeded(
                 message=message,
                 retry_after=retry_after,
@@ -773,7 +790,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
         if not allowed:
-            retry_after = max(1, reset_time - int(time.time()))
+            retry_after = retry_after_seconds(reset_time, rule.window)
             headers["Retry-After"] = str(retry_after)
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -843,7 +860,7 @@ def rate_limit(
             )
             
             if not allowed:
-                retry_after = reset_time - int(time.time())
+                retry_after = retry_after_seconds(reset_time, window)
                 headers = rate_limiter.get_rate_limit_headers(limit, 0, reset_time)
                 headers["Retry-After"] = str(retry_after)
                 

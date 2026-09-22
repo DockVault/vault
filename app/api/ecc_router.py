@@ -19,7 +19,7 @@ from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, VaultMembe
 from app.services import ecc_pop, ecc_update_pop
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
-from app.core.rate_limiter import rate_limiter as _rate_limiter
+from app.core.rate_limiter import rate_limiter as _rate_limiter, retry_after_seconds
 from app.core.endpoint_permissions import require_endpoint_permission
 from app.core.temp_scope import (
     require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
@@ -301,7 +301,7 @@ def _ecc_rate_limit(user: User, bucket: str) -> None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many key-management requests; please slow down.",
-            headers={"Retry-After": str(max(1, reset - int(_time.time())))},
+            headers={"Retry-After": str(retry_after_seconds(reset, window))},
         )
 
 

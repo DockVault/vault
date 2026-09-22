@@ -1681,7 +1681,7 @@ class AuthService:
         Raises RateLimitExceededError if the limit is exceeded; returns rate
         limit info (for response headers) otherwise.
         """
-        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
 
         # The admin 'Max Login Attempts' / 'Login window' settings override the env defaults when
         # configured (bounded + fail-safe-to-deployment via the rate-limit registry).
@@ -1707,7 +1707,7 @@ class AuthService:
         revert to IP-keying. `ip_address` is accepted for signature symmetry and audit parity; the
         bucket is deliberately NOT keyed on it (that is the point — devices behind one egress IP must
         not share a bucket)."""
-        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
         limit = rate_limit_settings.effective("rate_limit_device_sync_attempts")
         window = rate_limit_settings.effective("rate_limit_device_sync_window_seconds")
 
@@ -1717,7 +1717,7 @@ class AuthService:
                 prefix="rate_limit", fail_open=False,
             )
             if not allowed:
-                retry_after = reset - int(time.time())
+                retry_after = retry_after_seconds(reset, window)
                 # Same wording as the per-username login throttle: the web-login 429 handler echoes
                 # this message, and a device-specific one there would tell a prober the username is a
                 # sync credential. SFTP surfaces AUTH_FAILED uniformly, so it reveals nothing either way.
@@ -1757,7 +1757,7 @@ class AuthService:
         early and without spending a slot. That bucket is charged at the SFTP door, never at the
         mint, so a mint-time caller has no other way to learn its sync-auth standing.
         Returns (rate_limited, retry_after_seconds)."""
-        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
         limit = rate_limit_settings.effective("rate_limit_device_sync_attempts")
         window = rate_limit_settings.effective("rate_limit_device_sync_window_seconds")
         try:
@@ -1830,7 +1830,7 @@ class AuthService:
         NULL), is still bounded, just in a bucket of its own, so a client looping on it cannot spend
         the human's per-IP login budget and lock the owner out. Same fail-closed posture as the login
         throttle: on a Redis outage it drops to the durable DB fallback, keyed by username."""
-        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+        from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
         user_limit = rate_limit_settings.effective("max_login_attempts")
         window = rate_limit_settings.effective("rate_limit_login_window_seconds")
         try:
@@ -1839,7 +1839,7 @@ class AuthService:
                 prefix="rate_limit", fail_open=False,
             )
             if not allowed:
-                retry_after = reset - int(time.time())
+                retry_after = retry_after_seconds(reset, window)
                 raise RateLimitExceededError(
                     f"Too many login attempts. Please try again in {retry_after} seconds.",
                     retry_after=retry_after, limit=user_limit, remaining=0,
@@ -1858,13 +1858,14 @@ class AuthService:
     def _redis_rate_limit(self, rate_limiter, identifier, ip_address,
                           user_limit, ip_limit, window):
         """Primary, Redis-backed sliding-window throttle (fail closed)."""
+        from app.core.rate_limiter import retry_after_seconds
         # Per-username limit.
         allowed_user, remaining_user, reset_user = rate_limiter.check_rate_limit(
             f"login:{identifier}", user_limit, window,
             prefix="rate_limit", fail_open=False,
         )
         if not allowed_user:
-            retry_after = reset_user - int(time.time())
+            retry_after = retry_after_seconds(reset_user, window)
             raise RateLimitExceededError(
                 f"Too many login attempts. Please try again in {retry_after} seconds.",
                 retry_after=retry_after, limit=user_limit, remaining=0,
@@ -1876,7 +1877,7 @@ class AuthService:
             prefix="rate_limit", fail_open=False,
         )
         if not allowed_ip:
-            retry_after = reset_ip - int(time.time())
+            retry_after = retry_after_seconds(reset_ip, window)
             raise RateLimitExceededError(
                 f"Too many login attempts from this IP. Try again in {retry_after} seconds.",
                 retry_after=retry_after, limit=ip_limit, remaining=0,

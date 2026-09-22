@@ -27,7 +27,7 @@ from app.core.database import get_db
 from app.core.models import EmailAction, EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
 from app.core.security import decrypt_secret, encrypt_secret
-from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable
+from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable, retry_after_seconds
 from app.services.audit_logger import AuditLogger
 
 security_scheme = HTTPBearer()
@@ -212,7 +212,7 @@ def _rate_limit(admin_id, *, limit: int, window: int, prefix: str, detail: str) 
     if not allowed:
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail,
-                            headers={"Retry-After": str(max(1, reset - int(_t.time())))})
+                            headers={"Retry-After": str(retry_after_seconds(reset, window))})
 
 
 @router.get("/profiles")
