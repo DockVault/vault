@@ -22,7 +22,6 @@ import time
 from pathlib import Path
 
 import pytest
-import yaml
 
 from app.sftp import heartbeat
 from app.sftp import sftp_server as mod
@@ -116,8 +115,37 @@ def test_the_check_needs_nothing_but_the_standard_library():
 
 
 def _healthcheck(compose_file):
-    doc = yaml.safe_load((ROOT / compose_file).read_text(encoding="utf-8"))
-    return doc["services"]["vault-sftp"]["healthcheck"]
+    """The vault-sftp service's healthcheck block, read as text: this suite's dependency lock is
+    the ONLY thing some CI lanes install, and no YAML reader is in it. The block is four scalar
+    lines and one JSON-shaped list, which is all that is read.
+
+    A reader that finds nothing must say so, never return an empty block for the caller to
+    pass over: every miss below names the file and the service."""
+    where = "%s, service vault-sftp" % compose_file
+    text = (ROOT / compose_file).read_text(encoding="utf-8")
+    if text.count("\n  vault-sftp:\n") != 1:
+        raise AssertionError("the service block was not found exactly once in " + where)
+    service = text[text.index("\n  vault-sftp:\n"):]
+    body = []
+    for ln in service.splitlines()[2:]:                  # past the blank and the service line
+        if ln.strip() and not ln.startswith("    "):        # the next top-level key: the service ends
+            break
+        body.append(ln)
+    heads = [i for i, ln in enumerate(body) if ln == "    healthcheck:"]
+    if len(heads) != 1:
+        raise AssertionError("no single healthcheck block in " + where)
+    block = {}
+    for ln in body[heads[0] + 1:]:
+        if not ln.startswith("      "):                     # back out to the service's own keys
+            break
+        key, sep, value = ln.strip().partition(":")
+        value = value.strip()
+        if not sep or not value:
+            raise AssertionError("a healthcheck line this reader cannot read in %s: %r" % (where, ln))
+        block[key] = json.loads(value) if value.startswith("[") else (int(value) if value.isdigit() else value)
+    if not isinstance(block.get("test"), list) or not block["test"]:
+        raise AssertionError("no healthcheck argv read from " + where)
+    return block
 
 
 def _run_the_check(compose_file, heartbeat_file):

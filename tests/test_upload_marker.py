@@ -355,9 +355,11 @@ def test_a_stalled_upload_keeps_its_name_until_the_watchdog_has_failed_it():
     # lost its name but is not yet failed, and a second upload of that name is admitted -- to
     # lose at the unique index, instead of being refused at open with the holder named.
     #
-    # At the defaults this is 250 s against 245 s. FIVE SECONDS IS ALL THE MARGIN THERE IS: a
-    # longer window has to come with a longer TTL (or a larger divisor), and this is the test
-    # that says so.
+    # At the defaults this is 270 s against 245 s -- 241.8 s MEASURED on a live stack (one record,
+    # then silence, product defaults). The 25 s between is for a loaded server whose sweep arrives
+    # late: this test cannot see that, only a changed setting. It was 250 s (divisor 6) once,
+    # and 8 s of real margin was judged too little. A longer window has to come with a longer
+    # TTL (or a larger divisor), and this is the test that says so.
     from app.core.config import Settings
     from app.sftp import sftp_server as srv
     ttl = Settings.model_fields["upload_marker_ttl_seconds"].default

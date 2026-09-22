@@ -248,8 +248,10 @@ class _PathNotFound(Exception):
 # had already cleared, then a whole empty one, then one sweep interval. Otherwise there are
 # seconds in which an upload that is stalled but not yet failed has lost its name, and a second
 # upload of that name is let in to lose at commit instead of being refused at open. At the
-# defaults: 300 - 300/6 = 250 s, against 2 x 120 + 5 = 245 s. (A test holds the relation.)
-_MARKER_REFRESH_DIVISOR = 6
+# defaults: 300 - 300/10 = 270 s, against 2 x 120 + 5 = 245 s (241.8 s measured on a live
+# stack). The margin is there for a loaded server whose sweep arrives late; it costs one Redis
+# refresh every 30 s per active upload. (A test holds the relation.)
+_MARKER_REFRESH_DIVISOR = 10
 
 
 def _gone_when_it_returns(close):
@@ -365,7 +367,7 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
     def write(self, offset: int, data: bytes):
         # Heartbeat the in-flight marker so a slow-but-live transfer's marker (and its
         # same-name lock) does not lapse to the TTL mid-upload. Throttled to at most once per
-        # TTL/6 (_MARKER_REFRESH_DIVISOR), so a hot write loop is not one Redis op per write; best-effort, never affects
+        # TTL/10 (_MARKER_REFRESH_DIVISOR), so a hot write loop is not one Redis op per write; best-effort, never affects
         # the write result.
         self._refresh_marker()
         if self.stream is not None:

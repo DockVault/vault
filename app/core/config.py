@@ -140,10 +140,10 @@ class Settings(BaseSettings):
     # write-progress watchdog removes a stalled upload's marker itself, so this only reaps a marker
     # nothing was left alive to remove (the server process killed mid-upload). It was 900 when the
     # TTL was the ONLY thing that ever reclaimed a stalled upload's name. Every write refreshes it
-    # (at most once per TTL/6), so a live transfer never loses it. It must outlast the watchdog:
-    # five sixths of it has to cover TWO of sftp_write_progress_timeout_seconds plus 5 s, or a
+    # (at most once per TTL/10), so a live transfer never loses it. It must outlast the watchdog:
+    # nine tenths of it has to cover TWO of sftp_write_progress_timeout_seconds plus 5 s, or a
     # stalled upload loses its name before the watchdog has failed it. At the defaults that is
-    # 250 s against 245 s -- so RAISE THIS WHEN YOU RAISE THE WINDOW (a test holds the defaults). Readable so a kill
+    # 270 s against 245 s -- so RAISE THIS WHEN YOU RAISE THE WINDOW (a test holds the defaults). Readable so a kill
     # test can refuse to judge when the TTL is shorter than its observation window.
     upload_marker_ttl_seconds: int = Field(default=300)
 
