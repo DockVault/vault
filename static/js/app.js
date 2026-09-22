@@ -19545,6 +19545,14 @@ function _setLinkReCopyNote(resultElId, rc) {
 // Reveal a saved re-copy: fetch the blob, unlock the private key, unwrap client-side, copy the URL.
 // Any unwrap failure (a rotated key, a blob for another link) renders the honest message -- never a
 // dead button or a 500.
+//
+// The blob (token_enc) is wrapped to the user's OWN P-384 keypair, and that keypair has no rotation
+// path today: registration is first-write-wins, a passphrase change and a recovery keep the key, and
+// vault/team rekeys never touch token_enc. So the "after your key change" branch below cannot be
+// reached on this product yet. A FUTURE keypair-rotation flow must re-wrap every link's token_enc
+// the way it re-wraps vault keys (unwrap with the retired key, wrap to the new one, PUT each; the
+// AAD, link id || owner id, unchanged) -- otherwise every saved re-copy dies with the old key and
+// this branch becomes the only thing a user sees.
 async function _showLinkAgain(kind, id, urlPrefix) {
     const base = kind === 'note' ? '/note-links/' : '/public-links/';
     let resp;
