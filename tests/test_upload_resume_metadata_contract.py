@@ -15,6 +15,8 @@ import pytest
 
 pytestmark = [pytest.mark.unit, pytest.mark.crypto_compatibility]
 
+from _js_source import strip_comments  # noqa: E402
+
 APP_JS = Path(__file__).resolve().parent.parent / "static" / "js" / "app.js"
 
 
@@ -35,7 +37,7 @@ def test_the_writer_itself_never_sends_plaintext_metadata() -> None:
     call = app[app.index(marker):]
     call = call[: call.index("    async _persistResume(it) {")]
     # Code only: the builder's own comments discuss the very names it must not persist.
-    call = "\n".join(ln for ln in call.splitlines() if not ln.lstrip().startswith("//"))
+    call = strip_comments(call)
 
     assert "fileName:" not in call, f"the writer persists a plaintext filename again:\n{call}"
     assert "mimeType:" not in call, f"the writer persists a plaintext MIME again:\n{call}"

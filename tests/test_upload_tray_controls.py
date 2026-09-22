@@ -24,6 +24,8 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
+from _js_source import strip_comments  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 APP_JS = ROOT / "static" / "js" / "app.js"
 
@@ -110,7 +112,7 @@ def test_the_three_gates_share_one_answer():
     # predicate and each gate calls it; none spells `!it.isZk` for itself any more.
     js = APP_JS.read_text(encoding="utf-8")
     for head in ("_controlSig(it) {", "_buildControls(el, it) {", "_renderSub(sub, it) {"):
-        body = "\n".join(ln for ln in _method(js, head).splitlines() if not ln.lstrip().startswith("//"))
+        body = strip_comments(_method(js, head))
         assert body.count("this._canRepick(it)") == 1, f"{head} does not ask the shared predicate"
         assert "!it.isZk" not in body, f"{head} decides re-pick on its own again"
 
@@ -1153,7 +1155,7 @@ def test_a_refused_cancel_leaves_a_row_that_is_waiting_for_its_file_as_it_was():
 
 
 def _code(js: str, head: str) -> str:
-    return "\n".join(ln for ln in _method(js, head).splitlines() if not ln.lstrip().startswith("//"))
+    return strip_comments(_method(js, head))
 
 
 def test_the_source_half_on_code_only():

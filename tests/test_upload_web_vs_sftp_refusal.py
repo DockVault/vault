@@ -16,6 +16,8 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
+from _js_source import strip_comments  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 API = ROOT / "app" / "api" / "api_server.py"
 APPJS = ROOT / "static" / "js" / "app.js"
@@ -64,7 +66,9 @@ def test_the_client_refuses_a_legacy_zk_whole_file_encrypt_above_the_threshold()
 def _strip_line_comments(s: str) -> str:
     # Assert on CODE, not comments: the guard and closure carry comments that themselves discuss the
     # streaming sink and SFTP, so a raw search would pass on the prose even if the code regressed.
-    return "\n".join(ln for ln in s.splitlines() if not ln.lstrip().startswith("//"))
+    # Every kind of comment, not only whole-line ones: a block comment or a trailing one used to
+    # satisfy these pins with the code gone.
+    return strip_comments(s)
 
 
 def _zk_upload_block(js: str) -> str:

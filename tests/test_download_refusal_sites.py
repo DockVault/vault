@@ -22,6 +22,8 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
+from _js_source import strip_comments  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 APP_JS = ROOT / "static" / "js" / "app.js"
 
@@ -35,20 +37,28 @@ def _download_src(js: str) -> str:
 
 
 def _code(src: str) -> str:
-    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("//"))
+    return strip_comments(src)
 
 
 HARNESS = """
 const MAX_BUFFERED_DOWNLOAD_BYTES = 100;
 const API_BASE = '', authToken = 't';
 let _sinkUnavailableReason = null;
-const said = [], fetched = [];
+const said = [], fetched = [], order = [];      // order: 'abort' and 'error' as they happen
+// The download's own controller, watched: its abort is the guarantee that no connection keeps
+// downloading behind a refusal, and fetch below honours it like a browser would.
+let controller = null;
+class AbortController extends globalThis.AbortController {
+    constructor() { super(); controller = this; this.signal.addEventListener('abort', () => order.push('abort')); }
+}
 let cancelled = 0, saved = 0, zk = false, streamAnswer = false, duringFetch = null;
 const state = { currentVault: { id: 'V', has_password: false }, currentFiles: [], downloadSink: 'streaming' };
-const showError = (m) => said.push('error'), showInfo = () => {}, showSuccess = () => {};
+const showError = (m) => { said.push(m); order.push('error'); }, showInfo = () => {}, showSuccess = () => {};
 const formatBytes = (n) => n + ' B';
 const isZkVault = () => zk;
-const fetch = async (url) => { fetched.push(url); if (duringFetch) duringFetch();
+const fetch = async (url, opts) => {
+    if (opts && opts.signal && opts.signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+    fetched.push(url); if (duringFetch) duringFetch();
     return { ok: true, body: { cancel: async () => { cancelled++; } } }; };
 const dvTryStandardStreamedDownload = async () => streamAnswer;
 const zkTryStreamedDownload = async () => streamAnswer;
@@ -61,11 +71,16 @@ const window = { URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} } 
 const document = { createElement: () => ({ click() { saved++; } }), body: { appendChild() {}, removeChild() {} } };
 %s
 const leg = async (setup) => {
-    said.length = 0; fetched.length = 0; cancelled = 0; saved = 0; duringFetch = null; streamAnswer = false;
+    said.length = 0; fetched.length = 0; order.length = 0; controller = null;
+    cancelled = 0; saved = 0; duringFetch = null; streamAnswer = false;
     state.downloadSink = 'streaming'; zk = false;
     setup();
     await _downloadFile('f', 'big.bin');
-    return { refused: said.length, fetches: fetched.length, cancelled, saved };
+    // A refusal is the HONEST message, not any toast: a refusal that threw on entry would land
+    // in the catch below as 'Failed to download file', and that must not count.
+    const honest = said.filter(m => m.indexOf('too large to download') >= 0).length;
+    return { refused: honest, otherToasts: said.length - honest, fetches: fetched.length, cancelled, saved,
+             aborted: !!(controller && controller.signal.aborted), abortFirst: order[0] === 'abort' };
 };
 const both = async (setup) => ({
     over: await leg(() => { state.currentFiles = [{ id: 'f', size: 1000 }]; setup(); }),
@@ -99,19 +114,27 @@ def test_each_of_the_four_refusals_refuses_a_file_over_the_ceiling_and_lets_a_sm
     out = json.loads(done.stdout)
 
     # (mutation: `false &&` in front of the first guard -> the file is fetched and saved -> red.)
-    assert out["preFetch"]["over"] == {"refused": 1, "fetches": 0, "cancelled": 0, "saved": 0}, out["preFetch"]
-    assert out["preFetch"]["under"] == {"refused": 0, "fetches": 1, "cancelled": 0, "saved": 1}, out["preFetch"]
+    OVER_NO_FETCH = {"refused": 1, "otherToasts": 0, "fetches": 0, "cancelled": 0, "saved": 0, "aborted": True, "abortFirst": True}
+    OVER_ONE_FETCH = {"refused": 1, "otherToasts": 0, "fetches": 1, "cancelled": 1, "saved": 0, "aborted": True, "abortFirst": True}
+    UNDER = lambda fetches: {"refused": 0, "otherToasts": 0, "fetches": fetches, "cancelled": 0, "saved": 1, "aborted": False, "abortFirst": False}
+    # Every refusal: the honest message (not any toast -- a refusal that throws on entry lands in the
+    # catch as a generic failure), and the download's controller ABORTED, before the message is shown.
+    # (mutation: drop `_dlAbort.abort()` -> aborted false everywhere -> red. mutation: show the
+    # message first -> abortFirst false -> red. mutation: a throw at the top of _refuseTooLarge ->
+    # otherToasts 1, refused 0 -> red.)
+    assert out["preFetch"]["over"] == OVER_NO_FETCH, out["preFetch"]
+    assert out["preFetch"]["under"] == UNDER(1), out["preFetch"]
 
     # The streaming attempt spent the first body. Over the ceiling it is cancelled and NOTHING more
     # is fetched; under it, the body is fetched again for the buffered read, and the file is saved.
     # (mutation: `false &&` in front of THAT branch's condition -> a second fetch and a save -> red.)
     for branch in ("standard", "zeroKnowledge"):
-        assert out[branch]["over"] == {"refused": 1, "fetches": 1, "cancelled": 1, "saved": 0}, (branch, out[branch])
-        assert out[branch]["under"] == {"refused": 0, "fetches": 2, "cancelled": 0, "saved": 1}, (branch, out[branch])
+        assert out[branch]["over"] == OVER_ONE_FETCH, (branch, out[branch])
+        assert out[branch]["under"] == UNDER(2), (branch, out[branch])
 
     # (mutation: `false &&` in front of the backstop -> the over-size file is read whole and saved -> red.)
-    assert out["backstop"]["over"] == {"refused": 1, "fetches": 1, "cancelled": 1, "saved": 0}, out["backstop"]
-    assert out["backstop"]["under"] == {"refused": 0, "fetches": 1, "cancelled": 0, "saved": 1}, out["backstop"]
+    assert out["backstop"]["over"] == OVER_ONE_FETCH, out["backstop"]
+    assert out["backstop"]["under"] == UNDER(1), out["backstop"]
 
 
 def test_each_refusal_is_one_whole_condition_in_its_own_stretch_of_the_function():

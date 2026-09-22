@@ -22,6 +22,8 @@ import pytest
 
 pytestmark = [pytest.mark.unit, pytest.mark.crypto_compatibility]
 
+from _js_source import strip_comments  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 CRYPTO_JS = ROOT / "static" / "js" / "ecc_crypto.js"
 APP_JS = ROOT / "static" / "js" / "app.js"
@@ -36,7 +38,7 @@ def _fn(js: str, head: str) -> str:
 
 
 def _code(src: str) -> str:
-    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("//"))
+    return strip_comments(src)
 
 
 def _run(script: str) -> dict:
