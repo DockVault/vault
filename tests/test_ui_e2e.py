@@ -924,18 +924,96 @@ def test_zero_knowledge_upload_resumes_across_reload(page: Page, admin):
 # caller that names a session, which this one never does.
 
 
+# A Standard-vault upload of two chunks, interrupted by the wire after its first chunk landed and
+# then continued THE WAY A USER CONTINUES IT: the page is reloaded (so the tray rebuilds the row
+# from the server, with no file in hand), the row's "Resume…" is clicked, and the chooser it opens
+# is handed a file. Nothing about the row is built by hand -- that is the point: a row built with
+# the sync flag beside `isZk: false` proved the run's check, and not that any shipped path reaches
+# it, and for a re-pick none did.
+_HALF = 5 * 1024 * 1024        # one browser chunk (CHUNK_SIZE); two chunks make the file
+
+
+def _interrupt_reload_and_repick(page, vid, name, first_half, second_half, repick_second_half,
+                                 after_reload_js="() => {}"):
+    """Returns {"puts": [...chunk indexes re-sent after the re-pick], "stored": bytes}."""
+    # 1. Drop the file; the wire fails chunk 1's PUT once, so the run stops with chunk 0 landed.
+    page.evaluate("""() => {
+        const real = window.fetch;
+        let failed = false;
+        window.fetch = async (url, opts) => {
+            if (!failed && opts && opts.method === 'PUT' && String(url).endsWith('/chunks/1')) {
+                failed = true; window.fetch = real; throw new TypeError('network interrupted');
+            }
+            return real(url, opts);
+        };
+    }""")
+    page.set_input_files("#file-upload-input", files=[{
+        "name": name, "mimeType": "application/octet-stream", "buffer": first_half + second_half}])
+    expect(page.locator("#upload-tray.show")).to_be_visible(timeout=8000)
+    # The run stops on the failed PUT: the row is an error, offering Resume.
+    expect(page.locator("#upload-tray .up-error")).to_be_visible(timeout=30000)
+    sessions = None
+    # The server holds exactly the first chunk.
+    for _ in range(40):
+        sessions = page.evaluate("""async (vid) => {
+            const r = await fetch(`${API_BASE}/vaults/${vid}/uploads`, { headers: { 'Authorization': 'Bearer ' + authToken } });
+            const d = await r.json();
+            return Array.isArray(d) ? d : (d.sessions || []);
+        }""", vid)
+        if sessions:
+            break
+        page.wait_for_timeout(250)
+    assert sessions and len(sessions) == 1, sessions
+    sid = sessions[0]["session_id"]
+    held = page.evaluate("""async ([vid, sid]) => {
+        const r = await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}`, { headers: { 'Authorization': 'Bearer ' + authToken } });
+        return (await r.json()).received_chunks;
+    }""", [vid, sid])
+    assert held == [0], f"the interruption did not land exactly chunk 0: {held}"
+
+    # 2. Reload: the row comes back from the server with no file, and asks to be picked again.
+    page.evaluate("() => sessionStorage.removeItem('dv_nav')")
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.click('.sidebar-item[data-section="vaults"]')
+    page.wait_for_selector(f'.open-vault-btn[data-vault-id="{vid}"]', timeout=10000)
+    page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+    expect(page.locator("#upload-tray")).to_contain_text("Resumable", timeout=10000)
+    expect(page.locator('#upload-tray button[data-up-action="resume"]')).to_be_visible(timeout=10000)
+    # Count what the re-pick sends, and let a scenario shape the wire (e.g. strip the digests).
+    page.evaluate("""() => {
+        const real = window.fetch;
+        window.__puts = [];
+        window.fetch = async (url, opts) => {
+            const m = String(url).match(/[/]chunks[/]([0-9]+)$/);
+            if (m && opts && opts.method === 'PUT') window.__puts.push(Number(m[1]));
+            return real(url, opts);
+        };
+    }""")
+    page.evaluate(after_reload_js)
+
+    # 3. The user clicks the row's Resume… and picks the file again -- edited or not.
+    with page.expect_file_chooser() as chooser:
+        page.click('#upload-tray button[data-up-action="resume"]')
+    chooser.value.set_files({"name": name, "mimeType": "application/octet-stream",
+                             "buffer": first_half + repick_second_half})
+
+    # 4. It finishes and the file lands.
+    expect(page.locator("#upload-tray")).to_contain_text("Done", timeout=60000)
+    return {"puts": page.evaluate("() => window.__puts"), "sid": sid}
+
+
 @pytest.mark.ui
 def test_a_resumed_upload_re_sends_the_parts_that_changed(logged_in: Page, admin):
-    """The client half of resume integrity, which nothing covered.
+    """The client half of resume integrity, on the path a user takes.
 
-    Every browser resume test here is for an encrypted vault, and the verification loop excludes
-    those deliberately -- their local copy is ciphertext the server already holds byte for byte. So
-    the loop protecting ORDINARY uploads had no test, and the first version of it skipped a chunk
-    whenever the server reported no digest for it, which is the original defect back in every
-    degraded state.
-
-    Driven through the real uploadManager: interrupt after the chunks land, change the file
-    underneath it without changing its length, resume, and look at what was stored.
+    The run has held every chunk the server reports to the digest recorded when it arrived, and
+    re-sent one that no longer matches -- but only for a row restored across a reload. A re-pick
+    fetched the server's list itself and started with it, so a file edited since, to the same
+    length, was spliced onto the previous attempt's chunks and committed with a 200. The re-pick
+    now defers to the run's check. Driven end to end: interrupt, reload, Resume…, pick the edited
+    file, and look at what was sent and what was stored.
     """
     page = logged_in
     vault = admin.create_vault(name=_u("resumeverify"))
@@ -946,47 +1024,18 @@ def test_a_resumed_upload_re_sends_the_parts_that_changed(logged_in: Page, admin
         page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
 
-        out = page.evaluate("""async ({ vid }) => {
-                const enc = new TextEncoder();
-                const auth = { 'Authorization': 'Bearer ' + authToken };
-                const init = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
-                    method: 'POST',
-                    headers: { ...auth, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_name: 'edited.bin', total_size: 20,
-                                           total_chunks: 2, chunk_size: 10 }),
-                });
-                const sid = (await init.json()).session_id;
-                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/0`,
-                    { method: 'PUT', headers: auth, body: enc.encode('AAAAAAAAAA') });
-                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/1`,
-                    { method: 'PUT', headers: auth, body: enc.encode('BBBBBBBBBB') });
-
-                // Same length, second half different.
-                const changed = new File(
-                    [new Blob([enc.encode('AAAAAAAAAA'), enc.encode('ZZZZZZZZZZ')])],
-                    'edited.bin', { type: 'application/octet-stream' });
-
-                const id = uploadManager._newId();
-                uploadManager.items.set(id, {
-                    id, file: changed, vaultId: vid, folderId: null,
-                    fileName: 'edited.bin', totalSize: 20, totalChunks: 2, chunkSize: 10,
-                    sessionId: sid, received: new Set(), needsServerSync: true,
-                    status: 'queued', error: null, paused: false, cancelled: false, isZk: false,
-                });
-                await uploadManager.run(id);
-                const it = uploadManager.items.get(id);
-                return { status: it.status, error: it.error, changed: it.changedLocally || 0 };
-            }""", {"vid": vid})
-        assert out["status"] == "done", f"the resume did not finish: {out}"
-        assert out["changed"] == 1, (
-            f"exactly one chunk changed and the client should have said so, reported {out}")
+        a, b, z = b"A" * _HALF, b"B" * _HALF, b"Z" * _HALF
+        out = _interrupt_reload_and_repick(page, vid, "edited.bin", a, b, z)
+        # Only the chunk the server already held is checked; it no longer matches, so it goes
+        # again -- and ONLY it: chunk 0 still matches and is not re-sent.
+        assert out["puts"] == [1], f"the re-pick sent {out['puts']}, not exactly the chunk that changed"
 
         listing = admin.get(f"/vaults/{vid}/files").json()["items"]
         fid = next(f["id"] for f in listing if f.get("name") == "edited.bin")
         stored = admin.get(f"/vaults/{vid}/files/{fid}/download").content
-        assert stored == b"AAAAAAAAAAZZZZZZZZZZ", (
-            f"a resumed upload of an edited file stored {stored!r} -- the changed half was not "
-            "re-sent, so the object is part old and part new")
+        assert stored == a + z, (
+            "a resumed upload of an edited file stored the previous attempt's second half -- the "
+            "changed chunk was not re-sent, so the object is part old and part new")
     finally:
         admin.delete_vault(vid)
 
@@ -997,7 +1046,9 @@ def test_a_resume_with_no_recorded_digests_re_sends_everything(logged_in: Page, 
 
     A chunk the server holds no digest for cannot be checked, so it has to be sent again. The first
     version skipped it -- and chunks written before this change have no digest at all, so the
-    sessions most likely to be mid-resume when it lands were precisely the unprotected ones.
+    sessions most likely to be mid-resume when it lands were precisely the unprotected ones. The
+    same user path as above; the wire is shaped after the reload to answer the session GET as an
+    older build's server would, with no digests.
     """
     page = logged_in
     vault = admin.create_vault(name=_u("nodigest"))
@@ -1008,57 +1059,27 @@ def test_a_resume_with_no_recorded_digests_re_sends_everything(logged_in: Page, 
         page.click(f'.open-vault-btn[data-vault-id="{vid}"]')
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
 
-        out = page.evaluate("""async ({ vid }) => {
-                const enc = new TextEncoder();
-                const auth = { 'Authorization': 'Bearer ' + authToken };
-                const init = await fetch(`${API_BASE}/vaults/${vid}/uploads`, {
-                    method: 'POST',
-                    headers: { ...auth, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_name: 'legacy.bin', total_size: 20,
-                                           total_chunks: 2, chunk_size: 10 }),
-                });
-                const sid = (await init.json()).session_id;
-                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/0`,
-                    { method: 'PUT', headers: auth, body: enc.encode('AAAAAAAAAA') });
-                await fetch(`${API_BASE}/vaults/${vid}/uploads/${sid}/chunks/1`,
-                    { method: 'PUT', headers: auth, body: enc.encode('BBBBBBBBBB') });
-
-                // A session as an older build left it: chunks present, no digests. Stubbed on the
-                // wire, because that is exactly how that state looks to this client.
-                const realFetch = window.fetch;
-                window.fetch = async (url, opts) => {
-                    const r = await realFetch(url, opts);
-                    if (String(url).endsWith(`/uploads/${sid}`) && (!opts || !opts.method)) {
-                        const d = await r.clone().json();
-                        delete d.chunk_checksums;
-                        return new Response(JSON.stringify(d),
-                            { status: 200, headers: { 'Content-Type': 'application/json' } });
-                    }
-                    return r;
-                };
-
-                const changed = new File(
-                    [new Blob([enc.encode('XXXXXXXXXX'), enc.encode('ZZZZZZZZZZ')])],
-                    'legacy.bin', { type: 'application/octet-stream' });
-                const id = uploadManager._newId();
-                uploadManager.items.set(id, {
-                    id, file: changed, vaultId: vid, folderId: null,
-                    fileName: 'legacy.bin', totalSize: 20, totalChunks: 2, chunkSize: 10,
-                    sessionId: sid, received: new Set(), needsServerSync: true,
-                    status: 'queued', error: null, paused: false, cancelled: false, isZk: false,
-                });
-                await uploadManager.run(id);
-                window.fetch = realFetch;
-                const it = uploadManager.items.get(id);
-                return { status: it.status, error: it.error };
-            }""", {"vid": vid})
-        assert out["status"] == "done", f"the resume did not finish: {out}"
+        a, b, z = b"A" * _HALF, b"B" * _HALF, b"Z" * _HALF
+        strip_digests = """() => {
+            const real = window.fetch;
+            window.fetch = async (url, opts) => {
+                const r = await real(url, opts);
+                if (/[/]uploads[/][^/]+$/.test(String(url)) && (!opts || !opts.method)) {
+                    const d = await r.clone().json();
+                    delete d.chunk_checksums;
+                    return new Response(JSON.stringify(d), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                return r;
+            };
+        }"""
+        out = _interrupt_reload_and_repick(page, vid, "legacy.bin", a, b, z, after_reload_js=strip_digests)
+        # Nothing can vouch for chunk 0, so it goes again too.
+        assert sorted(out["puts"]) == [0, 1], f"with no digests every held chunk must be re-sent; sent {out['puts']}"
 
         listing = admin.get(f"/vaults/{vid}/files").json()["items"]
         fid = next(f["id"] for f in listing if f.get("name") == "legacy.bin")
         stored = admin.get(f"/vaults/{vid}/files/{fid}/download").content
-        assert stored == b"XXXXXXXXXXZZZZZZZZZZ", (
-            f"with no digests to check against every chunk must be re-sent; stored {stored!r}")
+        assert stored == a + z, f"the re-picked file's bytes were not what landed"
     finally:
         admin.delete_vault(vid)
 

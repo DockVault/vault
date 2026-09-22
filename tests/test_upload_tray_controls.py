@@ -239,9 +239,10 @@ NOT_REPLACED = ('toast error Could not replace "X": the existing file could not 
                 'unchanged and the new copy was not uploaded.')
 
 
-def _serve(scenarios: str) -> dict:
+def _serve(scenarios: str, extra=()) -> dict:
+    """Run `scenarios` against the shipped methods in LIFTED (plus any `extra` heads)."""
     js = APP_JS.read_text(encoding="utf-8")
-    return _node(SERVER % ("".join(_method(js, h) for h in LIFTED), scenarios))
+    return _node(SERVER % ("".join(_method(js, h) for h in LIFTED + tuple(extra)), scenarios))
 
 
 def test_a_cancel_the_server_refused_drops_the_replacement_by_name_and_never_commits():
@@ -1031,7 +1032,10 @@ def test_a_picked_file_goes_to_the_row_that_holds_the_session_now():
     Object.assign(document, { getElementById: (id) => (id === 'upload-reselect-input' ? input : null) });
     globalThis.isZkVault = () => false;
     const waiting = (id) => sent(id, 'old-sess', { status: 'needs-file', file: null, restored: true, paused: true });
-    const pick = () => input.onchange({ target: { files: [{ name: 'X', size: 10 }] } });
+    // A real 10-byte file: the re-pick is checked against what the server holds, and a chunk the
+    // server has no digest for is read again to be sent again.
+    const picked = new Blob([new Uint8Array(10)]); Object.defineProperty(picked, 'name', { value: 'X' });
+    const pick = () => input.onchange({ target: { files: [picked] } });
     // Rebuilt under a new id between the click and the pick.
     fresh(waiting('k1')); um._reselect('k1');
     const old = um.items.get('k1'); um.items.delete('k1'); um.items.set('k2', { ...old, id: 'k2' });
@@ -1043,7 +1047,9 @@ def test_a_picked_file_goes_to_the_row_that_holds_the_session_now():
     fresh(waiting('k1')); um._reselect('k1'); await pick(); await um.lastRun; out.same = log.slice();
     out.pickingCleared = !um.items.get('k1').picking;
     """))
-    ran = ["GET /vaults/V/uploads/old-sess", "POST /vaults/V/uploads/old-sess/complete"]
+    # The re-pick re-syncs with the server, which (here) reports the chunk with no digest, so the
+    # chunk is sent again rather than trusted, and then the upload is committed.
+    ran = ["GET /vaults/V/uploads/old-sess", "PUT /vaults/V/uploads/old-sess/chunks/0", "POST /vaults/V/uploads/old-sess/complete"]
     # (mutation: hand the pick to the row the chooser was opened for -> nothing happens -> red.)
     assert out["rebuilt"] == {"log": ran, "rows": ["k2"], "status": "done"}, out["rebuilt"]
     assert out["gone"]["rows"] == [] and len(out["gone"]["log"]) == 1, out["gone"]

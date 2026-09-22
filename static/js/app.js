@@ -17033,14 +17033,14 @@ const uploadManager = {
             showWarning(`Resuming with a differently-named file ("${file.name}"). Make sure it's the same content.`);
         }
         it.file = file;
-        it.received = new Set();  // re-sync from server below
-        try {
-            const s = await fetch(`${API_BASE}/vaults/${it.vaultId}/uploads/${it.sessionId}`, { headers: this._vaultHeaders() });
-            if (s.ok) {
-                const sd = await s.json();
-                it.received = new Set(sd.received_chunks || []);
-            }
-        } catch (_) {}
+        // The handle is not the file: the same length does not mean the same bytes. What the server
+        // holds is NOT trusted on this re-pick -- the run re-syncs the list AND holds every chunk the
+        // server has to the digest it recorded when the chunk arrived, so a file edited since is
+        // sent again where it differs, never spliced onto the previous attempt's chunks. That check
+        // lives in the run (it is the same one a reload's restored row gets); this used to fetch
+        // the list here and start with it, which skipped the check entirely.
+        it.received = new Set();
+        it.needsServerSync = true;
         this._start(it);
     },
 
