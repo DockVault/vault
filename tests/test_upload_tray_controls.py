@@ -527,7 +527,9 @@ def test_after_a_reload_the_newer_of_two_rows_of_one_name_still_cancels_the_olde
     older = out["olderContinued"]
     assert out["olderAdopted"] is None
     assert older["log"] == ["reselect v", "POST /vaults/V/uploads/old-sess/complete"] and older["o"]["status"] == "needs-file", older
-    assert out["autoResumed"]["log"] == [COMPLETE] and out["autoResumed"]["v"]["status"] == "needs-file", out["autoResumed"]
+    # ... it cancels nothing and the older row stays. It IS told the older upload is still there and
+    # can replace this copy: warned on what is known, cancelled only what was displayed.
+    assert out["autoResumed"]["log"] == [WARN_OTHER, COMPLETE] and out["autoResumed"]["v"]["status"] == "needs-file", out["autoResumed"]
     # An upload with nothing to fire goes straight on -- no confirming GET, nothing but its commit.
     assert out["alone"]["log"] == [COMPLETE], out["alone"]
 

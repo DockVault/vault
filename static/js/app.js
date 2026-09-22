@@ -16401,6 +16401,17 @@ const uploadManager = {
                 // Remembered on the row, not said yet: nothing has been replaced until the commit
                 // below succeeds, and that may be a later pass than this one.
                 it.replacedCount = (it.replacedCount || 0) + fired.cancelled;
+            } else if (this._liveRivals(it).length) {
+                // WARN ON WHAT WE KNOW; CANCEL ONLY WHAT WE DISPLAYED. An upload nobody was asked
+                // about cancels nothing -- the user was never shown a choice, so the step above is
+                // for replacements alone. But an earlier upload of its name that is still alive
+                // (another tab's, dropped before this tray refreshed it in) can finish later and
+                // replace this copy by name, and that is true whether or not anyone was asked. So it
+                // is said here, for every upload that reaches its commit. This whole step used to be
+                // gated on "replaces OR has live rivals"; narrowing it to `replaces` was right for the
+                // cancel and took the warning with it.
+                this._say(it, () => showWarning(`Another upload of "${it.fileName}" is still in progress and may replace this copy `
+                                             + `when it finishes.`));
             }
             // Cancelled while the last request of that step was still out: its row may already
             // be gone, and an upload the user withdrew is not committed behind their back. Paused:
