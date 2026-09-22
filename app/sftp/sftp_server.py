@@ -982,21 +982,10 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 
     @staticmethod
     def _resolve_member_name(db, member_id, viewer):
-        """Display name for the marker holder in a same-name refusal, gated exactly like the web
-        listing's uploader identity: reveal the holder's USERNAME only to a MEMBER-GRADE viewer (an
-        interactive member -- never a scoped credential, which is what most SFTP uploaders are), and
-        never an email. Everyone else gets a neutral "another member". Best-effort: any lookup miss
-        or failure also reads as "another member", so a refusal never 500s on a name lookup."""
-        from app.core.temp_scope import is_scoped
-        if is_scoped(viewer):
-            return "another member"
-        try:
-            u = db.query(User).filter(User.id == member_id).first()
-            if u is not None:
-                return getattr(u, "username", None) or "another member"
-        except Exception:  # noqa: BLE001 -- a lookup failure must not turn a refusal into a 500
-            pass
-        return "another member"
+        """Display name for the marker holder in a same-name refusal: the one rule both doors use
+        (upload_marker.holder_display_name) -- the username only to a member-grade viewer, a
+        neutral "another member" to a scoped credential and on any lookup miss."""
+        return upload_marker.holder_display_name(db, member_id, viewer)
 
     def _load_principal(self, db) -> Optional[User]:
         """Load the authenticated principal FRESH in the given session.

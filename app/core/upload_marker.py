@@ -58,6 +58,30 @@ _CAD_REFRESH = (
     "return 0")
 
 
+def holder_display_name(db, member_id, viewer) -> str:
+    """How a same-name refusal names the member whose upload holds the name -- ONE rule for every
+    door. The holder's USERNAME is revealed only to a MEMBER-GRADE viewer (an interactive member),
+    gated exactly like the web listing's uploader identity; a scoped credential -- most SFTP
+    uploaders, and any temporary web credential -- gets a neutral "another member", and an email is
+    never used. Best-effort: a lookup miss or failure also reads as "another member", so a refusal
+    never 500s on a name lookup.
+
+    The SFTP refusal had this gate and the web refusal did not: the same sentence named the holder
+    to ANY caller there, including a scoped credential that could learn a member's username from a
+    file name it was refused. Both doors call this now."""
+    from app.core.temp_scope import is_scoped
+    if is_scoped(viewer):
+        return "another member"
+    try:
+        from app.core.models import User
+        u = db.query(User).filter(User.id == member_id).first()
+        if u is not None:
+            return getattr(u, "username", None) or "another member"
+    except Exception:  # noqa: BLE001 -- a lookup failure must not turn a refusal into a 500
+        pass
+    return "another member"
+
+
 def marker_ttl_seconds() -> int:
     """The marker's backstop TTL in seconds. Readable so a kill test can refuse to judge when the TTL
     is shorter than its observation window."""

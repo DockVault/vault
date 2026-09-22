@@ -17339,19 +17339,14 @@ async def init_chunked_upload(
     # cannot both be writing the same final name at once. Standard vaults only (SFTP never serves
     # zero-knowledge, and a ZK name is server-invisible so there is nothing to compare). Best-effort
     # and fail-OPEN: with Redis down holder() returns SKIPPED and the upload proceeds -- an outage
-    # must never block an upload. The member is named with the same member-grade wording the SFTP
-    # refusal and the listing use.
+    # must never block an upload. The holder is named by the ONE rule both doors use
+    # (upload_marker.holder_display_name): the username only to a member-grade viewer, "another
+    # member" to a scoped credential. This site used to name the username to ANY caller.
     if not is_zk and body.file_name:
         from app.core import upload_marker as _um
         _holder = _um.holder(vault_id, folder_uuid, body.file_name)
         if isinstance(_holder, str):
-            _who = "another member"
-            try:
-                _u = db.query(User).filter(User.id == _holder).first()
-                if _u is not None:
-                    _who = getattr(_u, "username", None) or "another member"
-            except Exception:  # noqa: BLE001 -- a lookup failure must not turn the refusal into a 500
-                pass
+            _who = _um.holder_display_name(db, _holder, current_user)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"'{body.file_name}' is currently being uploaded by {_who}")

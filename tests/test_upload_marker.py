@@ -374,3 +374,56 @@ def test_the_fallback_ttl_is_used_when_the_setting_is_unusable(monkeypatch):
     assert um.marker_ttl_seconds() == 300
     monkeypatch.setattr(um.settings, "upload_marker_ttl_seconds", 45)
     assert um.marker_ttl_seconds() == 45
+
+
+# ---- how a refusal names the holder: one rule, both doors -----------------------------------------------------
+
+class _NameDB:
+    def __init__(self, user=None, raise_=False):
+        self._user, self._raise = user, raise_
+
+    def query(self, *a):
+        if self._raise:
+            raise RuntimeError("the lookup failed")
+        return self
+
+    def filter(self, *a):
+        return self
+
+    def first(self):
+        return self._user
+
+
+def test_a_same_name_refusal_names_the_holder_only_to_a_member_grade_viewer():
+    # The web refusal used to name the holder's username to ANY caller -- a scoped credential
+    # could learn a member's username from a file name it was refused -- while the SFTP refusal
+    # gated it. Both doors now ask this one function. (mutation: drop the is_scoped gate -> the
+    # scoped case names alice -> red. mutation: fall back to the email -> red.)
+    from types import SimpleNamespace
+    member = SimpleNamespace(_is_temp_session=False, _temp_scope=None)                   # interactive member
+    scoped = SimpleNamespace(_is_temp_session=True, _temp_scope={"pages": ["vaults"]})   # scoped credential
+    alice = SimpleNamespace(username="alice", email="alice@example.com")
+    assert um.holder_display_name(_NameDB(alice), "id", member) == "alice"
+    assert um.holder_display_name(_NameDB(alice), "id", scoped) == "another member"
+    assert um.holder_display_name(_NameDB(SimpleNamespace(username=None, email="b@x")), "id", member) == "another member"
+    assert um.holder_display_name(_NameDB(None), "id", member) == "another member"
+    assert um.holder_display_name(_NameDB(raise_=True), "id", member) == "another member"   # never a 500
+
+
+def test_both_doors_ask_the_one_rule_and_neither_looks_the_name_up_itself():
+    # Smoke alarm on comment-free code: the web upload-init refusal and the SFTP refusal both call
+    # holder_display_name, and no `.username` lookup for a marker holder remains inline at either.
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    api = "\n".join(ln for ln in (root / "app/api/api_server.py").read_text(encoding="utf-8").splitlines()
+                    if not ln.lstrip().startswith("#"))
+    site = api[api.index("_holder = _um.holder(vault_id, folder_uuid, body.file_name)"):]
+    site = site[:site.index("raise HTTPException(")]
+    assert "_who = _um.holder_display_name(db, _holder, current_user)" in site
+    assert "username" not in site and "User).filter" not in site, site
+    sftp = "\n".join(ln for ln in (root / "app/sftp/sftp_server.py").read_text(encoding="utf-8").splitlines()
+                     if not ln.lstrip().startswith("#"))
+    body = sftp[sftp.index("def _resolve_member_name(db, member_id, viewer):"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "return upload_marker.holder_display_name(db, member_id, viewer)" in body
+    assert "is_scoped" not in body and "username" not in body.split('"""')[-1]
