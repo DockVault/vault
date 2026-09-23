@@ -1,9 +1,71 @@
 {
-  "schema_version": 2,
-  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible. A version may also carry a `vulnerabilities` list of known, ALREADY-FIXED issues (title, description, optional null-able severity/cvss/id, the `fixed_in` release, and the `published` date); nothing is listed until a release fixes it, so a secure version carries none and an insecure one names what to upgrade to.",
+  "schema_version": 3,
+  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between ADJACENT releases only -- a longer upgrade is composed by walking them in order, rather than being asserted as a single hop nobody tested. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible. Each known vulnerability is recorded once, in the top-level `advisories`: title, description, impact, remediation, an optional mitigation, a CVSS v4.0 base vector (`cvss`) with the severity band it scores to, an optional id, the `fixed_in` release and the `published` date; `cvss` and `severity` are both null for an unrated advisory. Each affected version lists references to its advisories under `vulnerabilities` (`advisory`, with the advisory's `title` and `fixed_in` repeated for readers that predate advisories). A version affected by any advisory, of any severity, is not secure. An advisory is normally listed only once a release fixes it; one with no fix yet (`fixed_in` null) is published only together with a mitigation.",
   "kinds": {
     "direct": "The upgrade can be taken in one step. Any caveats are listed in the edge's conditions.",
     "blocked": "The upgrade must not be taken. The edge says why, and what to do instead."
+  },
+  "advisories": {
+    "sign-in-fails-without-session-cache": {
+      "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
+      "description": "With the cache down, minting failed while leaving an orphaned credential counting against the caps, a correct-password sign-in failed, and a valid single-use SFTP credential could be refused and consumed.",
+      "impact": "While the session cache was unreachable, users with the correct password could not sign in, a failed mint left behind a credential that still counted against the account's limits, and a valid single-use SFTP credential could be spent without being used.",
+      "remediation": "Upgrade to 0.29.1 or later, and revoke any credential a failed mint left behind.",
+      "mitigation": null,
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:L/VA:L/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.29.1",
+      "published": "2026-09-16"
+    },
+    "temp-credential-device-management": {
+      "title": "Temporary-credential sessions could manage devices",
+      "description": "A temporary credential's web session could enroll a device, grant it vaults the credential was not scoped to, and mint sync credentials, obtaining lasting sync access that outlived the credential.",
+      "impact": "A temporary credential, meant to be limited in scope and time, could be turned into lasting sync access -- including to vaults it was never granted -- that survived its expiry and revocation.",
+      "remediation": "Upgrade to 0.29.1 or later, then review each account's enrolled devices and revoke any that were enrolled from a temporary credential's session.",
+      "mitigation": null,
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.29.1",
+      "published": "2026-09-16"
+    },
+    "device-sync-shares-sign-in-throttle": {
+      "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
+      "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
+      "impact": "A sync client that kept failing to authenticate, whether misconfigured or deliberate, could lock every user behind the same address out of web sign-in until the throttle window passed.",
+      "remediation": "Upgrade to 0.30.0 or later.",
+      "mitigation": null,
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.30.0",
+      "published": "2026-09-18"
+    },
+    "note-link-token-stored-in-cleartext": {
+      "title": "Note-link URL tokens were stored in cleartext",
+      "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
+      "impact": "Anyone holding a copy of the database, such as a leaked backup, held a working link to every published note and could read those notes through the running vault.",
+      "remediation": "Upgrade to 0.30.0 or later. Upgrading keeps existing links working, so a link copied out of an older database still opens its note: if a copy of the database may have been exposed, remove those note links and create new ones.",
+      "mitigation": null,
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:H/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.30.0",
+      "published": "2026-09-18"
+    },
+    "temp-credential-liveness-at-sign-in": {
+      "title": "A temporary credential in use was distinguishable at sign-in",
+      "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
+      "impact": "Someone who guessed a temporary credential's name could tell, without its secret, whether that credential was currently signed in, and so aim a guessing attack at live credentials. No secret or data was exposed.",
+      "remediation": "Upgrade to 0.30.0 or later.",
+      "mitigation": null,
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.30.0",
+      "published": "2026-09-18"
+    }
   },
   "versions": {
     "0.6.0": {
@@ -15,13 +77,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -34,13 +92,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -53,13 +107,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -72,13 +122,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -91,13 +137,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -110,13 +152,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -129,13 +167,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -148,13 +182,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -167,13 +197,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -186,13 +212,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -205,13 +227,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -224,13 +242,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -243,13 +257,9 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -262,22 +272,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -290,22 +292,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -318,22 +312,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -346,22 +332,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -374,22 +352,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -402,22 +372,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -430,22 +392,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -458,22 +412,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -486,22 +432,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -514,22 +452,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -542,22 +472,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -570,22 +492,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -598,22 +512,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -626,22 +532,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -654,22 +552,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -682,22 +572,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -710,22 +592,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -738,22 +612,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -766,22 +632,14 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -794,49 +652,29 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-device-management",
           "title": "Temporary-credential sessions could manage devices",
-          "description": "A temporary credential's web session could enroll a device, grant it vaults the credential was not scoped to, and mint sync credentials, obtaining lasting sync access that outlived the credential.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.29.1",
-          "published": "2026-09-16"
+          "fixed_in": "0.29.1"
         },
         {
+          "advisory": "sign-in-fails-without-session-cache",
           "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
-          "description": "With the cache down, minting failed while leaving an orphaned credential counting against the caps, a correct-password sign-in failed, and a valid single-use SFTP credential could be refused and consumed.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.29.1",
-          "published": "2026-09-16"
+          "fixed_in": "0.29.1"
         },
         {
+          "advisory": "device-sync-shares-sign-in-throttle",
           "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
-          "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18"
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -849,49 +687,29 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "temp-credential-device-management",
           "title": "Temporary-credential sessions could manage devices",
-          "description": "A temporary credential's web session could enroll a device, grant it vaults the credential was not scoped to, and mint sync credentials, obtaining lasting sync access that outlived the credential.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.29.1",
-          "published": "2026-09-16"
+          "fixed_in": "0.29.1"
         },
         {
+          "advisory": "sign-in-fails-without-session-cache",
           "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
-          "description": "With the cache down, minting failed while leaving an orphaned credential counting against the caps, a correct-password sign-in failed, and a valid single-use SFTP credential could be refused and consumed.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.29.1",
-          "published": "2026-09-16"
+          "fixed_in": "0.29.1"
         },
         {
+          "advisory": "device-sync-shares-sign-in-throttle",
           "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
-          "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18"
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },
@@ -904,31 +722,19 @@
       },
       "vulnerabilities": [
         {
+          "advisory": "device-sync-shares-sign-in-throttle",
           "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
-          "description": "Device-sync authentication was throttled in the same per-address bucket as interactive sign-in, so a looping sync client could lock the account's owner out of the web sign-in from the same address; device sync now throttles per device in its own bucket.",
-          "severity": null,
-          "cvss": null,
-          "id": null,
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18"
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "note-link-token-stored-in-cleartext",
           "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "A published note link's URL token was stored as given in the database, so anyone who obtained a copy of the database held working links to every live note link; the token is now stored only as a hash and the link keeps working unchanged.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         },
         {
+          "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0",
-          "published": "2026-09-18",
-          "description": "Signing in with a temporary credential that already had a live session returned a server error while an unusable one returned the ordinary refusal, so the difference told a holder of a guessed name whether that credential was live; both now return the same refusal and count the same against the sign-in throttle.",
-          "severity": null,
-          "cvss": null,
-          "id": null
+          "fixed_in": "0.30.0"
         }
       ]
     },

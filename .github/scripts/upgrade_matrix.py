@@ -23,9 +23,34 @@ Stdlib only, like the rest of the release scripts.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
+
+
+def _load_cvss4():
+    """The sibling CVSS v4.0 scorer, loaded by path.
+
+    This module is itself loaded by path (by the release gate and by the tests), so the scripts
+    directory is not on sys.path and a plain `import cvss4` would not resolve. Resolving relative to
+    `__file__` works however this module was reached.
+    """
+    name = "dockvault_cvss4"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path(__file__).resolve().parent / "cvss4.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - a broken checkout
+        raise ImportError(f"cannot load the CVSS v4.0 scorer at {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+cvss4 = _load_cvss4()
 
 # Generous next to a file that holds a few dozen short records, and small enough that a runaway or
 # hostile file cannot make the parser the problem.
@@ -33,7 +58,11 @@ MAX_BYTES = 256 * 1024
 # 2 adds a required per-version `support` block (lifecycle: end-of-life, security posture, and
 # optional extended-support end dates). A schema_version-1 file has no such block and would leave
 # every version's lifecycle undeclared, so the bump is not backward-compatible on purpose.
-SUPPORTED_SCHEMA_VERSION = 2
+# 3 moves each vulnerability into a top-level `advisories` record -- stated once, with its impact,
+# remediation, optional mitigation and a CVSS v4.0 vector -- and leaves each affected version a
+# reference to it. Copying the full record onto every affected version grew the file by a whole
+# record per affected release, per release, and let two copies of one finding disagree.
+SUPPORTED_SCHEMA_VERSION = 3
 
 _UTF8_BOM = b"\xef\xbb\xbf"
 # No leading zeros: "0.10.00" and "0.10.0" would be two keys for one release, and the second would
@@ -51,11 +80,18 @@ _VERSION_KEYS = {"released", "notes", "must_land_here", "support", "vulnerabilit
 # be absent. They describe support GIVEN PAST end-of-life, so they are only meaningful on an EOL
 # version.
 _SUPPORT_KEYS = {"eol", "secure", "code_support", "security_support"}
-# A version's list of KNOWN, ALREADY-FIXED vulnerabilities. title/description carry the meaning; the
-# ratings (severity/cvss/id) are required keys that may be null, so an unrated finding says so rather
-# than omitting the field. `fixed_in` and `published` are what make the entry safe to publish: nothing
-# is listed until a release fixes it.
-_VULN_KEYS = {"title", "description", "severity", "cvss", "id", "fixed_in", "published"}
+# A version's list of the advisories that affect it. Each entry names its advisory and repeats the
+# advisory's `title` and `fixed_in` verbatim: those two fields are what every reader that predates
+# advisories shows (the host tool's older copies and the running app read a version's list and
+# nothing else), so the repetition is what keeps them informed. They must match the advisory exactly.
+_VULN_KEYS = {"advisory", "title", "fixed_in"}
+# One record per vulnerability. title, description, impact and remediation carry the meaning and are
+# always stated. The ratings are required keys that may be null, so an unrated finding says so rather
+# than omitting the field: `cvss` is a CVSS v4.0 base vector and `severity` the band it scores to
+# (derived and checked, never chosen). `mitigation` is what an operator can do before, or instead of,
+# upgrading; it is required when there is no fix.
+_ADVISORY_KEYS = {"title", "description", "impact", "remediation", "mitigation",
+                  "severity", "cvss", "id", "fixed_in", "published"}
 _SEVERITIES = ("low", "medium", "high", "critical")
 # The secure/vulnerabilities consistency below is enforced only from this version on. Releases before
 # it predate the vulnerability-list feature; the owner's decision is to leave their (end-of-life)
@@ -64,7 +100,7 @@ _VULN_LISTED_FROM = "0.28.0"
 _EDGE_KEYS = {"from", "to", "kind", "reversible", "requires_backup", "reason", "conditions"}
 _CONDITION_KEYS = {"id", "summary", "detect"}
 _WAIVER_KEYS = {"version", "reason"}
-_TOP_KEYS = {"schema_version", "about", "kinds", "versions", "edges", "waivers"}
+_TOP_KEYS = {"schema_version", "about", "kinds", "advisories", "versions", "edges", "waivers"}
 
 
 class UpgradeMatrixError(ValueError):
@@ -175,58 +211,140 @@ def _validate_support(support: object, where: str) -> None:
                  f"{where}.support.security_support must not end before code_support")
 
 
-def _validate_vulnerabilities(meta: dict, version: str, versions: dict, where: str,
-                              released_ceiling: str | None) -> None:
-    """The optional per-version list of KNOWN, ALREADY-FIXED vulnerabilities.
+def _validate_advisories(data: dict, versions: dict, released_ceiling: str | None) -> dict:
+    """The top-level `advisories` records: one per vulnerability, keyed by a stable slug.
 
-    This is a public repository, so an unpatched-vulnerability disclosure here is a disclosure to an
-    attacker. The rule that keeps the list safe to publish: an entry appears only once a release fixes
-    it. So `fixed_in` is required and must name a declared version LATER than this one -- a
-    vulnerability cannot be fixed in the release it affects, or in one that predates it. `severity`,
-    `cvss` and `id` are required keys but may be null: an unrated finding states so explicitly, rather
-    than by omission, the same way the support block always states eol/secure. title and description
-    carry the meaning and must be printable (see `_printable_string`).
+    This is a public repository, so publishing a vulnerability is publishing it to an attacker. The
+    rule that keeps the list safe: an advisory names the release that fixes it, and that release must
+    exist. `released_ceiling`, when supplied, is the newest RELEASED version -- on a push to main the
+    VERSION file, which the release commit bumps; at release time the version being cut. A `fixed_in`
+    above it names a fix nobody can install yet, which would turn the advisory into the unpatched
+    disclosure the rule exists to prevent. Declared-and-later alone does not catch this: a phantom
+    version can be declared to bridge the adjacency chain, and phantoms are only rejected in the
+    release gate. Left None (e.g. validating a published asset with no VERSION at hand) the ceiling is
+    not enforced and every other rule still holds.
 
-    `released_ceiling`, when supplied, is the newest RELEASED version -- on a push to main that is the
-    VERSION file, which the release commit bumps; at release time it is the version being cut. A
-    `fixed_in` above it names a fix that does not exist yet, which turns the entry back into the
-    unpatched disclosure the listing rule exists to prevent. Declared-and-later alone does not catch
-    this: a phantom version can be declared to bridge the adjacency chain, and phantoms are only
-    rejected in the release gate. Left None (e.g. validating a published asset with no VERSION at
-    hand) the ceiling is not enforced and the declared-and-later rule still holds.
+    The one deliberate exception is an advisory with no fix yet (`fixed_in` null). It is allowed only
+    with a `mitigation`: an unfixed issue is published when operators must act before the fix exists,
+    and then the entry exists to tell them what to do. An unfixed advisory that gives them nothing to
+    do would help an attacker and nobody else.
+
+    `severity` is never chosen by hand. When `cvss` carries a CVSS v4.0 base vector, `severity` must be
+    the band that vector scores to, recomputed here, so the two cannot drift apart; when `cvss` is
+    null the advisory is unrated and `severity` is null too. A vector that scores 0.0 describes no
+    impact at all, which is not a vulnerability. title, description, impact, remediation and
+    mitigation are printed raw by the host tool and must be printable (see `_printable_string`).
+    """
+    advisories = data.get("advisories")
+    _require(isinstance(advisories, dict),
+             "upgrade matrix needs an 'advisories' object (empty when nothing is known)")
+    for slug, advisory in advisories.items():
+        _string(slug, "advisory key", pattern=_ID_RE)
+        where = f"advisories[{slug}]"
+        _require(isinstance(advisory, dict), f"{where} must be an object")
+        _no_unknown_keys(advisory, _ADVISORY_KEYS, where)
+        missing = sorted(_ADVISORY_KEYS - set(advisory))
+        _require(not missing, f"{where} is missing required key(s): {', '.join(missing)}")
+        for field in ("title", "description", "impact", "remediation"):
+            _printable_string(advisory[field], f"{where}.{field}")
+        mitigation = advisory["mitigation"]
+        if mitigation is not None:
+            _printable_string(mitigation, f"{where}.mitigation")
+        if advisory["id"] is not None:
+            _printable_string(advisory["id"], f"{where}.id")
+        _string(advisory["published"], f"{where}.published", pattern=_DATE_RE)
+
+        vector, severity = advisory["cvss"], advisory["severity"]
+        if vector is None:
+            _require(severity is None,
+                     f"{where}.severity is {severity!r} with no cvss vector; the band is derived from "
+                     "the vector, so an unrated advisory leaves both null")
+        else:
+            try:
+                score = cvss4.base_score(vector)
+            except cvss4.CvssError as exc:
+                raise UpgradeMatrixError(f"{where}.cvss: {exc}") from exc
+            band = cvss4.severity_band(score)
+            _require(band != "none",
+                     f"{where}.cvss scores 0.0: a vector with no impact on anything describes no "
+                     "vulnerability")
+            _require(severity == band,
+                     f"{where}.severity must be the band its cvss vector scores to: the vector scores "
+                     f"{score} ({band}), got {severity!r}")
+
+        fixed_in = advisory["fixed_in"]
+        if fixed_in is None:
+            _require(mitigation is not None,
+                     f"{where} has no fix (fixed_in null) and no mitigation; an unfixed issue is "
+                     "published only when there is something operators can do before the fix exists")
+        else:
+            _string(fixed_in, f"{where}.fixed_in", pattern=_VERSION_RE)
+            _require(fixed_in in versions, f"{where}.fixed_in is not a declared version: {fixed_in}")
+            if released_ceiling is not None:
+                _require(_sort_key(fixed_in) <= _sort_key(released_ceiling),
+                         f"{where} names {fixed_in} as the fix but the newest released version is "
+                         f"{released_ceiling}; an unreleased fix is an unpatched disclosure")
+    return advisories
+
+
+def _validate_vulnerabilities(meta: dict, version: str, advisories: dict, where: str) -> None:
+    """A version's optional list of references to the advisories that affect it.
+
+    Each entry names an advisory and repeats its `title` and `fixed_in` exactly (see `_VULN_KEYS`).
+    A version cannot be affected by an advisory fixed in it or before it, and lists each advisory once.
     """
     vulns = meta.get("vulnerabilities")
     if vulns is None:
         return
     _require(isinstance(vulns, list), f"{where}.vulnerabilities must be a list")
-    for position, vuln in enumerate(vulns):
+    seen: set[str] = set()
+    for position, ref in enumerate(vulns):
         spot = f"{where}.vulnerabilities[{position}]"
-        _require(isinstance(vuln, dict), f"{spot} must be an object")
-        _no_unknown_keys(vuln, _VULN_KEYS, spot)
-        missing = sorted(_VULN_KEYS - set(vuln))
+        _require(isinstance(ref, dict), f"{spot} must be an object")
+        _no_unknown_keys(ref, _VULN_KEYS, spot)
+        missing = sorted(_VULN_KEYS - set(ref))
         _require(not missing, f"{spot} is missing required key(s): {', '.join(missing)}")
-        _printable_string(vuln.get("title"), f"{spot}.title")
-        _printable_string(vuln.get("description"), f"{spot}.description")
-        severity = vuln.get("severity")
-        _require(severity is None or severity in _SEVERITIES,
-                 f"{spot}.severity must be null or one of {', '.join(_SEVERITIES)}, got {severity!r}")
-        cvss = vuln.get("cvss")
-        _require(cvss is None or (isinstance(cvss, (int, float)) and not isinstance(cvss, bool)
-                                  and 0.0 <= cvss <= 10.0),
-                 f"{spot}.cvss must be null or a number in 0.0-10.0, got {cvss!r}")
-        if vuln.get("id") is not None:
-            _string(vuln.get("id"), f"{spot}.id")
-        fixed_in = _string(vuln.get("fixed_in"), f"{spot}.fixed_in", pattern=_VERSION_RE)
-        _require(fixed_in in versions, f"{spot}.fixed_in is not a declared version: {fixed_in}")
-        _require(_sort_key(fixed_in) > _sort_key(version),
-                 f"{spot}.fixed_in ({fixed_in}) must be a version later than {version}; a "
-                 "vulnerability is listed only once fixed, and cannot be fixed in the release it "
-                 "affects or an earlier one")
-        if released_ceiling is not None:
-            _require(_sort_key(fixed_in) <= _sort_key(released_ceiling),
-                     f"{spot} names {fixed_in} as the fix but the newest released version is "
-                     f"{released_ceiling}; an unreleased fix is an unpatched disclosure")
-        _string(vuln.get("published"), f"{spot}.published", pattern=_DATE_RE)
+        slug = _string(ref["advisory"], f"{spot}.advisory", pattern=_ID_RE)
+        _require(slug in advisories, f"{spot}.advisory names {slug}, which 'advisories' does not declare")
+        _require(slug not in seen, f"{spot} lists advisory {slug} a second time")
+        seen.add(slug)
+        advisory = advisories[slug]
+        for field in ("title", "fixed_in"):
+            _require(ref[field] == advisory[field],
+                     f"{spot}.{field} must repeat advisories[{slug}].{field} exactly; it is what a "
+                     f"reader that predates advisories shows (got {ref[field]!r}, "
+                     f"expected {advisory[field]!r})")
+        fixed_in = advisory["fixed_in"]
+        if fixed_in is not None:
+            _require(_sort_key(fixed_in) > _sort_key(version),
+                     f"{spot} names advisory {slug}, fixed_in ({fixed_in}), which must be a version "
+                     f"later than {version}; a release cannot be affected by an issue fixed in it or "
+                     "an earlier one")
+
+
+def _validate_advisory_coverage(advisories: dict, versions: dict) -> None:
+    """Every advisory affects an unbroken run of releases, from the first that lists it up to its fix.
+
+    An issue present in 0.10.0 and in 0.12.0 was present in 0.11.0. A gap is a release someone forgot
+    to mark, and the operator running it would be told nothing. An unfixed advisory runs to the newest
+    declared release. An advisory nothing references describes no release at all.
+    """
+    ordered = sorted(versions, key=_sort_key)
+    affected: dict[str, list[str]] = {slug: [] for slug in advisories}
+    for version in ordered:
+        for ref in versions[version].get("vulnerabilities") or []:
+            affected[ref["advisory"]].append(version)
+    for slug, advisory in advisories.items():
+        where = f"advisories[{slug}]"
+        listed = affected[slug]
+        _require(bool(listed), f"{where} is listed by no version; an advisory affects at least one release")
+        first, fixed_in = listed[0], advisory["fixed_in"]
+        expected = [v for v in ordered if _sort_key(v) >= _sort_key(first)
+                    and (fixed_in is None or _sort_key(v) < _sort_key(fixed_in))]
+        gaps = [v for v in expected if v not in listed]
+        _require(not gaps,
+                 f"{where} affects {first} and is fixed in {fixed_in or 'no release yet'}, so every "
+                 f"release in between is affected too; not listed on: {', '.join(gaps)}")
 
 
 def load_matrix(path: Path) -> dict:
@@ -285,6 +403,7 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
 
     versions = data.get("versions")
     _require(isinstance(versions, dict) and versions, "upgrade matrix needs a non-empty 'versions'")
+    advisories = _validate_advisories(data, versions, released_ceiling)
     for version, meta in versions.items():
         _string(version, "version key", pattern=_VERSION_RE)
         _require(isinstance(meta, dict), f"versions[{version}] must be an object")
@@ -303,10 +422,10 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
             _require(isinstance(meta["must_land_here"], bool),
                      f"versions[{version}].must_land_here must be a boolean")
         _validate_support(meta.get("support"), f"versions[{version}]")
-        _validate_vulnerabilities(meta, version, versions, f"versions[{version}]", released_ceiling)
-        # secure and the vulnerability list must agree. A secure version has nothing outstanding; and
-        # from _VULN_LISTED_FROM on, a version that declares itself insecure must say what is wrong
-        # with it (every such entry names a fix, so this discloses nothing unpatched).
+        _validate_vulnerabilities(meta, version, advisories, f"versions[{version}]")
+        # secure and the vulnerability list must agree. A version affected by any advisory, of any
+        # severity, is not secure -- a single low finding is still a known vulnerability. And from
+        # _VULN_LISTED_FROM on, a version that declares itself insecure must say what is wrong with it.
         secure = meta["support"]["secure"]
         listed = meta.get("vulnerabilities") or []
         _require(not (secure and listed),
@@ -316,7 +435,9 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
             _require(secure or listed,
                      f"versions[{version}] is marked support.secure=false but lists no "
                      f"vulnerabilities; from {_VULN_LISTED_FROM} on, an insecure version must name "
-                     "its known (now-fixed) vulnerabilities")
+                     "its known vulnerabilities")
+
+    _validate_advisory_coverage(advisories, versions)
 
     edges = data.get("edges")
     _require(isinstance(edges, list), "upgrade matrix needs an 'edges' list")

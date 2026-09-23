@@ -47,9 +47,10 @@ def _support(eol=False, secure=True, **extra):
 def _valid():
     """A minimal matrix that passes, as the starting point for each rejection case."""
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "about": "test fixture",
         "kinds": {"direct": "one step", "blocked": "do not"},
+        "advisories": {},
         "versions": {
             "0.1.0": {"released": "2026-01-01", "notes": "first", "support": _support()},
             "0.2.0": {"released": "2026-01-02", "notes": "second", "support": _support()},
@@ -156,8 +157,8 @@ def test_the_committed_matrix_declares_every_released_edge_direct():
 # --- rejection cases ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mutate, expected", [
-    (lambda m: m.update({"schema_version": 3}), "schema_version"),
-    (lambda m: m.update({"schema_version": "2"}), "schema_version"),
+    (lambda m: m.update({"schema_version": 4}), "schema_version"),
+    (lambda m: m.update({"schema_version": "3"}), "schema_version"),
     (lambda m: m.pop("versions"), "versions"),
     (lambda m: m.update({"versions": {}}), "versions"),
     (lambda m: m.update({"surprise": 1}), "unknown key"),
@@ -227,61 +228,273 @@ def test_validate_matrix_requires_the_release_ceiling_to_be_passed():
         um.validate_matrix(_valid())
 
 
-# --- the per-version vulnerabilities list ------------------------------------------------------
+# --- advisories, and the versions that reference them ------------------------------------------
+
+#: A canonical CVSS v4.0 base vector that scores 5.9 (medium) -- the interrupted-upload rating.
+_MEDIUM = "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N"
+#: 7.1 (high) -- the stalled-upload rating.
+_HIGH = "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N"
+#: 1.0 (low): physical access, high complexity, high privileges, a little availability.
+_LOW = "CVSS:4.0/AV:P/AC:H/AT:P/PR:H/UI:A/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N"
+
+
+def _advisory(title="A fixed issue", fixed_in="0.2.0", vector=_MEDIUM, severity="medium", **extra):
+    return {
+        "title": title,
+        "description": "Something that was wrong and is now put right.",
+        "impact": "What it let someone do.",
+        "remediation": "Upgrade.",
+        "mitigation": None,
+        "severity": severity,
+        "cvss": vector,
+        "id": None,
+        "fixed_in": fixed_in,
+        "published": "2026-01-02",
+        **extra,
+    }
+
+
+def _ref(slug="a-fixed-issue", title="A fixed issue", fixed_in="0.2.0"):
+    return {"advisory": slug, "title": title, "fixed_in": fixed_in}
+
 
 def _valid_with_vuln():
-    """A matrix whose earlier version carries one well-formed, already-fixed vulnerability."""
+    """_valid() with one well-formed advisory affecting 0.1.0, fixed in 0.2.0."""
     m = _valid()
+    m["advisories"] = {"a-fixed-issue": _advisory()}
     m["versions"]["0.1.0"]["support"] = _support(secure=False)
-    m["versions"]["0.1.0"]["vulnerabilities"] = [{
-        "title": "A fixed issue",
-        "description": "Something that was wrong and is now put right.",
-        "severity": None, "cvss": None, "id": None,
-        "fixed_in": "0.2.0", "published": "2026-01-02",
-    }]
+    m["versions"]["0.1.0"]["vulnerabilities"] = [_ref()]
     return m
 
 
-def test_a_well_formed_vulnerability_list_is_accepted():
+def _three_releases():
+    """0.1.0 -> 0.2.0 -> 0.3.0, all secure, no advisories: the base for coverage cases."""
+    m = _valid()
+    m["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
+    m["edges"].append({"from": "0.2.0", "to": "0.3.0", "kind": "direct",
+                       "reversible": True, "requires_backup": False})
+    return m
+
+
+def _reject(data, expected, ceiling=None):
+    with pytest.raises(um.UpgradeMatrixError) as caught:
+        um.validate_matrix(data, released_ceiling=ceiling)
+    assert expected in str(caught.value), f"expected {expected!r}, got {caught.value}"
+
+
+def test_a_well_formed_advisory_and_its_reference_are_accepted():
     um.validate_matrix(_valid_with_vuln(), released_ceiling=None)
 
 
+def test_an_empty_advisories_object_is_accepted_and_a_missing_one_is_not():
+    um.validate_matrix(_valid(), released_ceiling=None)
+    data = _valid()
+    del data["advisories"]
+    _reject(data, "needs an 'advisories' object")
+
+
+def test_the_previous_schema_is_refused():
+    # A schema-2 file copies full records onto every version; read as schema 3 its entries would be
+    # misunderstood, so the version is checked before anything else.
+    data = _valid()
+    data["schema_version"] = 2
+    _reject(data, "schema_version must be 3")
+
+
 @pytest.mark.parametrize("mutate, expected", [
-    (lambda v: v.update({"surprise": 1}), "unknown key"),
-    (lambda v: v.pop("title"), "missing required key"),
-    (lambda v: v.pop("fixed_in"), "missing required key"),
-    (lambda v: v.pop("severity"), "missing required key"),
+    (lambda a: a.update({"surprise": 1}), "unknown key"),
+    (lambda a: a.pop("title"), "missing required key"),
+    (lambda a: a.pop("impact"), "missing required key"),
+    (lambda a: a.pop("remediation"), "missing required key"),
+    (lambda a: a.pop("mitigation"), "missing required key"),
+    (lambda a: a.pop("severity"), "missing required key"),
+    (lambda a: a.pop("cvss"), "missing required key"),
+    (lambda a: a.pop("fixed_in"), "missing required key"),
+    (lambda a: a.update({"impact": ""}), "must not be empty"),
+    (lambda a: a.update({"remediation": "   "}), "must not be empty"),
     # An escape sequence in a string that the host tool prints raw on a terminal.
-    (lambda v: v.update({"title": "bad\x1b[31mred\x1b[0m"}), "non-printable"),
-    (lambda v: v.update({"description": "line\nbreak"}), "non-printable"),
-    (lambda v: v.update({"severity": "severe"}), "severity must be null or one of"),
-    (lambda v: v.update({"cvss": 11}), "cvss must be null or a number"),
-    (lambda v: v.update({"cvss": True}), "cvss must be null or a number"),  # a bool is not a number
-    (lambda v: v.update({"fixed_in": "9.9.9"}), "not a declared version"),
-    (lambda v: v.update({"fixed_in": "0.1.0"}), "later than"),   # cannot be fixed in its own version
-    (lambda v: v.update({"published": "soon"}), "malformed"),
+    (lambda a: a.update({"title": "bad\x1b[31mred\x1b[0m"}), "non-printable"),
+    (lambda a: a.update({"description": "line\nbreak"}), "non-printable"),
+    (lambda a: a.update({"impact": "bell\x07"}), "non-printable"),
+    (lambda a: a.update({"remediation": "tab\there"}), "non-printable"),
+    (lambda a: a.update({"mitigation": "\x1b]0;title\x07"}), "non-printable"),
+    (lambda a: a.update({"id": "GHSA\x1b[2J"}), "non-printable"),
+    (lambda a: a.update({"published": "soon"}), "malformed"),
+    (lambda a: a.update({"fixed_in": "9.9.9"}), "not a declared version"),
 ])
-def test_the_validator_rejects_a_bad_vulnerability(mutate, expected):
+def test_the_validator_rejects_a_bad_advisory(mutate, expected):
+    data = _valid_with_vuln()
+    mutate(data["advisories"]["a-fixed-issue"])
+    _reject(data, expected)
+
+
+def test_an_advisory_key_must_be_a_slug():
+    data = _valid_with_vuln()
+    data["advisories"] = {"Not A Slug": data["advisories"]["a-fixed-issue"]}
+    _reject(data, "advisory key is malformed")
+
+
+# --- the rating: a CVSS v4.0 base vector, and the band it scores to ------------------------------
+
+@pytest.mark.parametrize("vector, expected", [
+    ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "starts with 'CVSS:4.0/'"),
+    ("AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N", "starts with 'CVSS:4.0/'"),
+    # a base metric missing, and one extra (threat/environmental metrics belong to the operator)
+    ("CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N", "exactly the 11 base metrics"),
+    ("CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N/E:A", "exactly the 11 base metrics"),
+    # the specification's order, so one rating has one spelling
+    ("CVSS:4.0/AC:L/AV:N/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N", "metric 1 of a CVSS v4.0 base vector is AV"),
+    ("CVSS:4.0/AV:X/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N", "AV must be one of"),
+    ("CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:S/SA:N", "SI must be one of"),
+    ("CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI/SA:N", "metric 10 of a CVSS v4.0 base vector is SI"),
+    (7.5, "must be a string"),   # the schema-2 numeric score is not a vector
+])
+def test_a_malformed_vector_is_rejected(vector, expected):
+    data = _valid_with_vuln()
+    data["advisories"]["a-fixed-issue"]["cvss"] = vector
+    _reject(data, expected)
+
+
+def test_the_band_is_derived_from_the_vector_not_chosen():
+    # The vector scores 5.9 (medium). Stating "high" beside it is the drift this rule exists to stop;
+    # the error names the score so the author can see which of the two is wrong.
+    data = _valid_with_vuln()
+    data["advisories"]["a-fixed-issue"]["severity"] = "high"
+    _reject(data, "the vector scores 5.9 (medium), got 'high'")
+
+
+@pytest.mark.parametrize("vector, band", [(_LOW, "low"), (_MEDIUM, "medium"), (_HIGH, "high"),
+    ("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", "critical")])
+def test_each_band_is_accepted_beside_a_vector_that_scores_to_it(vector, band):
+    data = _valid_with_vuln()
+    data["advisories"]["a-fixed-issue"].update({"cvss": vector, "severity": band})
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def test_an_unrated_advisory_leaves_both_null_and_is_still_a_vulnerability():
+    data = _valid_with_vuln()
+    data["advisories"]["a-fixed-issue"].update({"cvss": None, "severity": None})
+    um.validate_matrix(data, released_ceiling=None)
+    # ...and a band with no vector is a band chosen by hand.
+    data["advisories"]["a-fixed-issue"]["severity"] = "low"
+    _reject(data, "with no cvss vector")
+
+
+def test_a_vector_with_no_impact_is_not_a_vulnerability():
+    data = _valid_with_vuln()
+    data["advisories"]["a-fixed-issue"].update({
+        "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N", "severity": "none"})
+    _reject(data, "scores 0.0")
+
+
+# --- the rule the user named: one finding of any severity makes a version insecure ---------------
+
+@pytest.mark.parametrize("vector, band", [(_LOW, "low"), (None, None)])
+def test_a_secure_version_may_not_be_affected_by_even_one_low_or_unrated_advisory(vector, band):
+    data = _valid_with_vuln()
+    data["advisories"]["a-fixed-issue"].update({"cvss": vector, "severity": band})
+    data["versions"]["0.1.0"]["support"] = _support(secure=True)
+    _reject(data, "marked support.secure but lists 1 vulnerability")
+
+
+# --- references ------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mutate, expected", [
+    (lambda r: r.update({"description": "copied"}), "unknown key"),
+    (lambda r: r.pop("advisory"), "missing required key"),
+    (lambda r: r.pop("title"), "missing required key"),
+    (lambda r: r.pop("fixed_in"), "missing required key"),
+    (lambda r: r.update({"advisory": "no-such-advisory"}), "which 'advisories' does not declare"),
+    (lambda r: r.update({"advisory": "Bad Slug"}), "malformed"),
+    # title and fixed_in are what an older reader shows, so they must be the advisory's exactly
+    (lambda r: r.update({"title": "A fixed issue."}), "title must repeat advisories[a-fixed-issue].title"),
+    (lambda r: r.update({"fixed_in": "0.1.0"}), "fixed_in must repeat advisories[a-fixed-issue].fixed_in"),
+])
+def test_the_validator_rejects_a_bad_reference(mutate, expected):
     data = _valid_with_vuln()
     mutate(data["versions"]["0.1.0"]["vulnerabilities"][0])
-    with pytest.raises(um.UpgradeMatrixError) as caught:
-        um.validate_matrix(data, released_ceiling=None)
-    assert expected in str(caught.value), f"expected {expected!r}, got {caught.value}"
+    _reject(data, expected)
 
 
 def test_a_vulnerabilities_value_that_is_not_a_list_is_rejected():
     data = _valid_with_vuln()
-    data["versions"]["0.1.0"]["vulnerabilities"] = {"title": "not in a list"}
-    with pytest.raises(um.UpgradeMatrixError, match="must be a list"):
-        um.validate_matrix(data, released_ceiling=None)
+    data["versions"]["0.1.0"]["vulnerabilities"] = {"advisory": "a-fixed-issue"}
+    _reject(data, "must be a list")
 
 
-def test_a_secure_version_may_not_list_vulnerabilities():
+def test_a_version_lists_an_advisory_once():
     data = _valid_with_vuln()
-    data["versions"]["0.1.0"]["support"] = _support(secure=True)  # secure but still listing one
-    with pytest.raises(um.UpgradeMatrixError, match="marked support.secure but lists"):
-        um.validate_matrix(data, released_ceiling=None)
+    data["versions"]["0.1.0"]["vulnerabilities"].append(_ref())
+    _reject(data, "lists advisory a-fixed-issue a second time")
 
+
+def test_a_release_cannot_be_affected_by_an_issue_fixed_in_it():
+    data = _valid_with_vuln()
+    data["versions"]["0.2.0"]["support"] = _support(secure=False)
+    data["versions"]["0.2.0"]["vulnerabilities"] = [_ref()]
+    _reject(data, "must be a version later than 0.2.0")
+
+
+# --- coverage: an advisory affects an unbroken run of releases ------------------------------------
+
+def test_an_advisory_affects_every_release_up_to_its_fix():
+    data = _three_releases()
+    data["advisories"] = {"a-fixed-issue": _advisory(fixed_in="0.3.0")}
+    for ver in ("0.1.0", "0.2.0"):
+        data["versions"][ver]["support"] = _support(secure=False)
+        data["versions"][ver]["vulnerabilities"] = [_ref(fixed_in="0.3.0")]
+    um.validate_matrix(data, released_ceiling=None)
+    # Forget 0.2.0 and an operator running it is told nothing.
+    data["versions"]["0.2.0"]["vulnerabilities"] = []
+    data["versions"]["0.2.0"]["support"] = _support(secure=True)
+    _reject(data, "not listed on: 0.2.0")
+
+
+def test_an_advisory_no_version_lists_is_rejected():
+    data = _valid_with_vuln()
+    data["advisories"]["an-orphan"] = _advisory(title="Orphan")
+    _reject(data, "advisories[an-orphan] is listed by no version")
+
+
+# --- an advisory with no fix yet ------------------------------------------------------------------
+
+def _unfixed(mitigation="Turn the feature off until the fix ships."):
+    """_three_releases() with an unfixed advisory introduced in 0.2.0 and still present in 0.3.0."""
+    data = _three_releases()
+    data["advisories"] = {"not-fixed-yet": _advisory(title="Not fixed yet", fixed_in=None,
+                                                       mitigation=mitigation)}
+    for ver in ("0.2.0", "0.3.0"):
+        data["versions"][ver]["support"] = _support(secure=False)
+        data["versions"][ver]["vulnerabilities"] = [
+            _ref(slug="not-fixed-yet", title="Not fixed yet", fixed_in=None)]
+    return data
+
+
+def test_an_unfixed_advisory_is_accepted_with_a_mitigation():
+    # Including below a release ceiling: there is no fix for the ceiling to bound.
+    um.validate_matrix(_unfixed(), released_ceiling="0.3.0")
+
+
+def test_an_unfixed_advisory_without_a_mitigation_is_rejected():
+    # With nothing for an operator to do, publishing an unpatched issue would only help an attacker.
+    _reject(_unfixed(mitigation=None), "has no fix (fixed_in null) and no mitigation")
+
+
+def test_an_unfixed_advisory_runs_to_the_newest_release():
+    data = _unfixed()
+    data["versions"]["0.3.0"]["vulnerabilities"] = []
+    data["versions"]["0.3.0"]["support"] = _support(secure=True)
+    _reject(data, "fixed in no release yet, so every release in between is affected too; "
+                  "not listed on: 0.3.0")
+
+
+def test_an_unfixed_advisory_makes_the_newest_release_insecure():
+    data = _unfixed()
+    data["versions"]["0.3.0"]["support"] = _support(secure=True)
+    _reject(data, "versions[0.3.0] is marked support.secure but lists 1")
+
+
+# --- secure/insecure and the itemisation rule (unchanged behaviour) -------------------------------
 
 def _matrix_reaching_0_29_0():
     """_valid() extended with 0.28.0 (insecure) and 0.29.0, and the edges that reach them."""
@@ -300,15 +513,13 @@ def _matrix_reaching_0_29_0():
 def test_an_insecure_version_from_0_28_0_on_must_name_its_vulnerabilities():
     # 0.28.0 is insecure with no list: from 0.28.0 on that is a validation error, so the file cannot
     # silently declare a release unsafe without saying what is wrong (and how to escape it).
-    with pytest.raises(um.UpgradeMatrixError, match="must name its known"):
-        um.validate_matrix(_matrix_reaching_0_29_0(), released_ceiling=None)
+    _reject(_matrix_reaching_0_29_0(), "must name its known")
 
 
 def test_such_a_version_validates_once_it_lists_a_fixed_vulnerability():
     data = _matrix_reaching_0_29_0()
-    data["versions"]["0.28.0"]["vulnerabilities"] = [{
-        "title": "t", "description": "d", "severity": None, "cvss": None, "id": None,
-        "fixed_in": "0.29.0", "published": "2026-09-16"}]
+    data["advisories"] = {"t": _advisory(title="t", fixed_in="0.29.0")}
+    data["versions"]["0.28.0"]["vulnerabilities"] = [_ref(slug="t", title="t", fixed_in="0.29.0")]
     um.validate_matrix(data, released_ceiling=None)
 
 
@@ -323,14 +534,12 @@ def test_an_insecure_version_before_0_28_0_need_not_itemise():
 def _matrix_with_a_fix_in_the_newest_version():
     """0.28.0 and 0.29.0 are insecure and each name a later fix; 0.30.0 is the newest and secure."""
     m = _valid()
+    m["advisories"] = {"a": _advisory(title="a", fixed_in="0.29.0"),
+                       "b": _advisory(title="b", fixed_in="0.30.0")}
     m["versions"]["0.28.0"] = {"released": "2026-09-04", "notes": "x", "support": _support(secure=False),
-                               "vulnerabilities": [{"title": "a", "description": "d", "severity": None,
-                                                    "cvss": None, "id": None, "fixed_in": "0.29.0",
-                                                    "published": "2026-09-15"}]}
+                               "vulnerabilities": [_ref(slug="a", title="a", fixed_in="0.29.0")]}
     m["versions"]["0.29.0"] = {"released": "2026-09-15", "notes": "y", "support": _support(secure=False),
-                               "vulnerabilities": [{"title": "b", "description": "d", "severity": None,
-                                                    "cvss": None, "id": None, "fixed_in": "0.30.0",
-                                                    "published": "2026-09-20"}]}
+                               "vulnerabilities": [_ref(slug="b", title="b", fixed_in="0.30.0")]}
     m["versions"]["0.30.0"] = {"released": "2026-09-20", "notes": "z", "support": _support(secure=True)}
     m["edges"] += [
         {"from": "0.2.0", "to": "0.28.0", "kind": "direct", "reversible": True, "requires_backup": False},
@@ -341,11 +550,10 @@ def _matrix_with_a_fix_in_the_newest_version():
 
 
 def test_a_fix_in_an_unreleased_version_is_rejected_below_the_ceiling():
-    # 0.29.0 names 0.30.0 as its fix. With the newest released version at 0.29.1, 0.30.0 does not
-    # exist yet -- listing it would disclose an unpatched issue -- so validation is refused.
-    data = _matrix_with_a_fix_in_the_newest_version()
-    with pytest.raises(um.UpgradeMatrixError, match="names 0.30.0 as the fix but the newest released"):
-        um.validate_matrix(data, released_ceiling="0.29.1")
+    # b names 0.30.0 as its fix. With the newest released version at 0.29.1, 0.30.0 does not exist
+    # yet -- listing it would disclose an unpatched issue -- so validation is refused.
+    _reject(_matrix_with_a_fix_in_the_newest_version(),
+            "names 0.30.0 as the fix but the newest released", ceiling="0.29.1")
 
 
 def test_the_same_fix_is_accepted_once_its_version_is_released():
@@ -367,10 +575,9 @@ _VULNS_FIXED_IN_0_29_1 = {
 
 def test_the_committed_matrix_holds_its_vulnerability_invariants():
     # Durable invariants of the COMMITTED docs/upgrade-matrix.json (never a fixture), so this survives
-    # every future release commit instead of snapshotting one release's state (the 0.29.1 snapshot it
-    # replaced broke the moment 0.30.0 added more entries and flipped 0.29.1 to secure=false).
+    # every future release commit instead of snapshotting one release's state.
     data = um.load_matrix(MATRIX_PATH)
-    versions = data["versions"]
+    versions, advisories = data["versions"], data["advisories"]
 
     # (a) MEMBERSHIP: 0.28.0 and 0.29.0 each still list the 0.29.1-era titles, fixed_in 0.29.1.
     for ver in ("0.28.0", "0.29.0"):
@@ -379,29 +586,37 @@ def test_the_committed_matrix_holds_its_vulnerability_invariants():
             assert title in by_title, f"{ver} no longer lists the 0.29.1-fixed defect {title!r}"
             assert by_title[title]["fixed_in"] == "0.29.1", f"{ver}:{title!r} must be fixed_in 0.29.1"
 
-    # (b) FIXED_IN STRICTLY LATER, over EVERY version: the release that fixes a defect never lists it,
-    # and a fixed_in typo that marks a version as its own fix is caught.
+    # (b) FIXED_IN STRICTLY LATER, over EVERY version: the release that fixes a defect never lists it.
     for ver, meta in versions.items():
         for v in (meta.get("vulnerabilities") or []):
-            assert um._sort_key(v["fixed_in"]) > um._sort_key(ver), (
-                f"{ver} lists {v['title']!r} with fixed_in={v['fixed_in']}, "
-                f"which is not strictly later than {ver}")
+            if v["fixed_in"] is not None:
+                assert um._sort_key(v["fixed_in"]) > um._sort_key(ver), (
+                    f"{ver} lists {v['title']!r} with fixed_in={v['fixed_in']}, "
+                    f"which is not strictly later than {ver}")
 
-    # (c) SECURE DERIVED: any version carrying a vulnerability entry reads support.secure false. A
-    # version carrying none is NOT asserted either way (old/EOL releases are insecure for other
-    # reasons, and a secure release simply lists nothing).
+    # (c) SECURE DERIVED: any version carrying a vulnerability entry reads support.secure false.
     for ver, meta in versions.items():
         if meta.get("vulnerabilities"):
             assert meta["support"]["secure"] is False, (
                 f"{ver} lists vulnerabilities but is marked support.secure true")
 
-    # (d) SHAPE: every entry carries id / severity / cvss keys, all null (the shape all entries follow
-    # today), so a stray extra field or a missing key still fails.
+    # (d) ONE RECORD PER FINDING: what an older reader sees on each version (title, fixed_in) is the
+    # advisory's own, so the two can never tell an operator different things.
     for ver, meta in versions.items():
         for v in (meta.get("vulnerabilities") or []):
-            for key in ("id", "severity", "cvss"):
-                assert key in v, f"{ver}:{v.get('title')!r} is missing the {key!r} key"
-                assert v[key] is None, f"{ver}:{v.get('title')!r} has a non-null {key}"
+            advisory = advisories[v["advisory"]]
+            assert (v["title"], v["fixed_in"]) == (advisory["title"], advisory["fixed_in"]), (
+                f"{ver}:{v['advisory']} disagrees with its advisory")
+
+
+def test_the_committed_matrix_stays_well_inside_what_its_readers_will_read():
+    # Readers cap what they fetch (the validator at MAX_BYTES; deployed tools and apps at their own
+    # limits) and fall back SILENTLY when the file is larger -- losing every advisory with it. Storing
+    # each finding once is what keeps the file from growing by a full record per affected release.
+    # Half the validator's cap leaves room for years of releases; hitting this means rethinking, not
+    # raising, the limit.
+    size = MATRIX_PATH.stat().st_size
+    assert size < um.MAX_BYTES // 2, f"docs/upgrade-matrix.json is {size} bytes"
 
 
 def test_the_shapes_a_real_non_trivial_upgrade_will_need_are_accepted():
