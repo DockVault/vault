@@ -25,6 +25,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The release gate's image scan, on this exact commit and in parallel with the suites: it fails on
+  # every High/Critical finding the reviewed VEX does not cover, whether or not a fix exists. A green
+  # run on a release candidate therefore means the publish-time scan will pass too, and a new CVE is
+  # decided before the release reaches main. Skipped on pull requests, whose own image-scan workflow
+  # deliberately blocks only on findings a dependency bump could fix.
+  image-scan:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/image-scan-pr.yml
+    with:
+      release_policy: true
+    permissions:
+      contents: read
   preflight:
     uses: ./.github/workflows/preflight.yml
     with:

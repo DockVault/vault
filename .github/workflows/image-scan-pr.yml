@@ -10,11 +10,16 @@ name: Image scan (PR)
 # amd64 only: the runner builds it natively, so this stays fast. arm64 would need QEMU emulation
 # for little added signal on a pre-merge gate; the release scans arm64 at publish time.
 #
-# Policy: only-fixed. This gate fails only on High/Critical findings that have an available fix --
-# the ones a pull-request author can actually remediate by bumping. A base-image or dependency CVE
-# with no upstream fix yet is not something a PR can resolve, so it does not block here; the
-# release-time scan, with its reviewed OpenVEX, is the backstop that decides such findings
-# consciously. The reviewed VEX is still applied here so already-accepted findings never block.
+# Policy on a pull request: only-fixed. This gate fails only on High/Critical findings that have an
+# available fix -- the ones a pull-request author can actually remediate by bumping. A base-image or
+# dependency CVE with no upstream fix yet is not something a PR can resolve, so it does not block
+# here. The reviewed VEX is still applied so already-accepted findings never block.
+#
+# Called with `release_policy: true` (the Tests workflow does, on every run that is not a pull
+# request) it applies the RELEASE gate's policy instead: every High/Critical finding the reviewed VEX
+# does not cover fails, fixed or not. That is the scan a release must pass to publish, so running it
+# on a candidate before it reaches main means a finding with no fix is decided -- remediated or
+# reviewed into the VEX -- before the release's advisories are public, not after.
 
 on:
   pull_request:
@@ -32,18 +37,32 @@ on:
       - "security/**"
       - ".github/workflows/image-scan-pr.yml"
       - ".github/scripts/render_release_vex.py"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      release_policy:
+        description: Fail on every High/Critical finding the reviewed VEX does not cover, fixed or not
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_policy:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Prefixed: called from another workflow, github.workflow is the CALLER's name, and an unprefixed
+  # group could collide with (and cancel) a group the caller itself uses.
+  group: image-scan-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   scan:
-    name: Build and scan (amd64)
+    name: ${{ inputs.release_policy && 'Build and scan (amd64, release policy)' || 'Build and scan (amd64)' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -88,5 +107,6 @@ jobs:
           grype-version: v0.112.0
           fail-build: true
           severity-cutoff: high
-          only-fixed: true
+          # On a pull request `inputs` is empty, so this is only-fixed; the release policy turns it off.
+          only-fixed: ${{ inputs.release_policy && 'false' || 'true' }}
           vex: pr-scan-amd64.openvex.json

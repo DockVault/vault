@@ -33,6 +33,14 @@ The release gate fails for every unexcepted vulnerability at `high` or `critical
 whether or not the feed advertises a fix. There is no blanket `only-fixed` bypass or global Grype
 ignore file.
 
+The same policy runs before a release reaches `main`: the Tests workflow builds the image for the
+commit under test and scans it with the release gate's rules on every run that is not a pull request
+— pushes to `main`, a manual run on a release candidate, and the release's own call. A finding
+published after the last release, with no fix yet, therefore fails the candidate's Tests run and is
+decided (remediated, or reviewed into the VEX below) before the release's advisories are public. On
+a pull request the image-scan workflow blocks only on findings that have a fix, the ones a
+dependency bump can resolve.
+
 The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from
 CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the 3.14 backports for
 `CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build checks the vendored file

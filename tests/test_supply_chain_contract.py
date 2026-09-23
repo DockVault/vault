@@ -617,3 +617,36 @@ def test_dependabot_covers_every_dependency_location():
         'package-ecosystem: "docker-compose"\n    directory: "/deploy"' in _DEPENDABOT
     )
     assert 'package-ecosystem: "github-actions"\n    directory: "/"' in _DEPENDABOT
+
+
+def test_every_non_pr_tests_run_applies_the_release_scan_policy():
+    """A release candidate's Tests run must fail on a finding the publish-time scan would refuse.
+
+    The pull-request image scan blocks only on findings that have a fix (only-fixed), which is right
+    for a PR author and wrong for a release: a CVE with no fix yet passes it and then stops the
+    publish, after the release's advisories are already public on main. The Tests workflow therefore
+    runs the image scan with the release gate's policy on every run that is not a pull request.
+    """
+    import yaml
+
+    tests = yaml.safe_load((_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8"))
+    job = tests["jobs"]["image-scan"]
+    assert job["uses"] == "./.github/workflows/image-scan-pr.yml"
+    assert job["with"] == {"release_policy": True}
+    assert job["if"] == "github.event_name != 'pull_request'"
+    assert "needs" not in job                              # in parallel with the suites, not after
+    assert job["permissions"] == {"contents": "read"}
+
+    scan = yaml.safe_load((_ROOT / ".github" / "workflows" / "image-scan-pr.yml").read_text(encoding="utf-8"))
+    triggers = scan[True]                                   # YAML reads the bare key `on` as True
+    for trigger in ("workflow_call", "workflow_dispatch"):
+        policy = triggers[trigger]["inputs"]["release_policy"]
+        assert policy["type"] == "boolean" and policy["default"] is False
+    grype = [s for s in scan["jobs"]["scan"]["steps"] if s.get("uses", "").startswith("anchore/scan-action@")]
+    assert len(grype) == 1
+    options = grype[0]["with"]
+    # The release policy turns only-fixed OFF; a pull request (empty inputs) keeps it on.
+    assert options["only-fixed"] == "${{ inputs.release_policy && 'false' || 'true' }}"
+    assert options["severity-cutoff"] == "high" and options["fail-build"] is True
+    assert options["vex"]                                   # reviewed exceptions still apply
+    assert scan["concurrency"]["group"].startswith("image-scan-")
