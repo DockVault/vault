@@ -29,30 +29,30 @@ def _init_upload_src():
     return s[start:s.index("\n@app.", start)]
 
 
-def test_web_upload_init_refuses_a_name_a_live_sftp_upload_holds():
+def test_web_upload_init_takes_the_same_name_lock_every_door_shares():
+    # The web upload no longer just LOOKS for an SFTP holder: it takes the lock itself, so an SFTP
+    # upload (and another member's web upload) is refused while it is live. The whole contract of
+    # that lock -- where each door takes it, keeps it and drops it -- is test_same_name_lock_wiring.
     body = _init_upload_src()
-    seg = body[body.index("WEB-vs-SFTP same-name guard"):]
-    assert "upload_marker" in seg and "holder(vault_id, folder_uuid, body.file_name)" in seg
+    assert "holder(vault_id, folder_uuid, body.file_name)" not in body
     # Standard vaults only, and only when a plaintext name is present.
-    assert "if not is_zk and body.file_name:" in body
-    # A live holder (str) -> 409 naming the member with the member-grade wording.
-    assert "isinstance(_holder, str)" in seg
-    assert "is currently being uploaded by" in seg
-    assert "status.HTTP_409_CONFLICT" in seg
+    assert body.count("if not is_zk and body.file_name:") == 2
+    assert body.count("_web_upload_name_lock(db, vault_id, folder_uuid, body.file_name, current_user,") == 2
 
 
-def test_the_guard_is_fail_open_and_member_grade():
-    body = _init_upload_src()
-    seg = body[body.index("WEB-vs-SFTP same-name guard"):]
-    # holder() returns SKIPPED on an outage (not a str) -> the isinstance(str) refusal is skipped ->
-    # the upload proceeds. The comment states fail-open; the code shape enforces it.
-    assert "fail-OPEN" in seg
-    # The holder is named by the ONE rule both doors share (upload_marker.holder_display_name: the
+def test_the_lock_refusal_is_fail_open_and_member_grade():
+    s = API.read_text(encoding="utf-8")
+    start = s.index("def _web_upload_name_lock(")
+    helper = s[start:s.index("\ndef ", start + 1)]
+    # claim() returns SKIPPED on an outage (not a str) -> the isinstance(str) refusal is skipped ->
+    # the upload proceeds. The docstring states fail-open; the code shape enforces it.
+    assert "Fail-OPEN" in helper and "isinstance(held, str)" in helper
+    assert "is currently being uploaded by" in helper and "status.HTTP_409_CONFLICT" in helper
+    # The holder is named by the ONE rule every door shares (upload_marker.holder_display_name: the
     # username only to a member-grade viewer, "another member" to a scoped credential, never an
-    # email) -- this site no longer looks the name up itself. The rule's behaviour is pinned beside
-    # it in test_upload_marker.py.
-    assert "_um.holder_display_name(db, _holder, current_user, vault_id)" in seg
-    assert 'getattr(_u, "username"' not in seg
+    # email). The rule's behaviour is pinned beside it in test_upload_marker.py.
+    assert "_um.holder_display_name(db, held, current_user, vault_id)" in helper
+    assert 'getattr(_u, "username"' not in helper
 
 
 def test_the_client_refuses_a_legacy_zk_whole_file_encrypt_above_the_threshold():
@@ -465,6 +465,10 @@ const pick = async (rowExtra, zk, fileNames) => {
     heldBy.length = 0; await pick({ status: 'paused' }); out.heldByUpload = heldBy.slice();
     state.currentFiles = [{ type: 'file', name: 'X', id: 'F' }];
     heldBy.length = 0; out.committed = await pick(null); out.heldByFile = heldBy.slice();
+    // SOMEONE ELSE'S upload, which the listing shows as a row in progress: the name is taken, so the
+    // question is asked -- but as an upload, not a file, and "replace" never aims at its synthetic id.
+    state.currentFiles = [{ type: 'file', name: 'X', id: 'upload:abc', in_progress: true, uploading_by: 'bob' }];
+    heldBy.length = 0; out.othersInFlight = await pick(null); out.heldByOthersInFlight = heldBy.slice();
     // "KEEP BOTH" on a zero-knowledge vault: the first free name in the clear is one a restored row
     // already holds by index, so the NEXT one is offered.
     state.currentFiles = [{ type: 'file', name: 'report.pdf', id: 'F' }]; answer = 'autorename'; offered.length = 0;
@@ -514,6 +518,11 @@ const pick = async (rowExtra, zk, fileNames) => {
     # (mutation: always say 'file' -> red.)
     assert out["heldByUpload"] == ["upload"] and out["heldByFile"] == ["file"]
     assert out["committed"]["replaces"] == [{"deleteId": "F", "known": {"sessions": [], "items": []}}]
+    # (mutation: count in-progress rows in idByName again -> deleteId 'upload:abc', held by 'file' -> red.)
+    assert out["othersInFlight"] == {"asked": ["X"], "names": ["X"],
+                                     "replaces": [{"deleteId": None, "known": {"sessions": [], "items": []}}]}, \
+        out["othersInFlight"]
+    assert out["heldByOthersInFlight"] == ["upload"]
     # (mutation: choose the "keep both" name against the names in the clear only -> 'report - 1.pdf',
     # which the restored row holds -> red.)
     assert out["offered"] == ["report - 2.pdf"] and out["keepBoth"]["names"] == ["report - 2.pdf"], out

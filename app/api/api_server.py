@@ -16089,6 +16089,10 @@ async def list_vault_files(
                             _m_names[str(_uid)] = _uname
                 _now_iso = datetime.utcnow().isoformat()
                 for _r in _marker_rows:
+                    # The viewer's OWN browser upload is in their upload tray already; listing it as a
+                    # locked row too would put their own upload in their way. Everyone else's shows.
+                    if _r.get("web") and _r.get("member_id") == str(current_user.id):
+                        continue
                     try:
                         _final = _dec_marker(vault_id, folder_uuid, _r["enc_name"])
                     except Exception:  # noqa: BLE001 -- a marker that won't decrypt here is skipped
@@ -16542,10 +16546,25 @@ async def upload_file(
             )
 
             _op_ok = False  # set True only after the file is fully committed (drives complete_operation)
+            # The same-name lock every upload door takes, held for this one file's write. A direct
+            # upload never takes over anything (web=False): it is refused while ANY other upload of the
+            # name is live -- an SFTP upload, another member's, or this member's own browser upload.
+            _direct_lock = "direct-%s" % operation_id
+            _direct_locked = False
 
             # Per-file teardown: the progress record and the operation entry. The transfer slot
             # and the space reservation belong to the request, and are released at the end of it.
             try:
+                from app.core import upload_marker as _um
+                _held = _um.claim(vault_id, folder_uuid, upload_file.filename, current_user.id,
+                                  _direct_lock, web=False)
+                if isinstance(_held, str):
+                    _who = _um.holder_display_name(db, _held, current_user, vault_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"'{upload_file.filename}' is currently being uploaded by {_who}")
+                _direct_locked = _held is None
+
                 # Same-name policy = replace; reject up front if the uploader can't.
                 _reject_unreplaceable_upload(db, vault_id, folder_uuid, upload_file.filename, current_user)
 
@@ -16815,7 +16834,11 @@ async def upload_file(
                 )
                     
             finally:
-                
+
+                # The name is the file list's from here, landed or not: never this request's any more.
+                if _direct_locked:
+                    _um.remove(vault_id, folder_uuid, upload_file.filename, _direct_lock)
+
                 # Mark the Redis progress record complete + clear it (it was never completed before, so
                 # every finished/failed upload used to leave a dangling operation:* record until TTL).
                 # Best-effort: cleanup must never fail the request.
@@ -17338,6 +17361,43 @@ class ChunkedUploadInit(BaseModel):
     name_bi_candidates: Optional[List[str]] = Field(None, max_length=64)
 
 
+def _web_upload_lock_token(session_id) -> str:
+    """The same-name lock token a resumable web upload holds its name with: its session, so every
+    request of that upload -- opening, each chunk, the commit, a cancel -- is the same holder."""
+    return "web-%s" % session_id
+
+
+def _web_upload_name_lock(db, vault_id, folder_uuid, file_name, current_user, session_id):
+    """Take, or keep, the same-name lock for a Standard web upload session, or refuse with a 409.
+
+    The lock SFTP uploads already take (upload_marker): while this upload is live, an SFTP upload of
+    the same name into the same folder is refused, and so is a web upload of it by ANOTHER member.
+    Between one account's own browser uploads the uploader's tray decides, so its own earlier web
+    upload is taken over, not refused. Fail-OPEN: with Redis down nothing is locked and the upload
+    proceeds -- an outage must never block an upload. The holder is named by the ONE rule every door
+    uses (upload_marker.holder_display_name): the username only to a member-grade viewer."""
+    from app.core import upload_marker as _um
+    token = _web_upload_lock_token(session_id)
+    held = _um.claim(vault_id, folder_uuid, file_name, current_user.id, token)
+    if isinstance(held, str):
+        who = _um.holder_display_name(db, held, current_user, vault_id)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"'{file_name}' is currently being uploaded by {who}")
+    return token
+
+
+def _release_web_upload_name(vault_id, folder_ids, file_name, session_id) -> None:
+    """Drop this web upload's same-name lock, wherever it may be held (the folder it was opened into,
+    and the one it committed to when that folder was gone). Token-checked, so it never frees a lock
+    that has become another upload's. Best-effort: a teardown never fails over it."""
+    if not file_name:
+        return
+    from app.core import upload_marker as _um
+    token = _web_upload_lock_token(session_id)
+    for folder_id in dict.fromkeys(folder_ids):
+        _um.remove(vault_id, folder_id, file_name, token)
+
+
 @app.post("/vaults/{vault_id}/uploads")
 @require_endpoint_permission("FILE_UPLOAD")
 @require_vault_cap("file.upload")
@@ -17456,22 +17516,8 @@ async def init_chunked_upload(
     # A scoped credential may only start an upload into an in-scope folder (root => denied).
     require_folder_scope(db, current_user, vault_id, body.folder_id)
 
-    # WEB-vs-SFTP same-name guard: refuse a web upload of a name a live SFTP upload is currently
-    # streaming into this same (vault, folder), the mirror of the SFTP-side lock -- so the two doors
-    # cannot both be writing the same final name at once. Standard vaults only (SFTP never serves
-    # zero-knowledge, and a ZK name is server-invisible so there is nothing to compare). Best-effort
-    # and fail-OPEN: with Redis down holder() returns SKIPPED and the upload proceeds -- an outage
-    # must never block an upload. The holder is named by the ONE rule both doors use
-    # (upload_marker.holder_display_name): the username only to a member-grade viewer, "another
-    # member" to a scoped credential. This site used to name the username to ANY caller.
-    if not is_zk and body.file_name:
-        from app.core import upload_marker as _um
-        _holder = _um.holder(vault_id, folder_uuid, body.file_name)
-        if isinstance(_holder, str):
-            _who = _um.holder_display_name(db, _holder, current_user, vault_id)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"'{body.file_name}' is currently being uploaded by {_who}")
+    # The same-name lock is taken below, once the session this request opens or continues is known,
+    # and only after every other refusal: see _web_upload_name_lock.
 
     now = datetime.utcnow()
     # Resume: reuse an active session for the same file if present. Standard vaults match
@@ -17571,6 +17617,10 @@ async def init_chunked_upload(
                 "message": ("An earlier attempt at this file is still in progress. Resume "
                             "that one, or discard it before starting again."),
             })
+        # Continuing: take the name back (a pause may have outlasted the lock), unless another
+        # member's upload, or an SFTP upload, has it now.
+        if not is_zk and body.file_name:
+            _web_upload_name_lock(db, vault_id, folder_uuid, body.file_name, current_user, session.id)
 
     if session is None:
         if is_zk:
@@ -17654,6 +17704,11 @@ async def init_chunked_upload(
         # ChunkedUploadSession.id defaults at flush (None at construction), so the seal cannot be
         # computed after the fact.
         _sid = uuid.uuid4()
+        # The name, for this new session, taken last: every refusal above leaves no lock behind.
+        _name_locked = False
+        if not is_zk and body.file_name:
+            _web_upload_name_lock(db, vault_id, folder_uuid, body.file_name, current_user, _sid)
+            _name_locked = True
         if is_zk:
             # Zero-knowledge: the client sent the browser-encrypted name in enc_name/enc_mime + its
             # own blind index; the server never sees the plaintext, so plaintext columns stay NULL.
@@ -17698,8 +17753,14 @@ async def init_chunked_upload(
             # finalize). Recorded only on a fresh session; a resumed one keeps its original.
             zk_key_version=body.zk_key_version,
         )
-        db.add(session)
-        db.commit()
+        try:
+            db.add(session)
+            db.commit()
+        except Exception:
+            # No session came of it, so nothing may hold the name in its place.
+            if _name_locked:
+                _release_web_upload_name(vault_id, [folder_uuid], body.file_name, _sid)
+            raise
         db.refresh(session)
 
     sdir = _upload_session_dir(vault_service, str(session.id))
@@ -17775,6 +17836,7 @@ async def upload_chunk(
     _user_id = current_user.id
     _blob_id = session.blob_id
     _folder_id = session.folder_id
+    _filename = session.filename          # a Standard session's name; a zero-knowledge one is never here
     sdir = _upload_session_dir(vault_service, str(_sid))
     sdir.mkdir(parents=True, exist_ok=True)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
@@ -17842,6 +17904,12 @@ async def upload_chunk(
         _peek = HeadPeek(request.stream()) if (chunk_index == 0 and _blob_id) else None
         # ---- THE BOUNDARY: no connection is held while the client sends. ----
         _release_db_before_streaming(db)
+        # Keep this upload's name while it moves, and take it back after a pause that outlasted the
+        # lock when nobody else has it. Never refused here -- whether it may land is the commit's
+        # question. After the boundary, so no connection waits on the Redis round trip.
+        if _filename:
+            from app.core import upload_marker as _um
+            _um.claim(vault_id, _folder_id, _filename, _user_id, _web_upload_lock_token(_sid))
         _written, chunk_digest = await seal_stream_to_file(
             _peek if _peek is not None else request.stream(),
             tmp_path, remaining, _sid, chunk_index)
@@ -18080,6 +18148,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     _reject_unreplaceable_upload(db, vault_id, folder_uuid, session.filename, current_user,
                                  name_bi=zk_name_bi, name_bi_candidates=zk_name_bi_candidates)
 
+    # The name must be this upload's to land on: refused while another member's upload, or an SFTP
+    # upload, holds it -- replacing by name what someone else is still writing is the lost update the
+    # lock exists to stop. Captured now for the release: after a commit the session row is gone.
+    _lock_name = session.filename if not is_zk else None
+    _lock_session = session.id
+    _lock_folders = [session.folder_id, folder_uuid]
+    if _lock_name:
+        _web_upload_name_lock(db, vault_id, folder_uuid, _lock_name, current_user, _lock_session)
+
     # Zero-knowledge v2 name binding: the client may supply the file id it sealed the name
     # under (so the sealed name binds the final row id and can't be transposed). Optional +
     # backward-compatible — absent means the server assigns the id (legacy v1). Reject a
@@ -18255,6 +18332,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         except Exception:
             db.rollback()
         shutil.rmtree(sdir, ignore_errors=True)
+        _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         _remove_orphan_blob()
@@ -18265,6 +18343,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
         # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
         fail_chunk_session(db, session, sdir, e)
+        _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
     except PermissionDeniedError as e:
         # A permission denial is a 403, not a 500 — and it isn't a corrupt upload, so leave
@@ -18275,6 +18354,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
         # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
         fail_chunk_session(db, session, sdir, e)
+        _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
         print(f"Error finalizing chunked upload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
 
@@ -18287,6 +18367,8 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     db.commit()
 
     shutil.rmtree(sdir, ignore_errors=True)
+    # Landed: the file list holds the name from here, not the lock.
+    _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
 
     # For ZK files original_name is NULL by design (the name is client-encrypted). Use a
     # neutral label for the admin-facing audit/broadcast so nothing leaks and we don't
@@ -18441,7 +18523,11 @@ async def cancel_chunked_upload(
         session.error_message = (
             'Cancelled by the account owner' if session.temp_credential_id
             and getattr(current_user, '_temp_cred_id', None) is None else 'Cancelled by user')
+        _cancelled_name, _cancelled_folder = session.filename, session.folder_id
         db.commit()
+        # A cancelled upload holds no name: the upload the user is replacing it with, or anyone's,
+        # may take it now rather than when the lock would have lapsed.
+        _release_web_upload_name(vault_id, [_cancelled_folder], _cancelled_name, session.id)
         # The one destructive cross-principal action here. On a zero-knowledge vault it
         # destroys the only copy of the buffered bytes, so it does not go unrecorded in a
         # change whose subject is attribution.

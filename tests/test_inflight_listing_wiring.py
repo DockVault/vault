@@ -63,5 +63,7 @@ def test_the_spa_renders_an_in_flight_row_disabled_and_unselectable():
     assert js.count("if (item.in_progress) {") == 2
     assert "is-uploading" in js and "aria-disabled=\"true\"" in js
     assert "item.uploading_by" in js
-    # In-flight rows are excluded from selection (synthetic id, no checkbox).
-    assert js.count("!i.in_progress") == 2
+    # In-flight rows are excluded wherever a real file id is wanted (the id is synthetic): selection
+    # (two sites, no checkbox) and the drop-time map of names to files that "replace" deletes.
+    assert js.count("!i.in_progress") == 3
+    assert "i.type !== 'folder' && !i.in_progress)\n        .map(i => [i.name, i.id])" in js

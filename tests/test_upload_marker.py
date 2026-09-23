@@ -62,6 +62,25 @@ class _FakeRedis:
     def smembers(self, key):
         return set(self.sets.get(key, set()))
 
+    def register_script(self, script):
+        """The claim script, emulated in Python like the two scripts emulated below. It proves the
+        wrapper and the rule; the Lua itself runs against real Redis in the live lane."""
+        assert script is um._CLAIM, "only the claim script is registered"
+        self.claims = getattr(self, "claims", 0) + 1
+
+        def run(keys, args):
+            mkey, ikey = keys
+            payload, token, member, _ttl, web = args
+            held = self.store.get(mkey)
+            if held:
+                d = json.loads(held)
+                if d.get("t") != token and not (web == "1" and d.get("w") == 1 and d.get("m") == member):
+                    return d.get("m") or ""
+            self.store[mkey] = payload
+            self.sets.setdefault(ikey, set()).add(mkey)
+            return None
+        return run
+
     def eval(self, script, numkeys, *args):
         keys, argv = list(args[:numkeys]), list(args[numkeys:])
         mkey, ikey, token = keys[0], (keys[1] if len(keys) > 1 else None), argv[0]
@@ -445,13 +464,116 @@ def test_both_doors_ask_the_one_rule_and_neither_looks_the_name_up_itself():
     root = Path(__file__).resolve().parents[1]
     api = "\n".join(ln for ln in (root / "app/api/api_server.py").read_text(encoding="utf-8").splitlines()
                     if not ln.lstrip().startswith("#"))
-    site = api[api.index("_holder = _um.holder(vault_id, folder_uuid, body.file_name)"):]
-    site = site[:site.index("raise HTTPException(")]
-    assert "_who = _um.holder_display_name(db, _holder, current_user, vault_id)" in site   # the vault too: share recipients
-    assert "username" not in site and "User).filter" not in site, site
+    # The web doors: the resumable upload's lock (opening + commit) and the direct upload.
+    helper = api[api.index("def _web_upload_name_lock("):]
+    helper = helper[:helper.index("\ndef ", 10)].split('"""')[-1]            # code, not the docstring
+    assert "who = _um.holder_display_name(db, held, current_user, vault_id)" in helper   # the vault too
+    direct = api[api.index("_held = _um.claim(vault_id, folder_uuid, upload_file.filename"):]
+    direct = direct[:direct.index("_direct_locked = ")]
+    assert "_who = _um.holder_display_name(db, _held, current_user, vault_id)" in direct
+    for site in (helper, direct):
+        assert "username" not in site and "User).filter" not in site, site
     sftp = "\n".join(ln for ln in (root / "app/sftp/sftp_server.py").read_text(encoding="utf-8").splitlines()
                      if not ln.lstrip().startswith("#"))
     body = sftp[sftp.index("def _resolve_member_name(db, member_id, viewer, vault_id=None):"):]
     body = body[:body.index("\n    def ", 10)]
     assert "return upload_marker.holder_display_name(db, member_id, viewer, vault_id)" in body
     assert "is_scoped" not in body and "username" not in body.split('"""')[-1]
+
+
+# --- claim(): the lock the web doors take ------------------------------------------------------------
+
+def _claimed(r, v, f, name):
+    return json.loads(r.store[um.marker_key(v, f, name)])
+
+
+def test_a_web_claim_takes_a_free_name_and_keeps_it_on_the_next_claim(fake_redis):
+    v, f, name = uuid.uuid4(), uuid.uuid4(), "report.pdf"
+    assert um.claim(v, f, name, "m1", "web-s1") is None
+    held = _claimed(fake_redis, v, f, name)
+    assert held["t"] == "web-s1" and held["m"] == "m1" and held["w"] == 1
+    assert um.claim(v, f, name, "m1", "web-s1") is None               # the same upload keeps it
+    assert um.holder(v, f, name) == "m1"
+    [row] = um.list_folder(v, f)
+    assert row["member_id"] == "m1" and row["web"] is True
+    # Re-sealed on every claim (a fresh nonce), and still the same name to the listing.
+    assert security.decrypt_upload_marker_name(v, f, row["enc_name"]) == name
+
+
+def test_another_members_web_upload_is_refused_and_told_whose_it_is(fake_redis):
+    v, f, name = uuid.uuid4(), None, "report.pdf"
+    um.claim(v, f, name, "m1", "web-s1")
+    assert um.claim(v, f, name, "m2", "web-s2") == "m1"
+    assert _claimed(fake_redis, v, f, name)["t"] == "web-s1"          # untouched
+
+
+def test_the_same_members_other_web_upload_takes_it_over(fake_redis):
+    # Between one account's own browser uploads the uploader's tray decides (it asks, and cancels
+    # the upload it replaces), so the server does not stand in the way of its answer.
+    v, f, name = uuid.uuid4(), uuid.uuid4(), "report.pdf"
+    um.claim(v, f, name, "m1", "web-s1")
+    assert um.claim(v, f, name, "m1", "web-s2") is None
+    assert _claimed(fake_redis, v, f, name)["t"] == "web-s2"
+    # ... and the superseded upload's own close cannot free its successor's lock.
+    um.remove(v, f, name, "web-s1")
+    assert um.holder(v, f, name) == "m1"
+
+
+def test_an_sftp_upload_is_never_taken_over_not_even_by_its_own_member(fake_redis):
+    v, f, name = uuid.uuid4(), uuid.uuid4(), "report.pdf"
+    outcome, token = um.place(v, f, name, "m1")                         # the SFTP door
+    assert outcome is None and token
+    assert um.claim(v, f, name, "m1", "web-s1") == "m1"
+    assert _claimed(fake_redis, v, f, name)["t"] == token
+
+
+def test_sftp_is_refused_while_a_web_upload_holds_the_name(fake_redis):
+    v, f, name = uuid.uuid4(), uuid.uuid4(), "report.pdf"
+    um.claim(v, f, name, "m1", "web-s1")
+    assert um.place(v, f, name, "m2") == ("m1", None)
+    assert um.place(v, f, name, "m1") == ("m1", None)                   # its own member too
+
+
+def test_a_direct_upload_takes_over_nothing(fake_redis):
+    # A direct upload (web=False) is refused even by its own member's browser upload, and a browser
+    # upload cannot take over a direct one: neither side can tell the other's user what to replace.
+    v, f, name = uuid.uuid4(), uuid.uuid4(), "report.pdf"
+    um.claim(v, f, name, "m1", "web-s1")
+    assert um.claim(v, f, name, "m1", "direct-op1", web=False) == "m1"
+    um.remove(v, f, name, "web-s1")
+    assert um.claim(v, f, name, "m1", "direct-op1", web=False) is None
+    assert "w" not in _claimed(fake_redis, v, f, name)
+    assert um.claim(v, f, name, "m1", "web-s2") == "m1"
+    assert um.list_folder(v, f)[0]["web"] is False
+
+
+def test_the_holders_close_frees_a_claimed_name(fake_redis):
+    v, f, name = uuid.uuid4(), uuid.uuid4(), "report.pdf"
+    um.claim(v, f, name, "m1", "web-s1")
+    um.remove(v, f, name, "web-s1")
+    assert um.holder(v, f, name) is None and um.list_folder(v, f) == []
+    assert um.claim(v, f, name, "m2", "web-s2") is None
+
+
+def test_claim_is_one_atomic_script(fake_redis):
+    # The check and the take must be one round trip: a GET-then-SET here would let an SFTP open land
+    # between them. Exactly one script per claim (and the call-site registry counts one site).
+    um.claim(uuid.uuid4(), None, "x", "m1", "web-s1")
+    um.claim(uuid.uuid4(), None, "y", "m1", "web-s2")
+    assert fake_redis.claims == 2
+
+
+def test_a_holder_read_back_as_bytes_is_still_a_refusal(monkeypatch):
+    # The stack's client decodes replies; a client that does not returns the holder as bytes, and
+    # reading that as "free" would let a second upload in. (mutation: drop the decode -> None -> red.)
+    class _BytesRedis:
+        def register_script(self, script):
+            return lambda keys, args: b"m1"
+    monkeypatch.setattr(um, "redis_client", _BytesRedis())
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: False)
+    assert um.claim(uuid.uuid4(), None, "x", "m2", "web-s2") == "m1"
+
+
+def test_claim_fails_open_on_an_outage(monkeypatch):
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda _now: True)
+    assert um.claim(uuid.uuid4(), None, "x", "m1", "web-s1") is um.SKIPPED

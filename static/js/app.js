@@ -17491,7 +17491,12 @@ async function uploadFiles(files) {
     if (state.canWriteCurrentVault === false) { showError('You have read-only access to this vault.'); return; }
 
     const existing = new Set((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => i.name));
-    const idByName = new Map((state.currentFiles || []).filter(i => i.type !== 'folder').map(i => [i.name, i.id]));
+    // A row the listing shows as IN PROGRESS is someone else's upload of that name -- it is taken
+    // (so `existing` has it and the question is asked), but it is not a file: it has no id to
+    // delete, and "replace" must never aim at it. The server refuses the name while that upload is
+    // live, and says who holds it.
+    const idByName = new Map((state.currentFiles || []).filter(i => i.type !== 'folder' && !i.in_progress)
+        .map(i => [i.name, i.id]));
     // A name that an upload into THIS folder still HOLDS is taken too. Without this, a second pick
     // of the same file races the first and both land (the reported "uploaded twice"), and a single
     // re-pick while the first is still in flight wouldn't prompt because the name isn't in the file

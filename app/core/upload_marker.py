@@ -1,10 +1,16 @@
-"""In-flight SFTP upload markers, in Redis.
+"""In-flight upload markers, in Redis: the same-name lock every upload door shares.
 
 At SFTP write-open the server places an EPHEMERAL marker keyed by (vault, folder, final-name); it
 lets the web listing show a disabled "uploading by <member>" row and doubles as a same-name LOCK
 (SET NX) that refuses a second concurrent upload of the same final name in the same folder. The
 final name is stored ENCRYPTED (never cleartext) and the Redis sub-key is a deterministic KEYED hash
 of (vault, folder, name), so nothing at rest reveals the name. The member is stored by ID, not name.
+
+The web doors take the same lock, through claim(): a resumable web upload holds it for as long as
+its session is live (opened, each chunk, the commit), and a direct upload for the request. Between
+one account's OWN browser uploads the uploader's tray decides -- it asks, and cancels the upload it
+replaces -- so a web upload may take over its own member's web marker; nothing takes over another
+member's, or any SFTP upload's. Standard vaults only: a zero-knowledge name never reaches the server.
 
 Enumeration for the listing is by a per-(vault, folder) INDEX SET, not a keyspace SCAN: place adds
 the marker key to `upload_marker:idx:v=<vault>:f=<folder>` and list_folder reads that set + MGETs
@@ -56,6 +62,22 @@ _CAD_REFRESH = (
     "  return 1\n"
     "end\n"
     "return 0")
+# Take or keep the lock, atomically (see claim()). KEYS: marker, folder index. ARGV: payload, token,
+# member id, TTL, and "1" when the claimant is a web upload. A holder is kept out unless it is this
+# claimant (same token) or -- web claimant only -- a web upload of the same member ("w" = 1). Returns
+# nil when the claimant now holds the lock, else the holder's member id ('' when it recorded none).
+_CLAIM = (
+    "local v = redis.call('GET', KEYS[1])\n"
+    "if v then\n"
+    "  local d = cjson.decode(v)\n"
+    "  if d.t ~= ARGV[2] and not (ARGV[5] == '1' and d.w == 1 and d.m == ARGV[3]) then\n"
+    "    return d.m or ''\n"
+    "  end\n"
+    "end\n"
+    "redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[4]))\n"
+    "redis.call('SADD', KEYS[2], KEYS[1])\n"
+    "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))\n"
+    "return false")
 
 
 def is_member_grade_viewer(viewer, vault_id=None) -> bool:
@@ -184,6 +206,47 @@ def place(vault_id, folder_id, name: str, member_id):
     return SKIPPED, None                     # lost the retry too -> fail OPEN
 
 
+def claim(vault_id, folder_id, name: str, member_id, token: str, *, web: bool = True):
+    """Take -- or keep -- the same-name lock for an upload that spans many requests or one long one:
+    a resumable web upload session (keyed by its session), or a direct upload request.
+
+    ONE atomic script, so the check and the take cannot interleave with another door:
+
+    * free, or already held by this claimant (same token): taken / kept, TTL renewed -- which is how a
+      live web upload keeps it between chunks, and takes it back after a pause outlasted the TTL;
+    * held by a WEB upload of the SAME member, and this is a web upload too: taken over. Between one
+      account's own browser uploads the uploader's tray decides: it asks the user, then cancels the
+      upload it replaces -- exactly as before the web held this lock;
+    * held by anyone else -- another member's upload, or ANY SFTP upload -- refused.
+
+    Returns None when the claimant now holds the lock, the holder's member id (str) to refuse (''
+    when the holder recorded none), or SKIPPED when Redis is unavailable (fail OPEN, like place()).
+    A direct upload claims with ``web=False``: it never takes over anything, so it is refused even
+    while the same member's own browser upload of the name is in progress. Best-effort (class D).
+    """
+    mkey = marker_key(vault_id, folder_id, name)
+    ikey = index_key(vault_id, folder_id)
+    ttl = marker_ttl_seconds()
+    payload = {
+        "n": encrypt_upload_marker_name(vault_id, folder_id, name),
+        "m": str(member_id),
+        "t": token,
+    }
+    if web:
+        payload["w"] = 1
+    out = redis_guard.best_effort(
+        "upload_marker.claim",
+        lambda: redis_client.register_script(_CLAIM)(
+            keys=[mkey, ikey],
+            args=[json.dumps(payload), token, str(member_id), str(ttl), "1" if web else "0"]),
+        default=SKIPPED)
+    if out is SKIPPED or out is None:
+        return out
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    return str(out)
+
+
 def holder(vault_id, folder_id, name: str) -> object:
     """Read who, if anyone, holds an in-flight upload of (vault, folder, name) WITHOUT taking the
     lock: the holder's member id (str) when a live upload holds the name, None when it is free, or
@@ -228,7 +291,7 @@ def refresh(vault_id, folder_id, name: str, token: str) -> None:
 
 
 def list_folder(vault_id, folder_id):
-    """The in-flight markers for a (vault, folder) as a list of {"enc_name", "member_id"}, read from
+    """The in-flight markers for a (vault, folder) as a list of {"enc_name", "member_id", "web"}, read from
     the folder index (O(folder), not a keyspace SCAN).
 
     Empty on an outage (guard open) -- the listing simply shows no in-flight rows while Redis is
@@ -252,7 +315,9 @@ def list_folder(vault_id, folder_id):
             continue
         try:
             blob = json.loads(raw)
-            out.append({"enc_name": blob["n"], "member_id": blob.get("m")})
+            # "web": held by a browser upload, which that member's own tray already shows them.
+            out.append({"enc_name": blob["n"], "member_id": blob.get("m"),
+                        "web": blob.get("w") == 1})
         except (ValueError, KeyError, TypeError):
             stale.append(k)
     if stale:

@@ -180,7 +180,7 @@ def _receiver_world(monkeypatch, tmp_path, pool, *, revalidate_ok=True, locked_s
     def provider(model, session):
         if model is S.ChunkedUploadSession:
             return _Row(session, id=sid, status=locked_status, vault_id=vid, total_chunks=3, total_size=48,
-                        bytes_received=0)
+                        bytes_received=0, filename="streamed.bin")
         return None
 
     db = _StandInSession(pool, provider)
@@ -261,7 +261,8 @@ def _auth_world(monkeypatch, tmp_path, pool, *, principal_ok=True, locked_status
             first = calls["loads"] == 1
             return _Row(session, id=sid, status=("active" if first else locked_status), vault_id=vid,
                         user_id=(uid if first or not other_user else uuid.uuid4()), folder_id=None,
-                        total_chunks=3, total_size=48, bytes_received=0, blob_id=None, expires_at=None)
+                        total_chunks=3, total_size=48, bytes_received=0, blob_id=None, expires_at=None,
+                        filename="streamed.bin")
         return None
 
     db = _StandInSession(pool, provider)
