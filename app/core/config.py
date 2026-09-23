@@ -66,11 +66,23 @@ class Settings(BaseSettings):
     # SFTP Server Configuration
     sftp_host: str = Field(default="0.0.0.0")  # the address the SFTP server BINDS (not client-reachable)
     sftp_port: int = Field(default=2222)
-    # The externally-reachable SFTP hostname a deployment ADVERTISES to sync clients in a device
-    # mint response (distinct from sftp_host, which is the bind address). Empty = not advertised, in
-    # which case the client falls back to the API host it already connects to. The host KEY in that
-    # response is what a client pins; this host/port is a convenience that retires a hard-coded port.
+    # Where SFTP clients are told to connect -- the device-sync mint response and the temporary-
+    # credential dialog both read it through advertised_sftp_endpoint(). The host is the externally
+    # reachable SFTP hostname (distinct from sftp_host, which is the bind address); empty = not
+    # advertised, and the client uses the address it already reached this server on. The host KEY is
+    # what a client pins; the host and port only say where to dial.
     sftp_public_host: str = Field(default="")
+    # The port. The server binds sftp_port INSIDE the container, but clients reach whatever port the
+    # host publishes -- 2322 on a standard install, mapped to 2222 -- so advertising sftp_port sent them
+    # to a port nothing answered on. The compose files pass the published port in by default; set it
+    # yourself when clients arrive through NAT or port forwarding. 0 = not set: see
+    # advertised_sftp_endpoint().
+    sftp_public_port: int = Field(default=0, ge=0, le=65535)
+    # SFTP_HOST_PORT is the compose variable for the host side of the SFTP port mapping; env_file also
+    # hands it to the container. advertised_sftp_endpoint() derives the published port from it when
+    # SFTP_PUBLIC_PORT is unset -- the case for a deployment whose compose file predates
+    # SFTP_PUBLIC_PORT, since updating by pulling the image never touches the checkout. 0 = not set.
+    sftp_host_port: int = Field(default=0, ge=0, le=65535)
     # Keeps its historical filename so an existing deployment's key is found unchanged on upgrade;
     # new installs write an Ed25519 key at this path (the loader accepts either kind).
     sftp_host_key_path: str = Field(default="./keys/ssh_host_rsa_key")
@@ -412,6 +424,33 @@ class Settings(BaseSettings):
         ]
         for directory in directories:
             Path(directory).mkdir(parents=True, exist_ok=True)
+
+
+# The host port every shipped compose file publishes SFTP on, unless SFTP_HOST_PORT says otherwise.
+STANDARD_SFTP_HOST_PORT = 2322
+
+
+def advertised_sftp_endpoint(s=None, *, in_container=None):
+    """``(host, port)`` that SFTP clients are told to connect to.
+
+    ``host`` is the configured public hostname, or None when none is advertised (the client then uses
+    the address it already reached this server on). ``port`` is the configured public port. Without
+    one, a server running in a container derives the port its host publishes the way the compose files
+    do -- ``SFTP_HOST_PORT``, else the standard 2322 -- because the port it binds inside the container is
+    never the one a client reaches. That also covers a deployment whose compose file predates
+    ``SFTP_PUBLIC_PORT``: updating by pulling the image does not touch the checkout. Outside a
+    container the bind port is the reachable one. Every place that tells a client where SFTP is reads
+    it from here, so the device mint and the web dialog cannot disagree.
+    """
+    s = settings if s is None else s
+    host = (getattr(s, "sftp_public_host", "") or "").strip() or None
+    port = int(getattr(s, "sftp_public_port", 0) or 0)
+    if not port:
+        if _is_container_runtime() if in_container is None else in_container:
+            port = int(getattr(s, "sftp_host_port", 0) or 0) or STANDARD_SFTP_HOST_PORT
+        else:
+            port = int(s.sftp_port)
+    return host, port
 
 
 # Pure import-time defaults. ``model_construct`` deliberately bypasses settings sources and

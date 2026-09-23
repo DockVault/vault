@@ -4370,7 +4370,12 @@ async function generateTempCreds(options = {}) {
 
 // Show temp credentials in a modal
 function showTempCredsModal(creds) {
-    const sftpCmd = `sftp -P 2222 ${creds.temp_username}@localhost`;
+    // The server says where SFTP clients reach it -- the published port, and a host when one is
+    // advertised; otherwise the address this page was loaded from is the one that works.
+    const sftpHost = creds.sftp_host || window.location.hostname;
+    const sftpCmd = Number.isInteger(creds.sftp_port)
+        ? `sftp -P ${creds.sftp_port} ${creds.temp_username}@${sftpHost}`
+        : `sftp ${creds.temp_username}@${sftpHost}`;
     const expires = formatServerTime(creds.expires_at, 'N/A');
     const validity = creds.validity_minutes != null
         ? `Valid for ${creds.validity_minutes} minute${creds.validity_minutes === 1 ? '' : 's'}` : '';

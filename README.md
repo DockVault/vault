@@ -35,7 +35,10 @@ setup — it writes `.env` with freshly generated secrets, provisions the TLS ce
 the HTTPS-only stack (web UI/API on port **443** by default, TLS terminated in-container, no
 plaintext listener; optional SFTP). The published host ports are configurable in `.env` —
 `WEB_HOST_PORT` (default 443) and `SFTP_HOST_PORT` (default 2322); the container ports stay
-8000/2222. Setup checks a port is free before using it.
+8000/2222. Setup checks a port is free before using it. SFTP clients (device sync, and the command
+shown with a temporary credential) are told the published SFTP port; when they reach the server at a
+different address or port — through NAT or port forwarding — set `SFTP_PUBLIC_HOST` /
+`SFTP_PUBLIC_PORT` (setup asks when you enable SFTP).
 
 Everything is driven by **`dockvault.py`** — an interactive management tool at the repo root
 (stdlib-only; needs **Python 3** on the host). Run it with no arguments for the full menu (Setup,

@@ -113,6 +113,10 @@ services:
       API_USE_HTTPS: "false"
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # The SFTP port CLIENTS are told to use (device sync, the temporary-credential dialog): the
+      # port published for SFTP below, unless SFTP_PUBLIC_PORT in .env says otherwise (NAT / port
+      # forwarding). SFTP_PORT above is only where the server listens inside the container.
+      SFTP_PUBLIC_PORT: "${SFTP_PUBLIC_PORT:-2322}"
       ENVIRONMENT: development
       # Hours a resumable chunked-upload session lives before its buffered chunks become
       # eligible for cleanup. Operators reclaim sooner via POST /api/maintenance/upload-sessions/cleanup.

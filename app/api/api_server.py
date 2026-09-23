@@ -87,7 +87,7 @@ from app.core.security import (
     create_access_token, verify_access_token, EncryptionError, ObjectChangedDuringRead,
     hash_device_secret,
 )
-from app.core.config import initialize_runtime, settings
+from app.core.config import advertised_sftp_endpoint, initialize_runtime, settings
 from app.core.endpoint_permissions import (
     require_endpoint_permission,
     validate_endpoint_permission_contract,
@@ -1140,6 +1140,10 @@ class TempCredentialResponse(BaseModel):
     vault_access_mode: Optional[str] = None
     # Temporary vault passcodes minted with this credential, shown ONCE. [{vault_id, passcode, kind}].
     passcodes: list = []
+    # Where SFTP clients connect (advertised_sftp_endpoint): the page builds the connection command
+    # from these. sftp_host is None when none is advertised -- the page then uses its own address.
+    sftp_host: Optional[str] = None
+    sftp_port: Optional[int] = None
 
 
 class VaultCreate(BaseModel):
@@ -5371,13 +5375,11 @@ async def mint_device_sync_credential_endpoint(
     _audit_device("device_sync_cred_mint", principal.device, vault_id=body.vault_id,
                   details={"cred_id": cred.get("id")})
 
-    # Return the host key to pin, the SFTP port (retires the desktop's hard-coded 2222), and the
-    # advertised host when the deployment set one (else null → the desktop uses the API host it
-    # already connects to).
+    # Return the host key to pin, and where to dial: the port clients can actually reach (the
+    # published one, not the port the server binds inside its container) and the advertised host when
+    # the deployment set one (else null -> the desktop uses the API host it already connects to).
     cred["host_public_key"] = host_public_key
-    cred["port"] = settings.sftp_port
-    advertised = (getattr(settings, "sftp_public_host", "") or "").strip()
-    cred["host"] = advertised or None
+    cred["host"], cred["port"] = advertised_sftp_endpoint()
     return cred
 
 
@@ -6218,6 +6220,7 @@ async def create_temp_credentials(
     _fire_action_email(db, "temp_credential_issued", email=current_user.email, username=current_user.username,
                        action_context={"expires": f"in {_lifetime} minutes"} if _lifetime else {})
 
+    temp_creds["sftp_host"], temp_creds["sftp_port"] = advertised_sftp_endpoint()
     return TempCredentialResponse(**temp_creds)
 
 

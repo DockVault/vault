@@ -455,6 +455,13 @@ def build_env_lines(cfg):
     if sftp_active and cfg.get("upload_marker_ttl_seconds") not in (None, "") \
             and int(cfg["upload_marker_ttl_seconds"]) != 300:
         bare("UPLOAD_MARKER_TTL_SECONDS", int(cfg["upload_marker_ttl_seconds"]))
+    # Where SFTP clients are told to connect, written only when it differs from what the deployment
+    # would advertise by itself -- the address clients already use, and the published SFTP port.
+    if sftp_active and (cfg.get("sftp_public_host") or "").strip():
+        bare("SFTP_PUBLIC_HOST", cfg["sftp_public_host"].strip())
+    if sftp_active and cfg.get("sftp_public_port") not in (None, "") \
+            and int(cfg["sftp_public_port"]) != int(cfg.get("sftp_host_port") or 2322):
+        bare("SFTP_PUBLIC_PORT", int(cfg["sftp_public_port"]))
     if cfg.get("update_check_enabled"):
         bare("UPDATE_CHECK_ENABLED", "true")
     # Deployment storage ceiling. Only written when the operator chose one: left out, the app's
@@ -1231,6 +1238,9 @@ def new_set_config(current_env, new_prefix, new_id):
         "sftp_transfer_buffer_mb": (current_env.get("SFTP_TRANSFER_BUFFER_MB") or "").strip() or None,
         # Keep a custom in-flight upload marker TTL across a fresh volume set, like the fields above.
         "upload_marker_ttl_seconds": (current_env.get("UPLOAD_MARKER_TTL_SECONDS") or "").strip() or None,
+        # Keep where SFTP clients are told to connect (NAT / port forwarding) across a fresh volume set.
+        "sftp_public_host": (current_env.get("SFTP_PUBLIC_HOST") or "").strip() or None,
+        "sftp_public_port": (current_env.get("SFTP_PUBLIC_PORT") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
@@ -3218,13 +3228,27 @@ class DockVault:
             web_port = prompt_free_port(pal, "Web (HTTPS)", 443)
             # split mode always runs the SFTP container, so offer a custom SFTP port there too.
             sftp_port = prompt_free_port(pal, "SFTP", 2322) if (enable_sftp or split) else 2322
+            sftp_public_host, sftp_public_port = None, None
+            if (enable_sftp or split) and confirm(
+                    "Do SFTP clients reach this server at a different address or port "
+                    "(NAT or port forwarding)?", pal, default=False):
+                sftp_public_host = ask("Address SFTP clients connect to (blank = %s)" % server,
+                                       pal, "").strip() or None
+                sftp_public_port = _port_or(ask("Port SFTP clients connect to", pal, str(sftp_port)),
+                                            sftp_port)
             update_check = confirm("Enable the opt-in 'update available' check (asks GitHub, no telemetry)?", pal, default=False)
             log_pull = confirm("Enable the authenticated log-pull endpoint (sets a pepper; still off until a component is ticked)?", pal, default=False)
         else:
             enable_sftp, split = bool(a("enable_sftp")), bool(a("split"))
             web_port = _port_or(a("web_port"), 443)
             sftp_port = _port_or(a("sftp_port"), 2322)
+            sftp_public_host = (a("sftp_public_host") or "").strip() or None
+            sftp_public_port = a("sftp_public_port")
             update_check, log_pull = bool(a("update_check")), bool(a("enable_log_pull"))
+        if sftp_public_host and not validate_server_name(sftp_public_host):
+            self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
+        if sftp_public_port is not None and not (1 <= int(sftp_public_port) <= 65535):
+            self._fail("invalid SFTP client port (1-65535): %r" % sftp_public_port)
 
         return {
             "server_name": server,
@@ -3241,6 +3265,8 @@ class DockVault:
             "run_sftp": enable_sftp,
             "web_host_port": web_port,
             "sftp_host_port": sftp_port,
+            "sftp_public_host": sftp_public_host,
+            "sftp_public_port": sftp_public_port,
             # SFTP staging tmpfs size — install-time only (a deploy-time infra knob, not a live
             # limit, so it is not in the Limits menu). --sftp-staging-tmpfs-mb or hand-edit .env.
             "sftp_staging_tmpfs_mb": (getattr(args, "sftp_staging_tmpfs_mb", None) if args else None),
@@ -5147,6 +5173,10 @@ def build_parser():
     sp.add_argument("--key-path", dest="key_path", help="bring-your-own private key (PEM)")
     sp.add_argument("--web-port", dest="web_port", type=int, help="host port for HTTPS (default 443)")
     sp.add_argument("--sftp-port", dest="sftp_port", type=int, help="host port for SFTP (default 2322)")
+    sp.add_argument("--sftp-public-host", dest="sftp_public_host",
+                    help="address SFTP clients connect to, when it is not the server name (NAT)")
+    sp.add_argument("--sftp-public-port", dest="sftp_public_port", type=int,
+                    help="port SFTP clients connect to, when it is not --sftp-port (port forwarding)")
     sp.add_argument("--sftp-staging-tmpfs-mb", dest="sftp_staging_tmpfs_mb", type=int,
                     help="size (MiB) of the RAM tmpfs SFTP buffers each upload's plaintext in, so it "
                          "never hits disk (512 by default). Also caps the SFTP upload size until "

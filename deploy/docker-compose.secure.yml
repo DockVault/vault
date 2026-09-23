@@ -132,6 +132,10 @@ services:
       API_SSL_KEYFILE: /app/certs/key.pem
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # The SFTP port CLIENTS are told to use (device sync, the temporary-credential dialog): the
+      # port published for SFTP below, unless SFTP_PUBLIC_PORT in .env says otherwise (NAT / port
+      # forwarding). SFTP_PORT above is only where the server listens inside the container.
+      SFTP_PUBLIC_PORT: "${SFTP_PUBLIC_PORT:-${SFTP_HOST_PORT:-2322}}"
       # Run the SFTP server in THIS same container? Default OFF (web only). Set RUN_SFTP=1 in
       # .env (dockvault.py setup does this when you enable SFTP) to also serve SFTP on 2322.
       # run_combined.py supervises both processes and exits if either dies (the restart policy
@@ -230,6 +234,10 @@ services:
       API_SSL_KEYFILE: /app/certs/key.pem
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # The SFTP port CLIENTS are told to use (device sync, the temporary-credential dialog): the
+      # port published for SFTP below, unless SFTP_PUBLIC_PORT in .env says otherwise (NAT / port
+      # forwarding). SFTP_PORT above is only where the server listens inside the container.
+      SFTP_PUBLIC_PORT: "${SFTP_PUBLIC_PORT:-${SFTP_HOST_PORT:-2322}}"
       # production disables the /docs, /redoc + /openapi.json endpoints.
       ENVIRONMENT: production
       # Hours a resumable chunked-upload session lives before its buffered chunks become
