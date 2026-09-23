@@ -36,6 +36,9 @@ nh3==0.3.6
 # Host tests import app.core.preview_render, which imports Markdown + Pygments. Same lock-step rule.
 Markdown==3.10.3
 Pygments==2.20.0
+# Host tests parse the workflow and compose files as YAML, to pin their structure rather than their
+# text. Same lock-step rule: the production lock already carries it.
+PyYAML==6.0.3
 
 # Test runners, clients, and supply-chain tooling.
 pytest>=9.1.1,<10.0

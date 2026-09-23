@@ -162,6 +162,8 @@ python-multipart==0.0.32
     # via -r tests/requirements-test.txt
 python-slugify==8.0.4
     # via pytest-playwright
+pyyaml==6.0.3
+    # via -r tests/requirements-test.txt
 redis==8.1.0
     # via -r tests/requirements-test.txt
 requests==2.34.2
