@@ -1139,6 +1139,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.31.1": {
+      "released": "2026-09-23",
+      "notes": "Device sync and the command shown with a temporary credential now name the SFTP port clients can reach -- the port the host publishes (2322 by default) -- instead of the port the server binds inside its container, which on any standard install sent the desktop sync client to a port nothing answered on; the command also names this server rather than localhost. SFTP_PUBLIC_PORT and SFTP_PUBLIC_HOST say where clients connect when they arrive through NAT or port forwarding, and setup asks for both when SFTP is enabled. A deployment updated by pulling the image, whose compose files stay as they were, gets the right port too. A release candidate's image is now scanned with the release gate's policy before it reaches main. No schema change; a rollback to 0.31.0 is clean.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -1415,6 +1423,13 @@
       "kind": "direct",
       "reversible": true,
       "requires_backup": true
+    },
+    {
+      "from": "0.31.0",
+      "to": "0.31.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
     }
   ],
   "waivers": [
