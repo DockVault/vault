@@ -323,8 +323,8 @@ starting. A release cannot be cut without an entry, so the description is not so
 might forget to write.
 
 `dockvault.py update` reads it. It tells you what the hop involves before doing anything, takes a
-backup when one is required, and asks you to type an acknowledgement for a change that cannot be
-rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
+backup when one is required, and, run interactively, asks you to type an acknowledgement for a change
+that cannot be rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
 description for is treated as the riskiest case rather than assumed safe.
 
 ### Support lifecycle and the minimum supported version
@@ -335,14 +335,32 @@ extended support — the dates its code fixes and its (usually longer) security-
 `dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
 one, and warns before moving to a version with known unpatched vulnerabilities.
 
-When a version is not secure, the matrix can also list the specific issues behind that verdict, under
-a per-version `vulnerabilities` key: each carries a title and description, the release that fixes it
-(`fixed_in`), an optional severity/CVSS/advisory id, and the date it was published. **An issue is
-listed only once a release fixes it** — this is a public repository, so listing an unpatched
-vulnerability here would disclose it to an attacker; the validator enforces that every entry names a
-released `fixed_in`, that a secure version lists none, and that an insecure one (from 0.28.0 on) names
-what is wrong with it. `dockvault.py update` names these titles, and the release they were fixed in,
-in the warning it shows before moving to an affected version.
+When a version is not secure, the matrix says why. Each vulnerability is recorded once, in the
+top-level `advisories`: a title and description, its **impact** (what it let someone do), its
+**remediation** (usually the release that fixes it, and anything to do after upgrading), an optional
+**mitigation** (what to do before, or instead of, upgrading), a **CVSS v4.0 base vector** with the
+severity band it scores to, an optional advisory id, the release that fixes it (`fixed_in`) and the
+date it was published. Each affected version lists the advisories that apply to it. **A version
+affected by even one advisory, of any severity, is not secure.**
+
+The validator recomputes every vector's score and refuses a severity that does not match it, requires
+an advisory to be listed on every release from the first it affects up to its fix, and refuses a
+`fixed_in` that has not been released. **An issue is normally listed only once a release fixes it** —
+this is a public repository, so listing an unpatched vulnerability here would disclose it to an
+attacker. The one exception is an advisory with no fix yet (`fixed_in` null), which is accepted only
+with a mitigation: it is published when operators need to act before a fix exists.
+
+`dockvault.py update` shows, beside each release it offers, how many known vulnerabilities it has by
+severity. Before moving to an affected release it lists each one with its impact and what to do, and
+says what the move fixes or brings back compared with the running version. When a release you could
+move to instead has only a subset of the target's known vulnerabilities, it names that release and,
+run interactively, asks you to type the target's version before continuing. It never refuses a release on this data: a
+rollback during an outage is exactly when an older release is needed, and the list is also read from
+the copy on `main`, which may warn but must never block.
+
+The file has three readers: `dockvault.py`, the running app's update check, and the documentation site
+at vault.dockvault.io, which fetches the copy on `main` and refuses a `schema_version` it does not
+know. A change to `schema_version` has to reach that site before it reaches `main`.
 
 **0.17.0 is the minimum supported version.** It seals vault names, descriptions and file checksums at
 rest in columns an older image cannot read, so there is no in-place upgrade into it from 0.16.1 and no

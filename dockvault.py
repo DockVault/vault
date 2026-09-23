@@ -1860,14 +1860,35 @@ def clean_matrix_text(value):
     return "".join(ch for ch in text if ch.isprintable() or ch == " ")
 
 
+# Most severe first. Anything else a matrix says about severity reads as unrated.
+_SEVERITY_RANK = ("critical", "high", "medium", "low")
+# Long enough for any real impact/remediation/mitigation sentence, short enough that a tampered
+# fetched matrix cannot flood the terminal through one field.
+_DETAIL_CAP = 1000
+
+
+def _severity(value):
+    """A matrix severity as one of _SEVERITY_RANK, or None (unrated). A fetched matrix is untrusted,
+    so another spelling, a number or an object reads as unrated rather than inventing a bucket."""
+    text = value.strip().lower() if isinstance(value, str) else None
+    return text if text in _SEVERITY_RANK else None
+
+
 def version_vulnerabilities(matrix, version):
-    """The list of known, already-fixed vulnerabilities declared for `version`, or [].
+    """The known vulnerabilities declared for `version`, or [].
 
     Tolerant like `version_support`: a matrix that predates the field, or does not declare the
-    version, or states something other than a list, reads as 'none listed' rather than an error. Each
-    entry is normalised to {title, fixed_in} with BOTH coerced to a bounded str or None as it is read
-    -- before it ever reaches the dedupe -- so an unhashable JSON value ({} / []) in either field can
-    never blow the (title, fixed_in) dedupe key. A non-dict entry is dropped."""
+    version, or states something other than a list, reads as 'none listed' rather than an error. A
+    non-dict entry is dropped.
+
+    Each entry is normalised to {title, fixed_in, advisory, severity, cvss, impact, remediation,
+    mitigation}. title and fixed_in are read from the version's own entry exactly as every older copy
+    of this tool reads them, and coerced to a bounded str or None before they reach the dedupe -- so
+    an unhashable JSON value ({} / []) in either can never blow the (title, fixed_in) key. The rest
+    comes from the advisory the entry names in the matrix's top-level `advisories` (schema 3), or
+    from the entry itself when it carries the fields (an older matrix, or a list this tool has
+    already resolved and merged). Every string is bounded here and escape-stripped where printed; an
+    unrecognised severity reads as unrated. fixed_in None means no fix has been released yet."""
     if not isinstance(matrix, dict):
         return []
     version = (version or "").lstrip("vV")
@@ -1875,15 +1896,126 @@ def version_vulnerabilities(matrix, version):
     vulns = meta.get("vulnerabilities")
     if not isinstance(vulns, list):
         return []
-    return [{"title": _bound_scalar(v.get("title")), "fixed_in": _bound_scalar(v.get("fixed_in"))}
-            for v in vulns if isinstance(v, dict)]
+    advisories = matrix.get("advisories")
+    advisories = advisories if isinstance(advisories, dict) else {}
+    out = []
+    for v in vulns:
+        if not isinstance(v, dict):
+            continue
+        slug = v.get("advisory") if isinstance(v.get("advisory"), str) else None
+        record = advisories.get(slug) if slug is not None else None
+        record = record if isinstance(record, dict) else {}
+
+        def detail(name, _v=v, _record=record):
+            value = _v.get(name)
+            return value if value is not None else _record.get(name)
+
+        out.append({
+            "title": _bound_scalar(v.get("title")),
+            "fixed_in": _bound_scalar(v.get("fixed_in")),
+            "advisory": _bound_scalar(slug),
+            "severity": _severity(detail("severity")),
+            "cvss": _bound_scalar(detail("cvss")),
+            "impact": _bound_scalar(detail("impact"), cap=_DETAIL_CAP),
+            "remediation": _bound_scalar(detail("remediation"), cap=_DETAIL_CAP),
+            "mitigation": _bound_scalar(detail("mitigation"), cap=_DETAIL_CAP),
+        })
+    return out
+
+
+def severity_counts(vulns):
+    """The non-zero severity buckets of a vulnerability list, most severe first: '1 high, 2 unrated'."""
+    counts = {}
+    for v in vulns:
+        bucket = v.get("severity") or "unrated"
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return ", ".join("%d %s" % (counts[b], b) for b in _SEVERITY_RANK + ("unrated",) if counts.get(b))
+
+
+def vulnerability_summary(vulns):
+    """'3 known vulnerabilities (1 high, 2 medium)' for a non-empty list."""
+    n = len(vulns)
+    return "%d known %s (%s)" % (n, "vulnerability" if n == 1 else "vulnerabilities",
+                                  severity_counts(vulns))
+
+
+def describe_vulnerabilities(vulns, indent="    ", width=100):
+    """The lines an operator reads before choosing a version, one block per vulnerability, most
+    severe first: the severity and title, the release that fixes it (or that none does yet), what it
+    lets someone do, and what to do about it. Every string is escape-stripped here, at the print."""
+    import textwrap
+
+    def rank(v):
+        return _SEVERITY_RANK.index(v["severity"]) if v.get("severity") in _SEVERITY_RANK else len(_SEVERITY_RANK)
+
+    lines = []
+    for v in sorted(vulns, key=rank):
+        fixed = v.get("fixed_in")
+        lines.append("%s- [%s] %s -- %s" % (
+            indent, (v.get("severity") or "unrated").upper(), clean_matrix_text(v.get("title") or ""),
+            ("fixed in %s" % clean_matrix_text(fixed)) if fixed else "no fix released yet"))
+        for heading, key in (("Impact", "impact"), ("Remediation", "remediation"),
+                             ("Mitigation", "mitigation")):
+            text = clean_matrix_text(v.get(key) or "")
+            if text:
+                lines.extend(textwrap.wrap("%s: %s" % (heading, text), width=width,
+                                           initial_indent=indent + "    ",
+                                           subsequent_indent=indent + "      "))
+        if v.get("cvss"):
+            lines.append("%s    CVSS: %s" % (indent, clean_matrix_text(v["cvss"])))
+    return lines
+
+
+def _finding_keys(matrix, version):
+    """The set of (title, fixed_in) identities a version is affected by -- the same key the merge
+    dedupes on, so a finding counts once however many sources list it."""
+    return {(v.get("title"), v.get("fixed_in")) for v in version_vulnerabilities(matrix, version)}
+
+
+def _declares_version(matrix, version):
+    versions = matrix.get("versions") if isinstance(matrix, dict) else None
+    return isinstance(versions, dict) and (version or "").lstrip("vV") in versions
+
+
+def safer_alternative(matrix, target, candidates):
+    """A release among `candidates` whose known vulnerabilities are a strict subset of `target`'s --
+    fewer of them, and none that `target` does not also have -- or None.
+
+    Choosing `target` over such a release accepts known vulnerabilities for no difference in known
+    ones in return, so the update asks for the target's name typed back. It is advice, never a
+    refusal: the tool cannot know why someone wants a particular release (a rollback during an
+    outage is the usual reason), and the vulnerability data can come from the unauthenticated copy on
+    main, which may raise a warning but must never block a change.
+
+    A release the matrix does not declare is never offered: it has no known vulnerabilities only
+    because nothing is known about it. A target with nothing listed has no safer alternative, since
+    nothing is a strict subset of an empty set. Among several, the fewest known vulnerabilities wins,
+    then the newest."""
+    if not _declares_version(matrix, target):
+        return None
+    affected = _finding_keys(matrix, target)
+    if not affected:
+        return None
+    target_version = parse_semver(target)
+    better = []
+    for candidate in candidates or []:
+        if parse_semver(candidate) is None or parse_semver(candidate) == target_version:
+            continue
+        if not _declares_version(matrix, candidate):
+            continue
+        keys = _finding_keys(matrix, candidate)
+        if keys < affected:
+            better.append((len(keys), tuple(-part for part in parse_semver(candidate)), candidate))
+    return min(better)[2] if better else None
 
 
 def support_line(matrix, version):
     """A one-line human summary of a version's lifecycle, or '' when nothing is stated. Names the
     end-of-life state, any extended-support tail dates, and whether the version is insecure -- and,
-    when the matrix lists them, how many known vulnerabilities it has, their titles, and the release
-    that fixes them. Every matrix-sourced fragment is escape-stripped before it reaches a terminal."""
+    when the matrix lists them, how many known vulnerabilities it has by severity, and the releases
+    that fix them. The titles and details are for the chosen version only (describe_vulnerabilities):
+    one line per release has no room for them. Every matrix-sourced fragment is escape-stripped
+    before it reaches a terminal."""
     s = version_support(matrix, version)
     if not s:
         return ""
@@ -1897,14 +2029,18 @@ def support_line(matrix, version):
     else:
         head = "supported"
     if s.get("secure") is False:
-        head += " -- has known unpatched vulnerabilities"
         vulns = version_vulnerabilities(matrix, version)
-        if vulns:
-            titles = "; ".join(clean_matrix_text(v.get("title") or "") for v in vulns)
-            fixes = sorted({v.get("fixed_in") for v in vulns if v.get("fixed_in")},
-                           key=lambda t: parse_semver(t) or (0, 0, 0))
-            fixed = " -- fixed in %s" % ", ".join(clean_matrix_text(f) for f in fixes) if fixes else ""
-            head += " (%d): %s%s" % (len(vulns), titles, fixed)
+        if not vulns:
+            # Insecure with nothing itemised (an older matrix, or an end-of-life release): the bare fact.
+            return head + " -- has known unpatched vulnerabilities"
+        head += " -- " + vulnerability_summary(vulns)
+        fixes = sorted({v.get("fixed_in") for v in vulns if v.get("fixed_in")},
+                       key=lambda t: parse_semver(t) or (0, 0, 0))
+        if fixes:
+            head += " -- fixed in %s" % ", ".join(clean_matrix_text(f) for f in fixes)
+        unfixed = sum(1 for v in vulns if not v.get("fixed_in"))
+        if unfixed:
+            head += " -- %d with no fix released yet" % unfixed
     return head
 
 
@@ -4526,6 +4662,14 @@ class DockVault:
                     print("    %s%s" % (t, label))
                 if not offered:
                     print(pal.paint("    (every reachable release is end-of-life)", "yellow"))
+                elif all(version_vulnerabilities(merged_lifecycle, t) for t in offered
+                         if _declares_version(merged_lifecycle, t)) and any(
+                             _declares_version(merged_lifecycle, t) for t in offered):
+                    # Nothing listed is free of known vulnerabilities (a finding with no fix yet reaches
+                    # the newest release). Say so, rather than leave a list that implies a clean choice.
+                    print(pal.paint(
+                        "    Every release listed has known vulnerabilities; the counts beside each "
+                        "say which is least affected.", "yellow"))
                 if hidden:
                     print(pal.paint(
                         "    %d end-of-life release(s) hidden -- they cannot be upgraded or "
@@ -4575,19 +4719,56 @@ class DockVault:
         # target's tag was cut still shows, and name which source produced the verdict.
         _src_phrase = ("per the current matrix on main" if lifecycle_source == "main"
                        else "per this release's matrix")
+        target_vulns = version_vulnerabilities(merged_lifecycle, tag)
         if version_support(merged_lifecycle, tag).get("secure") is False:
-            vulns = version_vulnerabilities(merged_lifecycle, tag)
-            if vulns:
-                titles = "; ".join(clean_matrix_text(v.get("title") or "") for v in vulns)
-                fixes = sorted({v.get("fixed_in") for v in vulns if v.get("fixed_in")},
-                               key=lambda t: parse_semver(t) or (0, 0, 0))
-                fixed = (" Fixed in %s." % ", ".join(clean_matrix_text(f) for f in fixes)) if fixes else ""
-                print(pal.paint(
-                    "  WARNING: %s has %d known unpatched vulnerability(ies): %s.%s (%s)"
-                    % (tag, len(vulns), titles, fixed, _src_phrase), "red"))
+            if target_vulns:
+                print(pal.paint("  WARNING: %s has %s (%s):"
+                                % (tag, vulnerability_summary(target_vulns), _src_phrase), "red"))
+                for line in describe_vulnerabilities(target_vulns):
+                    print(pal.paint(line, "yellow"))
             else:
                 print(pal.paint(
                     "  WARNING: %s has known unpatched vulnerabilities. (%s)" % (tag, _src_phrase), "red"))
+
+        # What this change does to the deployment's known vulnerabilities -- only when where it starts
+        # from is actually known; compared against a guessed version it would describe a different move.
+        if version_source == "the running container" and _declares_version(merged_lifecycle, current):
+            now = _finding_keys(merged_lifecycle, current)
+            after = {(v.get("title"), v.get("fixed_in")) for v in target_vulns}
+            gained = [v for v in target_vulns if (v.get("title"), v.get("fixed_in")) not in now]
+            if gained:
+                print(pal.paint("  Moving to %s brings back %d known %s that %s does not have:"
+                                % (tag, len(gained), "vulnerability" if len(gained) == 1
+                                   else "vulnerabilities", current), "red"))
+                for v in gained:
+                    print(pal.paint("    - [%s] %s" % ((v.get("severity") or "unrated").upper(),
+                                                       clean_matrix_text(v.get("title") or "")), "red"))
+            fixed_now = len(now - after)
+            if fixed_now:
+                print(pal.paint("  Moving to %s fixes %d known %s in %s." % (
+                    tag, fixed_now, "vulnerability" if fixed_now == 1 else "vulnerabilities", current),
+                    "green"))
+
+        # A release with a strict subset of the target's known vulnerabilities, among those this
+        # deployment could actually move to: not end-of-life, not a downgrade the matrix refuses, and
+        # not behind a blocked edge. Advice only -- see safer_alternative.
+        _candidates = []
+        for _t in (_release_tags or []):
+            try:
+                if (is_eol(local_matrix, _t) or downgrade_refusal(local_matrix, current, _t)[0]
+                        or plan_upgrade_path(local_matrix, current, _t).get("blocked") is not None):
+                    continue
+            except Exception:  # a candidate the tool cannot reason about is simply not suggested
+                continue
+            _candidates.append(_t)
+        safer = safer_alternative(merged_lifecycle, tag, _candidates)
+        if safer:
+            _fewer = len(_finding_keys(merged_lifecycle, tag)) - len(_finding_keys(merged_lifecycle, safer))
+            print(pal.paint(
+                "  %s is affected by %d fewer known %s than %s and by none that %s is not. Unless you "
+                "need %s specifically, choose %s." % (
+                    safer, _fewer, "vulnerability" if _fewer == 1 else "vulnerabilities", tag, tag, tag,
+                    safer), "yellow"))
 
         # A downgrade the matrix refuses: an older image cannot read data written by the newer one,
         # so the move is not offered even with an 'i accept'. Read off this checkout's matrix, which
@@ -4616,6 +4797,16 @@ class DockVault:
         if not confirmed:
             print(pal.paint("  Cancelled.\n", "yellow"))
             return
+
+        # Choosing a release with known vulnerabilities that a reachable release does not have is
+        # stated in words too: type the version back. It is not a refusal -- a rollback during an
+        # outage is exactly when someone needs an older release -- only a guard against a reflex.
+        if safer and interactive:
+            typed = ask("%s has known vulnerabilities that %s does not. Type %s to install it anyway"
+                        % (tag, safer, tag), pal)
+            if typed.strip().lstrip("vV") != tag.strip().lstrip("vV"):
+                print(pal.paint("  Cancelled.\n", "yellow"))
+                return
 
         # An irreversible change is acknowledged in words, not with a keypress. The point is to
         # make the operator state the thing they are accepting, so it cannot be got past by

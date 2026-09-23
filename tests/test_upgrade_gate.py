@@ -664,15 +664,22 @@ def test_version_vulnerabilities_is_tolerant_of_an_older_or_odd_matrix():
     assert dv.version_vulnerabilities(None, "0.1.0") == []
 
 
-def test_support_line_names_the_vulnerability_count_titles_and_fix():
-    m = _matrix_with_vulnerabilities()
-    line = dv.support_line(m, "0.1.0")
-    assert "has known unpatched vulnerabilities (2):" in line
-    assert "First issue" in line and "Second issue" in line
-    assert "fixed in 0.2.0" in line
-    assert dv.support_line(m, "0.2.0") == "supported"                   # secure -> just supported
+def test_support_line_counts_vulnerabilities_by_severity_and_names_the_fix():
+    # One line per release in the list: how many, how bad, and what fixes them. The titles and details
+    # belong to the version the operator picks (describe_vulnerabilities), not to every line.
+    older = _matrix_with_vulnerabilities()                              # a schema-2 file: unrated
+    line = dv.support_line(older, "0.1.0")
+    assert "2 known vulnerabilities (2 unrated)" in line and "fixed in 0.2.0" in line
+    assert "First issue" not in line
+    assert dv.support_line(older, "0.2.0") == "supported"               # secure -> just supported
     # An insecure version whose matrix predates the field still names the bare fact.
     assert "unpatched" in dv.support_line(_lifecycle_matrix(), "0.1.0")
+
+    m = _v3_matrix()
+    assert "2 known vulnerabilities (1 high, 1 medium) -- fixed in 0.2.0, 0.3.0" in dv.support_line(m, "0.1.0")
+    assert "1 known vulnerability (1 medium) -- fixed in 0.3.0" in dv.support_line(m, "0.2.0")
+    m = _v3_matrix(unfixed_in_newest=True)
+    assert dv.support_line(m, "0.3.0").endswith("1 known vulnerability (1 unrated) -- 1 with no fix released yet")
 
 
 # A colour code, a reset, and a screen-clearing CSI sequence around visible text.
@@ -687,14 +694,275 @@ def test_clean_matrix_text_removes_terminal_escapes_but_keeps_visible_text():
     assert dv.clean_matrix_text(123) == ""                              # non-strings answer empty
 
 
-def test_a_tampered_vulnerability_title_renders_without_the_escape_sequence():
-    # The runtime protection: a fetched (possibly tampered) asset whose title carries escape
-    # sequences must not print them raw to the operator's terminal.
-    m = _matrix_with_vulnerabilities()
+def test_a_tampered_advisory_prints_without_its_escape_sequences():
+    # The runtime protection: a fetched (possibly tampered) matrix whose advisory carries escape
+    # sequences must not print them raw to the operator's terminal -- in any field the tool prints.
+    m = _v3_matrix()
+    for field in ("impact", "remediation", "mitigation", "cvss"):
+        m["advisories"]["old-issue"][field] = _CLEARING_TITLE
     m["versions"]["0.1.0"]["vulnerabilities"][0]["title"] = _CLEARING_TITLE
-    line = dv.support_line(m, "0.1.0")
-    assert "\x1b" not in line and "[31m" not in line and "[2J" not in line
-    assert "DANGERcleared" in line                                      # the visible text survives
+    m["versions"]["0.1.0"]["vulnerabilities"][0]["fixed_in"] = _CLEARING_TITLE
+    lines = dv.describe_vulnerabilities(dv.version_vulnerabilities(m, "0.1.0"))
+    printed = "\n".join(lines + [dv.support_line(m, "0.1.0")])
+    assert "\x1b" not in printed and "[31m" not in printed and "[2J" not in printed
+    assert printed.count("DANGERcleared") >= 6                          # the visible text survives
+
+
+# --- schema-3 advisories: what the tool reads and shows -------------------------------------------
+
+_HIGH_VECTOR = "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N"
+_MEDIUM_VECTOR = "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N"
+
+
+def _v3_matrix(*, unfixed_in_newest=False):
+    """0.1.0 -> 0.2.0 -> 0.3.0, schema 3, every edge direct and reversible.
+
+    old-issue (high) affects 0.1.0 and is fixed in 0.2.0. mid-issue (medium) affects 0.1.0 and 0.2.0
+    and is fixed in 0.3.0. With `unfixed_in_newest`, new-issue (unrated, no fix yet, with a
+    mitigation) affects 0.3.0 only -- a regression in the newest release."""
+    def advisory(title, fixed_in, severity, vector, mitigation=None):
+        return {"title": title, "description": "d", "impact": title + " impact",
+                "remediation": ("Upgrade to %s." % fixed_in) if fixed_in else "Apply the mitigation.",
+                "mitigation": mitigation, "severity": severity, "cvss": vector, "id": None,
+                "fixed_in": fixed_in, "published": "2026-01-03"}
+
+    def ref(slug, title, fixed_in):
+        return {"advisory": slug, "title": title, "fixed_in": fixed_in}
+
+    m = {
+        "schema_version": 3, "about": "test", "kinds": {"direct": "a", "blocked": "b"},
+        "advisories": {"old-issue": advisory("Old issue", "0.2.0", "high", _HIGH_VECTOR),
+                       "mid-issue": advisory("Mid issue", "0.3.0", "medium", _MEDIUM_VECTOR)},
+        "versions": {
+            "0.1.0": {"released": "2026-01-01", "notes": "a", "support": {"eol": False, "secure": False},
+                      "vulnerabilities": [ref("old-issue", "Old issue", "0.2.0"),
+                                          ref("mid-issue", "Mid issue", "0.3.0")]},
+            "0.2.0": {"released": "2026-01-02", "notes": "b", "support": {"eol": False, "secure": False},
+                      "vulnerabilities": [ref("mid-issue", "Mid issue", "0.3.0")]},
+            "0.3.0": {"released": "2026-01-03", "notes": "c", "support": {"eol": False, "secure": True}},
+        },
+        "edges": [{"from": "0.1.0", "to": "0.2.0", "kind": "direct", "reversible": True, "requires_backup": False},
+                  {"from": "0.2.0", "to": "0.3.0", "kind": "direct", "reversible": True, "requires_backup": False}],
+    }
+    if unfixed_in_newest:
+        m["advisories"]["new-issue"] = advisory("New issue", None, None, None,
+                                                mitigation="Turn the new feature off.")
+        m["versions"]["0.3.0"]["support"]["secure"] = False
+        m["versions"]["0.3.0"]["vulnerabilities"] = [ref("new-issue", "New issue", None)]
+    return m
+
+
+def test_a_schema_3_reference_is_read_through_its_advisory():
+    by_title = {v["title"]: v for v in dv.version_vulnerabilities(_v3_matrix(), "0.1.0")}
+    assert set(by_title) == {"Old issue", "Mid issue"}
+    old = by_title["Old issue"]
+    assert (old["advisory"], old["severity"], old["fixed_in"]) == ("old-issue", "high", "0.2.0")
+    assert old["impact"] == "Old issue impact" and old["remediation"] == "Upgrade to 0.2.0."
+    assert old["cvss"] == _HIGH_VECTOR and old["mitigation"] is None
+
+
+@pytest.mark.parametrize("severity, expected", [
+    ("high", "high"), (" HIGH ", "high"),                  # a spelling this tool can recognise
+    ("severe", None), ("CRITICAL!!", None), (9, None), ({"band": "high"}, None), (None, None),
+])
+def test_a_severity_the_tool_does_not_recognise_reads_as_unrated(severity, expected):
+    # A fetched matrix is untrusted: an unknown severity must not invent a bucket in the counts.
+    m = _v3_matrix()
+    m["advisories"]["old-issue"]["severity"] = severity
+    assert dv.version_vulnerabilities(m, "0.1.0")[0]["severity"] == expected
+
+
+def test_advisory_details_are_bounded_and_a_missing_advisory_still_lists_its_title():
+    m = _v3_matrix()
+    m["advisories"]["old-issue"]["impact"] = "x" * 50_000
+    assert len(dv.version_vulnerabilities(m, "0.1.0")[0]["impact"]) <= dv._DETAIL_CAP
+    del m["advisories"]["old-issue"]                        # a reference to nothing: still a finding
+    old = dv.version_vulnerabilities(m, "0.1.0")[0]
+    assert (old["title"], old["fixed_in"], old["severity"], old["impact"]) == ("Old issue", "0.2.0", None, None)
+
+
+def test_the_detail_lists_the_most_severe_first_and_says_when_there_is_no_fix():
+    lines = dv.describe_vulnerabilities(dv.version_vulnerabilities(_v3_matrix(), "0.1.0"))
+    text = "\n".join(lines)
+    assert text.index("[HIGH] Old issue -- fixed in 0.2.0") < text.index("[MEDIUM] Mid issue -- fixed in 0.3.0")
+    assert "Impact: Old issue impact" in text and "Remediation: Upgrade to 0.2.0." in text
+    assert "CVSS: " + _HIGH_VECTOR in text
+    unfixed = "\n".join(dv.describe_vulnerabilities(
+        dv.version_vulnerabilities(_v3_matrix(unfixed_in_newest=True), "0.3.0")))
+    assert "[UNRATED] New issue -- no fix released yet" in unfixed
+    assert "Mitigation: Turn the new feature off." in unfixed
+
+
+def test_a_merged_main_copy_brings_its_advisory_details_with_it():
+    # The advisory published on main after this checkout was cut: the merge resolves it against MAIN's
+    # advisories, so the operator sees its severity and remediation, not only a title.
+    local = _v3_matrix()
+    main = _v3_matrix(unfixed_in_newest=True)
+    merged, source = dv.merge_lifecycle_matrix(local, main, "0.3.0")
+    assert source == "main"
+    new = dv.version_vulnerabilities(merged, "0.3.0")
+    assert [(v["title"], v["fixed_in"], v["mitigation"]) for v in new] == [
+        ("New issue", None, "Turn the new feature off.")]
+    assert dv.version_support(merged, "0.3.0")["secure"] is False
+
+
+# --- a safer release: advice, never a refusal ------------------------------------------------------
+
+_TAGS = ["v0.3.0", "v0.2.0", "v0.1.0"]
+
+
+def test_the_safer_alternative_has_a_strict_subset_and_the_fewest():
+    m = _v3_matrix()
+    # 0.2.0 {mid} and 0.3.0 {} are both strict subsets of 0.1.0 {old, mid}: the fewest wins.
+    assert dv.safer_alternative(m, "v0.1.0", _TAGS) == "v0.3.0"
+    assert dv.safer_alternative(m, "v0.1.0", ["v0.2.0", "v0.1.0"]) == "v0.2.0"
+    # Nothing listed: nothing is a strict subset of an empty set.
+    assert dv.safer_alternative(m, "v0.3.0", _TAGS) is None
+
+
+def test_a_release_the_matrix_does_not_describe_is_never_called_safer():
+    # v0.9.0 lists nothing only because nothing is known about it.
+    assert dv.safer_alternative(_v3_matrix(), "v0.2.0", ["v0.9.0"]) is None
+    assert dv.safer_alternative(_v3_matrix(), "v0.9.0", _TAGS) is None
+
+
+def test_a_release_with_a_vulnerability_the_target_lacks_is_not_safer():
+    m = _v3_matrix(unfixed_in_newest=True)
+    # 0.3.0 {new} is not a subset of 0.2.0 {mid}: they trade one known issue for another.
+    assert dv.safer_alternative(m, "v0.2.0", ["v0.3.0"]) is None
+    # ...and the same set is not strictly smaller.
+    m["versions"]["0.3.0"]["vulnerabilities"] = list(m["versions"]["0.2.0"]["vulnerabilities"])
+    m["advisories"]["mid-issue"]["fixed_in"] = None
+    for ver in ("0.1.0", "0.2.0", "0.3.0"):
+        for v in m["versions"][ver].get("vulnerabilities", []):
+            if v["advisory"] == "mid-issue":
+                v["fixed_in"] = None
+    assert dv.safer_alternative(m, "v0.2.0", ["v0.3.0"]) is None
+
+
+def test_a_regression_in_the_newest_release_makes_the_previous_one_safer():
+    # The newest release is not automatically the safest: when it introduced a known issue its
+    # predecessor does not have, going back is the advice, and a rollback is exactly this case.
+    m = _v3_matrix(unfixed_in_newest=True)
+    m["versions"]["0.2.0"]["vulnerabilities"] = []
+    m["versions"]["0.2.0"]["support"]["secure"] = True
+    m["advisories"]["mid-issue"]["fixed_in"] = "0.2.0"
+    m["versions"]["0.1.0"]["vulnerabilities"][1]["fixed_in"] = "0.2.0"
+    assert dv.safer_alternative(m, "v0.3.0", _TAGS) == "v0.2.0"
+
+
+def test_the_advice_always_ends_somewhere():
+    # The property that means the advice can never shut every door: following "a safer release" from
+    # any release strictly shrinks the set of known vulnerabilities, so it always stops at a release
+    # with no safer alternative -- and at least one such release always exists.
+    # Exhaustive over every way three findings can sit on four releases: 8**4 = 4,096 cases.
+    import itertools
+    findings = ["a", "b", "c"]
+    versions = ["0.1.0", "0.2.0", "0.3.0", "0.4.0"]
+    tags = ["v" + v for v in versions]
+    for combo in itertools.product(range(2 ** len(findings)), repeat=len(versions)):
+        m = {"versions": {v: {"vulnerabilities": [{"title": f, "fixed_in": None}
+                                                  for bit, f in enumerate(findings) if mask >> bit & 1]}
+                          for v, mask in zip(versions, combo)}}
+        ends = [t for t in tags if dv.safer_alternative(m, t, tags) is None]
+        assert ends, combo
+        for t in tags:
+            steps, at = 0, t
+            while (nxt := dv.safer_alternative(m, at, tags)) is not None:
+                assert len(dv._finding_keys(m, nxt)) < len(dv._finding_keys(m, at))
+                at, steps = nxt, steps + 1
+                assert steps <= len(findings), (combo, t)
+
+
+# --- the update flow ---------------------------------------------------------------------------------
+
+def _answers(monkeypatch, typed):
+    """Interactive: yes to every confirm; `typed` to the version-typed-back prompt and to the version
+    list; and 'i accept' to the irreversible-change prompt, which a downgrade raises on its own (a
+    backward hop is undescribed, so it is treated as possibly irreversible)."""
+    asked = []
+    monkeypatch.setattr(dv, "confirm", lambda prompt, pal, default=True: True)
+
+    def ask(prompt, pal, default=None):
+        asked.append(prompt)
+        return "i accept" if "'i accept'" in prompt else typed
+    monkeypatch.setattr(dv, "ask", ask)
+    return asked
+
+
+def _v3_deployment(tmp_path, monkeypatch, *, running, matrix=None, tags=_TAGS):
+    tool = _deployment(tmp_path, matrix=matrix or _v3_matrix())
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: (running, "the running container"))
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: list(tags))
+    monkeypatch.setattr(dv, "fetch_main_lifecycle_matrix", lambda *a, **k: None)   # hermetic
+    images = []
+    monkeypatch.setattr(tool, "_set_env_key",
+                        lambda path, key, value: images.append(value) if key == "DOCKVAULT_IMAGE" else None)
+    return tool, images
+
+
+def _interactive(tool, tag):
+    tool.update(argparse.Namespace(tag=tag, source=False, yes=False, non_interactive=False,
+                                   dry_run=False, backup_verified=False))
+
+
+def test_choosing_a_less_safe_release_asks_for_its_name_and_then_proceeds(tmp_path, monkeypatch, capsys):
+    tool, images = _v3_deployment(tmp_path, monkeypatch, running="0.3.0")
+    asked = _answers(monkeypatch, typed="v0.1.0")
+    _interactive(tool, "v0.1.0")
+    out = capsys.readouterr().out
+    assert "WARNING: v0.1.0 has 2 known vulnerabilities (1 high, 1 medium)" in out
+    assert "[HIGH] Old issue -- fixed in 0.2.0" in out and "Impact: Old issue impact" in out
+    assert "brings back 2 known vulnerabilities that 0.3.0 does not have" in out
+    assert "v0.3.0 is affected by 2 fewer known vulnerabilities than v0.1.0" in out
+    assert any("Type v0.1.0 to install it anyway" in q for q in asked), asked
+    assert images == ["ghcr.io/dockvault/vault:v0.1.0"], "typing the version back must let it proceed"
+
+
+def test_anything_but_the_version_typed_back_cancels(tmp_path, monkeypatch, capsys):
+    tool, images = _v3_deployment(tmp_path, monkeypatch, running="0.3.0")
+    _answers(monkeypatch, typed="yes")
+    _interactive(tool, "v0.1.0")
+    assert images == [] and "Cancelled." in capsys.readouterr().out
+
+
+def test_without_a_terminal_the_advice_is_printed_and_nothing_is_refused(tmp_path, monkeypatch, capsys):
+    # A scripted rollback with --yes must still work: the data can warn, never block.
+    tool, images = _v3_deployment(tmp_path, monkeypatch, running="0.3.0")
+    _update(tool, tag="v0.1.0", backup_verified=True)
+    assert "is affected by 2 fewer known vulnerabilities" in capsys.readouterr().out
+    assert images == ["ghcr.io/dockvault/vault:v0.1.0"]
+
+
+def test_an_upgrade_says_what_it_fixes_and_asks_nothing_extra(tmp_path, monkeypatch, capsys):
+    tool, images = _v3_deployment(tmp_path, monkeypatch, running="0.1.0")
+    asked = _answers(monkeypatch, typed="unexpected")
+    _interactive(tool, "v0.3.0")
+    out = capsys.readouterr().out
+    assert "Moving to v0.3.0 fixes 2 known vulnerabilities in 0.1.0." in out
+    assert not any("install it anyway" in q for q in asked), asked
+    assert images == ["ghcr.io/dockvault/vault:v0.3.0"]
+
+
+def test_the_newest_release_with_an_unfixed_issue_is_still_installable(tmp_path, monkeypatch, capsys):
+    # The lock-out case: every release carries a known vulnerability, the newest one with no fix yet.
+    # The list says so, the mitigation is shown, and the change still goes through.
+    m = _v3_matrix(unfixed_in_newest=True)
+    tool, images = _v3_deployment(tmp_path, monkeypatch, running="0.2.0", matrix=m)
+    asked = _answers(monkeypatch, typed="")
+    tool.update(argparse.Namespace(tag=None, source=False, yes=False, non_interactive=False,
+                                   dry_run=False, backup_verified=False))
+    listing = capsys.readouterr().out
+    assert "Every release listed has known vulnerabilities" in listing
+    assert "v0.3.0" in listing and "1 with no fix released yet" in listing
+    assert asked, "the list must still offer a choice"
+
+    _answers(monkeypatch, typed="unexpected")
+    _interactive(tool, "v0.3.0")
+    out = capsys.readouterr().out
+    assert "Mitigation: Turn the new feature off." in out
+    assert images == ["ghcr.io/dockvault/vault:v0.3.0"]
 
 
 # Every ECMA-48 sequence family, and the payload-survival defect they exposed: an OSC/DCS/APC/PM/SOS
