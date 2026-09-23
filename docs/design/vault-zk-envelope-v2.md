@@ -706,9 +706,12 @@ supported release reads both formats before any of them is written. What remains
 exposure — a tab left open since before the v0.11.0 reader shipped keeps running the old code until
 it is reloaded, and no cache header or asset buster changes what an already-open tab runs. A
 downgrade to a release older than 0.11.0 cannot open zero-knowledge vaults or files written after
-the switch. The release will record the 0.30.0 → 0.31.0 edge as one-way (`reversible: false`,
-`requires_backup: true`), and the host tool will gate that downgrade behind a typed acknowledgement
-and a backup; neither exists in this tree yet — they land in the release commit. Legacy-format files
+the switch. The release records the 0.30.0 → 0.31.0 edge as reversible (`reversible: true`,
+`requires_backup: true`), not as the one-way edge first planned here: 0.30.0 already reads every
+version-2 format 0.31.0 writes — content, direct and team DEK wraps, the team private key, name-index
+keys and link tokens, each reader chosen by the bytes' own header — so a rollback to 0.30.0 opens
+everything written after the switch. The host tool refuses any downgrade further back, because the
+edges into 0.30.0 are themselves irreversible, and every release below 0.17.0 is end-of-life. Legacy-format files
 written earlier keep reading, and each writer flag keeps a legacy fallback, so turning a flag back
 writes NEW data in the old form. What cannot be undone is data already written in v2 — above all a
 v2 WRAP, which the server cannot re-wrap for a reader that predates it.
