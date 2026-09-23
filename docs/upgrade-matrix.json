@@ -65,6 +65,30 @@
       "id": null,
       "fixed_in": "0.30.0",
       "published": "2026-09-18"
+    },
+    "sftp-interrupted-upload-committed": {
+      "title": "An interrupted SFTP upload was committed as a complete file",
+      "description": "An SFTP upload whose connection dropped before the client closed the file was finalized as though it had completed: nothing distinguished a dropped connection from a graceful close. A partial transfer was stored as a whole file and could replace an existing file of the same name. An upload the client never closed is now discarded instead of committed.",
+      "impact": "A file could be silently replaced by a truncated copy of an upload that was cut off, and the file's previous content was lost. Anyone able to interrupt a user's connection during an upload could cause it.",
+      "remediation": "Upgrade to 0.31.0. Files uploaded over SFTP by a connection that dropped part-way may be incomplete; check them against their source.",
+      "mitigation": "Until you can upgrade, have the SFTP client upload to a temporary name and rename the file into place once the transfer completes (many clients offer this), so an interrupted transfer leaves a partial temporary file instead of replacing the existing one.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.31.0",
+      "published": "2026-09-23"
+    },
+    "sftp-stalled-upload-holds-connection": {
+      "title": "A stalled SFTP upload held its connection indefinitely",
+      "description": "An authenticated SFTP session whose upload stopped making progress kept its worker thread and its connection for as long as the client stayed connected: nothing bounded a session that had signed in and then stopped sending. From 0.19.1, which caps live SFTP connections, enough stalled sessions filled that cap and the server refused every new SFTP connection; before it, each one held a thread with no limit at all. A stalled upload is now failed once it stops making progress, which frees its thread, its connection and the name it was writing.",
+      "impact": "Any user who can sign in over SFTP could stop the SFTP server accepting connections by leaving uploads stalled, for as long as they kept those sessions open. Clients on unreliable connections could do the same by accident.",
+      "remediation": "Upgrade to 0.31.0.",
+      "mitigation": "Until you can upgrade: on 0.19.1 or later, keep SFTP_MAX_CONNECTIONS_PER_IP well below SFTP_MAX_CONNECTIONS (the defaults, 10 and 100, already are) so that one address cannot hold the whole limit; on any version, restarting the service releases sessions that have stalled.",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.31.0",
+      "published": "2026-09-23"
     }
   },
   "versions": {
@@ -80,6 +104,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -95,6 +129,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -110,6 +154,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -125,6 +179,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -140,6 +204,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -155,6 +229,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -170,6 +254,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -185,6 +279,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -200,6 +304,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -215,6 +329,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -230,6 +354,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -245,6 +379,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -260,6 +404,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -280,6 +434,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -300,6 +464,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -320,6 +494,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -340,6 +524,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -360,6 +554,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -380,6 +584,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -400,6 +614,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -420,6 +644,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -440,6 +674,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -460,6 +704,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -480,6 +734,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -500,6 +764,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -520,6 +794,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -540,6 +824,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -560,6 +854,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -580,6 +884,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -600,6 +914,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -620,6 +944,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -640,6 +974,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -675,6 +1019,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -710,6 +1064,16 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
@@ -735,12 +1099,42 @@
           "advisory": "temp-credential-liveness-at-sign-in",
           "title": "A temporary credential in use was distinguishable at sign-in",
           "fixed_in": "0.30.0"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
         }
       ]
     },
     "0.30.0": {
       "released": "2026-09-18",
       "notes": "Device sync is throttled per device in its own bucket, so a looping sync client can no longer lock the owner out of the web sign-in from the same address; a device can ask the server whether it may sync before it tries; a sync credential frees its slot when its connection closes; an in-progress upload shows in the web listing and a second upload of the same name is refused, over the web as well as SFTP; note-link URL tokens are stored hashed with an in-place migration and links can be shown again only by their owner through an encrypted copy; SFTP uploads stream to storage by default within a documented memory ceiling, browser downloads stream to disk by default, and a file too large to hold in memory is refused up front instead of buffered when streaming is unavailable; the version lifecycle shown by the app and the host tool comes from the current matrix, not the release's frozen copy; database waits are bounded; the host tool's update no longer changes the deployment's image reference until the new image has actually been pulled. A rollback to 0.29.1 is not clean: note-link tokens are stored hashed and an older release cannot read them back.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "sftp-interrupted-upload-committed",
+          "title": "An interrupted SFTP upload was committed as a complete file",
+          "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection",
+          "title": "A stalled SFTP upload held its connection indefinitely",
+          "fixed_in": "0.31.0"
+        }
+      ]
+    },
+    "0.31.0": {
+      "released": "2026-09-23",
+      "notes": "An SFTP upload that stops making progress is failed instead of holding its thread, its connection slot and the lock on its filename until the client chooses to leave, and an upload the client never closed is discarded rather than committed as a complete file; in the split profile, the SFTP container's healthcheck reports whether the SFTP server is still working rather than whether its port is bound (the combined profile's health check still only tests that the port accepts connections); an abandoned upload's name is freed in five minutes instead of fifteen. A web upload is aborted at sign-out, so an upload in flight cannot outlive the session that started it; a re-picked file is checked against what the server already holds before an interrupted upload continues with it, so an edited file is never spliced onto the previous attempt's chunks; and every upload is told about an earlier upload of its name that is still in progress. No database connection is held while a client sends an upload chunk, and a chunk's whole authorisation is re-established after its body rather than only before it. Every Retry-After is computed in one place -- never below a second, never above its window, and never negative. Where an upload refusal names the member holding the name, it does so only to a viewer shown to be a member. The SFTP per-address limit is split so a device fleet behind one address is not turned away by the flood guard, while the guard against unauthenticated floods is unchanged. A hung Redis breaker probe is replaced instead of a request probing in the foreground. Plain HTTP to a loopback host is treated as a secure context by the browsers' own rule, so a vault served at a .localhost name streams downloads instead of buffering them. Zero-knowledge vaults now write the version-2 key-wrap and content formats, which 0.30.0 already reads, so a rollback to 0.30.0 still opens everything written after the switch; because this is the first release to write them, the upgrade asks for a backup first. The upgrade matrix records each known vulnerability once, with its impact, what to do about it and a CVSS v4.0 rating, and `dockvault.py update` shows each release's known vulnerabilities by severity, says what a change fixes or brings back, and names a release with fewer when there is one. A rollback to 0.30.0 is clean: this release changes no database table, and the one column it writes is read by nothing.",
       "support": {
         "eol": false,
         "secure": true
@@ -1014,6 +1408,13 @@
       "kind": "direct",
       "reversible": false,
       "requires_backup": false
+    },
+    {
+      "from": "0.30.0",
+      "to": "0.31.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true
     }
   ],
   "waivers": [
