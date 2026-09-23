@@ -267,7 +267,9 @@ class BrandingConfig(BaseSettings):
     
     enable_signup: bool = Field(
         default=True,
-        description="Allow new user signups"
+        description=("Deployment-level ceiling on self-signup. False: no admin can turn self-signup "
+                     "on here (for hosted deployments). True: the admin's Settings switch decides, "
+                     "and it is off by default.")
     )
     
     enable_trial: bool = Field(

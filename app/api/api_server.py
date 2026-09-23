@@ -3119,14 +3119,26 @@ def _login_identifier(db: Session) -> str:
     return effective_account_policy(row.value if row else None)["login_identifier"]
 
 
+def _signup_allowed() -> bool:
+    """The deployment's ceiling on self-signup: BRAND_ENABLE_SIGNUP, set by whoever runs the
+    deployment (a managing operator, or the operator's own .env). The admin brand editor cannot
+    change it. False means no admin can turn self-signup on here; True (the default) leaves it to
+    the admin's own switch, which is off by default. Read through get_branding() so a reload is
+    seen (app.config re-exports the INSTANCE under the module's name, so `app.config.branding` is
+    not the module)."""
+    from app.config.branding import get_branding
+    return bool(getattr(get_branding(), "enable_signup", True))
+
+
 def _account_policy(db: Session) -> dict:
     """The full effective account-onboarding policy block. Always read through
     effective_account_policy so defaults fill in and the domain list is leniently normalized — never
-    read the raw stored blob."""
+    read the raw stored blob — and through the deployment's self-signup ceiling, so the login page,
+    the signup endpoint and everything else that asks whether signup is on get the same answer."""
     from app.core.models import SystemSetting
-    from app.core.account_policy import effective_account_policy
+    from app.core.account_policy import effective_account_policy, apply_signup_ceiling
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
-    return effective_account_policy(row.value if row else None)
+    return apply_signup_ceiling(effective_account_policy(row.value if row else None), _signup_allowed())
 
 
 def _invite_pepper() -> str:
@@ -3342,7 +3354,8 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
                 payload,
                 email_login_locks_out_all_admins=_email_login_would_lock_out_all_admins(db),
                 smtp_configured=_smtp_configured(db),
-                username_email_collision=_username_email_collision(db))
+                username_email_collision=_username_email_collision(db),
+                signup_allowed=_signup_allowed())
         except AccountPolicyError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         # Persist the canonical form (deduped/lowercased domains), not the raw input. Mutating the
@@ -3443,8 +3456,12 @@ async def get_settings(
     # Effective account-onboarding policy (email requirement, invitation + signup switches, domain
     # gate, login identifier) with defaults filled in, so the Accounts & Access tab renders the real
     # posture and a whole-object save can't persist an unchecked default.
-    from app.core.account_policy import effective_account_policy
-    data.update(effective_account_policy(row.value if row else None))
+    # Under the deployment's self-signup ceiling, like every other reader; `signup_locked` tells the
+    # tab to show the switch as unavailable rather than as an admin choice.
+    from app.core.account_policy import effective_account_policy, apply_signup_ceiling
+    data.update(apply_signup_ceiling(effective_account_policy(row.value if row else None),
+                                     _signup_allowed()))
+    data["signup_locked"] = not _signup_allowed()
     # Effective MFA policy (mode / required groups + users / allowed methods / email TTL / sftp policy),
     # defaults filled in, so the Accounts & Access -> Two-factor tab renders the real posture.
     from app.core import second_factor_policy as _sfpol_get

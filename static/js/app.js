@@ -8211,6 +8211,13 @@ function populateAccountsPolicy(settings) {
     const setVal = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
     setChk('setting-invite-enabled', settings.invite_enabled);
     setChk('setting-signup-enabled', settings.signup_enabled);
+    // The deployment can rule self-signup out (BRAND_ENABLE_SIGNUP=false). Then the switch is not an
+    // admin choice: show it off and unavailable, and say why, instead of a toggle the save refuses.
+    const signupLocked = settings.signup_locked === true;
+    const signupEl = document.getElementById('setting-signup-enabled');
+    if (signupEl) { signupEl.disabled = signupLocked; if (signupLocked) signupEl.checked = false; }
+    const signupNote = document.getElementById('setting-signup-locked-note');
+    if (signupNote) signupNote.style.display = signupLocked ? '' : 'none';
     setVal('setting-invite-ttl-hours', settings.invite_ttl_hours != null ? settings.invite_ttl_hours : 24);
     setVal('setting-signup-domain-mode', settings.signup_email_domain_mode || 'off');
     setVal('setting-email-requirement', settings.email_requirement || 'required');

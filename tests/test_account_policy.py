@@ -14,6 +14,7 @@ from app.core.account_policy import (
     MAX_SIGNUP_DOMAINS,
     MAX_DOMAIN_LENGTH,
     AccountPolicyError,
+    apply_signup_ceiling,
     effective_account_policy,
     email_allowed_by_domain_gate,
     signup_email_is_ascii,
@@ -26,6 +27,38 @@ pytestmark = pytest.mark.unit
 
 
 # ---- effective_account_policy: defaults filled, stored overrides -----------------------------
+# --- the deployment's self-signup ceiling (BRAND_ENABLE_SIGNUP) -----------------------------------
+
+@pytest.mark.parametrize("stored, allowed, effective", [
+    (True, True, True),       # allowed: the admin's switch decides
+    (False, True, False),
+    (True, False, False),     # ruled out: off whatever the admin stored
+    (False, False, False),
+])
+def test_the_signup_ceiling(stored, allowed, effective):
+    policy = effective_account_policy({"signup_enabled": stored})
+    out = apply_signup_ceiling(policy, allowed)
+    assert out["signup_enabled"] is effective
+    assert policy["signup_enabled"] is stored                       # the input is not changed
+    assert {k: v for k, v in out.items() if k != "signup_enabled"} == \
+        {k: v for k, v in policy.items() if k != "signup_enabled"}  # nothing else moves
+
+
+def test_turning_signup_on_is_refused_when_the_deployment_rules_it_out():
+    with pytest.raises(AccountPolicyError, match="turned off for this whole deployment"):
+        validate_account_policy({"signup_enabled": True}, signup_allowed=False)
+
+
+@pytest.mark.parametrize("payload", [{"signup_enabled": False}, {"invite_enabled": True}, {}])
+def test_leaving_signup_off_is_accepted_when_the_deployment_rules_it_out(payload):
+    validate_account_policy(payload, signup_allowed=False)
+
+
+def test_turning_signup_on_is_accepted_by_default():
+    validate_account_policy({"signup_enabled": True})           # no ceiling given: no refusal
+    validate_account_policy({"signup_enabled": True}, signup_allowed=True)
+
+
 def test_effective_all_defaults_when_empty():
     eff = effective_account_policy(None)
     assert eff == {**DEFAULTS, "signup_email_domains": []}

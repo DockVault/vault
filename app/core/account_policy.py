@@ -86,6 +86,24 @@ def effective_account_policy(stored: dict | None) -> dict:
     return out
 
 
+SIGNUP_UNAVAILABLE_MESSAGE = (
+    "Self-signup is turned off for this whole deployment, so it cannot be switched on here.")
+
+
+def apply_signup_ceiling(policy: dict, allowed: bool) -> dict:
+    """The effective policy under the deployment's ceiling on self-signup (BRAND_ENABLE_SIGNUP).
+
+    `allowed` is False when whoever runs the deployment has ruled self-signup out; then it is off
+    whatever the admin's stored switch says. A stored True is left in place (lifting the ceiling
+    does not need the admin to find the switch again), but nothing reads it while the ceiling holds:
+    every reader of the switch goes through this. Returns a new dict; the input is not changed.
+    """
+    out = dict(policy)
+    if not allowed:
+        out["signup_enabled"] = False
+    return out
+
+
 def email_allowed_by_domain_gate(email, mode, domains) -> bool:
     """Is this email's domain permitted by the signup-domain policy?
 
@@ -193,7 +211,8 @@ def normalize_domains_lenient(value) -> list[str]:
 
 def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: bool = False,
                             smtp_configured: bool = False,
-                            username_email_collision: tuple | None = None) -> dict:
+                            username_email_collision: tuple | None = None,
+                            signup_allowed: bool = True) -> dict:
     """Validate only the account-policy keys PRESENT in `payload`; pass everything else through.
 
     Returns a dict of the NORMALIZED values for the keys it handled (e.g. deduped/lowercased
@@ -210,6 +229,9 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: 
     - `username_email_collision`: a sample (username, email) pair where one account's username equals
       another's email. Refuse switching to 'either' login when one exists, or that username would
       shadow the real email owner (username is tried first). Pure 'email' mode is unaffected.
+    - `signup_allowed`: the deployment's ceiling on self-signup (BRAND_ENABLE_SIGNUP). When False,
+      turning self-signup ON is refused -- saving it silently would claim a setting that does
+      nothing. Turning it off, or leaving it off, is always accepted.
     """
     if not isinstance(payload, dict):
         raise AccountPolicyError("Settings payload must be an object")
@@ -224,6 +246,8 @@ def validate_account_policy(payload: dict, *, email_login_locks_out_all_admins: 
     for bool_key in ("invite_enabled", "signup_enabled", "password_reset_enabled"):
         if bool_key in payload and not isinstance(payload[bool_key], bool):
             raise AccountPolicyError(f"{bool_key} must be true or false")
+    if payload.get("signup_enabled") is True and not signup_allowed:
+        raise AccountPolicyError(SIGNUP_UNAVAILABLE_MESSAGE)
 
     if "invite_ttl_hours" in payload:
         v = payload["invite_ttl_hours"]

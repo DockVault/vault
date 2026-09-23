@@ -116,6 +116,8 @@ async def get_features():
     """
     return {
         "signup": {
+            # Whether this deployment ALLOWS self-signup at all (BRAND_ENABLE_SIGNUP). The admin's
+            # own switch then decides whether it is actually on; GET /auth/policy reports that.
             "enabled": branding.enable_signup,
             "trial_enabled": branding.enable_trial,
             "trial_days": branding.trial_days if branding.enable_trial else 0,
