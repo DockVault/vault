@@ -11,6 +11,7 @@ on the second made every split deployment report itself permanently degraded.
 """
 import importlib.util
 import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from app.core.health import (
     check_sftp_status,
     check_storage_status,
 )
+from app.sftp import heartbeat
 
 pytestmark = pytest.mark.unit
 
@@ -60,23 +62,38 @@ def test_split_deployment_declines_to_answer_for_another_container(monkeypatch):
     assert status != "unreachable", "a split deployment must not report itself broken"
 
 
-def test_combined_deployment_reports_a_live_listener(monkeypatch):
+def _sftp_in_this_container(monkeypatch, tmp_path):
     monkeypatch.setenv("RUN_SFTP", "1")
     monkeypatch.setenv(SFTP_IN_CONTAINER_ENV, "1")
+    path = tmp_path / "sftp.heartbeat"
+    monkeypatch.setenv(heartbeat.HEARTBEAT_FILE_ENV, str(path))
+    return str(path)
+
+
+def test_combined_deployment_reports_a_beating_sftp_half(monkeypatch, tmp_path):
+    path = _sftp_in_this_container(monkeypatch, tmp_path)
+    heartbeat.beat(path)
+    # Read from the heartbeat, not a port: nothing is listening anywhere here.
+    monkeypatch.setattr("app.core.health.settings.sftp_port", _free_port(), raising=False)
+    assert check_sftp_status() == "listening"
+
+
+def test_combined_deployment_reports_a_hung_sftp_half(monkeypatch, tmp_path):
+    # The case the check exists for: SFTP runs HERE, its port still accepts -- a stopped process
+    # keeps its socket -- but it has stopped turning. Only the heartbeat knows.
+    path = _sftp_in_this_container(monkeypatch, tmp_path)
+    heartbeat.beat(path, now=time.time() - heartbeat.STALE_AFTER_SECONDS - 5)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         monkeypatch.setattr(
             "app.core.health.settings.sftp_port", listener.getsockname()[1], raising=False
         )
-        assert check_sftp_status() == "listening"
+        assert check_sftp_status() == "unresponsive"
 
 
-def test_combined_deployment_reports_a_dead_listener(monkeypatch):
-    # The case the check exists for: SFTP was meant to run HERE and is not answering.
-    monkeypatch.setenv("RUN_SFTP", "1")
-    monkeypatch.setenv(SFTP_IN_CONTAINER_ENV, "1")
-    monkeypatch.setattr("app.core.health.settings.sftp_port", _free_port(), raising=False)
+def test_combined_deployment_whose_sftp_half_never_started_is_unreachable(monkeypatch, tmp_path):
+    _sftp_in_this_container(monkeypatch, tmp_path)          # no heartbeat file at all
     assert check_sftp_status() == "unreachable"
 
 

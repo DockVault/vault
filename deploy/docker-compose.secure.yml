@@ -170,7 +170,8 @@ services:
     # against a TLS listener). NOTE: this does NOT cover the SFTP half — an SFTP-only failure
     # is caught by run_combined.py's supervisor (it exits if either child dies), not here.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request, ssl; ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8000/health', context=ctx)"]
+      # The app's /health and, where SFTP runs in this container, the SFTP half's heartbeat.
+      test: ["CMD", "python", "-B", "-m", "app.core.healthcheck"]
       interval: 30s
       timeout: 10s
       start_period: 20s
@@ -274,7 +275,8 @@ services:
     # because the cert may be self-signed and its SAN is the public name, not
     # localhost; this is a same-container liveness probe, not a trust decision.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request, ssl; ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8000/health', context=ctx)"]
+      # The app's /health and, where SFTP runs in this container, the SFTP half's heartbeat.
+      test: ["CMD", "python", "-B", "-m", "app.core.healthcheck"]
       interval: 30s
       timeout: 10s
       start_period: 20s

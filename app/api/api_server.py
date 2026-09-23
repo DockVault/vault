@@ -2221,7 +2221,8 @@ async def health_check():
     # only a vault that was meant to serve SFTP from HERE and is not counts against the summary.
     # Storage that cannot be written to is degraded even while the API answers: uploads will
     # fail, and nothing else would have said so.
-    degraded = ((not db_ok) or (not redis_ok) or sftp == "unreachable"
+    from app.core.healthcheck import SFTP_DOWN
+    degraded = ((not db_ok) or (not redis_ok) or sftp in SFTP_DOWN
                 or storage != "writable" or schema != "complete")
 
     body = {

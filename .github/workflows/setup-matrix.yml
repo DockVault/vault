@@ -111,6 +111,43 @@ jobs:
           docker compose -f docker-compose.secure.yml logs --no-color --tail=100
           exit 1
 
+      - name: Scenario A2b — a frozen SFTP half is reported, and recovers
+        # The combined container serves SFTP from a child process. Freeze it (SIGSTOP), and require
+        # /health to say the SFTP half is unresponsive -- its heartbeat went stale -- and the
+        # container's own healthcheck command to fail. Then thaw it and require both to recover. A
+        # bound port would have looked alive throughout: a stopped process keeps its socket.
+        run: |
+          set -euo pipefail
+          dc() { docker compose -f docker-compose.secure.yml "$@"; }
+          # An exact argv element, so this probe -- whose own -c source contains the module name --
+          # can never find itself.
+          read -r pid uid < <(dc exec -T vault python -c "import os; p = next(p for p in os.listdir('/proc') if p.isdigit() and b'app.sftp.sftp_server' in open('/proc/%s/cmdline' % p, 'rb').read().split(bytes(1))); print(p, os.stat('/proc/' + p).st_uid)")
+          test -n "$pid" && test -n "$uid" || { echo "::error::no SFTP process found in the vault container"; exit 1; }
+          # As the process's own user: the hardened container drops every capability, so even root
+          # in it cannot signal a process that belongs to another user.
+          sig() { dc exec -T --user "$uid" vault kill "$1" "$pid"; }
+          sftp_health() { curl -sS --cacert certs/cert.pem "$BASE/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sftp"])'; }
+          test "$(sftp_health)" = listening || { echo "::error::SFTP was not healthy before the freeze"; exit 1; }
+          sig -STOP
+          trap 'sig -CONT || true' EXIT
+          seen=""
+          for attempt in $(seq 1 30); do
+            seen="$(sftp_health)"; [ "$seen" = unresponsive ] && break; sleep 3
+          done
+          test "$seen" = unresponsive || { echo "::error::a frozen SFTP half was reported as '$seen'"; exit 1; }
+          if dc exec -T vault python -B -m app.core.healthcheck; then
+            echo "::error::the container healthcheck passed with its SFTP half frozen"; exit 1
+          fi
+          sig -CONT
+          trap - EXIT
+          for attempt in $(seq 1 20); do
+            seen="$(sftp_health)"; [ "$seen" = listening ] && break; sleep 2
+          done
+          test "$seen" = listening || { echo "::error::SFTP did not recover after the thaw: '$seen'"; exit 1; }
+          dc exec -T vault python -B -m app.core.healthcheck \
+            || { echo "::error::the container healthcheck still fails after the thaw"; exit 1; }
+          echo "A2b: frozen SFTP reported as unresponsive, healthcheck failed; recovered on thaw"
+
       - name: Plant data to prove continuity against
         run: |
           set -euo pipefail

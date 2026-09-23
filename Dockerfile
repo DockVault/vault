@@ -88,9 +88,10 @@ LABEL org.opencontainers.image.source=${OCI_SOURCE} \
 # 2222 - SFTP
 EXPOSE 8000 2222
 
-# Health check (stdlib only — does not depend on `requests`)
+# Health check (stdlib only): the app's /health over API_USE_HTTPS / API_PORT, and -- when SFTP runs in
+# this container -- the SFTP half's heartbeat, as reported there. See app/core/healthcheck.py.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=5 \
-    CMD python -c "import os,ssl,urllib.request; s='https' if os.getenv('API_USE_HTTPS','false').lower()=='true' else 'http'; c=ssl._create_unverified_context() if s=='https' else None; urllib.request.urlopen(s+'://localhost:8000/health', context=c, timeout=8)"
+    CMD ["python", "-B", "-m", "app.core.healthcheck"]
 
 # Root-init entrypoint: fix volume ownership, then drop to appuser and exec the CMD (below)
 # or any compose/worker-supplied command. Idempotent + cheap when volumes are already owned.

@@ -14,7 +14,9 @@ until an endpoint that needed the column returned a 500.
 Each step now records its outcome, and `/health` answers **503** when any of them failed. The two
 links below it did not have to change: the healthcheck calls the endpoint with `urlopen`, which
 raises on a non-2xx, so Docker marks the container unhealthy and the tool waiting on Docker sees
-it. That is why the endpoint was the right place to fix.
+it. That is why the endpoint was the right place to fix. (The healthcheck is now a small program,
+app.core.healthcheck, that also fails when the container's SFTP half has stopped; the link is
+pinned by driving it with the failures it must carry.)
 
 Half of this file asserts the fixed behaviour. The rest is still CHARACTERIZATION -- the two
 downstream links are recorded as they are, because they are load-bearing in the chain above and a
@@ -26,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.util
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -114,25 +117,36 @@ def test_health_answers_503_when_the_schema_is_incomplete():
 
 
 @pytest.mark.unit
-def test_the_container_healthcheck_only_asks_whether_the_page_loads():
-    """CHARACTERIZATION, and load-bearing exactly as it is.
+@pytest.mark.parametrize("error", [
+    urllib.error.HTTPError("http://localhost:8000/health", 503, "schema incomplete", {}, None),
+    urllib.error.URLError("connection refused"),
+    ValueError("an unreadable body"),
+])
+def test_the_container_healthcheck_carries_every_failure_out_to_docker(error):
+    """The second link, driven rather than described: the 503 above must reach Docker.
 
-    `urlopen` raises on a non-2xx, so this link needs no logic of its own to carry the 503 above --
-    which is why fixing the endpoint reached Docker for free. Recorded so that a well-meant change
-    here (parsing the body, tolerating errors) cannot quietly break the chain.
+    The image's healthcheck is app.core.healthcheck, which fetches /health with `urlopen` -- which
+    raises on a non-2xx -- and turns ANY failure into exit 1, never 0. It now also reads the body,
+    to fail when the SFTP half in the container has stopped; that is exactly the "well-meant change"
+    this link was once recorded against, so it is pinned by what it does: a 503, an unreachable app
+    and an unreadable answer each make the container unhealthy.
     """
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     lines = dockerfile.splitlines()
     index = next((i for i, line in enumerate(lines) if line.startswith("HEALTHCHECK")), None)
     assert index is not None, "the image no longer declares a healthcheck"
     command = " ".join(lines[index:index + 3])
+    assert 'CMD ["python", "-B", "-m", "app.core.healthcheck"]' in command, (
+        "the image's healthcheck is no longer the program pinned here")
+    assert "|| true" not in command
 
-    assert "urlopen" in command and "/health" in command, (
-        "the healthcheck no longer fetches /health, so a 503 from it reaches nothing")
-    for tolerates_failure in ("try:", "except", "|| true"):
-        assert tolerates_failure not in command, (
-            "the healthcheck now swallows an error (%r), which breaks the only thing carrying an "
-            "incomplete schema out to Docker" % tolerates_failure)
+    from app.core import healthcheck
+
+    def opener(url, context=None, timeout=None):
+        assert url.endswith("/health")
+        raise error
+
+    assert healthcheck.main(opener) == 1, "a failure from /health no longer reaches Docker"
 
 
 @pytest.mark.unit

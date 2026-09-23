@@ -11,7 +11,6 @@ This mirrors ``check_db_connection`` in ``database.py``, which already answers a
 the breaker and off the loop).
 """
 import os
-import socket
 import uuid
 
 from app.core.config import settings
@@ -28,12 +27,17 @@ def _truthy(value) -> bool:
 
 
 def check_sftp_status() -> str:
-    """``disabled`` | ``external`` | ``listening`` | ``unreachable``.
+    """``disabled`` | ``external`` | ``listening`` | ``unresponsive`` | ``unreachable``.
 
     SFTP is opt-in: a deployment runs web only unless ``RUN_SFTP`` is set, and the two halves
-    are separate processes. The API process therefore cannot inspect the SFTP process directly
-    — it asks the only question that matters to a client, which is whether something is
-    accepting connections on the port.
+    are separate processes. When SFTP runs in this container the API reads the SFTP server's
+    heartbeat file (``app/sftp/heartbeat.py``) -- the same evidence the split profile's
+    ``vault-sftp`` healthcheck uses. A bound port says a process once called listen(); the
+    heartbeat says it is still turning: its accept loop and write-progress watchdog beat every few
+    seconds, and stop beating when an upload told to stop is still holding its thread (a storage
+    write that never returns). So ``listening`` = beating; ``unresponsive`` = it beat, then
+    stopped; ``unreachable`` = it never beat at all (the half is not running). Reading a file
+    also opens no socket, where the old port probe made paramiko log a banner error every 30 s.
 
     ``disabled`` is deliberately distinct from ``unreachable``: a vault that was never meant to
     serve SFTP is healthy, while one that was and is not, is broken. Collapsing the two would
@@ -53,11 +57,10 @@ def check_sftp_status() -> str:
         return "disabled"
     if not _truthy(os.environ.get(SFTP_IN_CONTAINER_ENV)):
         return "external"
-    try:
-        with socket.create_connection(("127.0.0.1", int(settings.sftp_port)), timeout=2):
-            return "listening"
-    except Exception:
+    from app.sftp import heartbeat
+    if heartbeat.age_seconds() is None:
         return "unreachable"
+    return "listening" if heartbeat.is_fresh() else "unresponsive"
 
 
 def check_storage_status() -> str:

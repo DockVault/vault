@@ -562,9 +562,10 @@ def test_static_and_brand_anchor_at_app_root(anon):
 @pytest.mark.unit
 def test_baked_healthcheck_is_scheme_aware():
     # The baked HEALTHCHECK must honour API_USE_HTTPS, else an HTTPS deploy of the bare image reports
-    # perpetually unhealthy.
+    # perpetually unhealthy. It runs app.core.healthcheck, which reads it.
     df = _read("Dockerfile")
-    assert "API_USE_HTTPS" in df, "the baked healthcheck must read API_USE_HTTPS"
+    assert 'CMD ["python", "-B", "-m", "app.core.healthcheck"]' in df
+    assert 'os.getenv("API_USE_HTTPS"' in _read("app/core/healthcheck.py")
 
 
 @pytest.mark.unit
@@ -923,8 +924,9 @@ def test_readme_documents_deployment_modes():
     low = r.lower()
     assert "combined" in low and "split" in low, "README must document combined vs split modes"
     assert "COMPOSE_PROFILES" in r and "RUN_SFTP" in r, "README must name the mode + SFTP toggles"
-    # The key limitation: the healthcheck only covers the web half in combined mode.
-    assert "healthcheck" in low and "/health" in r, "README must note the healthcheck covers only web"
+    # What the combined container's healthcheck covers: both halves, SFTP through its heartbeat.
+    assert "healthcheck covers both halves" in low and "/health" in r and "heartbeat" in low, \
+        "README must say the combined healthcheck covers SFTP through its heartbeat"
 
 
 @pytest.mark.unit

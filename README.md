@@ -182,8 +182,11 @@ data volumes.
 
 **Know the trade-offs of combined mode:**
 
-- The container **healthcheck only probes the web app** (`/health`). An SFTP-only *hang* isn't caught
-  by the healthcheck — though `run_combined.py` still exits (and the restart policy recreates the
+- The container **healthcheck covers both halves**: it asks the web app's `/health`, which reads the
+  SFTP server's **heartbeat**, so an SFTP half that stops turning (a hung server, or an upload stuck on
+  a storage write that never returns) marks the whole container unhealthy -- five to six minutes after
+  the stall at the defaults, the same as the split profile's `vault-sftp`. Docker does not restart an
+  unhealthy container by itself; `run_combined.py` does exit (and the restart policy recreates the
   container) if **either** process dies.
 - Web and SFTP **share one restart policy and resource limit** — an SFTP crash restarts the whole
   container (dropping active web sessions), and you can't size them separately. Both log to one
