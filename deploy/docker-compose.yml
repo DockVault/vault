@@ -245,12 +245,14 @@ services:
       - /tmp:mode=1777
       - /app/logs:mode=1777
       - /app/certs:mode=1777
-      # SFTP buffers each upload's plaintext here while encrypting it; a tmpfs keeps that plaintext
-      # off the persistent storage volume. It is RAM, size-capped, and counts against mem_limit; a
-      # buffered upload cannot exceed it (SFTP_STAGING_TMPFS_MB, default 512 MiB).
+      # With SFTP_STREAMING_UPLOAD=false, SFTP buffers each upload's plaintext here while encrypting
+      # it (a streaming upload, the default, never stages); a tmpfs keeps that plaintext off the
+      # persistent storage volume. It is RAM, size-capped, and counts against mem_limit; a buffered
+      # upload cannot exceed it (SFTP_STAGING_TMPFS_MB, default 512 MiB).
       - /app/storage/.sftp_tmp:mode=1777,size=${SFTP_STAGING_TMPFS_MB:-512}m
-    # SFTP downloads stream (fixed cost); SFTP uploads buffer their plaintext in the staging tmpfs
-    # above (a shared cap across concurrent uploads), so keep mem_limit above ~530 MB + SFTP_STAGING_TMPFS_MB.
+    # SFTP downloads stream (fixed cost), and so do SFTP uploads by default. With streaming off,
+    # uploads buffer their plaintext in the staging tmpfs above (a shared cap across concurrent
+    # uploads), so then keep mem_limit above ~530 MB + SFTP_STAGING_TMPFS_MB.
     mem_limit: 2g
     pids_limit: 512
     cpus: 1.0

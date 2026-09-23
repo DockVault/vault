@@ -223,15 +223,28 @@ def test_message_server_substitutes_and_clears_pending_desc(monkeypatch):
     assert sent[-1] == (9, paramiko.SFTP_FAILURE, "explicit") and srv._pending_status_desc is None
 
 
-def test_env_example_file_size_agrees_with_sftp_staging():
-    """The shipped defaults must agree so SFTP never silently refuses a file the web UI accepts:
-    the effective SFTP per-file limit is min(MAX_FILE_SIZE_MB, SFTP_STAGING_TMPFS_MB)."""
+def test_a_fresh_install_accepts_a_ten_to_fifteen_gb_file_over_web_and_sftp_alike():
+    """The single-file ceiling a fresh install gets is the code default, and it is 10-15 GB.
+
+    Nothing a fresh install authors lowers it: .env.example leaves MAX_FILE_SIZE_MB commented, no
+    compose file sets it, and the setup tool never writes it. SFTP accepts the same size only because
+    streaming is the default -- a BUFFERED upload is capped at the 512 MiB staging tmpfs -- so the
+    streaming default is pinned here too: turning it off by default would silently make SFTP refuse
+    files the web UI accepts."""
+    from app.core.config import Settings
+
+    fields = Settings.model_fields
+    ceiling_bytes = fields["max_file_size_mb"].default * 1024 * 1024
+    assert 10 * 1000 ** 3 <= ceiling_bytes <= 15 * 1000 ** 3, ceiling_bytes
+    assert fields["sftp_streaming_upload"].default is True
+
     env = _read(".env.example")
-    file_mb = int(re.search(r"^MAX_FILE_SIZE_MB=(\d+)", env, re.M).group(1))
-    tmpfs_mb = int(re.search(r"^SFTP_STAGING_TMPFS_MB=(\d+)", env, re.M).group(1))
-    assert file_mb <= tmpfs_mb, (
-        "MAX_FILE_SIZE_MB (%d) must not exceed SFTP_STAGING_TMPFS_MB (%d), or SFTP refuses files the "
-        "web UI accepts" % (file_mb, tmpfs_mb))
+    assert not re.search(r"^MAX_FILE_SIZE_MB=", env, re.M)
+    assert re.search(r"^# MAX_FILE_SIZE_MB=%d$" % fields["max_file_size_mb"].default, env, re.M)
+    assert not re.search(r"^SFTP_STREAMING_UPLOAD=\s*(false|0|no|off)\b", env, re.M | re.I)
+    for rel in ("deploy/docker-compose.yml", "deploy/docker-compose.secure.yml"):
+        assert not re.search(r"^\s+MAX_FILE_SIZE_MB:", _read(rel), re.M), rel
+    assert "MAX_FILE_SIZE_MB" not in _read("dockvault.py")
 
 
 # --- the compose backing --------------------------------------------------------------------

@@ -1632,7 +1632,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             _upload_marker_ref = ((vault_id, folder_id, filename, _marker_token)
                                   if _marker_outcome is None else None)
 
-        # Streaming upload (opt-in via SFTP_STREAMING_UPLOAD): encrypt + persist records as they
+        # Streaming upload (the default; SFTP_STREAMING_UPLOAD=false turns it off): encrypt + persist
+        # records as they
         # arrive, so the plaintext is never staged whole to the .sftp_tmp tmpfs. All the open()-time
         # authorization above (no-clobber + write permission) already ran and applies unchanged; the
         # close-time re-authorization is the SAME _authorize_upload_persist the buffered path uses.
@@ -2468,7 +2469,8 @@ def listen_for_terminations():
 def _sweep_sftp_tmp():
     """Delete orphaned plaintext upload buffers from a previous run.
 
-    SFTP uploads buffer the client's plaintext to .sftp_tmp/up_* before encrypting at close.
+    A BUFFERED SFTP upload (streaming off) stages the client's plaintext to .sftp_tmp/up_* before
+    encrypting at close.
     A crash, kill, or dropped connection mid-transfer skips the finalizer's cleanup and
     leaves that plaintext on the persisted volume indefinitely. A freshly-started server has
     no in-flight uploads, so every up_* file here is an orphan — safe to remove. (The

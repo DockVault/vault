@@ -87,8 +87,9 @@ class Settings(BaseSettings):
     # new installs write an Ed25519 key at this path (the loader accepts either kind).
     sftp_host_key_path: str = Field(default="./keys/ssh_host_rsa_key")
     # The size, in MiB, of the RAM tmpfs the compose files back SFTP upload staging with, so the
-    # buffered plaintext never touches the persistent disk. Because a buffered upload cannot exceed
-    # that tmpfs, this also caps the SFTP upload size until true streaming lands. The compose passes
+    # buffered plaintext never touches the persistent disk. Only BUFFERED uploads stage there
+    # (sftp_streaming_upload=False); a streaming upload, the default, never does. Because a buffered
+    # upload cannot exceed that tmpfs, this caps the buffered SFTP upload size. The compose passes
     # the tmpfs size into the SFTP container's environment so this clamp always matches the real
     # tmpfs. The DEFAULT here is 0 (unclamped) ON PURPOSE: a deployment whose compose does NOT mount
     # the tmpfs -- e.g. one upgraded in place from before this existed -- must not be silently
@@ -181,8 +182,9 @@ class Settings(BaseSettings):
     # Environment Configuration
     environment: str = Field(default="production")  # Options: development, production
 
-    # Opt-in self-update check (default OFF). When on, the app checks GitHub Releases at most
-    # once/day for a newer version and shows an admin-only banner. Fail-closed-silent (never
+    # Opt-in self-update check (default OFF). When on, the app checks GitHub Releases for a newer
+    # version at most once per update_check_interval_minutes (below; six hours by default) and shows
+    # an admin-only banner. Fail-closed-silent (never
     # blocks a request, never errors to the user) and NO telemetry / instance identifier — only
     # the outbound request's egress IP reaches GitHub. See app/services/update_check.py.
     update_check_enabled: bool = Field(default=False)
@@ -256,11 +258,12 @@ class Settings(BaseSettings):
     max_device_sync_creds_per_device: int = Field(default=10)
     # Grace window (minutes) during which a device's PREVIOUS sync secret is still accepted after a
     # rotation, so an in-flight request or a client that just rotated is not falsely rejected. Kept
-    # short: past this window a retired secret is treated as a reuse/replay signal and revokes the
-    # device (fail-closed). Rotation is a proactive online action — an offline client does not rotate
+    # short: past this window a retired secret is treated as a reuse/replay signal (fail-closed): the
+    # device is suspended, or revoked outright with device_secret_reuse_hard_revoke (below). Rotation
+    # is a proactive online action — an offline client does not rotate
     # — so a few minutes covers the legitimate catch-up without leaving a long replay window.
     # Bounded [0, 1440]: 0 = NO catch-up window (any retired-secret presentation is immediately
-    # treated as reuse and revokes the device); the upper bound stops a value so large it defeats
+    # treated as reuse); the upper bound stops a value so large it defeats
     # rotation by keeping a retired secret acceptable indefinitely.
     device_secret_rotation_grace_minutes: int = Field(default=5, ge=0, le=1440)
     # Per-ACCOUNT cap on registered devices (counts is_active devices; an admin account is exempt,
@@ -388,9 +391,10 @@ class Settings(BaseSettings):
     # bounding the append-only table's growth for operators who want it.
     audit_log_retention_days: int = Field(default=0)
     
-    # Logging
+    # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
+    # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old
+    # .env's LOG_FILE_PATH -- once shipped here but never written -- is ignored like any unknown key.
     log_level: str = Field(default="INFO")
-    log_file_path: str = Field(default="./logs/sftp_server.log")
     
     # Admin Configuration
     admin_username: str = Field(default="admin")
@@ -419,7 +423,6 @@ class Settings(BaseSettings):
         """Ensure required directories exist."""
         directories = [
             self.file_storage_path,
-            Path(self.log_file_path).parent,
             Path(self.sftp_host_key_path).parent,
         ]
         for directory in directories:

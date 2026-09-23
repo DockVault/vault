@@ -162,7 +162,9 @@ s = config.initialize_runtime(interactive=False)
 assert s.api_port == 9191
 assert s.database_url.startswith("postgresql://file:file@")
 assert Path(s.file_storage_path).is_dir()
-assert Path(s.log_file_path).parent.is_dir()
+# LOG_FILE_PATH was retired: it was never written. The file above still sets it, exactly as an old
+# .env would, and it must be ignored rather than refuse to start.
+assert not hasattr(s, "log_file_path")
 assert Path(s.sftp_host_key_path).parent.is_dir()
 """
     proc = _run(script, tmp_path, env)

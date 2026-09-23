@@ -3410,20 +3410,17 @@ async def get_settings(
     # stored 0 on either means "unlimited" and is preserved verbatim.
     data["default_user_quota"] = _settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)
     data["max_vaults_per_user"] = _max_vaults_per_user(db)
-    # The EFFECTIVE per-file SFTP upload limit (MB). A buffered SFTP upload cannot exceed the RAM
-    # staging tmpfs, so over SFTP the limit is min(the file-size limit, SFTP_STAGING_TMPFS_MB) — which
-    # can be BELOW the web limit. Surface it so the admin sees why SFTP may refuse a file the web UI
-    # accepts. None => no SFTP-specific cap (the tmpfs is unbounded / not mounted; sftp_staging_tmpfs_mb
-    # is 0), matching _staging_capped_max's "0 disables the clamp".
+    # The EFFECTIVE per-file SFTP upload limit (MB). A BUFFERED SFTP upload cannot exceed the RAM
+    # staging tmpfs, so with streaming off the limit is min(the file-size limit,
+    # SFTP_STAGING_TMPFS_MB) — which can be BELOW the web limit. Surface it so the admin sees why SFTP
+    # may refuse a file the web UI accepts. None => no SFTP-specific cap: streaming is on (the default;
+    # a streaming upload never stages, exactly as the upload path applies _staging_capped_max only when
+    # it is off), or the tmpfs is unbounded / not mounted (sftp_staging_tmpfs_mb is 0).
     from app.core import upload_policy as _uploadp
     _eff_file_bytes = _uploadp.effective_max_file_bytes(
         (settings.max_file_size_mb or 0) * 1024 * 1024, data.get("max_file_size"))
-    _tmpfs_mb = settings.sftp_staging_tmpfs_mb or 0
-    if _tmpfs_mb > 0:
-        _eff_file_mb = _eff_file_bytes // (1024 * 1024) if _eff_file_bytes > 0 else _tmpfs_mb
-        data["sftp_effective_max_file_mb"] = min(_eff_file_mb, _tmpfs_mb)
-    else:
-        data["sftp_effective_max_file_mb"] = None
+    data["sftp_effective_max_file_mb"] = _uploadp.sftp_staging_cap_mb(
+        _eff_file_bytes, settings.sftp_staging_tmpfs_mb or 0, settings.sftp_streaming_upload)
     # Overlay the EFFECTIVE Temporary Vault Passcode policy (incl. the ZK-in-scope toggle) so the
     # Settings card renders correct defaults even when never saved (feature default OFF, allow-ZK ON).
     data.update(_temp_passcode_policy(db))
@@ -3431,9 +3428,9 @@ async def get_settings(
     data["force_no_remember_vault_password"] = _force_no_remember_vault_password(db)
     # Effective ZK-key idle auto-lock (minutes; 0 = disabled).
     data["zk_idle_lock_minutes"] = _zk_idle_lock_minutes(db)
-    # Effective Sharing master switch (default OFF) so the Settings -> Sharing toggle reflects reality.
+    # Effective Sharing master switch (default ON) so the Settings -> Sharing toggle reflects reality.
     data["sharing_enabled"] = _sharing_enabled(db)
-    # Public note-link master switch (default OFF) + the per-user active-link cap (anti-abuse).
+    # Public note-link master switch (default ON) + the per-user active-link cap (anti-abuse).
     _blob = _global_settings_blob(db)
     data["public_note_links_enabled"] = note_link_policy.public_note_links_enabled(_blob)
     data["public_note_link_user_cap"] = note_link_policy.public_note_link_user_cap(_blob)

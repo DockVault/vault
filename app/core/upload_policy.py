@@ -26,6 +26,21 @@ def file_type_allowed(name, allowed_exts):
     return allowed_exts is None or file_ext(name) in allowed_exts
 
 
+def sftp_staging_cap_mb(eff_file_bytes, tmpfs_mb, streaming):
+    """The SFTP-only per-file cap in MB that Settings shows beside the file-size limit, or None when
+    SFTP has none beyond that limit.
+
+    Only a BUFFERED upload (streaming off) is staged in the RAM tmpfs, so only then can SFTP refuse a
+    file the web UI accepts -- the same condition under which the SFTP upload path applies its
+    staging clamp. A streaming upload never stages; a tmpfs of 0 (unbounded, or not mounted) caps
+    nothing. An `eff_file_bytes` of 0 means no configured file-size limit, so the tmpfs is the cap.
+    """
+    if streaming or not tmpfs_mb or tmpfs_mb <= 0:
+        return None
+    eff_mb = eff_file_bytes // (1024 * 1024) if eff_file_bytes > 0 else tmpfs_mb
+    return min(eff_mb, tmpfs_mb)
+
+
 def effective_max_file_bytes(env_bytes, stored_mb):
     """Per-file upload ceiling in bytes: the admin 'max file size' (MB) clamped to the deployment
     env cap `env_bytes` — the UI can only LOWER the limit, never raise the hard ceiling. Falls back

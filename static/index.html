@@ -1800,8 +1800,8 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-session-timeout">Session Timeout (minutes)</label>
-                                    <input type="number" id="setting-session-timeout" class="form-control" placeholder="Deployment default" min="5" max="1440">
-                                    <small class="text-secondary">Overrides <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. <strong>Blank = use the deployment's value.</strong></small>
+                                    <input type="number" id="setting-session-timeout" class="form-control" placeholder="Deployment default" min="5" max="43200">
+                                    <small class="text-secondary">How long a sign-in lasts, 5 minutes to 43200 (30 days). Overrides <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. <strong>Blank = use the deployment's value.</strong> A longer sign-in stays usable longer if a device is lost or a session is stolen, so keep it as short as your people tolerate.</small>
                                 </div>
                                 <p class="text-secondary text-sm" style="margin-top:4px;">Login, lockout, vault-unlock, SFTP and API rate limits are configured in <strong>Rate limits</strong> at the bottom of this tab.</p>
                             </div>
@@ -2741,7 +2741,7 @@
                                     <input type="checkbox" id="setting-invite-enabled">
                                     <span>Let admins invite people by link</span>
                                 </label>
-                                <p class="text-secondary text-sm mt-sm">When on, an administrator can generate an invitation link for a new account. No email is sent — you copy the link and share it. Off by default.</p>
+                                <p class="text-secondary text-sm mt-sm">When on, an administrator can generate an invitation link for a new account. No email is sent — you copy the link and share it. On by default; an invitation link exists only once an administrator creates one.</p>
                                 <label class="flex items-center gap-sm mt-md">
                                     <input type="checkbox" id="setting-signup-enabled">
                                     <span>Let people sign themselves up</span>

@@ -414,7 +414,8 @@ def build_env_lines(cfg):
     sftp_active = cfg.get("run_sftp") or compose_profile == "split"
     if sftp_active and cfg.get("sftp_host_port") and int(cfg["sftp_host_port"]) != 2322:
         bare("SFTP_HOST_PORT", int(cfg["sftp_host_port"]))
-    # SFTP upload-staging tmpfs size (MiB) — also the max SFTP upload size until streaming lands.
+    # SFTP upload-staging tmpfs size (MiB) — used only by buffered uploads (SFTP_STREAMING_UPLOAD=false),
+    # whose size it then also caps; streaming uploads, the default, never stage.
     # Written only when the operator chose a non-default value; otherwise the compose/app default
     # (512) applies, so an install that never mentions it authors the .env it always did.
     if sftp_active and cfg.get("sftp_staging_tmpfs_mb") not in (None, "") \
@@ -2942,11 +2943,12 @@ class DockVault:
             return
         if not os.path.exists(self._env_path()):
             if container_exists(DB_CONTAINER):
-                # 'stop' needs .env to address the stack, so while sealed it is a no-op: guide the
-                # operator to unlock first, then stop (which removes the containers + their secrets).
+                # 'down' needs .env to address the stack, so while sealed it cannot run: guide the
+                # operator to unlock first, then 'down' (which removes the containers + their secrets;
+                # 'stop' keeps them).
                 print(pal.paint("  WARNING: the deployment's containers still exist, so its secrets are "
                                 "STILL in Docker's on-disk config even though .env is sealed - run "
-                                "'unlock' then 'stop' to remove them.", "red"))
+                                "'unlock' then 'down' to remove them.", "red"))
             print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
             return
         try:
@@ -4952,7 +4954,7 @@ class DockVault:
         pepper_ok = len((env.get("LOG_TOKEN_PEPPER") or "")) >= 32
         print(pal.paint("\n  Authenticated log pull", "cyan"))
         print("  The GET /logs endpoint is OFF by default. To use it you must set PLAN_LOG_PULL=true")
-        print("  and a LOG_TOKEN_PEPPER (>=32 chars); then, in the vault UI under Settings -> Logs, tick")
+        print("  and a LOG_TOKEN_PEPPER (>=32 chars); then, in the vault UI under Settings -> Log access, tick")
         print("  the Web/SFTP component and mint a token there. Enabling here opens nothing by itself.")
         print("  status: PLAN_LOG_PULL=%s, pepper %s" % (on, "set" if pepper_ok else "missing"))
         interactive = not (args and getattr(args, "non_interactive", False))
@@ -4973,7 +4975,7 @@ class DockVault:
             # env-only change: --force-recreate re-reads .env; do NOT rebuild (would clobber a
             # release image previously pulled by the Update menu with a local build).
             self._recreate_stack(build=False)
-        print(pal.paint("  Now open Settings -> Logs in the vault UI, tick the Web/SFTP component, and mint a "
+        print(pal.paint("  Now open Settings -> Log access in the vault UI, tick the Web/SFTP component, and mint a "
                         "token there.\n", "green"))
 
     def _stored_bytes(self):
@@ -5178,9 +5180,10 @@ def build_parser():
     sp.add_argument("--sftp-public-port", dest="sftp_public_port", type=int,
                     help="port SFTP clients connect to, when it is not --sftp-port (port forwarding)")
     sp.add_argument("--sftp-staging-tmpfs-mb", dest="sftp_staging_tmpfs_mb", type=int,
-                    help="size (MiB) of the RAM tmpfs SFTP buffers each upload's plaintext in, so it "
-                         "never hits disk (512 by default). Also caps the SFTP upload size until "
-                         "streaming lands, and counts toward the SFTP container's memory limit")
+                    help="size (MiB) of the RAM tmpfs a buffered SFTP upload's plaintext is staged in, "
+                         "so it never hits disk (512 by default). Used only with SFTP_STREAMING_UPLOAD="
+                         "false (streaming, the default, never stages); then it also caps the SFTP upload "
+                         "size and counts toward the SFTP container's memory limit")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),

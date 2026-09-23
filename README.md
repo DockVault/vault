@@ -41,8 +41,9 @@ different address or port — through NAT or port forwarding — set `SFTP_PUBLI
 `SFTP_PUBLIC_PORT` (setup asks when you enable SFTP).
 
 Everything is driven by **`dockvault.py`** — an interactive management tool at the repo root
-(stdlib-only; needs **Python 3** on the host). Run it with no arguments for the full menu (Setup,
-Backup & Restore, Volumes, Reset, Update, Logs), or go straight to setup:
+(stdlib-only; needs **Python 3** on the host). Run it with no arguments for the full menu -- Setup;
+Start, Stop, Down and Restart; Status; Lock, Unlock and Change passphrase (seal `.env` at rest);
+Backup & Restore; Volumes; Limits; Reset; Update; Logs -- or go straight to setup:
 
 **Linux** — interactive; collects your domain and TLS choice (Let's Encrypt, self-signed, or
 bring-your-own certificate):

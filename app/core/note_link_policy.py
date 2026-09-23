@@ -6,7 +6,8 @@ when a public link is created. Create-allowlist evaluation reuses sharing_policy
 (a NoteLinkTag carries the same allowlist fields as a ShareTag).
 
 Settings (in the global settings blob, like sharing_enabled):
-  * public_note_links_enabled  — bool, default False (public links are off until an admin turns them on)
+  * public_note_links_enabled  — bool, default True (available out of the box, like sharing_enabled;
+                                 an admin can turn it off)
   * public_note_link_user_cap  — int, a per-USER cap on active public links (anti-abuse), default 50
 """
 from __future__ import annotations

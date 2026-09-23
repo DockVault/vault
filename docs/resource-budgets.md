@@ -113,12 +113,14 @@ lengths are not derivable from the framing — padding hides up to sixteen bytes
 index cannot be built without decrypting everything anyway. No writer produces that format, so the
 exposure shrinks as those files are replaced and cannot grow.
 
-**SFTP uploads buffer their plaintext before encrypting it, and that buffer is now RAM.** Each
-upload is written to a staging directory and pushed through the encryption pipeline at close. The
-compose files back that directory with a size-capped tmpfs (`SFTP_STAGING_TMPFS_MB`, default
-512 MiB) so the plaintext never reaches the persistent disk — the trade is that the buffer is
-resident memory while the upload is in flight, and a buffered upload cannot exceed the tmpfs (which
-also caps the SFTP upload size until true streaming lands). The tmpfs is a single shared cap across
+**SFTP uploads stream by default; a buffered upload's staging is RAM.** A streaming upload
+(`SFTP_STREAMING_UPLOAD=true`, the default) is encrypted and persisted as it arrives and is never
+staged, so it adds nothing here. With streaming turned off, each upload is written to a staging
+directory and pushed through the encryption pipeline at close. The compose files back that directory
+with a size-capped tmpfs (`SFTP_STAGING_TMPFS_MB`, default 512 MiB) so the plaintext never reaches
+the persistent disk — the trade is that the buffer is resident memory while the upload is in
+flight, and a buffered upload cannot exceed the tmpfs, which therefore also caps the buffered SFTP
+upload size. The tmpfs is a single shared cap across
 concurrent uploads, so it adds at most `SFTP_STAGING_TMPFS_MB` to the container's ceiling regardless
 of how many run at once; size `mem_limit` above the resting figure plus that. An upload that fills
 the tmpfs fails cleanly and is discarded rather than persisted truncated — but keep
