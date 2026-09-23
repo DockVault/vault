@@ -69,6 +69,19 @@ def test_the_committed_matrix_is_valid():
     um.validate_matrix(um.load_matrix(MATRIX_PATH), released_ceiling=version)
 
 
+def test_every_one_way_edge_in_the_committed_matrix_asks_for_a_backup():
+    """An edge that cannot be rolled back says so in `requires_backup` too.
+
+    The host tool demands a backup for any one-way hop whatever this flag says, but the website and
+    the app show the flag as written. Two edges into 0.30.0 said "backup not required" on a hop that
+    can never be undone."""
+    matrix = um.load_matrix(MATRIX_PATH)
+    one_way = [e for e in matrix["edges"] if e.get("reversible") is False]
+    assert one_way, "the matrix has one-way edges; an empty set would make this vacuous"
+    missing = [(e["from"], e["to"]) for e in one_way if e.get("requires_backup") is not True]
+    assert not missing, f"one-way edges that do not ask for a backup: {missing}"
+
+
 def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
     """The backfill is checked against git, not against a list typed into the test.
 

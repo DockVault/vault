@@ -212,6 +212,56 @@ def test_a_hop_not_needing_one_does_not_take_a_backup(tmp_path, monkeypatch):
     assert not backups
 
 
+def test_a_downgrade_takes_a_backup_even_across_a_reversible_hop(tmp_path, monkeypatch, capsys):
+    """There are no down-migrations, so going back a version needs a restore point even where the
+    edge itself is reversible and asks for no backup -- and the summary says why."""
+    backups = []
+    tool = _deployment(tmp_path, version="0.2.0", matrix=_matrix(backup=False, reversible=True))
+    _stub(monkeypatch, tool, backups=backups)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.2.0", "the running container"))
+    _update(tool, tag="v0.1.0")
+    out = capsys.readouterr().out
+    # The matrix describes forward edges only, so a downgrade is undescribed -- and says so, rather
+    # than claiming the matrix asked for the backup.
+    assert "A backup is required: the matrix does not describe this change" in out
+    assert "the matrix marks this change as needing one" not in out
+    assert backups, "the downgrade proceeded without a backup"
+
+
+def test_a_one_way_hop_is_summarised_as_needing_the_backup_it_takes(tmp_path, monkeypatch, capsys):
+    """The summary and the gate read one rule. A one-way hop whose edge does not itself ask for a
+    backup -- the shape two real edges had -- used to print "backup: not required" and then demand
+    one on the next line."""
+    backups = []
+    tool = _deployment(tmp_path, matrix=_matrix(backup=False, reversible=False))
+    _stub(monkeypatch, tool, backups=backups)
+    _update(tool)
+    out = capsys.readouterr().out
+    assert "backup       : required (this change cannot be rolled back)" in out
+    assert "not required" not in out
+    assert backups, "the one-way change proceeded without a backup"
+
+
+def test_a_reversible_hop_without_a_backup_flag_is_summarised_as_not_needing_one(tmp_path, monkeypatch, capsys):
+    """Control for the test above: the summary is conditional, not always "required"."""
+    tool = _deployment(tmp_path, matrix=_matrix(backup=False, reversible=True))
+    _stub(monkeypatch, tool, backups=[])
+    _update(tool, dry_run=True)
+    assert "backup       : not required" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("plan, down, reason", [
+    ({"known": False, "requires_backup": True, "irreversible": True}, False,
+     "the matrix does not describe this change"),
+    ({"requires_backup": True, "irreversible": False}, False, "the matrix marks this change as needing one"),
+    ({"requires_backup": False, "irreversible": True}, False, "this change cannot be rolled back"),
+    ({"requires_backup": False, "irreversible": False}, True, "this is a downgrade, and there are no down-migrations"),
+    ({"requires_backup": False, "irreversible": False}, False, None),
+])
+def test_the_backup_rule(plan, down, reason):
+    assert dv.backup_reason(plan, down) == reason
+
+
 def test_backup_verified_skips_taking_one_and_says_it_was_not_checked(tmp_path, monkeypatch, capsys):
     backups = []
     tool = _deployment(tmp_path, matrix=_matrix(backup=True))

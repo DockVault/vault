@@ -1764,6 +1764,26 @@ def plan_upgrade_path(matrix, current, target):
     }
 
 
+def backup_reason(plan, down=False):
+    """Why a version change needs a backup first, or None when it does not.
+
+    ONE rule, read by both the summary the operator sees and the gate that enforces it, so the tool
+    can never print "backup: not required" and then demand one. A change needs a backup when the
+    matrix does not describe it, when the matrix says so, when it cannot be rolled back, or when it
+    is a downgrade, since there are no down-migrations. (The matrix describes forward edges only, so
+    a downgrade always arrives here undescribed; the downgrade test is the backstop behind that.)
+    """
+    if not plan.get("known", True):
+        return "the matrix does not describe this change"
+    if plan.get("requires_backup"):
+        return "the matrix marks this change as needing one"
+    if plan.get("irreversible"):
+        return "this change cannot be rolled back"
+    if down:
+        return "this is a downgrade, and there are no down-migrations"
+    return None
+
+
 def downgrade_refusal(matrix, current, target):
     """Whether a DOWNGRADE from `current` to `target` must be refused, and why.
 
@@ -4595,8 +4615,9 @@ class DockVault:
         fallback = read_version_file(self.root)
         return fallback, "this checkout's VERSION file (nothing is running to ask)"
 
-    def _describe_hop(self, plan, source, current, tag):
-        """Print what the hop does. Returns nothing; the caller decides what to require."""
+    def _describe_hop(self, plan, source, current, tag, down=False):
+        """Print what the hop does. Returns nothing; the caller decides what to require, from the same
+        backup_reason() this summary prints, so the two cannot disagree."""
         pal = self.pal
         print(pal.paint("\n  What this change involves", "cyan"))
         print("    described by : %s" % source)
@@ -4609,7 +4630,8 @@ class DockVault:
             return
         print("    steps        : %d adjacent release(s)" % len(plan["steps"]))
         print("    reversible   : %s" % ("no" if plan["irreversible"] else "yes"))
-        print("    backup       : %s" % ("required" if plan["requires_backup"] else "not required"))
+        why = backup_reason(plan, down)
+        print("    backup       : %s" % (("required (%s)" % why) if why else "not required"))
         for condition in plan["conditions"]:
             print(pal.paint("    note         : %s" % clean_matrix_text(condition.get("summary", "")),
                             "yellow"))
@@ -4734,7 +4756,7 @@ class DockVault:
                 "change starts from is a guess. Treating it as undescribed.", "yellow"))
             plan = plan_upgrade_path(None, current, tag)
 
-        self._describe_hop(plan, matrix_source, current, tag)
+        self._describe_hop(plan, matrix_source, current, tag, down)
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
         # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version
@@ -4845,10 +4867,8 @@ class DockVault:
                 print(pal.paint("  Cancelled.\n", "yellow"))
                 return
 
-        if plan["requires_backup"] or plan["irreversible"] or down:
-            why = ("the matrix marks this change as needing one" if plan["requires_backup"]
-                   else "this change cannot be rolled back" if plan["irreversible"]
-                   else "this is a downgrade, and there are no down-migrations")
+        why = backup_reason(plan, down)
+        if why:
             if not self._require_backup(args, interactive, why):
                 return
 
