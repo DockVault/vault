@@ -6,6 +6,9 @@
 # Volume backups written by dockvault.py (each bundle holds a copy of .env = secrets)
 backups/
 
+# Semgrep editor/plugin state: once someone signs in, it holds their OAuth access and refresh tokens
+.semgrep/
+
 # Python
 __pycache__/
 *.py[cod]

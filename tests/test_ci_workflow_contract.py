@@ -44,6 +44,34 @@ def test_preflight_blocks_expensive_integration_work():
     assert "playwright install" not in _PREFLIGHT
 
 
+def test_a_candidate_or_release_tests_run_includes_the_fast_lanes():
+    """The Fast lanes are the only ones with the test lock alone. A candidate's Tests run and the
+    release's call must include them, on the commit under test, or a test that imports something only
+    the production lock carries is first caught on main -- after the release has shipped."""
+    import yaml
+
+    tests = yaml.safe_load(_WORKFLOW)
+    job = tests["jobs"]["fast"]
+    assert job["uses"] == "./.github/workflows/fast-tests.yml"
+    # A manual run (a candidate) and a tag (the release, whose publish needs this whole workflow).
+    assert job["if"] == "github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')"
+    assert job["with"] == {"expected_sha": "${{ inputs.expected_sha }}"}
+    assert "needs" not in job                              # in parallel with the suites
+    assert job["permissions"] == {"contents": "read"}
+
+    fast = yaml.safe_load(_FAST_WORKFLOW)
+    triggers = fast[True]                                   # YAML reads the bare key `on` as True
+    assert triggers["workflow_call"]["inputs"]["expected_sha"]["type"] == "string"
+    for own in ("pull_request", "push", "workflow_dispatch"):
+        assert own in triggers                              # it still runs on its own as well
+    lane = fast["jobs"]["fast"]
+    assert sorted(lane["strategy"]["matrix"]["os"]) == ["ubuntu-latest", "windows-latest"]
+    checkout = [s for s in lane["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+    assert len(checkout) == 1
+    assert checkout[0]["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"
+    assert fast["concurrency"]["group"].startswith("fast-tests-")
+
+
 def test_fast_host_pytest_job_installs_the_cross_platform_locked_environment():
     test_install = "python -m pip install -r tests/requirements-test.lock"
     dependency_check = "python -m pip check"

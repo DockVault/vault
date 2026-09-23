@@ -41,6 +41,11 @@ decided (remediated, or reviewed into the VEX below) before the release's adviso
 a pull request the image-scan workflow blocks only on findings that have a fix, the ones a
 dependency bump can resolve.
 
+A manual Tests run on a release candidate, and the release's own call, also run the Fast workflow's
+lanes: Python on Windows and Ubuntu with only the test lock installed. Every other lane layers the
+production lock on top, so a test that imports a package only the production lock carries passes
+there and fails only here. Pull requests and pushes to `main` run the Fast workflow on their own.
+
 The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from
 CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the 3.14 backports for
 `CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build checks the vendored file

@@ -37,6 +37,18 @@ jobs:
       release_policy: true
     permissions:
       contents: read
+  # The Fast workflow's lanes -- Windows and Ubuntu, installing ONLY the test lock -- on this exact
+  # commit, when Tests is run by hand on a release candidate or runs inside a release (a tag). They are
+  # the only lanes without the production lock, so a test that imports something only that lock carries
+  # passes everywhere else and fails first here; without this job it first failed on main, after the
+  # release it shipped with. A pull request and a push to main run the Fast workflow on their own.
+  fast:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/fast-tests.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
+    permissions:
+      contents: read
   preflight:
     uses: ./.github/workflows/preflight.yml
     with:

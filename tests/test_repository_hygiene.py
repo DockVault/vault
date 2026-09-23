@@ -42,6 +42,16 @@ SEMVER_LF = re.compile(
 
 
 
+def test_semgrep_plugin_state_is_never_committed():
+    """The Semgrep editor plugin writes its OAuth access and refresh tokens into .semgrep/ once
+    someone signs in, so the directory must stay ignored and untracked."""
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", ".semgrep/guardian.yml"], cwd=ROOT, check=False
+    )
+    assert ignored.returncode == 0
+    assert not any(path.parts[0] == ".semgrep" for path in _tracked_relative_paths())
+
+
 def _tracked_relative_paths() -> list[Path]:
     result = subprocess.run(
         ["git", "ls-files", "-z"],
