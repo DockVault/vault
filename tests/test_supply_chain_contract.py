@@ -437,12 +437,14 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     vex = json.loads(
         (_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8")
     )
-    # The three CPython findings the vendored backport removes, plus the one OpenSSL QUIC-listener
-    # finding DockVault never reaches. Any OTHER exception must be a deliberate, reviewed addition.
+    # The three CPython findings the vendored backport removes, plus the OpenSSL QUIC-listener and
+    # zlib gz-write findings DockVault never reaches. Any OTHER exception must be a deliberate,
+    # reviewed addition.
     cpython_cves = {"CVE-2026-11940", "CVE-2026-11972", "CVE-2026-15308"}
     openssl_cve = "CVE-2026-14456"
+    zlib_cve = "CVE-2026-85091"
     by_name = {s["vulnerability"]["name"]: s for s in vex["statements"]}
-    assert set(by_name) == cpython_cves | {openssl_cve}
+    assert set(by_name) == cpython_cves | {openssl_cve, zlib_cve}
 
     for name in cpython_cves:
         statement = by_name[name]
@@ -488,6 +490,26 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert "__SOURCE_REVISION__" in openssl["impact_statement"]
     assert "QUIC" in openssl["impact_statement"]
 
+    # The zlib finding (CVE-2026-85091) is a heap overflow reached only through gzprintf()/
+    # gzvprintf() after a stalled gzwrite(); nothing in the image imports the gz write API. Bound to
+    # the exact package version, so a fixed zlib ends the exception instead of inheriting it.
+    zlib = by_name[zlib_cve]
+    assert zlib["status"] == "not_affected"
+    assert zlib["justification"] == "vulnerable_code_not_in_execute_path"
+    zlib_subs = [{"@id": "pkg:apk/alpine/zlib@1.3.2-r0"}]
+    assert zlib["products"] == [
+        {
+            "@id": (
+                "pkg:oci/vault@__IMAGE_DIGEST__"
+                "?repository_url=ghcr.io/dockvault/vault"
+            ),
+            "subcomponents": zlib_subs,
+        },
+        {"@id": "__IMAGE_REFERENCE__", "subcomponents": zlib_subs},
+    ]
+    assert "__SOURCE_REVISION__" in zlib["impact_statement"]
+    assert "gzprintf" in zlib["impact_statement"]
+
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "There is no blanket `only-fixed` bypass" in evidence
     assert "fails for every unexcepted vulnerability" in evidence
@@ -495,6 +517,7 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert "vulnerable_code_not_present" in evidence
     assert "vulnerable_code_not_in_execute_path" in evidence
     assert "CVE-2026-14456" in evidence
+    assert "CVE-2026-85091" in evidence
     assert "exact registry manifest digest" in evidence
     assert (
         "both push responses and both immediate tag resolutions must agree" in evidence

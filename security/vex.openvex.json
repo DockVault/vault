@@ -78,6 +78,27 @@
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "CVE-2026-14456 is a resource-exhaustion defect in OpenSSL's QUIC server Listener (unbounded incoming-channel queueing for unknown destination connection IDs). DockVault serves HTTP/HTTPS with uvicorn over Python's ssl module (OpenSSL TLS) and ships no QUIC listener, aioquic, or HTTP/3 stack, so OpenSSL's QUIC Listener is never instantiated and the vulnerable code is not in the execute path. Verified for source revision __SOURCE_REVISION__.",
       "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-85091"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [
+            {"@id": "pkg:apk/alpine/zlib@1.3.2-r0"}
+          ]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [
+            {"@id": "pkg:apk/alpine/zlib@1.3.2-r0"}
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-85091 is a heap buffer overflow in zlib's gz_vacate(), reached only by calling gzprintf() or gzvprintf() on a gzFile after a stalled non-blocking gzwrite(). No binary in the DockVault image imports gzprintf, gzvprintf, gzputs or gzwrite -- zlib's consumers there, Python's zlib module and apk, use the deflate/inflate stream API -- and no Python code loads zlib through ctypes, so zlib's gz write path is never executed. Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
     }
   ]
 }

@@ -64,6 +64,15 @@ statement binds the `pkg:apk/alpine/libssl3` and `pkg:apk/alpine/libcrypto3` sub
 future base image changes those package versions, the pin stops matching and the exception is
 re-reviewed rather than silently carried forward.
 
+A second is reviewed on the same justification: `CVE-2026-85091`, a heap buffer overflow in the base
+image's `zlib` (1.3.1.2 through 1.3.2), reached only through the gz file API's write path —
+`gzprintf()` or `gzvprintf()` after a stalled non-blocking `gzwrite()`. There is no fixed Alpine
+package yet. No binary in the image imports any gz write function (zlib's consumers there, Python's
+`zlib` module and `apk`, use the deflate/inflate stream API), and no Python code loads zlib through
+`ctypes`, so the vulnerable code is not reachable. The statement binds the
+`pkg:apk/alpine/zlib@1.3.2-r0` subcomponent: the image build's `apk upgrade` picks up a fixed package
+as soon as Alpine ships one, and the pin then stops matching instead of carrying the exception forward.
+
 ### Base-package patching: a deliberate reproducibility exception
 
 The Dockerfile's first build step is `RUN apk --no-cache upgrade`, which patches the base Alpine OS
