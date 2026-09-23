@@ -650,3 +650,19 @@ def test_every_non_pr_tests_run_applies_the_release_scan_policy():
     assert options["severity-cutoff"] == "high" and options["fail-build"] is True
     assert options["vex"]                                   # reviewed exceptions still apply
     assert scan["concurrency"]["group"].startswith("image-scan-")
+
+
+def test_the_advisory_lock_refresh_report_cannot_run_out_the_preflight_clock():
+    """The refresh report resolves the newest dependency set against the live index, which has taken
+    longer than the whole preflight job is allowed. Being advisory, it must never fail the job -- and
+    running out the job's clock is failing it, before any test has run."""
+    import yaml
+
+    preflight = yaml.safe_load(_PREFLIGHT)
+    steps = [s for job in preflight["jobs"].values() for s in job.get("steps", [])]
+    report = [s for s in steps if s.get("name") == "Report available lock refreshes"]
+    assert len(report) == 1
+    step = report[0]
+    assert step["continue-on-error"] is True
+    assert 1 <= step["timeout-minutes"] <= 5
+    assert "timeout --kill-after=10 180 python -m piptools compile" in step["run"]

@@ -91,14 +91,20 @@ jobs:
         # Advisory only — never fails the job. Resolves requirements.txt from scratch and names the
         # pins a `pip-compile --upgrade` would move, so the freshness signal the strict gate used to
         # give is still visible without letting an upstream release break unrelated work.
+        #
+        # Never failing the job includes its clock: a fresh resolution against the live index has
+        # taken over 13 minutes, which ran the whole job past its limit before a single test ran. The
+        # resolve is bounded, and the step itself cannot fail or hang the job.
+        timeout-minutes: 5
+        continue-on-error: true
         run: |
           set -euo pipefail
           workdir="$(mktemp -d "$RUNNER_TEMP/lock-refresh.XXXXXX")"
           cp requirements.txt "$workdir/requirements.txt"
-          if ! (cd "$workdir" && python -m piptools compile \
+          if ! (cd "$workdir" && timeout --kill-after=10 180 python -m piptools compile \
                   --quiet --generate-hashes --strip-extras \
                   --output-file requirements.lock requirements.txt >/dev/null 2>&1); then
-            echo "::notice::could not resolve the newest dependency set; skipping the refresh report"
+            echo "::notice::could not resolve the newest dependency set within 3 minutes; skipping the refresh report"
             exit 0
           fi
           python - "$workdir/requirements.lock" <<'PY'
