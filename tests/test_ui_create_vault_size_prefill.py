@@ -1,8 +1,8 @@
 """The size a new vault is offered must be one the form will accept.
 
-The Create vault dialog prefills 5 GB, and the availability note that loads a moment later sets the
+The Create vault dialog prefills 10 GB, and the availability note that loads a moment later sets the
 input's max to what the account may still allocate, bounded by the admin's per-vault ceiling. When
-that max is under 5, the prefill sits above it: native form validation then refuses the submit
+that max is under 10, the prefill sits above it: native form validation then refuses the submit
 with no toast and no request, so "Create Vault" simply does nothing. On a constrained deployment,
 the very first thing a person tries is the thing that silently fails.
 
@@ -11,7 +11,7 @@ with a 2 GB per-vault ceiling, open the dialog, type a name, press Create, and s
 
 Lanes:
   * ui — the real dialog against a real ceiling. Also asserts the prefill it shows, so a fix that
-         merely suppressed the validation (or sent 5 GB anyway) does not pass.
+         merely suppressed the validation (or sent 10 GB anyway) does not pass.
 """
 import re
 import time

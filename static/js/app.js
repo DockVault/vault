@@ -3418,9 +3418,9 @@ function syncCreateVaultForm() {
 // The static copy in index.html is the WITHOUT-clause variant, so the promise is added by this
 // function rather than rendered and then withdrawn.
 // Keep in step with DEFAULT_VAULT_SIZE_GB server-side — this is only the wording a person reads.
-const _SIZE_HINT_BASE = 'The most this vault may hold. Default 5 GB.';
+const _SIZE_HINT_BASE = 'The most this vault may hold. Default 10 GB.';
 const _SIZE_HINT_EDITABLE =
-    "The most this vault may hold. Default 5 GB; you can change it later in the vault's policies.";
+    "The most this vault may hold. Default 10 GB; you can change it later in the vault's policies.";
 
 function createVaultSizeHintBase() {
     if (isScopedTemp) return _SIZE_HINT_BASE;

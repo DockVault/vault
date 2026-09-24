@@ -1,4 +1,4 @@
-"""A new vault defaults to 5 GB — and an existing one is never resized to match.
+"""A new vault defaults to 10 GB — and an existing one is never resized to match.
 
 The second half is the whole risk. Changing a default is trivial; changing it in a way that also
 rewrites vaults on a deployment that already exists is a data change nobody asked for. So the checks
@@ -32,20 +32,20 @@ GIB = 1024 ** 3
 # --------------------------------------------------------------------------- unit lane
 
 @pytest.mark.unit
-def test_the_model_column_default_is_five_gib():
+def test_the_model_column_default_is_ten_gib():
     """The real default object, not its spelling — this is what SQLAlchemy applies at INSERT."""
-    assert Vault.__table__.c.size_limit.default.arg == 5 * GIB
+    assert Vault.__table__.c.size_limit.default.arg == 10 * GIB
 
 
 @pytest.mark.unit
-def test_the_api_default_constant_is_five_gb_and_the_create_path_uses_it():
+def test_the_api_default_constant_is_ten_gb_and_the_create_path_uses_it():
     src = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
 
-    # Read to the end of the line and compare as a NUMBER. Matching the text "= 5" would also be
-    # satisfied by "= 50" — every correct value here is a prefix of a plausible wrong one.
+    # Read to the end of the line and compare as a NUMBER. Matching the text "= 10" would also be
+    # satisfied by "= 100" — every correct value here is a prefix of a plausible wrong one.
     m = re.search(r"^DEFAULT_VAULT_SIZE_GB = (\d+)\s*$", src, re.M)
     assert m, "DEFAULT_VAULT_SIZE_GB is not declared on its own line"
-    assert int(m.group(1)) == 5
+    assert int(m.group(1)) == 10
 
     m = re.search(r"^DEFAULT_VAULT_SIZE_BYTES = DEFAULT_VAULT_SIZE_GB \* _GIB\s*$", src, re.M)
     assert m, "DEFAULT_VAULT_SIZE_BYTES must be derived from the GB constant, not restated"
@@ -56,6 +56,35 @@ def test_the_api_default_constant_is_five_gb_and_the_create_path_uses_it():
     assert fallback, "the create path's size fallback was not found"
     assert fallback.group(1).rstrip(")") == "DEFAULT_VAULT_SIZE_BYTES", (
         f"the create default must be the named constant, not {fallback.group(1)!r}")
+
+
+@pytest.mark.unit
+def test_the_largest_file_a_fresh_install_accepts_fits_a_default_vault():
+    """The two defaults a person meets first must agree.
+
+    A fresh install accepts one file up to MAX_FILE_SIZE_MB. If a vault made with the defaults were
+    smaller than that, the biggest file the upload page allows would be refused by the vault it is
+    going into. The vault quota counts a file's own bytes, so an equal size is enough.
+    """
+    from app.core.config import Settings
+
+    file_ceiling = Settings.model_fields["max_file_size_mb"].default * 1024 * 1024
+    assert Vault.__table__.c.size_limit.default.arg >= file_ceiling, (
+        "a vault made with the defaults cannot hold the largest file a fresh install accepts")
+
+
+@pytest.mark.unit
+def test_the_floor_is_a_fixed_gib_not_a_share_of_the_default():
+    """Raising the default must not start refusing size-less creates that used to succeed.
+
+    The floor was once written as a fifth of the default, which was 1 GiB only while the default was
+    5 GiB. Tied to the default, a bigger default would have raised the floor with it, and an account
+    with, say, 1.5 GiB left would suddenly be refused instead of getting a 1.5 GiB vault.
+    """
+    src = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    m = re.search(r"^VAULT_SIZE_FLOOR_BYTES = (.+?)\s*$", src, re.M)
+    assert m, "VAULT_SIZE_FLOOR_BYTES is not declared on its own line"
+    assert m.group(1) == "1 * _GIB", f"the floor must be a fixed 1 GiB, not {m.group(1)!r}"
 
 
 @pytest.mark.unit
@@ -81,7 +110,7 @@ def test_the_legacy_backfill_still_writes_one_gib_and_only_to_unset_rows():
 
 
 @pytest.mark.unit
-def test_the_create_form_offers_five_and_defers_to_the_server_when_blank():
+def test_the_create_form_offers_ten_and_defers_to_the_server_when_blank():
     """The half that would have made a server-only change invisible."""
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
@@ -89,8 +118,16 @@ def test_the_create_form_offers_five_and_defers_to_the_server_when_blank():
     field = re.search(r'<input[^>]*id="vault-size-gb"[^>]*>', html)
     assert field, "the vault size field was not found"
     value = re.search(r'value="([\d.]+)"', field.group(0))
-    assert value and float(value.group(1)) == 5.0, (
-        f"the form should offer 5 GB, not {value and value.group(1)!r}")
+    assert value and float(value.group(1)) == 10.0, (
+        f"the form should offer 10 GB, not {value and value.group(1)!r}")
+
+    # The hint a person reads says the same number, in the static copy and in both script variants.
+    hint = re.search(r'id="vault-size-avail">([^<]*)<', html)
+    assert hint and "Default 10 GB." in hint.group(1), hint and hint.group(1)
+    for name in ("_SIZE_HINT_BASE", "_SIZE_HINT_EDITABLE"):
+        decl = re.search(r"const %s =\s*(['\"])(.*?)\1;" % name, app, re.S)
+        assert decl, f"{name} was not found"
+        assert "Default 10 GB" in decl.group(2), f"{name} says {decl.group(2)!r}"
 
     sent = re.search(r"size_limit_gb: \(sizeGb && sizeGb > 0\) \? sizeGb : (\w+)", app)
     assert sent, "the create payload's size expression was not found"
@@ -102,14 +139,14 @@ def test_the_create_form_offers_five_and_defers_to_the_server_when_blank():
 # --------------------------------------------------------------------------- integration lane
 
 @pytest.mark.integration
-def test_a_vault_created_without_a_size_gets_five_gib(admin):
+def test_a_vault_created_without_a_size_gets_ten_gib(admin):
     """The only check that proves the default reaches a real vault. Needs a deployment of THIS code."""
     r = admin.post("/vaults", json={"name": f"default-size-{id(admin)}", "description": ""})
     assert r.status_code in (200, 201), r.text
     vault = r.json()
     try:
         detail = admin.get(f"/vaults/{vault['id']}").json()
-        assert detail["size_limit"] == 5 * GIB, (
-            f"a vault created without a size should hold 5 GiB, got {detail['size_limit']}")
+        assert detail["size_limit"] == 10 * GIB, (
+            f"a vault created without a size should hold 10 GiB, got {detail['size_limit']}")
     finally:
         admin.delete_vault(vault["id"])

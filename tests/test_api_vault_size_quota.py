@@ -1,6 +1,6 @@
 """Per-vault size + account-budget enforcement (the reservation model).
 
-A vault carries a declared size_limit (default 5 GB, bounded by the per-vault ceiling). Two admin settings bound it: max_vault_size
+A vault carries a declared size_limit (default 10 GB, bounded by the per-vault ceiling). Two admin settings bound it: max_vault_size
 (GB) is the hard per-vault ceiling; default_user_quota (GB) is a per-account budget that the SUM of
 an owner's declared vault sizes must stay under. Admins are bounded by the per-vault ceiling but
 exempt from the account budget.
@@ -25,11 +25,11 @@ def _reset_quotas(admin):
     _set_quotas(admin, 1000, 1000)
 
 
-def test_create_vault_default_size_is_5gb(admin):
+def test_create_vault_default_size_is_10gb(admin):
     v = admin.create_vault(name="qsize-default")
     try:
         got = admin.get(f"/vaults/{v['id']}").json()
-        assert got["size_limit"] == 5 * GIB
+        assert got["size_limit"] == 10 * GIB
     finally:
         admin.delete_vault(v["id"])
 
@@ -37,12 +37,13 @@ def test_create_vault_default_size_is_5gb(admin):
 def test_a_size_less_create_fits_under_a_ceiling_below_the_default(admin):
     """A caller who names no size gets the default, bounded by what they may have.
 
-    The default rose from 1 GB to 5 GB. On a deployment whose per-vault ceiling is under that,
-    every create that did not name a size — the API, the desktop app, anything not typing a
-    number into the dialog — was refused with "5 GB exceeds 1 GB", for a size the caller never
-    asked for. Only an EXPLICIT request above the ceiling is a mistake worth refusing.
+    The default rose from 1 GB (to 5 GB, then 10 GB). When it first rose, on a deployment whose
+    per-vault ceiling was under it, every create that did not name a size — the API, the desktop
+    app, anything not typing a number into the dialog — was refused with "5 GB exceeds 1 GB", for a
+    size the caller never asked for. Only an EXPLICIT request above the ceiling is a mistake worth
+    refusing.
     """
-    _set_quotas(admin, 1000, 1)  # 1 GB ceiling, under the 5 GB default
+    _set_quotas(admin, 1000, 1)  # 1 GB ceiling, under the 10 GB default
     v = None
     try:
         r = admin.post("/vaults", json={"name": "qsize-fits", "description": "created by tests"})
@@ -63,7 +64,7 @@ def test_the_bounded_default_has_a_floor(admin, temp_user_client):
     """Bounded to what is left, down to a useful minimum; below that, refused rather than shrunk.
 
     A non-admin, because an admin is exempt from the account budget that makes the cap small.
-    The floor is 1 GiB, a fifth of the default. Both edges: a budget of exactly the floor makes a
+    The floor is a fixed 1 GiB, whatever the default. Both edges: a budget of exactly the floor makes a
     vault of exactly the floor; a budget with a few megabytes left is refused, as it used to be,
     rather than quietly producing a vault too small to use.
     """

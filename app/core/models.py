@@ -756,7 +756,7 @@ class Vault(Base):
     # whatever it holds and an upgrade never rewrites it. Kept in step with
     # DEFAULT_VAULT_SIZE_BYTES in the API, which is what a create actually goes through;
     # this is the fallback for a direct insert that names no size.
-    size_limit = Column(BigInteger, default=5 * 1024 ** 3)  # 5 GiB
+    size_limit = Column(BigInteger, default=10 * 1024 ** 3)  # 10 GiB
     
     # Storage statistics
     total_size_bytes = Column(BigInteger, default=0)

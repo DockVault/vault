@@ -2564,12 +2564,15 @@ _INT64_MAX = 2 ** 63 - 1  # the size_limit column is BigInteger; a larger value 
 # nothing. The legacy backfill further down (NULL/0 -> 1 GiB) is deliberately NOT tied to this
 # constant: it repairs rows written before the column had a default, and pointing it here would
 # silently resize vaults on deployments that already exist — the one thing this must not do.
-DEFAULT_VAULT_SIZE_GB = 5
+# It matches the default single-file ceiling (MAX_FILE_SIZE_MB), so the largest file a fresh
+# install accepts also fits a vault made with the defaults.
+DEFAULT_VAULT_SIZE_GB = 10
 DEFAULT_VAULT_SIZE_BYTES = DEFAULT_VAULT_SIZE_GB * _GIB
 # The smallest vault a size-less create will quietly make. Below this the default is not bounded
 # to what is left; the request is refused, so a nearly exhausted account is told rather than
-# handed a vault too small to be useful.
-VAULT_SIZE_FLOOR_BYTES = DEFAULT_VAULT_SIZE_BYTES // 5
+# handed a vault too small to be useful. A fixed amount, not a share of the default: raising the
+# default must not start refusing accounts that were fine before.
+VAULT_SIZE_FLOOR_BYTES = 1 * _GIB
 
 
 def _settings_blob(db: Session) -> dict:
@@ -14002,7 +14005,7 @@ async def create_vault(
     # BigInteger column and 500s) BEFORE the quota check, then enforce the ceiling / account budget.
     #
     # The default is bounded by what this person may have, not enforced against it. A caller who
-    # named no size did not ask for 5 GB; on a deployment whose per-vault ceiling (or the account's
+    # named no size did not ask for the default; on a deployment whose per-vault ceiling (or the account's
     # remaining budget) is under the default, refusing them for a number they never typed made
     # every size-less create fail — the API, the desktop app, anything not filling in the dialog.
     # Only an EXPLICIT request above the cap is a mistake worth refusing.
