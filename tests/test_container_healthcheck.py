@@ -81,15 +81,63 @@ def test_it_imports_only_the_standard_library():
     assert names == {"json", "os", "ssl", "sys", "urllib.request"}, names
 
 
-def test_every_web_container_runs_it_and_the_sftp_container_keeps_its_own():
-    argv = ["CMD", "python", "-B", "-m", "app.core.healthcheck"]
-    services = yaml.safe_load((ROOT / "deploy" / "docker-compose.secure.yml").read_text(encoding="utf-8"))["services"]
-    assert services["vault"]["healthcheck"]["test"] == argv          # combined
-    assert services["vault-api"]["healthcheck"]["test"] == argv      # split, web half
-    assert services["vault-sftp"]["healthcheck"]["test"] == ["CMD", "python", "-B", "-m", "app.sftp.heartbeat"]
+WEB_SERVICES = {
+    "docker-compose.yml": ("vault-api",),                   # split is this file's only layout
+    "docker-compose.secure.yml": ("vault", "vault-api"),    # combined, and split's web half
+}
+
+
+def test_the_image_carries_it_and_no_web_service_overrides_it():
+    """The web check lives in the image, and every compose file leaves it there.
+
+    A compose file that names the check pins a program to files an operator does not replace when an
+    update or a rollback swaps only the image. That is how a rollback to a release without the
+    program would run a check the image does not have: the container never turns healthy, and in
+    the split layout vault-sftp, which waits on it, never starts. With no override, Docker runs the
+    check of the image that is actually there.
+    """
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert re.search(r'^HEALTHCHECK .*\\\n\s+CMD \["python", "-B", "-m", "app\.core\.healthcheck"\]$',
                      dockerfile, re.M)
+    for name, web in WEB_SERVICES.items():
+        services = yaml.safe_load((ROOT / "deploy" / name).read_text(encoding="utf-8"))["services"]
+        image_services = {s for s, v in services.items() if "DOCKVAULT_IMAGE" in str(v.get("image", ""))}
+        assert image_services == set(web) | {"vault-sftp"}, (name, sorted(image_services))
+        for service in web:
+            assert "healthcheck" not in services[service], (
+                f"{name}: {service} overrides the image's healthcheck")
+        # vault-sftp is the one image service whose check differs from the image's, so it names it.
+        assert services["vault-sftp"]["healthcheck"]["test"] == [
+            "CMD", "python", "-B", "-m", "app.sftp.heartbeat"], name
+
+
+def test_the_previous_release_must_turn_healthy_under_the_compose_files_under_test():
+    """Scenario I runs the newest published image under this checkout's compose files: the pairing a
+    rollback leaves. It must require Docker's verdict, not only an answering /health, because a
+    check the older image lacks leaves /health answering and the container short of healthy."""
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "setup-matrix.yml").read_text(encoding="utf-8"))
+    steps = [s for s in wf["jobs"]["scenarios"]["steps"]
+             if s.get("name", "").startswith("Scenario I ") and "published release image" in s["name"]]
+    assert len(steps) == 1
+    run = steps[0]["run"]
+    refused = run.index('! grep -q "did NOT report healthy" /tmp/setup-release.log')
+    judged = run.index("{{.State.Health.Status}}' vault")
+    assert run.index("python3 dockvault.py setup") < refused < judged
+    assert 'test "$state" = healthy' in run[judged:]
+    assert judged < run.index("/health", judged)       # Docker's verdict, then the answering check
+
+
+def test_the_setup_matrix_checks_docker_runs_the_images_check():
+    """Live: Docker reports the image's program as the combined container's check, and calls the
+    container healthy, before the freeze."""
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "setup-matrix.yml").read_text(encoding="utf-8"))
+    steps = [s for s in wf["jobs"]["scenarios"]["steps"] if "frozen SFTP half" in s.get("name", "")]
+    assert len(steps) == 1
+    run = steps[0]["run"]
+    inspected = run.index("{{json .Config.Healthcheck.Test}}")
+    assert "*app.core.healthcheck*" in run[inspected:]
+    healthy = run.index("{{.State.Health.Status}}")
+    assert inspected < healthy < run.index("sig -STOP")
 
 
 def test_health_reports_degraded_from_the_same_list():

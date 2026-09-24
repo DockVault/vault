@@ -128,6 +128,21 @@ jobs:
           sig() { dc exec -T --user "$uid" vault kill "$1" "$pid"; }
           sftp_health() { curl -sS --cacert certs/cert.pem "$BASE/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sftp"])'; }
           test "$(sftp_health)" = listening || { echo "::error::SFTP was not healthy before the freeze"; exit 1; }
+          # The compose file names no web healthcheck, so Docker runs the image's own. Require that
+          # Docker reports the image's program as this container's check and calls it healthy: a
+          # check the image does not have would leave the container stuck short of healthy.
+          cid="$(dc ps -q vault)"
+          test -n "$cid" || { echo "::error::no running vault container"; exit 1; }
+          hc="$(docker inspect -f '{{json .Config.Healthcheck.Test}}' "$cid")"
+          case "$hc" in
+            *app.core.healthcheck*) ;;
+            *) echo "::error::the vault container's healthcheck is not the image's program: $hc"; exit 1 ;;
+          esac
+          state=""
+          for attempt in $(seq 1 30); do
+            state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"; [ "$state" = healthy ] && break; sleep 3
+          done
+          test "$state" = healthy || { echo "::error::Docker calls the vault container '$state', not healthy"; exit 1; }
           sig -STOP
           trap 'sig -CONT || true' EXIT
           seen=""
@@ -657,6 +672,20 @@ jobs:
           [ "$(docker image inspect -f '{{len .RepoDigests}}' "$expected")" -gt 0 ] \
             || { echo "::error::$expected has no repo digest - it was built locally, not pulled"; exit 1; }
           echo "running $expected ($(docker image inspect -f '{{index .RepoDigests 0}}' "$expected"))"
+
+          # And Docker has to call it healthy. This pairing -- the compose files under test with the
+          # previous release's image -- is also what a rollback leaves behind, since a rollback swaps
+          # the image and not the files. A compose file that names a healthcheck the older image
+          # does not have leaves the container short of healthy (and, split, vault-sftp never
+          # starts) while /health still answers, so answering is not enough.
+          ! grep -q "did NOT report healthy" /tmp/setup-release.log \
+            || { echo "::error::setup reported the published image's container as not healthy"; exit 1; }
+          state=""
+          for attempt in $(seq 1 40); do
+            state="$(docker inspect -f '{{.State.Health.Status}}' vault)"; [ "$state" = healthy ] && break; sleep 3
+          done
+          test "$state" = healthy \
+            || { echo "::error::Docker calls the published image's container '$state', not healthy"; exit 1; }
 
           # And it has to actually serve.
           for attempt in $(seq 1 20); do
