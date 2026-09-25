@@ -14232,6 +14232,53 @@ async def create_vault(
     return VaultResponse(**vault_dict)
 
 
+def _may_see_vault_members(db, vault, current_user, members_group_ok: bool) -> bool:
+    """Whether the caller may know who has access to `vault` -- the same rule as the vault's member
+    list (GET /vaults/{id}/permissions): the VAULT_PERMISSIONS endpoint group (`members_group_ok`, a
+    property of the caller decided once per request by endpoint_permission_denial), the
+    vault.see_permissions capability for a scoped temp session, and being its owner, a manager or a
+    global admin. Asked without side effects, once per row of the vault list, so a caller who may not
+    is never logged as refused just for loading the list."""
+    from app.core.temp_scope import require_cap
+    if not members_group_ok:
+        return False
+    try:
+        require_cap(current_user, vault.id, "vault.see_permissions")
+    except HTTPException:
+        return False
+    return _can_manage_vault(db, vault, current_user)
+
+
+def _vault_access_counts(db, vaults) -> dict:
+    """{vault_id: (members, departments)} for `vaults`, in two queries for the whole list: the
+    distinct people who are the owner or a direct member, and the departments granted access. These
+    are the two lists the vault's access panel shows, so the counts say nothing a caller who may see
+    them could not already read there. Department members are deliberately NOT folded into the member
+    count: who is in a department, and how many, is for admins only, and a combined number would give
+    both away (add someone directly; if the count does not move, they were in the department). A
+    zero-knowledge vault is never shared through a department, so it has none; a share claim is not
+    membership, so share recipients are not counted."""
+    from app.core.models import vault_members, vault_group_access
+    from sqlalchemy import select as _select
+    people = {v.id: {v.owner_id} for v in vaults}
+    if not people:
+        return {}
+    for vid, uid in db.execute(
+        _select(vault_members.c.vault_id, vault_members.c.user_id)
+        .where(vault_members.c.vault_id.in_(list(people)))
+    ).fetchall():
+        people[vid].add(uid)
+    departments = {vid: set() for vid in people}
+    standard = [v.id for v in vaults if not _is_zk_vault(v)]
+    if standard:
+        for vid, gid in db.execute(
+            _select(vault_group_access.c.vault_id, vault_group_access.c.group_id)
+            .where(vault_group_access.c.vault_id.in_(standard))
+        ).fetchall():
+            departments[vid].add(gid)
+    return {vid: (len(people[vid]), len(departments[vid])) for vid in people}
+
+
 @app.get("/vaults")
 @require_endpoint_permission("VAULT_VIEW")
 async def list_vaults(
@@ -14274,6 +14321,18 @@ async def list_vaults(
 
     from app.core.temp_scope import scope_ids as _scope_ids
     _fnr = _force_no_remember_vault_password(db)
+
+    # How many members and departments have access, only for the vaults whose access lists the caller
+    # may see; every other row carries null, so the page shows no count rather than a made-up one. An
+    # id-scoped caller never gets them (like the other whole-vault aggregates). Two queries in all.
+    from app.core.endpoint_permissions import endpoint_permission_denial
+    _members_group_ok = endpoint_permission_denial(db, current_user, "VAULT_PERMISSIONS") is None
+    _access_counts = _vault_access_counts(db, [
+        v for v in vaults
+        if _scope_ids(current_user, v.id) is None
+        and _may_see_vault_members(db, v, current_user, _members_group_ok)
+    ])
+
     result = []
     for vault in vaults:
         perms = permission_service.get_vault_permissions(current_user, vault.id)
@@ -14295,6 +14354,8 @@ async def list_vaults(
             'size_limit': vault.size_limit,
             'total_size_bytes': None if _id_scoped else vault.total_size_bytes,
             'file_count': None if _id_scoped else vault.file_count,
+            'member_count': _access_counts.get(vault.id, (None, None))[0],
+            'department_count': _access_counts.get(vault.id, (None, None))[1],
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
             'last_accessed': vault.last_accessed,
@@ -14584,7 +14645,9 @@ async def delete_vault(
     try:
         # require_password=True because we're deleting (destructive operation)
         vault = vault_service.get_vault(vault_id, current_user, effective_vault_password, require_password=True)
-        vault_name = str(vault.name)  # Convert to string
+        # None for a zero-knowledge vault without a label: its real name is sealed in the browser and
+        # the server never knows it, so neither the reply nor the audit row may claim one.
+        vault_name = str(vault.name) if vault.name else None
 
         # SECURITY: deletion is owner-or-admin, mirroring update_vault_info /
         # change_vault_password. get_vault() above only checks READ, so without this guard a
@@ -14608,7 +14671,8 @@ async def delete_vault(
             vault_id, vault_name, current_user, get_client_ip(request)
         )
 
-        return {"message": f"Vault {vault_name} deleted successfully"}
+        return {"message": f"Vault {vault_name} deleted successfully" if vault_name
+                else "Vault deleted successfully"}
 
     except HTTPException:
         raise

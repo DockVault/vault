@@ -20,6 +20,9 @@ TARGET_KINDS = ("note", "file", "folder")
 # Strength ordering for the "a user may only TIGHTEN" rule: a link may require a stronger secret
 # than its tag floor, never a weaker one. none < pin < password.
 SECRET_STRENGTH = {"none": 0, "pin": 1, "password": 2}
+# How a refusal names each secret kind to a person.
+_SECRET_WORDS = {"none": "no code", "pin": "a PIN", "password": "a password"}
+
 PIN_LENGTHS = (4, 6, 8)
 # The hard floor on a link token: 6 base62 chars is the smallest "easy" id we allow (~57e9 keyspace,
 # only safe alongside the always-on redemption rate limit). Longer is the default for real tiers.
@@ -217,7 +220,7 @@ def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
         if isinstance(v, bool) or not isinstance(v, int):
             raise PolicyViolation("token_len must be an integer")
         if v < floor_token:
-            raise PolicyViolation("token_len %d is below this tag's minimum of %d" % (v, floor_token))
+            raise PolicyViolation("The link length must be at least %d characters for this link type." % floor_token)
         if v > MAX_TOKEN_LEN:
             raise PolicyViolation("token_len cannot exceed %d" % MAX_TOKEN_LEN)
         token_len = v
@@ -230,7 +233,7 @@ def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
             raise PolicyViolation("secret_kind must be one of %s" % (SECRET_KINDS,))
         if SECRET_STRENGTH[req] < SECRET_STRENGTH[floor_secret]:
             raise PolicyViolation(
-                "this tag requires at least a '%s' secret; you cannot use '%s'" % (floor_secret, req))
+                "This link type requires at least %s; %s is not enough." % (_SECRET_WORDS[floor_secret], _SECRET_WORDS[req]))
         secret_kind = req
 
     secret_value = None
@@ -242,18 +245,18 @@ def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
             raise PolicyViolation("PIN length must be one of %s" % (PIN_LENGTHS,))
         min_pin = int(_tag_attr(tag, "min_pin_len", 4) or 4)
         if len(pin) < min_pin:
-            raise PolicyViolation("PIN must be at least %d digits for this tag" % min_pin)
+            raise PolicyViolation("The PIN must be at least %d digits for this link type." % min_pin)
         secret_value = pin
     elif secret_kind == "password":
         pw = o.get("password") or ""
         min_len = int(_tag_attr(tag, "password_min_len", 8) or 8)
         if len(pw) < min_len:
-            raise PolicyViolation("password must be at least %d characters for this tag" % min_len)
+            raise PolicyViolation("The password must be at least %d characters for this link type." % min_len)
         if len(pw) > PASSWORD_MAX_LEN:
             raise PolicyViolation("password cannot exceed %d characters" % PASSWORD_MAX_LEN)
         if _tag_attr(tag, "password_require_alnum", False):
             if not (any(c.isalpha() for c in pw) and any(c.isdigit() for c in pw)):
-                raise PolicyViolation("password must contain both letters and numbers for this tag")
+                raise PolicyViolation("The password must contain both letters and numbers for this link type.")
         secret_value = pw
 
     # --- ttl: max_ttl_hours is the ceiling; shorter is tighter; None = no expiry -----------------
@@ -266,13 +269,13 @@ def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
             # "no expiry" is the loosest option — only allowed when the tag sets no ceiling.
             if max_ttl is not None:
                 raise PolicyViolation(
-                    "this tag caps link lifetime at %d hours; a never-expiring link is not allowed" % max_ttl)
+                    "This link type expires links within %d hours, so a link cannot be set to never expire." % max_ttl)
             ttl_hours = None
         else:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise PolicyViolation("ttl_hours must be a positive integer or null")
             if max_ttl is not None and v > max_ttl:
-                raise PolicyViolation("ttl_hours %d exceeds this tag's maximum of %d" % (v, max_ttl))
+                raise PolicyViolation("The expiry can be at most %d hours for this link type." % max_ttl)
             if v > MAX_TTL_HOURS:
                 raise PolicyViolation("ttl_hours cannot exceed %d" % MAX_TTL_HOURS)
             ttl_hours = v
@@ -288,13 +291,13 @@ def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
         if v is None:
             if cap is not None:
                 raise PolicyViolation(
-                    "this tag caps a link at %d view(s); an unlimited-use link is not allowed" % cap)
+                    "This link type allows at most %d views or downloads per link, so it cannot be unlimited." % cap)
             max_uses = None
         else:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise PolicyViolation("max_uses must be a positive integer or null")
             if cap is not None and v > cap:
-                raise PolicyViolation("max_uses %d exceeds this tag's cap of %d" % (v, cap))
+                raise PolicyViolation("This link type allows at most %d views or downloads per link." % cap)
             max_uses = v
 
     return {"token_len": token_len, "secret_kind": secret_kind, "secret_value": secret_value,

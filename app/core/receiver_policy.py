@@ -17,6 +17,9 @@ from __future__ import annotations
 SECRET_KINDS = ("none", "pin", "password")
 # Strength ordering for the link-secret "tighten only" rule: none < pin < password.
 SECRET_STRENGTH = {"none": 0, "pin": 1, "password": 2}
+# How a refusal names each secret kind to a person.
+_SECRET_WORDS = {"none": "no code", "pin": "a PIN", "password": "a password"}
+
 PIN_LENGTHS = (4, 6, 8)
 # Receiver kind: 'confidential' forces the client-side password envelope and is STRONGER than
 # 'standard', so a receiver may be confidential under a standard-floor tag but never the reverse.
@@ -150,10 +153,19 @@ def _tag_attr(tag, name, default=None):
     return getattr(tag, name, default)
 
 
-def _tighten_cap(o, key, cap, label):
+def _mb(n):
+    """A byte count as the form shows it: whole MB when exact, else one decimal."""
+    mb = n / (1024 * 1024)
+    return ("%d MB" % mb) if mb == int(mb) else ("%.1f MB" % mb)
+
+
+def _tighten_cap(o, key, cap, label, in_mb=False):
     """Resolve a nullable 'ceiling' axis (max_uploads / max_file_bytes / max_total_bytes) where a
     SMALLER value is tighter. cap is the tag ceiling (None = unlimited within the tag). Returns the
-    resolved value (default = cap). Raises PolicyViolation on a loosen or a malformed override."""
+    resolved value (default = cap). Raises PolicyViolation on a loosen or a malformed override.
+    `label` is the form's own name for the field, and `in_mb` shows a byte cap in MB (the unit the
+    form takes), so the refusal reads in the words a person just saw."""
+    shown = _mb if in_mb else str
     val = cap
     if key in o:
         v = o[key]
@@ -161,13 +173,13 @@ def _tighten_cap(o, key, cap, label):
             # 'unlimited' is the loosest — only allowed when the tag sets no ceiling.
             if cap is not None:
                 raise PolicyViolation(
-                    "this tag caps %s at %d; an unlimited value is not allowed" % (label, cap))
+                    "%s can be at most %s for this link type, so it cannot be unlimited." % (label, shown(cap)))
             val = None
         else:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise PolicyViolation("%s must be a positive integer or null" % key)
             if cap is not None and v > cap:
-                raise PolicyViolation("%s %d exceeds this tag's cap of %d" % (key, v, cap))
+                raise PolicyViolation("%s can be at most %s for this link type." % (label, shown(cap)))
             if v > MAX_BYTES:
                 raise PolicyViolation("%s is too large" % key)
             val = v
@@ -199,7 +211,7 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
         if isinstance(v, bool) or not isinstance(v, int):
             raise PolicyViolation("token_len must be an integer")
         if v < floor_token:
-            raise PolicyViolation("token_len %d is below this tag's minimum of %d" % (v, floor_token))
+            raise PolicyViolation("The link length must be at least %d characters for this link type." % floor_token)
         if v > MAX_TOKEN_LEN:
             raise PolicyViolation("token_len cannot exceed %d" % MAX_TOKEN_LEN)
         token_len = v
@@ -215,7 +227,7 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
             raise PolicyViolation("secret_kind must be one of %s" % (SECRET_KINDS,))
         if SECRET_STRENGTH[req] < SECRET_STRENGTH[floor_secret]:
             raise PolicyViolation(
-                "this tag requires at least a '%s' link secret; you cannot use '%s'" % (floor_secret, req))
+                "This link type requires at least %s; %s is not enough." % (_SECRET_WORDS[floor_secret], _SECRET_WORDS[req]))
         secret_kind = req
 
     secret_value = None
@@ -227,18 +239,18 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
             raise PolicyViolation("PIN length must be one of %s" % (PIN_LENGTHS,))
         min_pin = int(_tag_attr(tag, "min_pin_len", 4) or 4)
         if len(pin) < min_pin:
-            raise PolicyViolation("PIN must be at least %d digits for this tag" % min_pin)
+            raise PolicyViolation("The PIN must be at least %d digits for this link type." % min_pin)
         secret_value = pin
     elif secret_kind == "password":
         pw = o.get("password") or ""
         min_len = int(_tag_attr(tag, "password_min_len", 8) or 8)
         if len(pw) < min_len:
-            raise PolicyViolation("password must be at least %d characters for this tag" % min_len)
+            raise PolicyViolation("The password must be at least %d characters for this link type." % min_len)
         if len(pw) > PASSWORD_MAX_LEN:
             raise PolicyViolation("password cannot exceed %d characters" % PASSWORD_MAX_LEN)
         if _tag_attr(tag, "password_require_alnum", False):
             if not (any(c.isalpha() for c in pw) and any(c.isdigit() for c in pw)):
-                raise PolicyViolation("password must contain both letters and numbers for this tag")
+                raise PolicyViolation("The password must contain both letters and numbers for this link type.")
         secret_value = pw
 
     # --- kind: confidential is stronger; floor sets the minimum ----------------------------------
@@ -264,13 +276,13 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
         if v is None:
             if max_ttl is not None:
                 raise PolicyViolation(
-                    "this tag caps the link lifetime at %d hours; a never-expiring link is not allowed" % max_ttl)
+                    "This link type expires links within %d hours, so a link cannot be set to never expire." % max_ttl)
             ttl_hours = None
         else:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise PolicyViolation("ttl_hours must be a positive integer or null")
             if max_ttl is not None and v > max_ttl:
-                raise PolicyViolation("ttl_hours %d exceeds this tag's maximum of %d" % (v, max_ttl))
+                raise PolicyViolation("The expiry can be at most %d hours for this link type." % max_ttl)
             if v > MAX_TTL_HOURS:
                 raise PolicyViolation("ttl_hours cannot exceed %d" % MAX_TTL_HOURS)
             ttl_hours = v
@@ -278,11 +290,11 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
         ttl_hours = max_ttl
 
     # --- upload / size ceilings: smaller is tighter ----------------------------------------------
-    max_uploads = _tighten_cap(o, "max_uploads", _tag_attr(tag, "max_uploads_cap", None), "uploads")
+    max_uploads = _tighten_cap(o, "max_uploads", _tag_attr(tag, "max_uploads_cap", None), "The number of files")
     max_file_bytes = _tighten_cap(o, "max_file_bytes", _tag_attr(tag, "max_file_bytes_cap", None),
-                                  "the per-file size")
+                                  "The size per file", in_mb=True)
     max_total_bytes = _tighten_cap(o, "max_total_bytes", _tag_attr(tag, "max_total_bytes_cap", None),
-                                   "the total size")
+                                   "The total upload budget", in_mb=True)
 
     # --- retention: retention_max_days is the ceiling; shorter is tighter ------------------------
     max_ret = _tag_attr(tag, "retention_max_days", None)
@@ -293,13 +305,13 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
         if v is None:
             if max_ret is not None:
                 raise PolicyViolation(
-                    "this tag caps retention at %d days; keeping uploads forever is not allowed" % max_ret)
+                    "This link type deletes uploads within %d days, so they cannot be kept forever." % max_ret)
             retention_days = None
         else:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise PolicyViolation("retention_days must be a positive integer or null")
             if max_ret is not None and v > max_ret:
-                raise PolicyViolation("retention_days %d exceeds this tag's maximum of %d" % (v, max_ret))
+                raise PolicyViolation("The retention period can be at most %d days for this link type." % max_ret)
             if v > MAX_RETENTION_DAYS:
                 raise PolicyViolation("retention_days cannot exceed %d" % MAX_RETENTION_DAYS)
             retention_days = v

@@ -2660,8 +2660,18 @@ function renderVaults() {
         const nameHtml = escapeHtml(vaultDisplayName(vault));
         const descHtml = locked ? '••••••'
                                 : escapeHtml(vault.description || 'No description');
-        const filesHtml = locked ? '••' : `${vault.file_count || 0}`;
-        const membersHtml = locked ? '••' : `${vault.member_count || 1}`;
+        // The server sends each count only to a caller who may know it (members and departments to
+        // the owner, a manager or an admin; neither to a credential scoped to part of the vault). A
+        // missing count is left off the card rather than shown as a made-up number. Members are the
+        // owner and the people added directly; a department is counted as one, not as its people.
+        const hasFiles = Number.isInteger(vault.file_count);
+        const hasMembers = Number.isInteger(vault.member_count);
+        const departments = Number.isInteger(vault.department_count) ? vault.department_count : 0;
+        const filesHtml = locked ? '••' : `${vault.file_count}`;
+        const membersHtml = locked ? '••' : `${vault.member_count}`;
+        const filesLabel = (!locked && vault.file_count === 1) ? 'file' : 'files';
+        const membersLabel = ((!locked && vault.member_count === 1) ? 'member' : 'members')
+            + (departments ? ` · ${departments} ${departments === 1 ? 'department' : 'departments'}` : '');
         return `
         <div class="card card-interactive vault-card ${locked ? 'vault-zk-locked' : ''}" data-vault-id="${vault.id}"${isZk ? ' data-zk="1"' : ''}>
             <button class="vault-fav ${vault.is_favorite ? 'is-fav' : ''}" data-vault-id="${vault.id}"
@@ -2676,8 +2686,8 @@ function renderVaults() {
                     <span class="vault-badge ${isZk ? 'vault-badge-zk' : 'vault-badge-std'}">${iconSvg(isZk ? 'shield' : 'vault', 'icon-xs')}${isZk ? 'Zero-knowledge' : 'Standard'}</span>
                     <p class="vault-desc"><span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="desc">${descHtml}</span></p>
                     <div class="vault-meta">
-                        <span>${iconSvg('folder', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="files">${filesHtml}</span> files</span>
-                        <span>${iconSvg('users', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="members">${membersHtml}</span> members</span>
+                        ${hasFiles ? `<span>${iconSvg('folder', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="files">${filesHtml}</span> ${filesLabel}</span>` : ''}
+                        ${hasMembers ? `<span>${iconSvg('users', 'icon-sm')} <span class="zk-field${locked ? ' zk-hidden' : ''}" data-zk-field="members">${membersHtml}</span> ${membersLabel}</span>` : ''}
                     </div>
                 </div>
                 <button class="open-vault-btn btn btn-primary btn-sm vault-open" data-vault-id="${vault.id}">${locked ? 'Unlock' : 'Open'}</button>
@@ -10552,6 +10562,16 @@ function applyAuditView() {
     });
 }
 
+// How each audit status reads at a glance. Only a failure or a refusal is red: "authorized" is an
+// allowed request whose outcome is logged in a row of its own, and "active"/"revoked" are states,
+// not errors. A status this list does not know stays neutral rather than looking like a failure.
+const _AUDIT_STATUS_BADGE = {
+    success: 'success', active: 'success', authorized: 'info',
+    revoked: 'secondary', unconfirmed: 'warning',
+    failure: 'danger', failed: 'danger', error: 'danger', refused: 'danger',
+};
+function auditStatusBadge(status) { return _AUDIT_STATUS_BADGE[status] || 'secondary'; }
+
 // The detailed view. Same rows, same page, more of each row visible without opening
 // anything — which is the point of having two: the table scans, the cards read.
 function renderAuditCards(logs, start) {
@@ -10565,12 +10585,12 @@ function renderAuditCards(logs, start) {
     }
     logs.forEach((log, i) => {
         const gi = start + i;
-        const ok = log.status === 'success';
-        const card = _el('div', 'audit-card' + (ok ? '' : ' is-bad'));
+        const badge = auditStatusBadge(log.status);
+        const card = _el('div', 'audit-card' + (badge === 'danger' ? ' is-bad' : ''));
 
         const head = _el('div', 'audit-card-head');
         head.appendChild(_el('span', 'badge badge-secondary', (log.action || '').replace(/_/g, ' ')));
-        head.appendChild(_el('span', 'badge badge-' + (ok ? 'success' : 'danger'), log.status || '-'));
+        head.appendChild(_el('span', 'badge badge-' + badge, log.status || '-'));
         head.appendChild(_el('span', 'audit-card-when', formatServerTime(log.timestamp)));
         card.appendChild(head);
 
@@ -10665,7 +10685,7 @@ function renderAuditPage() {
             const tdAction = document.createElement('td');
             const ab = document.createElement('span'); ab.className = 'badge badge-secondary'; ab.textContent = (log.action || '').replace(/_/g, ' '); tdAction.appendChild(ab); tr.appendChild(tdAction);
             const tdStatus = document.createElement('td');
-            const sb = document.createElement('span'); sb.className = 'badge badge-' + (log.status === 'success' ? 'success' : 'danger'); sb.textContent = log.status || '-'; tdStatus.appendChild(sb); tr.appendChild(tdStatus);
+            const sb = document.createElement('span'); sb.className = 'badge badge-' + auditStatusBadge(log.status); sb.textContent = log.status || '-'; tdStatus.appendChild(sb); tr.appendChild(tdStatus);
             const tdIp = document.createElement('td'); tdIp.textContent = log.ip_address || '-'; tr.appendChild(tdIp);
             const tdDet = document.createElement('td');
             const view = document.createElement('button'); view.type = 'button'; view.className = 'btn btn-ghost btn-sm'; view.textContent = 'View';
@@ -19996,11 +20016,34 @@ function _notePublicPayload() {
     return p;
 }
 
+// The link forms set each number field's min/max from the chosen link type, but submit through
+// script, so an out-of-range value used to reach the server and come back as its refusal. Say it in
+// the form's own words first. `fields` is [[input, label, unit]]; returns the first message, or ''.
+function _linkLimitMessage(fields) {
+    for (const [input, label, unit] of fields) {
+        if (!input || input.disabled || input.value === '') continue;
+        const v = Number(input.value);
+        if (!Number.isFinite(v)) continue;
+        const max = input.max === '' ? NaN : Number(input.max);
+        const min = input.min === '' ? NaN : Number(input.min);
+        const withUnit = (n) => unit ? `${n} ${n === 1 ? unit.replace(/s$/, '') : unit}` : `${n}`;
+        if (Number.isFinite(max) && v > max) return `${label} can be at most ${withUnit(max)} for this link type.`;
+        if (Number.isFinite(min) && v < min) return `${label} must be at least ${withUnit(min)} for this link type.`;
+    }
+    return '';
+}
+
 async function submitNotePublicLink() {
     const t = _notePublicSelectedTag();
     const err = _npEl('note-public-error');
     if (err) err.hidden = true;
     if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const limit = _linkLimitMessage([
+        [_npEl('note-public-token-len'), 'The link length', 'characters'],
+        [_npEl('note-public-ttl'), 'The expiry', 'hours'],
+        [_npEl('note-public-max-uses'), 'The number of views', ''],
+    ]);
+    if (limit) { if (err) { err.textContent = limit; err.hidden = false; } return; }
     const btn = _npEl('note-public-create');
     btn.disabled = true;
     try {
@@ -20164,6 +20207,12 @@ async function submitPublicFileLink() {
     const t = _pflSelectedTag();
     const err = _pflEl('pfl-error'); if (err) err.hidden = true;
     if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const limit = _linkLimitMessage([
+        [_pflEl('pfl-token-len'), 'The link length', 'characters'],
+        [_pflEl('pfl-ttl'), 'The expiry', 'hours'],
+        [_pflEl('pfl-max-uses'), 'The number of downloads', ''],
+    ]);
+    if (limit) { if (err) { err.textContent = limit; err.hidden = false; } return; }
     const btn = _pflEl('pfl-create'); btn.disabled = true;
     try {
         const link = await apiRequest('/public-links', { method: 'POST', body: JSON.stringify(_pflPayload()) });
@@ -20660,6 +20709,15 @@ async function submitReceiver() {
     const t = _rcSelectedTag();
     const err = _rcEl('rc-error'); if (err) err.hidden = true;
     if (!t) { if (err) { err.textContent = 'Choose a link type first.'; err.hidden = false; } return; }
+    const limit = _linkLimitMessage([
+        [_rcEl('rc-token-len'), 'The link length', 'characters'],
+        [_rcEl('rc-ttl'), 'The expiry', 'hours'],
+        [_rcEl('rc-max-uploads'), 'The number of files', ''],
+        [_rcEl('rc-max-file-mb'), 'The size per file', 'MB'],
+        [_rcEl('rc-max-total-mb'), 'The total upload budget', 'MB'],
+        [_rcEl('rc-retention-days'), 'The retention period', 'days'],
+    ]);
+    if (limit) { if (err) { err.textContent = limit; err.hidden = false; } return; }
     const payload = _rcPayload();
     if (!payload.max_total_bytes) { if (err) { err.textContent = 'Enter a total upload budget (MB).'; err.hidden = false; } return; }
     const btn = _rcEl('rc-create'); btn.disabled = true;
