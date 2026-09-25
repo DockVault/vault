@@ -10562,9 +10562,9 @@ function applyAuditView() {
     });
 }
 
-// How each audit status reads at a glance. Only a failure or a refusal is red: "authorized" is an
-// allowed request whose outcome is logged in a row of its own, and "active"/"revoked" are states,
-// not errors. A status this list does not know stays neutral rather than looking like a failure.
+// How each audit status reads at a glance. Only a failure or a refusal is red: "authorized" records
+// that a download or a rendered preview was allowed (a download's outcome is logged in a row of its
+// own), and "active"/"revoked" are states, not errors. A status this list does not know stays neutral rather than looking like a failure.
 const _AUDIT_STATUS_BADGE = {
     success: 'success', active: 'success', authorized: 'info',
     revoked: 'secondary', unconfirmed: 'warning',
