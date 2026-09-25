@@ -22,8 +22,8 @@ def test_create_vault_with_chosen_size(page: Page, admin, admin_creds):
     page.click('.sidebar-item[data-section="vaults"]')
     page.click("#create-vault-btn")
     expect(page.locator("#create-vault-modal")).to_be_visible()
-    # the size input defaults to 5 and the availability note is shown
-    expect(page.locator("#vault-size-gb")).to_have_value("5")
+    # the size input defaults to 10 and the availability note is shown
+    expect(page.locator("#vault-size-gb")).to_have_value("10")
     expect(page.locator("#vault-size-avail")).to_be_visible()
     page.fill("#vault-name", name)
     page.fill("#vault-size-gb", "3")

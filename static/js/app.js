@@ -3435,9 +3435,10 @@ async function fetchAccountStorage(excludeVaultId) {
 }
 function _bytesToGb(bytes) { return bytes / (1024 ** 3); }
 
-// The size a new vault is offered before the person changes it. The markup's value attribute
-// carries the same number, so a form reset lands on it too.
-const CREATE_VAULT_PREFILL_GB = 5;
+// The size a new vault is offered before the person changes it. Opening the dialog writes this into
+// the field, so it is the number a person sees: the markup's value attribute only carries the same
+// number so that a form reset lands on it too. Keep in step with DEFAULT_VAULT_SIZE_GB server-side.
+const CREATE_VAULT_PREFILL_GB = 10;
 
 // A prefill above the input's own max is worse than a smaller one: native validation refuses the
 // submit with no toast and no request, so "Create vault" simply does nothing on a deployment

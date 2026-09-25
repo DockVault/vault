@@ -9,9 +9,13 @@ the very first thing a person tries is the thing that silently fails.
 The prefill is now clamped to the ceiling once it is known. Proved the way a person would find it:
 with a 2 GB per-vault ceiling, open the dialog, type a name, press Create, and see the vault exist.
 
+With nothing to clamp it, the dialog must offer the 10 GB default itself, read from the field a
+person sees rather than from the markup the dialog overwrites.
+
 Lanes:
   * ui — the real dialog against a real ceiling. Also asserts the prefill it shows, so a fix that
-         merely suppressed the validation (or sent 10 GB anyway) does not pass.
+         merely suppressed the validation (or sent 10 GB anyway) does not pass. And the real dialog
+         for a fresh account with no ceiling, which must offer 10.
 """
 import re
 import time
@@ -48,6 +52,39 @@ def two_gb_ceiling(admin):
     assert r.status_code == 200, r.text
     yield 2
     admin.put("/settings", json={"max_vault_size": before if before else 0})
+
+
+@pytest.fixture
+def no_ceiling(admin):
+    before = admin.get("/settings").json().get("max_vault_size")
+    r = admin.put("/settings", json={"max_vault_size": 0})
+    assert r.status_code == 200, r.text
+    yield
+    admin.put("/settings", json={"max_vault_size": before if before else 0})
+
+
+@pytest.mark.ui
+def test_the_dialog_offers_ten_gb_when_nothing_caps_it_lower(page: Page, temp_user, no_ceiling):
+    """The default a person meets is the number in the field, and it is 10 GB.
+
+    Read from the real dialog, not the markup: opening it rewrites the field, and in 0.32.0 it wrote
+    5 while the markup, the hint and the server all said 10. A fresh account with no per-vault ceiling
+    has nothing to clamp the prefill, so anything but 10 here is the wrong default.
+    """
+    page.goto("/")
+    _login(page, temp_user["_username"], temp_user["_password"])
+    page.click('.sidebar-item[data-section="vaults"]')
+    page.wait_for_selector("#vaults-section.active", timeout=10000)
+    page.click("#create-vault-btn")
+    page.wait_for_selector("#create-vault-modal.active", timeout=10000)
+    # The availability note loads afterwards and may clamp the field; let it land before reading.
+    page.wait_for_load_state("networkidle")
+    time.sleep(1)
+    offered, ceiling = page.evaluate(
+        "() => { const i = document.getElementById('vault-size-gb'); return [i.value, i.max]; }")
+    assert not ceiling or float(ceiling) >= 10, (
+        f"a fresh account with no per-vault ceiling should have room for 10 GB, but the field's max is {ceiling}")
+    assert float(offered) == 10, f"the Create vault dialog offers {offered} GB; the default is 10"
 
 
 @pytest.mark.ui

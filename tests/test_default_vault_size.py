@@ -136,6 +136,32 @@ def test_the_create_form_offers_ten_and_defers_to_the_server_when_blank():
         "is what made the server default unreachable from the UI")
 
 
+@pytest.mark.unit
+def test_the_number_the_dialog_fills_in_is_ten():
+    """What a person sees is the script's prefill, not the markup's value attribute.
+
+    Opening the dialog overwrites the field with CREATE_VAULT_PREFILL_GB. In 0.32.0 the markup said 10
+    and that constant still said 5, so the web form created 5 GB vaults while the check above, which
+    reads the markup, passed. Pin the constant, that it is what the open path writes into the field,
+    and that the markup carries the same number.
+    """
+    html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+    decls = re.findall(r"^const CREATE_VAULT_PREFILL_GB = ([^;\n]+);\s*$", app, re.M)
+    assert len(decls) == 1, f"CREATE_VAULT_PREFILL_GB should be declared once, found {decls}"
+    assert float(decls[0]) == 10.0, f"the dialog would offer {decls[0]} GB, not 10"
+
+    writes = re.findall(r"^\s*if \(sizeInput\) sizeInput\.value = String\(CREATE_VAULT_PREFILL_GB\);\s*$",
+                        app, re.M)
+    assert len(writes) == 1, "opening the dialog should write the prefill constant into the field once"
+
+    field = re.search(r'<input[^>]*id="vault-size-gb"[^>]*>', html)
+    value = field and re.search(r'value="([\d.]+)"', field.group(0))
+    assert value and float(value.group(1)) == float(decls[0]), (
+        "the markup's value and the script's prefill must be the same number")
+
+
 # --------------------------------------------------------------------------- integration lane
 
 @pytest.mark.integration
