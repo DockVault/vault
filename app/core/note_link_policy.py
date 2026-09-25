@@ -195,6 +195,12 @@ def _tag_attr(tag, name, default=None):
     return getattr(tag, name, default)
 
 
+def _uses(n):
+    """A use cap as a refusal names it: one view or download is singular (the seeded Confidential
+    tag allows exactly one)."""
+    return "1 view or download" if n == 1 else "%d views or downloads" % n
+
+
 def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
     """Merge a NoteLinkTag floor with a user's requested overrides into the concrete link policy,
     enforcing "tighten only". Returns a dict:
@@ -291,13 +297,13 @@ def resolve_link_policy(tag, overrides: dict | None = None) -> dict:
         if v is None:
             if cap is not None:
                 raise PolicyViolation(
-                    "This link type allows at most %d views or downloads per link, so it cannot be unlimited." % cap)
+                    "This link type allows at most %s per link, so it cannot be unlimited." % _uses(cap))
             max_uses = None
         else:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise PolicyViolation("max_uses must be a positive integer or null")
             if cap is not None and v > cap:
-                raise PolicyViolation("This link type allows at most %d views or downloads per link." % cap)
+                raise PolicyViolation("This link type allows at most %s per link." % _uses(cap))
             max_uses = v
 
     return {"token_len": token_len, "secret_kind": secret_kind, "secret_value": secret_value,

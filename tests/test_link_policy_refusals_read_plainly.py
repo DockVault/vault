@@ -119,6 +119,11 @@ def test_note_and_file_link_refusals():
         "This link type allows at most 3 views or downloads per link.")
     assert _refusal(nlp, nlp.resolve_link_policy, {"max_uses_cap": 3}, {"max_uses": None}) == (
         "This link type allows at most 3 views or downloads per link, so it cannot be unlimited.")
+    # The seeded Confidential link type allows exactly one: the refusal must not say "1 views".
+    assert _refusal(nlp, nlp.resolve_link_policy, {"max_uses_cap": 1}, {"max_uses": 2}) == (
+        "This link type allows at most 1 view or download per link.")
+    assert _refusal(nlp, nlp.resolve_link_policy, {"max_uses_cap": 1}, {"max_uses": None}) == (
+        "This link type allows at most 1 view or download per link, so it cannot be unlimited.")
     assert _refusal(nlp, nlp.resolve_link_policy, {"max_ttl_hours": 24}, {"ttl_hours": 25}) == (
         "The expiry can be at most 24 hours for this link type.")
     assert _refusal(nlp, nlp.resolve_link_policy, {"max_ttl_hours": 24}, {"ttl_hours": None}) == (
