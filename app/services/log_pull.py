@@ -10,6 +10,8 @@ import hmac
 import re
 import secrets
 
+from app.core.log_redaction import redact_secret_urls_in_text
+
 # The components the log system knows about. Phase 1 can SERVE only web/sftp (sourced from the
 # run_combined sink); db-diag/redis-diag are accepted as scopes/flags but 404 until Phase 2 adds
 # the vault-side DB/redis client-diagnostics view.
@@ -158,4 +160,7 @@ def redact_log_text(text, secret_values):
     text = _CRED_RE.sub(lambda m: m.group(1) + _REDACTED, text)
     text = _CONN_RE.sub(lambda m: m.group(1) + _REDACTED + m.group(3), text)
     text = _JWT_RE.sub("«redacted-jwt»", text)
+    # Link, invite and reset tokens in request paths and landing queries, including lines written
+    # before their route was masked at write time.
+    text = redact_secret_urls_in_text(text)
     return text

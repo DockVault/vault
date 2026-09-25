@@ -10337,7 +10337,7 @@ async def redeem_note_link(
     #     is the per-IP throttle GET /invites/{token} and /reset/{token} already apply.
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{token}", limit=_NOTELINK_REDEEM_LIMIT,
+            identifier=f"{client_ip}:{_notelink_token_hash(token)}", limit=_NOTELINK_REDEEM_LIMIT,
             window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
             identifier=client_ip, limit=_NOTELINK_REDEEM_IP_LIMIT,
@@ -11143,7 +11143,7 @@ async def redeem_public_link(
     # alone throttles enumerating many different tokens from one address.
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{token}", limit=_PUBLINK_REDEEM_LIMIT,
+            identifier=f"{client_ip}:{_publiclink_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
             window=_PUBLINK_REDEEM_WINDOW, prefix="publiclink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
             identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
@@ -12068,7 +12068,7 @@ async def open_receiver_upload_session(
 
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{token}", limit=_PUBLINK_REDEEM_LIMIT,
+            identifier=f"{client_ip}:{_receiver_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
             window=_PUBLINK_REDEEM_WINDOW, prefix="receiver_open", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
             identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,

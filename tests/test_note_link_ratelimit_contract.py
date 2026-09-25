@@ -25,8 +25,22 @@ def _redeem_body() -> str:
 
 
 def test_redeem_keeps_the_per_pair_bucket():
-    assert 'identifier=f"{client_ip}:{token}"' in _redeem_body(), (
+    # Keyed on the token's HASH: the rate-limit key lives in Redis, and a raw link token there is a
+    # usable secret sitting in cleartext next to the hashed lockout key.
+    body = _redeem_body()
+    assert 'identifier=f"{client_ip}:{_notelink_token_hash(token)}"' in body, (
         "the per-(IP, token) bucket must remain to bound hammering a single link")
+    assert 'identifier=f"{client_ip}:{token}"' not in body, (
+        "the per-(IP, token) bucket must not put the raw link token in its Redis key")
+
+
+def test_every_public_link_throttle_keys_on_the_token_hash():
+    # The same rule for the other two public link kinds, whose redeem/open routes use a per-(IP, token)
+    # bucket of their own.
+    assert 'identifier=f"{client_ip}:{token}"' not in _SRC, (
+        "a per-(IP, token) throttle key still embeds the raw token")
+    assert 'identifier=f"{client_ip}:{_publiclink_token_hash(token)}"' in _SRC
+    assert 'identifier=f"{client_ip}:{_receiver_token_hash(token)}"' in _SRC
 
 
 def test_redeem_adds_the_per_ip_bucket_for_enumeration():
