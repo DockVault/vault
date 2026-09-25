@@ -18,7 +18,7 @@
 fastapi==0.141.1
 starlette==1.6.0
 python-multipart==0.0.32
-pydantic==2.13.4
+pydantic==2.13.5
 pydantic-settings==2.15.0
 python-dotenv==1.2.2
 email-validator==2.3.0
