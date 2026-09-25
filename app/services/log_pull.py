@@ -156,11 +156,12 @@ def redact_log_text(text, secret_values):
             text = text.replace(s, _REDACTED)
     if len(text) > _MAX_REDACT_LINE:
         text = text[:_MAX_REDACT_LINE] + " …[truncated]"
+    # Link, invite and reset tokens in request paths, and secret-named query values, including lines
+    # written before their route was masked at write time. Run before the passes below so a value both
+    # would catch ends up with this reader's own marker.
+    text = redact_secret_urls_in_text(text)
     text = _BEARER_RE.sub(lambda m: m.group(1) + _REDACTED, text)
     text = _CRED_RE.sub(lambda m: m.group(1) + _REDACTED, text)
     text = _CONN_RE.sub(lambda m: m.group(1) + _REDACTED + m.group(3), text)
     text = _JWT_RE.sub("«redacted-jwt»", text)
-    # Link, invite and reset tokens in request paths and landing queries, including lines written
-    # before their route was masked at write time.
-    text = redact_secret_urls_in_text(text)
     return text

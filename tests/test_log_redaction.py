@@ -132,6 +132,23 @@ def test_routes_with_ids_stay_readable(target):
     assert rec.args[2] == target
 
 
+@pytest.mark.parametrize("target, expected", [
+    # The legacy query form an API client may still use to prove a vault password on delete.
+    (f"/vaults/7d1e/delete?vault_password={TOKEN}", "/vaults/7d1e/delete?vault_password=<redacted>"),
+    (f"/vaults/7d1e/delete?Vault_Password={TOKEN}&x=1", "/vaults/7d1e/delete?Vault_Password=<redacted>&x=1"),
+    (f"/x?passcode={TOKEN}", "/x?passcode=<redacted>"),
+    (f"/x?a=1&client_secret={TOKEN}", "/x?a=1&client_secret=<redacted>"),
+    (f"/x?token={TOKEN}", "/x?token=<redacted>"),
+    ("/files?key_version=3&tab=vaults", "/files?key_version=3&tab=vaults"),   # not secret-named
+])
+def test_secret_named_query_values_are_masked(target, expected):
+    assert redact_access_path(target) == expected
+    rec = _access_record(target)
+    AccessLogRedactFilter().filter(rec)
+    assert rec.args[2] == expected
+    assert TOKEN not in redact_secret_urls_in_text(f'"POST {target} HTTP/1.1" 200')
+
+
 def test_text_scrubber_catches_full_urls_and_queries():
     text = (f"sent https://vault.example.com/p/{TOKEN} and https://vault.example.com/u/{TOKEN}, "
             f"landing /?invite={TOKEN} and /?reset={TOKEN}")

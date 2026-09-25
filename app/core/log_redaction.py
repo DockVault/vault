@@ -61,9 +61,14 @@ LOG_PATH_SECRET_SUBS = [(_anchored(p, f), r"\1<redacted>\2") for p, f in SECRET_
 # The same routes found anywhere inside a formatted log line ("GET /p/<token> HTTP/1.1", "-> ...").
 _TEXT_SECRET_SUBS = [(_anywhere(p, f), r"\1<redacted>\2") for p, f in SECRET_PATH_ROUTES]
 
-# Covers both the /?invite=<token> and /?reset=<token> landing links (the token rides the query on the
-# initial page load, before the client strips it from the address bar).
-INVITE_QUERY_RE = re.compile(r"(?i)([?&](?:invite|reset)=)[^&#\s\"']+")
+# Secrets that ride the QUERY: the /?invite=<token> and /?reset=<token> landing links (the token rides
+# the query on the initial page load, before the client strips it from the address bar), and any
+# parameter whose name says it holds a secret, such as the legacy ?vault_password= an API client may
+# still send to POST /vaults/{id}/delete (the web app uses the X-Vault-Password header). The name is
+# matched loosely on purpose: masking a harmless value costs nothing.
+SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:invite|reset|[^=&#\s]*(?:password|passcode|secret|token)[^=&#\s]*)=)[^&#\s\"']+")
+INVITE_QUERY_RE = SECRET_QUERY_RE  # the earlier name, kept for callers and tests
 
 
 def redact_log_path(path: str) -> str:
@@ -75,13 +80,13 @@ def redact_log_path(path: str) -> str:
 
 def redact_access_path(full_path: str) -> str:
     """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
-    mask every secret-carrying route in the PATH and the ?invite=/?reset=<token> QUERY the landing
-    page carries."""
+    mask every secret-carrying route in the PATH and every secret-named QUERY value (the landing
+    page's ?invite=/?reset= token, a legacy ?vault_password=, and the like)."""
     path, sep, query = full_path.partition("?")
     path = redact_log_path(path)
     if not sep:
         return path
-    query = INVITE_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
+    query = SECRET_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
     return path + "?" + query
 
 
@@ -93,7 +98,7 @@ def redact_secret_urls_in_text(text: str) -> str:
         return text
     for rx, repl in _TEXT_SECRET_SUBS:
         text = rx.sub(repl, text)
-    return INVITE_QUERY_RE.sub(r"\1<redacted>", text)
+    return SECRET_QUERY_RE.sub(r"\1<redacted>", text)
 
 
 class AccessLogRedactFilter(logging.Filter):
