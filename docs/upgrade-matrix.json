@@ -89,6 +89,18 @@
       "id": null,
       "fixed_in": "0.31.0",
       "published": "2026-09-23"
+    },
+    "link-tokens-written-to-access-log": {
+      "title": "Public link tokens were written to the access log",
+      "description": "The token in a note link, public file link or upload link address rides the request path, and the web access log wrote it in full: the access-log filter masked only invitation, share and password-reset addresses. The default container prints that log to docker logs and to the log file the web log pull serves. Rate-limit keys in Redis also held the raw token. A vault password an API client sent in the legacy vault_password query parameter was written to the same log.",
+      "impact": "Anyone who could read the web access log, through docker logs, a copy of the log file, or a web log-pull token an administrator issued, could open a live note link, download through a live file link, or upload into a live upload link, and read any vault password an API client had passed in the query string.",
+      "remediation": "Upgrade to 0.32.3. Lines written before the upgrade still hold tokens in docker logs and in any copy of the log file; the web log pull masks them from 0.32.3 on. If someone who should not have those links may have read the logs, revoke and replace the affected links.",
+      "mitigation": "Until you can upgrade, keep the web log pull off (the default) or disable its tokens, and limit who can read docker logs and the vault's log volume.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:H/UI:N/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.3",
+      "published": "2026-09-26"
     }
   },
   "versions": {
@@ -444,6 +456,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -474,6 +491,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -504,6 +526,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -534,6 +561,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -564,6 +596,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -594,6 +631,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -624,6 +666,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -654,6 +701,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -684,6 +736,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -714,6 +771,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -744,6 +806,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -774,6 +841,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -804,6 +876,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -834,6 +911,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -864,6 +946,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -894,6 +981,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -924,6 +1016,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -954,6 +1051,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -984,6 +1086,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -1029,6 +1136,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -1074,6 +1186,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -1109,6 +1226,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -1129,6 +1251,11 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
         }
       ]
     },
@@ -1137,36 +1264,79 @@
       "notes": "An SFTP upload that stops making progress is failed instead of holding its thread, its connection slot and the lock on its filename until the client chooses to leave, and an upload the client never closed is discarded rather than committed as a complete file; in the split profile, the SFTP container's healthcheck reports whether the SFTP server is still working rather than whether its port is bound (the combined profile's health check still only tests that the port accepts connections); an abandoned upload's name is freed in five minutes instead of fifteen. A web upload is aborted at sign-out, so an upload in flight cannot outlive the session that started it; a re-picked file is checked against what the server already holds before an interrupted upload continues with it, so an edited file is never spliced onto the previous attempt's chunks; and every upload is told about an earlier upload of its name that is still in progress. No database connection is held while a client sends an upload chunk, and a chunk's whole authorisation is re-established after its body rather than only before it. Every Retry-After is computed in one place -- never below a second, never above its window, and never negative. Where an upload refusal names the member holding the name, it does so only to a viewer shown to be a member. The SFTP per-address limit is split so a device fleet behind one address is not turned away by the flood guard, while the guard against unauthenticated floods is unchanged. A hung Redis breaker probe is replaced instead of a request probing in the foreground. Plain HTTP to a loopback host is treated as a secure context by the browsers' own rule, so a vault served at a .localhost name streams downloads instead of buffering them. Zero-knowledge vaults now write the version-2 key-wrap and content formats, which 0.30.0 already reads, so a rollback to 0.30.0 still opens everything written after the switch; because this is the first release to write them, the upgrade asks for a backup first. The upgrade matrix records each known vulnerability once, with its impact, what to do about it and a CVSS v4.0 rating, and `dockvault.py update` shows each release's known vulnerabilities by severity, says what a change fixes or brings back, and names a release with fewer when there is one. A rollback to 0.30.0 is clean: this release changes no database table, and the one column it writes is read by nothing.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
+        }
+      ]
     },
     "0.31.1": {
       "released": "2026-09-23",
       "notes": "Device sync and the command shown with a temporary credential now name the SFTP port clients can reach -- the port the host publishes (2322 by default) -- instead of the port the server binds inside its container, which on any standard install sent the desktop sync client to a port nothing answered on; the command also names this server rather than localhost. SFTP_PUBLIC_PORT and SFTP_PUBLIC_HOST say where clients connect when they arrive through NAT or port forwarding, and setup asks for both when SFTP is enabled. A deployment updated by pulling the image, whose compose files stay as they were, gets the right port too. A release candidate's image is now scanned with the release gate's policy before it reaches main. No schema change; a rollback to 0.31.0 is clean.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
+        }
+      ]
     },
     "0.32.0": {
       "released": "2026-09-24",
       "notes": "An upload now holds its file name while it runs, whichever way it arrives -- from the web page, through the API or over SFTP -- so a second upload of that name by another route or another member is refused instead of replacing the first when it lands, and another member's web upload shows in the listing as an upload in progress (Standard vaults; a zero-knowledge vault's names never reach the server). In the combined profile /health reads the SFTP server's heartbeat -- \"unresponsive\" once it stops, \"unreachable\" if it never started, both reported as degraded -- and the container's healthcheck fails when its SFTP half is down, so a hung SFTP server marks the container unhealthy five to six minutes after the stall at the defaults. The web healthcheck is now the image's own in every compose file, so it always matches the image that runs; a deployment updated by pulling the image, whose secure compose file still names the older check, keeps that check, which does not cover SFTP, until the file is updated. BRAND_ENABLE_SIGNUP=false now rules self-signup out for the whole deployment whatever the admin's switch says; the default, true, leaves the admin's switch in charge. A vault created without a size holds 10 GB instead of 5, the same as the largest single file a fresh install accepts, though the web page's Create vault dialog still filled in 5 GB, so a vault made there held 5 GB unless the number was changed (fixed in 0.32.1); existing vaults keep their size, and under the default 50 GB account budget a regular user fits five default-size vaults instead of ten. Settings accepts a session length of up to 30 days, as the server already did. `dockvault.py update` says a backup is required, and why, whenever it will ask for one. .env.example no longer sets MAX_FILE_SIZE_MB=512, which capped any install that copied it at 512 MB: if your .env still has that line, remove it to get the 10 GB default. LOG_FILE_PATH is retired; nothing wrote it, and an .env that still sets it keeps working. Help text, setting descriptions and the 0.29.0 and 0.30.0 notes now say what the code does. A release candidate's tests now include the Windows and Ubuntu fast lanes, and the setup test requires the previous release's image to turn healthy under the new compose files. No schema change; a rollback to 0.31.1 is clean, except that self-signup goes back to the admin's switch alone, and a name being uploaded from the web page at that moment stays locked for up to five minutes.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
+        }
+      ]
     },
     "0.32.1": {
       "released": "2026-09-25",
       "notes": "The web page's Create vault dialog now fills in 10 GB, the default its hint and the server already used. In 0.32.0 it still filled in 5 GB, so a vault made there held 5 GB unless the number was changed; such a vault keeps its size, and can be made larger in the vault's policies. A vault created through the API without a size was already 10 GB. No schema change; a rollback to 0.32.0 is clean.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
+        }
+      ]
     },
     "0.32.2": {
       "released": "2026-09-25",
       "notes": "Each vault card now shows how many members the vault has -- its owner and the people added to it directly -- and how many departments have access, instead of always \"1 members\". The counts show only to someone who may see the vault's member list (its owner, a manager or an admin); the vault list carries them as member_count and department_count, null for anyone else. A department counts as one: who is in it, and how many, stays visible to admins only. The note-link, file-link and upload-link forms now name a value over the link type's limit in their own words and units before sending anything, and the server's refusals read the same way, for example \"The size per file can be at most 100 MB for this link type.\" instead of the raw field name and byte count. Deleting a zero-knowledge vault with no label answers \"Vault deleted successfully\" instead of \"Vault None deleted successfully\". In the audit log only failures and refusals are red; an \"authorized\" row, which records that a download or a rendered preview was allowed, is blue, and a download's outcome is logged in a row of its own. No schema change; a rollback to 0.32.1 is clean.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "link-tokens-written-to-access-log",
+          "title": "Public link tokens were written to the access log",
+          "fixed_in": "0.32.3"
+        }
+      ]
+    },
+    "0.32.3": {
+      "released": "2026-09-26",
+      "notes": "Security fix: the token in a note link, public file link or upload link address was written in full to the web access log, so anyone who could read that log (docker logs, or the web log pull when an administrator has enabled it) could open or use those links. Every such token is now masked in every log the vault writes, as is any password, passcode, secret or token in a query string, and the web log pull also masks lines written before this release. Rate-limit keys in Redis now hold a hash of the link token instead of the token. A link type that allows exactly one view or download now says \"1 view or download\" when it refuses more. No schema change; a rollback to 0.32.2 is clean, but new log lines would hold the tokens again.",
       "support": {
         "eol": false,
         "secure": true
@@ -1472,6 +1642,13 @@
     {
       "from": "0.32.1",
       "to": "0.32.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.32.2",
+      "to": "0.32.3",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
