@@ -11,9 +11,10 @@ anyone else gets null, and the card shows no count rather than a made-up one.
 Department members are not folded into the member count. Who is in a department, and how many, is for
 admins only; a combined number would give both away to any owner or manager.
 
-Deleting a zero-knowledge vault with no label used to answer "Vault None deleted successfully" and
-record the vault name as the string "None": the real name is sealed in the browser, so the server has
-none to give.
+Deleting a zero-knowledge vault with no label used to answer "Vault None deleted successfully": the
+real name is sealed in the browser, so the server has none to give. (The audit row never held a name
+either way: every vault name is stripped from audit details before a row is stored, which
+test_audit_redaction.py pins.)
 """
 import os
 import subprocess
@@ -217,9 +218,6 @@ def test_deleting_an_unlabelled_zero_knowledge_vault_claims_no_name(admin, zk_en
     r = admin.delete_vault(vid)
     assert r.status_code == 200, r.text
     assert r.json()["message"] == "Vault deleted successfully"
-    recorded = _psql("SELECT coalesce(details->>'vault_name', '<null>') FROM audit_logs "
-                     f"WHERE action='vault_deleted' AND resource_id='{vid}'")
-    assert recorded == "<null>", f"the audit row should record no name, not {recorded!r}"
 
 
 def test_deleting_a_named_vault_still_names_it(admin):
