@@ -1150,7 +1150,15 @@
     },
     "0.32.0": {
       "released": "2026-09-24",
-      "notes": "An upload now holds its file name while it runs, whichever way it arrives -- from the web page, through the API or over SFTP -- so a second upload of that name by another route or another member is refused instead of replacing the first when it lands, and another member's web upload shows in the listing as an upload in progress (Standard vaults; a zero-knowledge vault's names never reach the server). In the combined profile /health reads the SFTP server's heartbeat -- \"unresponsive\" once it stops, \"unreachable\" if it never started, both reported as degraded -- and the container's healthcheck fails when its SFTP half is down, so a hung SFTP server marks the container unhealthy five to six minutes after the stall at the defaults. The web healthcheck is now the image's own in every compose file, so it always matches the image that runs; a deployment updated by pulling the image, whose secure compose file still names the older check, keeps that check, which does not cover SFTP, until the file is updated. BRAND_ENABLE_SIGNUP=false now rules self-signup out for the whole deployment whatever the admin's switch says; the default, true, leaves the admin's switch in charge. A vault created without a size holds 10 GB instead of 5, the same as the largest single file a fresh install accepts; existing vaults keep their size, and under the default 50 GB account budget a regular user fits five default-size vaults instead of ten. Settings accepts a session length of up to 30 days, as the server already did. `dockvault.py update` says a backup is required, and why, whenever it will ask for one. .env.example no longer sets MAX_FILE_SIZE_MB=512, which capped any install that copied it at 512 MB: if your .env still has that line, remove it to get the 10 GB default. LOG_FILE_PATH is retired; nothing wrote it, and an .env that still sets it keeps working. Help text, setting descriptions and the 0.29.0 and 0.30.0 notes now say what the code does. A release candidate's tests now include the Windows and Ubuntu fast lanes, and the setup test requires the previous release's image to turn healthy under the new compose files. No schema change; a rollback to 0.31.1 is clean, except that self-signup goes back to the admin's switch alone, and a name being uploaded from the web page at that moment stays locked for up to five minutes.",
+      "notes": "An upload now holds its file name while it runs, whichever way it arrives -- from the web page, through the API or over SFTP -- so a second upload of that name by another route or another member is refused instead of replacing the first when it lands, and another member's web upload shows in the listing as an upload in progress (Standard vaults; a zero-knowledge vault's names never reach the server). In the combined profile /health reads the SFTP server's heartbeat -- \"unresponsive\" once it stops, \"unreachable\" if it never started, both reported as degraded -- and the container's healthcheck fails when its SFTP half is down, so a hung SFTP server marks the container unhealthy five to six minutes after the stall at the defaults. The web healthcheck is now the image's own in every compose file, so it always matches the image that runs; a deployment updated by pulling the image, whose secure compose file still names the older check, keeps that check, which does not cover SFTP, until the file is updated. BRAND_ENABLE_SIGNUP=false now rules self-signup out for the whole deployment whatever the admin's switch says; the default, true, leaves the admin's switch in charge. A vault created without a size holds 10 GB instead of 5, the same as the largest single file a fresh install accepts, though the web page's Create vault dialog still filled in 5 GB, so a vault made there held 5 GB unless the number was changed (fixed in 0.32.1); existing vaults keep their size, and under the default 50 GB account budget a regular user fits five default-size vaults instead of ten. Settings accepts a session length of up to 30 days, as the server already did. `dockvault.py update` says a backup is required, and why, whenever it will ask for one. .env.example no longer sets MAX_FILE_SIZE_MB=512, which capped any install that copied it at 512 MB: if your .env still has that line, remove it to get the 10 GB default. LOG_FILE_PATH is retired; nothing wrote it, and an .env that still sets it keeps working. Help text, setting descriptions and the 0.29.0 and 0.30.0 notes now say what the code does. A release candidate's tests now include the Windows and Ubuntu fast lanes, and the setup test requires the previous release's image to turn healthy under the new compose files. No schema change; a rollback to 0.31.1 is clean, except that self-signup goes back to the admin's switch alone, and a name being uploaded from the web page at that moment stays locked for up to five minutes.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
+    "0.32.1": {
+      "released": "2026-09-25",
+      "notes": "The web page's Create vault dialog now fills in 10 GB, the default its hint and the server already used. In 0.32.0 it still filled in 5 GB, so a vault made there held 5 GB unless the number was changed; such a vault keeps its size, and can be made larger in the vault's policies. A vault created through the API without a size was already 10 GB. No schema change; a rollback to 0.32.0 is clean.",
       "support": {
         "eol": false,
         "secure": true
@@ -1442,6 +1450,13 @@
     {
       "from": "0.31.1",
       "to": "0.32.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.32.0",
+      "to": "0.32.1",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
