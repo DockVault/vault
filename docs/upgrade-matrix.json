@@ -101,6 +101,42 @@
       "id": null,
       "fixed_in": "0.32.3",
       "published": "2026-09-26"
+    },
+    "sign-in-throttle-address-and-name-share-buckets": {
+      "title": "A username could use up an address's sign-in attempts",
+      "description": "Sign-in attempts are limited per name and per client address, and the two limits were kept under the same kind of key: one for the text typed as the username and one for the address. A sign-in with an address typed as the username was therefore counted against that address. This applies to web and SFTP password sign-in on a default install; the database fallback used while Redis is down already kept them apart.",
+      "impact": "Anyone, without an account, who knew a client's address could use up half of that address's sign-in attempts within the limit window, slowing down or blocking sign-in for everyone behind that address. No account or data was exposed.",
+      "remediation": "Upgrade to 0.32.5. The two limits are kept apart.",
+      "mitigation": "None through settings. Blocking repeated failed sign-ins at a proxy in front of the vault limits it.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.5",
+      "published": "2026-09-26"
+    },
+    "client-address-forgeable-behind-proxy": {
+      "title": "The client address could be forged behind some proxies",
+      "description": "Three ways, none on a default install. With TRUSTED_PROXIES set and a proxy that adds its own X-Forwarded-For header line instead of appending to the client's, the vault read the first line, which the client wrote. With TRUST_ALL_PROXIES=true, it took the left-most address, which is whatever the client wrote unless the proxy replaces the header. And the web server's own forwarded-header handling was on: a connection from 127.0.0.1 (a proxy in the vault's own network namespace, with host networking, or an install outside Docker) that passed the client's header through set the address from it without checking it was an address.",
+      "impact": "A client could make the vault record any address in the audit log, sessions and security alerts, spread its sign-in attempts over invented addresses to avoid the per-address limit (the per-account limit still applied), or use up another address's attempts. No data was exposed.",
+      "remediation": "Upgrade to 0.32.5. Before upgrading, check your proxy settings. A proxy that connects from 127.0.0.1 is no longer trusted on its own: set TRUSTED_PROXIES=127.0.0.1, or every client appears as 127.0.0.1 and all share one sign-in limit. With TRUST_ALL_PROXIES=true the vault now takes the address the nearest proxy saw, so behind a chain of proxies list each proxy in TRUSTED_PROXIES instead. uvicorn's own FORWARDED_ALLOW_IPS is no longer used; the vault applies a trusted proxy's X-Forwarded-Proto itself.",
+      "mitigation": "Until you can upgrade, make the proxy replace the X-Forwarded-For header a client sends rather than keep it.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:L/VA:L/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.5",
+      "published": "2026-09-26"
+    },
+    "live-monitor-sent-names-to-every-admin": {
+      "title": "The live activity feed sent file and vault names to every administrator",
+      "description": "Administrators are not members of every vault, and file names are encrypted at rest, as are Standard vault names from 0.14.0. The Live Monitor feed nevertheless carried the file name of every upload and download in a Standard vault, and from 0.14.0 the vault's name, to every signed-in administrator, including vaults they are not a member of and vaults with a vault password.",
+      "impact": "An administrator could learn the names of files, and from 0.14.0 the names of vaults, that they had no access to. File contents were not exposed, and zero-knowledge vaults were not affected.",
+      "remediation": "Upgrade to 0.32.5. Another account's activity now reaches a watching administrator with only who, from where, when, the kind of event and the vault's id; a person's own activity is unchanged.",
+      "mitigation": "None through settings. The feed reaches signed-in administrators only.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:H/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.5",
+      "published": "2026-09-26"
     }
   },
   "versions": {
@@ -126,6 +162,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -151,6 +202,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -176,6 +242,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -201,6 +282,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -226,6 +322,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -251,6 +362,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -276,6 +402,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -301,6 +442,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -326,6 +482,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -351,6 +522,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -376,6 +562,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -401,6 +602,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -426,6 +642,21 @@
           "advisory": "sftp-stalled-upload-holds-connection",
           "title": "A stalled SFTP upload held its connection indefinitely",
           "fixed_in": "0.31.0"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -461,6 +692,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -496,6 +742,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -531,6 +792,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -566,6 +842,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -601,6 +892,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -636,6 +942,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -671,6 +992,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -706,6 +1042,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -741,6 +1092,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -776,6 +1142,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -811,6 +1192,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -846,6 +1242,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -881,6 +1292,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -916,6 +1342,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -951,6 +1392,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -986,6 +1442,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1021,6 +1492,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1056,6 +1542,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1091,6 +1592,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1141,6 +1657,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1191,6 +1722,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1231,6 +1777,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1256,6 +1817,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1271,6 +1847,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1286,6 +1877,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1301,6 +1907,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1316,6 +1937,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1331,6 +1967,21 @@
           "advisory": "link-tokens-written-to-access-log",
           "title": "Public link tokens were written to the access log",
           "fixed_in": "0.32.3"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
         }
       ]
     },
@@ -1339,12 +1990,54 @@
       "notes": "Security fix: the token in a note link, public file link or upload link address was written in full to the web access log, so anyone who could read that log (docker logs, or the web log pull when an administrator has enabled it) could open or use those links. Every such token is now masked in every log the vault writes, as is any password, passcode, secret or token in a query string, and the web log pull also masks lines written before this release. Rate-limit keys in Redis now hold a hash of the link token instead of the token. A link type that allows exactly one view or download now says \"1 view or download\" when it refuses more. No schema change; a rollback to 0.32.2 is clean, but new log lines would hold the tokens again.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
+        }
+      ]
     },
     "0.32.4": {
       "released": "2026-09-26",
       "notes": "The web app fits a phone screen. The sidebar opens from a menu button in the top bar and closes when you choose a section or tap outside it; before, a phone could not reach most sections. Section headers, the file table, an opened user row, long dialogs, the notifications panel and the dashboard now fit the screen. A PDF preview in a browser with no inline PDF viewer, such as Chrome on Android, says to use Download instead of showing an empty frame. On every screen size, toasts have their spacing back, and a wrong password on a public link page says \"password\" or \"PIN\" instead of \"code\". No schema change; a rollback to 0.32.3 is clean.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets",
+          "title": "A username could use up an address's sign-in attempts",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy",
+          "title": "The client address could be forged behind some proxies",
+          "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin",
+          "title": "The live activity feed sent file and vault names to every administrator",
+          "fixed_in": "0.32.5"
+        }
+      ]
+    },
+    "0.32.5": {
+      "released": "2026-09-26",
+      "notes": "Security fixes, three advisories. Sign-in attempts typed with a client's address as the username no longer count against that address. The client address is read from the whole forwarding chain, and only proxies listed in TRUSTED_PROXIES are believed. Another account's activity reaches an administrator watching the Live Monitor without file, folder or vault names. Before upgrading behind a proxy: a proxy that connects from 127.0.0.1 must be listed (TRUSTED_PROXIES=127.0.0.1), or every client appears as 127.0.0.1 and shares one sign-in limit; with TRUST_ALL_PROXIES=true the vault takes the address the nearest proxy saw, so list each proxy of a chain in TRUSTED_PROXIES instead; uvicorn's FORWARDED_ALLOW_IPS is no longer used. No schema change; a rollback to 0.32.4 is clean.",
       "support": {
         "eol": false,
         "secure": true
@@ -1664,6 +2357,13 @@
     {
       "from": "0.32.3",
       "to": "0.32.4",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.32.4",
+      "to": "0.32.5",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
