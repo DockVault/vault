@@ -1908,7 +1908,7 @@ function logout() {
     state.vaultPassword = null;
 
     // Drop the previous user's per-user CONTENT — in-memory AND its rendered DOM — so the NEXT user on
-    // this shared tab can't briefly see it (finding F-R015-004). showScreen('login-screen') only toggles
+    // this shared tab can't briefly see it. showScreen('login-screen') only toggles
     // the .screen wrappers, so the dashboard's inner DOM (vault list, open file browser, dashboard tiles)
     // and the body-level upload tray survive the screen swap unless emptied here. Server authz is intact
     // (any click 403s); this closes the visual residue.
@@ -14881,7 +14881,7 @@ async function openFilePreview(fileId, fileName, mime) {
         const isVideo = type.startsWith('video/') || ['mp4', 'webm', 'mov'].includes(ext);
         const isAudio = type.startsWith('audio/') || ['mp3', 'wav', 'flac'].includes(ext);
         const isText = type.startsWith('text/') || ['txt', 'md', 'json', 'csv', 'log', 'xml', 'yml', 'yaml', 'js', 'css', 'html', 'py', 'sh', 'ini'].includes(ext);
-        // For a PDF, re-mint the blob under a FIXED application/pdf type (finding F-R015-001): an
+        // For a PDF, re-mint the blob under a FIXED application/pdf type: an
         // untrusted stored MIME can otherwise coerce the <iframe> into a scriptable HTML/XHTML/SVG
         // document. Forcing application/pdf lets the browser only route it to its isolated PDF viewer.
         _previewUrl = URL.createObjectURL(isPdf ? new Blob([blob], { type: 'application/pdf' }) : blob);
@@ -14922,7 +14922,7 @@ async function openFilePreview(fileId, fileName, mime) {
             el.src = _previewUrl;
             if (isPdf) {
                 el.className = 'preview-frame'; el.title = fileName;
-                // Sandbox the PDF frame (finding F-R015-001). A blob: URL is origin-scoped, so an
+                // Sandbox the PDF frame. A blob: URL is origin-scoped, so an
                 // opaque-origin sandbox would break it; allow-same-origin + allow-scripts keep the
                 // browser's own PDF viewer working while still dropping forms / popups / top-navigation.
                 // The fixed application/pdf blob type above is what actually closes the script-execution
@@ -15764,7 +15764,7 @@ const uploadManager = {
     // One controller per run in flight; reset() aborts them all. See _send.
     _aborts: new Set(),
 
-    // Logout scrub (finding F-R015-004): drop the tray's items + its DOM WITHOUT cancelling — cancel()
+    // Logout scrub: drop the tray's items + its DOM WITHOUT cancelling — cancel()
     // fires a server DELETE per session, and on logout we only want to clear this browser's view so the
     // next user on a shared tab can't see the prior user's upload tray. render() with an empty Map
     // takes the "nothing in flight" branch; then remove the body-level tray element outright.

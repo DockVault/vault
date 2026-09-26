@@ -2592,10 +2592,10 @@ def _is_budget_exempt(user: User) -> bool:
 
 
 # Default per-account storage budget (GB) when the deployment has not saved one. A fresh install
-# ships with a 50 GB per-account ceiling rather than unlimited (finding F-R015-003), so no single
+# ships with a 50 GB per-account ceiling rather than unlimited, so no single
 # account can consume unbounded storage out of the box. An admin raises it, or sets 0 = unlimited.
 _DEFAULT_ACCOUNT_QUOTA_GB = 50
-# Default per-account cap on OWNED vaults when the deployment has not saved one (finding F-R015-003).
+# Default per-account cap on OWNED vaults when the deployment has not saved one.
 # 0 = unlimited. Full admins are exempt.
 _DEFAULT_MAX_VAULTS_PER_USER = 50
 
@@ -13997,7 +13997,7 @@ async def create_vault(
     from app.core.temp_scope import require_create_vault_type
     require_create_vault_type(current_user, vault_type)
 
-    # Per-user vault-count cap (finding F-R015-003): a single account cannot create unbounded vaults.
+    # Per-user vault-count cap: a single account cannot create unbounded vaults.
     _enforce_vault_count(db, current_user)
 
     # Per-vault size: DEFAULT_VAULT_SIZE_GB when the caller does not say. Reject a size out of range (a sub-nanogigabyte value
@@ -14884,7 +14884,7 @@ async def update_vault_info(
         }
 
     except (VaultNotFoundError, ResourceNotFoundError) as e:
-        # A missing vault is a clean 404 (finding F-R001-001). VaultNotFoundError subclasses
+        # A missing vault is a clean 404. VaultNotFoundError subclasses
         # FileServiceError (not ResourceNotFoundError), so it must be named here or the `except
         # Exception` below re-wraps it as a 500.
         raise HTTPException(
@@ -14970,7 +14970,7 @@ async def change_vault_password(
             detail=str(e)
         )
     except (VaultNotFoundError, ResourceNotFoundError) as e:
-        # A missing vault is a clean 404 (finding F-R001-001); VaultNotFoundError subclasses
+        # A missing vault is a clean 404; VaultNotFoundError subclasses
         # FileServiceError, not ResourceNotFoundError, so it must be named here.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -15106,7 +15106,7 @@ async def update_vault_settings(
                 "unlock_remember_minutes": vault.unlock_remember_minutes}
         
     except (ResourceNotFoundError, VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
-        # A missing vault/folder/file is a clean 404, not a 500 (finding F-R001-001): the catch-all
+        # A missing vault/folder/file is a clean 404, not a 500: the catch-all
         # below would otherwise swallow VaultNotFoundError into a generic 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -16200,7 +16200,7 @@ async def list_vault_files(
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VaultNotFoundError as e:
-        # A missing vault is a clean 404 (finding F-R001-001), not a 500 — the per-route `except
+        # A missing vault is a clean 404, not a 500 — the per-route `except
         # Exception` below would otherwise shadow the global FileServiceError->404 handler.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -16939,7 +16939,7 @@ async def upload_file(
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except (VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
-        # A missing vault/folder is a clean 404, not a 500 (finding F-R001-001).
+        # A missing vault/folder is a clean 404, not a 500.
         db.rollback()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault not found")
     except Exception as e:
@@ -17482,7 +17482,7 @@ async def init_chunked_upload(
     vault_service = VaultService(db, permission_service)
     vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
 
-    # Require WRITE to OPEN an upload session (finding F-R015-002). get_vault only proves READ, so
+    # Require WRITE to OPEN an upload session. get_vault only proves READ, so
     # without this a read-only member could stream chunks to staging (only /complete refused them). A
     # whole-vault SHARE does not grant upload (allow_share defaults False). Gating session creation is
     # enough — a chunk PUT needs a session that only this endpoint mints.
@@ -19241,7 +19241,7 @@ async def download_file(
             detail=str(e),
         )
     except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
-        # A missing vault / folder / file is a clean 404 (finding F-R001-001). VaultNotFoundError and
+        # A missing vault / folder / file is a clean 404. VaultNotFoundError and
         # FolderNotFoundError are FileServiceError SIBLINGS of FileNotFoundError, so they must be named
         # here or the `except Exception` below re-wraps them as a 500.
         if burned_share_claim_ids:
@@ -19396,7 +19396,7 @@ async def delete_file(
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VaultNotFoundError as e:
-        # A missing vault is a clean 404 (finding F-R001-001), not a 500.
+        # A missing vault is a clean 404, not a 500.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         db.rollback()
@@ -19485,7 +19485,7 @@ async def get_file_info(
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError, ResourceNotFoundError):
-        # A missing vault/folder/file is a clean 404, not a 500 (finding F-R001-001). The catch-all
+        # A missing vault/folder/file is a clean 404, not a 500. The catch-all
         # below would otherwise swallow VaultNotFoundError into a generic 500 before it reached the
         # global handler that maps it — same fix as the other file-plane endpoints.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
@@ -19715,7 +19715,7 @@ async def rename_file(
             detail=str(e)
         )
     except (FileNotFoundError, VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
-        # A missing file/vault/folder is a clean 404, not a 500 (finding F-R001-001): the catch-all
+        # A missing file/vault/folder is a clean 404, not a 500: the catch-all
         # below would otherwise swallow VaultNotFoundError/FolderNotFoundError into a generic 500.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -20145,7 +20145,7 @@ async def create_folder(
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except (VaultNotFoundError, FolderNotFoundError, ResourceNotFoundError):
-        # A missing vault/parent-folder is a clean 404, not a 500 (finding F-R001-001).
+        # A missing vault/parent-folder is a clean 404, not a 500.
         db.rollback()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
@@ -20236,7 +20236,7 @@ async def delete_folder(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError, ResourceNotFoundError):
-        # A missing vault/folder is a clean 404, not a 500 (finding F-R001-001).
+        # A missing vault/folder is a clean 404, not a 500.
         db.rollback()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
@@ -22465,7 +22465,7 @@ if __name__ == "__main__":
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
-        # Do not advertise the server software (finding F-R015-008). uvicorn adds its `Server:` header
+        # Do not advertise the server software. uvicorn adds its `Server:` header
         # at the transport layer, below the app, so a response-header middleware cannot strip it — it
         # has to be turned off here in the server config.
         server_header=False,

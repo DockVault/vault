@@ -794,7 +794,7 @@ class AuthService:
             _pol_raw = {}
         _tp_policy = _tpp.effective_policy(_pol_raw)
 
-        # Per-user cap on ACTIVE temporary credentials (finding F-R015-006): a single account cannot
+        # Per-user cap on ACTIVE temporary credentials: a single account cannot
         # hold unbounded temp creds. Count only credentials that are BOTH is_active AND not yet expired
         # (expiry is lazy — is_active flips only on the next auth attempt or the cleanup sweep — so
         # counting is_active alone would over-count). expires_at is naive UTC, so compare with a naive

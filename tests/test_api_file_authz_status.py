@@ -63,7 +63,7 @@ def test_non_member_read_ops_are_403_not_500(admin, temp_user, temp_user_client)
 
 
 def test_readonly_member_cannot_open_chunked_upload(admin, temp_user, temp_user_client):
-    # A read-only member is refused at OPEN of a chunked upload session (finding F-R015-002): the write
+    # A read-only member is refused at OPEN of a chunked upload session: the write
     # gate now runs when the session is created, so they can't stream chunks to staging at all. (The
     # older behaviour let them init + chunk and only refused at /complete.)
     v = admin.create_vault()

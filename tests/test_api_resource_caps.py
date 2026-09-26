@@ -1,4 +1,4 @@
-"""Per-user resource caps (findings F-R015-003 + F-R015-006): a per-user vault-count cap, a 50 GB
+"""Per-user resource caps: a per-user vault-count cap, a 50 GB
 default per-account storage budget, and a cap on simultaneously-active temporary credentials. Regular
 users are bounded; full admins are exempt."""
 import json
@@ -100,7 +100,7 @@ def test_vault_count_cap_enforced_for_non_admin(admin):
 
 def test_default_account_quota_is_50gb_for_non_admin(admin, caps_defaults_absent):
     # default_user_quota is ABSENT, so the 50 GB budget is the server's FALLBACK default (the actual
-    # F-R015-003 fix: `_settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)`), not a
+    # The fix: `_settings_blob(db).get("default_user_quota", _DEFAULT_ACCOUNT_QUOTA_GB)`), not a
     # value this test set. A non-admin's vaults are then bounded to that 50 GB aggregate.
     u, c = _user_client(admin)
     try:

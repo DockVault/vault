@@ -1,7 +1,7 @@
-"""Security hardening batch: a missing vault answers 404 not 500 (F-R001-001); opening a chunked
-upload session requires WRITE (F-R015-002); the account.second_factor OTP requirement can't be
+"""Security hardening batch: a missing vault answers 404 not 500; opening a chunked
+upload session requires WRITE; the account.second_factor OTP requirement can't be
 disabled (R018-INFO-1); an admin's login-attempt override is bounded (R018-INFO-2); the response
-carries no Server header (F-R015-008)."""
+carries no Server header."""
 import uuid
 
 import pytest
@@ -21,7 +21,7 @@ def test_missing_vault_is_404_not_500(admin):
     assert admin.put(f"/vaults/{fake}/password",
                      json={"password": "New-Strong-Pass-1234"}).status_code == 404
     # get-file-info + rename had a local `except Exception` catch-all that swallowed VaultNotFoundError
-    # into a 500 before it reached the global 404 mapper (F-R001-001 follow-up); both must 404 too.
+    # into a 500 before it reached the global 404 mapper (a follow-up); both must 404 too.
     assert admin.get(f"/vaults/{fake}/files/{uuid.uuid4()}/info").status_code == 404
     assert admin.put(f"/vaults/{fake}/files/{uuid.uuid4()}/rename",
                      json={"new_name": "x.txt"}).status_code == 404
