@@ -1341,6 +1341,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.32.4": {
+      "released": "2026-09-26",
+      "notes": "The web app fits a phone screen. The sidebar opens from a menu button in the top bar and closes when you choose a section or tap outside it; before, a phone could not reach most sections. Section headers, the file table, an opened user row, long dialogs, the notifications panel and the dashboard now fit the screen. A PDF preview in a browser with no inline PDF viewer, such as Chrome on Android, says to use Download instead of showing an empty frame. On every screen size, toasts have their spacing back, and a wrong password on a public link page says \"password\" or \"PIN\" instead of \"code\". No schema change; a rollback to 0.32.3 is clean.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -1649,6 +1657,13 @@
     {
       "from": "0.32.2",
       "to": "0.32.3",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.32.3",
+      "to": "0.32.4",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
