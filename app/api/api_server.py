@@ -2385,6 +2385,65 @@ async def search_audit_log(
     return [_audit_row_to_dict(r) for r in rows]
 
 
+@app.get("/activity/catalog")
+def activity_catalog(current_user: User = Depends(require_interactive_admin)):
+    """What the Events filters offer: the categories and their events, the channels and the statuses."""
+    from app.core import audit_catalog
+    from app.services import activity_events as ev
+    return {
+        "categories": [
+            {"key": key, "label": label,
+             "actions": [{"name": a.name, "label": a.label} for a in audit_catalog.ACTIONS if a.category == key]}
+            for key, label in audit_catalog.CATEGORIES
+        ] + [{"key": ev.LEGACY_CATEGORY, "label": audit_catalog.LEGACY_LABEL, "actions": []}],
+        "channels": list(ev.CHANNEL_CHOICES),
+        "statuses": list(ev.STATUS_GROUPS),
+    }
+
+
+@app.get("/activity/events")
+def activity_events(
+    category: List[str] = Query([]),
+    channel: List[str] = Query([]),
+    status: List[str] = Query([]),
+    user: Optional[str] = Query(None, max_length=128),
+    ip: Optional[str] = Query(None, max_length=64),
+    q: Optional[str] = Query(None, max_length=128),
+    temp_credential_id: Optional[str] = Query(None, max_length=64),
+    from_date: Optional[str] = Query(None, max_length=64),
+    to_date: Optional[str] = Query(None, max_length=64),
+    cursor: Optional[str] = Query(None, max_length=200),
+    limit: int = 50,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """The Activity page's Events tab: the audit log filtered by category, channel, status, user, IP or
+    CIDR, text, temporary credential and time, newest first, a page at a time (admin only).
+
+    A plain def, so FastAPI runs it in its thread pool: a count and a page over a large audit table
+    must not hold the event loop. The first page also returns how many rows match."""
+    from app.core import audit_range
+    from app.core.models import AuditLog
+    from app.services import activity_events as ev
+    limit = max(1, min(limit, ev.MAX_PAGE))
+    base = ev.build_events_query(
+        db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
+        username=user, ip=ip, text=q, temp_credential_id=temp_credential_id,
+        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+    after = ev.decode_cursor(cursor)
+    total = base.order_by(None).count() if after is None else None
+    rows = (ev.after_cursor(base, AuditLog, after)
+            .order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+            .limit(limit + 1).all())
+    more = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "events": [ev.row_view(r) for r in rows],
+        "next_cursor": ev.encode_cursor(rows[-1].timestamp, rows[-1].id) if more and rows else None,
+        "total": total,
+    }
+
+
 def _csv_formula_safe(value):
     """Neutralise spreadsheet formula injection. A CSV cell that begins with =, +, -, @ (or a
     leading tab / carriage return) is interpreted as a FORMULA by Excel / Google Sheets. Audit
