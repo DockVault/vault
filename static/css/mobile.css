@@ -45,6 +45,10 @@
     .sidebar.collapsed .sidebar-text { opacity: 1; width: auto; overflow: visible; }
     .sidebar.collapsed .nav-group-label { display: block; }
 
+    /* The top bar is a stacking context of its own (sticky, z-index 50), so its notifications panel
+       and profile menu would open under the drawer. Lift it above the drawer; dialogs (1000) stay on top. */
+    .navbar { z-index: 970; }
+
     .sidebar-backdrop {
         position: fixed; top: var(--navbar-height); right: 0; bottom: 0; left: 0;
         background: rgba(15, 23, 42, .45); z-index: 955;

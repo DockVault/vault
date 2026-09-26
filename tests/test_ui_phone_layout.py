@@ -100,23 +100,40 @@ def test_the_menu_button_opens_a_drawer_that_closes_on_every_exit(page: Page, ph
     _wait_drawer_open(page)
     expect(toggle).to_have_attribute("aria-expanded", "true")
     expect(page.locator("#sidebar-backdrop")).to_be_visible()
+    # Focus moves into the drawer, and the page it covers cannot take focus.
+    expect(page.locator("#sidebar .sidebar-item.active")).to_be_focused()
+    assert page.evaluate("() => document.querySelector('.main-content').inert") is True
 
     page.click('.sidebar-item[data-section="vaults"]')          # choosing a section closes it
     expect(page.locator("#vaults-section")).to_be_visible()
     expect(toggle).to_have_attribute("aria-expanded", "false")
     expect(page.locator("#sidebar-backdrop")).to_be_hidden()
+    assert page.evaluate("() => document.querySelector('.main-content').inert") is False
 
     toggle.click()
+    _wait_drawer_open(page)
     page.mouse.click(370, 500)                                   # a tap outside it closes it
     expect(toggle).to_have_attribute("aria-expanded", "false")
 
     toggle.click()
-    page.keyboard.press("Escape")                                # so does Escape
+    _wait_drawer_open(page)
+    page.keyboard.press("Escape")                                # so does Escape, handing focus back
     expect(toggle).to_have_attribute("aria-expanded", "false")
+    expect(toggle).to_be_focused()
 
     page.set_viewport_size({"width": 1280, "height": 800})       # a wide screen has the rail, no button
     expect(toggle).to_be_hidden()
     expect(page.locator('.sidebar-item[data-section="vaults"]')).to_be_visible()
+
+
+@pytest.mark.ui
+def test_the_drawer_does_not_slide_when_motion_is_reduced(page: Page, phone_admin):
+    page.emulate_media(reduced_motion="reduce")
+    _login(page, phone_admin, "v2")
+    page.click("#mobile-nav-toggle")
+    durations = page.evaluate("() => getComputedStyle(document.getElementById('sidebar')).transitionDuration")
+    # Both skins already cap every transition at .001ms under reduced motion; the drawer must not undo it.
+    assert all(float(d.strip().rstrip("s") or 0) <= 0.001 for d in durations.split(",")), durations
 
 
 @pytest.mark.ui
@@ -127,7 +144,7 @@ def test_no_section_is_wider_than_the_phone(page: Page, phone_admin, skin):
     for section in ("dashboard", "vaults", "shared", "notes", "temp-creds", "users", "groups",
                     "monitor", "settings"):
         _go(page, section)
-        page.wait_for_timeout(300)
+        page.wait_for_load_state("networkidle")                  # measure the section as rendered
         doc_w = page.evaluate("() => document.documentElement.scrollWidth")
         if doc_w > PHONE["width"] + 1:
             wide[section] = doc_w
@@ -178,6 +195,26 @@ def test_the_notifications_panel_stays_on_the_phone_screen(page: Page, phone_adm
     assert box["x"] >= 0 and box["x"] + box["width"] <= PHONE["width"], f"panel off screen: {box}"
 
 
+
+@pytest.mark.ui
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+def test_a_top_bar_menu_opened_over_the_drawer_is_usable(page: Page, phone_admin, skin):
+    # The top bar is its own stacking layer; its menus used to open under the drawer and backdrop.
+    _login(page, phone_admin, skin)
+    page.click("#mobile-nav-toggle")
+    _wait_drawer_open(page)
+    page.click("#notif-btn")
+    expect(page.locator("#mobile-nav-toggle")).to_have_attribute("aria-expanded", "false")
+    panel = page.locator("#notif-dropdown")
+    expect(panel).to_be_visible()
+    page.wait_for_timeout(300)                                   # its open transition
+    on_top = page.evaluate("""() => {
+        const p = document.getElementById('notif-dropdown'), r = p.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(20, r.height / 2));
+        return !!hit && p.contains(hit);
+    }""")
+    assert on_top, "the notifications panel is covered by something else"
+
 def _open_synthetic_pdf(page: Page, pdf_viewer: bool):
     """Preview a listing entry that names a PDF; no real file exists, so any /download is observable."""
     page.evaluate(
@@ -210,13 +247,13 @@ def test_a_pdf_preview_without_a_pdf_viewer_points_at_download(page: Page, phone
         _go(page, "vaults")
         page.click(f'.open-vault-btn[data-vault-id="{v["id"]}"]')
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
-        _open_synthetic_pdf(page, pdf_viewer)
         body = page.locator("#file-preview-body")
-        page.wait_for_timeout(600)
         if pdf_viewer:
-            assert downloads, "with a PDF viewer the preview should fetch the file"
+            with page.expect_request(lambda r: "/download" in r.url, timeout=8000):
+                _open_synthetic_pdf(page, pdf_viewer)
             expect(body).not_to_contain_text("can't show PDFs")
         else:
+            _open_synthetic_pdf(page, pdf_viewer)
             expect(body).to_contain_text("This browser can't show PDFs inside the page.")
             assert page.locator("#file-preview-body iframe").count() == 0
             assert not downloads, f"no file should be fetched for a PDF the page cannot show: {downloads}"

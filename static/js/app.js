@@ -21484,11 +21484,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const mobileNavToggle = document.getElementById('mobile-nav-toggle');
     const sidebarBackdrop = document.getElementById('sidebar-backdrop');
     const mobileNavQuery = window.matchMedia('(max-width: 860px)');
+    const mainContent = document.querySelector('.main-content');
     const setMobileNav = (open) => {
         if (!sidebar) return;
         const on = !!open && mobileNavQuery.matches;
         sidebar.classList.toggle('mobile-open', on);
         if (sidebarBackdrop) sidebarBackdrop.hidden = !on;
+        // The page under an open drawer is out of reach, so keyboard focus cannot land on a control
+        // the drawer covers.
+        if (mainContent) mainContent.inert = on;
         if (mobileNavToggle) {
             mobileNavToggle.setAttribute('aria-expanded', String(on));
             mobileNavToggle.setAttribute('aria-label', on ? 'Close menu' : 'Open menu');
@@ -21508,6 +21512,11 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
         mobileNavQuery.addEventListener('change', () => setMobileNav(false));
+        // Opening the notifications or the profile menu leaves the drawer.
+        ['notif-btn', 'profile-btn'].forEach((id) => {
+            const btn = document.getElementById(id);
+            if (btn) btn.addEventListener('click', () => setMobileNav(false));
+        });
     }
 
     // Sidebar item navigation
