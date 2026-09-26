@@ -95,3 +95,123 @@ def test_a_ranged_download_is_recorded_without_the_file_name(admin, temp_vault):
     assert ev["status"] == "success" and ev["label"] == "Part of a file downloaded"
     assert ev["details"]["range_start"] == 0 and ev["details"]["range_end"] == 99
     assert name not in str(ev["details"])
+
+
+def test_an_export_holds_the_filtered_rows_and_is_itself_recorded(admin, anon):
+    import csv
+    import io
+    import json
+    prefix = unique("exporter")
+    for i in range(3):
+        _failed_sign_in(anon, f"{prefix}-{i}")
+    time.sleep(0.3)
+    r = admin.get("/activity/export", params={"user": prefix})
+    assert r.status_code == 200, r.text
+    assert r.headers["X-Export-Total"] == "3" and r.headers["X-Export-Rows"] == "3"
+    assert r.headers["Content-Disposition"].startswith("attachment; filename=activity-")
+    table = list(csv.reader(io.StringIO(r.text)))
+    assert table[0][:3] == ["Time (UTC)", "Event", "Action"] and len(table) == 4
+    assert sorted(row[5] for row in table[1:]) == [f"{prefix}-{i}" for i in range(3)]
+    assert all(row[0].endswith("+00:00") for row in table[1:])
+    nd = admin.get("/activity/export", params={"user": prefix, "format": "ndjson"})
+    lines = [json.loads(line) for line in nd.text.splitlines()]
+    assert len(lines) == 3 and {e["label"] for e in lines} == {"Sign-in failed"}
+    time.sleep(0.3)
+    recorded = _events(admin, q=prefix, category="administration")["events"]
+    exports = [e for e in recorded if e["action"] == "audit_exported"]
+    assert [e["details"]["format"] for e in exports] == ["ndjson", "csv"]
+    assert exports[1]["details"]["filters"] == {"user": prefix} and exports[1]["details"]["rows"] == 3
+
+
+def test_an_export_refuses_an_unknown_format_and_a_non_admin(admin, temp_user_client):
+    assert admin.get("/activity/export", params={"format": "xlsx"}).status_code == 422
+    assert temp_user_client.get("/activity/export").status_code == 403
+
+
+def _upload(client, vid, name, headers=None):
+    up = client.post(f"/vaults/{vid}/files", files=[("files", (name, b"x" * 200, "text/plain"))],
+                     headers=headers or {})
+    assert up.status_code in (200, 201), up.text
+    listing = client.get(f"/vaults/{vid}/files", headers=headers or {}).json()
+    items = listing if isinstance(listing, list) else next(v for v in listing.values() if isinstance(v, list))
+    return next(i["id"] for i in items if i.get("name") == name)
+
+
+def _ranged_event(admin, client, vid, fid, headers=None):
+    r = client.get(f"/vaults/{vid}/files/{fid}/download", headers={"Range": "bytes=0-9", **(headers or {})})
+    assert r.status_code == 206, r.status_code
+    time.sleep(0.5)
+    rows = [e for e in _events(admin, q=fid, category="files")["events"] if e["action"] == "file_download_range"]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def test_names_are_shown_for_a_vault_the_admin_can_open(admin, temp_vault):
+    name = unique("plan") + ".txt"
+    fid = _upload(admin, temp_vault["id"], name)
+    ev = _ranged_event(admin, admin, temp_vault["id"], fid)
+    assert ev["names"] == {"vault": temp_vault["name"], "item": name}
+    assert ev["username"] == admin.get("/users/me").json()["username"]    # not "Unknown"
+    assert name not in str(ev["details"])                      # shown, never stored
+
+
+def test_names_are_withheld_for_a_vault_the_admin_is_not_in(admin, temp_user_client):
+    from app.services.activity_names import DELETED_VAULT, NOT_SHOWN
+    vault = temp_user_client.create_vault()
+    fid = _upload(temp_user_client, vault["id"], unique("private") + ".txt")
+    ev = _ranged_event(admin, temp_user_client, vault["id"], fid)
+    assert ev["names"] == {"vault": NOT_SHOWN, "item": NOT_SHOWN}
+    assert temp_user_client.delete_vault(vault["id"]).status_code == 200
+    again = [e for e in _events(admin, q=fid, category="files")["events"] if e["id"] == ev["id"]][0]
+    assert again["names"]["vault"] == DELETED_VAULT
+
+
+def test_names_follow_a_department_grant(admin, temp_user_client):
+    from app.services.activity_names import NOT_SHOWN
+    vault = temp_user_client.create_vault()
+    name = unique("dept-file") + ".txt"
+    fid = _upload(temp_user_client, vault["id"], name)
+    ev = _ranged_event(admin, temp_user_client, vault["id"], fid)
+    assert ev["names"]["item"] == NOT_SHOWN
+    group = admin.post("/groups", json={"name": unique("readers")}).json()
+    try:
+        me = admin.get("/users/me").json()["id"]
+        assert admin.post(f"/groups/{group['id']}/members", json={"user_ids": [me]}).status_code == 200
+        r = temp_user_client.post(f"/vaults/{vault['id']}/group-access",
+                                  json={"group_id": group["id"], "permission": "read"})
+        assert r.status_code == 200, r.text
+        again = [e for e in _events(admin, q=fid, category="files")["events"] if e["id"] == ev["id"]][0]
+        assert again["names"] == {"vault": vault["name"], "item": name}
+    finally:
+        admin.delete(f"/groups/{group['id']}")
+        temp_user_client.delete_vault(vault["id"])
+
+
+def test_file_names_stay_hidden_in_a_vault_with_a_password(admin, temp_vault_pw):
+    from app.services.activity_names import PASSWORD_HIDDEN
+    unlock = {"X-Vault-Password": temp_vault_pw["_password"]}
+    fid = _upload(admin, temp_vault_pw["id"], unique("locked") + ".txt", headers=unlock)
+    ev = _ranged_event(admin, admin, temp_vault_pw["id"], fid, headers=unlock)
+    assert ev["names"] == {"vault": temp_vault_pw["name"], "item": PASSWORD_HIDDEN}
+
+
+def test_zero_knowledge_file_names_are_hidden(admin):
+    import os
+    from conftest import create_zk_vault, ensure_ecc_keypair, zk_chunked_upload
+    from app.services.activity_names import ZK_HIDDEN
+    ensure_ecc_keypair(admin)
+    before = admin.get("/settings").json().get("zero_knowledge_enabled", False)
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    try:
+        label = unique("zk-label")
+        vid = create_zk_vault(admin, name=label)["id"]
+    finally:
+        admin.put("/settings", json={"zero_knowledge_enabled": before})
+    try:
+        fid = zk_chunked_upload(admin, vid, unique("zk-secret") + ".txt", b"opaque" * 20, os.urandom(32))
+        time.sleep(0.5)
+        rows = [e for e in _events(admin, q=fid, category="files")["events"] if e["resource_id"] == fid]
+        assert rows, "the upload wrote no row"
+        assert rows[0]["names"] == {"vault": label, "item": ZK_HIDDEN}
+    finally:
+        admin.delete_vault(vid)

@@ -637,7 +637,7 @@ class SecurityMonitor:
         except Exception as e:
             logger.error(f"Failed to broadcast security alert: {e}")
     
-    def resolve_alert(self, alert_id: str, resolved_by: str, notes: Optional[str] = None):
+    def resolve_alert(self, alert_id: str, resolved_by: str, notes: Optional[str] = None) -> bool:
         """
         Mark a security alert as resolved.
         
@@ -657,6 +657,8 @@ class SecurityMonitor:
             self.db.commit()
             
             logger.info(f"Security alert {alert_id} resolved by {_sanitize_for_log(resolved_by)}")
+            return True
+        return False
     
     # ========================================================================
     # Cleanup

@@ -1188,23 +1188,19 @@ async def change_user_role(
     target_user.role = request.new_role
     target_user.updated_at = datetime.now(timezone.utc)
     
-    # Log the action. NOTE: this constructs an AuditLog DIRECTLY, bypassing AuditLogger.log_action's
-    # at-rest name redaction -- safe here because `details` carries only role keys. Do NOT add any of
-    # audit_logger.REDACTED_NAME_KEYS (file_name/folder_name/old_name/new_name/vault_name) to a
-    # directly-constructed row, or route it through log_action instead.
-    audit_log = AuditLog(
-        user_id=target_user.id,
-        username=target_user.username,
+    # Recorded as the admin who made the change, with the account changed as the resource, like the
+    # other account events. log_action's commit is the one commit for both, so a role change is never
+    # saved without its record. (This row used to be built directly, under the changed account and
+    # with "admin-action" where the address belongs.)
+    AuditLogger(db).log_action(
         action="role_changed",
         status="success",
-        details={"old_role": old_role, "new_role": new_role, "changed_by": current_user.username},
-        ip_address="admin-action",
-        timestamp=datetime.now(timezone.utc)
+        user=current_user,
+        resource_type="user",
+        resource_id=str(target_user.id),
+        details={"username": target_user.username, "old_role": old_role, "new_role": new_role},
     )
-    db.add(audit_log)
-    
-    db.commit()
-    
+
     return ChangeRoleResponse(
         message=f"Role changed successfully from '{old_role}' to '{new_role}'",
         user_id=str(target_user.id),

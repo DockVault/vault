@@ -2437,11 +2437,73 @@ def activity_events(
             .limit(limit + 1).all())
     more = len(rows) > limit
     rows = rows[:limit]
+    events = [ev.row_view(r) for r in rows]
+    from app.services.activity_names import names_for
+    for event, names in zip(events, names_for(db, current_user, events)):
+        event["names"] = names
     return {
-        "events": [ev.row_view(r) for r in rows],
+        "events": events,
         "next_cursor": ev.encode_cursor(rows[-1].timestamp, rows[-1].id) if more and rows else None,
         "total": total,
     }
+
+
+@app.get("/activity/export")
+def activity_export(
+    format: str = Query("csv", pattern="^(csv|ndjson)$"),
+    category: List[str] = Query([]),
+    channel: List[str] = Query([]),
+    status: List[str] = Query([]),
+    user: Optional[str] = Query(None, max_length=128),
+    ip: Optional[str] = Query(None, max_length=64),
+    q: Optional[str] = Query(None, max_length=128),
+    temp_credential_id: Optional[str] = Query(None, max_length=64),
+    from_date: Optional[str] = Query(None, max_length=64),
+    to_date: Optional[str] = Query(None, max_length=64),
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """The Events tab's rows as a CSV or NDJSON download, with the same filters (admin only).
+
+    Streamed a batch at a time, each batch in its own short database session, so a large export neither
+    holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
+    started, stops at activity_events.EXPORT_CAP rows (the last line says so), and is itself recorded."""
+    from app.core import audit_range
+    from app.core.database import SessionLocal
+    from app.core.models import AuditLog
+    from app.services import activity_events as ev
+    started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
+    filters = ev.export_filters(
+        started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
+        statuses=status, username=user, ip=ip, text=q, temp_credential_id=temp_credential_id,
+        start=audit_range.lower_bound(from_date))
+    total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
+    _audit_change(db, current_user, "audit_exported", "audit_log", None, {
+        "format": format, "rows": min(total, ev.EXPORT_CAP), "total": total,
+        "filters": {k: v for k, v in (("category", category), ("channel", channel), ("status", status),
+                                      ("user", user), ("ip", ip), ("q", q),
+                                      ("temp_credential_id", temp_credential_id),
+                                      ("from_date", from_date), ("to_date", to_date)) if v},
+    })
+
+    def fetch(after):
+        s = SessionLocal()
+        try:
+            got = ev.export_page(s.query(AuditLog), AuditLog, filters, after).all()
+            nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
+            return [ev.row_view(r) for r in got], nxt
+        finally:
+            s.close()
+
+    name = f"activity-{started:%Y%m%d-%H%M%S}.{format}"
+    return StreamingResponse(
+        ev.export_lines(fetch, format, total),
+        media_type="text/csv; charset=utf-8" if format == "csv" else "application/x-ndjson",
+        headers={"Content-Disposition": f"attachment; filename={name}",
+                 "X-Export-Total": str(total),
+                 "X-Export-Rows": str(min(total, ev.EXPORT_CAP)),
+                 "Cache-Control": "no-store"},
+    )
 
 
 def _csv_formula_safe(value):
@@ -2489,6 +2551,13 @@ async def export_audit_log(
             r.resource_id or "",
             json.dumps(r.details) if r.details else "",
         )])
+    # Recorded after the rows are written out: the audit write commits, which would expire every
+    # loaded row and reload each one with its own query.
+    _audit_change(db, current_user, "audit_exported", "audit_log", None, {
+        "rows": len(rows), "format": "csv",
+        "filters": {k: v for k, v in (("user_id", user_id), ("action", action),
+                                      ("from_date", from_date), ("to_date", to_date)) if v},
+    })
     return Response(
         content=buf.getvalue(),
         media_type="text/csv",
@@ -5808,7 +5877,7 @@ async def second_factor_login_verify(
         try:
             AuditLogger(db).log_action(action="second_factor_failed", status="failed", user=user,
                                        ip_address=client_ip,
-                                       details={"method": (body.method or "").lower()})
+                                       details={"method": _sf_method_name(body.method)})
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -5939,10 +6008,14 @@ async def second_factor_step_up(
         otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if m != "password"}
         if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
                 db, user=current_user, action=body.action, method=body.method, code=body.code):
+            _audit_change(db, current_user, "second_factor_failed", "user", current_user.id,
+                          {"method": _sf_method_name(body.method), "step_up": body.action}, status="failed")
             raise HTTPException(status_code=403, detail="That code is not valid.")
     if req["password"]:
         pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
         if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):
+            _audit_change(db, current_user, "step_up_password_failed", "user", current_user.id,
+                          {"step_up": body.action}, status="failed")
             raise HTTPException(status_code=403, detail="Your account password is required and must be correct.")
     session_hash = _current_session_hash(request)
     return {"receipt": sf.issue_step_up_receipt(db, user_id=current_user.id, action=body.action,
@@ -6642,6 +6715,8 @@ async def deactivate_temp_credential(
     revoked = _revoke_sessions(db, temp_credential_id=temp_cred.id,
                                actor_username=current_user.username)
     db.commit()
+    _audit_change(db, current_user, "TEMP_CREDENTIAL_DEACTIVATED", "temporary_credential", temp_cred.id,
+                  {"temp_username": temp_username, "sessions_closed": revoked})
 
     return {
         "message": "Temporary credential deactivated successfully",
@@ -6674,10 +6749,13 @@ async def delete_temp_credential(
         raise HTTPException(status_code=403, detail="Access denied")
     _guard_temp_session_cred_mutation(current_user, temp_cred, 'clear')
 
+    cred_id = temp_cred.id
     # Force-close any live session before the row (and its cascaded sessions) go.
     _revoke_sessions(db, temp_credential_id=temp_cred.id, actor_username=current_user.username)
     db.delete(temp_cred)
     db.commit()
+    _audit_change(db, current_user, "TEMP_CREDENTIAL_DELETED", "temporary_credential", cred_id,
+                  {"temp_username": temp_username})
 
     return {"message": "Temporary credential deleted successfully"}
 
@@ -7314,7 +7392,7 @@ async def terminate_temp_credential_sessions(
         audit_logger.log_action(
             action="terminate_session",
             status="success",
-            user_id=current_user.id,
+            user=current_user,
             resource_type="temporary_credential",
             resource_id=str(temp_cred.id),
             details={
@@ -8395,6 +8473,7 @@ async def regenerate_recovery_codes(
     for _plain, prefix, code_hash in generated:
         db.add(SecondFactorRecoveryCode(user_id=current_user.id, code_prefix=prefix, code_hash=code_hash))
     db.commit()
+    _audit_change(db, current_user, "second_factor_recovery_regenerated", "user", current_user.id)
     return {"recovery_codes": [sf.format_recovery_code(p) for p, _pr, _h in generated]}
 
 
@@ -9222,7 +9301,7 @@ async def terminate_user_sessions(
     audit_logger.log_action(
         action="terminate_session",
         status="success",
-        user_id=current_user.id,
+        user=current_user,
         resource_type="user",
         resource_id=str(user_id),
         details={
@@ -9305,7 +9384,9 @@ async def create_group(
     db.commit()
     db.refresh(group)
     members_map, children_map = _group_counts(db)
-    return _group_to_response(group, members_map, children_map)
+    out = _group_to_response(group, members_map, children_map)
+    _audit_change(db, current_user, "group_created", "group", group.id, {"name": name})
+    return out
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetailResponse)
@@ -9379,7 +9460,10 @@ async def update_group(
     db.commit()
     db.refresh(group)
     members_map, children_map = _group_counts(db)
-    return _group_to_response(group, members_map, children_map)
+    out = _group_to_response(group, members_map, children_map)
+    _audit_change(db, current_user, "group_updated", "group", group_id,
+                  {"name": out.name, "fields": sorted(data)})
+    return out
 
 
 @app.delete("/groups/{group_id}")
@@ -9393,11 +9477,14 @@ async def delete_group(
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    for child in list(group.children):
+    children = list(group.children)
+    for child in children:
         child.parent_id = group.parent_id
     name = group.name
     db.delete(group)
     db.commit()
+    _audit_change(db, current_user, "group_deleted", "group", group_id,
+                  {"name": name, "children_moved_up": len(children)})
     return {"message": f"Group '{name}' deleted"}
 
 
@@ -11668,6 +11755,38 @@ def _audit_access_change(db, actor, action, resource_type, resource_id, details=
         print(f"⚠ audit write skipped for {action}: {e}")
 
 
+_SF_METHOD_NAMES = ("totp", "recovery", "email", "password")
+
+
+def _sf_method_name(method) -> str:
+    """The second-factor method a client named, as stored in an audit row: one of the known names or
+    "other". The request field is free text, so storing it verbatim would let any account write
+    arbitrarily large rows."""
+    m = (method or "").lower()
+    return m if m in _SF_METHOD_NAMES else "other"
+
+
+def _audit_change(db, actor, action, resource_type, resource_id, details=None, status="success"):
+    """One audit row for a change a route has already committed. Best-effort, for the same reason as
+    _audit_access_change: the change succeeded, so a failed audit write must not turn it into an error.
+    The address comes from the request (AuditLogger fills it)."""
+    try:
+        AuditLogger(db).log_action(
+            action=action,
+            status=status,
+            user=actor,
+            resource_type=resource_type,
+            resource_id=str(resource_id) if resource_id is not None else None,
+            details=details or None,
+        )
+    except Exception as e:                                   # noqa: BLE001 - see docstring
+        print(f"⚠ audit write skipped for {action}: {e}")
+        try:
+            db.rollback()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
 def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
     """Owner-facing view of a receiver. NEVER includes the token (stored hashed; the plaintext URL is
     shown only once, in the create response).
@@ -13721,7 +13840,9 @@ async def create_note(
     db.add(n)
     db.commit()
     db.refresh(n)
-    return _note_dict(n)
+    out = _note_dict(n)
+    _audit_change(db, current_user, "note_created", "note", n.id)
+    return out
 
 
 @app.get("/notes/{note_id}")
@@ -13745,7 +13866,8 @@ async def update_note(
     if _notes_denied_for_temp(current_user):
         raise HTTPException(status_code=403, detail="Notes are not available for temporary sessions")
     n = _get_owned_note(db, current_user, note_id)
-    if body.title is not None or body.body is not None:
+    edited = body.title is not None or body.body is not None
+    if edited:
         title, text = _clean_note_fields(
             n.title if body.title is None else body.title,
             n.body if body.body is None else body.body,
@@ -13756,7 +13878,10 @@ async def update_note(
         n.is_favorite = bool(body.is_favorite)
     db.commit()
     db.refresh(n)
-    return _note_dict(n)
+    out = _note_dict(n)
+    if edited:  # starring a note is not recorded
+        _audit_change(db, current_user, "note_updated", "note", note_id)
+    return out
 
 
 @app.delete("/notes/{note_id}")
@@ -13770,6 +13895,7 @@ async def delete_note(
     n = _get_owned_note(db, current_user, note_id)
     db.delete(n)
     db.commit()
+    _audit_change(db, current_user, "note_deleted", "note", note_id)
     return {"ok": True}
 
 
@@ -13786,7 +13912,9 @@ async def adopt_note(
     n.adopted = True
     db.commit()
     db.refresh(n)
-    return _note_dict(n)
+    out = _note_dict(n)
+    _audit_change(db, current_user, "note_adopted", "note", note_id)
+    return out
 
 
 @app.post("/notes/{note_id}/send")
@@ -15308,6 +15436,13 @@ async def update_vault_settings(
 
         vault.updated_at = datetime.now(timezone.utc)
         db.commit()
+        if updated_fields:
+            _audit_change(db, current_user, "vault_settings_updated", "vault", vault_id, {
+                "fields": updated_fields,
+                **{k: getattr(vault, k) for k in ("size_limit", "expire_files_after_days",
+                                                  "expire_files_unit", "unlock_remember_minutes")
+                   if k in updated_fields},
+            })
 
         # Echo the stored unlock window (already clamped to 0 when the org floor is set) so the
         # client bases its remember cache on the authoritative value, not the submitted one.
@@ -19569,7 +19704,7 @@ async def download_file(
                         # A status is required, and the details are a dict with no file name: a
                         # string here carried the name past the audit log's name stripping.
                         audit_logger.log_action(
-                            user_id=current_user.id,
+                            user=current_user,
                             action="file_download_range",
                             status="success",
                             resource_type="file",
@@ -20759,6 +20894,7 @@ async def zk_seal_names(
             sealed += 1
     if sealed:
         db.commit()
+        _audit_change(db, current_user, "zk_names_sealed", "vault", vault_id, {"sealed": sealed})
     return {"status": "ok", "sealed": sealed}
 
 
@@ -20999,6 +21135,8 @@ async def cancel_operation(
                 "cancelled": True
             }
         })
+        # A transfer stopped this way leaves no other row (an admin may stop anyone's).
+        _audit_change(db, current_user, "transfer_cancelled", "operation", operation_id)
         
         return {"message": "Operation cancelled successfully"}
     else:
@@ -21125,7 +21263,8 @@ async def resolve_security_alert(
         monitor = get_security_monitor(db)
         # Convert current_user.username from Column to string using getattr
         username = str(current_user.username) if hasattr(current_user, 'username') else 'unknown'
-        monitor.resolve_alert(alert_id, username, notes)
+        if monitor.resolve_alert(alert_id, username, notes):
+            _audit_change(db, current_user, "security_alert_resolved", "security_alert", alert_id)
         
         return {"message": "Alert resolved successfully"}
     except Exception as e:

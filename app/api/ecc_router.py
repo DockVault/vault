@@ -1122,6 +1122,9 @@ async def put_vault_index_key(
         raise HTTPException(
             status_code=409,
             detail="A name-index-key wrap for a member in this request was just created; re-read.")
+    _audit_zk(db, current_user, "zk_index_key_wrapped", resource_id=vault.id,
+              details={"wraps": len(incoming), "minted": not existing_uids,
+                       "members": [str(uid) for uid, _ in incoming]})
     return {"status": "ok", "wraps": len(incoming), "index_key_version": 1}
 
 

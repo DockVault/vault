@@ -182,3 +182,86 @@ def row_view(r) -> dict:
         "details": r.details,
         "error_message": r.error_message,
     }
+
+
+# --- Export ----------------------------------------------------------------------------------------
+
+# The most rows one export holds. A larger result stops here and says so in its last line.
+EXPORT_CAP = 100_000
+EXPORT_BATCH = 1000
+EXPORT_FORMATS = ("csv", "ndjson")
+
+# (column heading, row_view key), in the order a CSV export lists them.
+EXPORT_COLUMNS = (
+    ("Time (UTC)", "timestamp"), ("Event", "label"), ("Action", "action"), ("Category", "category"),
+    ("Status", "status"), ("User", "username"), ("Temporary credential", "temp_credential_id"),
+    ("Channel", "channel"), ("IP address", "ip_address"), ("Method", "method"), ("Route", "endpoint"),
+    ("User agent", "user_agent"), ("Resource type", "resource_type"), ("Resource ID", "resource_id"),
+    ("Details", "details"), ("Error", "error_message"),
+)
+
+
+def export_filters(*, started: datetime, end: Optional[datetime] = None, **filters) -> dict:
+    """The Events filters for an export, its end clamped to the moment the export started: the export
+    then holds exactly the rows it counted, and not its own audit row or anything written while it
+    streams."""
+    filters["end"] = min(end, started) if end else started
+    return filters
+
+
+def export_page(q, AuditLog, filters: dict, after, batch: int = EXPORT_BATCH):
+    """One batch of an export: the rows after the cursor, newest first, at most `batch`."""
+    return (after_cursor(build_events_query(q, AuditLog, **filters), AuditLog, after)
+            .order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+            .limit(batch))
+
+
+def formula_safe(value):
+    """A CSV cell a spreadsheet would run as a formula (=, +, -, @, tab, carriage return first) gets a
+    leading quote. Audit cells hold text anyone can influence, such as a username typed at sign-in."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def _cell(value):
+    import json
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, default=str)
+    return formula_safe(str(value))
+
+
+def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP):
+    """The export, a line at a time. `fetch_batch(after)` returns (row_views, next_cursor) for the rows
+    after the cursor (None: from the newest). Stops at `cap` rows; when more matched, the last line says
+    how many were left out."""
+    import csv
+    import io
+    import json
+
+    def csv_line(cells):
+        buf = io.StringIO()
+        csv.writer(buf).writerow(cells)
+        return buf.getvalue()
+
+    if fmt == "csv":
+        yield csv_line([h for h, _ in EXPORT_COLUMNS])
+    sent, after = 0, None
+    while sent < cap:
+        rows, after = fetch_batch(after)
+        for row in rows[:cap - sent]:
+            if fmt == "csv":
+                yield csv_line([_cell(row.get(k)) for _, k in EXPORT_COLUMNS])
+            else:
+                yield json.dumps(row, default=str) + "\n"
+            sent += 1
+        if not rows or after is None:
+            break
+    if total > sent and sent >= cap:           # the cap cut it short (not rows deleted meanwhile)
+        note = (f"Export stopped at {sent} of {total} events. Narrow the filters to export the rest.")
+        if fmt == "csv":
+            yield csv_line(["# " + note])
+        else:
+            yield json.dumps({"truncated": True, "exported": sent, "total": total, "message": note}) + "\n"

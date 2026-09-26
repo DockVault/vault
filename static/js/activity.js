@@ -88,7 +88,15 @@
         wrap.appendChild(_el('span', 'activity-event-label', ev.label));
         const cat = state.catalog && state.catalog.categories.find(c => c.key === ev.category);
         wrap.appendChild(_el('span', 'activity-event-cat text-tertiary text-xs', cat ? cat.label : ev.category));
+        const where = whereText(ev);
+        if (where) wrap.appendChild(_el('span', 'activity-event-where text-secondary text-xs', where));
         return wrap;
+    }
+
+    // The vault and the file or folder an event is about, named by the server for this viewer only.
+    function whereText(ev) {
+        const n = ev.names || {};
+        return [n.vault, n.item && n.item !== n.vault ? n.item : null].filter(Boolean).join(' · ');
     }
 
     function whoText(ev) {
@@ -124,7 +132,10 @@
             head.append(_el('span', 'activity-event-label', ev.label), statusBadge(ev));
             const meta = _el('div', 'activity-card-meta text-secondary text-sm');
             meta.textContent = [whoText(ev), channelLabel(ev.channel), ev.ip_address].filter(Boolean).join(' · ');
-            card.append(head, meta, whenCell(ev.timestamp));
+            card.append(head);
+            const where = whereText(ev);
+            if (where) card.append(_el('div', 'activity-event-where text-secondary text-sm', where));
+            card.append(meta, whenCell(ev.timestamp));
             card.addEventListener('click', () => openEvent(index));
             cards.appendChild(card);
         });
@@ -145,7 +156,47 @@
         const summary = state.total == null ? `${shown} shown`
             : `Showing ${shown.toLocaleString()} of ${state.total.toLocaleString()} ${state.total === 1 ? 'event' : 'events'}`;
         $('activity-summary').textContent = empty ? '' : summary;
+        $('activity-export').hidden = empty;
         $('activity-more').hidden = !state.cursor;
+    }
+
+    // The rows the Events tab shows, with the filters they were searched with, as a file. The server
+    // streams it, stops at its row limit and says so in the last line; the headers carry both counts.
+    async function exportEvents(fmt) {
+        const buttons = document.querySelectorAll('[data-activity-export]');
+        const p = new URLSearchParams(state.params);
+        p.set('format', fmt);
+        buttons.forEach((b) => { b.disabled = true; });
+        try {
+            const resp = await fetch(`${API_BASE}/activity/export?${p.toString()}`, {
+                headers: { 'Authorization': `Bearer ${authToken}` },
+            });
+            if (!resp.ok) throw new Error(`the server answered ${resp.status}`);
+            const totalHeader = resp.headers.get('X-Export-Total');
+            const total = Number(totalHeader || 0);
+            const rows = Number(resp.headers.get('X-Export-Rows') || 0);
+            const match = /filename=([^;]+)/.exec(resp.headers.get('Content-Disposition') || '');
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = match ? match[1].trim() : `activity.${fmt}`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            if (totalHeader === null) {
+                showSuccess('Export downloaded');
+            } else if (rows < total) {
+                showWarning(`Exported ${rows.toLocaleString()} of ${total.toLocaleString()} events, the most one export holds. Narrow the filters to export the rest.`);
+            } else {
+                showSuccess(`Exported ${rows.toLocaleString()} ${rows === 1 ? 'event' : 'events'}`);
+            }
+        } catch (err) {
+            showError(`Export failed: ${err.message}`);
+        } finally {
+            buttons.forEach((b) => { b.disabled = false; });
+        }
     }
 
     // A new search replaces any still in flight; its reply is the one shown. "Load more" continues the
@@ -157,12 +208,15 @@
         const btn = $('activity-more');
         btn.disabled = true;
         try {
-            if (!append) state.params = filterParams();
-            const p = new URLSearchParams(state.params);
+            // The filters become the page's only when their reply arrives, so "Load more" and Export
+            // never pair the rows on screen with filters from a search still loading or one that failed.
+            const params = append ? state.params : filterParams();
+            const p = new URLSearchParams(params);
             p.set('limit', '50');
             if (append) p.set('cursor', state.cursor);
             const data = await apiRequest('/activity/events?' + p.toString());
             if (seq !== state.seq) return;          // a newer search has replaced this one
+            if (!append) state.params = params;
             if (append) {
                 state.events = state.events.concat(data.events || []);
             } else {
@@ -198,6 +252,8 @@
             ['IP address', ev.ip_address],
             ['Request', ev.method && ev.endpoint ? `${ev.method} ${ev.endpoint}` : ev.endpoint],
             ['Browser or client', ev.user_agent],
+            ['Vault', (ev.names || {}).vault],
+            [ev.resource_type === 'folder' ? 'Folder' : 'File', (ev.names || {}).item],
             ['Affected', ev.resource_type ? `${ev.resource_type} ${ev.resource_id || ''}`.trim() : null],
             ['Error', ev.error_message],
             ['Stored as', ev.action],
@@ -337,9 +393,14 @@
             picks.forEach(d => { if (d.open && !d.contains(e.target)) d.open = false; });
         });
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') picks.forEach(d => { if (d.open) { d.open = false; d.querySelector('summary').focus(); } });
+            if (e.key !== 'Escape') return;
+            if ($('activity-event-modal').classList.contains('active')) { closeModal(); return; }
+            picks.forEach(d => { if (d.open) { d.open = false; d.querySelector('summary').focus(); } });
         });
         $('activity-more').addEventListener('click', () => search(true));
+        document.querySelectorAll('[data-activity-export]').forEach((b) => {
+            b.addEventListener('click', () => exportEvents(b.dataset.activityExport));
+        });
     }
 
     async function loadCatalog() {
@@ -354,7 +415,18 @@
     window.initActivity = async function initActivity() {
         wire();
         try { await loadCatalog(); } catch (e) { /* the filters stay empty; searching still works */ }
-        selectTab(document.querySelector('[data-activity-tab].active')?.getAttribute('data-activity-tab') || 'overview');
+        const tab = document.querySelector('[data-activity-tab].active')?.getAttribute('data-activity-tab') || 'overview';
+        selectTab(tab);
+        if (tab === 'events' && !state.events.length) search(false);
         loadOverview();
     };
+
+    // Settings → Audit Log points here: open the page on its Events tab.
+    const fromAudit = document.getElementById('audit-open-activity');
+    if (fromAudit) {
+        fromAudit.addEventListener('click', () => {
+            selectTab('events');
+            navigateToSection('activity');
+        });
+    }
 })();

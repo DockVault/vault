@@ -31,6 +31,7 @@ PASS_THROUGH = {
     ("app/core/temp_scope.py", "_audit_scope_denial"),
     ("app/services/audit_logger.py", "log_custom_action"),
     ("app/services/audit_logger.py", "log_error"),
+    ("app/api/api_server.py", "_audit_change"),
     ("app/sftp/sftp_server.py", "_audit"),
 }
 

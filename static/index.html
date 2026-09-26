@@ -24,7 +24,7 @@
          ui-boot.js + the Interface switcher in the profile dropdown. -->
     <link rel="stylesheet" href="/static/css/redesign.css?v=20260926b" id="skin-v1" disabled>
     <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260926b" id="skin-v2">
-    <link rel="stylesheet" href="/static/css/activity.css?v=20260926a">
+    <link rel="stylesheet" href="/static/css/activity.css?v=20260926b">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260926b">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
@@ -1609,7 +1609,13 @@
                                 <button type="button" class="btn btn-ghost" id="activity-reset">Clear filters</button>
                             </div>
                         </form>
-                        <div class="activity-summary text-secondary text-sm" id="activity-summary" aria-live="polite"></div>
+                        <div class="activity-results-bar">
+                            <div class="activity-summary text-secondary text-sm" id="activity-summary" aria-live="polite"></div>
+                            <div class="activity-export" id="activity-export" hidden>
+                                <button type="button" class="btn btn-ghost btn-sm" data-activity-export="csv">Export CSV</button>
+                                <button type="button" class="btn btn-ghost btn-sm" data-activity-export="ndjson">Export NDJSON</button>
+                            </div>
+                        </div>
                         <div class="data-table-wrapper activity-table-wrap">
                             <table class="data-table activity-table">
                                 <thead><tr><th>When</th><th>Event</th><th>Who</th><th>Channel</th><th>Status</th><th>IP address</th></tr></thead>
@@ -2938,6 +2944,10 @@
 
                     <!-- Audit Log Tab -->
                     <div id="settings-tab-audit" class="settings-tab-content">
+                        <div class="alert alert-info mb-lg audit-moved">
+                            <span>The <strong>Activity</strong> page shows this log with more filters (event type, channel, status, address and text) and exports it as CSV or NDJSON.</span>
+                            <button type="button" class="btn btn-sm btn-primary" id="audit-open-activity">Open Activity</button>
+                        </div>
                         <div class="card mb-lg">
                             <div class="card-header">
                                 <h3>Audit Log Filters</h3>
@@ -4109,7 +4119,7 @@
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260923a"></script>
     <script src="/static/js/app.js?v=20260926b"></script>
-    <script src="/static/js/activity.js?v=20260926a"></script>
+    <script src="/static/js/activity.js?v=20260926b"></script>
 </body>
 </html>
 

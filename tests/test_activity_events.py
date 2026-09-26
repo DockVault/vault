@@ -97,3 +97,88 @@ def test_a_row_names_its_event_and_keeps_utc():
     r.action = "something_old"
     v = ev.row_view(r)
     assert (v["label"], v["category"]) == ("Other (legacy)", "legacy")
+
+
+def _batches(rows, size):
+    """A fetch_batch over a list: returns (batch, next cursor), the cursor None after a short batch."""
+    calls = []
+
+    def fetch(after):
+        start = 0 if after is None else after
+        calls.append(start)
+        got = rows[start:start + size]
+        return got, (start + size if len(got) == size else None)
+    return fetch, calls
+
+
+def _view(i, **extra):
+    row = {"timestamp": f"2026-09-26T0{i % 10}:00:00+00:00", "label": "Sign-in failed", "action": "login_failure",
+           "username": f"user{i}", "details": {"reason": "bad password"}, "ip_address": "203.0.113.9"}
+    row.update(extra)
+    return row
+
+
+def test_a_csv_export_has_the_headings_then_a_line_per_event():
+    import csv, io
+    fetch, calls = _batches([_view(i) for i in range(5)], size=2)
+    text = "".join(ev.export_lines(fetch, "csv", total=5))
+    table = list(csv.reader(io.StringIO(text)))
+    assert table[0] == [h for h, _ in ev.EXPORT_COLUMNS]
+    assert [r[5] for r in table[1:]] == [f"user{i}" for i in range(5)]
+    assert table[1][14] == '{"reason": "bad password"}'
+    assert calls == [0, 2, 4]                 # batch by batch, stopping after the short one
+
+
+def test_a_csv_cell_that_would_run_as_a_formula_is_quoted():
+    import csv, io
+    fetch, _ = _batches([_view(0, username="=HYPERLINK(\"http://x\")"), _view(1, username="-2+3")], size=10)
+    table = list(csv.reader(io.StringIO("".join(ev.export_lines(fetch, "csv", total=2)))))
+    assert table[1][5] == "'=HYPERLINK(\"http://x\")" and table[2][5] == "'-2+3"
+
+
+def test_an_export_stops_at_the_cap_and_says_how_many_were_left_out():
+    import csv, io, json
+    rows = [_view(i) for i in range(7)]
+    fetch, _ = _batches(rows, size=3)
+    table = list(csv.reader(io.StringIO("".join(ev.export_lines(fetch, "csv", total=7, cap=4)))))
+    assert len(table) == 1 + 4 + 1
+    assert table[-1] == ["# Export stopped at 4 of 7 events. Narrow the filters to export the rest."]
+    fetch, _ = _batches(rows, size=3)
+    lines = [json.loads(line) for line in ev.export_lines(fetch, "ndjson", total=7, cap=4)]
+    assert [line.get("username") for line in lines[:4]] == ["user0", "user1", "user2", "user3"]
+    assert lines[-1] == {"truncated": True, "exported": 4, "total": 7,
+                         "message": "Export stopped at 4 of 7 events. Narrow the filters to export the rest."}
+
+
+def test_a_complete_export_has_no_closing_note():
+    import json
+    fetch, _ = _batches([_view(i) for i in range(3)], size=3)
+    lines = [json.loads(line) for line in ev.export_lines(fetch, "ndjson", total=3)]
+    assert len(lines) == 3 and all("truncated" not in line for line in lines)
+
+
+def test_an_export_ends_when_it_started():
+    started = datetime(2026, 9, 26, 5, 0, 0)
+    assert ev.export_filters(started=started)["end"] == started
+    assert ev.export_filters(started=started, end=datetime(2027, 1, 1))["end"] == started
+    earlier = datetime(2026, 9, 1)
+    assert ev.export_filters(started=started, end=earlier, username="x") == {"end": earlier, "username": "x"}
+
+
+def test_an_export_batch_continues_after_the_cursor_newest_first():
+    cursor = (datetime(2026, 9, 26, 5, 0, 0), uuid.UUID(int=7))
+    q = ev.export_page(Query(AuditLog), AuditLog, {"statuses": ["failed"]}, cursor, batch=3)
+    compiled = q.statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "audit_logs.timestamp < %(timestamp_1)s" in sql and "audit_logs.id < %(id_1)s" in sql
+    assert "ORDER BY audit_logs.timestamp DESC, audit_logs.id DESC" in sql
+    assert compiled.params["param_1"] == 3 and compiled.params["timestamp_1"] == cursor[0]
+    first = str(ev.export_page(Query(AuditLog), AuditLog, {}, None).statement.compile(dialect=postgresql.dialect()))
+    assert "audit_logs.id <" not in first
+
+
+def test_rows_gone_since_the_count_leave_no_closing_note():
+    import json
+    fetch, _ = _batches([_view(i) for i in range(3)], size=10)      # counted 5, two were deleted since
+    lines = [json.loads(line) for line in ev.export_lines(fetch, "ndjson", total=5, cap=100)]
+    assert len(lines) == 3 and all("truncated" not in line for line in lines)

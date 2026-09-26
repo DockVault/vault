@@ -82,6 +82,13 @@ class AuditLogger:
             # a new one cannot forget. A temp session is the account object with this stamped
             # on it, which is exactly why `username` alone is not attribution.
             temp_credential_id = getattr(user, '_temp_cred_id', None)
+        elif user_id and not username:
+            # A caller that passed only the id: store the name too, or the row reads "Unknown" in the
+            # Activity page and cannot be found by a username filter.
+            try:
+                username = self.db.query(User.username).filter(User.id == user_id).scalar()
+            except Exception:  # noqa: BLE001 -- a missing name never stops the row
+                username = None
 
         # At-rest privacy: file/folder names are encrypted in the files/folders tables,
         # so we must not persist their plaintext in the audit details JSON (that would
@@ -109,6 +116,12 @@ class AuditLogger:
             method = method or ctx.method
             endpoint = endpoint or ctx.endpoint
             user_agent = user_agent or ctx.user_agent
+        if not ip_address:
+            # The address the middleware resolved for this request. A few callers never passed one,
+            # so their rows had no address; outside a request (the SFTP server, a scheduled job)
+            # this is None and the caller's own value, if any, is what is stored.
+            from app.core.net_utils import current_client_ip
+            ip_address = current_client_ip()
 
         audit_log = AuditLog(
             user_id=user_id,

@@ -115,3 +115,45 @@ def test_an_unknown_channel_from_a_caller_is_not_stored():
         assert _row(channel="made-up").channel == "web"
     finally:
         rc.reset_request_context(token)
+
+
+class _NameDB(_FakeDB):
+    """A fake session that answers the username lookup for one id."""
+
+    def __init__(self, users):
+        super().__init__()
+        self.users, self.asked = users, []
+
+    def query(self, *_cols):
+        db = self
+
+        class _Q:
+            def filter(self, cond):
+                db.asked.append(cond.right.value)
+                return self
+
+            def scalar(self):
+                return db.users.get(db.asked[-1])
+        return _Q()
+
+
+def test_a_row_given_only_a_user_id_stores_the_name_too():
+    import uuid
+    uid = uuid.uuid4()
+    db = _NameDB({uid: "maria"})
+    AuditLogger(db).log_action(action="device_refresh", status="success", user_id=uid)
+    assert db.added[0].username == "maria" and db.asked == [uid]
+    db = _NameDB({uid: "maria"})
+    AuditLogger(db).log_action(action="device_refresh", status="success", user_id=uid, username="given")
+    assert db.added[0].username == "given" and db.asked == []        # a name the caller gave is kept
+
+
+def test_a_row_without_an_address_takes_the_requests():
+    from app.core import net_utils
+    token = net_utils.set_client_ip("198.51.100.23")
+    try:
+        assert _row().ip_address == "198.51.100.23"
+        assert _row(ip_address="203.0.113.5").ip_address == "203.0.113.5"      # the caller's wins
+    finally:
+        net_utils.reset_client_ip(token)
+    assert _row().ip_address is None                                          # outside a request
