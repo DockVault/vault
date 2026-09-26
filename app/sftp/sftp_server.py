@@ -81,6 +81,7 @@ from app.core.safe_log import safe_event
 from app.core.temp_scope import is_scoped, effective_vault_caps, scope_ids
 from app.core.security import name_blind_index
 from app.core import upload_marker
+from app.core import file_expiry
 from sqlalchemy import or_
 
 # Global registry of active transports: session_token -> transport
@@ -1266,10 +1267,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 
     def _resolve_file(self, db, vault_id, folder_id, name: str) -> Optional[File]:
         """Find a file by its display name within a vault+folder. Matches the
-        human ``original_name`` first, then the sanitized stored ``name``."""
+        human ``original_name`` first, then the sanitized stored ``name``. An expired file is
+        not found: stat, open, remove and rename all resolve through here."""
         q = db.query(File).filter(
             File.vault_id == vault_id,
             File.folder_id == folder_id,
+            file_expiry.live_clause(),
         )
         # Newest-first: if a name somehow has duplicate rows (the data model
         # doesn't enforce per-folder name uniqueness), SFTP reads/removes should
@@ -1400,6 +1403,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             files = db.query(File).filter(
                 File.vault_id == vault.id,
                 File.folder_id == folder_id,
+                file_expiry.live_clause(),
             ).all()
             # Filter to in-scope children + the ancestor folders needed to reach the scope.
             folders, files = filter_listing_for_scope(db, user, vault.id, folder_id, folders, files)

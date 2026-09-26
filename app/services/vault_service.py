@@ -16,6 +16,7 @@ from sqlalchemy import and_, or_, func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
+from app.core import file_expiry
 from app.core.safe_log import safe_event
 from app.core.security import (
     encrypt_file_content, decrypt_file_content,
@@ -282,12 +283,14 @@ def calculate_file_expiration(vault) -> Optional[datetime]:
         vault: Vault object with expire_files_after_days and expire_files_unit fields
         
     Returns:
-        datetime: Expiration timestamp, or None if no expiration policy
+        datetime: Expiration timestamp, or None if no expiration policy. Naive UTC, the form the
+        column stores: an aware value would be converted through the database session's time
+        zone on the way in (see app/core/file_expiry.py).
     """
     if not vault.expire_files_after_days:
         return None
     
-    now = datetime.now(timezone.utc)
+    now = file_expiry.utc_now()
     value = vault.expire_files_after_days
     unit = vault.expire_files_unit or 'days'
     
@@ -1377,7 +1380,11 @@ class VaultService:
         GREATEST is applied in the database rather than in Python for the same reason as the
         arithmetic: a floor computed from a stale read is not a floor.
         """
-        self.db.query(Vault).filter(Vault.id == vault.id).update(
+        self._adjust_vault_totals_by_id(vault.id, size_delta, count_delta)
+
+    def _adjust_vault_totals_by_id(self, vault_id, size_delta, count_delta):
+        """:meth:`_adjust_vault_totals` for a caller that holds the vault's id but not its row."""
+        self.db.query(Vault).filter(Vault.id == vault_id).update(
             {
                 Vault.total_size_bytes: func.greatest(
                     0, func.coalesce(Vault.total_size_bytes, 0) + size_delta),
@@ -1578,7 +1585,9 @@ class VaultService:
         """
         file = self.db.query(File).filter(File.id == file_id).first()
 
-        if not file:
+        # An expired file is gone for every reader, whatever the sweep has got round to (web
+        # download and preview, SFTP open, and copy/move, which read through here).
+        if not file or file_expiry.is_expired(file):
             raise FileNotFoundError(f"File not found: {file_id}")
 
         # Check vault access
@@ -1939,6 +1948,9 @@ class VaultService:
         # so we can branch on vault type before any plaintext-name validation (which can't
         # run for zero-knowledge renames — the server never receives the plaintext name).
         file = self.db.query(File).filter(File.id == file_id).first()
+        if file_expiry.is_expired(file):
+            # An expired file is gone here too, as on every read path.
+            raise FileNotFoundError("File or folder not found. It may have been deleted.")
         folder = None if file else self.db.query(Folder).filter(Folder.id == file_id).first()
         if not file and not folder:
             raise FileNotFoundError("File or folder not found. It may have been deleted.")
@@ -2093,48 +2105,100 @@ class VaultService:
             'file_type': 'folder' if is_folder_kind else 'file'
         }
     
-    def cleanup_expired_files(self):
-        """Clean up expired files."""
-        now = datetime.now(timezone.utc)
-        
-        expired_files = self.db.query(File).filter(
-            and_(
-                File.expires_at.isnot(None),
-                File.expires_at < now
-            )
-        ).all()
-        
-        # Delete the rows + update stats and COMMIT before destroying any blob: an irreversible
-        # overwrite/unlink sequenced before the commit would, on a commit failure, leave live rows
-        # pointing at gone blobs. Capture each path only after its delete is staged.
-        stale_paths = []
-        for file in expired_files:
-            try:
-                _path = self.storage_path / file.storage_path
-                vault = file.vault
-                if vault:
-                    self._adjust_vault_totals(vault, -(file.size_bytes or 0), -1)
-                self.db.delete(file)
-                stale_paths.append(_path)
-            except Exception as e:
-                safe_event('expired-file.delete.failed', e, file=file.id)
-                continue
+    def cleanup_expired_files(self, batch_size: int = 200,
+                              now: Optional[datetime] = None) -> List[dict]:
+        """Delete one batch of files whose retention has run out, and return what was deleted:
+        ``[{'file_id': ..., 'vault_id': ...}]``, empty when nothing is due.
 
+        A file's retention is its vault's "expire files after" setting (an upload link's retention
+        is the same setting on the link's vault), stamped on the row at upload as ``expires_at`` --
+        UTC, without a time zone, so it is compared with a naive UTC "now" (file_expiry.utc_now).
+
+        One transaction, which never waits on another:
+
+        * Lock order is the vault row, then the file row, as on every other path that deletes a
+          file (delete_file, same-name replacement, upload completion), so the sweep cannot
+          deadlock with them. Both locks are taken SKIP LOCKED: a vault or file someone else holds
+          is left for the next run, so two sweepers never delete, or audit, the same file twice.
+        * Each vault's size and file counters drop by exactly what left it. The storage-allocation
+          ledger is untouched: it funds the vault's size limit, not its contents.
+        * The rows are deleted. What points at a file goes with it through its foreign key -- a
+          file share and a public file link cascade, a chunked-upload session's reference is
+          cleared -- and the database trigger retires the id, as it does for any deleted file.
+          Folders are left as they are; expiry applies to files.
+        * One ``file_expired`` audit row per file, carrying the vault id and never the name.
+
+        The stored bytes are destroyed only after the commit, as delete_file does: an overwrite
+        before a commit that then failed would leave live rows pointing at destroyed blobs. A blob
+        that cannot be removed is logged and left as an orphan. A zero-knowledge file's blob is the
+        client's ciphertext and is removed the same way.
+
+        Does not consult ENFORCE_FILE_EXPIRY; the caller decides whether to sweep. A database error
+        rolls the batch back and is raised for the caller to log."""
+        from app.core.models import AuditLog
+
+        now = file_expiry.as_stored_utc(now) if now is not None else file_expiry.utc_now()
+        batch_size = max(1, int(batch_size))
         try:
-            self.db.commit()
-        except Exception as e:
-            self.db.rollback()
-            safe_event('expired-file.cleanup-commit.failed', e)
-            return
+            # Which vaults have something due. Read without a lock; the files are re-selected
+            # under lock below, so one that stopped being due (or was deleted) in between is skipped.
+            due_vaults = [vid for (vid,) in self.db.query(File.vault_id)
+                          .filter(file_expiry.expired_clause(now))
+                          .distinct().limit(batch_size).all()]
+            if not due_vaults:
+                self.db.rollback()
+                return []
+            # FOR NO KEY UPDATE, the strength of the counter UPDATE below: it does not block a new
+            # row that merely references the vault.
+            held = [vid for (vid,) in self.db.query(Vault.id)
+                    .filter(Vault.id.in_(due_vaults))
+                    .order_by(Vault.id)
+                    .with_for_update(key_share=True, skip_locked=True).all()]
+            rows = []
+            if held:
+                rows = (self.db.query(File.id, File.vault_id, File.size_bytes,
+                                      File.storage_path, File.expires_at)
+                        .filter(file_expiry.expired_clause(now), File.vault_id.in_(held))
+                        .order_by(File.expires_at, File.id)
+                        .limit(batch_size)
+                        .with_for_update(of=File, skip_locked=True).all())
+            if not rows:
+                self.db.rollback()
+                return []
 
-        # Rows are durably gone; now securely destroy the blobs (best-effort — an orphan blob is
-        # recoverable/GC-able, a dangling row is not). secure_delete overwrites in bounded 1 MB
-        # chunks (+ fsync) so a large blob can't spike memory, and is a no-op on an absent path.
-        for storage_path in stale_paths:
+            per_vault = {}
+            for r in rows:
+                size, count = per_vault.get(r.vault_id, (0, 0))
+                per_vault[r.vault_id] = (size + (r.size_bytes or 0), count + 1)
+            for vault_id, (size, count) in per_vault.items():
+                self._adjust_vault_totals_by_id(vault_id, -size, -count)
+            self.db.query(File).filter(File.id.in_([r.id for r in rows])).delete(
+                synchronize_session=False)
+            for r in rows:
+                # Built directly rather than through AuditLogger.log_action, which commits on its
+                # own: the audit rows and the deletions must commit together or not at all. No
+                # name goes in `details` (see REDACTED_NAME_KEYS in the audit logger).
+                self.db.add(AuditLog(
+                    action='file_expired', status='success', resource_type='file',
+                    resource_id=str(r.id), timestamp=now,
+                    details={'vault_id': str(r.vault_id), 'expires_at': r.expires_at.isoformat()},
+                ))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        # Rows are durably gone; now securely destroy the blobs (best-effort -- an orphan blob is
+        # recoverable, a dangling row is not). secure_delete overwrites in bounded 1 MB chunks
+        # (+ fsync), so a large blob cannot spike memory.
+        for r in rows:
             try:
-                self.encrypted_storage.secure_delete(storage_path)
-            except Exception as e:
-                safe_event('expired-blob.remove.failed', e)
+                blob = self.storage_path / r.storage_path
+                if blob.exists():
+                    self.encrypted_storage.secure_delete(blob)
+            except Exception as e:  # noqa: BLE001
+                safe_event('expired-blob.remove.failed', e, file=r.id)
+        return [{'file_id': r.id, 'vault_id': r.vault_id} for r in rows]
     
     # ---- Move / Copy (files + folders) --------------------------------------------------------
     # Semantics (Phase E, Standard vaults + within-vault):
@@ -2239,7 +2303,7 @@ class VaultService:
         """Copy a file into dest_vault_id/dest_folder_id, leaving the original in place. Standard
         vaults only (server cannot re-encrypt a ZK blob). Returns the new File."""
         src_file = self.db.query(File).filter(File.id == file_id).first()
-        if not src_file:
+        if not src_file or file_expiry.is_expired(src_file):
             raise FileNotFoundError(f"File not found: {file_id}")
         src_vault = self.db.query(Vault).filter(Vault.id == src_file.vault_id).first()
         dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
@@ -2260,7 +2324,8 @@ class VaultService:
         """Move a file. Within the same vault this is a reparent (no re-encryption). Across vaults it
         re-encrypts into the destination (Standard↔Standard) and then deletes the source."""
         src_file = self.db.query(File).filter(File.id == file_id).first()
-        if not src_file:
+        # An expired file is gone: moving it -- even a reparent, which reads no bytes -- is refused.
+        if not src_file or file_expiry.is_expired(src_file):
             raise FileNotFoundError(f"File not found: {file_id}")
         dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
         if not dest_vault:
@@ -2346,9 +2411,10 @@ class VaultService:
             raise FileServiceError("Folder is too large to copy (item limit reached).")
         new_folder = self.create_folder(
             dest_vault_id, folder.name, user, parent_folder_id=dest_parent_folder_id)
-        # Copy the files directly under this folder.
+        # Copy the files directly under this folder. An expired file is gone, so it is not copied.
         child_files = self.db.query(File).filter(
-            File.vault_id == folder.vault_id, File.folder_id == folder.id).all()
+            File.vault_id == folder.vault_id, File.folder_id == folder.id,
+            file_expiry.live_clause()).all()
         for f in child_files:
             counter[0] += 1
             if counter[0] > self._COPY_MAX_ITEMS:

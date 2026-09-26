@@ -51,6 +51,7 @@ from app.core import sharing_policy
 from app.core import note_link_policy
 from app.core import receiver_policy
 from app.core import storage_quota
+from app.core import file_expiry
 from app.core.email_identity import (
     EMAIL_LOWER_UNIQUE_INDEX, email_in_use, find_email_collisions, normalize_email,
 )
@@ -10729,7 +10730,8 @@ async def create_public_link(
             raise HTTPException(status_code=400, detail="A file link requires target_file_id.")
         if payload.target_folder_id:
             raise HTTPException(status_code=400, detail="A file link takes no folder target.")
-        f = db.query(File).filter(File.id == payload.target_file_id, File.vault_id == vault.id).first()
+        f = db.query(File).filter(File.id == payload.target_file_id, File.vault_id == vault.id,
+                                  file_expiry.live_clause()).first()
         if not f:
             raise HTTPException(status_code=404, detail="File not found in this vault.")
         if f.password_hash:
@@ -11225,7 +11227,9 @@ async def redeem_public_link(
     # The target must still exist (and, for a folder, resolve its children). A missing target → 404.
     now = datetime.utcnow()
     if link.target_type == "file":
-        f = db.query(File).filter(File.id == link.target_file_id, File.vault_id == vault.id).first()
+        # An expired target is gone: the link answers exactly as for a deleted file.
+        f = db.query(File).filter(File.id == link.target_file_id, File.vault_id == vault.id,
+                                  file_expiry.live_clause()).first()
         if not f or f.password_hash:
             _audit("failure", reason="not_available", link_id=link.id)
             raise HTTPException(status_code=404, detail="This link is not available.")
@@ -11242,7 +11246,8 @@ async def redeem_public_link(
                 "file_id": str(f.id)}
     else:
         child_files = db.query(File).filter(File.vault_id == vault.id,
-                                            File.folder_id == folder.id).all()
+                                            File.folder_id == folder.id,
+                                            file_expiry.live_clause()).all()
         child_dirs = db.query(Folder).filter(Folder.vault_id == vault.id,
                                              Folder.parent_folder_id == folder.id).all()
         entries = [{"id": str(d.id), "name": d.name or "", "size": 0, "is_folder": True} for d in child_dirs]
@@ -11337,8 +11342,10 @@ async def download_public_link(
         _deny()
     vault, owner = live
 
-    # The requested file must exist in the vault and carry no file password (added-since-mint → 404).
-    file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault.id).first()
+    # The requested file must exist in the vault, not have expired, and carry no file password
+    # (added-since-mint → 404).
+    file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault.id,
+                                        file_expiry.live_clause()).first()
     if not file_record or file_record.password_hash:
         _deny()
 
@@ -12658,7 +12665,8 @@ def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
         f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
         target_name = f.name if f else None
     elif share.target_type == "file" and share.target_file_id:
-        x = db.query(File).filter(File.id == share.target_file_id).first()
+        x = db.query(File).filter(File.id == share.target_file_id,
+                                  file_expiry.live_clause()).first()
         target_name = x.original_name if x else None
     return {
         "id": str(share.id),
@@ -12753,7 +12761,8 @@ async def create_share(
             raise HTTPException(status_code=400, detail="A file share requires target_file_id.")
         if payload.target_folder_id:
             raise HTTPException(status_code=400, detail="A file share takes no folder target.")
-        f = db.query(File).filter(File.id == payload.target_file_id, File.vault_id == vault.id).first()
+        f = db.query(File).filter(File.id == payload.target_file_id, File.vault_id == vault.id,
+                                  file_expiry.live_clause()).first()
         if not f:
             raise HTTPException(status_code=404, detail="File not found in this vault.")
         if f.password_hash:
@@ -13068,6 +13077,11 @@ def _claim_resolved_share(db: Session, share: Share, current_user: User, request
     vault = db.query(Vault).filter(Vault.id == share.vault_id, Vault.is_active.is_(True)).first()
     if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
         raise HTTPException(status_code=403, detail="That share is no longer available.")
+    # A file share whose file has expired is gone with the file; the sweep deletes the share when it
+    # deletes the file, and until then it is refused the same way.
+    if share.target_type == "file" and not db.query(File.id).filter(
+            File.id == share.target_file_id, file_expiry.live_clause()).first():
+        raise HTTPException(status_code=403, detail="That share is no longer available.")
 
     existing = db.query(ShareClaim).filter(
         ShareClaim.share_id == share.id, ShareClaim.user_id == current_user.id).first()
@@ -13156,7 +13170,8 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
             f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
             target_name = f.name if f else None
         elif share.target_type == "file" and share.target_file_id:
-            x = db.query(File).filter(File.id == share.target_file_id).first()
+            x = db.query(File).filter(File.id == share.target_file_id,
+                                      file_expiry.live_clause()).first()
             target_name = x.original_name if x else None
     return {
         "claim_id": str(claim.id),
@@ -13179,9 +13194,14 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
 def _shared_available_dict(db: Session, share: Share) -> Optional[dict]:
     """A DIRECT-PUSH share addressed to the current user (named users/departments audience) that they
     have NOT claimed yet — an 'available' card they can claim in one click. Returns None if the vault is
-    no longer shareable (deleted / zero-knowledge / password-protected), so a stale push isn't offered."""
+    no longer shareable (deleted / zero-knowledge / password-protected) or the shared file has expired,
+    so a stale push isn't offered."""
     vault = db.query(Vault).filter(Vault.id == share.vault_id, Vault.is_active.is_(True)).first()
     if not vault or getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
+        return None
+    # Nor is a push whose file has expired: it could only be refused at claim.
+    if share.target_type == "file" and not db.query(File.id).filter(
+            File.id == share.target_file_id, file_expiry.live_clause()).first():
         return None
     # A share whose recipient cap is already full can never be claimed by a new recipient — don't offer
     # a dead-end 'Claim' card (the claim would just 409). First-come-first-served among the pushed set.
@@ -13195,7 +13215,8 @@ def _shared_available_dict(db: Session, share: Share) -> Optional[dict]:
         f = db.query(Folder).filter(Folder.id == share.target_folder_id).first()
         target_name = f.name if f else None
     elif share.target_type == "file" and share.target_file_id:
-        x = db.query(File).filter(File.id == share.target_file_id).first()
+        x = db.query(File).filter(File.id == share.target_file_id,
+                                  file_expiry.live_clause()).first()
         target_name = x.original_name if x else None
     return {
         "claim_id": None,
@@ -16043,8 +16064,9 @@ async def list_vault_files(
         
         folders = folder_query.all()
         
-        # Query files in this location
-        file_query = db.query(File).filter(File.vault_id == vault_id)
+        # Query files in this location. An expired file is gone the moment it expires, not when
+        # the sweep next runs.
+        file_query = db.query(File).filter(File.vault_id == vault_id, file_expiry.live_clause())
         if folder_uuid:
             file_query = file_query.filter(File.folder_id == folder_uuid)
         else:
@@ -18765,7 +18787,7 @@ async def download_file(
         # caller who is going to be told 404 should not first be made to queue behind real
         # transfers -- nor should the attempt show up as load the deployment shed.
         file_record = db.query(File).filter(
-            File.id == file_id, File.vault_id == vault_id
+            File.id == file_id, File.vault_id == vault_id, file_expiry.live_clause()
         ).first()
         if not file_record:
             raise HTTPException(
@@ -19443,7 +19465,8 @@ async def get_file_info(
         # A path-scoped temp credential may only read info for a file within its scope.
         require_item_scope(db, current_user, vault_id, file_id)
 
-        file = db.query(File).filter(File.id == file_id, File.vault_id == vault_id).first()
+        file = db.query(File).filter(File.id == file_id, File.vault_id == vault_id,
+                                     file_expiry.live_clause()).first()
         if file is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
@@ -19566,7 +19589,8 @@ async def preview_render_file(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="Rendered preview is not available for zero-knowledge vaults.")
 
-        file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault_id).first()
+        file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault_id,
+                                            file_expiry.live_clause()).first()
         if file_record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
         if (file_record.size_bytes or 0) > _MAX_PREVIEW_RENDER_BYTES:
@@ -19813,7 +19837,8 @@ async def copy_file_endpoint(
     try:
         # Source: access + password on the path vault, the file belongs to it, item in scope.
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first():
+        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
+                                        file_expiry.live_clause()).first():
             raise HTTPException(status_code=404, detail="File not found in this vault")
         require_item_scope(db, current_user, vault_id, file_id)
         # Destination: access + password + the write cap + folder scope.
@@ -19866,7 +19891,8 @@ async def move_file_endpoint(
     audit_logger = AuditLogger(db)
     try:
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id).first():
+        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
+                                        file_expiry.live_clause()).first():
             raise HTTPException(status_code=404, detail="File not found in this vault")
         require_item_scope(db, current_user, vault_id, file_id)
         _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
@@ -22399,6 +22425,13 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(cleanup_expired_sessions())
     print("[OK] Session cleanup task started")
 
+    # File expiry: say once how many files are already past their expiry, then sweep every minute on
+    # a loop of its own. Only this process runs it, so a split deployment's SFTP container never
+    # runs a second sweeper. With ENFORCE_FILE_EXPIRY=false each pass returns without touching
+    # anything.
+    file_expiry.report_at_startup()
+    expiry_task = asyncio.create_task(file_expiry.run_forever())
+
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.
     _install_access_log_redaction()
@@ -22428,6 +22461,11 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         print("Session cleanup task cancelled")
+    expiry_task.cancel()
+    try:
+        await expiry_task
+    except asyncio.CancelledError:
+        pass
     pass
 
 # Update app initialization

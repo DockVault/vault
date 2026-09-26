@@ -370,7 +370,7 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str)."""
+    invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written)."""
     lines = []
 
     def q(k):
@@ -477,6 +477,11 @@ def build_env_lines(cfg):
     for key in ("max_concurrent_transfers", "max_queued_transfers", "transfer_queue_wait_seconds"):
         if cfg.get(key) not in (None, ""):
             bare(key.upper(), str(cfg[key]))
+    # File expiry is enforced by default, so a normal install never mentions it. Author
+    # ENFORCE_FILE_EXPIRY only when the operator has postponed enforcement, so that choice survives
+    # a fresh volume set instead of silently switching back on.
+    if str(cfg.get("enforce_file_expiry") or "").strip().lower() in ("false", "0", "no", "off"):
+        bare("ENFORCE_FILE_EXPIRY", "false")
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -1257,6 +1262,9 @@ def new_set_config(current_env, new_prefix, new_id):
         "max_queued_transfers": parse_transfer_queue(current_env.get("MAX_QUEUED_TRANSFERS")),
         "transfer_queue_wait_seconds": parse_transfer_wait(
             current_env.get("TRANSFER_QUEUE_WAIT_SECONDS")),
+        # Keep a postponed file-expiry enforcement across a fresh volume set, like the choices above
+        # (raw, so an explicit "false" survives; the default is on).
+        "enforce_file_expiry": (current_env.get("ENFORCE_FILE_EXPIRY") or "").strip() or None,
     }
     return cfg
 

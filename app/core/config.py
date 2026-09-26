@@ -302,6 +302,13 @@ class Settings(BaseSettings):
     # to allow longer multi-day resumes. Effective value is floored at 1h in code so a
     # mis-set 0/negative can't expire every session the instant it's created.
     chunk_session_ttl_hours: int = Field(default=24)
+    # Whether a vault's "expire files after" setting (and an upload link's retention, which is the
+    # same setting on the link's vault) is enforced. On, an expired file disappears from every read
+    # path the moment it expires, and a sweep in the web process deletes it and its stored bytes
+    # within about a minute. Off, nothing is hidden and nothing is deleted -- the behaviour before
+    # enforcement existed -- so an operator can postpone it while reviewing what it would remove.
+    # Expiry times are recorded at upload either way. See app/core/file_expiry.py.
+    enforce_file_expiry: bool = Field(default=True)
     
     # Rate Limiting
     rate_limit_login_attempts: int = Field(default=5)
