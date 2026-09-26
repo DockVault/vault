@@ -19498,13 +19498,22 @@ async def download_file(
                             pass
 
                     try:
+                        # A status is required, and the details are a dict with no file name: a
+                        # string here carried the name past the audit log's name stripping.
                         audit_logger.log_action(
                             user_id=current_user.id,
-                            action="file.download.range",
+                            action="file_download_range",
+                            status="success",
                             resource_type="file",
                             resource_id=str(file_id),
-                            details=(f"{disp_name}: bytes {span.start}-{span.last} of "
-                                     f"{span.total}, {served_bytes} served"),
+                            details={
+                                "vault_id": str(vault.id),
+                                "range_start": span.start,
+                                "range_end": span.last,
+                                "size": span.total,
+                                "served_bytes": served_bytes,
+                                "completed": served_bytes == span.length,
+                            },
                             ip_address=request_ip,
                         )
                     except Exception:      # noqa: BLE001 - an audit write must not kill a response
