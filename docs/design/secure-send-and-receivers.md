@@ -101,7 +101,8 @@ any loosening; the resolved policy is **frozen onto the link row** so a later ta
 `POST /note-links/{token}/redeem` applies **two** fail-closed rate limits (per `(ip, token)` at 10/min
 and per IP at 600/min — the enumeration bound), a per-link wrong-secret lockout (5 → 15 min), the
 **kill switch** (feature off ⇒ every minted link 404s), a uniform 404 for missing/revoked/expired/
-exhausted, and an atomic `UPDATE … WHERE` consume of one use. Owners revoke/delete; admins list
+exhausted **or whose owner is no longer active or is locked** (checked before any secret prompt), and
+an atomic `UPDATE … WHERE` consume of one use. Owners revoke/delete; admins list
 (`/admin/note-links`, never the body), revoke one, or `revoke-all`. Owner tiles render in the Notes
 section's *Shared* tab (`_noteLinkCard`), coloured by the tag.
 
@@ -256,7 +257,8 @@ link active (not revoked / expired / exhausted); vault active, Standard, not pas
 still present and still inside the link's subtree; **neither the target file nor any ancestor folder
 has acquired a `password_hash` since the link was minted** (creation refuses those, and a password
 added later must bite on the next request just as it would for a share recipient); the **owner's**
-account active and not locked and the owner **still holds READ** on the vault (a live check — an owner
+account active and not locked (read as sign-in reads it: an administrator's lock has no expiry and
+still counts) and the owner **still holds READ** on the vault (a live check — an owner
 removed from a shared vault takes their public links with them, the way `stamp_share_scope` re-checks
 a department audience). Any failure is the uniform 404.
 
@@ -557,7 +559,7 @@ an envelope, plus an honest label.
 | Owner escaping the frozen policy | the vault-settings, permissions and storage-grant routes are constrained on receiver vaults; retention authoritative from the receiver row (§3.1) | those routes, `/complete` |
 | Stale exposure | link expiry; `paused`; revoke; the master kill switch; retention sweeps the files themselves | `/redeem`, `cleanup_expired_files` |
 | Cross-session interference | per-session secret + `receiver_upload_sessions` binding; no overwrite | upload routes |
-| Owner de-provisioned | `get_receiver_principal` re-checks the owner is active and not locked on every call | every anonymous route |
+| Owner de-provisioned | `_receiver_resolve_live` re-checks, on every call, that the owner is active and not locked (an administrator's lock included; `_link_owner_if_live`, shared with note and file links) | every anonymous route |
 
 ### 5.2 Retention
 

@@ -10390,6 +10390,12 @@ async def redeem_note_link(
     if not link or _notelink_status(link) != "active":
         _audit("failure", reason="not_available", link_id=(link.id if link else None))
         raise HTTPException(status_code=404, detail="This link is not available.")
+    # The owner must still be able to publish, as for file and upload links: locking or
+    # deactivating an account takes its links down with it. Same 404 as a missing link, and
+    # checked before any secret prompt, so the answer does not depend on knowing the secret.
+    if _link_owner_if_live(db, link.owner_id) is None:
+        _audit("failure", reason="owner_unavailable", link_id=link.id)
+        raise HTTPException(status_code=404, detail="This link is not available.")
 
     if link.secret_kind != "none":
         # Lockout peek first — a locked link refuses everything, including the correct secret.
@@ -10574,6 +10580,21 @@ def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
     return removed >= 1
 
 
+def _link_owner_if_live(db, owner_id):
+    """The owner of an anonymous link (note, file or upload link), or None when that owner may no
+    longer publish through one: the account is gone, deactivated, or locked.
+
+    Locked means account_locked(), the same reading sign-in uses. An admin lock has no expiry
+    (locked_until stays empty) and holds until an admin clears it; a failed-login lock holds until
+    its expiry. Comparing locked_until alone let every admin-locked owner's links keep serving,
+    because an admin lock has no expiry to compare."""
+    from app.services.auth_service import account_locked
+    owner = db.query(User).filter(User.id == owner_id).first()
+    if owner is None or not getattr(owner, "is_active", True) or account_locked(owner):
+        return None
+    return owner
+
+
 def _publiclink_resolve_live(db, link):
     """Re-validate a public link against LIVE state and return (vault, owner) — or None if any gate
     fails (the caller maps that to the uniform 404). Checked every redeem AND every download so a
@@ -10587,11 +10608,8 @@ def _publiclink_resolve_live(db, link):
         return None
     if getattr(vault, "type", "standard") == "zero_knowledge" or vault.password_hash:
         return None
-    owner = db.query(User).filter(User.id == link.owner_id).first()
-    if not owner or not getattr(owner, "is_active", True):
-        return None
-    locked_until = getattr(owner, "locked_until", None)
-    if locked_until is not None and locked_until > datetime.utcnow():
+    owner = _link_owner_if_live(db, link.owner_id)
+    if owner is None:
         return None
     if not PermissionService(db).can_access_vault(owner, vault.id, VaultPermissionEnum.READ):
         return None
@@ -12048,11 +12066,8 @@ def _receiver_resolve_live(db, receiver):
     vault = db.query(Vault).filter(Vault.id == receiver.vault_id, Vault.is_active.is_(True)).first()
     if not vault or getattr(vault, "type", "standard") == "zero_knowledge":
         return None
-    owner = db.query(User).filter(User.id == receiver.owner_id).first()
-    if not owner or not getattr(owner, "is_active", True):
-        return None
-    locked_until = getattr(owner, "locked_until", None)
-    if locked_until is not None and locked_until > datetime.utcnow():
+    owner = _link_owner_if_live(db, receiver.owner_id)
+    if owner is None:
         return None
     return vault, owner
 
