@@ -11498,8 +11498,8 @@ def _receiver_status(r, now=None) -> str:
     return "active"
 
 
-def _audit_access_change(db, actor, action, resource_type, resource_id, details=None):
-    """Record a change to WHO CAN REACH WHAT.
+def _audit_access_change(db, actor, action, resource_type, resource_id, details=None, status="success"):
+    """Record a change to WHO CAN REACH WHAT, or a refused attempt at one (status="refused").
 
     Access control was the largest hole in the audit log: granting a person, a group or a device
     access to a vault left no trace, so the log recorded uploads and logins while the permission
@@ -11520,7 +11520,7 @@ def _audit_access_change(db, actor, action, resource_type, resource_id, details=
         from app.core.net_utils import current_client_ip
         AuditLogger(db).log_action(
             action=action,
-            status="success",
+            status=status,
             user=actor,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -13699,13 +13699,27 @@ async def add_group_members(
     db: Session = Depends(get_db)
 ):
     """Add one or more users to a group (idempotent)."""
-    group = db.query(Group).filter(Group.id == group_id).first()
+    # Locked for the rest of the request, as POST /vaults/{id}/group-access locks it, so the
+    # self-access check below and a concurrent grant to this department cannot interleave.
+    group = db.query(Group).filter(Group.id == group_id).with_for_update().first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     group_role = payload.group_role if payload.group_role in ('member', 'manager') else 'member'
     existing = {
         row[0] for row in db.query(user_groups.c.user_id).filter(user_groups.c.group_id == group_id).all()
     }
+    # Nobody widens their own access (see _gains_own_access): an admin may not join a department
+    # that reaches a vault they cannot otherwise open. Another administrator can add them. The
+    # whole request is refused, so nobody in it is added.
+    if current_user.id in payload.user_ids and current_user.id not in existing:
+        opened = _vaults_opened_by_joining(db, current_user, group_id)
+        if opened:
+            _audit_access_change(db, current_user, "vault_self_access_refused", "group", str(group_id),
+                                 {"via": "department_membership", "vault_ids": opened}, status="refused")
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot add yourself to this department: it has access to vaults you "
+                       "cannot otherwise open. Ask another administrator.")
     added = []
     for uid in payload.user_ids:
         if uid in existing:
@@ -15371,6 +15385,62 @@ def _can_manage_vault(db, vault, current_user) -> bool:
     return _vault_member_manages(db, vault.id, current_user.id)
 
 
+# ----------------------------------------------------------------------------
+# Nobody gives themselves access. Whoever may administer a vault's access (its owner, a Manager or
+# a global admin) may grant it to OTHER people, but a change that would widen the caller's OWN
+# access to a vault they do not own is refused, on every path that could widen it: a grant to
+# themselves, a grant to a department they belong to, and joining a department that has access.
+# Administrators are not members of every vault; without this, any admin could open any Standard
+# vault by granting it to themselves. The owner or another administrator can still grant them
+# access, so such a grant always has a second person behind it. Every refusal is audited.
+# ----------------------------------------------------------------------------
+_VAULT_PERMISSION_KEYS = ("read", "write", "delete", "manage")
+
+_SELF_GRANT_REFUSED = ("You cannot give yourself access to another person's vault, or widen the "
+                       "access you have; ask its owner or another administrator.")
+
+
+def _person_grant_permissions(level: str) -> dict:
+    """What a per-person grant at `level` carries; each level includes the ones below it."""
+    rank = _VAULT_PERMISSION_KEYS.index(level) if level in _VAULT_PERMISSION_KEYS else -1
+    return {k: i <= rank for i, k in enumerate(_VAULT_PERMISSION_KEYS)}
+
+
+def _department_grant_permissions(permission: str) -> dict:
+    """What a department grant carries: read, plus write when granted write. A department never
+    holds delete or manage (PermissionService._group_vault_permission)."""
+    return {"read": True, "write": permission == "write", "delete": False, "manage": False}
+
+
+def _gains_own_access(db, vault, user, grant: dict) -> bool:
+    """True if adding `grant` would give `user` a permission on `vault` they do not hold today.
+
+    Today's access is what PermissionService resolves without share claims: ownership, the
+    user's own member row, and their departments. A share claim is a narrow grant to one item and
+    does not count. The owner already holds everything, so nothing widens it."""
+    if vault.owner_id == user.id:
+        return False
+    held = PermissionService(db).get_vault_permissions(user, vault.id) or {}
+    return any(grant.get(k) and not held.get(k) for k in _VAULT_PERMISSION_KEYS)
+
+
+def _vaults_opened_by_joining(db, user, group_id) -> list:
+    """Ids of the vaults on which joining this department would widen `user`'s own access."""
+    from app.core.models import vault_group_access
+    rows = db.query(vault_group_access.c.vault_id, vault_group_access.c.permission).filter(
+        vault_group_access.c.group_id == group_id).all()
+    opened = []
+    for vault_id, permission in rows:
+        vault = db.query(Vault).filter(Vault.id == vault_id).first()
+        # A department never opens a zero-knowledge vault (get_vault_permissions), so joining one
+        # that holds a stale row for such a vault gives nothing.
+        if vault is None or getattr(vault, "type", "standard") == "zero_knowledge":
+            continue
+        if _gains_own_access(db, vault, user, _department_grant_permissions(permission)):
+            opened.append(str(vault_id))
+    return opened
+
+
 @app.get("/vaults/{vault_id}/permissions")
 @require_endpoint_permission("VAULT_PERMISSIONS")
 @require_vault_cap("vault.see_permissions")
@@ -15533,6 +15603,15 @@ async def grant_vault_permission(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot grant permissions to vault owner"
             )
+
+        # Nobody widens their own access (see _gains_own_access). An admin may grant anyone else;
+        # reaching another person's vault themselves takes its owner or a second administrator.
+        # Lowering your own level, or restating the one you hold, is not a widening.
+        if user.id == current_user.id and _gains_own_access(
+                db, vault, current_user, _person_grant_permissions(permission.level)):
+            _audit_access_change(db, current_user, "vault_self_access_refused", "vault", str(vault_id),
+                                 {"via": "grant_to_self", "level": permission.level}, status="refused")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_SELF_GRANT_REFUSED)
 
         # Privilege-escalation guard: assigning the Manager role, or modifying a
         # user who is already a Manager, is reserved for the owner / global admin.
@@ -15777,7 +15856,11 @@ async def grant_vault_group_access(
             detail="Zero-knowledge vaults can't be shared with a department. "
                    "Share with individual users instead so their key is provisioned.",
         )
-    if not db.query(Group).filter(Group.id == payload.group_id).first():
+    # The department's row is locked for the rest of the request, as POST /groups/{id}/members
+    # locks it: a concurrent request that adds the caller to this department waits for this one and
+    # then sees this grant, and the reverse, so the two cannot pass the self-access check below
+    # together.
+    if not db.query(Group).filter(Group.id == payload.group_id).with_for_update().first():
         raise HTTPException(status_code=404, detail="Group not found")
     # A receiver vault is share-frozen to READ (like the per-user permissions route): a department
     # granted write could alter or delete the arrived files and upload bypassing the receiver's policy.
@@ -15786,6 +15869,22 @@ async def grant_vault_group_access(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This vault backs an upload link; only read access can be granted on it.")
     perm = 'write' if payload.permission == 'write' else 'read'
+    # Nobody widens their own access (see _gains_own_access): a department the caller belongs to
+    # may be given only what the caller already holds on this vault.
+    caller_in_group = db.execute(
+        select(user_groups.c.user_id).where(
+            user_groups.c.group_id == payload.group_id,
+            user_groups.c.user_id == current_user.id,
+        )
+    ).first() is not None
+    if caller_in_group and _gains_own_access(db, vault, current_user, _department_grant_permissions(perm)):
+        _audit_access_change(db, current_user, "vault_self_access_refused", "vault", str(vault_id),
+                             {"via": "department_access", "group_id": str(payload.group_id),
+                              "permission": perm}, status="refused")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You belong to this department, so granting it access would give you access to "
+                   "another person's vault; ask its owner or another administrator.")
     existing = db.execute(
         select(vault_group_access).where(
             vault_group_access.c.vault_id == vault_id,
