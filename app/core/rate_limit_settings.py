@@ -70,7 +70,7 @@ class RateLimitSpec:
     deployment_min: Optional[int] = None
     # Ceiling applied to an ADMIN CUSTOM override (the UI slider), independent of the deployment clamp.
     # Defaults to `maximum`. Set it lower to bound what an admin may set from the panel without also
-    # clamping a deliberate deployment .env value (R018-INFO-2: cap the login-attempts override at 1000
+    # clamping a deliberate deployment .env value (for example, cap the login-attempts override at 1000
     # so a fat-finger can't widen the brute-force window, while the operator's env value is untouched).
     custom_max: Optional[int] = None
 

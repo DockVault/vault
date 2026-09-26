@@ -8324,7 +8324,7 @@ async def update_second_factor_action(
     if key not in ACTION_KEYS:
         raise HTTPException(status_code=404, detail="Unknown second-factor action.")
     # account.second_factor is the gate that protects the two-factor policy itself. Refuse to disable
-    # its OTP requirement (R018-INFO-1): otherwise turning off this one switch would silently drop the
+    # its OTP requirement: otherwise turning off this one switch would silently drop the
     # step-up from every later matrix edit. body.require_otp is Optional[bool], so `is False` fires only
     # on an explicit false, never on an omitted field.
     if key == "account.second_factor" and body.require_otp is not None and not bool(body.require_otp):
@@ -8340,7 +8340,7 @@ async def update_second_factor_action(
     if key == "account.second_factor":
         # Pin the gate's OTP requirement ON regardless of an omitted field or the fresh-row column
         # default (require_otp defaults False) — the invariant is the EFFECTIVE state, not just the
-        # incoming field (R018-INFO-1).
+        # incoming field.
         row.require_otp = True
     if body.require_password is not None:
         row.require_password = bool(body.require_password)
@@ -8377,7 +8377,7 @@ async def update_second_factor_actions_bulk(
     for it in items:
         if not isinstance(it, dict) or it.get("key") not in ACTION_KEYS:
             raise HTTPException(status_code=400, detail="actions contains an unknown or malformed entry.")
-        # R018-INFO-1: refuse to disable OTP on the action that gates the matrix itself (all-or-nothing,
+        # Refuse to disable OTP on the action that gates the matrix itself (all-or-nothing,
         # so the whole batch is rejected before anything is written). The items are RAW dicts (the model
         # field is an untyped list), so a falsy-but-not-False JSON value (0, "", [], {}) must be caught
         # with bool() -- an identity `is False` check would let it slip the guard yet be written as False.

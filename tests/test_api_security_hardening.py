@@ -1,6 +1,6 @@
 """Security hardening batch: a missing vault answers 404 not 500; opening a chunked
 upload session requires WRITE; the account.second_factor OTP requirement can't be
-disabled (R018-INFO-1); an admin's login-attempt override is bounded (R018-INFO-2); the response
+disabled; an admin's login-attempt override is bounded; the response
 carries no Server header."""
 import uuid
 
