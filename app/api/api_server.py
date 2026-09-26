@@ -612,6 +612,16 @@ class ClientIPMiddleware:
             ip = client_ip(_Request(scope))
         except Exception:  # noqa: BLE001 — never fail a request over IP resolution
             ip = None
+        # A trusted proxy's X-Forwarded-Proto sets the request's scheme, so request.url and base_url
+        # say https behind a TLS proxy (invitation, reset and share email links are built from them).
+        # uvicorn's own handling did this for 127.0.0.1 only and is off; this uses the same trust set
+        # as the client address.
+        try:
+            proto = _external_scheme(_Request(scope))
+            if proto in ("http", "https") and proto != scope.get("scheme"):
+                scope = dict(scope, scheme=proto)
+        except Exception:  # noqa: BLE001 — never fail a request over the scheme
+            pass
         token = set_client_ip(ip)
         try:
             await self.app(scope, receive, send)
@@ -7494,6 +7504,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         # activity (unchanged); everyone else receives only events they own (e.g.
         # the login of a temporary credential they created). This makes it safe to
         # open the socket app-wide for notifications without leaking others' activity.
+        from app.core import feed_privacy as _feed_privacy
         is_admin_conn = False
         try:
             from app.core.database import get_db_context
@@ -7555,7 +7566,9 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                         # Parse and forward the event (filtered per connection)
                         event_data = json.loads(message['data'])
                         if _event_visible_to_conn(event_data):
-                            await websocket.send_json(event_data)
+                            # Someone else's file activity reaches a watching admin without names.
+                            await websocket.send_json(
+                                _feed_privacy.for_viewer(event_data, user_id, username))
 
                     await asyncio.sleep(0.01)  # Small delay to prevent busy loop
 

@@ -100,9 +100,16 @@ def _is_trusted_peer(peer: Optional[str]) -> bool:
 
 def _real_client_from_xff(forwarded: str) -> Optional[str]:
     """Walk the X-Forwarded-For chain RIGHT-TO-LEFT and return the first entry that is a valid
-    IP and NOT a trusted proxy — i.e. the real client. If every hop is trusted (all-internal
-    traffic), return the hop nearest the peer: the left-most entry is whatever the client wrote,
-    so it could name any address inside the trusted range. Junk / non-IP tokens are skipped."""
+    IP and NOT a trusted proxy — i.e. the real client. Junk / non-IP tokens are skipped.
+
+    When every hop is trusted:
+    - under TRUST_ALL_PROXIES that is always so, and the left-most entry is whatever the client
+      wrote, so take the address the nearest proxy recorded (behind a chain of proxies, list each
+      one in TRUSTED_PROXIES instead);
+    - under a TRUSTED_PROXIES list it means the client is itself inside a trusted network (someone
+      on the LAN behind internal proxies), so take the left-most entry, as nginx and most frameworks
+      do, and each such person keeps their own address. They could only name another address
+      inside the trusted networks."""
     parsed = [_parse_ip(p) for p in forwarded.split(",")]
     parsed = [a for a in parsed if a is not None]
     if not parsed:
@@ -110,7 +117,9 @@ def _real_client_from_xff(forwarded: str) -> Optional[str]:
     for addr in reversed(parsed):
         if not _is_trusted_addr(addr):
             return str(addr)
-    return str(parsed[-1])  # all hops trusted -> the hop our own proxy recorded
+    if getattr(settings, "trust_all_proxies", False):
+        return str(parsed[-1])
+    return str(parsed[0])
 
 
 def forwarded_for_chain(request) -> str:

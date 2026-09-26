@@ -84,10 +84,11 @@ def test_every_resolved_address_fits_the_stored_column(trust):
         assert len(net_utils.client_ip(_request("172.18.0.5", chain))) <= 45
 
 
-def test_an_all_trusted_chain_resolves_to_the_nearest_hop(trust):
-    # The left-most entry is client-written, so it could name any address inside the trusted range.
+def test_an_all_trusted_chain_under_a_list_is_its_left_most_entry(trust):
+    # Only someone inside the trusted networks can make every hop trusted, and they can only name
+    # another address inside them; the left-most entry keeps LAN users apart.
     trust(TRUSTED)
-    assert net_utils.client_ip(_request("127.0.0.1", "10.0.0.7, 192.168.1.2")) == "192.168.1.2"
+    assert net_utils.client_ip(_request("127.0.0.1", "10.0.0.7, 192.168.1.2")) == "10.0.0.7"
 
 
 def test_a_loopback_peer_is_not_trusted_by_default(trust):
@@ -135,3 +136,68 @@ def test_a_username_that_looks_like_an_ip_has_its_own_bucket():
         "rate_limit:login_user:203.0.113.50", "rate_limit:login_ip:198.51.100.9",
         "rate_limit:login_user:alice", "rate_limit:login_ip:203.0.113.50",
     }
+
+
+def test_a_known_temporary_name_is_throttled_in_the_name_bucket_only(monkeypatch):
+    # The per-credential throttle for a temporary credential without a device keys on the name kind
+    # of bucket, never the address kind: a name like an address must not spend that address's budget.
+    from app.core import rate_limiter as rl_module
+    from app.services import auth_service
+    from app.services.auth_service import AuthService
+
+    limiter = _CountingLimiter()
+    monkeypatch.setattr(rl_module, "rate_limiter", limiter)
+    monkeypatch.setattr(auth_service.rate_limit_settings, "effective", lambda name: 5 if "attempts" in name else 60)
+    svc = AuthService.__new__(AuthService)
+    svc._check_username_rate_limit("203.0.113.50")
+    assert set(limiter.hits) == {"rate_limit:login_user:203.0.113.50"}
+
+
+def test_under_a_trusted_list_an_all_trusted_chain_resolves_to_the_left_most(trust):
+    # Someone on the LAN behind two internal proxies: every hop is inside the trusted networks, and
+    # the left-most entry is that person, so each keeps their own address.
+    trust(TRUSTED)
+    assert net_utils.client_ip(_request("127.0.0.1", "192.168.1.50, 10.0.0.4")) == "192.168.1.50"
+
+
+def test_under_trust_all_the_nearest_proxys_record_wins(monkeypatch, trust):
+    # With every hop trusted by setting, the left-most entry is whatever the client wrote: a forged
+    # 9.9.9.9 in front of the real address must not be believed.
+    trust("")
+    monkeypatch.setattr(net_utils.settings, "trust_all_proxies", True, raising=False)
+    assert net_utils.client_ip(_request("172.18.0.5", "9.9.9.9, 203.0.113.50")) == "203.0.113.50"
+    assert net_utils.client_ip(_request("172.18.0.5", "203.0.113.50")) == "203.0.113.50"
+
+
+def test_a_v4_mapped_peer_is_matched_against_the_trusted_list(trust):
+    trust(TRUSTED)
+    assert net_utils.client_ip(_request("::ffff:172.18.0.5", "203.0.113.50")) == "203.0.113.50"
+    assert net_utils._parse_ip("::ffff:203.0.113.50") == net_utils._parse_ip("203.0.113.50")
+
+
+def _scheme_seen(middleware, peer, proto):
+    """The scheme the app sees after ClientIPMiddleware, for a plain-HTTP request from `peer`."""
+    from _async_run import run_coroutine  # the one loop helper; see tests/_async_run.py
+    seen = {}
+
+    async def inner(scope, receive, send):
+        seen["scheme"] = scope["scheme"]
+
+    headers = [(b"x-forwarded-proto", proto.encode())] if proto else []
+    scope = {"type": "http", "method": "GET", "path": "/", "raw_path": b"/", "query_string": b"",
+             "headers": headers, "client": (peer, 40000), "server": ("vault", 8000), "scheme": "http"}
+    run_coroutine(middleware(inner)(scope, None, None))
+    return seen["scheme"]
+
+
+def test_a_trusted_proxys_forwarded_scheme_is_applied(trust):
+    # Behind a TLS proxy the app hears plain HTTP; the proxy's X-Forwarded-Proto makes request.url and
+    # base_url https again (email links are built from them), but only from a trusted peer.
+    from app.api.api_server import ClientIPMiddleware as mw     # imported first: importing the app
+    trust(TRUSTED)                                              # reloads the proxy settings
+    assert _scheme_seen(mw, "127.0.0.1", "https") == "https"
+    assert _scheme_seen(mw, "172.18.0.5", "https") == "https"
+    assert _scheme_seen(mw, "203.0.113.50", "https") == "http"
+    assert _scheme_seen(mw, "127.0.0.1", "javascript") == "http"
+    trust("")
+    assert _scheme_seen(mw, "127.0.0.1", "https") == "http"

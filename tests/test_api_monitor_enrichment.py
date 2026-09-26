@@ -95,3 +95,66 @@ def test_upload_broadcast_carries_vault_name_and_type(base_url, admin, temp_vaul
             ws.close()
         except Exception:
             pass
+
+
+@pytest.mark.websocket
+def test_a_watching_admin_sees_someone_elses_files_without_names(base_url, admin, temp_user_client):
+    """Admins are not members of every vault. Another account's upload and download reach a watching
+    admin with the vault's id and type, but without the file's or the vault's name."""
+    from conftest import ApiClient
+    vault = temp_user_client.create_vault(name=unique("private-vault"))
+    vid = str(vault["id"])
+    fname = unique("private-file") + ".bin"
+    watcher = admin.create_user(role="admin")
+    ws = None
+
+    def collect(done):
+        frames, deadline = [], time.time() + 10
+        ws.settimeout(1)
+        while time.time() < deadline:
+            try:
+                msg = ws.recv()
+            except Exception:
+                continue
+            if not msg:
+                continue
+            frames.append(msg)
+            try:
+                ev = (json.loads(msg) or {}).get("event") or {}
+            except Exception:
+                continue
+            if done(ev):
+                break
+        return frames
+
+    try:
+        client = ApiClient()
+        client.login(watcher["_username"], watcher["_password"])
+        ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+        ws.send(json.dumps({"type": "auth", "token": client.token}))
+        _drain(ws)
+
+        fid = _upload(temp_user_client, vid, fname, b"someone-elses-file" * 200)
+        frames = collect(lambda ev: ev.get("type") == "upload" and ev.get("vault_id") == vid
+                         and ev.get("completed") is True)
+        r = temp_user_client.get(f"/vaults/{vid}/files/{fid}/download")
+        assert r.status_code == 200, r.status_code
+        frames += collect(lambda ev: ev.get("type") == "download" and ev.get("vault_id") == vid
+                          and ev.get("completed") is True)
+
+        ours = [json.loads(f)["event"] for f in frames if vid in f]
+        kinds = {e["type"] for e in ours}
+        assert {"upload", "download"} <= kinds, kinds
+        assert not any(fname in f or vault["name"] in f for f in frames), "a name reached the watcher"
+        for ev in ours:
+            assert "file_name" not in ev and "vault_name" not in ev, ev
+            assert ev.get("description") == ev.get("title"), ev
+            assert ev.get("vault_type") == "standard", ev
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        admin.delete_user(watcher["id"])
+        temp_user_client.delete_vault(vid)

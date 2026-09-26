@@ -184,9 +184,9 @@ try:
     assert ci(_Req("172.18.0.5", "garbage, 203.0.113.50")) == "203.0.113.50", "skip junk token"
     assert ci(_Req("172.18.0.5", "203.0.113.50:1234")) == "203.0.113.50", "strip :port"
     assert ci(_Req("127.0.0.1", "not-an-ip")) == "127.0.0.1", "all-junk XFF -> peer"
-    # All-trusted chain -> the hop nearest the peer. The left-most entry is whatever the client wrote,
-    # so it could name any address inside the trusted range.
-    assert ci(_Req("127.0.0.1", "10.0.0.7, 192.168.1.2")) == "192.168.1.2", "all-trusted -> right-most"
+    # All-trusted chain under a list -> the left-most entry: someone inside the trusted networks behind
+    # internal proxies keeps their own address (they could only name another trusted address).
+    assert ci(_Req("127.0.0.1", "10.0.0.7, 192.168.1.2")) == "10.0.0.7", "all-trusted -> left-most"
 finally:
     # Restore the process default so this throwaway interpreter leaks no config.
     net_utils.settings.trusted_proxies = ""
