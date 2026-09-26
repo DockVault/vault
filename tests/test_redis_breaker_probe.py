@@ -18,6 +18,7 @@ product wrote. A product that stops stamping, stamps wrongly, or gives up after 
 genuinely never goes stale here, and the test sees it -- a helper that rewrote the stamp would have
 supplied the stale state itself and hidden all three.
 """
+import inspect
 import threading
 import time
 
@@ -45,6 +46,32 @@ class _Clock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+_PROBE_THREAD_NAME = "redis-cb-probe"
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _no_probe_left_by_other_modules():
+    """Wait out every probe thread an earlier test module left sleeping, before any test here runs.
+
+    A test elsewhere that opens the breaker starts a real probe, which sleeps a full cooldown before
+    it pings. If it wakes while a test here has made the ping healthy, its success closes the breaker
+    under that test: by design, since a ping that succeeded is current news whoever ran it. With the
+    breaker closed and the slot empty, each such thread pings once more and then exits."""
+    # The wait finds those threads by name; if the product renamed them, it would find none.
+    assert inspect.getsource(R._cb_start_probe_locked).count(f'name="{_PROBE_THREAD_NAME}"') == 1
+    R._cb_record_success()
+    with R._cb_lock:
+        R._cb_probe_thread = None
+        R._cb_probe_threads[:] = []
+    deadline = time.monotonic() + R._CB_COOLDOWN_SECONDS + R._CB_PROBE_TIMEOUT_SECONDS + 5
+    for thread in threading.enumerate():
+        if thread.name == _PROBE_THREAD_NAME:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    stray = [t for t in threading.enumerate() if t.name == _PROBE_THREAD_NAME and t.is_alive()]
+    assert not stray, f"{len(stray)} probe thread(s) from another test module never exited"
+    yield
 
 
 @pytest.fixture(autouse=True)
