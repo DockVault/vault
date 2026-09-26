@@ -609,6 +609,8 @@ class ClientIPMiddleware:
             await self.app(scope, receive, send)
             return
         from app.core.net_utils import client_ip, set_client_ip, reset_client_ip
+        from app.core.request_context import (RequestContext, channel_for_path, set_request_context,
+                                              reset_request_context)
         from starlette.requests import Request as _Request
         try:
             ip = client_ip(_Request(scope))
@@ -625,9 +627,16 @@ class ClientIPMiddleware:
         except Exception:  # noqa: BLE001 — never fail a request over the scheme
             pass
         token = set_client_ip(ip)
+        # The request's channel, method, route and user agent, for the audit rows it writes. The
+        # route template is read from this same scope later, once routing has matched it.
+        path = scope.get("path") or ""
+        agent = next((v.decode("latin-1") for k, v in scope.get("headers") or () if k == b"user-agent"), None)
+        ctx_token = set_request_context(
+            RequestContext(scope.get("method"), path, agent, channel_for_path(path), scope))
         try:
             await self.app(scope, receive, send)
         finally:
+            reset_request_context(ctx_token)
             reset_client_ip(token)
 
 
@@ -21892,6 +21901,9 @@ def _run_lightweight_migrations():
             # Delegated vault administration: a member with manage_permission is a "Manager".
             "ALTER TABLE vault_members ADD COLUMN IF NOT EXISTS manage_permission BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE chunked_upload_sessions ADD COLUMN IF NOT EXISTS folder_id UUID",
+            # The way an audited request came in (web, sftp, a public or upload link, device sync).
+            # Nullable, so rows from before it read as unknown and an older release ignores it.
+            "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS channel VARCHAR(20)",
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",

@@ -2545,6 +2545,11 @@ def start_sftp_server():
     """
     Start the SFTP server.
     """
+    # This process serves SFTP only, so every audit row it writes, sign-ins included, is on the
+    # SFTP channel.
+    from app.core.request_context import set_process_default_channel
+    set_process_default_channel("sftp")
+
     # Generate or load host key
     host_key_path = Path(settings.sftp_host_key_path)
 

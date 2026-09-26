@@ -1203,6 +1203,9 @@ class AuditLog(Base):
     # How
     method = Column(String(10), nullable=True)  # HTTP method for API calls
     endpoint = Column(String(255), nullable=True)
+    # The way in: web, sftp, public_link, upload_link or device_sync. NULL on rows written before it
+    # existed and on rows written outside any request.
+    channel = Column(String(20), nullable=True)
     
     # Result
     status = Column(String(20), nullable=False)  # success, failure, error

@@ -50,7 +50,8 @@ class AuditLogger:
         method: Optional[str] = None,
         endpoint: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        channel: Optional[str] = None,
     ) -> AuditLog:
         """
         Log an action to the audit log.
@@ -98,6 +99,17 @@ class AuditLogger:
             if any(k in details for k in REDACTED_NAME_KEYS):
                 details = {k: v for k, v in details.items() if k not in REDACTED_NAME_KEYS}
 
+        # Where the request came from and what it was, when the caller did not say: the request
+        # context (a web request) or the process default (the SFTP server).
+        from app.core.request_context import CHANNELS, current_channel, current_request_context
+        ctx = current_request_context()
+        if channel not in CHANNELS:
+            channel = current_channel()
+        if ctx is not None:
+            method = method or ctx.method
+            endpoint = endpoint or ctx.endpoint
+            user_agent = user_agent or ctx.user_agent
+
         audit_log = AuditLog(
             user_id=user_id,
             username=username,
@@ -110,6 +122,7 @@ class AuditLogger:
             user_agent=user_agent,
             method=method,
             endpoint=endpoint,
+            channel=channel,
             status=status,
             details=details,
             error_message=error_message
