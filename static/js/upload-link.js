@@ -39,7 +39,7 @@
       $("secret-input").setAttribute("inputmode", "numeric");
       $("secret-input").setAttribute("autocomplete", "one-time-code");
     }
-    if (errorText) { msg(errorText, "error"); }
+    msg(errorText || "", errorText ? "error" : null);
     $("secret-input").focus();
   }
 
@@ -87,8 +87,8 @@
       var resp = await openSession(file);
       if (resp.status === 401) {
         var d = (await resp.json()).detail || {};
-        promptSecret(d.secret_kind || "password",
-                     d.error === "wrong_secret" ? "That code is incorrect. Please try again." : null);
+        var kind = d.secret_kind || "password";
+        promptSecret(kind, d.error === "wrong_secret" ? (kind === "pin" ? "That PIN is incorrect. Please try again." : "That password is incorrect. Please try again.") : null);
         btn.disabled = false;
         return;
       }

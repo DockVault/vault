@@ -74,6 +74,8 @@ def test_password_link_prompts_then_unlocks(page: Page, admin, links_on):
     page.fill("#secret-input", "wrongpass1")
     page.click("#secret-submit")
     expect(page.locator("#secret-error")).to_be_visible(timeout=10000)
+    # It names what was wrong: this link has a password, not a PIN or a "code".
+    expect(page.locator("#secret-error")).to_have_text("That password is incorrect. Please try again.")
     expect(page.locator("#content")).to_be_hidden()
     # Correct secret -> content.
     page.fill("#secret-input", "hunter2x")

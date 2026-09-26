@@ -162,7 +162,7 @@
       return resp.json().then(function (payload) {
         var d = parseDetail(payload);
         var kind = d.secret_kind || "password";
-        promptSecret(kind, d.error === "wrong_secret" ? "That code is incorrect. Please try again." : null);
+        promptSecret(kind, d.error === "wrong_secret" ? (kind === "pin" ? "That PIN is incorrect. Please try again." : "That password is incorrect. Please try again.") : null);
       });
     }
     if (resp.status === 429) { notice("Too many attempts. Please wait a few minutes and try again."); return; }

@@ -75,7 +75,7 @@
         var d = parseDetail(payload);
         var kind = d.secret_kind || "password";
         if (d.error === "wrong_secret") {
-          promptSecret(kind, "That code is incorrect. Please try again.");
+          promptSecret(kind, kind === "pin" ? "That PIN is incorrect. Please try again." : "That password is incorrect. Please try again.");
         } else {
           promptSecret(kind, null);
         }
