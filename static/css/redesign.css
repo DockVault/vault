@@ -453,8 +453,7 @@ label.checkbox-label,
 @media (max-width: 860px) {
     .main-content { padding: var(--space-lg); }
     .navbar { padding: 0 var(--space-md); }
-    .sidebar { width: 100%; position: static; height: auto; border-right: none; border-bottom: 1px solid var(--surface-3); }
-    .app-layout { flex-direction: column; }
+    /* The sidebar becomes a drawer at this width: see mobile.css. */
 }
 
 /* ----------------------------------------------------------------------------

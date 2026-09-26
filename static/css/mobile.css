@@ -1,0 +1,137 @@
+/* ============================================================================
+   Phone-width layout, shared by both skins.
+
+   Loaded after the skin stylesheet, so a rule here wins over a skin rule of the same specificity.
+   Keep skin-specific looks in the skins; put here only what a narrow screen needs whichever skin
+   is active.
+   ============================================================================ */
+
+/* The menu button that opens the sidebar drawer. Hidden wherever the sidebar is a rail. */
+.mobile-nav-toggle { display: none; }
+
+@media (max-width: 860px) {
+    .mobile-nav-toggle {
+        display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+        width: 40px; height: 40px; margin: 0 var(--space-xs) 0 calc(-1 * var(--space-xs));
+        padding: 0; border: 0; border-radius: var(--radius-md);
+        background: transparent; color: var(--text-primary); cursor: pointer;
+    }
+    .mobile-nav-toggle .icon { width: 22px; height: 22px; }
+    .mobile-nav-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+    /* The sidebar is a drawer under the top bar. Closed, it is off-screen AND hidden, so it drops
+       out of the tab order; the visibility change waits for the slide to finish. */
+    .app-layout { display: block; height: auto; overflow: visible; }
+    .sidebar, .sidebar.collapsed {
+        position: fixed; top: var(--navbar-height); bottom: 0; left: 0;
+        flex: none; width: min(280px, 85vw); min-width: 0; height: auto;
+        display: flex; flex-direction: column;
+        padding: var(--space-sm) var(--space-sm) var(--space-lg);
+        overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain;
+        background: var(--surface-0);
+        border-right: 1px solid var(--surface-3); border-bottom: 0;
+        box-shadow: var(--shadow-xl);
+        transform: translateX(-100%); visibility: hidden;
+        transition: transform .2s ease, visibility 0s linear .2s;
+        z-index: 960;
+    }
+    .sidebar.mobile-open { transform: none; visibility: visible; transition: transform .2s ease; }
+    .sidebar-toggle { display: none; }
+    .sidebar-nav { flex-direction: column; margin-top: 0; padding: 0; gap: 2px; }
+    .sidebar-item, .sidebar.collapsed .sidebar-item {
+        justify-content: flex-start; gap: var(--space-md); min-height: 44px; white-space: nowrap;
+    }
+    /* The desktop rail may be saved collapsed; the drawer always shows labels. */
+    .sidebar.collapsed .sidebar-text { opacity: 1; width: auto; overflow: visible; }
+    .sidebar.collapsed .nav-group-label { display: block; }
+
+    .sidebar-backdrop {
+        position: fixed; top: var(--navbar-height); right: 0; bottom: 0; left: 0;
+        background: rgba(15, 23, 42, .45); z-index: 955;
+    }
+    .sidebar-backdrop[hidden] { display: none; }
+
+    .main-content { width: 100%; min-width: 0; }
+}
+
+@media (max-width: 640px) {
+    /* Section headers (a title, then a group of actions) wrap instead of squeezing the title and
+       pushing the actions past the right edge; the actions then wrap among themselves. */
+    .content-section > .flex.justify-between.items-center:first-child {
+        flex-wrap: wrap; align-items: flex-start; gap: var(--space-sm) var(--space-md);
+    }
+    .content-section > .flex.justify-between.items-center:first-child > * { min-width: 0; max-width: 100%; }
+    .content-section > .flex.justify-between.items-center:first-child > .flex { flex-wrap: wrap; }
+
+    /* File table: the type and modified columns go (the file's info panel shows them), so each row's
+       actions are on screen, and a long name wraps instead of widening the table. */
+    .files-table .col-meta { display: none; }
+    .files-table td .file-name > span:last-child { white-space: normal; overflow-wrap: break-word; }
+    .files-table th.col-check, .files-table td.col-check { width: 32px; padding-left: .35rem; padding-right: 0; }
+    .files-table th.col-num, .files-table td.col-num { padding-left: .35rem; padding-right: .35rem; }
+    .files-table th.col-actions, .files-table td.col-actions { padding-left: 0; padding-right: .35rem; }
+
+    /* Add-a-member rows (a picker, a level, a button): the picker gets its own line so its label is
+       not cut off under the arrow. */
+    .group-add-member { flex-wrap: wrap; }
+    .group-add-member .form-control:first-child { flex: 1 1 100%; }
+    /* A level picker inside a table row keeps room for its label; the table scrolls if it must. */
+    .data-table select.form-control-sm { min-width: 8.5rem; }
+
+    /* Expandable tables (users, temporary credentials): the opened row's panel stays within the
+       visible part of the table, not the width of all its columns, so its fields and buttons are on
+       screen even when the columns scroll sideways. */
+    .data-table-wrapper { container-type: inline-size; }
+    .exp-detail > td { padding: var(--space-md); }
+    .exp-detail > td > * { position: sticky; left: var(--space-md); max-width: calc(100cqi - 2 * var(--space-md)); }
+    .exp-table .col-depts { display: none; }
+    .exp-toggle { width: 36px; height: 36px; }
+    .exp-table th.col-toggle, .exp-table td.col-toggle { width: 40px; padding-left: .25rem; padding-right: 0; }
+
+    /* Vault header: the name wraps rather than truncating, and the description takes its own line
+       instead of competing with the name for one row. */
+    .vault-view-head { flex-wrap: wrap; }
+    .vault-view-title { white-space: normal; overflow-wrap: break-word; }
+    .vault-view-desc { flex: 1 1 100%; white-space: normal; padding-left: 0; }
+
+    /* Long dialogs scroll inside themselves; their buttons stay pinned at the bottom of the dialog so
+       Save or Cancel is always in reach, and the dialog uses the whole screen but a small margin. */
+    .modal-content { width: calc(100% - 2 * var(--space-sm)); max-height: calc(100dvh - 2 * var(--space-sm)); }
+    .modal-footer { position: sticky; bottom: 0; z-index: 1; background: var(--surface-0); }
+
+    /* Tag lists in Settings are capped at 260px with their own scroll on a wide screen; on a phone
+       their text wraps to several times that, so the page scrolls instead of a box inside it. */
+    #share-tags-list, #nl-tags-list, #rt-tags-list { max-height: none; overflow-y: visible; }
+
+    /* Dashboard: Recent Events and System Status stack. The script sets two columns inline when both
+       are shown, so only an !important rule reaches it. */
+    #dashboard-lower-grid { grid-template-columns: minmax(0, 1fr) !important; }
+
+    /* Pending invitations: each row's name, email, status, expiry and Revoke wrap onto more lines. */
+    .invite-row { flex-wrap: wrap; row-gap: var(--space-xs); }
+
+    /* A dropdown keeps clear room for its arrow, so a long choice is cut short rather than running
+       under the arrow. */
+    select.form-control, select.form-select, .form-select { padding-right: 1.75rem; text-overflow: ellipsis; }
+
+    /* A status pill stays on one line ("In use" broke into two lines beside a long title). */
+    .badge { white-space: nowrap; }
+
+    /* Checkboxes in lists are finger-sized. */
+    .files-check { width: 20px; height: 20px; }
+
+    /* The notifications panel is 340px wide and hangs from the bell, which sits well left of the
+       screen's right edge, so it ran off the left edge. Pin it under the top bar between margins. */
+    .notif-dropdown {
+        position: fixed; top: calc(var(--navbar-height) + var(--space-xs));
+        left: var(--space-md); right: var(--space-md); width: auto; max-width: none;
+    }
+
+    /* Toasts span the screen between even margins instead of a 300px box pinned to the right. */
+    .toast-container { top: calc(var(--navbar-height) + var(--space-sm)); left: var(--space-md); right: var(--space-md); max-width: none; }
+    .toast { min-width: 0; }
+}
+
+@media (max-width: 860px) and (prefers-reduced-motion: reduce) {
+    .sidebar, .sidebar.collapsed, .sidebar.mobile-open { transition: none; }
+}

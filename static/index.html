@@ -24,6 +24,8 @@
          ui-boot.js + the Interface switcher in the profile dropdown. -->
     <link rel="stylesheet" href="/static/css/redesign.css?v=20260825a" id="skin-v1" disabled>
     <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260825a" id="skin-v2">
+    <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
+    <link rel="stylesheet" href="/static/css/mobile.css?v=20260926a">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
     <!-- Auth boot: picks the first-paint screen from whether a session token is
          cached, so an expired/logged-out load never flashes the app shell. See
@@ -88,6 +90,7 @@
         <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
         <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
         <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
+        <symbol id="i-menu" viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></symbol>
         <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
     </svg>
 
@@ -216,6 +219,9 @@
     <div id="dashboard-screen" class="screen">
         <nav class="navbar">
             <div class="navbar-brand">
+                <button type="button" class="mobile-nav-toggle" id="mobile-nav-toggle" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                    <svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg>
+                </button>
                 <img src="/static/assets/logo-small.png" data-brand-logo alt="Logo" style="height: 32px; margin-right: var(--space-xs);">
                 <span data-brand-name>DockVault</span>
             </div>
@@ -354,6 +360,8 @@
                     </a>
                 </nav>
             </aside>
+            <!-- Phone width: the sidebar is a drawer; tapping outside it closes it. -->
+            <div class="sidebar-backdrop" id="sidebar-backdrop" hidden></div>
 
             <!-- Toast Notification Container -->
             <div id="toast-container" class="toast-container"></div>
@@ -673,9 +681,9 @@
                                                 <th class="col-check"><input type="checkbox" id="files-select-all" class="files-check" aria-label="Select all files"></th>
                                                 <th class="sortable" data-sort-key="name" role="button" tabindex="0" aria-sort="none">Name<span class="sort-ind" aria-hidden="true"></span></th>
                                                 <th class="col-num sortable" data-sort-key="size" role="button" tabindex="0" aria-sort="none">Size<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="sortable" data-sort-key="type" role="button" tabindex="0" aria-sort="none">Type<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="sortable" data-sort-key="modified" role="button" tabindex="0" aria-sort="none">Modified<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="sortable" data-sort-key="modified_by" role="button" tabindex="0" aria-sort="none">Modified by<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable col-meta" data-sort-key="type" role="button" tabindex="0" aria-sort="none">Type<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable col-meta" data-sort-key="modified" role="button" tabindex="0" aria-sort="none">Modified<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable col-meta" data-sort-key="modified_by" role="button" tabindex="0" aria-sort="none">Modified by<span class="sort-ind" aria-hidden="true"></span></th>
                                                 <th class="col-actions">Actions</th>
                                             </tr>
                                         </thead>

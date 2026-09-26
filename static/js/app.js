@@ -5135,7 +5135,7 @@ function renderUsersTable() {
                         <th class="col-toggle"></th>
                         <th>User</th>
                         <th>Role</th>
-                        <th>Departments</th>
+                        <th class="col-depts">Departments</th>
                         <th>Status</th>
                         <th>MFA</th>
                     </tr></thead>
@@ -5209,7 +5209,7 @@ function renderUserRow(u) {
                 </div>
             </td>
             <td><span class="badge badge-${u.role}">${u.role}</span></td>
-            <td><div class="chip-row">${groupChips}</div></td>
+            <td class="col-depts"><div class="chip-row">${groupChips}</div></td>
             <td><div class="badge-row">
                 <span class="badge badge-${u.is_active ? 'success' : 'secondary'}">${u.is_active ? 'Active' : 'Inactive'}</span>
                 ${u.is_locked ? `<span class="badge badge-warning">${iconSvg('lock', 'icon-sm')} Locked</span>` : ''}
@@ -11598,9 +11598,9 @@ function renderFilesTable(items, canWrite, tbody) {
                     </div>
                 </td>
                 <td class="col-num"><span class="file-size">—</span></td>
-                <td><span class="file-type">Uploading…</span></td>
-                <td><span class="file-modified">—</span></td>
-                <td><span class="file-modified-by">uploading${by}</span></td>
+                <td class="col-meta"><span class="file-type">Uploading…</span></td>
+                <td class="col-meta"><span class="file-modified">—</span></td>
+                <td class="col-meta"><span class="file-modified-by">uploading${by}</span></td>
                 <td class="col-actions"></td>
             </tr>`;
         }
@@ -11624,9 +11624,9 @@ function renderFilesTable(items, canWrite, tbody) {
                     </div>
                 </td>
                 <td class="col-num"><span class="file-size">${size}</span></td>
-                <td><span class="file-type">${escapeHtml(friendlyFileType(item))}</span></td>
-                <td><span class="file-modified">${formatModified(item.modified)}</span></td>
-                <td><span class="file-modified-by">${escapeHtml(isFolder ? '—' : (item.modified_by_name || '—'))}</span></td>
+                <td class="col-meta"><span class="file-type">${escapeHtml(friendlyFileType(item))}</span></td>
+                <td class="col-meta"><span class="file-modified">${formatModified(item.modified)}</span></td>
+                <td class="col-meta"><span class="file-modified-by">${escapeHtml(isFolder ? '—' : (item.modified_by_name || '—'))}</span></td>
                 <td class="col-actions"><div class="file-actions">${fileActionButtons(item, canWrite, { grid: false })}</div></td>
             </tr>`;
     }).join('');
@@ -14689,6 +14689,20 @@ function _renderPreviewTooLarge(bodyEl, fsize) {
     bodyEl.replaceChildren(wrap);
 }
 
+// A browser with no inline PDF viewer (Chrome on Android, for one) paints an empty frame for a PDF.
+// Say so, and point at Download, instead of fetching a file the page cannot show.
+function _renderPdfNotInline(bodyEl) {
+    const wrap = document.createElement('div');
+    wrap.className = 'preview-none text-center text-secondary p-xl';
+    const p1 = document.createElement('p');
+    p1.textContent = "This browser can't show PDFs inside the page.";
+    const p2 = document.createElement('p');
+    p2.className = 'text-sm';
+    p2.textContent = 'Use Download to open it in your PDF app.';
+    wrap.append(p1, p2);
+    bodyEl.replaceChildren(wrap);
+}
+
 // Preview a big Standard-vault text file from just its first window: fetch the leading bytes with a
 // Range request, read at most TEXT_WINDOW_FETCH_BYTES, then cancel the rest so nothing more is
 // buffered. Shows the window in a <pre> with a note that it is truncated. A trailing multi-byte UTF-8
@@ -14835,6 +14849,10 @@ async function openFilePreview(fileId, fileName, mime) {
             || _mt0.includes('pdf') || LARGE_MEDIA_EXTS.has(_ext0);
         if (_isMedia && _fsize > MEDIA_PREVIEW_MAX_BYTES) {
             _renderPreviewTooLarge(bodyEl, _fsize);
+            return;
+        }
+        if ((_mt0.includes('pdf') || _ext0 === 'pdf') && navigator.pdfViewerEnabled === false) {
+            _renderPdfNotInline(bodyEl);
             return;
         }
         const _isTextish = _mt0.startsWith('text/') || WINDOWABLE_TEXT_EXTS.has(_ext0);
@@ -21460,11 +21478,43 @@ document.addEventListener('DOMContentLoaded', () => {
             localStorage.setItem('sidebarCollapsed', sidebar.classList.contains('collapsed'));
         });
     }
-    
+
+    // Phone width: the sidebar is a drawer (mobile.css), opened by the menu button in the top bar and
+    // closed by choosing a section, tapping outside it, Escape, or widening past the breakpoint.
+    const mobileNavToggle = document.getElementById('mobile-nav-toggle');
+    const sidebarBackdrop = document.getElementById('sidebar-backdrop');
+    const mobileNavQuery = window.matchMedia('(max-width: 860px)');
+    const setMobileNav = (open) => {
+        if (!sidebar) return;
+        const on = !!open && mobileNavQuery.matches;
+        sidebar.classList.toggle('mobile-open', on);
+        if (sidebarBackdrop) sidebarBackdrop.hidden = !on;
+        if (mobileNavToggle) {
+            mobileNavToggle.setAttribute('aria-expanded', String(on));
+            mobileNavToggle.setAttribute('aria-label', on ? 'Close menu' : 'Open menu');
+        }
+        if (on) {
+            const current = sidebar.querySelector('.sidebar-item.active') || sidebar.querySelector('.sidebar-item');
+            if (current) current.focus({ preventScroll: true });
+        }
+    };
+    if (mobileNavToggle && sidebar) {
+        mobileNavToggle.addEventListener('click', () => setMobileNav(!sidebar.classList.contains('mobile-open')));
+        if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setMobileNav(false));
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && sidebar.classList.contains('mobile-open')) {
+                setMobileNav(false);
+                mobileNavToggle.focus();
+            }
+        });
+        mobileNavQuery.addEventListener('change', () => setMobileNav(false));
+    }
+
     // Sidebar item navigation
     document.querySelectorAll('.sidebar-item').forEach(item => {
         item.addEventListener('click', (e) => {
             e.preventDefault();
+            setMobileNav(false);
             const section = item.getAttribute('data-section');
 
             // Remember the section so a refresh restores it (and leaving a vault

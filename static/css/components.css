@@ -1197,26 +1197,8 @@ button.vault-sort-dir {
     }
 }
 
-/* Responsive */
+/* Responsive: the phone-width sidebar drawer lives in mobile.css, loaded after both skins. */
 @media (max-width: 768px) {
-    .sidebar {
-        position: fixed;
-        left: 0;
-        top: var(--navbar-height);
-        height: calc(100vh - var(--navbar-height));
-        transform: translateX(-100%);
-        box-shadow: var(--shadow-xl);
-    }
-    
-    .sidebar.mobile-open {
-        transform: translateX(0);
-    }
-    
-    .sidebar.collapsed {
-        width: 240px;
-        transform: translateX(-100%);
-    }
-    
     .main-content {
         width: 100%;
     }
@@ -1508,7 +1490,7 @@ button.vault-sort-dir {
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    padding: var(--spacing-xl);
+    padding: var(--space-xl);
     background: var(--primary);
     color: white;
     border-radius: var(--radius-lg);
@@ -1667,7 +1649,7 @@ button.vault-sort-dir {
 .monitor-events-container {
     background: var(--surface-0);
     border-radius: var(--radius-lg);
-    padding: var(--spacing-md);
+    padding: var(--space-md);
 }
 
 .monitor-event-item {
@@ -1691,9 +1673,9 @@ button.vault-sort-dir {
 
 .tabs {
     display: flex;
-    gap: var(--spacing-sm);
+    gap: var(--space-sm);
     border-bottom: 2px solid var(--surface-2);
-    margin-bottom: var(--spacing-lg);
+    margin-bottom: var(--space-lg);
     /* Keep the tab strip on ONE row and scroll horizontally when it overflows, instead of wrapping
        to several rows (which grew the strip's height and showed a vertical scrollbar). */
     flex-wrap: nowrap;
@@ -1702,7 +1684,7 @@ button.vault-sort-dir {
 }
 
 .tab-btn {
-    padding: var(--spacing-md) var(--spacing-lg);
+    padding: var(--space-md) var(--space-lg);
     background: transparent;
     border: none;
     border-bottom: 3px solid transparent;
@@ -1767,18 +1749,18 @@ details summary:hover {
     z-index: 10000;
     display: flex;
     flex-direction: column;
-    gap: var(--spacing-sm);
+    gap: var(--space-sm);
     max-width: 400px;
 }
 
 .toast {
     background: white;
     border-radius: var(--radius-lg);
-    padding: var(--spacing-md) var(--spacing-lg);
+    padding: var(--space-md) var(--space-lg);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     display: flex;
     align-items: center;
-    gap: var(--spacing-md);
+    gap: var(--space-md);
     animation: slideInRight 0.3s ease-out;
     border-left: 4px solid;
     min-width: 300px;
@@ -1868,8 +1850,8 @@ details summary:hover {
 .modal-footer {
     display: flex;
     justify-content: flex-end;
-    gap: var(--spacing-md);
-    padding: var(--spacing-lg);
+    gap: var(--space-md);
+    padding: var(--space-lg);
     border-top: 1px solid var(--surface-2);
 }
 
@@ -2363,3 +2345,7 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
 .audit-card-head { display: flex; align-items: center; gap: var(--space-xs); flex-wrap: wrap; }
 .audit-card-when { margin-left: auto; color: var(--text-3); font-size: var(--text-sm); }
 .audit-card-who { margin-top: 4px; color: var(--text-2); font-size: var(--text-sm); }
+
+/* Row-expand toggle in expandable tables: both skins style it as a bare icon, so drop the native
+   button border they never reset (it drew a bevelled box around the chevron). */
+.exp-toggle { border: 0; padding: 0; cursor: pointer; }

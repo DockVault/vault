@@ -1572,16 +1572,8 @@ button.chip:hover { filter: brightness(1.06); }
 .empty-state { text-align: center; color: var(--text-tertiary); font-size: var(--text-sm); }
 .empty-state .icon { color: var(--text-disabled); }
 
-/* ---- Responsive: collapse the rail to a horizontal strip on narrow screens ---- */
+/* ---- Responsive: the rail becomes a drawer on narrow screens (mobile.css) ---- */
 @media (max-width: 860px) {
-    .app-layout { flex-direction: column; height: auto; overflow: visible; }
-    .sidebar {
-        width: 100% !important; height: auto; position: static; transform: none;
-        flex-direction: row; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--line);
-    }
-    .sidebar-nav { flex-direction: row; margin-top: 0; padding: var(--space-xs) var(--space-sm); gap: var(--space-xs); }
-    .sidebar-toggle { display: none; }
-    .sidebar-item { white-space: nowrap; }
     .main-content { padding: var(--space-md); }
     .roles-summary { grid-template-columns: 1fr; }
     .groups-layout { grid-template-columns: 1fr; }
