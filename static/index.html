@@ -24,6 +24,7 @@
          ui-boot.js + the Interface switcher in the profile dropdown. -->
     <link rel="stylesheet" href="/static/css/redesign.css?v=20260926b" id="skin-v1" disabled>
     <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260926b" id="skin-v2">
+    <link rel="stylesheet" href="/static/css/activity.css?v=20260926a">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260926b">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
@@ -353,6 +354,10 @@
                     <a href="#" class="sidebar-item" data-section="monitor">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-activity"/></svg></span>
                         <span class="sidebar-text">Live Monitor</span>
+                    </a>
+                    <a href="#" class="sidebar-item admin-only" data-section="activity" style="display: none;">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-list"/></svg></span>
+                        <span class="sidebar-text">Activity</span>
                     </a>
                     <a href="#" class="sidebar-item admin-only" data-section="settings" style="display: none;">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-settings"/></svg></span>
@@ -1539,6 +1544,80 @@
                             </div>
                         </div>
                         <div id="monitor-pagination" class="audit-pagination mt-md"></div>
+                    </div>
+                </div>
+
+                <!-- Activity (administrators): what happened, who did it, and how it came in. The Events tab
+                     is the audit log, filterable by every kind of event. -->
+                <div id="activity-section" class="content-section">
+                    <div class="flex justify-between items-center mb-lg">
+                        <div>
+                            <h2 class="text-2xl font-bold">Activity</h2>
+                            <p class="text-secondary">What happened, who did it, and how it came in.</p>
+                        </div>
+                    </div>
+                    <div class="tabs mb-lg" role="tablist" aria-label="Activity views">
+                        <button class="tab-btn active" type="button" role="tab" id="activity-tabbtn-overview" data-activity-tab="overview" aria-selected="true" aria-controls="activity-tab-overview">Overview</button>
+                        <button class="tab-btn" type="button" role="tab" id="activity-tabbtn-events" data-activity-tab="events" aria-selected="false" aria-controls="activity-tab-events">Events</button>
+                    </div>
+
+                    <div id="activity-tab-overview" class="activity-tab" role="tabpanel" aria-labelledby="activity-tabbtn-overview">
+                        <p class="text-tertiary text-sm mb-md">The last 24 hours.</p>
+                        <div class="activity-stats" id="activity-stats"></div>
+                        <div class="card mt-lg">
+                            <div class="card-header"><h3 class="text-lg font-bold">Latest failures and refusals</h3></div>
+                            <div class="card-body" id="activity-overview-recent"></div>
+                        </div>
+                    </div>
+
+                    <div id="activity-tab-events" class="activity-tab" role="tabpanel" aria-labelledby="activity-tabbtn-events" hidden>
+                        <button type="button" class="btn btn-secondary activity-filters-toggle" id="activity-filters-toggle" aria-expanded="false" aria-controls="activity-filters">Filters</button>
+                        <form id="activity-filters" class="activity-filters" autocomplete="off">
+                            <details class="activity-pick" id="activity-pick-category">
+                                <summary><span class="activity-pick-label">Events</span> <span class="activity-pick-value" id="activity-pick-category-value">All</span></summary>
+                                <div class="activity-pick-list" id="activity-category-list"></div>
+                            </details>
+                            <details class="activity-pick" id="activity-pick-channel">
+                                <summary><span class="activity-pick-label">Channel</span> <span class="activity-pick-value" id="activity-pick-channel-value">All</span></summary>
+                                <div class="activity-pick-list" id="activity-channel-list"></div>
+                            </details>
+                            <label class="activity-field"><span>Status</span>
+                                <select class="form-control" id="activity-status">
+                                    <option value="">Any</option>
+                                    <option value="success">Succeeded</option>
+                                    <option value="authorized">Allowed</option>
+                                    <option value="failed">Failed or refused</option>
+                                </select>
+                            </label>
+                            <label class="activity-field"><span>User</span>
+                                <input class="form-control" type="search" id="activity-user" maxlength="128" placeholder="Any user, including failed sign-ins">
+                            </label>
+                            <label class="activity-field"><span>IP address</span>
+                                <input class="form-control" type="search" id="activity-ip" maxlength="64" placeholder="203.0.113.7 or 203.0.113.0/24">
+                            </label>
+                            <label class="activity-field"><span>Contains</span>
+                                <input class="form-control" type="search" id="activity-q" maxlength="128" placeholder="Text in the event">
+                            </label>
+                            <label class="activity-field"><span>From</span>
+                                <input class="form-control" type="datetime-local" id="activity-from">
+                            </label>
+                            <label class="activity-field"><span>To</span>
+                                <input class="form-control" type="datetime-local" id="activity-to">
+                            </label>
+                            <div class="activity-actions">
+                                <button type="submit" class="btn btn-primary" id="activity-search">Search</button>
+                                <button type="button" class="btn btn-ghost" id="activity-reset">Clear filters</button>
+                            </div>
+                        </form>
+                        <div class="activity-summary text-secondary text-sm" id="activity-summary" aria-live="polite"></div>
+                        <div class="data-table-wrapper activity-table-wrap">
+                            <table class="data-table activity-table">
+                                <thead><tr><th>When</th><th>Event</th><th>Who</th><th>Channel</th><th>Status</th><th>IP address</th></tr></thead>
+                                <tbody id="activity-rows"></tbody>
+                            </table>
+                        </div>
+                        <div class="activity-cards" id="activity-cards"></div>
+                        <div class="activity-more"><button type="button" class="btn btn-secondary" id="activity-more" hidden>Load more</button></div>
                     </div>
                 </div>
 
@@ -3998,6 +4077,18 @@
             </div>
 
             <!-- Audit event detail modal (80vw): left = the page's events (TOC), right = full detail -->
+            <div id="activity-event-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="activity-event-title">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3 id="activity-event-title">Event</h3>
+                        <button type="button" class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <dl class="activity-event-fields" id="activity-event-fields"></dl>
+                        <pre class="activity-event-details" id="activity-event-details" hidden></pre>
+                    </div>
+                </div>
+            </div>
             <div id="audit-event-modal" class="modal" role="dialog" aria-modal="true" aria-label="Audit event details">
                 <div class="modal-content audit-event-content">
                     <div class="modal-header">
@@ -4018,6 +4109,7 @@
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260923a"></script>
     <script src="/static/js/app.js?v=20260926b"></script>
+    <script src="/static/js/activity.js?v=20260926a"></script>
 </body>
 </html>
 

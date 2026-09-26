@@ -1,0 +1,100 @@
+/* Activity page. Shared by both skins; colours come from the theme tokens, so light and dark follow. */
+
+.activity-stats {
+    display: grid; gap: var(--space-md);
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.activity-stat {
+    display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-xs);
+    padding: var(--space-md); text-align: left; cursor: pointer;
+    background: var(--surface-0); color: var(--text-primary);
+    border: 1px solid var(--surface-3); border-radius: var(--radius-lg);
+}
+.activity-stat:hover { border-color: var(--brand-secondary); }
+.activity-stat:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.activity-stat-num { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.activity-stat-label { color: var(--text-secondary); font-size: var(--text-sm); }
+
+.activity-recent-row {
+    display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) auto; gap: var(--space-sm);
+    align-items: baseline; padding: var(--space-xs) 0; border-bottom: 1px solid var(--surface-3);
+}
+.activity-recent-row:last-child { border-bottom: 0; }
+
+/* Filters: dropdown checklists for events and channels, then plain fields. */
+.activity-filters {
+    display: grid; gap: var(--space-sm) var(--space-md); align-items: start;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    margin-bottom: var(--space-md);
+}
+.activity-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.activity-field > span, .activity-pick-label {
+    display: block; font-size: var(--text-xs); line-height: 1.4; color: var(--text-tertiary); font-weight: 600;
+}
+.activity-actions { align-self: end; }
+.activity-pick { position: relative; min-width: 0; }
+.activity-pick > summary {
+    list-style: none; cursor: pointer; display: flex; flex-direction: column; gap: 4px;
+}
+.activity-pick > summary::-webkit-details-marker { display: none; }
+.activity-pick-value {
+    display: block; padding: .45rem .6rem; border: 1px solid var(--surface-3); border-radius: var(--radius-md);
+    background: var(--surface-0); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.activity-pick[open] .activity-pick-value { border-color: var(--brand-secondary); }
+.activity-pick-list {
+    position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; min-width: 100%; max-width: min(320px, 90vw);
+    max-height: 320px; overflow-y: auto; padding: var(--space-xs);
+    background: var(--surface-0); border: 1px solid var(--surface-3); border-radius: var(--radius-md); box-shadow: var(--shadow-lg);
+}
+.activity-pick-item {
+    display: flex; align-items: center; gap: var(--space-sm); padding: .4rem .5rem; border-radius: var(--radius-sm);
+    color: var(--text-primary); cursor: pointer; white-space: nowrap;
+}
+.activity-pick-item:hover { background: var(--surface-2); }
+.activity-actions { display: flex; gap: var(--space-sm); flex-wrap: wrap; }
+
+.activity-filters-toggle { display: none; }
+.activity-summary { margin: var(--space-sm) 0; min-height: 1.2em; }
+
+/* Results: a table on wide screens, cards on narrow ones. */
+.activity-row { cursor: pointer; }
+.activity-row:focus-visible { outline: 2px solid var(--brand-secondary); outline-offset: -2px; }
+.activity-row.is-bad td:first-child { box-shadow: inset 3px 0 0 var(--error); }
+.activity-event { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.activity-event-label { font-weight: 600; color: var(--text-primary); }
+.activity-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.activity-ip { font-family: var(--font-mono, monospace); font-size: var(--text-sm); }
+.activity-cards { display: none; }
+.activity-card {
+    display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left; cursor: pointer;
+    padding: var(--space-sm) var(--space-md); margin-bottom: var(--space-sm);
+    background: var(--surface-0); color: var(--text-primary);
+    border: 1px solid var(--surface-3); border-radius: var(--radius-md);
+}
+.activity-card.is-bad { border-left: 3px solid var(--error); }
+.activity-card-head { display: flex; justify-content: space-between; gap: var(--space-sm); align-items: center; }
+.activity-more { display: flex; justify-content: center; margin: var(--space-md) 0; }
+
+.activity-event-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px var(--space-md); margin: 0; }
+.activity-event-fields dt { color: var(--text-tertiary); }
+.activity-event-fields dd { margin: 0; overflow-wrap: anywhere; }
+.activity-event-details {
+    margin-top: var(--space-md); padding: var(--space-sm); max-height: 40vh; overflow: auto;
+    background: var(--surface-1); border: 1px solid var(--surface-3); border-radius: var(--radius-md);
+    font-size: var(--text-sm); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+@media (max-width: 767px) {
+    .activity-table-wrap { display: none; }
+    .activity-cards { display: block; }
+    /* On a phone the filters fold behind a button, so the results are on the first screen. */
+    .activity-filters-toggle { display: inline-flex; margin-bottom: var(--space-sm); }
+    .activity-filters:not(.is-open) { display: none; }
+    .activity-filters { grid-template-columns: minmax(0, 1fr); }
+    /* An open checklist pushes the fields below it down instead of covering them. */
+    .activity-pick-list { position: static; max-width: none; max-height: none; margin-top: 4px; box-shadow: none; }
+    .activity-recent-row { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+    .activity-event-fields { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+    .activity-event-fields dd { margin-bottom: var(--space-xs); }
+}

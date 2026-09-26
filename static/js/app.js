@@ -21692,6 +21692,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadGroups().catch(err => console.error('Failed to load groups:', err));
                 } else if (section === 'monitor') {
                     initMonitor();
+                } else if (section === 'activity') {
+                    if (typeof initActivity === 'function') initActivity();
                 } else if (section === 'settings') {
                     initSettings();
                 } else if (section === 'dashboard') {
