@@ -55,6 +55,9 @@
 }
 
 @media (max-width: 640px) {
+    /* The same 16px page margin in both skins (Classic kept 24px, which a phone cannot spare). */
+    .main-content { padding: var(--space-md); }
+
     /* Section headers (a title, then a group of actions) wrap instead of squeezing the title and
        pushing the actions past the right edge; the actions then wrap among themselves. */
     .content-section > .flex.justify-between.items-center:first-child {
@@ -66,6 +69,7 @@
     /* File table: the type and modified columns go (the file's info panel shows them), so each row's
        actions are on screen, and a long name wraps instead of widening the table. */
     .files-table .col-meta { display: none; }
+    .files-table th, .files-table td { padding-left: .5rem; padding-right: .5rem; }
     .files-table td .file-name > span:last-child { white-space: normal; overflow-wrap: break-word; }
     .files-table th.col-check, .files-table td.col-check { width: 32px; padding-left: .35rem; padding-right: 0; }
     .files-table th.col-num, .files-table td.col-num { padding-left: .35rem; padding-right: .35rem; }

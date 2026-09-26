@@ -63,11 +63,19 @@ def _login(page: Page, user, skin: str, viewport=PHONE):
     assert applied == skin, f"skin {skin!r} did not apply (got {applied!r})"
 
 
+_DRAWER_OPEN = """() => {
+    const s = document.getElementById('sidebar'), r = s.getBoundingClientRect();
+    return s.classList.contains('mobile-open') && r.left >= 0 && getComputedStyle(s).visibility === 'visible';
+}"""
+
+
 def _drawer_open(page: Page) -> bool:
-    return page.evaluate("""() => {
-        const s = document.getElementById('sidebar'), r = s.getBoundingClientRect();
-        return s.classList.contains('mobile-open') && r.left >= 0 && getComputedStyle(s).visibility === 'visible';
-    }""")
+    return page.evaluate(_DRAWER_OPEN)
+
+
+def _wait_drawer_open(page: Page):
+    # It slides in over .2s; until then its left edge is still off screen.
+    page.wait_for_function(_DRAWER_OPEN, timeout=5000)
 
 
 def _go(page: Page, section: str):
@@ -89,7 +97,7 @@ def test_the_menu_button_opens_a_drawer_that_closes_on_every_exit(page: Page, ph
     expect(page.locator('.sidebar-item[data-section="vaults"]')).to_be_hidden()
 
     toggle.click()
-    assert _drawer_open(page)
+    _wait_drawer_open(page)
     expect(toggle).to_have_attribute("aria-expanded", "true")
     expect(page.locator("#sidebar-backdrop")).to_be_visible()
 
