@@ -54,12 +54,25 @@ def _normalize(addr: "ipaddress._BaseAddress") -> "ipaddress._BaseAddress":
     return addr
 
 
+# The longest text this parser accepts as one address: a bracketed IPv6 address with a port is at
+# most 47 + 6 characters. Anything longer is not an address, and must never reach the 45-character
+# ip_address column or become a per-IP throttle key.
+_MAX_IP_TOKEN = 56
+
+
 def _parse_ip(token: Optional[str]) -> Optional["ipaddress._BaseAddress"]:
     """Parse an XFF token (or peer host) to a normalized ip address, tolerating an optional
-    :port and [ipv6] wrapper. Returns None for a non-IP token (e.g. 'unknown', '_hidden')."""
+    :port and [ipv6] wrapper. Returns None for a non-IP token (e.g. 'unknown', '_hidden').
+
+    An IPv6 zone id (``fe80::1%eth0``) is refused: Python accepts any text after the ``%``, so a
+    forged hop could carry a value of any length that differs on every request, overflowing the
+    stored column and escaping every per-IP throttle. No client address that reaches a web server
+    carries one."""
     if not token:
         return None
     token = token.strip()
+    if len(token) > _MAX_IP_TOKEN or "%" in token:
+        return None
     candidates = [token]
     if token.startswith("[") and "]" in token:              # [::1] or [::1]:443
         candidates.append(token[1:token.index("]")])
@@ -88,7 +101,8 @@ def _is_trusted_peer(peer: Optional[str]) -> bool:
 def _real_client_from_xff(forwarded: str) -> Optional[str]:
     """Walk the X-Forwarded-For chain RIGHT-TO-LEFT and return the first entry that is a valid
     IP and NOT a trusted proxy — i.e. the real client. If every hop is trusted (all-internal
-    traffic) fall back to the left-most valid entry. Junk / non-IP tokens are skipped."""
+    traffic), return the hop nearest the peer: the left-most entry is whatever the client wrote,
+    so it could name any address inside the trusted range. Junk / non-IP tokens are skipped."""
     parsed = [_parse_ip(p) for p in forwarded.split(",")]
     parsed = [a for a in parsed if a is not None]
     if not parsed:
@@ -96,7 +110,21 @@ def _real_client_from_xff(forwarded: str) -> Optional[str]:
     for addr in reversed(parsed):
         if not _is_trusted_addr(addr):
             return str(addr)
-    return str(parsed[0])  # all hops trusted -> the originating (left-most) address
+    return str(parsed[-1])  # all hops trusted -> the hop our own proxy recorded
+
+
+def forwarded_for_chain(request) -> str:
+    """Every X-Forwarded-For line, joined in order into one chain. A proxy may ADD its own header
+    line instead of appending to the client's (HAProxy's ``option forwardfor`` does), and reading
+    only the first line would then hand the client-written line to the walk; RFC 9110 section 5.3
+    reads several lines as one comma-joined field."""
+    getlist = getattr(request.headers, "getlist", None)
+    if getlist is not None:
+        lines = getlist("X-Forwarded-For")
+    else:
+        one = request.headers.get("X-Forwarded-For")
+        lines = [one] if one else []
+    return ", ".join(line for line in lines if line)
 
 
 def client_ip(request) -> str:
@@ -107,7 +135,7 @@ def client_ip(request) -> str:
     behind a trusted proxy — can't spoof its IP). Falls back to the peer address, then
     'unknown'."""
     peer = request.client.host if request.client else None
-    forwarded = request.headers.get("X-Forwarded-For")
+    forwarded = forwarded_for_chain(request)
     if forwarded and _is_trusted_peer(peer):
         real = _real_client_from_xff(forwarded)
         if real:

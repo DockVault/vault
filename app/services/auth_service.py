@@ -415,7 +415,7 @@ class AuthService:
             RateLimitExceededError: If rate limit exceeded
             SessionLimitExceededError: If max sessions reached
         """
-        # Check rate limit. Keyed on the RAW submitted identifier (login:{identifier}), NOT the
+        # Check rate limit. Keyed on the RAW submitted identifier (login_user:{identifier}), NOT the
         # resolved username — the limiter must throttle a junk/never-resolving identifier too, and
         # keying on the resolved username would let an attacker spread attempts across the two
         # forms (username and email) of one account.
@@ -516,9 +516,9 @@ class AuthService:
         # The throttle bucket depends on the DOOR.
         #
         # WEB door (allow_device_credential=False): EVERY temp_ name — known or unknown, device-linked
-        # or not — goes through the full login throttle (login:<temp_username> + login:<ip>), the
+        # or not — goes through the full login throttle (login_user:<temp_username> + login_ip:<ip>), the
         # uniform login path. A per-kind bucket here is a status-code oracle: a known name's own
-        # bucket never touches login:<ip>, while an unknown name's IP leg does, so priming login:<ip>
+        # bucket never touches login_ip:<ip>, while an unknown name's IP leg does, so priming login_ip:<ip>
         # then made a known name's 401 and an unknown name's 429 an existence classifier. Uniform
         # closes it, and it still never reaches the device bucket, so a web attempt cannot drain a
         # device's SFTP budget and every temp_ name trips at the same count.
@@ -1843,8 +1843,8 @@ class AuthService:
 
     def _check_username_rate_limit(self, username: str):
         """Throttle a KNOWN temp_ credential that has no live device in its OWN per-username bucket
-        (`login:<username>`) at the login per-username limit — and NEVER charge the shared
-        `login:<ip>` bucket. A hand-out credential, or one whose device was deleted (device_id SET
+        (`login_user:<username>`) at the login per-username limit — and NEVER charge the shared
+        `login_ip:<ip>` bucket. A hand-out credential, or one whose device was deleted (device_id SET
         NULL), is still bounded, just in a bucket of its own, so a client looping on it cannot spend
         the human's per-IP login budget and lock the owner out. Same fail-closed posture as the login
         throttle: on a Redis outage it drops to the durable DB fallback, keyed by username."""
@@ -1853,7 +1853,7 @@ class AuthService:
         window = rate_limit_settings.effective("rate_limit_login_window_seconds")
         try:
             allowed, remaining, reset = rate_limiter.check_rate_limit(
-                f"login:{username}", user_limit, window,
+                f"login_user:{username}", user_limit, window,
                 prefix="rate_limit", fail_open=False,
             )
             if not allowed:
@@ -1879,7 +1879,7 @@ class AuthService:
         from app.core.rate_limiter import retry_after_seconds
         # Per-username limit.
         allowed_user, remaining_user, reset_user = rate_limiter.check_rate_limit(
-            f"login:{identifier}", user_limit, window,
+            f"login_user:{identifier}", user_limit, window,
             prefix="rate_limit", fail_open=False,
         )
         if not allowed_user:
@@ -1891,7 +1891,7 @@ class AuthService:
 
         # Per-IP limit (2x threshold).
         allowed_ip, remaining_ip, reset_ip = rate_limiter.check_rate_limit(
-            f"login:{ip_address}", ip_limit, window,
+            f"login_ip:{ip_address}", ip_limit, window,
             prefix="rate_limit", fail_open=False,
         )
         if not allowed_ip:

@@ -4890,8 +4890,9 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
 
     # (a) Rate limit — per IP AND per attempted username, both fail-closed (unauthenticated
     # account-creation surface; it must throttle even during a Redis outage). Distinct prefixes so the
-    # budgets don't collide with login (rate_limit:login:*) or invites (invite_accept_*). The username
-    # key is the raw submitted value (lowered), so even a never-existing name is throttled.
+    # budgets don't collide with login (rate_limit:login_user:* / rate_limit:login_ip:*) or invites
+    # (invite_accept_*). The username key is the raw submitted value (lowered), so even a
+    # never-existing name is throttled.
     for ident, pfx, lim in ((client_ip, "signup_ip", settings.rate_limit_api_auth),
                             (uname.strip().lower(), "signup_identifier", 5)):
         try:
@@ -22465,9 +22466,14 @@ if __name__ == "__main__":
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
-        # Do not advertise the server software. uvicorn adds its `Server:` header
-        # at the transport layer, below the app, so a response-header middleware cannot strip it — it
-        # has to be turned off here in the server config.
+        # Do not advertise the server software. uvicorn adds its `Server:` header at the transport
+        # layer, below the app, so a response-header middleware cannot strip it — it has to be turned
+        # off here in the server config.
         server_header=False,
+        # One parser decides the client address: app.core.net_utils, from TRUSTED_PROXIES. uvicorn's
+        # own proxy-header handling trusts X-Forwarded-For from 127.0.0.1 by default and rewrites the
+        # peer before the app sees it, so a loopback peer's header would be believed even with no
+        # trusted proxy configured.
+        proxy_headers=False,
         **ssl_config
     )
