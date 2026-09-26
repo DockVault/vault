@@ -15,7 +15,7 @@
         error: 'Failed', refused: 'Refused', active: 'Active', revoked: 'Revoked', unconfirmed: 'Unconfirmed',
     };
 
-    const state = { catalog: null, events: [], cursor: null, total: null, loading: false, wired: false };
+    const state = { catalog: null, events: [], cursor: null, total: null, loading: false, wired: false, seq: 0, params: new URLSearchParams() };
 
     const $ = (id) => document.getElementById(id);
 
@@ -139,7 +139,7 @@
             body.appendChild(tr);
             cards.appendChild(_el('p', 'text-secondary text-center py-xl', 'No events match these filters.'));
         }
-        const active = Array.from(filterParams().keys()).length;
+        const active = Array.from(state.params.keys()).length;
         $('activity-filters-toggle').textContent = active ? `Filters (${active})` : 'Filters';
         const shown = state.events.length;
         const summary = state.total == null ? `${shown} shown`
@@ -148,16 +148,21 @@
         $('activity-more').hidden = !state.cursor;
     }
 
+    // A new search replaces any still in flight; its reply is the one shown. "Load more" continues the
+    // results on screen with the filters they were searched with, not whatever the fields now hold.
     async function search(append) {
-        if (state.loading) return;
+        if (append && (state.loading || !state.cursor)) return;
+        const seq = ++state.seq;
         state.loading = true;
         const btn = $('activity-more');
         btn.disabled = true;
         try {
-            const p = filterParams();
+            if (!append) state.params = filterParams();
+            const p = new URLSearchParams(state.params);
             p.set('limit', '50');
-            if (append && state.cursor) p.set('cursor', state.cursor);
+            if (append) p.set('cursor', state.cursor);
             const data = await apiRequest('/activity/events?' + p.toString());
+            if (seq !== state.seq) return;          // a newer search has replaced this one
             if (append) {
                 state.events = state.events.concat(data.events || []);
             } else {
@@ -167,10 +172,13 @@
             state.cursor = data.next_cursor || null;
             renderRows(append);
         } catch (e) {
+            if (seq !== state.seq) return;
             $('activity-summary').textContent = 'The events could not be loaded: ' + ((e && e.message) || 'unknown error');
         } finally {
-            state.loading = false;
-            btn.disabled = false;
+            if (seq === state.seq) {
+                state.loading = false;
+                btn.disabled = false;
+            }
         }
     }
 
