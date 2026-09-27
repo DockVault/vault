@@ -824,7 +824,9 @@ async function apiRequest(endpoint, options = {}) {
                     console.warn('Permission denied:', endpoint);
                     showPermissionDenied(errorDetail || 'You do not have permission to perform this action.');
                 }
-                throw new Error(errorDetail || 'Permission denied');
+                const err = new Error(errorDetail || 'Permission denied');
+                err.status = 403;  // a refusal, which callers may tell apart from a failure
+                throw err;
             }
         }
         
@@ -14156,16 +14158,19 @@ async function zkMaybePromptPendingInvites() {
 // Whether the signed-in user holds this zero-knowledge vault's CURRENT key, and whether the vault
 // owes a key rotation (someone was removed without one). Asked fresh, not from the DEK cache: both
 // answers change when someone else removes a member or rotates. The server reports rekey_owed only
-// to a key holder. Any failure reads as "not a holder", which is the safe side: the caller then
-// removes access without rotating, and the vault asks its key holders to rotate.
+// to a key holder. A refusal (403) is an answer: the server turns away only someone with no key or
+// membership in this vault, and they hold no key. Any other failure leaves the answer unknown and
+// is thrown, so that a key holder whose check failed is never taken for someone without the key.
 async function zkVaultKeyStatus(vaultId) {
+    let keys;
     try {
-        const keys = await apiRequest(`/ecc/vaults/${vaultId}/keys`, { silent: true });
-        const holdsKey = !!(keys && keys.has_access);
-        return { holdsKey, rekeyOwed: holdsKey && !!keys.rekey_owed };
-    } catch (_) {
-        return { holdsKey: false, rekeyOwed: false };
+        keys = await apiRequest(`/ecc/vaults/${vaultId}/keys`, { silent: true });
+    } catch (e) {
+        if (e && e.status === 403) return { holdsKey: false, rekeyOwed: false };
+        throw e;
     }
+    const holdsKey = !!(keys && keys.has_access);
+    return { holdsKey, rekeyOwed: holdsKey && !!keys.rekey_owed };
 }
 
 // The notice a key holder sees when their zero-knowledge vault owes a rotation: someone was removed
@@ -14181,7 +14186,12 @@ async function refreshZkRekeyNotice() {
     box.hidden = true;
     if (!vault || !isZkVault(vault) || !state.canManageCurrentVault
         || !vaultCapAllowed('vault.change_permissions')) return;
-    const status = await zkVaultKeyStatus(vault.id);
+    let status;
+    try {
+        status = await zkVaultKeyStatus(vault.id);
+    } catch (_) {
+        return;   // unknown: show nothing; the notice is checked again when the vault is next opened
+    }
     // Another vault may have been opened while the answer was on its way.
     if (!state.currentVault || state.currentVault.id !== vault.id) return;
     if (!status.holdsKey || !status.rekeyOwed) return;
@@ -18169,7 +18179,18 @@ async function revokeVaultPermission(userId) {
     // Anyone else who may manage the vault removes the access alone: the server switches off the
     // member's keys, and the vault asks its key holders to rotate (see refreshZkRekeyNotice).
     const self = String(userId) === String(currentUser.id);
-    const rotate = zk && !self && (await zkVaultKeyStatus(state.currentVault.id)).holdsKey;
+    let rotate = false;
+    if (zk && !self) {
+        // Removing without a rotation is the weaker path, so it is taken only when the answer is
+        // that this user does not hold the key, never because the check itself failed.
+        try {
+            rotate = (await zkVaultKeyStatus(state.currentVault.id)).holdsKey;
+        } catch (_) {
+            showError("Nothing was changed: whether you hold this vault's key could not be "
+                + 'checked. Please try again.');
+            return;
+        }
+    }
     let message = 'Are you sure you want to revoke access for this user?';
     if (rotate) {
         message = 'Revoke access? The vault key will be rotated so this user can no longer open '

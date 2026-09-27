@@ -11,15 +11,22 @@ drives both with real crypto:
     rotation that removes nobody -- in a direct vault and in a team (hierarchical) vault, where it
     has to replace the team keypair. Afterwards the notice is gone and the holder's browser can
     still unwrap the new key, so the wrap it wrote for them is usable, not merely stored.
+
+And three things that must not happen: the notice is not shown to a key holder who may not manage
+the vault; a removal whose key check fails removes nobody (removing without a rotation is the weaker
+path, taken only when the answer is that the remover holds no key); and a key holder removing
+themselves never rotates. Where no browser has to open a vault's key, these use stand-in wraps.
 """
 
 from __future__ import annotations
+
+import re
 
 import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import (
-    ApiClient, BASE_URL, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, ensure_ecc_keypair,
+    ApiClient, BASE_URL, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, create_zk_vault, ensure_ecc_keypair,
 )
 from test_ui_e2e import _create_zk_vault_via_ui, _login, _u
 
@@ -182,5 +189,216 @@ def test_the_notice_rotates_a_team_vault_whose_member_was_removed_without_a_rota
         for v in vids:
             co.delete_vault(v)
         for person in (owner, member):
+            admin.delete_user(person["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+# --------------------------------------------------------------------------- what must not happen
+
+ROTATION_REQUESTS = ("/member-keys", "/rekey")   # a rotation's first request, and its last
+
+
+def _watch_rotations(page: Page) -> list:
+    seen = []
+    page.on("request", lambda req: seen.append(req.url)
+            if any(part in req.url for part in ROTATION_REQUESTS) else None)
+    return seen
+
+
+def _stub_share(owner_client, vault_id: str, person: dict, level: str):
+    """Share the way the web app does (wrap the key, then grant access), with a stand-in wrap."""
+    owner_client.post(f"/ecc/vaults/{vault_id}/members", json={
+        "user_id": person["id"], "wrapped_dek": ZK_WRAPPED_DEK_STUB,
+        "ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
+    owner_client.post(f"/vaults/{vault_id}/permissions",
+                      json={"user_id": person["id"], "level": level}).raise_for_status()
+
+
+def _listed(owner_client, vault_id: str) -> set:
+    return {p["user_id"] for p in owner_client.get(f"/vaults/{vault_id}/permissions").json()}
+
+
+def test_the_notice_is_not_shown_to_a_key_holder_who_cannot_manage_the_vault(browser, admin):
+    """A member with read access holds the key, and the vault owes a rotation. The server reports it
+    to them, as to every key holder; the notice is still not theirs, since its button rotates the
+    key and that needs the right to manage the vault."""
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    owner, reader, gone = (admin.create_user(role="user") for _ in range(3))
+    co, cr, cg = _client(owner), _client(reader), _client(gone)
+    ctx = browser.new_context(base_url=BASE_URL)
+    page = ctx.new_page()
+    vid = vid_r = None
+    try:
+        ensure_ecc_keypair(co)
+        vid = create_zk_vault(co)["id"]
+        _login(page, reader["_username"], reader["_password"])
+        vid_r = _create_zk_vault_via_ui(page, cr, "passphrase-R-123")   # sets up the reader's key
+        _stub_share(co, vid, reader, "read")
+        ensure_ecc_keypair(cg)
+        _stub_share(co, vid, gone, "read")
+        admin.delete(f"/vaults/{vid}/permissions/{gone['id']}").raise_for_status()
+        keys = cr.get(f"/ecc/vaults/{vid}/keys").json()
+        assert keys["has_access"] is True and keys["rekey_owed"] is True, keys
+
+        _open_vault(page, vid)
+        # The open refreshes the notice without waiting for it; run that refresh to its end here.
+        page.evaluate("() => refreshZkRekeyNotice()")
+        expect(page.locator("#vault-rekey-notice")).to_be_hidden()
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+        if vid:
+            co.delete_vault(vid)
+        if vid_r:
+            cr.delete_vault(vid_r)
+        for person in (owner, reader, gone):
+            admin.delete_user(person["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+def test_a_removal_whose_key_check_fails_removes_nobody(browser, admin):
+    """Whether the remover holds the key decides between rotating and removing alone. When reading
+    that fails -- the network drops, or the server errs -- the app cannot know which applies, so it
+    removes nobody and says nothing was changed, rather than take a key holder for someone without
+    the key and remove without the rotation they could have run. A refusal is different: the server
+    refuses the key check only to someone with no key in the vault, so it is an answer, and the
+    removal goes ahead without a rotation. Once the check answers again, the same click rotates and
+    removes."""
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    owner, member, other = (admin.create_user(role="user") for _ in range(3))
+    co, cx, cy = _client(owner), _client(member), _client(other)
+    ctx = browser.new_context(base_url=BASE_URL)
+    page = ctx.new_page()
+    vid = None
+    try:
+        _login(page, owner["_username"], owner["_password"])
+        vid = _create_zk_vault_via_ui(page, co, "passphrase-F-123")
+        for person, client in ((member, cx), (other, cy)):
+            ensure_ecc_keypair(client)
+            _stub_share(co, vid, person, "read")
+        _open_vault(page, vid)
+        page.click('[data-vault-tab="permissions"]')
+        revoke = page.locator(f'button[data-action="revoke-permission"][data-user-id="{member["id"]}"]')
+        expect(revoke).to_be_visible(timeout=10000)
+
+        writes = []   # a removal, or any step of a rotation
+        page.on("request", lambda req: writes.append(f"{req.method} {req.url}")
+                if (req.method == "DELETE" and "/permissions/" in req.url)
+                or any(p in req.url for p in ROTATION_REQUESTS) else None)
+        keys_url = re.compile(rf"/ecc/vaults/{vid}/keys(\?|$)")
+        toasts = page.locator("#toast-container .toast")
+        failures = {
+            "the network drops": lambda route: route.abort(),
+            "the server errs": lambda route: route.fulfill(
+                status=500, content_type="application/json", body='{"detail": "unavailable"}'),
+        }
+        for how, fail in failures.items():
+            expect(toasts).to_have_count(0, timeout=15000)
+            page.route(keys_url, fail)
+            revoke.click()
+            expect(page.locator("#toast-container .toast-error")).to_contain_text(
+                "Nothing was changed", timeout=10000)
+            expect(page.locator("#confirm-modal")).to_be_hidden()
+            page.unroute(keys_url)
+            assert writes == [], f"when {how}, the app still acted: {writes}"
+        assert {member["id"], other["id"]} <= _listed(co, vid)
+        assert cx.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
+
+        # A refusal (here a stand-in 403, as the server gives someone with no key in the vault) is
+        # an answer: the other member is removed without a rotation.
+        page.route(keys_url, lambda route: route.fulfill(
+            status=403, content_type="application/json",
+            body='{"detail": "No access to this vault\'s keys"}'))
+        page.click(f'button[data-action="revoke-permission"][data-user-id="{other["id"]}"]')
+        expect(page.locator("#confirm-modal-message")).to_contain_text(
+            "You don't hold this vault's key", timeout=10000)
+        page.click("#confirm-modal-confirm-btn")
+        for _ in range(40):
+            if other["id"] not in _listed(co, vid):
+                break
+            page.wait_for_timeout(250)
+        else:
+            pytest.fail("a refused key check stopped the removal")
+        page.unroute(keys_url)
+        assert [w for w in writes if not w.startswith("DELETE")] == [], (
+            f"a rotation was attempted without the key: {writes}")
+        assert cy.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is False
+        del writes[:]
+
+        # The control: with the check answering, the owner (who holds the key) rotates and removes.
+        revoke.click()
+        expect(page.locator("#confirm-modal-message")).to_contain_text(
+            "The vault key will be rotated", timeout=10000)
+        page.click("#confirm-modal-confirm-btn")
+        for _ in range(60):
+            if member["id"] not in _listed(co, vid):
+                break
+            page.wait_for_timeout(250)
+        else:
+            pytest.fail("the member was never removed once the check worked")
+        assert any("/rekey" in w for w in writes), f"no rotation ran: {writes}"
+        assert co.get(f"/ecc/vaults/{vid}/keys").json()["current_dek_version"] == 2
+        assert cx.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is False
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+        if vid:
+            co.delete_vault(vid)
+        for person in (owner, member, other):
+            admin.delete_user(person["id"])
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+
+
+def test_a_key_holder_removing_themselves_never_rotates(browser, admin):
+    """An administrator who is a member and holds the key removes their own access. Whoever rotates
+    learns the new key, so a rotation that removes the person running it would leave them holding
+    the key to files added after they left (the server refuses it as well). The app asks whether to
+    remove them, never starts a rotation, and the vault is left owing one."""
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    owner = admin.create_user(role="user")
+    leaver = admin.create_user(role="admin")
+    co, cl = _client(owner), _client(leaver)
+    ctx = browser.new_context(base_url=BASE_URL)
+    page = ctx.new_page()
+    vid = vid_l = None
+    try:
+        ensure_ecc_keypair(co)
+        vid = create_zk_vault(co)["id"]
+        _login(page, leaver["_username"], leaver["_password"])
+        vid_l = _create_zk_vault_via_ui(page, cl, "passphrase-L-123")   # sets up the leaver's key
+        _stub_share(co, vid, leaver, "manage")
+        assert cl.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
+
+        rotations = _watch_rotations(page)
+        _open_vault(page, vid)
+        page.click('[data-vault-tab="permissions"]')
+        page.click(f'button[data-action="revoke-permission"][data-user-id="{leaver["id"]}"]')
+        expect(page.locator("#confirm-modal")).to_be_visible(timeout=10000)
+        expect(page.locator("#confirm-modal-message")).to_contain_text("Remove your own access?")
+        page.click("#confirm-modal-confirm-btn")
+
+        for _ in range(40):
+            if leaver["id"] not in _listed(co, vid):
+                break
+            page.wait_for_timeout(250)
+        else:
+            pytest.fail("the administrator's access was never removed")
+        assert rotations == [], f"removing themselves started a rotation: {rotations}"
+        assert cl.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is False
+        assert co.get(f"/ecc/vaults/{vid}/keys").json()["rekey_owed"] is True
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+        if vid:
+            co.delete_vault(vid)
+        if vid_l:
+            cl.delete_vault(vid_l)
+        for person in (owner, leaver):
             admin.delete_user(person["id"])
         admin.put("/settings", json={"zero_knowledge_enabled": False})
