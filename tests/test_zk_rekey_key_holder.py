@@ -13,7 +13,12 @@ in a direct vault, a team private key at team_key_version in a hierarchical one 
 vault row lock the rotation already takes. And because the caller learns the new key, they must be
 one of the members it is wrapped for: nobody rotates themselves out.
 
-This file drives the real handler (without its permission decorators, which the live tests cover)
+The same holds for handing out key material that members will then use: sharing the vault key with
+a new member (POST /ecc/vaults/{id}/members), which already required *a* key and now requires the
+current one, and minting or extending the name-index key (PUT /ecc/vaults/{id}/index-key), which
+required only management rights.
+
+This file drives the real handlers (without their permission decorators, which the live tests cover)
 against the real tables in a throwaway SQLite database. test_zk_rekey_key_holder_live.py drives the
 route on a running deployment, including the lock under a real concurrent removal.
 """
@@ -37,7 +42,7 @@ set_bare_api_env()
 from app.api import ecc_router as E  # noqa: E402
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO  # noqa: E402
 from app.core.models import (  # noqa: E402
-    RoleEnum, User, UserKeyPair, Vault, VaultMemberKey, vault_members,
+    RoleEnum, User, UserKeyPair, Vault, VaultMemberIndexKey, VaultMemberKey, vault_members,
 )
 
 pytestmark = pytest.mark.unit
@@ -45,6 +50,8 @@ pytestmark = pytest.mark.unit
 # The route's own function, below its two permission decorators (endpoint group + temp-credential
 # scope). Those are exercised by the live tests; what is under test here is the handler's decision.
 REKEY = inspect.unwrap(E.rekey_vault)
+GRANT = inspect.unwrap(E.grant_member_key)
+PUT_INDEX_KEY = inspect.unwrap(E.put_vault_index_key)
 
 NOT_A_HOLDER = E._NOT_A_KEY_HOLDER
 MUST_REMAIN = "must remain a member"
@@ -77,7 +84,8 @@ def Session(monkeypatch):
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'zk.db'}",
                                   connect_args={"check_same_thread": False})
         for table in (User.__table__, Vault.__table__, vault_members,
-                      VaultMemberKey.__table__, UserKeyPair.__table__):
+                      VaultMemberKey.__table__, UserKeyPair.__table__,
+                      VaultMemberIndexKey.__table__):
             table.create(engine)
         # The application's own session flags (app/core/database.py).
         yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -371,3 +379,119 @@ def test_a_non_holder_is_refused_before_the_body_is_used(Session):
     assert "epoch" not in stale.detail
     bad_shape = _refused(Session, vid, admin, E.RekeyRequest(from_version=2, to_version=9, member_keys=[]))
     assert bad_shape.status_code == 403 and bad_shape.detail == NOT_A_HOLDER
+
+
+# --------------------------------------------------------------------------- handing out key material
+
+def _call(Session, handler, caller, **kwargs):
+    s = Session()
+    try:
+        user = s.query(User).filter(User.id == caller).first()
+        return run_coroutine(handler(current_user=user, db=s, **kwargs))
+    finally:
+        s.close()
+
+
+def _new_person(Session):
+    s = Session()
+    uid = _person(s)
+    s.commit()
+    s.close()
+    return uid
+
+
+def _rows_for(Session, vid, user_id):
+    s = Session()
+    try:
+        return s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid,
+                                              VaultMemberKey.user_id == user_id).count()
+    finally:
+        s.close()
+
+
+def _direct_share(target):
+    return E.GrantMemberKeyRequest(user_id=str(target), wrapped_dek="w", ephemeral_public_key="e")
+
+
+def _team_share(target):
+    return E.GrantMemberKeyRequest(user_id=str(target), wrapped_team_privkey="w",
+                                   team_ephemeral_public_key="e")
+
+
+def test_sharing_needs_the_current_key_not_just_a_key(Session):
+    """A Manager whose only active row is from an older epoch does not hold the key in use now, so
+    whatever they wrap for a new member is not it -- and members use what they are given."""
+    vid, _, manager, _ = _direct_vault(Session, epoch=2)
+    s = Session()
+    s.query(VaultMemberKey).filter(VaultMemberKey.user_id == manager,
+                                   VaultMemberKey.key_version == 2).delete()
+    s.commit()
+    s.close()
+    target = _new_person(Session)
+    with pytest.raises(HTTPException) as exc:
+        _call(Session, GRANT, manager, vault_id=str(vid), request=_direct_share(target))
+    assert exc.value.status_code == 403 and "current key" in exc.value.detail
+    assert _rows_for(Session, vid, target) == 0, "a refused share still stored a key"
+
+
+def test_sharing_by_a_holder_of_the_current_key_works(Session):
+    vid, _, manager, _ = _direct_vault(Session, epoch=2)
+    target = _new_person(Session)
+    out = _call(Session, GRANT, manager, vault_id=str(vid), request=_direct_share(target))
+    assert out["status"] == "ok" and out["key_version"] == 2
+
+
+def test_sharing_a_hierarchical_vault_needs_the_current_team_key(Session):
+    vid, _, manager, _ = _hier_vault(Session, team_epoch=2)
+    target = _new_person(Session)
+    assert _call(Session, GRANT, manager, vault_id=str(vid),
+                 request=_team_share(target))["key_version"] == 2
+    s = Session()
+    s.query(VaultMemberKey).filter(VaultMemberKey.user_id == manager,
+                                   VaultMemberKey.key_version == 2).delete()
+    s.commit()
+    s.close()
+    other = _new_person(Session)
+    with pytest.raises(HTTPException) as exc:
+        _call(Session, GRANT, manager, vault_id=str(vid), request=_team_share(other))
+    assert exc.value.status_code == 403
+    assert _rows_for(Session, vid, other) == 0
+
+
+def _index_wraps(*user_ids):
+    return E.IndexKeyPut(wraps=[E.IndexKeyWrap(user_id=str(u), encrypted_index_key="k",
+                                               ephemeral_public_key="e") for u in user_ids])
+
+
+def _index_rows(Session, vid):
+    s = Session()
+    try:
+        return s.query(VaultMemberIndexKey).filter(VaultMemberIndexKey.vault_id == vid).count()
+    finally:
+        s.close()
+
+
+def test_an_admin_without_the_key_cannot_mint_the_name_index_key(Session):
+    """The name-index key is one every member then uses for the names they write. Whoever mints it
+    knows it, and with the stored indices can confirm a guessed file name."""
+    vid, owner, manager, admin = _direct_vault(Session)
+    with pytest.raises(HTTPException) as exc:
+        _call(Session, PUT_INDEX_KEY, admin, vault_id=str(vid), body=_index_wraps(owner, manager))
+    assert exc.value.status_code == 403 and "holds this vault's key" in exc.value.detail
+    assert _index_rows(Session, vid) == 0
+
+    out = _call(Session, PUT_INDEX_KEY, owner, vault_id=str(vid), body=_index_wraps(owner, manager))
+    assert out["status"] == "ok" and _index_rows(Session, vid) == 2
+
+
+def test_a_key_from_an_older_epoch_only_cannot_mint_the_name_index_key(Session):
+    vid, _, manager, _ = _hier_vault(Session, team_epoch=2)
+    s = Session()
+    s.query(VaultMemberKey).filter(VaultMemberKey.user_id == manager,
+                                   VaultMemberKey.key_version == 2).delete()
+    s.commit()
+    s.close()
+    with pytest.raises(HTTPException) as exc:
+        _call(Session, PUT_INDEX_KEY, manager, vault_id=str(vid), body=_index_wraps(manager))
+    assert exc.value.status_code == 403
+    assert _index_rows(Session, vid) == 0

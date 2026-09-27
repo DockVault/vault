@@ -1052,7 +1052,9 @@ async def put_vault_index_key(
     Authorization is the vault-management gate, not mere read access: handing a member a wrap binds
     who can compute this vault's name indices, which is the same class of decision as granting a
     DEK. Adding a wrap of the RIGHT key is trusted to the manager, exactly as a DEK re-wrap on share
-    is -- the server holds only opaque wraps and cannot check the plaintext key.
+    is -- the server holds only opaque wraps and cannot check the plaintext key. And, as for a DEK
+    re-wrap, the caller must hold the vault's current key: management rights alone do not make
+    someone a party to the vault's keys.
     """
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -1061,6 +1063,17 @@ async def put_vault_index_key(
     if not _can_manage_vault(db, vault, current_user):
         raise HTTPException(status_code=403,
                             detail="Only the vault owner or a manager can set the name-index key")
+    # The key minted here is one members then use for every name they write, so its minter learns
+    # it -- and with it can confirm guessed names against the stored indices. Minting (or handing out
+    # a wrap) is for someone who holds the vault's key, checked under the vault row lock like a
+    # rotation (see _holds_current_key). The lock is held to the commit below.
+    locked = (db.query(Vault).populate_existing()
+              .filter(Vault.id == vault_id).with_for_update().first())
+    if locked is None:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if not _holds_current_key(db, locked, current_user.id):
+        raise HTTPException(status_code=403,
+                            detail="Only someone who holds this vault's key can set its name-index key")
 
     # Validate every user_id up front so a malformed one is a clean 400, not a partial write.
     incoming = []
@@ -1343,11 +1356,32 @@ async def grant_member_key(
                 detail="Only the vault owner or an admin can re-wrap a manager's key",
             )
 
+    # Re-read the vault under a row lock before deciding the epoch, so a rotation cannot
+    # commit between the read and the upsert. populate_existing() is load-bearing: this
+    # session already holds the row from the entry read, and without it the identity map
+    # hands back the stale instance -- the lock would be taken and the value compared
+    # would still predate it.
+    #
+    # The lock alone is not sufficient anyway: it stops the value moving during the write,
+    # not the client's blob being older than the value we read. The declared epoch below
+    # is the actual fix; the lock is what makes checking it meaningful.
+    locked = (db.query(Vault).populate_existing()
+              .filter(Vault.id == vault_id).with_for_update().first())
+    if locked is None:
+        # Hard-deleted between the entry read and here. Saying 404 is honest; defaulting
+        # the epoch to 1 would answer a 409 naming an epoch that no longer exists.
+        raise HTTPException(status_code=404, detail="Vault not found")
+    # The granter hands out the key in use NOW, so they must hold it at the current epoch -- a
+    # row only at an older epoch is not that key, and the check above accepts any epoch. Under the
+    # lock, for the same reason as the rotation's check (see _holds_current_key).
+    if not _holds_current_key(db, locked, current_user.id):
+        raise HTTPException(status_code=403, detail="You don't hold this vault's current key")
+
     # HIERARCHICAL: store the recipient's wrap of the TEAM PRIVATE key at the current TEAM
     # epoch — O(1), the DEK is not touched. DIRECT: store the DEK wrapped to the recipient at
     # the current DEK epoch. Either way, upsert keyed by (vault, user, key_version) (the
     # table's uniqueness) so re-sharing refreshes the current-epoch row in place.
-    if _is_hierarchical(vault):
+    if _is_hierarchical(locked):
         if not (request.wrapped_team_privkey and request.team_ephemeral_public_key):
             raise HTTPException(
                 status_code=400,
@@ -1359,7 +1393,7 @@ async def grant_member_key(
                 detail=("dek_version does not apply to a hierarchical vault; its member rows "
                         "are keyed by the team epoch. Omit it."),
             )
-        epoch = getattr(vault, 'team_key_version', 1) or 1
+        epoch = getattr(locked, 'team_key_version', 1) or 1
         blob, eph, algo = request.wrapped_team_privkey, request.team_ephemeral_public_key, TEAMPRIV_ALGO
     else:
         if not (request.wrapped_dek and request.ephemeral_public_key):
@@ -1367,21 +1401,6 @@ async def grant_member_key(
                 status_code=400,
                 detail="This vault uses direct wrapping; supply wrapped_dek + ephemeral_public_key.",
             )
-        # Re-read the vault under a row lock before deciding the epoch, so a rotation cannot
-        # commit between the read and the upsert. populate_existing() is load-bearing: this
-        # session already holds the row from the entry read, and without it the identity map
-        # hands back the stale instance -- the lock would be taken and the value compared
-        # would still predate it.
-        #
-        # The lock alone is not sufficient anyway: it stops the value moving during the write,
-        # not the client's blob being older than the value we read. The declared epoch below
-        # is the actual fix; the lock is what makes checking it meaningful.
-        locked = (db.query(Vault).populate_existing()
-                  .filter(Vault.id == vault_id).with_for_update().first())
-        if locked is None:
-            # Hard-deleted between the entry read and here. Saying 404 is honest; defaulting
-            # the epoch to 1 would answer a 409 naming an epoch that no longer exists.
-            raise HTTPException(status_code=404, detail="Vault not found")
         epoch = getattr(locked, 'dek_version', 1) or 1
         if request.dek_version is not None and request.dek_version != epoch:
             raise HTTPException(

@@ -4,7 +4,8 @@ The rule itself, in both wrapping modes and at every epoch edge, is driven again
 test_zk_rekey_key_holder.py. This file drives the route: a global admin who manages every vault but
 was never given this one's key is refused, the owner is not, and a removal done WITHOUT a rotation
 (which is what the web app now does when the person removing a member does not hold the key) leaves
-the vault reporting rekey_owed to its key holder until they rotate.
+the vault reporting rekey_owed to its key holder until they rotate. Minting the name-index key, which
+members then use for every name they write, follows the same rule.
 
 It also holds the vault row lock from outside, which is the only way to observe the lock: a rotation
 must re-check the caller's key after it gets the lock, and the two removal routes must wait for it.
@@ -181,6 +182,18 @@ def test_a_member_cannot_be_rotated_out_by_themselves(admin, temp_user, temp_use
     assert r.status_code == 200, r.text
 
 
+def test_an_admin_without_the_key_cannot_mint_the_name_index_key(admin, temp_user, temp_user_client,
+                                                                owned_vault):
+    vid = owned_vault
+    body = {"wraps": [{"user_id": str(temp_user["id"]), "encrypted_index_key": ZK_WRAPPED_DEK_STUB,
+                       "ephemeral_public_key": ZK_EPHEMERAL_STUB}]}
+    r = admin.put(f"/ecc/vaults/{vid}/index-key", json=body)
+    assert r.status_code == 403, r.text
+    assert temp_user_client.get(f"/ecc/vaults/{vid}/index-key").json()["index_key"] is None
+    r = temp_user_client.put(f"/ecc/vaults/{vid}/index-key", json=body)
+    assert r.status_code == 200, r.text
+
+
 # --------------------------------------------------------------------------- the lock
 
 _HOLD = 4
@@ -247,3 +260,25 @@ def test_removing_a_member_waits_for_the_vault_row_lock(route, admin, temp_user_
     assert r.status_code == 200, r.text
     assert elapsed >= 2.0, f"the removal did not wait for the vault row lock ({elapsed:.2f}s)"
     assert _keys(member_client, vid)["has_access"] is False
+
+
+def test_a_share_rechecks_the_key_after_it_gets_the_lock(temp_user, temp_user_client, owned_vault,
+                                                        second_member):
+    """Sharing hands out the key in use now, so the sharer's own key is checked under the lock too:
+    removed while the share waited for the lock, it is refused rather than written."""
+    vid, uid = owned_vault, temp_user["id"]
+    member, member_client = second_member
+    ensure_ecc_keypair(member_client)
+    holder = _hold_vault_row(vid, before_commit=(
+        f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
+    try:
+        r, elapsed = _timed(lambda: temp_user_client.post(f"/ecc/vaults/{vid}/members",
+                                                          json=_wrap(member["id"])))
+    finally:
+        holder.wait(timeout=_HOLD + 5)
+    assert holder.returncode == 0, "the lock-holding transaction failed"
+    assert elapsed >= 2.0, f"the share did not wait for the vault row lock ({elapsed:.2f}s)"
+    assert r.status_code == 403, r.text
+    assert "current key" in r.json()["detail"]
+    # Nothing was written for the member: they still have no key row, so no relationship at all.
+    assert member_client.get(f"/ecc/vaults/{vid}/keys").status_code == 403
