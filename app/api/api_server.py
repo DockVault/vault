@@ -2812,17 +2812,21 @@ def activity_export(
     category: List[str] = Query([]),
     channel: List[str] = Query([]),
     status: List[str] = Query([]),
+    action: List[str] = Query([]),
     user: Optional[str] = Query(None, max_length=128),
+    user_match: str = Query("contains", pattern="^(contains|exact)$"),
+    no_account: bool = False,
     ip: Optional[str] = Query(None, max_length=64),
     q: Optional[str] = Query(None, max_length=128),
     temp_credential_id: Optional[str] = Query(None, max_length=64),
     temp_credential: Optional[str] = Query(None, max_length=128),
+    vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """The Events tab's rows as a CSV or NDJSON download, with the same filters (admin only).
+    """The Events list's rows as a CSV or NDJSON download, with the same filters (admin only).
 
     Streamed a batch at a time, each batch in its own short database session, so a large export neither
     holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
@@ -2835,15 +2839,19 @@ def activity_export(
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
-        statuses=status, username=user, ip=ip, text=q, temp_credential_id=temp_credential_id,
-        temp_credential=temp_credential, start=audit_range.lower_bound(from_date))
+        statuses=status, actions=action, username=user, user_exact=(user_match == "exact"),
+        no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
+        temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date))
     total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
     _audit_change(db, current_user, "audit_exported", "audit_log", None, {
         "format": format, "rows": min(total, ev.EXPORT_CAP), "total": total,
+        # The filters that narrowed it: how a user was matched only when it was exactly.
         "filters": {k: v for k, v in (("category", category), ("channel", channel), ("status", status),
-                                      ("user", user), ("ip", ip), ("q", q),
+                                      ("action", action), ("user", user),
+                                      ("user_match", "exact" if user and user_match == "exact" else None),
+                                      ("no_account", no_account), ("ip", ip), ("q", q),
                                       ("temp_credential_id", temp_credential_id),
-                                      ("temp_credential", temp_credential),
+                                      ("temp_credential", temp_credential), ("vault_id", vault_id),
                                       ("from_date", from_date), ("to_date", to_date)) if v},
     })
 

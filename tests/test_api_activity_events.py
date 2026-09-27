@@ -123,6 +123,54 @@ def test_an_export_holds_the_filtered_rows_and_is_itself_recorded(admin, anon):
     assert exports[1]["details"]["filters"] == {"user": prefix} and exports[1]["details"]["rows"] == 3
 
 
+def test_an_export_takes_every_filter_the_list_takes(admin, anon, temp_vault):
+    """An event, a user exactly, names no account had and a vault narrow the export as they narrow the
+    list, and its audit row says which filters were used."""
+    import json
+    prefix = unique("exportf")
+    for i in range(2):
+        _failed_sign_in(anon, f"{prefix}-{i}")
+    for _ in range(25):
+        if _events(admin, user=prefix)["total"] >= 2:
+            break
+        time.sleep(0.2)
+
+    def exported(**params):
+        r = admin.get("/activity/export", params={"format": "ndjson", **params})
+        assert r.status_code == 200, r.text
+        rows = [json.loads(line) for line in r.text.splitlines()]
+        assert int(r.headers["X-Export-Total"]) == len(rows)
+        return rows
+
+    assert len(exported(user=prefix, action="login_failure")) == 2
+    assert exported(user=prefix, action="login_success") == []
+    assert [e["username"] for e in exported(user=f"{prefix}-1", user_match="exact")] == [f"{prefix}-1"]
+    assert exported(user=prefix, user_match="exact") == []
+    assert len(exported(user=prefix, no_account="true")) == 2
+    vid = temp_vault["id"]
+    up = admin.post(f"/vaults/{vid}/files", files=[("files", (unique("f") + ".txt", b"x", "text/plain"))])
+    assert up.status_code in (200, 201), up.text
+    listed = None
+    for _ in range(25):
+        listed = _events(admin, vault_id=vid)
+        if listed["total"] >= 1:
+            break
+        time.sleep(0.2)
+    in_vault = exported(vault_id=vid)
+    assert len(in_vault) == listed["total"] >= 1
+    assert all(e["resource_id"] == vid or (e["details"] or {}).get("vault_id") == vid for e in in_vault)
+    assert exported(vault_id="not-an-id") == []
+    time.sleep(0.3)
+    recorded = _events(admin, q=prefix, action="audit_exported")["events"]
+    assert [e["details"]["filters"] for e in recorded] == [
+        {"user": prefix, "no_account": True},
+        {"user": prefix, "user_match": "exact"},
+        {"user": f"{prefix}-1", "user_match": "exact"},
+        {"user": prefix, "action": ["login_success"]},
+        {"user": prefix, "action": ["login_failure"]},
+    ]
+
+
 def test_a_date_at_the_edge_of_the_calendar_is_not_an_error(admin):
     # The calendar's last day runs to its end; an instant that is off the calendar in UTC is no date.
     for params in ({"to_date": "9999-12-31"}, {"from_date": "0001-01-01T00:00:00+01:00"},
