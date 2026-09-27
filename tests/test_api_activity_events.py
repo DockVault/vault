@@ -28,6 +28,10 @@ def test_the_catalog_offers_every_category_channel_and_status(admin):
     assert keys[0] == "sign_in" and "security" in keys and keys[-1] == "legacy"
     assert set(body["channels"]) == {"web", "sftp", "public_link", "upload_link", "device_sync", "unknown"}
     assert body["statuses"] == ["success", "authorized", "failed"]
+    # The events the summary counts as each sign-in outcome, so a click on one filters the list to them.
+    assert body["sign_in_outcomes"] == {"succeeded": ["login_success"],
+                                        "failed": ["login_failure", "second_factor_failed"],
+                                        "locked": ["account_auto_locked"]}
 
 
 def test_only_an_administrator_reads_the_feed(temp_user_client):

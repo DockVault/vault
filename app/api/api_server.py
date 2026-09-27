@@ -2392,9 +2392,15 @@ async def search_audit_log(
 
 @app.get("/activity/catalog")
 def activity_catalog(current_user: User = Depends(require_interactive_admin)):
-    """What the Events filters offer: the categories and their events, the channels and the statuses."""
+    """What the Events filters offer: the categories and their events, the channels and the statuses,
+    and which events the summary band counts as each sign-in outcome (so a click on one of its rows
+    filters the list to exactly the events it counted)."""
     from app.core import audit_catalog
     from app.services import activity_events as ev
+    from app.services.activity_summary import SIGN_IN_OUTCOMES
+    outcomes = {"succeeded": [], "failed": [], "locked": []}
+    for name, outcome in SIGN_IN_OUTCOMES.items():
+        outcomes.setdefault(outcome, []).append(name)
     return {
         "categories": [
             {"key": key, "label": label,
@@ -2403,6 +2409,7 @@ def activity_catalog(current_user: User = Depends(require_interactive_admin)):
         ] + [{"key": ev.LEGACY_CATEGORY, "label": audit_catalog.LEGACY_LABEL, "actions": []}],
         "channels": list(ev.CHANNEL_CHOICES),
         "statuses": list(ev.STATUS_GROUPS),
+        "sign_in_outcomes": outcomes,
     }
 
 
