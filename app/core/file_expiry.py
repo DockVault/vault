@@ -116,6 +116,26 @@ def expiry_is_off(value) -> bool:
     return value is None or value <= 0
 
 
+# The longest a vault's "expire files after" may be, in each unit it can be given in: 100 years.
+# Nothing longer is of use, and a deadline far enough out does not fit a date at all: working it out
+# failed every upload into the vault, and a value past the column's range failed the save itself.
+MAX_EXPIRY = {"minutes": 52_560_000, "hours": 876_000, "days": 36_500}
+
+
+def max_expiry(unit) -> int:
+    """The largest "expire files after" value ``unit`` takes. A unit that is not minutes or hours
+    is read as days, as it is when the deadline is worked out."""
+    return MAX_EXPIRY.get(unit, MAX_EXPIRY["days"])
+
+
+def check_not_too_long(value, unit) -> None:
+    """Raise ValueError, with a message fit to show, when ``value`` ``unit`` is longer than 100
+    years. A value that turns expiry off is never too long."""
+    if not expiry_is_off(value) and value > max_expiry(unit):
+        unit = unit if unit in MAX_EXPIRY else "days"
+        raise ValueError(f"File expiry can be at most 100 years ({max_expiry(unit):,} {unit}).")
+
+
 def vault_expiry_on():
     """A filter for ``Vault`` queries: vaults whose files expire (a positive setting)."""
     return Vault.expire_files_after_days > 0

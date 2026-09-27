@@ -296,9 +296,11 @@ def calculate_file_expiration(vault) -> Optional[datetime]:
         return None
     
     now = file_expiry.utc_now()
-    value = vault.expire_files_after_days
     unit = vault.expire_files_unit or 'days'
-    
+    # A value longer than 100 years, which an earlier version stored unchecked, counts as 100 years:
+    # a deadline far enough out does not fit a date, and failing here fails every upload.
+    value = min(vault.expire_files_after_days, file_expiry.max_expiry(unit))
+
     if unit == 'minutes':
         return now + timedelta(minutes=value)
     elif unit == 'hours':
@@ -513,7 +515,8 @@ class VaultService:
             owner: Owner user
             description: Optional description
             password: Optional vault password
-            expire_files_after_days: Optional file expiration policy
+            expire_files_after_days: Optional file expiration policy, in days; at most 100 years
+                (ValueError otherwise)
             vault_id: Optionally the id to create the vault under, chosen by the caller.
                 A zero-knowledge client needs the id BEFORE it locks the vault key, because
                 the newer lock format stamps the key with the vault it belongs to and the
@@ -525,7 +528,10 @@ class VaultService:
         from app.core.vault_key_utils import generate_vault_key, encrypt_vault_key
         from app.core.config import settings
         import json
-        
+
+        # A new vault counts its file expiry in days (the column's default unit).
+        file_expiry.check_not_too_long(expire_files_after_days, 'days')
+
         # Hash password if provided
         password_hash = hash_password(password) if password else None
         
@@ -961,7 +967,9 @@ class VaultService:
 
         ``expire_files_after_days`` is a whole number of units (``expire_files_unit``: minutes,
         hours or days): each file uploaded from now on is deleted that long after its upload. None
-        or 0 turns expiry off. Raises ValueError for anything else, with a message fit to show.
+        or 0 turns expiry off, and the longest is 100 years (file_expiry.MAX_EXPIRY), checked
+        against the unit the vault ends up with. Raises ValueError for anything else, with a
+        message fit to show.
 
         A file's deadline is stamped on it at upload, and changing the setting does not move it:
         files already in the vault keep the deadline they have. Turning expiry off is different. It
@@ -987,6 +995,10 @@ class VaultService:
             value = value or None
         if unit is not _UNCHANGED and unit not in FILE_EXPIRY_UNITS:
             raise ValueError("expire_files_unit must be 'minutes', 'hours', or 'days'")
+        # The value and unit the vault will have: changing only the unit changes the length too.
+        file_expiry.check_not_too_long(
+            vault.expire_files_after_days if value is _UNCHANGED else value,
+            (vault.expire_files_unit or 'days') if unit is _UNCHANGED else unit)
 
         self.db.query(Vault.id).filter(Vault.id == vault.id).with_for_update(key_share=True).first()
         if value is not _UNCHANGED:

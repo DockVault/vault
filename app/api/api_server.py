@@ -14162,6 +14162,13 @@ async def create_vault(
                             detail=f"Vault size must be between 1 byte and {_INT64_MAX / _GIB:.0f} GB")
     _enforce_vault_size(db, current_user, requested_size)
 
+    # File expiry, given in days here: at most 100 years (create_vault checks it too, but its
+    # ValueError would surface below as a server error).
+    try:
+        file_expiry.check_not_too_long(vault_create.expire_files_after_days, 'days')
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     if vault_create.id is not None:
         # Only a zero-knowledge vault has a reason to choose its own id: its key is locked
         # before the vault exists, and the lock is stamped with the id. A Standard vault's id
