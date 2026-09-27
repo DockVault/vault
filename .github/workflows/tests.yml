@@ -49,6 +49,16 @@ jobs:
       expected_sha: ${{ inputs.expected_sha }}
     permissions:
       contents: read
+  # The real-proxy matrix, on the same terms as the Fast lanes: a pull request runs it on its own,
+  # and a candidate's manual run and a release's call run it here, on the commit under test, so the
+  # client-address handling is proven behind real proxies before main moves and before publication.
+  proxy-matrix:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/proxy-matrix.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
+    permissions:
+      contents: read
   preflight:
     uses: ./.github/workflows/preflight.yml
     with:

@@ -46,6 +46,15 @@ lanes: Python on Windows and Ubuntu with only the test lock installed. Every oth
 production lock on top, so a test that imports a package only the production lock carries passes
 there and fails only here. Pull requests and pushes to `main` run the Fast workflow on their own.
 
+The same runs, and every pull request, also run the proxy matrix
+(`.github/scripts/proxy_matrix.py`): the candidate image behind real nginx (plain and TLS), two nginx
+in a chain, HAProxy with `option forwardfor`, and an nginx inside the API's own network namespace,
+under each `TRUSTED_PROXIES` / `TRUST_ALL_PROXIES` setting, with clients at fixed addresses on a
+private Docker network. It checks the client address the audit log records, the scheme a reset link
+is built with, and that a client cannot spend another client's sign-in allowance by typing its
+address. Run it locally with `python3 .github/scripts/proxy_matrix.py --image <image>`; it removes
+everything it created when it ends.
+
 The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from
 CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the 3.14 backports for
 `CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build checks the vendored file

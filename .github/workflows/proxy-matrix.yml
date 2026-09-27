@@ -1,0 +1,80 @@
+name: Proxy matrix
+
+# Runs the candidate image behind real reverse proxies and checks the client address and scheme it
+# records: nginx (plain and TLS), two nginx in a chain, HAProxy with `option forwardfor` (which adds
+# its own X-Forwarded-For line), and an nginx inside the API's own network namespace (connecting from
+# 127.0.0.1), under each trust setting, with clients at fixed addresses on a private network. The
+# unit tests prove the address parser on strings; this proves it on the wire, where the proxies
+# decide what the header looks like. .github/scripts/proxy_matrix.py documents every check.
+#
+# It needs no test lock and no preflight: the script is standard-library Python that drives Docker,
+# and the probes run inside the image under test. Pull requests run it on their own; the Tests
+# workflow calls it on a release candidate (a manual run) and inside a release (a tag), so the
+# publish job waits for it on the exact commit it publishes.
+
+on:
+  pull_request:
+  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Commit the matrix must test
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # Prefixed: called from another workflow, github.workflow is the CALLER's name, and an unprefixed
+  # group could collide with (and cancel) a group the caller itself uses.
+  group: proxy-matrix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proxy-matrix:
+    name: Client address behind real proxies
+    runs-on: ubuntu-latest
+    # Measured at about three minutes for the matrix and one for the build; fifteen leaves room for
+    # a slow image pull without letting a stall hold a runner for an hour.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify requested commit
+        if: ${{ inputs.expected_sha != '' }}
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      # The same build the Tests workflow measures at under a minute; a stalled pull says so here.
+      - name: Build the candidate image
+        timeout-minutes: 6
+        run: docker build --tag dockvault-vault:proxy-matrix .
+
+      - name: Run the proxy matrix
+        timeout-minutes: 7
+        run: >-
+          python3 .github/scripts/proxy_matrix.py
+          --image dockvault-vault:proxy-matrix
+          --json proxy-matrix.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proxy-matrix-results
+          path: proxy-matrix.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The script removes what it created when it ends, including on a failure; this covers a run
+      # killed by its step timeout before its own cleanup could run.
+      - name: Remove anything the matrix left behind
+        if: always()
+        run: python3 .github/scripts/proxy_matrix.py --cleanup-only

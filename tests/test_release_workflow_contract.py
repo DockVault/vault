@@ -120,8 +120,10 @@ def test_publish_waits_for_both_same_commit_reusable_gates():
 
 def test_each_reusable_gate_checks_out_and_verifies_the_requested_sha():
     preflight = (_WORKFLOWS / "preflight.yml").read_text(encoding="utf-8")
+    # Called by Tests on a candidate and inside a release, so it gates the published commit too.
+    proxy_matrix = (_WORKFLOWS / "proxy-matrix.yml").read_text(encoding="utf-8")
 
-    for workflow in (preflight, _TESTS, _SETUP):
+    for workflow in (preflight, _TESTS, _SETUP, proxy_matrix):
         assert "expected_sha:" in workflow
         assert "ref: ${{ inputs.expected_sha || github.sha }}" in workflow
         assert "if: ${{ inputs.expected_sha != '' }}" in workflow
