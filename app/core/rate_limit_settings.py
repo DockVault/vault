@@ -83,27 +83,39 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
     # --- Login (password) -----------------------------------------------------------------------
     RateLimitSpec(
         "max_login_attempts", "rate_limit_login_attempts", 1, _ATTEMPTS_MAX, "attempts", "login",
-        "Failed logins before lockout",
-        "The number of wrong-password attempts allowed for one account within the login window.",
-        "Triggers on repeated failed logins for the same account; the account is locked when the "
-        "count is exceeded.",
+        "Failed sign-ins before a lock (per address)",
+        "The number of wrong passwords allowed for one account from one network address. It also "
+        "bounds how many sign-in attempts one address may make to one account within the login window.",
+        "Triggers on repeated failed sign-ins to one account from one address: new sign-ins to it "
+        "from that address are refused for the lockout duration. Other addresses, and sessions "
+        "already signed in, keep working.",
         custom_max=1_000,  # an admin override may not widen the brute-force window past 1000 (INFO-2)
     ),
     RateLimitSpec(
         "rate_limit_login_window_seconds", "rate_limit_login_window_seconds", 10, _WINDOW_MAX,
         "seconds", "login",
         "Login window",
-        "The rolling time window over which failed logins are counted.",
-        "Applies to the failed-login counter above and to the SFTP key-offer throttle.",
+        "The rolling time window over which sign-in attempts are throttled, and over which failed "
+        "sign-ins from all addresses are counted for the account-wide lock.",
+        "Applies to the sign-in throttle, the account-wide lock and the SFTP key-offer throttle.",
     ),
     RateLimitSpec(
         "lockout_duration", "account_lockout_minutes", 1, 1440, "minutes", "login",
         "Lockout duration",
-        "How long an account stays locked after too many failed logins before it can try again "
-        "(auto-unlock).",
-        "Starts when an account is locked by failed logins. (An admin-set lock is permanent and "
+        "How long new sign-ins stay refused after too many failed ones, from one address or, past the "
+        "account-wide limit, from everywhere. The lock then ends by itself; sessions already signed in "
+        "keep working throughout.",
+        "Starts when failed sign-ins lock an account. (An admin-set lock is permanent and "
         "unaffected.)",
         deployment_min=0,  # a deployment account_lockout_minutes of 0 means "locks are permanent"
+    ),
+    RateLimitSpec(
+        "lockout_backstop_multiplier", "account_lockout_backstop_multiplier", 2, 100, "times", "login",
+        "Account-wide lock (times the per-address limit)",
+        "How many times the per-address limit of failed sign-ins, counted across every address "
+        "within the login window, refuses new sign-ins to the account from everywhere.",
+        "Triggers when many addresses guess one account's password at once; lasts the lockout "
+        "duration. Sessions already signed in keep working.",
     ),
     # --- Vault unlock ---------------------------------------------------------------------------
     RateLimitSpec(

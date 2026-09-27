@@ -133,9 +133,23 @@ def test_a_username_that_looks_like_an_ip_has_its_own_bucket():
     svc._redis_rate_limit(limiter, "alice", "203.0.113.50", 5, 1, 60)
     assert limiter.hits["rate_limit:login_ip:203.0.113.50"] == 1
     assert set(limiter.hits) == {
-        "rate_limit:login_user:203.0.113.50", "rate_limit:login_ip:198.51.100.9",
-        "rate_limit:login_user:alice", "rate_limit:login_ip:203.0.113.50",
+        "rate_limit:login_user:203.0.113.50|198.51.100.9", "rate_limit:login_ip:198.51.100.9",
+        "rate_limit:login_user:alice|203.0.113.50", "rate_limit:login_ip:203.0.113.50",
     }
+
+
+def test_a_name_throttled_from_one_address_signs_in_from_another():
+    # The per-name bucket is per name AND address: guessing a name from one address cannot throttle
+    # its owner signing in from another (the account-wide lock answers many addresses at once).
+    from app.services.auth_service import AuthService, RateLimitExceededError
+
+    svc = AuthService.__new__(AuthService)
+    limiter = _CountingLimiter()
+    with pytest.raises(RateLimitExceededError):
+        for _ in range(6):
+            svc._redis_rate_limit(limiter, "alice", "203.0.113.66", 5, 100, 60)
+    svc._redis_rate_limit(limiter, "alice", "198.51.100.10", 5, 100, 60)   # not raised
+    assert limiter.hits["rate_limit:login_user:alice|198.51.100.10"] == 1
 
 
 def test_a_known_temporary_name_is_throttled_in_the_name_bucket_only(monkeypatch):

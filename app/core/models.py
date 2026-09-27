@@ -2762,3 +2762,33 @@ class CredentialChange(Base):
         Index('idx_credential_change_target', 'target_user_id', 'applied_at'),
         Index('idx_credential_change_status', 'status'),
     )
+
+
+class SignInLockout(Base):
+    """Failed sign-ins to one account, counted per source address and across all addresses, and the
+    automatic lock they arm (see app/core/sign_in_lockout.py).
+
+    ``source`` is the client address the failures came from, or '*' for the account-wide count. A
+    lock here refuses NEW sign-ins only: sessions already signed in, devices and temporary credentials
+    keep working, unlike an administrator's lock (users.is_locked with no end), which this never sets.
+
+    A NEW table, so create_all builds it on an existing deployment, and a release that does not know
+    it ignores it (its automatic locks simply stop applying there). Rows cascade with the account."""
+    __tablename__ = 'sign_in_lockouts'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    source = Column(String(64), nullable=False)
+    failed_attempts = Column(Integer, nullable=False, default=0)
+    window_start = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_failure_at = Column(DateTime, nullable=True)
+    # When the lock was armed; NULL while the failures are only being counted.
+    locked_at = Column(DateTime, nullable=True)
+    # When it ends (naive UTC). NULL with locked_at set: no end, for a deployment whose lockout
+    # duration is 0; an administrator clears it.
+    locked_until = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'source', name='uq_sign_in_lockout_user_source'),
+        Index('idx_sign_in_lockout_locked_until', 'locked_until'),
+    )

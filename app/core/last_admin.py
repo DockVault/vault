@@ -19,7 +19,9 @@ LAST_ADMIN_DETAIL = ("This would leave no active administrator. Make another acc
 def can_administer(user) -> bool:
     """An administrator who can act right now: active, and not locked.
 
-    A failed-login lock counts as a lock until its time runs out, exactly as sign-in reads it."""
+    A timed lock on the account row (from before automatic locks moved to their own table) counts
+    until its time runs out, exactly as sign-in reads it. An automatic lock in sign_in_lockouts does
+    not: it only pauses new sign-ins, and the administrator's sessions carry on."""
     from app.services.auth_service import account_locked
     return (getattr(user, "role", None) == RoleEnum.ADMIN
             and getattr(user, "is_active", None) is not False

@@ -1,30 +1,28 @@
 """Live: an automatic lock and its release are audited, and failures sent together all count.
 
-* The failure that arms the lock writes one ``account_auto_locked`` row: the account, the address
-  the failure came from, the count, and when the lock ends. Failures against the running lock only
-  move its end and write nothing more.
+* The failure that arms a lock writes one ``account_auto_locked`` row: the account, the address the
+  failure came from, the scope (that address, or account-wide), the count, and when the lock ends. A
+  sign-in while the lock holds is refused before its password is checked, and counts nothing.
 * A sign-in after the lock ran out clears it and writes ``account_auto_unlocked`` from that sign-in;
   the periodic timer does the same with no address. The timer is run here inside the web container,
-  because it only fires every five minutes.
-* Failed sign-ins sent in parallel each add one to the count. The count was read, increased and
-  written back, so parallel failures overwrote each other and most were lost.
+  because it only fires every five minutes. A timed lock left on the account row from before automatic
+  locks moved to their own table is released and recorded the same way.
+* Failed sign-ins sent in parallel each add one to every count.
 * The Activity page's Events feed lists both under sign-ins, with the request that made them (none for
   the timer).
 
-test_account_auto_lock_audit.py covers the same offline.
+test_account_auto_lock_audit.py and test_sign_in_lockout.py cover the same offline; the smart
+lockout's behaviour across addresses and doors is in test_smart_lockout_live.py.
 """
-import os
-import subprocess
 import threading
 
 import pytest
 
-from conftest import ApiClient, BASE_URL, skip_if_container_absent
+from conftest import ApiClient, BASE_URL
+from _account_change_helpers import host_address, in_api_container, lock_rows, psql, reset_sign_in_throttle
 
 pytestmark = pytest.mark.integration
 
-_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
-_API_CONTAINER = os.environ.get("VAULT_API_CONTAINER", "vault-api")
 LOCKED = "account_auto_locked"
 UNLOCKED = "account_auto_unlocked"
 # Far past any sane max_login_attempts, so a single further failure arms the lock whatever the
@@ -32,42 +30,9 @@ UNLOCKED = "account_auto_unlocked"
 PRIMED = 1_000_000
 
 
-def _psql(sql):
-    try:
-        r = subprocess.run(
-            ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db",
-             "-v", "ON_ERROR_STOP=1", "-Atc", sql],
-            capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        pytest.skip(f"docker/psql unavailable: {exc}")
-    skip_if_container_absent(r, _DB_CONTAINER)
-    assert r.returncode == 0, r.stderr[:300]
-    return r.stdout.strip()
-
-
-def _in_web_container(source):
-    script = ("from app.core.config import bootstrap_entrypoint\n"
-              "bootstrap_entrypoint('lock-audit-test')\n" + source)
-    try:
-        r = subprocess.run(["docker", "exec", "-i", _API_CONTAINER, "python", "-c", script],
-                           capture_output=True, text=True, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        pytest.skip(f"docker unavailable: {exc}")
-    skip_if_container_absent(r, _API_CONTAINER)
-    assert r.returncode == 0, (r.stderr or r.stdout)[-600:]
-    return r.stdout.strip().splitlines()[-1]
-
-
 def _login(client, username, password):
     return client.session.post(f"{client.base_url}/auth/login",
                                json={"username": username, "password": password}, timeout=30)
-
-
-def _state(uid):
-    locked, count, until = _psql(
-        f"SELECT is_locked, failed_login_attempts, coalesce(locked_until::text, '') FROM users "
-        f"WHERE id='{uid}'").split("|")
-    return locked == "t", int(count), until
 
 
 def _rows(admin, action, uid):
@@ -99,46 +64,59 @@ def _request(event):
 
 def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recorded(admin, temp_user):
     uid, name, password = temp_user["id"], temp_user["_username"], temp_user["_password"]
-    _psql(f"UPDATE users SET failed_login_attempts={PRIMED} WHERE id='{uid}'")
+    reset_sign_in_throttle()
     client = ApiClient(BASE_URL)
+    assert _login(client, name, "definitely-the-wrong-password").status_code == 401
+    here = host_address(admin, name)
+    psql(f"UPDATE sign_in_lockouts SET failed_attempts={PRIMED} WHERE user_id='{uid}' AND source='{here}'")
 
     r = _login(client, name, "definitely-the-wrong-password")
     assert r.status_code == 401, r.text
-    locked, count, until = _state(uid)
-    assert (locked, count) == (True, PRIMED + 1)
+    assert "lock" not in r.text.lower(), "the failure that arms the lock still sees only the generic answer"
+    assert lock_rows(uid)[here] == (PRIMED + 1, True)
+    until = psql(f"SELECT coalesce(locked_until::text, '') FROM sign_in_lockouts "
+                 f"WHERE user_id='{uid}' AND source='{here}'")
+    assert psql(f"SELECT is_locked FROM users WHERE id='{uid}'") == "f", "the account row is never locked"
 
     rows = _rows(admin, LOCKED, uid)
     assert len(rows) == 1, rows
     row = rows[0]
     assert row["username"] == name and row["resource_id"] == uid and row["status"] == "success"
+    assert row["details"]["scope"] == "address" and row["details"]["address"] == here
     assert row["details"]["failed_attempts"] == PRIMED + 1
     failure = _latest(admin, "login_failure", name)
     assert row["ip_address"] and row["ip_address"] == failure["ip_address"], (row, failure)
-    assert "lock" not in r.text.lower(), "the caller still sees only the generic failure"
     event = _event(admin, LOCKED, name)
     assert (event["label"], event["status"]) == ("Account locked after failed sign-ins", "success")
     assert _request(event) == ("web", "POST", "/auth/login")
 
-    # A failure against the running lock moves its end but is not recorded again.
-    assert _login(client, name, "definitely-the-wrong-password").status_code == 401
-    assert _state(uid)[1] == PRIMED + 2
+    # While it holds, a sign-in from here is refused before its password is checked: a guess counts
+    # nothing, and the right password is refused too.
+    for attempt in ("another-guess", password):
+        refused = _login(client, name, attempt)
+        assert refused.status_code == 403, refused.text
+        if until:
+            assert int(refused.headers.get("Retry-After", "0")) > 0
+    assert lock_rows(uid)[here] == (PRIMED + 1, True)
     assert len(_rows(admin, LOCKED, uid)) == 1
 
     if not until:
-        pytest.skip("this deployment's failed-login lock is permanent (lockout_duration=0), "
-                    "so there is no timed release to observe")
+        pytest.skip("this deployment's automatic lock has no end (lockout_duration=0), so there is no "
+                    "timed release to observe")
     assert row["details"]["locked_until"], row
 
     # The lock runs out; the next sign-in clears it and says so.
-    _psql(f"UPDATE users SET locked_until=(now() AT TIME ZONE 'utc') - interval '1 minute' WHERE id='{uid}'")
+    psql(f"UPDATE sign_in_lockouts SET locked_until=(now() AT TIME ZONE 'utc') - interval '1 minute' "
+         f"WHERE user_id='{uid}' AND source='{here}'")
     r = _login(client, name, password)
     assert r.status_code == 200, r.text
-    assert _state(uid)[:2] == (False, 0)
+    assert here not in lock_rows(uid), "the released lock and its count are gone"
 
     released = _rows(admin, UNLOCKED, uid)
     assert len(released) == 1, released
-    assert released[0]["details"]["cleared_by"] == "sign_in"
-    assert released[0]["details"]["failed_attempts"] == PRIMED + 2
+    details = released[0]["details"]
+    assert (details["cleared_by"], details["scope"], details["address"]) == ("sign_in", "address", here)
+    assert details["failed_attempts"] == PRIMED + 1
     success = _latest(admin, "login_success", name)
     assert released[0]["ip_address"] == success["ip_address"], (released[0], success)
     event = _event(admin, UNLOCKED, name)
@@ -148,21 +126,24 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
 
 def test_the_timer_clears_an_expired_lock_and_records_it(admin, temp_user):
     uid = temp_user["id"]
-    _psql("UPDATE users SET is_locked=true, failed_login_attempts=7, "
-          f"locked_until=(now() AT TIME ZONE 'utc') - interval '1 minute' WHERE id='{uid}'")
+    psql("INSERT INTO sign_in_lockouts (id, user_id, source, failed_attempts, window_start, locked_at, "
+         f"locked_until) VALUES (gen_random_uuid(), '{uid}', '*', 7, now() AT TIME ZONE 'utc', "
+         "now() AT TIME ZONE 'utc', (now() AT TIME ZONE 'utc') - interval '1 minute')")
     # The same call the periodic cleanup makes, on the real database. It clears every expired lock
     # in the deployment, which is what the timer would do within five minutes anyway.
-    cleared = _in_web_container(
+    cleared = in_api_container(
         "from app.core.database import get_db_context\n"
-        "from app.services.auth_service import release_expired_locks\n"
+        "from app.core import sign_in_lockout\n"
         "with get_db_context() as db:\n"
-        "    print(release_expired_locks(db))\n")
+        "    n = sign_in_lockout.release_expired(db)\n"
+        "    db.commit()\n"
+        "    print(n)\n").stdout.strip().splitlines()[-1]
     assert int(cleared) >= 1
-    assert _state(uid) == (False, 0, "")
+    assert lock_rows(uid) == {}
 
     rows = _rows(admin, UNLOCKED, uid)
     assert len(rows) == 1, rows
-    assert rows[0]["details"]["cleared_by"] == "timer"
+    assert (rows[0]["details"]["cleared_by"], rows[0]["details"]["scope"]) == ("timer", "account")
     assert rows[0]["details"]["failed_attempts"] == 7
     assert rows[0]["ip_address"] is None
     assert _rows(admin, LOCKED, uid) == [], "nothing here armed a lock"
@@ -170,15 +151,33 @@ def test_the_timer_clears_an_expired_lock_and_records_it(admin, temp_user):
     assert _request(event) == (None, None, None), "the timer is not a request"
 
 
-def test_failures_sent_in_parallel_each_count(temp_user):
+def test_a_timed_lock_left_on_the_account_row_is_still_released(admin, temp_user):
+    uid = temp_user["id"]
+    psql("UPDATE users SET is_locked=true, failed_login_attempts=7, "
+         f"locked_until=(now() AT TIME ZONE 'utc') - interval '1 minute' WHERE id='{uid}'")
+    cleared = in_api_container(
+        "from app.core.database import get_db_context\n"
+        "from app.services.auth_service import release_expired_locks\n"
+        "with get_db_context() as db:\n"
+        "    n = release_expired_locks(db)\n"
+        "    db.commit()\n"
+        "    print(n)\n").stdout.strip().splitlines()[-1]
+    assert int(cleared) >= 1
+    assert psql(f"SELECT is_locked, failed_login_attempts FROM users WHERE id='{uid}'") == "f|0"
+    rows = _rows(admin, UNLOCKED, uid)
+    assert len(rows) == 1 and rows[0]["details"]["cleared_by"] == "timer", rows
+
+
+def test_failures_sent_in_parallel_each_count(admin, temp_user):
     uid, name = temp_user["id"], temp_user["_username"]
+    reset_sign_in_throttle()
     senders, each = 4, 10
     statuses = []
     guard = threading.Lock()
     start = threading.Barrier(senders)
 
     def send():
-        client = ApiClient(BASE_URL)      # a source address of its own
+        client = ApiClient(BASE_URL)
         start.wait()
         for _ in range(each):
             code = _login(client, name, "definitely-the-wrong-password").status_code
@@ -191,9 +190,14 @@ def test_failures_sent_in_parallel_each_count(temp_user):
     for t in threads:
         t.join(120)
 
-    # Only a failure that reached the password check is counted; a throttled one (429) is not.
+    # Only a failure that reached the password check is counted; a throttled (429) or refused (403)
+    # one is not.
     reached = statuses.count(401)
     if reached < 8:
         pytest.skip(f"only {reached} of {len(statuses)} attempts got past this deployment's "
                     "sign-in throttle, too few to send in parallel")
-    assert _state(uid)[1] == reached, statuses
+    here = host_address(admin, name)
+    rows = lock_rows(uid)
+    assert rows[here][0] == reached, (statuses, rows)
+    assert rows["*"][0] == reached, (statuses, rows)
+    assert int(psql(f"SELECT failed_login_attempts FROM users WHERE id='{uid}'")) == reached

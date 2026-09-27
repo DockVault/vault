@@ -41,9 +41,11 @@ def _raw_login(username: str, password: str):
 
 
 def test_failed_login_lock_is_time_boxed_and_auto_unlocks(admin, temp_user):
-    """A failed-login auto-lock (is_locked + a future locked_until) rejects both an existing
-    token and a fresh login; once the TTL has elapsed (locked_until in the past) the account
-    auto-unlocks — so 5 wrong passwords can't permanently DoS a known account."""
+    """A timed lock on the account row (is_locked + a future locked_until: what failed logins armed
+    before automatic locks moved to their own table) refuses a fresh login, and once the TTL has
+    elapsed the account auto-unlocks — so wrong passwords can't permanently DoS a known account. It
+    does not end the token already issued: only an administrator's lock ends sessions, or anyone who
+    knows a username could sign its owner out by guessing."""
     uid, uname, pw = temp_user["id"], temp_user["_username"], temp_user["_password"]
     c = ApiClient(); c.login(uname, pw)
     assert c.get("/vaults").status_code == 200  # token works before any lock
@@ -51,7 +53,7 @@ def test_failed_login_lock_is_time_boxed_and_auto_unlocks(admin, temp_user):
     # Simulate the failed-login auto-lock with a FUTURE TTL.
     _db(f"UPDATE users SET is_locked=true, failed_login_attempts=99, "
         f"locked_until=now()+interval '1 hour' WHERE id='{uid}'")
-    assert c.get("/vaults").status_code == 403, "locked account's existing token must be rejected"
+    assert c.get("/vaults").status_code == 200, "an automatic lock must not end a session already signed in"
     assert _raw_login(uname, pw).status_code in (401, 403), "login must be refused while locked"
 
     # TTL elapsed: the lock auto-expires (account_locked honours locked_until).

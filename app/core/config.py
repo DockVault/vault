@@ -324,11 +324,15 @@ class Settings(BaseSettings):
     # sustained; 30 per 5 min is roughly 3x that headroom and still a firm ceiling on a runaway client.
     rate_limit_device_sync_attempts: int = Field(default=30)
     rate_limit_device_sync_window_seconds: int = Field(default=300)
-    # Auto-unlock TTL (minutes) for an account locked by FAILED LOGINS — a time-boxed lock
-    # instead of a permanent one, so 5 wrong passwords can't permanently DoS a known account.
-    # An ADMIN lock (set via the API) stays permanent (locked_until is NULL). 0 disables the
-    # auto-lock TTL (locks stay until cleared), preserving the old behaviour if ever wanted.
+    # How long (minutes) new sign-ins stay refused after too many failed ones: from one address, or
+    # from every address once the account-wide limit below is reached. The lock ends by itself;
+    # sessions already signed in keep working. An ADMIN lock (set via the API) stays permanent.
+    # 0 keeps an automatic lock until an administrator clears it.
     account_lockout_minutes: int = Field(default=15)
+    # The account-wide lock: failed sign-ins to one account from ALL addresses within the login window
+    # that refuse new sign-ins from everywhere, as a multiple of rate_limit_login_attempts (the
+    # per-address limit). 4 with the default 5 = 20. The answer to many addresses guessing at once.
+    account_lockout_backstop_multiplier: int = Field(default=4)
     # Trust X-Forwarded-For ONLY when the immediate peer is one of these networks (CIDR /
     # bare IP, comma-separated). Empty (the default) => trust NO proxy: XFF is ignored and the
     # immediate peer is used (fail-closed — the shipped direct-port-mapped topology has no

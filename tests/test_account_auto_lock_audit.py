@@ -1,12 +1,13 @@
 """Failed sign-ins that lock an account, and the timer that unlocks it, are both audited.
 
-Enough wrong passwords lock an account for a while, and the lock lifts by itself when the time runs
-out. Neither was recorded: every failure wrote the same "Invalid username or password" login_failure
-row whether or not it armed the lock, and the unlock wrote nothing, so a lock could only be inferred
-by counting. Now the failure that arms the lock writes an ``account_auto_locked`` row (the account,
-the address, the count and when the lock ends), and each release writes ``account_auto_unlocked``,
-saying whether the timer or a sign-in cleared it. Each row is added to the transaction that makes
-the change, so the two commit together or not at all.
+Enough wrong passwords lock an account against new sign-ins for a while (from the address they came
+from, or past a higher count from everywhere: app/core/sign_in_lockout.py, tested in
+test_sign_in_lockout.py), and the lock lifts by itself when the time runs out. The failure that arms
+a lock writes an ``account_auto_locked`` row (the account, the address, the scope, the count and when
+the lock ends), and each release writes ``account_auto_unlocked``, saying whether the timer or a
+sign-in cleared it. Each row is added to the transaction that makes the change, so the two commit
+together or not at all. A timed lock left on the account row by a release from before automatic locks
+moved to their own table is released and recorded the same way.
 
 The failure count is also kept in the database now. It was read into Python, increased by one and
 written back, so failures arriving together each wrote the same number and all but one were lost.
@@ -33,7 +34,8 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 from app.core import request_context as rc  # noqa: E402
-from app.core.models import AuditLog, RoleEnum, User  # noqa: E402
+from app.core import sign_in_lockout as L  # noqa: E402
+from app.core.models import AuditLog, RoleEnum, SignInLockout, User  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.services import auth_service as A  # noqa: E402
 
@@ -51,7 +53,8 @@ def _now():
 
 @pytest.fixture
 def limits(monkeypatch):
-    values = {"max_login_attempts": MAX_ATTEMPTS, "lockout_duration": LOCK_MINUTES}
+    values = {"max_login_attempts": MAX_ATTEMPTS, "lockout_duration": LOCK_MINUTES,
+              "lockout_backstop_multiplier": 4, "rate_limit_login_window_seconds": 300}
     monkeypatch.setattr(A.rate_limit_settings, "effective", lambda key: values[key])
     return values
 
@@ -63,6 +66,7 @@ def db_factory():
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'locks.db'}")
         User.__table__.create(engine)
         AuditLog.__table__.create(engine)
+        SignInLockout.__table__.create(engine)
         # The application's own session flags.
         yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
         engine.dispose()
@@ -138,53 +142,74 @@ def test_the_count_is_not_computed_in_python():
     assert "self.db.commit()" in body, "the slice did not reach the end of the method"
     code = [ln for ln in body.splitlines() if not ln.strip().startswith("#")]
     assert not [ln for ln in code if "failed_login_attempts +=" in ln]
-    assert ".returning(users.c.failed_login_attempts, users.c.is_locked, users.c.locked_until)" in body
+    assert ".returning(users.c.failed_login_attempts)" in body
 
 
 # --------------------------------------------------------------------------- arming the lock
+
+def _address_lock(Session, uid, ip=IP):
+    s = Session()
+    try:
+        return s.query(SignInLockout).filter(SignInLockout.user_id == uid, SignInLockout.source == ip).first()
+    finally:
+        s.close()
+
 
 def test_the_failure_that_arms_the_lock_is_recorded_once(db_factory, limits):
     uid = _add_user(db_factory)
     for _ in range(MAX_ATTEMPTS - 1):
         _fail(db_factory, uid)
     assert _rows(db_factory, A.AUTO_LOCKED_ACTION) == [], "no row before the lock is armed"
-    assert _state(db_factory, uid)[1] is False
+    assert _address_lock(db_factory, uid).locked_at is None
 
     before = _now()
     _fail(db_factory, uid)
-    count, locked, until = _state(db_factory, uid)
-    assert (count, locked) == (MAX_ATTEMPTS, True)
+    lock = _address_lock(db_factory, uid)
+    until = lock.locked_until
+    assert lock.failed_attempts == MAX_ATTEMPTS
     assert before + timedelta(minutes=LOCK_MINUTES - 1) < until < _now() + timedelta(minutes=LOCK_MINUTES + 1)
+    assert _state(db_factory, uid) == (MAX_ATTEMPTS, False, None), "the account row is never locked"
 
     rows = _rows(db_factory, A.AUTO_LOCKED_ACTION)
     assert len(rows) == 1
     row = rows[0]
     assert row.user_id == uid and row.resource_id == str(uid) and row.resource_type == "user"
     assert row.ip_address == IP and row.status == "success"
-    assert row.details == {"failed_attempts": MAX_ATTEMPTS, "locked_until": until.isoformat()}
+    assert row.details == {"scope": "address", "address": IP, "failed_attempts": MAX_ATTEMPTS,
+                           "locked_until": until.isoformat()}
 
-    # Failures against the running lock move its end but do not record it again.
+    # Failures against the running lock (reaching it directly; a sign-in is refused before it
+    # counts) are counted but do not arm or record it again.
     _fail(db_factory, uid)
     _fail(db_factory, uid)
-    assert _state(db_factory, uid)[0] == MAX_ATTEMPTS + 2
+    assert _address_lock(db_factory, uid).failed_attempts == MAX_ATTEMPTS + 2
+    assert _address_lock(db_factory, uid).locked_until == until
     assert len(_rows(db_factory, A.AUTO_LOCKED_ACTION)) == 1
 
 
 def test_an_administrators_lock_is_never_turned_into_a_timed_one_or_recorded_as_automatic(db_factory, limits):
     uid = _add_user(db_factory, is_locked=True, locked_until=None, failed_login_attempts=MAX_ATTEMPTS)
-    _fail(db_factory, uid)
+    for _ in range(MAX_ATTEMPTS):
+        _fail(db_factory, uid)
     count, locked, until = _state(db_factory, uid)
-    assert (count, locked, until) == (MAX_ATTEMPTS + 1, True, None)
+    assert (count, locked, until) == (MAX_ATTEMPTS * 2, True, None)
     assert _rows(db_factory, A.AUTO_LOCKED_ACTION) == []
+    assert _address_lock(db_factory, uid) is None, "an account an administrator locked is not counted"
 
 
 def test_a_lock_armed_after_an_expired_one_is_recorded(db_factory, limits):
     """An expired lock that nothing has cleared yet is not a running lock: the next lock is new."""
-    uid = _add_user(db_factory, is_locked=True, locked_until=_now() - timedelta(minutes=1),
-                    failed_login_attempts=MAX_ATTEMPTS)
+    uid = _add_user(db_factory)
+    for _ in range(MAX_ATTEMPTS):
+        _fail(db_factory, uid)
+    s = db_factory()
+    s.query(SignInLockout).filter(SignInLockout.source == IP).update(
+        {"locked_until": _now() - timedelta(minutes=1)})
+    s.commit()
+    s.close()
     _fail(db_factory, uid)
-    assert _state(db_factory, uid)[1] is True
-    assert len(_rows(db_factory, A.AUTO_LOCKED_ACTION)) == 1
+    assert _address_lock(db_factory, uid).locked_until > _now()
+    assert len(_rows(db_factory, A.AUTO_LOCKED_ACTION)) == 2
 
 
 def test_a_failure_for_an_unknown_name_records_nothing(db_factory, limits):
@@ -333,8 +358,9 @@ def _request_fields(row):
 
 
 def test_the_lock_row_carries_the_sign_in_that_armed_it(db_factory, limits, signing_in):
-    uid = _add_user(db_factory, failed_login_attempts=MAX_ATTEMPTS - 1)
-    _fail(db_factory, uid)
+    uid = _add_user(db_factory)
+    for _ in range(MAX_ATTEMPTS):
+        _fail(db_factory, uid)
     (row,) = _rows(db_factory, A.AUTO_LOCKED_ACTION)
     assert _request_fields(row) == signing_in and row.ip_address == IP
 
@@ -380,7 +406,9 @@ def _count_commits(s):
 
 
 def test_the_lock_and_its_row_are_one_commit(db_factory, limits):
-    uid = _add_user(db_factory, failed_login_attempts=MAX_ATTEMPTS - 1)
+    uid = _add_user(db_factory)
+    for _ in range(MAX_ATTEMPTS - 1):
+        _fail(db_factory, uid)
     s, user = _load(db_factory, uid)
     commits = _count_commits(s)
     try:
@@ -388,11 +416,13 @@ def test_the_lock_and_its_row_are_one_commit(db_factory, limits):
     finally:
         s.close()
     assert commits == [[A.AUTO_LOCKED_ACTION]], "one commit, and it writes the lock's row"
-    assert _state(db_factory, uid)[1] is True
+    assert _address_lock(db_factory, uid).locked_at is not None
 
 
 def test_a_lock_whose_commit_fails_leaves_neither_the_lock_nor_its_row(db_factory, limits):
-    uid = _add_user(db_factory, failed_login_attempts=MAX_ATTEMPTS - 1)
+    uid = _add_user(db_factory)
+    for _ in range(MAX_ATTEMPTS - 1):
+        _fail(db_factory, uid)
     s, user = _load(db_factory, uid)
 
     def failing_commit():
@@ -406,6 +436,7 @@ def test_a_lock_whose_commit_fails_leaves_neither_the_lock_nor_its_row(db_factor
     finally:
         s.close()
     assert _state(db_factory, uid) == (MAX_ATTEMPTS - 1, False, None)
+    assert _address_lock(db_factory, uid).locked_at is None
     assert _rows(db_factory, A.AUTO_LOCKED_ACTION) == []
 
 

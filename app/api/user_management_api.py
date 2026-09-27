@@ -761,8 +761,12 @@ async def toggle_user_locked(
     # locked_until NULL — never an auto-unlocking TTL; a stale past TTL must not silently
     # defeat the lock). Unlock also resets the failed-attempt counter.
     user.locked_until = None
+    cleared = 0
     if not new_locked:
         user.failed_login_attempts = 0
+        # Unlocking also clears every automatic lock failed sign-ins put on the account.
+        from app.core import sign_in_lockout
+        cleared = sign_in_lockout.clear_for_user(db, user.id)
     elif new_locked:
         # Locking revokes the user's live sessions immediately + durably (durable web-token
         # revocation + force-close of any live SFTP transport), matching the PATCH path.
@@ -784,7 +788,8 @@ async def toggle_user_locked(
     )
     from app.api.api_server import _notify_account_status_changes
     _notify_account_status_changes(db, user, by_name=current_user.username,
-                                   locked=(not user.is_locked, user.is_locked))
+                                   locked=(not user.is_locked, user.is_locked),
+                                   sign_in_locks_cleared=cleared)
     
     return {
         "message": f"User {'locked' if user.is_locked else 'unlocked'} successfully",

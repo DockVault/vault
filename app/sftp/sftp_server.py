@@ -1068,13 +1068,13 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         if uid is None:
             return None
         user = db.query(User).filter(User.id == uid).first()
-        # Parity with the web get_current_user: a deactivated or locked account is
-        # rejected on EVERY operation, so an admin lock/disable revokes an already
-        # -open SFTP connection at its next op (not just at the next login). Also
-        # honour sftp_enabled here so turning SFTP off cuts a live session next op.
-        # account_locked() honours the auto-unlock TTL (an expired failed-login lock = open).
-        from app.services.auth_service import account_locked
-        if user is None or not user.is_active or account_locked(user) or not user.sftp_enabled:
+        # Parity with the web get_current_user: a deactivated account, or one an administrator
+        # locked, is rejected on EVERY operation, so an admin lock/disable revokes an already-open
+        # SFTP connection at its next op (not just at the next login). Also honour sftp_enabled here
+        # so turning SFTP off cuts a live session next op. An automatic lock armed by wrong
+        # passwords refuses new sign-ins only: it never cuts a session already open.
+        from app.services.auth_service import admin_locked
+        if user is None or not user.is_active or admin_locked(user) or not user.sftp_enabled:
             return None
         src = getattr(self.server, "user", None)
         if src is not None and getattr(src, "_is_temp_session", False):
@@ -2366,8 +2366,14 @@ class SFTPServer(paramiko.ServerInterface):
             offered_b64 = key.get_base64()
             with get_db_context() as db:
                 from app.services.auth_service import account_locked
+                from app.core import sign_in_lockout
                 user = db.query(User).filter(User.username == username).first()
                 if user is None or not user.is_active or account_locked(user) or not user.sftp_enabled:
+                    return paramiko.AUTH_FAILED
+                # A key sign-in follows the same automatic locks as a password: refused from an
+                # address its failures paused, and from everywhere when the account-wide lock holds.
+                # A rejected key is not counted, since a key cannot be guessed.
+                if sign_in_lockout.lock_in_force(db, user.id, self.client_address) is not None:
                     return paramiko.AUTH_FAILED
                 # Org policy: this user's group(s) may require a temp credential for
                 # SFTP, which refuses SSH-key (and password) auth. A policy that cannot be
@@ -2412,9 +2418,12 @@ class SFTPServer(paramiko.ServerInterface):
             try:
                 from datetime import datetime as _dt, timezone as _tz
                 from app.services.auth_service import account_locked
+                from app.core import sign_in_lockout
                 with get_db_context() as db:
                     u = db.query(User).filter(User.id == self.user_id).first()
                     if u is None or not u.is_active or account_locked(u) or not u.sftp_enabled:
+                        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+                    if sign_in_lockout.lock_in_force(db, u.id, self.client_address) is not None:
                         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
                     self.session_token = AuthService(db).create_sftp_key_session(
                         u, self.client_address)

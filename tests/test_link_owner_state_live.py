@@ -257,17 +257,15 @@ def _sign_in(username, password):
 
 
 def _arm_the_automatic_lock(owner):
-    """Lock the owner the way a stranger can: with a wrong password. The failure count is primed far
-    past any threshold first, so one wrong password arms the lock whatever the deployment's setting."""
+    """Lock the owner the way strangers can: with wrong passwords, from anywhere. The account-wide
+    count is primed far past any threshold after a first failure has created it, so one more wrong
+    password arms the account-wide lock whatever the deployment's setting."""
     uid, name = owner.account["id"], owner.account["_username"]
-    _psql(f"UPDATE users SET failed_login_attempts = 1000000 WHERE id = '{uid}'")
     assert _sign_in(name, "definitely-not-the-password").status_code == 401
-    locked, until = _psql(f"SELECT is_locked, coalesce(locked_until::text, '') FROM users "
-                          f"WHERE id = '{uid}'").split("|")
+    _psql(f"UPDATE sign_in_lockouts SET failed_attempts = 1000000 WHERE user_id = '{uid}' AND source = '*'")
+    assert _sign_in(name, "definitely-not-the-password").status_code == 401
+    locked = _psql(f"SELECT locked_at IS NOT NULL FROM sign_in_lockouts WHERE user_id = '{uid}' AND source = '*'")
     assert locked == "t", "a wrong password past the threshold is expected to lock the account"
-    if not until:
-        pytest.skip("this deployment's automatic lock has no end time (lockout_duration=0), and such "
-                    "a lock stops links by design")
     assert _sign_in(name, owner.account["_password"]).status_code != 200, \
         "anchor: the automatic lock keeps even the owner from signing in"
 
@@ -318,5 +316,5 @@ def test_the_lock_wrong_passwords_arm_leaves_every_link_working(admin, owner, li
         done = anon.post(f"/receivers/{token}/upload-session/{sid}/complete", json={})
         assert done.status_code == 200, done.text
     finally:
-        # An administrator's unlock also clears the failure count primed above.
+        # An administrator's unlock also clears the automatic lock and the counts primed above.
         assert admin.patch(f"/users/{owner.account['id']}", json={"is_locked": False}).status_code == 200

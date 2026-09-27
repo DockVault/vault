@@ -28,7 +28,7 @@ from app.core.session_hash_utils import hash_session_token
 from app.core.database import redis_client, get_db_context
 from app.core.safe_log import safe_event
 from app.core.config import settings
-from app.core import rate_limit_settings, vault_attempt_throttle
+from app.core import rate_limit_settings, sign_in_lockout, vault_attempt_throttle
 from app.core.temp_cred_slot import outstanding_conditions
 
 
@@ -188,12 +188,11 @@ def _rollback_on_error(method):
 
 
 def account_locked(user) -> bool:
-    """Whether an account is CURRENTLY locked.
-
-    A FAILED-LOGIN auto-lock sets locked_until in the future and expires automatically (so a
-    handful of wrong passwords can't permanently DoS a known account). An ADMIN lock leaves
-    locked_until NULL and stays permanent until an admin clears it. Tolerates a naive (UTC)
-    locked_until column value."""
+    """Whether the account row carries a lock in force: an administrator's (locked_until NULL,
+    permanent until cleared), or a timed one armed by failed sign-ins before those moved to
+    sign_in_lockouts (it runs out on its own). Consulted at sign-in. Whether a session already
+    signed in may go on is admin_locked's question: only an administrator's lock ends sessions.
+    Tolerates a naive (UTC) locked_until column value."""
     if not getattr(user, 'is_locked', False):
         return False
     locked_until = getattr(user, 'locked_until', None)
@@ -202,6 +201,20 @@ def account_locked(user) -> bool:
     if locked_until.tzinfo is None:
         locked_until = locked_until.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) < locked_until
+
+
+def login_user_key(identifier, ip_address, *, prefixed=True) -> str:
+    """The sign-in throttle's per-name bucket: one per name AND source address. ``prefixed`` gives
+    the cache key; without it, the durable fallback's identifier (its column is bounded)."""
+    bucket = f"{identifier}|{ip_address}"
+    return f"login_user:{bucket}" if prefixed else bucket[:255]
+
+
+# The reason an automatic lock's refusal carries into the audit log (the caller sees its own text).
+_LOCK_REASONS = {
+    "address": "Sign-in refused: too many failed sign-ins to this account from this address",
+    "account": "Sign-in refused: too many failed sign-ins to this account from several addresses",
+}
 
 
 def admin_locked(user) -> bool:
@@ -213,8 +226,10 @@ def admin_locked(user) -> bool:
 
 
 # Audit actions for a failed-login lock that is armed, and later released, without anyone acting.
-# An administrator's lock and unlock are recorded by the routes that make them.
-AUTO_LOCKED_ACTION = "account_auto_locked"
+# An administrator's lock and unlock are recorded by the routes that make them. Automatic locks are
+# armed in app/core/sign_in_lockout.py; this module still releases a timed lock left on the account row
+# from before they moved there.
+AUTO_LOCKED_ACTION = sign_in_lockout.AUTO_LOCKED_ACTION
 AUTO_UNLOCKED_ACTION = "account_auto_unlocked"
 
 
@@ -288,10 +303,14 @@ class InvalidCredentialsError(AuthenticationError):
 
 
 class AccountLockedError(AuthenticationError):
-    """Raised when account is locked. Carries locked_until (None = a permanent/admin lock)."""
-    def __init__(self, message: str = "Account is locked", locked_until=None):
+    """Raised when a sign-in is refused by a lock. Carries locked_until (None = no end) and scope:
+    "administrator" (an administrator's lock), "timed" (a timed lock on the account row, from before
+    automatic locks moved to their own table), or an automatic lock's "address" or "account" (see
+    app/core/sign_in_lockout.py)."""
+    def __init__(self, message: str = "Account is locked", locked_until=None, scope: str = "administrator"):
         super().__init__(message)
         self.locked_until = locked_until
+        self.scope = scope
 
 
 class RateLimitExceededError(AuthenticationError):
@@ -504,17 +523,35 @@ class AuthService:
             user = self.db.query(User).filter(User.username == username).first()
 
         if not user:
+            # A name that is no account is refused at the same point an account's automatic lock
+            # would refuse it (counted in the cache), so being refused never tells whether an
+            # account exists.
+            phantom = sign_in_lockout.phantom_lock(username, ip_address)
+            if phantom is not None:
+                raise AccountLockedError(_LOCK_REASONS[phantom.scope], locked_until=phantom.locked_until,
+                                         scope=phantom.scope)
             # Equalize timing with the real path so a non-existent username isn't
             # distinguishable by response time (username-enumeration oracle).
             verify_password(password, _DUMMY_PASSWORD_HASH)
             self._record_failed_login(username, ip_address)
+            sign_in_lockout.phantom_failure(username, ip_address)
             raise InvalidCredentialsError("Invalid username or password")
-        
-        # A failed-login auto-lock auto-expires (locked_until in the past) — clear it so the
-        # password is verified afresh; an admin lock (locked_until NULL) stays in force. The release
-        # and its account_auto_unlocked row commit with whatever this sign-in commits next.
+
+        # Automatic locks whose time has run out end here, recorded with this sign-in's address:
+        # the account row's timed lock from before they moved (an administrator's, with no end,
+        # stays), and the address's or the account-wide lock. The releases commit with whatever this
+        # sign-in commits next.
         if user.is_locked and not account_locked(user):
             release_expired_locks(self.db, user=user, ip_address=ip_address)
+        sign_in_lockout.release_expired(self.db, user_id=user.id, ip_address=ip_address)
+
+        # An automatic lock refuses the sign-in BEFORE the password is checked: while it lasts,
+        # nobody at that address (or, account-wide, anywhere) can go on guessing. A name that is no
+        # account is refused the same way above, so this answer does not reveal the account.
+        lock = sign_in_lockout.lock_in_force(self.db, user.id, ip_address)
+        if lock is not None:
+            raise AccountLockedError(_LOCK_REASONS[lock.scope], locked_until=lock.locked_until,
+                                     scope=lock.scope)
 
         # Verify the password FIRST, before any account-state branch, so a caller who does
         # NOT present valid credentials cannot distinguish existing/active/locked/deactivated
@@ -527,7 +564,8 @@ class AuthService:
         # Credentials are valid — now enforce account state. (The distinct exception type is
         # for audit / internal handling; the endpoint surfaces a generic message.)
         if account_locked(user):
-            raise AccountLockedError("Account is locked", locked_until=user.locked_until)
+            raise AccountLockedError("Account is locked", locked_until=user.locked_until,
+                                     scope="administrator" if user.locked_until is None else "timed")
         if not user.is_active:
             raise InvalidCredentialsError("Account is not active")
         
@@ -542,11 +580,12 @@ class AuthService:
         session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
         session_token = self._create_session(user, None, ip_address, expires_at=session_expires_at)
         
-        # Reset failed login attempts
+        # Reset failed login attempts: the total, and this address's count toward its lock.
         user.failed_login_attempts = 0
+        sign_in_lockout.clear_after_success(self.db, user.id, ip_address)
         user.last_login = datetime.now(timezone.utc)
         self.db.commit()
-        
+
         return user, session_token
     
     def authenticate_temporary_credential(
@@ -683,8 +722,10 @@ class AuthService:
         # principal could still mint a temp session, emit a misleading login-success signal,
         # and BURN this one-time credential. Check BEFORE marking it used so a deactivated
         # owner does not consume it.
+        # An automatic lock (wrong passwords for the account's own password) does not stop a
+        # temporary credential or a device's sync credential: only an administrator's lock does.
         user = temp_cred.user
-        if user is None or not user.is_active or account_locked(user):
+        if user is None or not user.is_active or admin_locked(user):
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
 
@@ -1399,9 +1440,10 @@ class AuthService:
         if getattr(vault, 'type', 'standard') == 'zero_knowledge':
             raise _device_mint_refusal("vault-not-standard")
 
-        # Predicate 3 (the owning account is active and not locked).
+        # Predicate 3 (the owning account is active and not locked by an administrator; an
+        # automatic lock after wrong passwords never freezes a device).
         owner = self.db.query(User).filter(User.id == device.user_id).first()
-        if owner is None or not owner.is_active or account_locked(owner):
+        if owner is None or not owner.is_active or admin_locked(owner):
             raise _device_mint_refusal("account-inactive")
 
         # Predicate 5 (the grant is still proven). The grant's frozen fingerprint must still equal
@@ -1945,9 +1987,11 @@ class AuthService:
                           user_limit, ip_limit, window):
         """Primary, Redis-backed sliding-window throttle (fail closed)."""
         from app.core.rate_limiter import retry_after_seconds
-        # Per-username limit.
+        # Per-name limit, from this address: the same limit from somewhere else is a separate
+        # budget, so guessing from one address cannot throttle the account's owner signing in from
+        # another. Guessing from many addresses at once meets the account-wide lock.
         allowed_user, remaining_user, reset_user = rate_limiter.check_rate_limit(
-            f"login_user:{identifier}", user_limit, window,
+            login_user_key(identifier, ip_address), user_limit, window,
             prefix="rate_limit", fail_open=False,
         )
         if not allowed_user:
@@ -1977,7 +2021,7 @@ class AuthService:
         """DB-backed throttle used only when Redis is unavailable, so a Redis
         outage cannot silently disable login throttling."""
         allowed_user, retry_user = self._db_throttle_hit(
-            identifier, "login_user", user_limit, window
+            login_user_key(identifier, ip_address, prefixed=False), "login_user", user_limit, window
         )
         if not allowed_user:
             raise RateLimitExceededError(
@@ -2122,50 +2166,27 @@ class AuthService:
         if user:
             # Counted in the database. `user.failed_login_attempts += 1` wrote back one more than
             # the value this request had loaded, so failures arriving together each wrote the same
-            # number and all but one were lost. This UPDATE adds one to whatever is stored and
-            # returns the result with the lock state, and the row stays locked until the commit
-            # below, so the lock decision is made on the row as it stands. Anything pending on the
-            # row is written first, so the increment lands on top of it instead of under it.
+            # number and all but one were lost. This UPDATE adds one to whatever is stored. It is
+            # the total since the last successful sign-in, shown to administrators; it arms nothing.
+            # Anything pending on the row is written first, so the increment lands on top of it.
             self.db.flush()
             users = User.__table__
             row = self.db.execute(
                 update(users).where(users.c.id == user.id)
                 .values(failed_login_attempts=func.coalesce(users.c.failed_login_attempts, 0) + 1)
-                .returning(users.c.failed_login_attempts, users.c.is_locked, users.c.locked_until)
+                .returning(users.c.failed_login_attempts)
             ).first()
             if row is None:  # the account was deleted meanwhile; there is nothing to count or lock
                 self.db.commit()
                 return
-            for key, value in zip(("failed_login_attempts", "is_locked", "locked_until"), row):
-                set_committed_value(user, key, value)
-            was_locked = account_locked(user)
+            set_committed_value(user, "failed_login_attempts", row[0])
 
-            # Lock account after too many failed attempts. TIME-BOX the lock (locked_until)
-            # so it auto-unlocks — a permanent lock here is a trivial targeted DoS (5 wrong
-            # passwords against a known username). account_lockout_minutes=0 keeps it
-            # permanent (locked_until NULL) if a deployment ever wants the old behaviour.
-            # Since now verifies the password even for an already-locked account, a
-            # failed login can reach this branch for a PERMANENT admin lock (is_locked=True,
-            # locked_until=NULL). Do NOT downgrade such a standing lock into an auto-expiring
-            # one — only arm a fresh auto-lock when the account is not already permanently
-            # locked (regression guard).
-            if user.failed_login_attempts >= rate_limit_settings.effective(
-                "max_login_attempts"
-            ) and not (user.is_locked and user.locked_until is None):
-                user.is_locked = True
-                ttl = rate_limit_settings.effective("lockout_duration")
-                user.locked_until = (
-                    datetime.utcnow() + timedelta(minutes=ttl) if ttl > 0 else None
-                )
-                # Record the failure that arms the lock. Every failure is already in the log as a
-                # login_failure with the same generic reason, so without this row a lock could only
-                # be inferred. A failure against an account already under a timed lock only moves
-                # its end, and is not recorded again.
-                if not was_locked:
-                    self.db.add(_lock_audit_row(
-                        self.db, AUTO_LOCKED_ACTION, user.id, user.username, ip_address, {
-                            "failed_attempts": user.failed_login_attempts,
-                            "locked_until": _iso(user.locked_until),
-                        }))
+            # The counts that lock: this address's, and the account's across every address. Each
+            # arms its lock at its limit and records account_auto_locked with the scope, in this
+            # transaction (app/core/sign_in_lockout.py). Neither touches users.is_locked, which is
+            # an administrator's alone, so sessions already signed in carry on. An account an
+            # administrator locked is out of use already, and gains no automatic lock on top.
+            if not admin_locked(user):
+                sign_in_lockout.record_failure(self.db, user, ip_address)
 
             self.db.commit()

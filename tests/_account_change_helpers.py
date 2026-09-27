@@ -115,3 +115,78 @@ def mail_to(address, subject_contains=None, timeout=20.0):
                 return {"subject": m.get("Subject") or "", "text": body.get("Text") or ""}
         time.sleep(0.5)
     return None
+
+
+# --- signing in from a second address, and the automatic locks -------------------------------------
+
+REDIS = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
+
+
+def reset_sign_in_throttle():
+    """Clear the sign-in throttle's buckets, so a test that counts failures meets the lock, not the
+    throttle that fires at the same count within its window."""
+    r = subprocess.run(["docker", "exec", REDIS, "sh", "-c",
+                        "redis-cli --scan --pattern 'rate_limit:login_user:*' | xargs -r redis-cli del; "
+                        "redis-cli --scan --pattern 'rate_limit:login_ip:*' | xargs -r redis-cli del"],
+                       capture_output=True, text=True, timeout=30)
+    skip_if_container_absent(r, REDIS)
+
+
+SFTP_CONTAINER = os.environ.get("VAULT_SFTP_CONTAINER", "vault-sftp")
+
+
+def sign_in_from_inside(username, password, *, container=None, url="http://127.0.0.1:8000"):
+    """Sign in over HTTP from inside a container of the stack, so the vault sees the request come from
+    another source address than the host's: 127.0.0.1 from the web container itself, or the SFTP
+    container's own address when run there against http://vault-api:8000. Returns
+    (status, body, Retry-After)."""
+    container = container or API
+    script = (
+        "import json, urllib.request, urllib.error\n"
+        f"data = json.dumps({{'username': {username!r}, 'password': {password!r}}}).encode()\n"
+        f"req = urllib.request.Request({url + '/auth/login'!r}, data=data,\n"
+        "                             headers={'Content-Type': 'application/json'})\n"
+        "try:\n"
+        "    r = urllib.request.urlopen(req, timeout=60)\n"
+        "    print(json.dumps([r.status, json.loads(r.read() or b'null'), None]))\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    print(json.dumps([e.code, json.loads(e.read() or b'null'), e.headers.get('Retry-After')]))\n")
+    try:
+        r = subprocess.run(["docker", "exec", "-i", container, "python", "-c", script],
+                           capture_output=True, text=True, timeout=90)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker unavailable: {exc}")
+    skip_if_container_absent(r, container)
+    assert r.returncode == 0, (r.stderr or r.stdout)[-600:]
+    import json
+    return tuple(json.loads(r.stdout.strip().splitlines()[-1]))
+
+
+def lock_rows(user_id):
+    """{source: (failed_attempts, locked)} for the account's rows in sign_in_lockouts."""
+    out = psql(f"SELECT source, failed_attempts, locked_at IS NOT NULL FROM sign_in_lockouts "
+               f"WHERE user_id='{user_id}'")
+    rows = {}
+    for line in out.splitlines():
+        source, count, locked = line.split("|")
+        rows[source] = (int(count), locked == "t")
+    return rows
+
+
+def arm_lock(user_id, source, minutes=10):
+    """Put an automatic lock in force directly: `source` is an address, or '*' for account-wide."""
+    psql("INSERT INTO sign_in_lockouts (id, user_id, source, failed_attempts, window_start, last_failure_at, "
+         "locked_at, locked_until) VALUES (gen_random_uuid(), "
+         f"'{user_id}', '{source}', 1000, now() AT TIME ZONE 'utc', now() AT TIME ZONE 'utc', "
+         f"now() AT TIME ZONE 'utc', (now() AT TIME ZONE 'utc') + interval '{int(minutes)} minutes') "
+         "ON CONFLICT (user_id, source) DO UPDATE SET locked_at = EXCLUDED.locked_at, "
+         "locked_until = EXCLUDED.locked_until, failed_attempts = EXCLUDED.failed_attempts")
+
+
+def host_address(admin, username):
+    """The address the vault sees this test's host requests come from: that of a failed sign-in just
+    made from here under `username`."""
+    rows = admin.get("/audit/log", params={"action": "login_failure", "limit": 200}).json()
+    mine = [r for r in rows if r["username"] == username and r.get("ip_address")]
+    assert mine, "no failed sign-in from this host was recorded"
+    return mine[0]["ip_address"]

@@ -5220,6 +5220,14 @@ function fillCredentialChangeNotes() {
         if (u && u.second_factor_reset_pending) {
             lines.push('Second factor reset: they set up a new one at their next sign-in.');
         }
+        if (u && u.sign_in_block) {
+            const b = u.sign_in_block;
+            const where = b.scope === 'account'
+                ? 'from every address (many failed sign-ins from different places)'
+                : 'from ' + b.addresses + (b.addresses === 1 ? ' address' : ' addresses') + ' with too many failed sign-ins';
+            const until = b.until ? ' until ' + formatServerTime(b.until) : ' until an administrator clears it';
+            lines.push('New sign-ins are paused ' + where + until + '. Anyone already signed in stays signed in. Unlock clears it now.');
+        }
         note.replaceChildren(...lines.map(t => _el('div', null, t)));
         note.hidden = lines.length === 0;
     });
@@ -5261,7 +5269,7 @@ function renderUsersTable() {
         if (roleF !== 'all' && u.role !== roleF) return false;
         if (statusF === 'active' && !(u.is_active && !u.is_locked)) return false;
         if (statusF === 'inactive' && u.is_active) return false;
-        if (statusF === 'locked' && !u.is_locked) return false;
+        if (statusF === 'locked' && !u.is_locked && !u.sign_in_block) return false;
         if (groupF !== 'all' && !(u.groups || []).some(g => g.id === groupF)) return false;
         if (q && !(u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q))) return false;
         return true;
@@ -5365,6 +5373,7 @@ function renderUserRow(u) {
             <td><div class="badge-row">
                 <span class="badge badge-${u.is_active ? 'success' : 'secondary'}">${u.is_active ? 'Active' : 'Inactive'}</span>
                 ${u.is_locked ? `<span class="badge badge-warning">${iconSvg('lock', 'icon-sm')} Locked</span>` : ''}
+                ${!u.is_locked && u.sign_in_block ? `<span class="badge badge-warning sign-in-block-badge" data-user-id="${u.id}">${iconSvg('clock', 'icon-sm')} Sign-ins paused</span>` : ''}
             </div></td>
             <td>${u.second_factor_enabled
                     ? `<span class="badge badge-success">${iconSvg('shield', 'icon-sm')} On</span>`
@@ -5424,7 +5433,7 @@ function renderUserDetail(u) {
             <div class="credential-change-note" data-user-id="${u.id}" hidden></div>
             <div class="entity-actions">
                 <button class="btn btn-sm btn-secondary edit-user-btn" data-user-id="${u.id}">${iconSvg('edit', 'icon-sm')} Edit</button>
-                ${u.is_locked
+                ${u.is_locked || u.sign_in_block
                     ? `<button class="btn btn-sm btn-success unlock-user-btn" data-user-id="${u.id}">${iconSvg('unlock', 'icon-sm')} Unlock</button>`
                     : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
@@ -5902,6 +5911,9 @@ function attachUserListeners() {
 
     // What the last credential change was, and until when a further one needs a second administrator
     fillCredentialChangeNotes();
+    document.querySelectorAll('.sign-in-block-badge').forEach(badge => {
+        badge.title = 'Failed sign-ins paused new sign-ins to this account. Sessions already signed in carry on.';
+    });
 
     // Lock user buttons
     document.querySelectorAll('.lock-user-btn').forEach(btn => {

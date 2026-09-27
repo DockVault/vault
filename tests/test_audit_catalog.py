@@ -39,6 +39,7 @@ PASS_THROUGH = {
     ("app/api/api_server.py", "_audit_change"),
     ("app/sftp/sftp_server.py", "_audit"),
     ("app/services/auth_service.py", "_lock_audit_row"),
+    ("app/core/sign_in_lockout.py", "_audit_row"),
 }
 
 # Names built at run time: (file, enclosing function, source of the expression) -> every name it yields.
@@ -169,7 +170,8 @@ def test_actions_passed_by_a_constants_name_are_read_as_their_text():
     # The automatic account lock and unlock pass their action by a constant's name (AUTO_LOCKED_ACTION,
     # AUTO_UNLOCKED_ACTION). The scan reads the constant, so the name it holds is checked against the
     # catalog like a literal, and so is any name a new constant holds.
-    assert {("app/services/auth_service.py", "AUTO_LOCKED_ACTION", "account_auto_locked"),
+    assert {("app/core/sign_in_lockout.py", "AUTO_LOCKED_ACTION", "account_auto_locked"),
+            ("app/core/sign_in_lockout.py", "AUTO_UNLOCKED_ACTION", "account_auto_unlocked"),
             ("app/services/auth_service.py", "AUTO_UNLOCKED_ACTION", "account_auto_unlocked")} <= set(FROM_CONSTANTS)
 
 

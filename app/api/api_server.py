@@ -262,6 +262,38 @@ def _account_lock_retry_after(locked_until, now=None) -> int:
     return retry_after_seconds(locked_until.timestamp(), window, now)
 
 
+def _sign_in_lock_refusal(exc) -> HTTPException:
+    """What a sign-in refused by a lock is told (403). Only a caller who reached the check gets it:
+    an administrator's lock is reported after the password proved right, an automatic lock before
+    the password is checked (a name that is no account is refused the same way, so it reveals
+    nothing). Each says what to do; a lock that ends says when."""
+    scope = getattr(exc, "scope", "administrator")
+    if scope == "administrator":
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                             detail="Your account is locked. Contact your administrator to unlock it.")
+    if scope == "address":
+        why = ("Too many failed sign-ins to this account from your network address, so sign-ins from "
+               "it are paused.")
+    elif scope == "account":
+        why = ("Too many failed sign-ins to this account from different places, so new sign-ins to it "
+               "are paused everywhere. Anyone already signed in stays signed in.")
+    else:   # a timed lock on the account row, from before automatic locks moved to their own table
+        why = "Your account is temporarily locked after too many failed attempts."
+    locked_until = getattr(exc, "locked_until", None)
+    if locked_until is None:
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                             detail=why + " An administrator can clear it.")
+    if locked_until.tzinfo is None:
+        locked_until = locked_until.replace(tzinfo=timezone.utc)
+    secs = _account_lock_retry_after(locked_until)
+    # Minutes for the sentence only, rounded up from the wait above; not a second wait.
+    mins = max(1, (secs + 59) // 60)
+    tail = (f" Try again in about {mins} minute(s)." if scope == "timed"
+            else f" Try again in about {mins} minute(s), or ask an administrator to clear it.")
+    return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=why + tail,
+                         headers={"Retry-After": str(secs)})
+
+
 def _external_scheme(request: StarletteRequest) -> str:
     """The externally-visible request scheme, honouring X-Forwarded-Proto only from a trusted proxy.
 
@@ -913,6 +945,10 @@ class UserResponse(BaseModel):
     # An administrator reset the second factor and the user has not set it up again yet: the next
     # sign-in asks them to. Filled in by the admin users list.
     second_factor_reset_pending: bool = False
+    # New sign-ins to this account are paused by failed ones ({scope: "address" | "account",
+    # addresses, until}), or None. Sessions carry on; an administrator's unlock clears it. Filled in
+    # by the admin users list.
+    sign_in_block: Optional[Dict[str, Any]] = None
     # The newest credential change an administrator made to this account within the last 14 days
     # ({kind, label, by, at, window_ends}), or None. Until window_ends, a further change needs a
     # second administrator's approval. Filled in by the admin users list.
@@ -1498,13 +1534,14 @@ async def get_current_device_principal(
     if device.expires_at is not None and device.expires_at <= datetime.utcnow():
         raise _device_auth_401("device-expired")
 
-    # The OWNING ACCOUNT must be active and not locked, so a locked/deactivated account's devices
-    # are fully INERT — no mint, no refresh, no grant listing. The mint re-checks this (predicate 3),
-    # but enforcing it in the resolver means EVERY device route inherits it, mirroring on the server
-    # side the desktop's lock-state purge (a locked account performs no key operation).
-    from app.services.auth_service import account_locked
+    # The OWNING ACCOUNT must be active and not locked by an administrator, so a locked/deactivated
+    # account's devices are fully INERT — no mint, no refresh, no grant listing. The mint re-checks
+    # this (predicate 3), but enforcing it in the resolver means EVERY device route inherits it,
+    # mirroring on the server side the desktop's lock-state purge. An automatic lock after wrong
+    # passwords never freezes a device: it is about signing in with the password, not about this.
+    from app.services.auth_service import admin_locked
     owner = db.query(User).filter(User.id == device.user_id).first()
-    if owner is None or not owner.is_active or account_locked(owner):
+    if owner is None or not owner.is_active or admin_locked(owner):
         raise _device_auth_401("account-inactive")
 
     return DevicePrincipal(device, in_grace=in_grace)
@@ -1696,12 +1733,12 @@ async def get_current_user(
             headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
         )
 
-    # A locked account is rejected on every request (not just at login), so an admin
-    # locking a user revokes their already-issued token immediately. A FAILED-LOGIN auto-lock
-    # auto-expires (account_locked honours locked_until), so a brute-force on a victim's
-    # username can't keep their valid session locked out beyond the TTL.
-    from app.services.auth_service import account_locked
-    if account_locked(user):
+    # An administrator's lock is rejected on every request (not just at login), so locking a user
+    # ends their already-issued token immediately. An automatic lock armed by wrong passwords only
+    # refuses new sign-ins: it never ends a session already signed in, or anyone who knows a
+    # username could sign its owner out by guessing (app/core/sign_in_lockout.py).
+    from app.services.auth_service import admin_locked
+    if admin_locked(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is locked",
@@ -5506,10 +5543,17 @@ def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=
                            email=(old_email or "") if kind == cc.EMAIL else None)
 
 
-def _notify_account_status_changes(db, user, *, by_name, locked=None, active=None, role=None) -> None:
+def _notify_account_status_changes(db, user, *, by_name, locked=None, active=None, role=None,
+                                   sign_in_locks_cleared=0) -> None:
     """The notices for an administrator's lock, unlock, deactivation, reactivation or role change.
-    Each argument is (old, new), or None when that did not change hands in the request."""
+    Each argument is (old, new), or None when that did not change hands in the request.
+    ``sign_in_locks_cleared`` is how many automatic locks an unlock cleared; clearing them is told as
+    an unlock too when the account itself was not locked."""
     by = _actor_text(by_name)
+    if sign_in_locks_cleared and not (locked is not None and bool(locked[0]) != bool(locked[1])):
+        _notify_account_change(db, user, ntype="account_changed", title="Your account was unlocked",
+                               change="An administrator cleared the pause that failed sign-ins had put on "
+                                      "new sign-ins to your account.", by=by)
     if locked is not None and bool(locked[0]) != bool(locked[1]):
         if locked[1]:
             _notify_account_change(db, user, ntype="account_changed", title="Your account was locked",
@@ -6953,23 +6997,7 @@ async def login(
         # stuck. Wrong password / nonexistent / inactive still get the uniform generic 401 so the
         # response body can't enumerate accounts or their state.
         if isinstance(e, AccountLockedError):
-            locked_until = getattr(e, 'locked_until', None)
-            if locked_until is not None:
-                if locked_until.tzinfo is None:
-                    locked_until = locked_until.replace(tzinfo=timezone.utc)
-                secs = _account_lock_retry_after(locked_until)
-                # Minutes for the sentence only, rounded up from the wait above; not a second wait.
-                mins = max(1, (secs + 59) // 60)
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Your account is temporarily locked after too many failed attempts. "
-                           f"Try again in about {mins} minute(s).",
-                    headers={"Retry-After": str(secs)},
-                )
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Your account is locked. Contact your administrator to unlock it.",
-            )
+            raise _sign_in_lock_refusal(e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password"
@@ -8254,7 +8282,7 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
     socket at once; the next cycle re-checks."""
     try:
         from app.core.database import SessionLocal
-        from app.services.auth_service import is_token_denylisted, account_locked
+        from app.services.auth_service import is_token_denylisted, admin_locked
         from app.core.models import ActiveSession as _AS, User as _U
         if is_token_denylisted(session_token):
             return True
@@ -8270,7 +8298,8 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
             if is_temporary and not is_active:
                 return True  # temp credential invalidated (_revoke_sessions flips is_active)
             u = db.query(_U).filter(_U.id == uuid.UUID(user_id)).first()
-            if not u or not u.is_active or account_locked(u):
+            # Only an administrator's lock ends a live session; an automatic one never does.
+            if not u or not u.is_active or admin_locked(u):
                 return True
         finally:
             db.close()
@@ -8371,7 +8400,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             if not session_token:
                 raise ValueError("Invalid token payload")
             from app.core.database import SessionLocal
-            from app.services.auth_service import is_token_denylisted, account_locked
+            from app.services.auth_service import is_token_denylisted, admin_locked
             from app.core.models import ActiveSession as _WsAS, User as _WsUser
             _wsdb = SessionLocal()
             try:
@@ -8431,7 +8460,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                         if _now > _lim:
                             raise ValueError("Session terminated")
                 _wsuser = _wsdb.query(_WsUser).filter(_WsUser.id == uuid.UUID(user_id)).first()
-                if not _wsuser or not _wsuser.is_active or account_locked(_wsuser):
+                if not _wsuser or not _wsuser.is_active or admin_locked(_wsuser):
                     raise ValueError("Account inactive or locked")
             finally:
                 _wsdb.close()
@@ -8661,11 +8690,17 @@ async def list_users(
     # sees before acting that a further change would wait for a second administrator.
     from app.core import credential_changes as cc
     recent = cc.recent_by_account(db, [u.id for u in users])
+    from app.core import sign_in_lockout
+    blocks = sign_in_lockout.blocks_by_user(db, [u.id for u in users])
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
         item.second_factor_enabled = user.id in mfa_user_ids
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
+        block = blocks.get(user.id)
+        if block is not None:
+            item.sign_in_block = {"scope": block["scope"], "addresses": block["addresses"],
+                                  "until": block["until"].isoformat() + "Z" if block["until"] else None}
         change = recent.get(user.id)
         if change is not None:
             item.credential_change = {
@@ -9801,9 +9836,14 @@ async def update_user(
                 # account_locked() treats it as a standing lock until an admin clears it.
                 user.locked_until = None
             else:
-                # Unlock: clear the failed-attempt counter and any auto-lock TTL.
+                # Unlock: clear the failed-attempt counter and any auto-lock TTL, and every
+                # automatic lock failed sign-ins put on the account, from any address.
                 user.failed_login_attempts = 0
                 user.locked_until = None
+                from app.core import sign_in_lockout
+                cleared = sign_in_lockout.clear_for_user(db, user.id)
+                if cleared:
+                    changes['sign_in_locks_cleared'] = cleared
 
         # Locking or deactivating an account revokes its live sessions immediately:
         # force-close any open SFTP transport now (the per-request is_active/
@@ -9846,7 +9886,8 @@ async def update_user(
             c = changes.get(key)
             return (c["old"], c["new"]) if isinstance(c, dict) else None
         _notify_account_status_changes(db, user, by_name=current_user.username, locked=_pair("is_locked"),
-                                       active=_pair("is_active"), role=_pair("role"))
+                                       active=_pair("is_active"), role=_pair("role"),
+                                       sign_in_locks_cleared=changes.get("sign_in_locks_cleared", 0))
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
@@ -11756,10 +11797,9 @@ def _link_owner_if_live(db, owner_id):
     every note, file and upload link of that user answer 404 for as long as they kept guessing.
     That lock is about signing in; the links stay as the owner left them.
 
-    A deployment whose lockout duration is 0 arms the automatic lock with no end time either, and
-    it then holds until an administrator clears it. It reads as an administrator's lock here and
-    stops the links, which is acceptable: in that configuration the account is out of use until an
-    administrator acts."""
+    Automatic locks live in their own table now (app/core/sign_in_lockout.py) and never set
+    is_locked, so only an administrator's lock, or a timed one left from before they moved, is on
+    the account row; the timed one has an end and is ignored here like any automatic lock."""
     owner = db.query(User).filter(User.id == owner_id).first()
     if owner is None or not getattr(owner, "is_active", True):
         return None
@@ -22659,6 +22699,20 @@ async def cleanup_expired_sessions():
                 if pruned:
                     db.commit()
                     print(f"🧹 Pruned {pruned} stale rate-limit record(s)")
+
+                # Automatic sign-in locks whose time ran out end, each recorded with its scope; and
+                # counts with nothing left to count are dropped.
+                try:
+                    from app.core import sign_in_lockout
+                    released = sign_in_lockout.release_expired(db)
+                    pruned_counts = sign_in_lockout.prune_stale(db)
+                    if released or pruned_counts:
+                        db.commit()
+                    if released:
+                        print(f"🔓 Released {released} automatic sign-in lock(s) past their duration")
+                except Exception as lockout_err:
+                    db.rollback()
+                    print(f"⚠ sign-in lock release failed: {type(lockout_err).__name__}")
 
                 # Delete finished session and pending-login rows once they are past retention.
                 # Each holds the address a sign-in came from, and nothing else ever removed them
