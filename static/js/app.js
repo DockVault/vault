@@ -19908,6 +19908,8 @@ function _rcRetentionEditor(r) {
         wrap.appendChild(off);
     }
     const err = document.createElement('p'); err.className = 'text-sm mt-sm'; err.id = 'rc-info-retention-error';
+    // An alert, so a screen reader says the refusal when it appears rather than leaving it to be found.
+    err.setAttribute('role', 'alert');
     err.style.color = 'var(--danger,#dc2626)'; err.hidden = true;
     wrap.appendChild(err);
     const actions = document.createElement('div'); actions.className = 'flex gap-sm mt-sm';

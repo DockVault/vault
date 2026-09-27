@@ -6,6 +6,8 @@ actually produces.
 
 1. Storage for an empty drop vault read " / 10 MB": _mbFromBytes gives '' for 0 bytes -- right for a
    form field left empty, wrong in "0 / 10 MB". The Info dialog and the card now show 0.
+2. The retention form's error line appeared silently: a screen reader was not told that Save had been
+   refused. It is an alert now, for the page's own check and for the server's refusal alike.
 """
 import json
 import shutil
@@ -132,3 +134,25 @@ def test_an_empty_drop_vault_shows_0_mb_of_its_budget():
         "infoEmpty": "0 / 10 MB", "infoUnknown": "0 / 10 MB", "infoNoBudget": "0 MB used",
         "infoSome": "3 / 10 MB", "cardEmpty": "0 / 10 MB", "cardNoBudget": "0 MB used",
     }
+
+
+def test_a_refused_retention_change_is_announced():
+    """Change, then Save with no number (the page refuses it), then with one the server refuses:
+    each time the refusal appears in an alert."""
+    out = _run(f"""
+    const els = all(infoModal(link({{ max_total_bytes: 10 * {MB}, stored_bytes: 0, retention_days: null }})));
+    const byId = (id) => els.find(e => e.id === id);
+    const said = () => els.filter(e => !e.hidden && /^(Enter the number|The server says)/.test(e._text))
+        .map(e => ({{ text: e._text, role: e.getAttribute('role') }}));
+    await byId('rc-info-retention-change').click();
+    byId('rc-info-retention-days').value = '';
+    await byId('rc-info-retention-save').click();
+    out.page = said();
+    byId('rc-info-retention-days').value = '5';
+    apiAnswer = new Error('The server says no.');
+    await byId('rc-info-retention-save').click();
+    out.server = said();
+    """)
+    assert out["page"] == [{"text": "Enter the number of days to keep uploads: a whole number, 1 or more.",
+                            "role": "alert"}]
+    assert out["server"] == [{"text": "The server says no.", "role": "alert"}]
