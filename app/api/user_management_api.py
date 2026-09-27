@@ -573,6 +573,8 @@ async def update_user(
 
     # Update fields
     held = []   # credential changes waiting for another administrator's approval
+    made = []   # credential changes made, for the user's notice
+    old_role, old_active = user.role.value if user.role is not None else None, user.is_active
     # Omitting "email" leaves the address alone; sending it as an explicit null clears it. The
     # previous `is not None` test collapsed those two into one, so an address could be replaced but
     # never removed.
@@ -601,6 +603,8 @@ async def update_user(
                 payload={"email": new_email}, request=request)
             if outcome.held:
                 held.append(outcome)
+            else:
+                made.append(outcome)
 
     if update_data.role is not None:
         user.role = update_data.role
@@ -626,6 +630,15 @@ async def update_user(
         details=f"Updated user {user.username}",
         ip_address=None
     )
+
+    # The user hears of every change an administrator made to their address or standing.
+    if current_user.id != user_id:
+        from app.api.api_server import _notify_account_status_changes, _notify_credential_change
+        for outcome in made:
+            _notify_credential_change(db, "email", user, outcome.result, by_name=current_user.username)
+        _notify_account_status_changes(
+            db, user, by_name=current_user.username, active=(old_active, user.is_active),
+            role=(old_role, user.role.value if user.role is not None else None))
     
     # Return updated details
     # Keyword args, not positional: get_user_detail is wrapped by require_endpoint_permission,
@@ -706,6 +719,9 @@ async def toggle_user_active(
         details=f"Set user {user.username} active status to {user.is_active}",
         ip_address=None
     )
+    from app.api.api_server import _notify_account_status_changes
+    _notify_account_status_changes(db, user, by_name=current_user.username,
+                                   active=(not user.is_active, user.is_active))
     
     return {
         "message": f"User {'activated' if user.is_active else 'deactivated'} successfully",
@@ -766,6 +782,9 @@ async def toggle_user_locked(
         details=f"Set user {user.username} locked status to {user.is_locked}",
         ip_address=None
     )
+    from app.api.api_server import _notify_account_status_changes
+    _notify_account_status_changes(db, user, by_name=current_user.username,
+                                   locked=(not user.is_locked, user.is_locked))
     
     return {
         "message": f"User {'locked' if user.is_locked else 'unlocked'} successfully",
@@ -1224,6 +1243,8 @@ async def change_user_role(
         resource_id=str(target_user.id),
         details={"username": target_user.username, "old_role": old_role, "new_role": new_role},
     )
+    from app.api.api_server import _notify_account_status_changes
+    _notify_account_status_changes(db, target_user, by_name=current_user.username, role=(old_role, new_role))
 
     return ChangeRoleResponse(
         message=f"Role changed successfully from '{old_role}' to '{new_role}'",

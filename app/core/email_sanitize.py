@@ -192,6 +192,12 @@ DYNAMIC_ACTIONS: tuple[DynamicAction, ...] = (
     DynamicAction("action.link", "Action link", "https://vault.example.com/invite/…", "Automated action", "The action's link (invite / reset / verify) — empty in a manual send"),
     DynamicAction("action.code", "Action code", "482913", "Automated action", "A one-time code — empty in a manual send"),
     DynamicAction("action.expires", "Expires", "in 24 hours", "Automated action", "When the link or code expires"),
+    DynamicAction("action.change", "What changed", "Your password was changed.", "Automated action",
+                  "What an administrator changed on the account — empty in a manual send"),
+    DynamicAction("action.by", "Changed by", "alice", "Automated action",
+                  "The administrator who made the change — empty in a manual send"),
+    DynamicAction("action.when", "Changed at", "2026-08-24 14:05 UTC", "Automated action",
+                  "When the change was made — empty in a manual send"),
 )
 
 
@@ -227,7 +233,7 @@ def token_context(
     """Build the substitution map for one recipient. Every key in DYNAMIC_ACTIONS is present; missing
     inputs render as an empty string (never ``None``/``KeyError``). ``sender`` carries the resolved
     sending profile ({from_name, from_email}); ``action`` carries an automated email's per-send values
-    ({link, code, expires}) and is empty for a manual send/preview."""
+    ({link, code, expires, change, by, when}) and is empty for a manual send/preview."""
     recipient = recipient or {}
     sender = sender or {}
     action = action or {}
@@ -248,6 +254,9 @@ def token_context(
         "action.link": str(action.get("link") or ""),
         "action.code": str(action.get("code") or ""),
         "action.expires": str(action.get("expires") or ""),
+        "action.change": str(action.get("change") or ""),
+        "action.by": str(action.get("by") or ""),
+        "action.when": str(action.get("when") or ""),
     }
 
 

@@ -5430,6 +5430,107 @@ def _held_body(outcome, target, viewer_id) -> dict:
     }
 
 
+def _change_time_text() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _actor_text(name) -> str:
+    """How a notice names who made a change: the administrator's username, or the server's operator."""
+    from app.core import credential_changes as cc
+    return "the server's operator, on the host" if name == cc.HOST_OPERATOR else (name or "an administrator")
+
+
+def _notify_account_change(db, user, *, ntype, title, change, by, email=None) -> None:
+    """Tell a user that an administrator changed their account: in the app, and by email when email is
+    configured and there is an address (``email``, else the account's own; an email change passes the
+    OLD address). Says what changed, when, by whom, and what to do if it was not expected. After the
+    commit; best-effort, it never undoes the change."""
+    when = _change_time_text()
+    try:
+        _notify_users([str(user.id)], ntype, title=title,
+                      body=(f"{change} When: {when}. By: {by}. If you did not expect this, contact your "
+                            "administrators at once."),
+                      target="#profile")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ account-change notice skipped: {type(e).__name__}")
+    try:
+        _fire_action_email(db, "account_changed_by_admin",
+                           email=email if email is not None else user.email, username=user.username,
+                           action_context={"change": change, "by": by, "when": when})
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ account-change email skipped: {type(e).__name__}")
+
+
+def _credential_change_notice(kind, result, by_host=False):
+    """(title, sentence) for a credential change that was made, from what applying it returned."""
+    from app.core import credential_changes as cc
+    who = "The server's operator" if by_host else "An administrator"
+    result = result or {}
+    if kind == cc.PASSWORD:
+        return ("Your password was changed",
+                f"{who} set a new password for your account and signed it out everywhere.")
+    if kind == cc.RESET_LINK:
+        if "email_sent" in result:
+            return ("A password reset link was sent to you", f"{who} emailed you a password reset link.")
+        return ("A password reset link was created for your account",
+                f"{who} created a password reset link for your account. Whoever uses it can set a new "
+                "password.")
+    if kind == cc.SECOND_FACTOR:
+        return ("Your second factor was reset",
+                f"{who} reset your second factor and signed your account out everywhere. You will set up "
+                "a new one, with your own password, at your next sign-in.")
+    if kind == cc.EMAIL:
+        old, new = result.get("old_email"), result.get("new_email")
+        return ("Your email address was changed",
+                f"{who} changed your account's email address from {old or '(none)'} to {new or '(none)'}.")
+    if kind == cc.SSH_KEY:
+        key = result.get("ssh_key")
+        name = getattr(key, "name", "") if key is not None else ""
+        fingerprint = getattr(key, "fingerprint", "") if key is not None else ""
+        return ("An SSH key was added to your account",
+                f"{who} added the SSH key \"{name}\" ({fingerprint}) to your account. It can sign in to "
+                "SFTP as you.")
+    return ("Your account was changed", f"{who} changed your sign-in details.")
+
+
+def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=None,
+                              ntype="account_changed") -> None:
+    """The notice for a credential change that was made. An email change is told to the OLD address."""
+    from app.core import credential_changes as cc
+    title, change = _credential_change_notice(kind, result, by_host=(by_name == cc.HOST_OPERATOR))
+    by = _actor_text(by_name)
+    if approved_by:
+        by += f", approved by {_actor_text(approved_by)}"
+    old_email = (result or {}).get("old_email") if kind == cc.EMAIL else None
+    _notify_account_change(db, target, ntype=ntype, title=title, change=change, by=by,
+                           email=(old_email or "") if kind == cc.EMAIL else None)
+
+
+def _notify_account_status_changes(db, user, *, by_name, locked=None, active=None, role=None) -> None:
+    """The notices for an administrator's lock, unlock, deactivation, reactivation or role change.
+    Each argument is (old, new), or None when that did not change hands in the request."""
+    by = _actor_text(by_name)
+    if locked is not None and bool(locked[0]) != bool(locked[1]):
+        if locked[1]:
+            _notify_account_change(db, user, ntype="account_changed", title="Your account was locked",
+                                   change="An administrator locked your account. You cannot sign in until "
+                                          "it is unlocked.", by=by)
+        else:
+            _notify_account_change(db, user, ntype="account_changed", title="Your account was unlocked",
+                                   change="An administrator unlocked your account.", by=by)
+    if active is not None and bool(active[0]) != bool(active[1]):
+        if active[1]:
+            _notify_account_change(db, user, ntype="account_changed", title="Your account was reactivated",
+                                   change="An administrator reactivated your account.", by=by)
+        else:
+            _notify_account_change(db, user, ntype="account_changed", title="Your account was deactivated",
+                                   change="An administrator deactivated your account. You cannot sign in "
+                                          "until it is reactivated.", by=by)
+    if role is not None and role[0] != role[1]:
+        _notify_account_change(db, user, ntype="account_changed", title="Your role was changed",
+                               change=f"An administrator changed your role from {role[0]} to {role[1]}.", by=by)
+
+
 def _announce_held_change(db, change, target) -> None:
     """Tell the administrator who asked, the administrators who can approve, and the user, that a
     change is waiting. After the commit; best-effort."""
@@ -5451,50 +5552,55 @@ def _announce_held_change(db, change, target) -> None:
                       body=(f"{who} asked to {what} for {target.username}. Approve or deny it on the "
                             f"Users page. The request expires on {until}."),
                       target="#users")
-        _notify_users([str(target.id)], "credential_change_held",
-                      title="A change to your account is waiting for approval",
-                      body=(f"The administrator {who} asked to {what} for your account. It takes effect "
-                            "only if another administrator approves it. If you did not expect this, "
-                            "tell your administrators."))
+        _notify_account_change(
+            db, target, ntype="credential_change_held",
+            title="A change to your account is waiting for approval",
+            change=(f"An administrator asked to {what} for your account. It takes effect only if another "
+                    f"administrator approves it by {until}."),
+            by=_actor_text(who))
     except Exception as e:  # noqa: BLE001 - a notice never undoes the request
         print(f"⚠ held-change notice skipped: {type(e).__name__}")
 
 
-def _announce_decided_change(change, target_id, target_username, outcome: str) -> None:
-    """Tell the administrator who asked and the user how a held request ended: approved, denied,
-    withdrawn or expired. After the commit; best-effort."""
+def _announce_decided_change(db, change, target, outcome: str, result=None) -> None:
+    """Tell the administrator who asked and the user how a held request ended: approved (the user gets
+    the notice of the change itself), denied, withdrawn or expired. After the commit; best-effort."""
     from app.core import credential_changes as cc
     what, who, by = cc.phrase(change.kind), change.requested_by_name, change.decided_by_name
     requester = [str(change.requested_by_id)] if change.requested_by_id is not None else []
     try:
         if outcome == cc.APPROVED:
             _notify_users(requester, "credential_change_approved", title="Your change was approved",
-                          body=f"{by} approved your request to {what} for {target_username}. It is done.",
+                          body=f"{_actor_text(by)} approved your request to {what} for {target.username}. It is done.",
                           target="#users")
-            _notify_users([str(target_id)], "credential_change_approved",
-                          title="A change to your account was approved",
-                          body=(f"{by} approved the request by {who} to {what} for your account, and it "
-                                "was made. If you did not expect this, tell your administrators at once."))
+            _notify_credential_change(db, change.kind, target, result, by_name=who, approved_by=by,
+                                      ntype="credential_change_approved")
         elif outcome == cc.DENIED:
             _notify_users(requester, "credential_change_denied", title="Your change was denied",
-                          body=f"{by} denied your request to {what} for {target_username}. Nothing was changed.",
+                          body=f"{by} denied your request to {what} for {target.username}. Nothing was changed.",
                           target="#users")
-            _notify_users([str(target_id)], "credential_change_denied",
-                          title="A requested change to your account was turned down",
-                          body=f"{by} denied the request by {who} to {what} for your account. Nothing was changed.")
+            _notify_account_change(
+                db, target, ntype="credential_change_denied",
+                title="A requested change to your account was turned down",
+                change=f"An administrator's request to {what} for your account was denied. Nothing was changed.",
+                by=f"{_actor_text(who)} asked; {_actor_text(by)} denied it")
         elif outcome == cc.WITHDRAWN:
-            _notify_users([str(target_id)], "credential_change_withdrawn",
-                          title="A requested change to your account was withdrawn",
-                          body=f"{who} withdrew the request to {what} for your account. Nothing was changed.")
+            _notify_account_change(
+                db, target, ntype="credential_change_withdrawn",
+                title="A requested change to your account was withdrawn",
+                change=f"An administrator withdrew the request to {what} for your account. Nothing was changed.",
+                by=_actor_text(who))
         elif outcome == cc.EXPIRED:
             _notify_users(requester, "credential_change_expired", title="Your change request expired",
-                          body=(f"Nobody approved your request to {what} for {target_username} within 7 "
+                          body=(f"Nobody approved your request to {what} for {target.username} within 7 "
                                 "days, so nothing was changed."),
                           target="#users")
-            _notify_users([str(target_id)], "credential_change_expired",
-                          title="A requested change to your account expired",
-                          body=(f"Nobody approved the request by {who} to {what} for your account within "
-                                "7 days, so nothing was changed."))
+            _notify_account_change(
+                db, target, ntype="credential_change_expired",
+                title="A requested change to your account expired",
+                change=(f"Nobody approved an administrator's request to {what} for your account within 7 "
+                        "days, so nothing was changed."),
+                by=_actor_text(who))
     except Exception as e:  # noqa: BLE001
         print(f"⚠ decided-change notice skipped: {type(e).__name__}")
 
@@ -5506,19 +5612,21 @@ def _expire_held_credential_changes(db) -> int:
     due = cc.expire_due(db)
     if not due:
         return 0
-    names = dict(db.query(User.id, User.username).filter(
-        User.id.in_([c.target_user_id for c in due])).all())
+    targets = {u.id: u for u in db.query(User).filter(
+        User.id.in_([c.target_user_id for c in due])).all()}
     for change in due:
+        target = targets.get(change.target_user_id)
         db.add(AuditLogger(db).build_row(
             action="credential_change_expired", status="success",
             resource_type="user", resource_id=str(change.target_user_id),
             details={"kind": change.kind, "change_id": str(change.id),
-                     "target_username": names.get(change.target_user_id),
+                     "target_username": target.username if target is not None else None,
                      "requested_by": change.requested_by_name}))
     db.commit()
     for change in due:
-        _announce_decided_change(change, change.target_user_id, names.get(change.target_user_id, ""),
-                                 cc.EXPIRED)
+        target = targets.get(change.target_user_id)
+        if target is not None:
+            _announce_decided_change(db, change, target, cc.EXPIRED)
     return len(due)
 
 
@@ -5555,6 +5663,8 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
                                    details={"target_user_id": str(user_id), "email_sent": sent})
     except Exception:  # noqa: BLE001
         pass
+    if user.id != current_user.id:
+        _notify_credential_change(db, "reset_link", user, outcome.result, by_name=current_user.username)
     return {"email_sent": sent}
 
 
@@ -5598,6 +5708,8 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
                                    details={"target_user_id": str(user_id), "ttl_minutes": ttl})
     except Exception:  # noqa: BLE001
         pass
+    if user.id != current_user.id:
+        _notify_credential_change(db, "reset_link", user, outcome.result, by_name=current_user.username)
     return {"reset_link": link, "expires_in_minutes": ttl, "username": user.username}
 
 
@@ -9576,6 +9688,7 @@ async def update_user(
     # Track changes for audit log
     changes = {}
     held = []   # credential changes waiting for another administrator's approval
+    made = []   # (kind, outcome) of the credential changes made, for the user's notice
 
     # Non-admin users can only update their own email and password.
     # "email" omitted leaves the address alone; sent as an explicit null clears it.
@@ -9618,6 +9731,7 @@ async def update_user(
                 held.append(outcome)
             else:
                 changes['email'] = {'old': outcome.result['old_email'], 'new': new_email}
+                made.append(("email", outcome))
 
     if user_update.password is not None:
         # Setting your OWN password here would sidestep the re-proof its sibling requires.
@@ -9645,6 +9759,7 @@ async def update_user(
             held.append(outcome)
         else:
             changes['password'] = 'changed'
+            made.append(("password", outcome))
 
     # SFTP controls — a user may manage their own (or an admin, anyone's).
     if user_update.sftp_enabled is not None:
@@ -9721,6 +9836,17 @@ async def update_user(
     audit_logger.log_user_updated(
         user, current_user, get_client_ip(request), changes
     )
+
+    # The user hears of every change an administrator made to their credentials or standing.
+    if not is_self:
+        for kind, outcome in made:
+            _notify_credential_change(db, kind, user, outcome.result, by_name=current_user.username)
+    if is_admin and not is_self:
+        def _pair(key):
+            c = changes.get(key)
+            return (c["old"], c["new"]) if isinstance(c, dict) else None
+        _notify_account_status_changes(db, user, by_name=current_user.username, locked=_pair("is_locked"),
+                                       active=_pair("is_active"), role=_pair("role"))
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
@@ -9827,6 +9953,8 @@ async def add_ssh_key(
     key = outcome.result["ssh_key"]
     db.commit()
     db.refresh(key)
+    if target.id != current_user.id:
+        _notify_credential_change(db, "ssh_key", target, outcome.result, by_name=current_user.username)
     try:
         AuditLogger(db).log_action(
             action="ssh_key_add", status="success", user=current_user,
@@ -9916,14 +10044,8 @@ async def admin_reset_second_factor(
                                    details={"target_username": target.username})
     except Exception:      # noqa: BLE001
         pass
-    try:
-        _notify_users([str(target.id)], "second_factor_admin_reset",
-                      title="Your second factor was reset",
-                      body="An administrator reset your two-factor authentication. You'll set it up "
-                           "again at your next sign-in.",
-                      target="#profile")
-    except Exception:      # noqa: BLE001
-        pass
+    if target.id != current_user.id:
+        _notify_credential_change(db, "second_factor", target, outcome.result, by_name=current_user.username)
     return {"reset": True}
 
 
@@ -9967,7 +10089,7 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
         details={"kind": kind, "change_id": str(change.id), "target_username": target.username,
                  "requested_by": requested_by, "approved_by": approver_name}))
     db.commit()
-    _announce_decided_change(change, target.id, target.username, cc.APPROVED)
+    _announce_decided_change(db, change, target, cc.APPROVED, result)
     return {k: result[k] for k in ("reset_link", "expires_in_minutes", "email_sent") if k in result}
 
 
@@ -10032,7 +10154,7 @@ async def deny_credential_request(
                                          user=current_user, resource_type="user",
                                          resource_id=str(target.id), details=details))
     db.commit()
-    _announce_decided_change(change, target.id, target.username, outcome)
+    _announce_decided_change(db, change, target, outcome)
     return {"status": outcome,
             "request": _credential_request_dict(change, target.username, current_user.id)}
 

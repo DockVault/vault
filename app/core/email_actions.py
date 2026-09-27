@@ -139,6 +139,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "account_changed_by_admin": {
+        "name": "Account changed by an administrator",
+        "subject": "A change to your {{vault.name}} account",
+        "body_html": (
+            "<h2>A change to your account</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>By: {{action.by}}</p>"
+            "<p>If you did not expect this, contact your administrators at once. If you can still sign "
+            "in, change your password.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -160,6 +175,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — notify a user when they're added to a vault or team.", OPTIONAL),
     ("temp_credential_issued", "Temporary credential issued",
      "Optional — notify a user when a temporary access credential is created for them.", OPTIONAL),
+    ("account_changed_by_admin", "Account changed by an administrator",
+     "Sent to a user when an administrator changes their password, reset link, second factor, email "
+     "address (to the old address), SSH keys, lock, activation or role — says what, when and by whom.",
+     SYSTEM),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(
@@ -338,10 +357,10 @@ def default_template_payloads() -> list[dict]:
 
 
 def _fallback_body_if_missing_required_token(category, body_tpl, spec):
-    """A SYSTEM security action's built-in body carries a required token ({{action.code}} or
-    {{action.link}}). If the chosen (admin-bound/customized) body OMITS it, return the built-in body
-    instead, so a misconfigured template can never silently drop the verification code / reset or
-    invite link. Non-system actions, or bodies that already carry the token, are returned unchanged.
+    """A SYSTEM security action's built-in body carries a required token ({{action.code}},
+    {{action.link}}, or {{action.change}} for the notice of an administrator's change). If the chosen
+    (admin-bound/customized) body OMITS it, return the built-in body instead, so a misconfigured
+    template can never silently drop the verification code / reset or invite link, or what changed. Non-system actions, or bodies that already carry the token, are returned unchanged.
     Matched on the token KEY, so a whitespace variant like ``{{ action.code }}`` still counts.
     An EMPTY body on a system action is itself the 'required token missing' case (an admin who cleared
     the body but kept a subject), so it must fall through to the default body — not short-circuit."""
@@ -349,7 +368,7 @@ def _fallback_body_if_missing_required_token(category, body_tpl, spec):
     if category != SYSTEM:
         return body_tpl
     default_body = (spec or {}).get("default_body_html", "") or ""
-    for key_tok in ("action.code", "action.link"):
+    for key_tok in ("action.code", "action.link", "action.change"):
         if key_tok in default_body and key_tok not in body_tpl:
             return default_body
     return body_tpl

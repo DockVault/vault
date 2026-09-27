@@ -34,10 +34,17 @@ import sys
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve")
 
 
+class _Answer(Exception):
+    """The answer, carried out of the work so it is printed last, after everything the web app
+    printed on its way (which goes to standard error, see run)."""
+
+    def __init__(self, obj, code):
+        super().__init__("answer")
+        self.obj, self.code = obj, code
+
+
 def _answer(obj, code=0):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-    return code
+    raise _Answer(obj, code)
 
 
 def _refuse(message):
@@ -95,11 +102,44 @@ def _find(db, username):
     return db.query(User).filter(User.username == username).first()
 
 
+def _wait_for_background_work(started_before, timeout=30.0):
+    """The web app sends its emails on background threads, which a short-lived process would kill as
+    it exits. Give the ones this run started time to finish."""
+    import threading
+    import time
+    deadline = time.monotonic() + timeout
+    for t in threading.enumerate():
+        if t not in started_before and t is not threading.current_thread():
+            t.join(max(0.0, deadline - time.monotonic()))
+
+
 def run(argv=None) -> int:
+    """Do what was asked and print the answer as the last line on standard output. Everything the web
+    app prints while it works (start-up notes, a mail failure) is sent to standard error instead, so
+    standard output carries the answer alone."""
+    import contextlib
+    import threading
     args = build_parser().parse_args(argv)
-    # Importing the web app sets up the configuration, the database and the cache exactly as the
-    # server does, from this container's own environment.
-    import app.api.api_server as api
+    answer = {"ok": False, "error": "The account tool stopped before it could answer."}
+    code = 1
+    with contextlib.redirect_stdout(sys.stderr):
+        # Importing the web app sets up the configuration, the database and the cache exactly as the
+        # server does, from this container's own environment. Threads it starts on import are its
+        # own; only those this run starts afterwards (the emails) are waited for.
+        import app.api.api_server as api
+        started_before = set(threading.enumerate())
+        try:
+            _run(args, api)
+        except _Answer as done:
+            answer, code = done.obj, done.code
+        finally:
+            _wait_for_background_work(started_before)
+    sys.stdout.write(json.dumps(answer) + "\n")
+    sys.stdout.flush()
+    return code
+
+
+def _run(args, api) -> int:
     from app.core import credential_changes as cc
     from app.core.database import get_db_context
     from app.services.audit_logger import AuditLogger
@@ -155,10 +195,11 @@ def run(argv=None) -> int:
             if args.temporary_password or not pepper_ok(api._reset_pepper()):
                 from app.core.security import hash_password
                 secret = temporary_password()
-                api._credential_change(db, None, user, cc.PASSWORD,
-                                       summary="Temporary password set by the host operator",
-                                       payload={"password_hash": hash_password(secret)})
+                outcome = api._credential_change(db, None, user, cc.PASSWORD,
+                                                 summary="Temporary password set by the host operator",
+                                                 payload={"password_hash": hash_password(secret)})
                 db.commit()
+                api._notify_credential_change(db, cc.PASSWORD, user, outcome.result, by_name=cc.HOST_OPERATOR)
                 AuditLogger(db).log_action(
                     action="user_updated", status="success", username=cc.HOST_OPERATOR,
                     resource_type="user", resource_id=str(user.id),
@@ -170,6 +211,7 @@ def run(argv=None) -> int:
                                              summary="Password reset link created by the host operator",
                                              payload={"delivery": "copy"})
             db.commit()
+            api._notify_credential_change(db, cc.RESET_LINK, user, outcome.result, by_name=cc.HOST_OPERATOR)
             AuditLogger(db).log_action(
                 action="password_reset_link_minted", status="success", username=cc.HOST_OPERATOR,
                 resource_type="user", resource_id=str(user.id),
@@ -183,6 +225,7 @@ def run(argv=None) -> int:
             outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,
                                              summary="Second factor reset by the host operator", payload={})
             db.commit()
+            api._notify_credential_change(db, cc.SECOND_FACTOR, user, outcome.result, by_name=cc.HOST_OPERATOR)
             AuditLogger(db).log_action(
                 action="second_factor_admin_reset", status="success", username=cc.HOST_OPERATOR,
                 resource_type="user", resource_id=str(user.id),
