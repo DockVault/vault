@@ -6764,6 +6764,16 @@ function handleMonitorEvent(data) {
         return;
     }
 
+    // The Activity signal: the id and category of each new audit row, sent only to an administrator's
+    // own session. It names nothing; the Activity page listens for this event and fetches the rows.
+    if (data.type === 'activity') {
+        try {
+            window.dispatchEvent(new CustomEvent('dockvault:activity',
+                { detail: { events: Array.isArray(data.events) ? data.events : [] } }));
+        } catch (_) { /* a listener's fault is not the socket's */ }
+        return;
+    }
+
     // Past the control frames, this is real activity, so nudge the Audit Log to re-read itself. It
     // sat ABOVE these returns at first, which meant every stats and keepalive frame triggered a
     // re-read: live appeared to work with the poll removed entirely, for a reason that had nothing

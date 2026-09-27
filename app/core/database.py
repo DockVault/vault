@@ -83,6 +83,9 @@ def initialize_consumers() -> None:
                 "consumer-initialization-failed",
                 "Database or cache consumers could not be initialized.",
             ) from None
+        # A committed audit row signals the Activity page (see app/core/audit_signal.py).
+        from app.core import audit_signal
+        audit_signal.install(factory)
         _engine = engine
         _session_factory = factory
         _redis_client = cache

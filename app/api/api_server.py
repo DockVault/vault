@@ -1898,6 +1898,11 @@ def broadcast_event(event_data: dict, include_metrics: bool = True) -> None:
             - operations: Optional active operations count
         include_metrics: If True, fetch and include current metrics (default: True)
     """
+    from app.core import socket_frames as _socket_frames
+    # Only a frame some socket passes on is published (app/core/socket_frames.py). The upload, download
+    # and sign-out frames the Live Monitor page showed go to no socket any more.
+    if not _socket_frames.worth_publishing(event_data):
+        return
     try:
         # Add current metrics to the broadcast
         if include_metrics:
@@ -7514,6 +7519,26 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
     return False
 
 
+def _ws_sees_activity(user_id: str, is_temporary: bool) -> bool:
+    """Whether a live socket's session may receive the Activity signal: an administrator's own
+    interactive session, the same rule as the Activity page (require_interactive_admin). A temporary
+    credential is not, even an administrator's. Fails closed on an error."""
+    if is_temporary:
+        return False
+    try:
+        from app.core.database import SessionLocal
+        from app.core.models import User as _U
+        db = SessionLocal()
+        try:
+            role = db.query(_U.role).filter(_U.id == uuid.UUID(str(user_id))).scalar()
+        finally:
+            db.close()
+        return role == RoleEnum.ADMIN
+    except Exception as e:  # noqa: BLE001
+        print(f"[WS] activity access check failed (no signal): {e}")
+        return False
+
+
 @app.websocket("/ws/monitor")
 async def websocket_monitor_endpoint(websocket: WebSocket):
     """
@@ -7673,46 +7698,25 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         # Send connection success message
         await websocket.send_json({
             "type": "connected",
-            "message": f"Connected to live monitor as {username}",
+            "message": f"Connected as {username}",
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
-        
-        # Determine this connection's role so we can filter events: admins see all
-        # activity (unchanged); everyone else receives only events they own (e.g.
-        # the login of a temporary credential they created). This makes it safe to
-        # open the socket app-wide for notifications without leaking others' activity.
-        from app.core import feed_privacy as _feed_privacy
-        is_admin_conn = False
-        try:
-            from app.core.database import get_db_context
-            from app.core.models import User as _WSUser, RoleEnum as _WSRole
-            with get_db_context() as _wsdb:
-                _wsu = _wsdb.query(_WSUser).filter(_WSUser.id == uuid.UUID(user_id)).first()
-                # A temporary credential — even an admin's — is NOT a full admin here: it receives
-                # only its OWN activity events, never the deployment-wide fleet feed (mirrors the
-                # /api/dashboard confinement).
-                is_admin_conn = bool(_wsu and _wsu.role == _WSRole.ADMIN and not is_temporary)
-        except Exception:
-            is_admin_conn = False
 
-        def _event_visible_to_conn(ev):
-            inner = ev.get('event', ev) if isinstance(ev, dict) else {}
-            # A temp / scoped-temp connection must NEVER receive notification nudges: they belong to
-            # the PARENT account, and a scoped credential (handed to an external party) has no business
-            # seeing the owner's live notification metadata. The JS client already ignores them; this
-            # keeps them off the wire too. (Checked before the admin short-circuit: an admin acting via
-            # a temp credential is not a full admin here.)
-            if is_temporary and inner.get('type') == 'notification':
-                return False
-            if is_admin_conn:
-                return True
-            owner = inner.get('owner_user_id')
-            return owner is not None and str(owner) == str(user_id)
+        # What this connection receives is decided per frame by app/core/socket_frames.py: the Activity
+        # signal only for an administrator's own session, nudges and sign-in frames only for the
+        # account they belong to, and nothing of the kind for a temporary credential. Whether the
+        # session may open the Activity page is re-checked with the session itself (below), so a
+        # demoted administrator stops receiving the signal.
+        from app.core import socket_frames as _socket_frames
+        viewer = _socket_frames.Viewer(
+            user_id=str(user_id), is_temporary=bool(is_temporary),
+            sees_activity=await asyncio.get_event_loop().run_in_executor(
+                None, _ws_sees_activity, user_id, is_temporary))
 
-        # Subscribe to Redis pub/sub channel
+        # Subscribe to Redis pub/sub channels
         pubsub = redis_client.pubsub()
         await asyncio.get_event_loop().run_in_executor(
-            None, pubsub.subscribe, "activity_events"
+            None, pubsub.subscribe, *_socket_frames.CHANNELS
         )
         
         # Create tasks for sending and receiving
@@ -7723,6 +7727,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             # it down promptly when the session is logged out / terminated / locked. Without this a
             # revoked session (an admin's, streaming the whole fleet feed) would keep receiving events
             # until natural expiry, and the "terminate sessions" control would not cut the live socket.
+            nonlocal viewer
             loops = 0
             while True:
                 try:
@@ -7734,18 +7739,20 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                         if revoked:
                             print("[WS] session revoked/terminated; closing live socket")
                             break
+                        if viewer.sees_activity and not await asyncio.get_event_loop().run_in_executor(
+                                None, _ws_sees_activity, user_id, is_temporary):
+                            viewer = viewer._replace(sees_activity=False)
                     # Get message from Redis (non-blocking with timeout)
                     message = await asyncio.get_event_loop().run_in_executor(
                         None, pubsub.get_message, True, 0.1
                     )
 
                     if message and message['type'] == 'message':
-                        # Parse and forward the event (filtered per connection)
-                        event_data = json.loads(message['data'])
-                        if _event_visible_to_conn(event_data):
-                            # Someone else's file activity reaches a watching admin without names.
-                            await websocket.send_json(
-                                _feed_privacy.for_viewer(event_data, user_id, username))
+                        # The frame this connection may receive for the message, if any.
+                        frame = _socket_frames.frame_for(viewer, message.get('channel'),
+                                                         json.loads(message['data']))
+                        if frame is not None:
+                            await websocket.send_json(frame)
 
                     await asyncio.sleep(0.01)  # Small delay to prevent busy loop
 
@@ -7804,7 +7811,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         try:
             if 'pubsub' in locals():
                 await asyncio.get_event_loop().run_in_executor(
-                    None, pubsub.unsubscribe, "activity_events"
+                    None, pubsub.unsubscribe
                 )
                 await asyncio.get_event_loop().run_in_executor(
                     None, pubsub.close

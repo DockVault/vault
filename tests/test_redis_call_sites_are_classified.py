@@ -54,6 +54,9 @@ _REGISTRY = {
         "upload_file": ("E", 3),                 # space reservation: skip the eval when open -> fallback
         "websocket_monitor_endpoint": ("E", 1),  # .pubsub() off-loop (subscribe/get via run_in_executor)
     },
+    "core/audit_signal.py": {
+        "_publish": ("D", 1),                    # the Activity signal: a background thread, guarded
+    },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated
     },                                           # short-timeout client (the constructor uses redis.Redis)

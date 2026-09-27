@@ -76,12 +76,14 @@ def test_ws_temp_cred_isolated_from_others_activity(base_url, admin):
         tws.send(json.dumps({"type": "auth", "token": tclient.token}))
         _drain(aws)
         _drain(tws)
-        # Trigger another user's activity (login broadcasts an activity event owned by them).
+        # Trigger another user's activity (a sign-in writes an audit row, which is signalled).
         ApiClient().login(other["_username"], other["_password"])
-        # Control (non-vacuous guard): the admin WS should see it — proves the event was broadcast.
-        assert _saw(aws, other["_username"], 6), "admin WS should see the other user's activity (control)"
-        # Isolation: the temp-cred WS must NOT see another user's activity.
-        assert not _saw(tws, other["_username"], 3), "temp cred WS must not see another user's activity"
+        # Control (non-vacuous guard): the admin WS hears that something happened, as the Activity
+        # signal, which carries no name since the Live Monitor's feed was removed.
+        assert _saw(aws, '"activity"', 6), "admin WS should hear the Activity signal (control)"
+        # Isolation: the temp-cred WS hears neither the signal nor anything naming the other user.
+        assert not _saw(tws, other["_username"], 2), "temp cred WS must not see another user's activity"
+        assert not _saw(tws, '"activity"', 1), "temp cred WS must not hear the Activity signal"
     finally:
         try:
             aws.close()
