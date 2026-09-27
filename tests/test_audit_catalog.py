@@ -1,12 +1,14 @@
 """The audit action catalog stays complete: every action name the code can store is catalogued.
 
 The scan reads app/ as source (no app import). An audit write is a call to AuditLogger.log_action,
-log_custom_action or build_row, whose first argument is the action, or to a module's own `_audit...` helper
-(or a wrapper listed in PASS_THROUGH) that takes an `action` parameter, checked at that parameter's
-position. A literal action must be in the catalog, and so must one passed by the name of a module-level
-constant (`AUTO_LOCKED_ACTION = "account_auto_locked"`), whose text the scan reads. Any other non-literal
-is either a wrapper passing its own `action` parameter through (its callers are checked instead) or one
-of the few names built at run time, pinned below with every name it can produce.
+log_custom_action, log_error or build_row, whose first argument is the action, or to a module's own
+`_audit...` helper (or a wrapper listed in PASS_THROUGH) that takes an `action` parameter, checked at that
+parameter's position whether the helper is called by name or, as a method, through an attribute
+(`self._audit(user, "file_download", ...)`). A literal action must be in the catalog, and so must one
+passed by the name of a module-level constant (`AUTO_LOCKED_ACTION = "account_auto_locked"`), whose text
+the scan reads. Any other non-literal is either a wrapper passing its own `action` parameter through (its
+callers are checked instead) or one of the few names built at run time, pinned below with every name it
+can produce.
 """
 import ast
 from pathlib import Path
@@ -19,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "app"
-METHODS = {"log_action": 0, "log_custom_action": 0, "build_row": 0}
+METHODS = {"log_action": 0, "log_custom_action": 0, "build_row": 0, "log_error": 0}
 
 # Wrappers that pass their own `action` parameter to the logger: the check moves to their callers.
 PASS_THROUGH = {
@@ -46,6 +48,8 @@ COMPUTED = {
                                                                     "device_secret_reuse_suspend"),
     ("app/api/api_server.py", "pause_receiver",
      "'receiver_pause' if want else 'receiver_resume'"): ("receiver_pause", "receiver_resume"),
+    ("app/sftp/sftp_server.py", "rename",
+     "'file_rename' if f is not None else 'folder_rename'"): ("file_rename", "folder_rename"),
 }
 
 
@@ -122,6 +126,10 @@ def _scan():
                 idx = METHODS[f.attr]
             elif isinstance(f, ast.Name) and f.id in helpers:
                 idx = helpers[f.id]
+            elif isinstance(f, ast.Attribute) and f.attr in helpers:
+                # A helper that is a method, called through an attribute: self._audit(user, "file_upload", ...)
+                # or self._interface._audit(...). Its index already leaves out self.
+                idx = helpers[f.attr]
             else:
                 continue
             arg = next((k.value for k in node.keywords if k.arg == "action"), None)
@@ -148,6 +156,13 @@ def test_the_scan_sees_the_audit_writes():
     assert len(LITERAL) > 150, len(LITERAL)
     assert {"login_success", "file_download", "note_link_create", "zk_vault_rekeyed",
             "vault_self_access_refused", "file_expired"} <= {n for _, _, n in LITERAL}
+
+
+def test_the_scan_sees_the_sftp_audit_writes():
+    # The SFTP server writes its audit rows through a method, self._audit(user, action, ...) and
+    # self._interface._audit(...), so the scan must follow a helper called through an attribute.
+    sftp = {n for f, _, n in LITERAL if f == "app/sftp/sftp_server.py"}
+    assert {"file_upload", "file_download", "file_delete", "folder_create", "folder_delete"} <= sftp, sftp
 
 
 def test_actions_passed_by_a_constants_name_are_read_as_their_text():
