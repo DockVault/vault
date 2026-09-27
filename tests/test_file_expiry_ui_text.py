@@ -27,8 +27,10 @@ INDEX = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
 
 
 def _describe(cases):
-    lifted = _function(APP_JS, "function describeFileExpiry(vault) {")
-    return _node(lifted + "\nconst cases = " + json.dumps(cases) + ";\n"
+    lifted = "".join(_function(APP_JS, head) for head in (
+        "function fileExpiryEnforced() {", "function fileExpiryNotEnforcedSuffix() {",
+        "function describeFileExpiry(vault) {"))
+    return _node("const state = {};\n" + lifted + "\nconst cases = " + json.dumps(cases) + ";\n"
                  "console.log(JSON.stringify(cases.map((v) => describeFileExpiry(v))));\n")
 
 
@@ -63,3 +65,67 @@ def test_the_dialog_says_what_a_change_does_to_the_files_already_there():
     assert "Files already in the vault keep their current deadline." in text
     assert "0 turns expiry off and removes the deadline from every file in the vault." in text
     assert "older than" not in INDEX.lower().split('id="set-expiry-modal"')[1].split("</form>")[0]
+
+
+# ---------------------------------------------------------------------------------------------
+# ENFORCE_FILE_EXPIRY=false: the web app must not promise a deletion that is not happening
+# ---------------------------------------------------------------------------------------------
+
+# The notes the interface shows beside a retention when this server is not deleting anything.
+NOTES = {
+    "expire-files-not-enforced": "showFileExpiryNotice('expire-files-not-enforced');\n"
+                                 "                openModal('set-expiry-modal');",
+    "rc-retention-not-enforced": "showFileExpiryNotice('rc-retention-not-enforced');\n"
+                                 "    openModal('receiver-create-modal');",
+    "rt-tag-retention-not-enforced": "showFileExpiryNotice('rt-tag-retention-not-enforced');\n"
+                                     "    ed.style.display = '';",
+}
+
+HELPERS = ("function fileExpiryEnforced() {", "function fileExpiryNotEnforcedSuffix() {",
+           "function showFileExpiryNotice(id) {", "function describeFileExpiry(vault) {")
+
+
+def _run(scenario):
+    lifted = "".join(_function(APP_JS, head) for head in HELPERS)
+    return _node("""
+const els = {};
+const document = { getElementById: (id) => (els[id] = els[id] || { style: { display: 'none' } }) };
+const state = {};
+const out = {};
+""" + lifted + scenario + "\nconsole.log(JSON.stringify(out));\n")
+
+
+def test_every_retention_the_interface_shows_says_when_nothing_is_being_deleted():
+    out = _run("""
+const vault = { expire_files_after_days: 3, expire_files_unit: 'hours' };
+for (const [key, flag] of [['unknown', undefined], ['on', true], ['off', false]]) {
+    state.fileExpiryEnforced = flag;
+    showFileExpiryNotice('note');
+    out[key] = { panel: describeFileExpiry(vault), never: describeFileExpiry({}),
+                 suffix: fileExpiryNotEnforcedSuffix(), note: els.note.style.display };
+}
+""")
+    # Not known yet counts as enforced: the interface never says files are kept when they may not be.
+    for key in ("unknown", "on"):
+        assert out[key] == {"panel": "3 hours after upload", "never": "Never", "suffix": "",
+                            "note": "none"}, key
+    off = out["off"]
+    assert off["panel"] == "3 hours after upload (not enforced on this server: no files are being deleted)"
+    assert off["never"] == "Never", "a vault without expiry has nothing to qualify"
+    assert off["suffix"] and off["note"] == "", "the note is shown"
+
+
+def test_the_notes_exist_hidden_and_each_is_shown_where_it_is_needed():
+    for note_id, opener in NOTES.items():
+        m = re.search(r'<p [^>]*id="%s"[^>]*>(.*?)</p>' % note_id, INDEX, re.S)
+        assert m, f"{note_id} is missing"
+        assert 'style="display:none;"' in m.group(0), f"{note_id} must start hidden"
+        assert "no files are being deleted" in m.group(1) or "uploads are not deleted" in m.group(1)
+        assert APP_JS.count(opener) == 1, f"{note_id} is not shown when its dialog opens"
+    # An upload link's details carry the same qualifier as a vault's panels.
+    assert APP_JS.count("(r.retention_days + ' days' + fileExpiryNotEnforcedSuffix())") == 1
+
+
+def test_the_flag_is_read_at_sign_in_with_the_rest_of_the_policy():
+    assert APP_JS.count(
+        "state.fileExpiryEnforced = !(zk && zk.file_expiry_enforced === false);") == 1

@@ -320,3 +320,13 @@ def test_an_upload_link_retention_is_enforced_the_same_way(admin, receivers_enab
     finally:
         admin.post(f"/receivers/{rec['id']}/revoke")
         admin.delete_vault(vid)
+
+
+def test_the_web_app_is_told_that_expiry_is_enforced(admin, temp_user_client):
+    """Any signed-in user reads it with the rest of the capabilities; nobody signed out does."""
+    for client in (admin, temp_user_client):
+        r = client.get("/zk-enabled")
+        assert r.status_code == 200, r.text
+        assert r.json()["file_expiry_enforced"] is True
+    assert admin.clone_anonymous().get("/zk-enabled").status_code in (401, 403)
+    assert "file_expiry_enforced" not in admin.clone_anonymous().get("/auth/policy").json()

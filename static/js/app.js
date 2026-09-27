@@ -18696,6 +18696,7 @@ function setupVaultSettingsButtons() {
                 if (sizeEl) sizeEl.value = state.currentVault.size_limit ? _bytesToGb(state.currentVault.size_limit) : '';
                 renderVaultSizeAvailability('vault-size-limit-avail', sizeEl, state.currentVault.id,
                     "The most this vault may hold. Can't go below what's already stored.");
+                showFileExpiryNotice('expire-files-not-enforced');
                 openModal('set-expiry-modal');
             };
         }
@@ -18888,13 +18889,32 @@ async function handleChangeVaultPassword(e) {
     }
 }
 
+// Whether this server deletes files when their expiry passes. Its operator can postpone that
+// (ENFORCE_FILE_EXPIRY=false); the answer comes from /zk-enabled at sign-in. Unknown counts as
+// enforced: the interface must never tell anyone their files are kept when they may not be.
+function fileExpiryEnforced() {
+    return state.fileExpiryEnforced !== false;
+}
+
+// What follows a retention wherever one is shown, so none of them promises a deletion that is not
+// happening on this server.
+function fileExpiryNotEnforcedSuffix() {
+    return fileExpiryEnforced() ? '' : ' (not enforced on this server: no files are being deleted)';
+}
+
+// Show one of the static "no files are being deleted on this server" notes, or hide it.
+function showFileExpiryNotice(id) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = fileExpiryEnforced() ? 'none' : '';
+}
+
 // A vault's file expiry as its info and settings panels show it. The deadline is stamped on each file
 // at upload, so the setting describes files uploaded from now on: "7 days after upload", or "Never".
 function describeFileExpiry(vault) {
     const n = vault ? Number(vault.expire_files_after_days) : 0;
     if (!Number.isFinite(n) || n <= 0) return 'Never';
     const unit = (vault.expire_files_unit || 'days');
-    return `${n} ${n === 1 ? unit.replace(/s$/, '') : unit} after upload`;
+    return `${n} ${n === 1 ? unit.replace(/s$/, '') : unit} after upload` + fileExpiryNotEnforcedSuffix();
 }
 
 async function handleSetExpiry(e) {
@@ -20555,7 +20575,7 @@ function openReceiverInfoModal(r) {
         // stored_bytes, not reserved_bytes — the same distinction the card's ring got wrong: reserved
         // is in-flight and refunded on finalize, so this row read 0 however full the vault was.
         ['Storage', r.max_total_bytes ? (_mbFromBytes(r.stored_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.stored_bytes || 0) + ' MB used')],
-        ['Retention', r.retention_days ? (r.retention_days + ' days') : 'Kept'],
+        ['Retention', r.retention_days ? (r.retention_days + ' days' + fileExpiryNotEnforcedSuffix()) : 'Kept'],
     ];
     const modal = document.createElement('div'); modal.className = 'modal active rc-info-modal';
     modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
@@ -20655,6 +20675,7 @@ async function openReceiverCreate() {
         _rcEl('rc-create').disabled = false;
         tags.forEach(t => { const o = _el('option', '', t.name); o.value = t.id; sel.appendChild(o); });
     }
+    showFileExpiryNotice('rc-retention-not-enforced');
     openModal('receiver-create-modal');
     onRcTagChange();
 }
@@ -20921,6 +20942,7 @@ function openReceiverTagEditor(tag) {
     _rtEl('rt-tag-auto-enroll').checked = tag ? (t.auto_enroll_new_users === true) : true;
     _rtEl('rt-tag-active').checked = tag ? (t.is_active !== false) : true;
     const err = _rtEl('rt-tag-editor-error'); if (err) err.style.display = 'none';
+    showFileExpiryNotice('rt-tag-retention-not-enforced');
     ed.style.display = '';
 }
 
@@ -21292,7 +21314,9 @@ async function applyServerPreferences() {
         // buffered path, which is what shipped before any of this existed.
         state.downloadSink = (zk && zk.download_sink && zk.download_sink.sink === 'streaming')
             ? 'streaming' : 'buffered';
-    } catch (_) { /* best-effort; default = no idle lock, buffered downloads */ }
+        // Whether this server deletes files when their expiry passes (see fileExpiryEnforced).
+        state.fileExpiryEnforced = !(zk && zk.file_expiry_enforced === false);
+    } catch (_) { /* best-effort; default = no idle lock, buffered downloads, expiry enforced */ }
 
     const tm = window.themeManager;
     if (!tm) return false;

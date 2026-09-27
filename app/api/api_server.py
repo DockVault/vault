@@ -5228,7 +5228,10 @@ async def get_zk_enabled(
           create error.
       - allowed_vault_types: the operator-set, admin-irreversible allowlist of the
           types this deployment may create, so the UI can hide/disable a forbidden
-          option instead of surfacing a create error."""
+          option instead of surfacing a create error.
+      - file_expiry_enforced: whether this server deletes files when their expiry
+          passes (ENFORCE_FILE_EXPIRY), so the UI does not promise a deletion an
+          operator has postponed."""
     allowed = _allowed_vault_types()
     zk_allowed = "zero_knowledge" in allowed
     return {
@@ -5253,6 +5256,9 @@ async def get_zk_enabled(
         # on rather than three inputs to combine -- and so the three ways of arriving at
         # "buffered" stay distinguishable in the UI.
         "download_sink": _resolved_download_sink(request, db, current_user),
+        # A vault's "expire files after" and an upload link's retention are only carried out when
+        # this is true. Where they are not, the interface says so wherever it would promise one.
+        "file_expiry_enforced": file_expiry.enforcement_enabled(),
     }
 
 
