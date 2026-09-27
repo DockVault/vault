@@ -187,7 +187,8 @@ def test_put_refuses_self_changes_and_asks_before_writing():
     body = _route(USER_MGMT, '@router.put("/users/{user_id}", response_model=UserDetailResponse)')
     for message in ("Cannot change your own role", "Cannot deactivate your own account"):
         assert body.index(message) < body.index("removes_last_admin(db, user)")
-    _before(body, "removes_last_admin(db, user)", "user.email = new_email")
+    # The address is written by the credential-change rule, which the route calls.
+    _before(body, "removes_last_admin(db, user)", "outcome = _credential_change(")
     _before(body, "removes_last_admin(db, user)", "user.role = update_data.role")
 
 
