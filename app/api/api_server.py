@@ -10639,15 +10639,22 @@ def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
 
 def _link_owner_if_live(db, owner_id):
     """The owner of an anonymous link (note, file or upload link), or None when that owner may no
-    longer publish through one: the account is gone, deactivated, or locked.
+    longer publish through one: the account is gone, deactivated, or locked by an administrator.
 
-    Locked means account_locked(), the same reading sign-in uses. An admin lock has no expiry
-    (locked_until stays empty) and holds until an admin clears it; a failed-login lock holds until
-    its expiry. Comparing locked_until alone let every admin-locked owner's links keep serving,
-    because an admin lock has no expiry to compare."""
-    from app.services.auth_service import account_locked
+    An administrator's lock has no end: is_locked with locked_until empty. The automatic lock that
+    wrong passwords arm has an end time, and does NOT take the links down. Anyone who knows a
+    username can arm it, again and again, so letting it stop the links would let a stranger make
+    every note, file and upload link of that user answer 404 for as long as they kept guessing.
+    That lock is about signing in; the links stay as the owner left them.
+
+    A deployment whose lockout duration is 0 arms the automatic lock with no end time either, and
+    it then holds until an administrator clears it. It reads as an administrator's lock here and
+    stops the links, which is acceptable: in that configuration the account is out of use until an
+    administrator acts."""
     owner = db.query(User).filter(User.id == owner_id).first()
-    if owner is None or not getattr(owner, "is_active", True) or account_locked(owner):
+    if owner is None or not getattr(owner, "is_active", True):
+        return None
+    if getattr(owner, "is_locked", False) and getattr(owner, "locked_until", None) is None:
         return None
     return owner
 
@@ -10657,7 +10664,8 @@ def _publiclink_resolve_live(db, link):
     fails (the caller maps that to the uniform 404). Checked every redeem AND every download so a
     change after minting (revoke, vault password added, owner removed) bites on the next request:
       * the vault is active, Standard, and NOT password-protected;
-      * the OWNER account is active and not locked and STILL holds READ on the vault (live);
+      * the OWNER account is active, not locked by an administrator (_link_owner_if_live), and
+        STILL holds READ on the vault (live);
     The link's own active/expiry/exhaustion status and the target's presence are checked by the caller
     (they differ between redeem and per-file download)."""
     vault = db.query(Vault).filter(Vault.id == link.vault_id, Vault.is_active.is_(True)).first()
@@ -12118,8 +12126,9 @@ def _receiver_clear_fails(token_hash: str) -> None:
 
 def _receiver_resolve_live(db, receiver):
     """Re-validate a receiver against LIVE state and return (vault, owner) — or None (uniform 404). The
-    wrapped vault must be active + Standard, and the owner active + not locked. Checked every anonymous
-    request so a revoke / owner-lockout after minting bites on the next upload."""
+    wrapped vault must be active + Standard, and the owner active + not locked by an administrator
+    (_link_owner_if_live). Checked every anonymous request so a revoke / owner lock after minting bites
+    on the next upload."""
     vault = db.query(Vault).filter(Vault.id == receiver.vault_id, Vault.is_active.is_(True)).first()
     if not vault or getattr(vault, "type", "standard") == "zero_knowledge":
         return None

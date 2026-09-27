@@ -1,5 +1,5 @@
 """Live: locking or deactivating an owner stops their note, file and upload links, and undoing it
-brings them back.
+brings them back. The lock that wrong passwords arm does not.
 
 Each link is created by a regular user and used anonymously. An administrator then locks the owner
 (an admin lock, which has no expiry) or deactivates them. Every anonymous use must answer 404, the
@@ -7,16 +7,23 @@ same as a missing link, and must do so for a file grant or an upload session obt
 lock too: a token holder must not be able to finish what they started. Unlocking or reactivating the
 owner makes the same link work again, so the link itself was never touched.
 
+The automatic lock armed by wrong passwords has an end time, and anyone who knows a username can arm
+it, so it must leave all three links working.
+
 test_link_owner_state.py covers the same rule offline, owner state by owner state.
 """
+import os
+import subprocess
+
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, skip_if_container_absent, unique
 
 pytestmark = pytest.mark.integration
 
 _MB = 1024 * 1024
 _UNAVAILABLE = 404
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
 # name -> (the PATCH /users body that takes the owner out, the one that brings them back)
 OWNER_CHANGES = {
@@ -229,3 +236,87 @@ def test_an_upload_link_stops_with_its_owner(admin, owner, links_on, tags, chang
         assert admin.patch(f"/users/{uid}", json=back).status_code == 200
 
     _take_out_and_back(admin, owner, change, check)
+
+
+def _psql(sql):
+    try:
+        r = subprocess.run(
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db",
+             "-v", "ON_ERROR_STOP=1", "-Atc", sql],
+            capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker/psql unavailable: {exc}")
+    skip_if_container_absent(r, _DB_CONTAINER)
+    assert r.returncode == 0, r.stderr[:300]
+    return r.stdout.strip()
+
+
+def _sign_in(username, password):
+    return ApiClient(BASE_URL).session.post(f"{BASE_URL}/auth/login", timeout=30,
+                                            json={"username": username, "password": password})
+
+
+def _arm_the_automatic_lock(owner):
+    """Lock the owner the way a stranger can: with a wrong password. The failure count is primed far
+    past any threshold first, so one wrong password arms the lock whatever the deployment's setting."""
+    uid, name = owner.account["id"], owner.account["_username"]
+    _psql(f"UPDATE users SET failed_login_attempts = 1000000 WHERE id = '{uid}'")
+    assert _sign_in(name, "definitely-not-the-password").status_code == 401
+    locked, until = _psql(f"SELECT is_locked, coalesce(locked_until::text, '') FROM users "
+                          f"WHERE id = '{uid}'").split("|")
+    assert locked == "t", "a wrong password past the threshold is expected to lock the account"
+    if not until:
+        pytest.skip("this deployment's automatic lock has no end time (lockout_duration=0), and such "
+                    "a lock stops links by design")
+    assert _sign_in(name, owner.account["_password"]).status_code != 200, \
+        "anchor: the automatic lock keeps even the owner from signing in"
+
+
+def test_the_lock_wrong_passwords_arm_leaves_every_link_working(admin, owner, links_on, tags):
+    anon = ApiClient(BASE_URL)
+
+    note = owner.post("/notes", json={"title": "T", "body": "still readable"})
+    assert note.status_code == 200, note.text
+    note_link = owner.post("/note-links", json={"note_id": note.json()["id"],
+                                                "tag_id": tags("/note-link-tags")["id"]})
+    assert note_link.status_code == 200, note_link.text
+
+    vault, file_id = _own_file(owner, "kept.txt", b"still downloadable")
+    file_link = owner.post("/public-links", json={
+        "vault_id": vault["id"], "target_type": "file", "target_file_id": file_id,
+        "tag_id": tags("/note-link-tags", allowed_targets=["file", "folder"])["id"]})
+    assert file_link.status_code == 200, file_link.text
+
+    receiver = owner.post("/receivers", json={
+        "tag_id": tags("/receiver-tags", kind_floor="standard", max_total_bytes_cap=50 * _MB,
+                       max_file_bytes_cap=10 * _MB, retention_max_days=30,
+                       retention_default_days=7)["id"],
+        "max_total_bytes": 10 * _MB})
+    assert receiver.status_code == 200, receiver.text
+
+    _arm_the_automatic_lock(owner)
+    try:
+        r = anon.post(f"/note-links/{note_link.json()['token']}/redeem", json={})
+        assert r.status_code == 200 and r.json()["body"] == "still readable", r.text
+
+        token = file_link.json()["token"]
+        r = anon.post(f"/public-links/{token}/redeem", json={})
+        assert r.status_code == 200, r.text
+        d = anon.get(f"/public-links/{token}/download/{file_id}",
+                     headers={"X-Download-Grant": r.json()["grant"]})
+        assert d.status_code == 200 and d.content == b"still downloadable", d.text
+
+        token = receiver.json()["token"]
+        payload = b"dropped while the owner cannot sign in"
+        r = anon.post(f"/receivers/{token}/upload-session",
+                      json={"filename": unique("drop") + ".txt", "total_size": len(payload),
+                            "total_chunks": 1})
+        assert r.status_code == 200, r.text
+        sid = r.json()["session_id"]
+        assert anon.put(f"/receivers/{token}/upload-session/{sid}/chunks/0", data=payload,
+                        headers={"Content-Type": "application/octet-stream"}).status_code == 200
+        done = anon.post(f"/receivers/{token}/upload-session/{sid}/complete", json={})
+        assert done.status_code == 200, done.text
+    finally:
+        # An administrator's unlock also clears the failure count primed above.
+        assert admin.patch(f"/users/{owner.account['id']}", json={"is_locked": False}).status_code == 200

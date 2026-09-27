@@ -1,4 +1,4 @@
-"""A locked or deactivated owner's anonymous links stop serving.
+"""An owner's anonymous links stop when an administrator locks or deactivates the owner, and only then.
 
 Note links, public file links and upload links are used with no login: whoever holds the token uses
 it. Each one is published on its owner's behalf, so it must stop the moment an administrator locks or
@@ -7,8 +7,12 @@ deactivates that owner, and answer exactly as a missing link does.
 Before this, file and upload links compared only the lock's expiry. An administrator's lock has no
 expiry, so an admin-locked owner's links kept serving files and accepting uploads. A note link never
 looked at its owner at all, so a lock and a deactivation both left it serving the note. All three
-now go through one check, _link_owner_if_live, which reads a lock the way sign-in does
-(account_locked).
+now go through one check, _link_owner_if_live.
+
+That check does NOT count the automatic lock that wrong passwords arm, which has an end time. Anyone
+who knows a username can arm it, again and again, so counting it would let a stranger take every link
+of that user down. An administrator's lock has no end time; so does the automatic lock on a deployment
+whose lockout duration is 0, which then holds until an administrator clears it and counts as theirs.
 
 These tests drive the real resolvers and the real note-link redeem handler against a stand-in
 database, one owner state at a time. test_link_owner_state_live.py does the same against a running
@@ -76,15 +80,18 @@ def _owner(**state):
 OWNER_STATES = {
     "active": ({}, True),
     "admin_locked": ({"is_locked": True, "locked_until": None}, False),
-    "login_locked": ({"is_locked": True, "locked_until": datetime.utcnow() + timedelta(hours=1)}, False),
+    # The automatic lock armed by wrong passwords: a stranger can arm it, so it must not stop links.
+    "login_locked": ({"is_locked": True, "locked_until": datetime.utcnow() + timedelta(hours=1)}, True),
     "login_lock_expired": ({"is_locked": True,
                             "locked_until": datetime.utcnow() - timedelta(minutes=1)}, True),
     "deactivated": ({"is_active": False}, False),
+    "deactivated_and_login_locked": ({"is_active": False, "is_locked": True,
+                                      "locked_until": datetime.utcnow() + timedelta(hours=1)}, False),
 }
 
 
 @pytest.mark.parametrize("state", sorted(OWNER_STATES))
-def test_the_owner_check_reads_a_lock_the_way_sign_in_does(state):
+def test_the_owner_check_counts_only_an_administrators_lock(state):
     fields, serves = OWNER_STATES[state]
     owner = _owner(**fields)
     got = S._link_owner_if_live(_FakeDB({S.User: owner}), owner.id)
