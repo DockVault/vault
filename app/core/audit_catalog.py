@@ -146,6 +146,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("receiver_link_replaced", "upload_links", "Upload link address replaced", "notice"),
     AuditAction("receiver_pause", "upload_links", "Upload link paused", "info"),
     AuditAction("receiver_resume", "upload_links", "Upload link resumed", "info"),
+    AuditAction("receiver_retention_changed", "upload_links", "Upload link retention changed", "notice"),
     AuditAction("receiver_revoke", "upload_links", "Upload link revoked", "info"),
     AuditAction("receiver_upload_complete", "upload_links", "File received through an upload link", "info"),
     AuditAction("receiver_upload_open", "upload_links", "Upload started through an upload link", "info"),

@@ -6,7 +6,7 @@ Provides REST endpoints for user management, vault operations, and administratio
 Performance: Key endpoints support ETag-based conditional responses to reduce traffic.
 """
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 import asyncio
 import hashlib
 import hmac
@@ -12170,7 +12170,11 @@ def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
     ring used to read, is not a usage figure at all: it counts bytes reserved by uploads still IN
     FLIGHT and is refunded the moment one finalizes. So it sat at zero except during a transfer, and
     the ring appeared never to move no matter how much was uploaded.
+
+    `retention_limit_days` and `retention_may_keep` are what the owner may change the retention to
+    now (receiver_policy.retention_limits), so the details can offer only what the server accepts.
     """
+    retention_limit, retention_may_keep = receiver_policy.retention_limits(tag, r.retention_days)
     return {
         "id": str(r.id),
         "kind": r.kind,
@@ -12187,6 +12191,8 @@ def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
         "max_file_bytes": r.max_file_bytes,
         "max_total_bytes": r.max_total_bytes,
         "retention_days": r.retention_days,
+        "retention_limit_days": retention_limit,
+        "retention_may_keep": retention_may_keep,
         "paused": bool(r.paused),
         "revoked": bool(r.revoked),
         "status": _receiver_status(r),
@@ -12264,6 +12270,12 @@ def _receiver_release_bytes(db, receiver_id, size) -> None:
 
 class ReceiverPauseBody(BaseModel):
     paused: bool = True
+
+
+class ReceiverRetentionBody(BaseModel):
+    # Required. A whole number of days, or null to keep uploads until someone deletes them. Typed Any
+    # so a wrong value gets the policy's own plain refusal rather than a validation error.
+    retention_days: Any
 
 
 class ReceiverCreate(BaseModel):
@@ -12590,6 +12602,82 @@ async def revoke_receiver(
         except Exception:
             pass
     return {"ok": True, "id": str(r.id), "revoked": True}
+
+
+@app.patch("/receivers/{receiver_id}/retention")
+async def set_receiver_retention(
+    receiver_id: uuid.UUID,
+    body: ReceiverRetentionBody,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change how long one of MY upload links keeps what it receives. Body: {retention_days: N} for N
+    days after each upload, or {retention_days: null} to keep uploads until someone deletes them.
+
+    The link's tag bounds it, as the tag stands now (receiver_policy.retention_limits): at most the
+    tag's maximum retention, and no retention only when the tag sets no maximum; a link whose tag is
+    gone can only be shortened. The retention is the drop vault's "expire files after" setting, which
+    the vault's own settings refuse to change for this vault, so both move here, together:
+
+      * A new number of days applies to files uploaded from now on. Files already in the vault keep
+        the deadline they were given when they arrived (as a vault's own setting works).
+      * No retention takes the deadline off every file already in the vault, in the same transaction
+        (VaultService.set_file_expiry), so nothing the link received can expire after it is off.
+
+    Allowed on a paused, revoked, expired or used-up link too: its files stay in the vault."""
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="A temporary session cannot manage upload links.")
+    r = db.query(Receiver).filter(Receiver.id == receiver_id,
+                                  Receiver.owner_id == current_user.id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Upload link not found")
+    vault = db.query(Vault).filter(Vault.id == r.vault_id).first()
+    if vault is None:
+        raise HTTPException(status_code=404, detail="Upload link not found")
+
+    vault_service = VaultService(db, PermissionService(db))
+    try:
+        # The vault row first, the order every path that changes its files takes, then the link row:
+        # two changes to one link run one after the other, so each checks the retention the other left.
+        db.query(Vault.id).filter(Vault.id == vault.id).with_for_update(key_share=True).first()
+        r = (db.query(Receiver).filter(Receiver.id == r.id)
+             .populate_existing().with_for_update().first())
+        tag = db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first() if r.tag_id else None
+        before = r.retention_days
+        try:
+            new = receiver_policy.resolve_retention_change(tag, before, body.retention_days)
+        except receiver_policy.PolicyViolation as e:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+        db.refresh(vault)
+        unchanged = (new == before and (vault.expire_files_after_days or None) == new
+                     and (vault.expire_files_unit or "days") == "days")
+        cleared = 0
+        if not unchanged:
+            cleared = vault_service.set_file_expiry(vault, expire_files_after_days=new,
+                                                    expire_files_unit="days")
+            r.retention_days = new
+            vault.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    except HTTPException:
+        raise
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not change the retention of the upload link.")
+
+    if not unchanged:
+        _audit_change(db, current_user, "receiver_retention_changed", "receiver", r.id, {
+            "vault_id": str(vault.id), "retention_days": new,
+            "previous_retention_days": before, "deadlines_removed": cleared,
+        })
+    stored = db.query(Vault.total_size_bytes).filter(Vault.id == vault.id).scalar() or 0
+    out = _receiver_public_dict(r, tag, stored)
+    out["deadlines_removed"] = cleared
+    return out
 
 
 @app.get("/admin/receivers")
@@ -15741,7 +15829,8 @@ async def update_vault_settings(
             if 'expire_files_after_days' in settings_update or 'expire_files_unit' in settings_update:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="This vault backs an upload link; change its retention through the upload link.")
+                    detail="This vault holds the files an upload link receives, so how long they are kept "
+                           "is set on the link: open Upload links and choose Info on the link.")
             if 'size_limit' in settings_update and _receiver.max_total_bytes is not None:
                 try:
                     _req = int(settings_update['size_limit'])

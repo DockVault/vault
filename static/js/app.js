@@ -19823,7 +19823,6 @@ function openReceiverInfoModal(r) {
         // stored_bytes, not reserved_bytes — the same distinction the card's ring got wrong: reserved
         // is in-flight and refunded on finalize, so this row read 0 however full the vault was.
         ['Storage', r.max_total_bytes ? (_mbFromBytes(r.stored_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.stored_bytes || 0) + ' MB used')],
-        ['Retention', r.retention_days ? (r.retention_days + ' days' + fileExpiryNotEnforcedSuffix()) : 'Kept'],
     ];
     const modal = document.createElement('div'); modal.className = 'modal active rc-info-modal';
     modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
@@ -19839,10 +19838,100 @@ function openReceiverInfoModal(r) {
         const val = document.createElement('div'); val.className = 'audit-detail-val'; val.textContent = v;
         grid.appendChild(key); grid.appendChild(val);
     });
+    // Retention, with the control that changes it: the drop vault's own settings refuse to, because
+    // the link's type bounds it.
+    const rKey = document.createElement('div'); rKey.className = 'audit-detail-key'; rKey.textContent = 'Retention';
+    const rVal = document.createElement('div'); rVal.className = 'audit-detail-val rc-retention-val';
+    const rText = document.createElement('span'); rText.id = 'rc-info-retention-text'; rText.textContent = _rcRetentionText(r);
+    const change = _el('button', 'btn btn-ghost btn-sm', 'Change'); change.type = 'button'; change.id = 'rc-info-retention-change';
+    rVal.appendChild(rText); rVal.appendChild(change);
+    grid.appendChild(rKey); grid.appendChild(rVal);
     body.appendChild(grid);
+    const editor = _rcRetentionEditor(r);
+    change.addEventListener('click', () => { editor.hidden = false; change.hidden = true; const i = editor.querySelector('input[type=number]'); if (i && !i.disabled) i.focus(); });
+    editor.addEventListener('rc-retention-cancel', () => { editor.hidden = true; change.hidden = false; });
+    body.appendChild(editor);
     content.appendChild(header); content.appendChild(body); modal.appendChild(content);
     modal.addEventListener('click', (ev) => { if (ev.target === modal) modal.remove(); });
     document.body.appendChild(modal);
+}
+
+// A link's retention as its details show it: how long an upload is kept, or that it is kept.
+function _rcRetentionText(r) {
+    const n = Number(r.retention_days);
+    if (!Number.isFinite(n) || n <= 0) return 'Kept until you delete them';
+    return 'Deleted ' + n + (n === 1 ? ' day' : ' days') + ' after upload' + fileExpiryNotEnforcedSuffix();
+}
+
+// The form that changes a link's retention, hidden until "Change" is pressed. It offers only what the
+// server accepts for this link now (retention_limit_days, retention_may_keep), and the server checks
+// again. DOM APIs only.
+function _rcRetentionEditor(r) {
+    const limit = Number(r.retention_limit_days) > 0 ? Number(r.retention_limit_days) : null;
+    const wrap = document.createElement('div'); wrap.className = 'rc-retention-editor mt-md'; wrap.id = 'rc-info-retention-editor'; wrap.hidden = true;
+    const group = document.createElement('div'); group.className = 'form-group';
+    const label = document.createElement('label'); label.htmlFor = 'rc-info-retention-days'; label.textContent = 'Delete uploads after (days)';
+    const input = document.createElement('input'); input.type = 'number'; input.id = 'rc-info-retention-days'; input.className = 'form-control';
+    input.min = '1'; input.step = '1'; input.inputMode = 'numeric'; input.style.maxWidth = '160px';
+    if (limit) input.max = String(limit);
+    if (Number(r.retention_days) > 0) input.value = String(r.retention_days);
+    const help = document.createElement('small'); help.className = 'form-help';
+    help.textContent = limit ? ('At most ' + limit + (limit === 1 ? ' day.' : ' days.')) : '';
+    group.appendChild(label); group.appendChild(input); group.appendChild(help);
+    wrap.appendChild(group);
+    let keep = null;
+    if (r.retention_may_keep) {
+        const kl = document.createElement('label'); kl.className = 'checkbox-label';
+        keep = document.createElement('input'); keep.type = 'checkbox'; keep.id = 'rc-info-retention-keep';
+        keep.checked = !(Number(r.retention_days) > 0);
+        kl.appendChild(keep); kl.appendChild(document.createTextNode(' Keep uploads until I delete them'));
+        wrap.appendChild(kl);
+        const sync = () => { input.disabled = keep.checked; };
+        keep.addEventListener('change', sync); sync();
+    }
+    const note = document.createElement('p'); note.className = 'text-sm text-secondary mt-sm';
+    note.textContent = 'A new number of days applies to files that arrive from now on; files already here keep the date they were given. Keeping uploads removes the date from every file, including those.';
+    wrap.appendChild(note);
+    if (!fileExpiryEnforced()) {
+        const off = document.createElement('p'); off.className = 'text-sm text-warning mt-sm';
+        off.textContent = 'File expiry is switched off on this server, so no files are being deleted. Deadlines are still recorded, and files past theirs will be deleted if it is switched back on.';
+        wrap.appendChild(off);
+    }
+    const err = document.createElement('p'); err.className = 'text-sm mt-sm'; err.id = 'rc-info-retention-error';
+    err.style.color = 'var(--danger,#dc2626)'; err.hidden = true;
+    wrap.appendChild(err);
+    const actions = document.createElement('div'); actions.className = 'flex gap-sm mt-sm';
+    const save = _el('button', 'btn btn-primary btn-sm', 'Save'); save.type = 'button'; save.id = 'rc-info-retention-save';
+    const cancel = _el('button', 'btn btn-secondary btn-sm', 'Cancel'); cancel.type = 'button';
+    cancel.addEventListener('click', () => { err.hidden = true; wrap.dispatchEvent(new CustomEvent('rc-retention-cancel')); });
+    save.addEventListener('click', async () => {
+        err.hidden = true;
+        let days = null;
+        if (!(keep && keep.checked)) {
+            const n = Number(input.value);
+            if (!input.value || !Number.isInteger(n) || n < 1) {
+                err.textContent = 'Enter the number of days to keep uploads: a whole number, 1 or more.'; err.hidden = false; return;
+            }
+            if (limit && n > limit) {
+                err.textContent = 'The retention can be at most ' + limit + (limit === 1 ? ' day.' : ' days.'); err.hidden = false; return;
+            }
+            days = n;
+        }
+        save.disabled = true;
+        try {
+            const updated = await apiRequest('/receivers/' + r.id + '/retention', { method: 'PATCH', body: JSON.stringify({ retention_days: days }) });
+            showSuccess(days == null ? 'Uploads to this link are now kept until you delete them' : ('Uploads to this link are now deleted ' + days + (days === 1 ? ' day' : ' days') + ' after they arrive'));
+            openReceiverInfoModal(updated);
+            loadMyReceivers().catch(() => {});
+        } catch (e) {
+            err.textContent = (e && e.message) || 'Could not change the retention.'; err.hidden = false;
+        } finally {
+            save.disabled = false;
+        }
+    });
+    actions.appendChild(save); actions.appendChild(cancel);
+    wrap.appendChild(actions);
+    return wrap;
 }
 
 function _rcExpiryText(r) { return r.expires_at ? (typeof _fmtLinkExpiry === 'function' ? _fmtLinkExpiry(r.expires_at).replace(/^Expires /, '') : r.expires_at) : 'Never'; }
@@ -19885,6 +19974,10 @@ function renderMyReceivers(receivers) {
             op.addEventListener('click', () => { closeModal(); openVault(r.vault_id, { from: 'uploadlinks' }); });
             actTd.appendChild(op);
         }
+        // The link's details, where its retention is changed; the same dialog as a drop-vault card's.
+        const inf = _el('button', 'btn btn-ghost btn-sm rc-info-btn', 'Info'); inf.type = 'button';
+        inf.addEventListener('click', () => openReceiverInfoModal(r));
+        actTd.appendChild(inf);
         tr.appendChild(actTd); tb.appendChild(tr);
     });
     table.appendChild(tb); host.replaceChildren(table);

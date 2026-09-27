@@ -2187,6 +2187,7 @@ body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster 
 .rc-ring { width: 84px; height: 84px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
 .rc-ring-hole { width: 62px; height: 62px; border-radius: 50%; background: var(--surface-1); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }
 .rc-vault-actions { margin-top: auto; }
+.rc-retention-val { display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap; }
 
 /* Disabled "hint" item in the file context menu (e.g. Public link when no Link tag permits files). */
 .context-menu-item:disabled, .context-menu-item.is-hint { opacity: .5; cursor: default; }

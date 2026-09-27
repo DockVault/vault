@@ -124,8 +124,26 @@ def test_the_notes_exist_hidden_and_each_is_shown_where_it_is_needed():
         assert 'style="display:none;"' in m.group(0), f"{note_id} must start hidden"
         assert "no files are being deleted" in m.group(1) or "uploads are not deleted" in m.group(1)
         assert APP_JS.count(opener) == 1, f"{note_id} is not shown when its dialog opens"
-    # An upload link's details carry the same qualifier as a vault's panels.
-    assert APP_JS.count("(r.retention_days + ' days' + fileExpiryNotEnforcedSuffix())") == 1
+
+
+def test_an_upload_links_details_qualify_its_retention_too():
+    # The same qualifier as a vault's panels, on the retention an upload link's details show.
+    lifted = "".join(_function(APP_JS, head) for head in (
+        "function fileExpiryEnforced() {", "function fileExpiryNotEnforcedSuffix() {",
+        "function _rcRetentionText(r) {"))
+    got = _node("const state = {};\n" + lifted + """
+const got = {};
+for (const [key, flag] of [['on', true], ['off', false]]) {
+    state.fileExpiryEnforced = flag;
+    got[key] = [7, 1, null, 0].map((d) => _rcRetentionText({ retention_days: d }));
+}
+console.log(JSON.stringify(got));
+""")
+    assert got["on"] == ["Deleted 7 days after upload", "Deleted 1 day after upload",
+                         "Kept until you delete them", "Kept until you delete them"]
+    assert got["off"][0] == ("Deleted 7 days after upload (not enforced on this server: no files are "
+                             "being deleted)")
+    assert got["off"][2] == "Kept until you delete them", "a kept upload has nothing to qualify"
 
 
 def test_the_flag_is_read_at_sign_in_with_the_rest_of_the_policy():

@@ -322,3 +322,60 @@ def resolve_receiver_policy(tag, overrides: dict | None = None) -> dict:
             "ttl_hours": ttl_hours, "kind": kind, "max_uploads": max_uploads,
             "max_file_bytes": max_file_bytes, "max_total_bytes": max_total_bytes,
             "retention_days": retention_days}
+
+
+# --- changing an existing link's retention ---------------------------------------------------------
+def _tag_in_force(tag) -> bool:
+    """Whether a link's tag still exists and is active. A deleted tag reaches here as None."""
+    return tag is not None and bool(_tag_attr(tag, "is_active", True))
+
+
+def retention_limits(tag, current_days):
+    """What the owner of an existing upload link may set its retention to now, as
+    ``(most_days, may_keep)``: the longest retention in days, and whether uploads may be kept with no
+    retention at all (until someone deletes them).
+
+    The link's tag decides, as it stands now rather than as it stood when the link was made: at most
+    the tag's retention_max_days (MAX_RETENTION_DAYS when the tag sets none), and no retention only
+    when the tag sets no maximum. A link whose tag has been deactivated or deleted has no policy left
+    to lengthen it under, so its retention can only be shortened: at most what it is now, and kept
+    with no retention only if it already is."""
+    current = (current_days if isinstance(current_days, int) and not isinstance(current_days, bool)
+               and current_days > 0 else None)
+    if not _tag_in_force(tag):
+        if current is None:
+            return MAX_RETENTION_DAYS, True
+        return min(current, MAX_RETENTION_DAYS), False
+    ceiling = _tag_attr(tag, "retention_max_days", None)
+    if ceiling is None:
+        return MAX_RETENTION_DAYS, True
+    return min(int(ceiling), MAX_RETENTION_DAYS), False
+
+
+def resolve_retention_change(tag, current_days, requested):
+    """Check a new retention for an existing upload link against retention_limits, and return it: a
+    number of days, or None for no retention. Raises PolicyViolation, with a message fit to show, when
+    the value is not a whole number of days (1 or more) or is more than the link may have."""
+    most, may_keep = retention_limits(tag, current_days)
+    in_force = _tag_in_force(tag)
+    has_ceiling = in_force and _tag_attr(tag, "retention_max_days", None) is not None
+    if requested is None:
+        if may_keep:
+            return None
+        if in_force:
+            raise PolicyViolation(
+                "This link type deletes uploads within %d days, so they cannot be kept forever." % most)
+        raise PolicyViolation(
+            "This link's type is no longer available, so its retention can only be shortened; "
+            "uploads cannot be kept forever.")
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
+        raise PolicyViolation("Enter the number of days to keep uploads: a whole number, 1 or more.")
+    if requested > most:
+        if not in_force:
+            raise PolicyViolation(
+                "This link's type is no longer available, so its retention can only be shortened, "
+                "to %d days or fewer." % most)
+        if has_ceiling:
+            raise PolicyViolation("The retention period can be at most %d days for this link type." % most)
+        raise PolicyViolation("The retention period can be at most %d days." % most)
+    return requested
