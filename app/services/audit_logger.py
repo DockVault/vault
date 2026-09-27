@@ -602,12 +602,12 @@ class AuditLogger:
     def cleanup_old_audit_logs(self, days: Optional[int] = None) -> int:
         """Opportunistically prune audit_logs older than the retention window.
 
-        Retention is OPT-IN: a window of 0 or negative -- the default -- keeps every audit row
-        forever. Audit rows are forensic/compliance records, so silent deletion is the worse failure;
-        an operator must explicitly choose to bound the append-only table. When a positive window is
-        configured (settings.audit_log_retention_days), rows older than it are deleted. Process-wide
-        throttled to at most once per hour, so it can be wired into a frequently-hit admin read path
-        without issuing a DELETE per request. Returns the rows deleted (0 when disabled or throttled).
+        Retention is OPT-IN: a window of 0 or negative -- the default -- keeps every audit row. A
+        deleted record of what happened cannot be brought back, so deleting them is left to the
+        operator. When a positive window is configured (settings.audit_log_retention_days), rows older
+        than it are deleted. Process-wide throttled to at most once per hour, so it can be wired into
+        a frequently-hit admin read path without issuing a DELETE per request. Returns the rows
+        deleted (0 when disabled or throttled).
         """
         global _last_audit_cleanup_at
 

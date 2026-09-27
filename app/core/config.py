@@ -392,10 +392,11 @@ class Settings(BaseSettings):
     security_bulk_deletion_threshold: int = Field(default=10)  # Files deleted in time window
     security_bulk_deletion_window: int = Field(default=60)  # Time window in seconds
     security_alert_retention_days: int = Field(default=90)  # How long to keep resolved alerts
-    # Audit-log retention. 0 (the default) keeps audit_logs forever -- the compliance-safe default,
-    # since audit rows are forensic/compliance records and deleting them silently is the worse
-    # failure. A positive value opportunistically prunes rows older than N days (throttled once/hour),
-    # bounding the append-only table's growth for operators who want it.
+    # Audit-log retention in days. 0 (the default) keeps every audit row: a deleted record of what
+    # happened cannot be brought back, so deleting them is left to the operator. A positive value
+    # deletes rows older than that many days, at most once an hour, when an administrator's dashboard
+    # loads its recent activity (AuditLogger.cleanup_old_audit_logs). The app only adds rows and
+    # deletes old ones; the table is an ordinary one that anyone with database access can change.
     audit_log_retention_days: int = Field(default=0)
     
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
