@@ -52,6 +52,7 @@ from app.core import note_link_policy
 from app.core import receiver_policy
 from app.core import storage_quota
 from app.core import file_expiry
+from app.core.last_admin import LAST_ADMIN_DETAIL, removes_last_admin
 from app.core.email_identity import (
     EMAIL_LOWER_UNIQUE_INDEX, email_in_use, find_email_collisions, normalize_email,
 )
@@ -8672,9 +8673,32 @@ async def update_user(
             detail="User not found"
         )
 
+    # An administrator cannot change their own role, deactivate or lock themselves here, exactly as
+    # the dedicated role, activate and lock endpoints refuse it, each with the same message. Undoing
+    # any of those needs another administrator, and there may be none. Resaving the value you already
+    # have is not a change: the admin edit form sends role and is_active with every save.
+    if is_admin and is_self:
+        if user_update.role is not None and user_update.role != user.role:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Cannot change your own role")
+        if user_update.is_active is False:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Cannot deactivate your own account")
+        if user_update.is_locked is True:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Cannot lock your own account")
+
+    # Nor may any change leave the deployment without an administrator who can act. Checked before
+    # anything below touches the row, because the check reloads it under a lock.
+    if is_admin and user.role == RoleEnum.ADMIN and (
+            (user_update.role is not None and user_update.role != RoleEnum.ADMIN)
+            or user_update.is_active is False or user_update.is_locked is True):
+        if removes_last_admin(db, user):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=LAST_ADMIN_DETAIL)
+
     # Track changes for audit log
     changes = {}
-    
+
     # Non-admin users can only update their own email and password.
     # "email" omitted leaves the address alone; sent as an explicit null clears it.
     if "email" in user_update.model_fields_set:
@@ -9031,6 +9055,10 @@ async def delete_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account"
         )
+
+    # Never delete the last administrator who can act (see app/core/last_admin.py).
+    if user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=LAST_ADMIN_DETAIL)
 
     # A user who still owns vaults can't be hard-deleted: Vault.owner_id is NOT NULL and the
     # vaults_owned relationship nullifies-the-FK-then-fails, so db.delete would raise IntegrityError

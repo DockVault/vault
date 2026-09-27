@@ -19,6 +19,7 @@ from pydantic import BaseModel, EmailStr, Field
 from app.core.database import get_db
 from app.core.auth_offload import auth_offload_slot, run_offloaded
 from app.core.email_identity import email_in_use, normalize_email
+from app.core.last_admin import LAST_ADMIN_DETAIL, removes_last_admin
 from app.core.models import User, TemporaryCredential, RoleEnum, AuditLog, ActiveSession
 from app.services.auth_service import AuthService
 from app.services.audit_logger import AuditLogger
@@ -521,7 +522,21 @@ async def update_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
+    # The same refusals as the dedicated role and activate endpoints, and PATCH /users/{id}: an
+    # administrator cannot change their own role or deactivate themselves, and no change may leave
+    # the deployment without an administrator who can act. Both are checked before any field is set,
+    # because the second reloads the row under a lock. Resaving an unchanged role is not a change.
+    changes_role = update_data.role is not None and update_data.role != user.role
+    if current_user.id == user_id:
+        if changes_role:
+            raise HTTPException(status_code=400, detail="Cannot change your own role")
+        if update_data.is_active is False:
+            raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
+    if user.role == RoleEnum.ADMIN and (changes_role or update_data.is_active is False):
+        if removes_last_admin(db, user):
+            raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
+
     # Update fields
     # Omitting "email" leaves the address alone; sending it as an explicit null clears it. The
     # previous `is not None` test collapsed those two into one, so an address could be replaced but
@@ -593,6 +608,10 @@ async def toggle_user_active(
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
 
+    # Never deactivate the last administrator who can act (see app/core/last_admin.py).
+    if user.is_active and user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
+        raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
+
     # Reactivating a user consumes a seat, so enforce the plan's user cap on the
     # inactive->active transition here too (mirrors the PATCH /users/{id} path). create_user
     # and that PATCH are otherwise the only checkpoints, which an admin at the cap could
@@ -642,7 +661,11 @@ async def toggle_user_locked(
     # Prevent self-locking
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot lock your own account")
-    
+
+    # Never lock the last administrator who can act (see app/core/last_admin.py).
+    if not user.is_locked and user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
+        raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
+
     new_locked = not user.is_locked
     user.is_locked = new_locked
     user.updated_at = datetime.now(timezone.utc)
@@ -1098,7 +1121,13 @@ async def change_user_role(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot change your own role"
         )
-    
+
+    # Never demote the last administrator who can act (see app/core/last_admin.py). Checked before
+    # old_role is read, because the check reloads the row under a lock.
+    if (target_user.role == RoleEnum.ADMIN and request.new_role != RoleEnum.ADMIN
+            and removes_last_admin(db, target_user)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=LAST_ADMIN_DETAIL)
+
     old_role = target_user.role.value
     new_role = request.new_role.value
     
