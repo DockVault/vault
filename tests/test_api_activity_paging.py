@@ -53,10 +53,11 @@ def test_numbered_pages_hold_every_row_once_whichever_way_they_are_reached(admin
     assert _events(admin, user=prefix, page=9, limit=2)["events"] == []
 
 
-def test_a_page_too_far_in_to_open_directly_says_so(admin):
-    r = admin.get("/activity/events", params={"page": 5000, "limit": 100})
-    assert r.status_code == 400
-    assert "a page at a time" in r.json()["detail"]
+def test_a_page_past_the_end_is_empty(admin):
+    # (A page far from both ends of a long list is refused; tests/test_activity_events_paging.py
+    # covers that, since it takes more than 200,000 rows.)
+    body = _events(admin, page=5000, limit=100)
+    assert body["events"] == [] and body["page"] == 5000 and body["next_cursor"] is None
 
 
 def test_newer_rows_are_the_ones_after_the_row_the_list_shows(admin):
@@ -70,14 +71,24 @@ def test_newer_rows_are_the_ones_after_the_row_the_list_shows(admin):
         if len(body["events"]) >= 2:
             break
         time.sleep(0.2)
-    assert [e["username"] for e in body["events"]] == [f"{prefix}-n-1", f"{prefix}-n-0"]
+    # The nearest first: the rows next to the one shown, in time order.
+    assert [e["username"] for e in body["events"]] == [f"{prefix}-n-0", f"{prefix}-n-1"]
     assert body["more"] is False and body["total"] is None
-    # More new rows than asked for: the list is told to reload rather than patch in part of them.
-    assert _events(admin, user=prefix, after=shown, limit=1)["more"] is True
+    assert body["head_cursor"] == body["events"][-1]["cursor"]
+    # More new rows than asked for: the nearest one, and `more` says others follow.
+    one = _events(admin, user=prefix, after=shown, limit=1)
+    assert [e["username"] for e in one["events"]] == [f"{prefix}-n-0"] and one["more"] is True
+    # From that row's cursor, the next one: how Newer walks from any event.
+    step = _events(admin, user=prefix, after=one["events"][0]["cursor"], limit=1)
+    assert [e["username"] for e in step["events"]] == [f"{prefix}-n-1"]
     # The newest row has nothing after it.
-    newest = body["events"][0]["id"]
+    newest = body["events"][-1]["id"]
     assert _events(admin, user=prefix, after=newest) == {"events": [], "next_cursor": None, "total": None,
-                                                        "more": False}
+                                                        "more": False, "head_cursor": None}
+    # A safety poll reaching back two minutes also returns the rows just before its starting point.
+    polled = _events(admin, user=prefix, after=newest, overlap=120)
+    assert {e["username"] for e in polled["events"]} == {prefix + "-0", f"{prefix}-n-0", f"{prefix}-n-1"}
+    assert _events(admin, user=prefix, after=shown, count_only="true") == {"count": 2}
 
 
 def test_a_row_the_list_no_longer_knows_means_reload(admin):
@@ -98,6 +109,62 @@ def test_rows_named_by_the_signal_come_back_only_if_they_match_the_filters(admin
     only = _events(admin, ids=ids, user=f"{prefix}-1")
     assert [e["username"] for e in only["events"]] == [f"{prefix}-1"]
     assert _events(admin, ids=ids, category="files")["events"] == []
+    # Comma-separated, as the page sends a batch, and counted without the rows.
+    assert sorted(e["id"] for e in _events(admin, ids=",".join(ids))["events"]) == sorted(ids)
+    assert _events(admin, ids=",".join(ids), user=f"{prefix}-1", count_only="true") == {"count": 1}
+
+
+def test_one_event_opens_by_its_id(admin):
+    prefix = unique("one")
+    _failed_sign_ins(prefix, 1)
+    row = _wait_for(admin, 1, user=prefix)["events"][0]
+    r = admin.get(f"/activity/events/{row['id']}")
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["id"] == row["id"] and got["username"] == f"{prefix}-0" and "names" in got
+    import uuid
+    assert admin.get(f"/activity/events/{uuid.uuid4()}").status_code == 404
+    assert admin.get("/activity/events/not-an-id").status_code == 404
+
+
+def test_the_filters_the_page_asks_for(admin, temp_vault):
+    prefix = unique("filters")
+    _failed_sign_ins(prefix, 2)
+    _wait_for(admin, 2, user=prefix)
+    # By event name, and by the label the page shows.
+    assert _events(admin, user=prefix, action="login_failure")["total"] == 2
+    assert _events(admin, user=prefix, action="file_uploaded")["total"] == 0
+    assert _events(admin, user=prefix, q="Sign-in failed")["total"] == 2
+    # A user exactly, not every name containing it.
+    assert _events(admin, user=f"{prefix}-1", user_match="exact")["total"] == 1
+    assert _events(admin, user=prefix, user_match="exact")["total"] == 0
+    # Names no account had.
+    assert _events(admin, user=prefix, no_account="true")["total"] == 2
+    # A vault: its own rows and the rows of what is in it.
+    vid = temp_vault["id"]
+    up = admin.post(f"/vaults/{vid}/files", files=[("files", (unique("f") + ".txt", b"x", "text/plain"))])
+    assert up.status_code in (200, 201), up.text
+    in_vault = None
+    for _ in range(25):
+        in_vault = _events(admin, vault_id=vid)
+        if in_vault["total"] >= 1:
+            break
+        time.sleep(0.2)
+    assert in_vault["total"] >= 1
+    assert all(e["resource_id"] == vid or (e["details"] or {}).get("vault_id") == vid for e in in_vault["events"])
+    assert _events(admin, vault_id="not-an-id")["total"] == 0
+
+
+def test_a_numbered_page_says_where_its_neighbours_start(admin):
+    prefix = unique("cursors")
+    _failed_sign_ins(prefix, 3)
+    first = _wait_for(admin, 3, user=prefix, page=1, limit=2)
+    assert first["prev_cursor"] == first["events"][0]["cursor"]
+    assert first["next_cursor"] == first["events"][-1]["cursor"]
+    assert first["head_cursor"] == first["events"][0]["cursor"]
+    # Older from any event: the cursor continues after it.
+    older = _events(admin, user=prefix, cursor=first["events"][0]["cursor"], limit=1)
+    assert older["events"][0]["id"] == first["events"][1]["id"]
 
 
 def test_a_temporary_credential_is_found_by_its_name_even_after_it_is_deleted(admin, temp_user):
@@ -128,7 +195,7 @@ def test_the_typeahead_offers_accounts_and_names_only_the_log_has_seen(admin, te
             if len(got) >= 2:
                 break
             time.sleep(0.2)
-        assert got == [{"username": f"{stem}-account", "account": True},
+        assert got == [{"username": f"{stem}-account", "account": True, "active": True},
                        {"username": typed, "account": False}]            # in name order, as typed
         upper = admin.get("/activity/usernames", params={"q": stem.upper()}).json()["usernames"]
         assert upper == got                                                # any case finds them
@@ -141,3 +208,38 @@ def test_the_typeahead_offers_accounts_and_names_only_the_log_has_seen(admin, te
 
 def test_only_an_administrator_gets_the_typeahead(temp_user_client):
     assert temp_user_client.get("/activity/usernames", params={"q": "a"}).status_code == 403
+    assert temp_user_client.get("/activity/temp-credentials", params={"q": "temp_"}).status_code == 403
+
+
+def test_the_typeahead_can_offer_accounts_only(admin):
+    stem = unique("tb").lower()
+    ApiClient().post("/auth/login", json={"username": f"{stem}-typed", "password": "not-the-password-1"})
+    user = admin.create_user(username=f"{stem}-account")
+    try:
+        got = None
+        for _ in range(25):
+            got = admin.get("/activity/usernames", params={"q": stem}).json()["usernames"]
+            if len(got) >= 2:
+                break
+            time.sleep(0.2)
+        assert len(got) == 2
+        only = admin.get("/activity/usernames", params={"q": stem, "accounts_only": "true"}).json()["usernames"]
+        assert only == [{"username": f"{stem}-account", "account": True, "active": True}]
+    finally:
+        admin.delete_user(user["id"])
+
+
+def test_the_credential_typeahead_names_state_and_expiry_but_never_the_note(admin):
+    note = unique("secret-note")
+    tc = admin.post("/auth/temp-credentials", json={"note": note}).json()
+    name = tc["temp_username"]
+    try:
+        r = admin.get("/activity/temp-credentials", params={"q": name})
+        assert r.status_code == 200, r.text
+        got = r.json()["temp_credentials"]
+        assert [c["name"] for c in got] == [name]
+        assert got[0]["state"] == "active" and got[0]["expires_at"].endswith("+00:00")
+        assert set(got[0]) == {"id", "name", "state", "expires_at"} and note not in r.text
+        assert admin.get("/activity/temp-credentials", params={"q": "t"}).json() == {"temp_credentials": []}
+    finally:
+        admin.post(f"/temp-creds/{name}/delete")

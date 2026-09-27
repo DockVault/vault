@@ -5,11 +5,13 @@ Everything here counts rows the Events list would show for the same filters, and
 Events list does not: event categories, usernames and addresses, never a vault, file or folder name.
 The window is split into buckets aligned to the viewer's clock (whole hours for 24 hours, quarter days
 for 7 days, whole days for 30 days), the last bucket being the one in progress; the band's figures all
-cover exactly that window.
+cover exactly that window. "Failed" is a status in the Events list's Failed group (failure, failed,
+error, refused). The most active people are accounts: a name typed at a failed sign-in, which can be
+anything a person typed into the username box, is counted in `no_account` and never listed by name.
 
 Cost on a large log: three aggregate queries over the window, each an index range scan on the
 timestamp, and one over the sessions table. The window is at most 30 days, whatever the log holds.
-Measured on 520,000 rows (about 260,000 in 30 days): 24 hours 50 ms, 7 days 320 ms, 30 days 900 ms.
+Measured on 520,000 rows (about 260,000 in 30 days): 24 hours 70 ms, 7 days 290 ms, 30 days 770 ms.
 The page refreshes the band as events arrive, so the counts are kept for a few seconds (CACHE_SECONDS)
 and shared by everyone who asks for the same range and filters: they are the same for every
 administrator, since they name nothing that depends on who is looking. The "now" figures are never kept.
@@ -30,8 +32,9 @@ RANGES = {
     "30d": (30, 86400),
 }
 DEFAULT_RANGE = "24h"
-TOP = 5
+TOP = 6
 LEGACY = "legacy"
+FAILED_STATUSES = ("failure", "failed", "error", "refused")
 
 # Sign-in outcomes, by catalog name (a stored alias counts as its entry).
 SIGN_IN_OUTCOMES = {
@@ -50,6 +53,8 @@ _cache_lock = threading.Lock()
 # How long a session counts as signed in after its last request: the grace a temporary credential's
 # session gets (TEMP_CRED_SESSION_GRACE_MINUTES), the figure the rest of the vault uses for "active".
 SESSION_GRACE_MINUTES = 65
+# The most people, and temporary credentials, the "now" lists name.
+NOW_LIST = 50
 
 
 @dataclass(frozen=True)
@@ -91,59 +96,76 @@ def category_of(action: Optional[str]) -> str:
 
 
 def shape(win: Window, grouped, top_users, top_addresses) -> dict:
-    """The band from the grouped counts: `grouped` is (bucket number, stored action, count) rows,
-    the tops are (value, count) rows, already ordered."""
-    buckets: List[Dict[str, int]] = [{} for _ in range(win.buckets)]
-    mix: Dict[str, int] = {}
+    """The band from the grouped counts. `grouped` is (bucket number, stored action, failed, no
+    account, count) rows; the tops are (value, count, failed) rows, already ordered."""
+    buckets: List[Dict] = [{"counts": {}, "failed": 0} for _ in range(win.buckets)]
+    mix: Dict[str, List[int]] = {}
     outcomes = {"succeeded": 0, "failed": 0, "locked": 0}
-    for bucket, action, count in grouped:
+    no_account = {"total": 0, "failed": 0}
+    for bucket, action, failed, unowned, count in grouped:
         if bucket is None or not 0 <= int(bucket) < win.buckets:
             continue
+        n = int(count)
         cat = category_of(action)
         slot = buckets[int(bucket)]
-        slot[cat] = slot.get(cat, 0) + int(count)
-        mix[cat] = mix.get(cat, 0) + int(count)
+        slot["counts"][cat] = slot["counts"].get(cat, 0) + n
+        tally = mix.setdefault(cat, [0, 0])
+        tally[0] += n
+        if failed:
+            slot["failed"] += n
+            tally[1] += n
+        if unowned:
+            no_account["total"] += n
+            no_account["failed"] += n if failed else 0
         entry = audit_catalog.lookup(action or "")
         outcome = SIGN_IN_OUTCOMES.get(entry.name if entry else "")
         if outcome:
-            outcomes[outcome] += int(count)
+            outcomes[outcome] += n
     labels = dict(audit_catalog.CATEGORIES)
     order = [k for k, _ in audit_catalog.CATEGORIES] + [LEGACY]
     return {
         "from": _iso(win.start),
         "to": _iso(win.end),
         "bucket_seconds": win.size,
-        "buckets": [{"start": _iso(win.bucket_start(i)), "total": sum(c.values()), "counts": c}
-                    for i, c in enumerate(buckets)],
-        "total": sum(mix.values()),
-        "categories": [{"key": k, "label": labels.get(k, audit_catalog.LEGACY_LABEL), "count": mix[k]}
-                       for k in order if mix.get(k)],
+        "buckets": [{"start": _iso(win.bucket_start(i)), "total": sum(b["counts"].values()),
+                     "failed": b["failed"], "counts": b["counts"]} for i, b in enumerate(buckets)],
+        "total": sum(t[0] for t in mix.values()),
+        "failed": sum(t[1] for t in mix.values()),
+        "categories": [{"key": k, "label": labels.get(k, audit_catalog.LEGACY_LABEL),
+                        "count": mix[k][0], "failed": mix[k][1]} for k in order if k in mix],
         "sign_ins": outcomes,
-        "top_users": [{"username": u, "count": int(n)} for u, n in top_users],
-        "top_addresses": [{"ip_address": a, "count": int(n)} for a, n in top_addresses],
+        "top_users": [{"username": u, "count": int(n), "failed": int(f or 0)} for u, n, f in top_users],
+        "no_account": no_account,
+        "top_addresses": [{"ip_address": a, "count": int(n), "failed": int(f or 0)} for a, n, f in top_addresses],
     }
 
 
 def summarize(db, base, AuditLog, win: Window) -> dict:
     """The band for the rows of `base` (the Events filters, already applied) inside the window."""
-    from sqlalchemy import func, literal_column
+    from sqlalchemy import case, func, literal_column, text
     q = base.filter(AuditLog.timestamp >= win.start, AuditLog.timestamp <= win.end).order_by(None)
-    # The start of a row's bucket (date_bin, PostgreSQL 14 and later). Written out rather than built
-    # from bound parameters, so the SELECT and the GROUP BY are the same expression to the database; the
-    # size and the origin are the server's own values, never the request's.
+    # The start of a row's bucket (date_bin, PostgreSQL 14 and later), whether it failed, and whether it
+    # is under no account. Written out, and grouped by position, so the SELECT and the GROUP BY are the
+    # same to the database; every value in them is the server's own, never the request's.
     bucket = literal_column(
         f"date_bin('{int(win.size):d} seconds'::interval, audit_logs.timestamp, "
         f"timestamp '{win.start:%Y-%m-%d %H:%M:%S}')")
-    grouped = [(win.bucket_of(b), action, n) for b, action, n in
-               q.with_entities(bucket, AuditLog.action, func.count()).group_by(bucket, AuditLog.action).all()
+    failed = literal_column(
+        "(audit_logs.status IN (" + ", ".join(f"'{s}'" for s in FAILED_STATUSES) + "))")
+    unowned = literal_column("(audit_logs.user_id IS NULL AND audit_logs.username IS NOT NULL)")
+    grouped = [(win.bucket_of(b), action, f, u, n) for b, action, f, u, n in
+               q.with_entities(bucket, AuditLog.action, failed, unowned, func.count())
+               .group_by(text("1"), text("2"), text("3"), text("4")).all()
                if b is not None]
     count = func.count()
+    failures = func.sum(case((AuditLog.status.in_(FAILED_STATUSES), 1), else_=0))
 
-    def top(col):
-        return (q.filter(col.isnot(None)).with_entities(col, count).group_by(col)
+    def top(col, *conds):
+        return (q.filter(col.isnot(None), *conds).with_entities(col, count, failures).group_by(col)
                 .order_by(count.desc(), col).limit(TOP).all())
 
-    return shape(win, grouped, top(AuditLog.username), top(AuditLog.ip_address))
+    return shape(win, grouped, top(AuditLog.username, AuditLog.user_id.isnot(None)),
+                 top(AuditLog.ip_address))
 
 
 def cached(key: tuple, range_key: str, compute):
@@ -165,19 +187,23 @@ def cached(key: tuple, range_key: str, compute):
     return value, 0.0
 
 
+def _live_sessions(db, now: datetime):
+    from app.core.models import ActiveSession
+    cutoff = now - timedelta(minutes=SESSION_GRACE_MINUTES)
+    return db.query(ActiveSession).filter(
+        ActiveSession.is_active == True,  # noqa: E712
+        ActiveSession.revoked == False,  # noqa: E712
+        ActiveSession.last_activity >= cutoff,
+    ).order_by(None)
+
+
 def now_panel(db, now: datetime, transfers: dict) -> dict:
     """What is happening now: signed-in sessions (web and SFTP, from the sessions the vault keeps),
     the people and temporary credentials behind them, and the web transfers in progress (`transfers`,
     from the web process's own count; SFTP transfers are not counted)."""
     from sqlalchemy import distinct, func
     from app.core.models import ActiveSession
-    cutoff = now - timedelta(minutes=SESSION_GRACE_MINUTES)
-    live = db.query(ActiveSession).filter(
-        ActiveSession.is_active == True,  # noqa: E712
-        ActiveSession.revoked == False,  # noqa: E712
-        ActiveSession.last_activity >= cutoff,
-    ).order_by(None)
-    sessions, people, temps = live.with_entities(
+    sessions, people, temps = _live_sessions(db, now).with_entities(
         func.count(ActiveSession.id),
         func.count(distinct(ActiveSession.user_id)).filter(ActiveSession.temp_credential_id.is_(None)),
         func.count(distinct(ActiveSession.temp_credential_id)),
@@ -188,5 +214,49 @@ def now_panel(db, now: datetime, transfers: dict) -> dict:
         "people": int(people or 0),
         "temporary_credentials": int(temps or 0),
         "transfers_in_progress": int(transfers.get("in_progress", 0)),
+        "transfers_in_flight": int(transfers.get("in_flight", 0)),
         "transfers_waiting": int(transfers.get("waiting", 0)),
+        "transfer_limit": transfers.get("limit"),
+    }
+
+
+def who_is_online(db, now: datetime) -> dict:
+    """The people and temporary credentials behind the signed-in sessions, most recently active first,
+    at most NOW_LIST of each: a person's username, their sessions, when the latest was last used and
+    from which address; a credential's name, its owner and when it was last used."""
+    from sqlalchemy import func
+    from app.core.models import ActiveSession, TemporaryCredential, User as _User
+    live = _live_sessions(db, now)
+    people_q = (live.filter(ActiveSession.temp_credential_id.is_(None))
+                .join(_User, _User.id == ActiveSession.user_id)
+                .with_entities(_User.username, func.count(ActiveSession.id),
+                               func.max(ActiveSession.last_activity))
+                .group_by(_User.username))
+    people_total = people_q.count()
+    people = people_q.order_by(func.max(ActiveSession.last_activity).desc(), _User.username).limit(NOW_LIST).all()
+    latest_ip = {}
+    if people:
+        names = [p[0] for p in people]
+        for username, ip, _last in (live.filter(ActiveSession.temp_credential_id.is_(None))
+                                    .join(_User, _User.id == ActiveSession.user_id)
+                                    .filter(_User.username.in_(names))
+                                    .with_entities(_User.username, ActiveSession.ip_address,
+                                                   ActiveSession.last_activity)
+                                    .order_by(ActiveSession.last_activity.asc()).all()):
+            latest_ip[username] = ip          # ascending, so the last one written is the latest
+    owner = _User
+    temps = (live.filter(ActiveSession.temp_credential_id.isnot(None))
+             .join(TemporaryCredential, TemporaryCredential.id == ActiveSession.temp_credential_id)
+             .join(owner, owner.id == TemporaryCredential.user_id)
+             .with_entities(TemporaryCredential.temp_username, owner.username,
+                            func.max(ActiveSession.last_activity))
+             .group_by(TemporaryCredential.temp_username, owner.username)
+             .order_by(func.max(ActiveSession.last_activity).desc()).limit(NOW_LIST).all())
+    return {
+        "as_of": _iso(now),
+        "online_total": int(people_total),
+        "online_people": [{"username": u, "sessions": int(n), "last_active": _iso(last) if last else None,
+                           "ip_address": latest_ip.get(u)} for u, n, last in people],
+        "temp_in_use": [{"name": name, "owner": who, "last_active": _iso(last) if last else None}
+                        for name, who, last in temps],
     }

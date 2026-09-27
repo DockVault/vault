@@ -18,6 +18,7 @@ def _api():
     ("hide_note_text", ("on", "off")),
     ("activity_page_size", ("25", "50", "100", "all")),
     ("activity_live", ("on", "off")),
+    ("activity_range", ("24h", "7d", "30d", "all")),
 ])
 def test_the_values_the_pages_offer_are_kept(key, values):
     S = _api()
@@ -42,5 +43,6 @@ def test_the_update_model_accepts_each_key():
 
 def test_a_temporary_session_cannot_change_the_notes_or_activity_choices():
     S = _api()
-    assert S._PREF_NOT_FOR_TEMP_SESSIONS == {"hide_note_text", "activity_page_size", "activity_live"}
+    assert S._PREF_NOT_FOR_TEMP_SESSIONS == {"hide_note_text", "activity_page_size", "activity_live",
+                                             "activity_range"}
     assert S._PREF_NOT_FOR_TEMP_SESSIONS <= set(S._PREF_ALLOWED)

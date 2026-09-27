@@ -2411,83 +2411,110 @@ def activity_events(
     category: List[str] = Query([]),
     channel: List[str] = Query([]),
     status: List[str] = Query([]),
+    action: List[str] = Query([]),
     user: Optional[str] = Query(None, max_length=128),
+    user_match: str = Query("contains", pattern="^(contains|exact)$"),
+    no_account: bool = False,
     ip: Optional[str] = Query(None, max_length=64),
     q: Optional[str] = Query(None, max_length=128),
     temp_credential_id: Optional[str] = Query(None, max_length=64),
     temp_credential: Optional[str] = Query(None, max_length=128),
+    vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
     cursor: Optional[str] = Query(None, max_length=200),
     page: Optional[int] = Query(None, ge=1, le=1_000_000),
-    after: Optional[str] = Query(None, max_length=64),
-    ids: List[str] = Query([], max_length=200),
+    after: Optional[str] = Query(None, max_length=200),
+    overlap: int = Query(0, ge=0, le=300),
+    ids: List[str] = Query([], max_length=8000),
+    count_only: bool = False,
     limit: int = 50,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """The Activity page's Events list: the audit log filtered by category, channel, status, user, IP or
-    CIDR, text, temporary credential (by id or name) and time, newest first (admin only).
+    """The Activity page's Events list: the audit log filtered by category, event, channel, status,
+    user (containing or exactly), rows under no account, IP or CIDR, text (which also matches the
+    events' labels), temporary credential (by id or name), vault and time (admin only).
 
     Four ways to read it, which never mix:
     - numbered pages: `page` and `limit` (the page size), with the total and the page count. The page
       starts at `cursor` when given (the `next_cursor` of the page before it, so walking through the
-      pages never makes the database skip rows), otherwise after skipping the rows of the pages before
-      it, up to activity_events.MAX_OFFSET rows;
-    - progressive loading ("All"): no `page`; each call continues from `cursor`, and the first also
-      returns the total;
-    - newer rows for a live list: `after`, a row id; the rows after that row, newest first, at most
-      `limit`, with `more` true when there were more (or the row is gone), meaning reload instead;
-    - specific rows: `ids`, the row ids the live signal named, each returned only if it matches the
-      filters.
+      pages never makes the database skip rows); otherwise it is counted from the newest row, or for a
+      page near the end from the oldest, and a page more than activity_events.MAX_OFFSET rows from both
+      ends is refused;
+    - progressive loading ("All"): no `page`; each call continues from `cursor`, newest first, and the
+      first also returns the total;
+    - the rows next to a row on the newer side: `after`, a row's id or cursor, oldest first (the
+      nearest first), at most `limit`, with `more` true when more remain. `overlap` seconds also takes
+      rows from just before that point, for a poll that catches rows committed late;
+    - specific rows: `ids` (repeated, or comma-separated), those of the rows that match the filters,
+      newest first. This is how the live signal's rows are fetched.
+    `count_only` returns {"count": n} for any of them instead of rows. Every row carries its `cursor`;
+    `head_cursor` is the newest row's in the response.
 
     A plain def, so FastAPI runs it in its thread pool: a count and a page over a large audit table
-    must not hold the event loop."""
+    must not hold the event loop. It never writes an audit row: the page re-reads it as events arrive,
+    and a row written here would signal another read."""
     from app.core import audit_range
     from app.core.models import AuditLog
     from app.services import activity_events as ev
     limit = max(1, min(limit, ev.MAX_PAGE))
+    wanted_ids = ev.split_ids(ids)
     base = ev.build_events_query(
         db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
-        username=user, ip=ip, text=q, temp_credential_id=temp_credential_id,
-        temp_credential=temp_credential, ids=ids,
+        actions=action, username=user, user_exact=(user_match == "exact"), no_account=no_account,
+        ip=ip, text=q, temp_credential_id=temp_credential_id, temp_credential=temp_credential,
+        vault_id=vault_id, ids=wanted_ids,
         start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
     newest_first = (AuditLog.timestamp.desc(), AuditLog.id.desc())
     out = {"events": [], "next_cursor": None, "total": None}
 
-    if ids:
+    if wanted_ids:
+        if count_only:
+            return {"count": base.order_by(None).count()}
         rows = base.order_by(*newest_first).limit(ev.MAX_IDS).all()
     elif after:
-        anchor = None
-        try:
-            anchor = db.query(AuditLog.timestamp, AuditLog.id).filter(
-                AuditLog.id == uuid.UUID(after)).first()
-        except ValueError:
-            pass
+        anchor = ev.read_anchor(after)
+        if anchor and anchor[0] == "id":
+            row = db.query(AuditLog.timestamp, AuditLog.id).filter(AuditLog.id == anchor[1]).first()
+            anchor = (row[0], row[1]) if row else None
+        elif anchor:
+            anchor = anchor[1]
         if anchor is None:
-            return {**out, "more": True}
-        rows = ev.newer_than(base, AuditLog, (anchor[0], anchor[1])).order_by(*newest_first).limit(limit + 1).all()
+            return {"count": 0, "more": True} if count_only else {**out, "more": True, "head_cursor": None}
+        start_at = anchor
+        if overlap:
+            start_at = (anchor[0] - timedelta(seconds=overlap), uuid.UUID(int=0))
+        newer = ev.newer_than(base, AuditLog, start_at)
+        if count_only:
+            return {"count": newer.order_by(None).count()}
+        rows = newer.order_by(AuditLog.timestamp.asc(), AuditLog.id.asc()).limit(limit + 1).all()
         out["more"] = len(rows) > limit
         rows = rows[:limit]
     else:
         start_at = ev.decode_cursor(cursor)
-        q_rows = ev.after_cursor(base, AuditLog, start_at).order_by(*newest_first)
+        if count_only:
+            return {"count": ev.after_cursor(base, AuditLog, start_at).order_by(None).count()}
         if page is not None:
             total = base.order_by(None).count()
             out.update(total=total, page=page, pages=ev.page_count(total, limit), page_size=limit)
-            if start_at is None and page > 1:
-                offset = ev.page_offset(page, limit)
-                if offset is None:
-                    raise HTTPException(status_code=400, detail=(
-                        "That page is too far in to open directly. Narrow the filters, or move to it "
-                        "a page at a time."))
-                q_rows = q_rows.offset(offset)
         elif start_at is None:
             out["total"] = base.order_by(None).count()
-        rows = q_rows.limit(limit + 1).all()
-        if len(rows) > limit:
+        if page is not None and start_at is None:
+            try:
+                rows, more = ev.numbered_page(base, AuditLog, page, limit, out["total"])
+            except ev.PageTooFar:
+                raise HTTPException(status_code=400, detail=(
+                    "That page is too far from both ends of the list to open directly. Narrow the "
+                    "filters, or move to it a page at a time."))
+        else:
+            rows = ev.after_cursor(base, AuditLog, start_at).order_by(*newest_first).limit(limit + 1).all()
+            more = len(rows) > limit
             rows = rows[:limit]
+        if more and rows:
             out["next_cursor"] = ev.encode_cursor(rows[-1].timestamp, rows[-1].id)
+        if page is not None and rows:
+            out["prev_cursor"] = ev.encode_cursor(rows[0].timestamp, rows[0].id)
 
     events = [ev.row_view(r) for r in rows]
     from app.services.activity_names import names_for, temp_credential_names
@@ -2495,22 +2522,45 @@ def activity_events(
         event["names"] = names
     temp_credential_names(db, events)
     out["events"] = events
+    newest = max(rows, key=lambda r: (r.timestamp, r.id)) if rows else None
+    out["head_cursor"] = ev.encode_cursor(newest.timestamp, newest.id) if newest else None
     return out
+
+
+@app.get("/activity/events/{event_id}")
+def activity_event(event_id: str,
+                   current_user: User = Depends(require_interactive_admin),
+                   db: Session = Depends(get_db)):
+    """One event, as the Events list shows it (admin only): for a copied link to an event."""
+    from app.core.models import AuditLog
+    from app.services import activity_events as ev
+    from app.services.activity_names import names_for, temp_credential_names
+    try:
+        row = db.query(AuditLog).filter(AuditLog.id == uuid.UUID(event_id)).first()
+    except ValueError:
+        row = None
+    if row is None:
+        raise HTTPException(status_code=404, detail="That event is not in the log.")
+    event = ev.row_view(row)
+    event["names"] = names_for(db, current_user, [event])[0]
+    temp_credential_names(db, [event])
+    return event
 
 
 @app.get("/activity/usernames")
 def activity_usernames(
     q: str = Query("", max_length=64),
     limit: int = Query(10, ge=1, le=20),
+    accounts_only: bool = False,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
     """Usernames that start with `q`, for the Events filter's typeahead (admin only): the accounts, and
-    every other name the audit log has seen, such as a name typed at a failed sign-in or a deleted
-    account. Each says whether it is an account now. At most 20, and cheap on a large log (see
-    activity_events.username_suggestions)."""
+    unless `accounts_only`, every other name the audit log has seen, such as a name typed at a failed
+    sign-in or a deleted account. Each says whether it is an account now, and an account whether it is
+    active. At most 20, and cheap on a large log (see activity_events.username_suggestions)."""
     from app.services import activity_events as ev
-    return {"usernames": ev.username_suggestions(db, q, limit)}
+    return {"usernames": ev.username_suggestions(db, q, limit, accounts_only=accounts_only)}
 
 
 # --- Saved searches (the Activity page) ------------------------------------------------------------
@@ -2719,11 +2769,41 @@ def activity_summary(
            tuple(sorted(status)), user, ip, q, temp_credential)
     band, age = summary.cached(key, range_, lambda: summary.summarize(db, base, AuditLog, win))
     out = {"range": range_, **band, "age_seconds": round(age, 1)}
-    out["now"] = summary.now_panel(db, now, {
-        "in_progress": get_active_operations_count(),
-        "waiting": transfer_admission.stats()["waiting"],
-    })
+    out["now"] = summary.now_panel(db, now, _activity_transfers())
     return out
+
+
+def _activity_transfers() -> dict:
+    """The web transfers of this process: in the operations registry, holding the admission gate, and
+    waiting for it, with the gate's limit. SFTP transfers are in another process and not counted."""
+    stats = transfer_admission.stats()
+    return {"in_progress": get_active_operations_count(), "in_flight": stats["in_flight"],
+            "waiting": stats["waiting"], "limit": stats["limit"]}
+
+
+@app.get("/activity/now")
+def activity_now(current_user: User = Depends(require_interactive_admin),
+                 db: Session = Depends(get_db)):
+    """Who is signed in now, for the Activity page's "Now" panel and its list (admin only): the counts
+    of the summary's "now", and the people and temporary credentials behind the sessions, most
+    recently active first (see activity_summary.who_is_online). Not affected by any filter."""
+    from app.services import activity_summary as summary
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return {**summary.now_panel(db, now, _activity_transfers()), **summary.who_is_online(db, now)}
+
+
+@app.get("/activity/temp-credentials")
+def activity_temp_credentials(
+    q: str = Query("", max_length=64),
+    limit: int = Query(8, ge=1, le=20),
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Temporary credentials whose name starts with `q` (a prefix of at least two characters), for the
+    Events filter's typeahead (admin only): each one's id, name, state (active, expired or turned off)
+    and expiry, newest first. Its note is not included."""
+    from app.services import activity_events as ev
+    return {"temp_credentials": ev.temp_credential_suggestions(db, q, limit)}
 
 
 @app.get("/activity/export")
@@ -8376,11 +8456,13 @@ _PREF_ALLOWED = {
     # appear as they happen.
     "activity_page_size": {"25", "50", "100", "all"},
     "activity_live": {"on", "off"},
+    "activity_range": {"24h", "7d", "30d", "all"},
 }
 
 # Preferences that belong to the account's own pages, which a temporary credential's session cannot
 # open (Notes, Activity): such a session may read them but not change them for the account.
-_PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size", "activity_live"})
+_PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size", "activity_live",
+                                         "activity_range"})
 
 
 def _sanitize_preferences(data) -> dict:
@@ -8409,6 +8491,7 @@ class PreferencesUpdate(BaseModel):
     hide_note_text: Optional[str] = None
     activity_page_size: Optional[str] = None
     activity_live: Optional[str] = None
+    activity_range: Optional[str] = None
 
 
 def _current_session_hash(request) -> Optional[str]:

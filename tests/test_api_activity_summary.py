@@ -37,13 +37,25 @@ def test_the_band_counts_the_rows_the_events_list_shows(admin):
     assert band["range"] == "24h" and band["bucket_seconds"] == 3600 and len(band["buckets"]) == 24
     assert band["total"] == 2 == sum(b["total"] for b in band["buckets"])
     assert band["buckets"][-1]["counts"] == {"sign_in": 2}        # the hour in progress
-    assert band["categories"] == [{"key": "sign_in", "label": "Sign-in and sessions", "count": 2}]
+    assert band["buckets"][-1]["failed"] == 2 and band["failed"] == 2
+    assert band["categories"] == [{"key": "sign_in", "label": "Sign-in and sessions", "count": 2, "failed": 2}]
     assert band["sign_ins"] == {"succeeded": 0, "failed": 2, "locked": 0}
-    assert band["top_users"] == [{"username": name, "count": 2}]
+    # A name no account has is counted, never listed: people type passwords into the username box.
+    assert band["top_users"] == [] and band["no_account"] == {"total": 2, "failed": 2}
+    assert name not in str(band)
     ip = admin.get("/activity/events", params={"user": name}).json()["events"][0]["ip_address"]
-    assert band["top_addresses"] == [{"ip_address": ip, "count": 2}]
+    assert band["top_addresses"] == [{"ip_address": ip, "count": 2, "failed": 2}]
     events = admin.get("/activity/events", params={"user": name, "from_date": band["from"]}).json()
     assert events["total"] == band["total"]
+
+
+def test_the_most_active_people_are_accounts(admin, temp_user):
+    for _ in range(2):
+        ApiClient().login(temp_user["_username"], temp_user["_password"])
+    band = _settled(admin, 2, range="24h", user=temp_user["_username"], category="sign_in")
+    assert band["top_users"][0]["username"] == temp_user["_username"]
+    assert band["top_users"][0]["count"] >= 2 and band["top_users"][0]["failed"] == 0
+    assert band["sign_ins"]["succeeded"] >= 2
 
 
 @pytest.mark.parametrize("range_key,buckets", [("7d", 28), ("30d", 30)])
@@ -57,9 +69,31 @@ def test_the_longer_ranges_have_their_buckets(admin, range_key, buckets):
 
 def test_what_is_happening_now_counts_this_session(admin):
     now = _summary(admin)["now"]
-    assert set(now) == {"as_of", "sessions", "people", "temporary_credentials",
-                        "transfers_in_progress", "transfers_waiting"}
+    assert set(now) == {"as_of", "sessions", "people", "temporary_credentials", "transfers_in_progress",
+                        "transfers_in_flight", "transfers_waiting", "transfer_limit"}
     assert now["sessions"] >= 1 and now["people"] >= 1
+    assert isinstance(now["transfer_limit"], int) and now["transfer_limit"] >= 1
+
+
+def test_who_is_online_lists_people_and_credentials_in_use(admin, temp_user):
+    person = ApiClient()
+    person.login(temp_user["_username"], temp_user["_password"])
+    tc = person.post("/auth/temp-credentials", json={"note": unique("now")}).json()
+    ApiClient().login(tc["temp_username"], tc["credential"])
+    try:
+        r = admin.get("/activity/now")
+        assert r.status_code == 200, r.text
+        now = r.json()
+        me = next(p for p in now["online_people"] if p["username"] == temp_user["_username"])
+        assert me["sessions"] >= 1 and me["last_active"].endswith("+00:00") and me["ip_address"]
+        cred = next(c for c in now["temp_in_use"] if c["name"] == tc["temp_username"])
+        assert cred["owner"] == temp_user["_username"]
+        assert now["online_total"] >= len(now["online_people"]) >= 2          # this admin too
+        assert now["sessions"] >= 2 and now["temporary_credentials"] >= 1
+        # Nothing about the credential beyond its name: not its note.
+        assert set(cred) == {"name", "owner", "last_active"}
+    finally:
+        person.post(f"/temp-creds/{tc['temp_username']}/delete")
 
 
 def test_an_administrator_who_cannot_read_a_vault_sees_no_name_from_it(admin, temp_user, temp_user_client):
@@ -84,6 +118,7 @@ def test_an_administrator_who_cannot_read_a_vault_sees_no_name_from_it(admin, te
 
 def test_only_an_administrators_own_session_reads_the_band(admin, temp_user_client):
     assert temp_user_client.get("/activity/summary").status_code == 403
+    assert temp_user_client.get("/activity/now").status_code == 403
     tc = admin.post("/auth/temp-credentials", json={"note": unique("band")}).json()
     tclient = ApiClient()
     tclient.login(tc["temp_username"], tc["credential"])

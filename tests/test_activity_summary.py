@@ -51,28 +51,33 @@ def _grouped(*rows):
 
 
 def test_grouped_counts_become_buckets_categories_and_sign_in_outcomes():
+    # (bucket, stored action, failed, under no account, count)
     w = s.window("24h", NOW)
     band = s.shape(w, _grouped(
-        (23, "login_success", 4), (23, "login_failure", 2), (22, "second_factor_failed", 1),
-        (0, "account_auto_locked", 1), (23, "file_uploaded", 3), (23, "file_upload", 2),
-        (10, "a_name_no_release_wrote", 5),
-    ), [("maria", 7), ("203.0.113.9-typed-name", 2)], [("203.0.113.9", 6)])
-    assert band["total"] == 18
+        (23, "login_success", False, False, 4), (23, "login_failure", True, True, 2),
+        (22, "second_factor_failed", True, False, 1), (0, "account_auto_locked", False, False, 1),
+        (23, "file_uploaded", False, False, 3), (23, "file_upload", False, False, 2),
+        (10, "a_name_no_release_wrote", False, False, 5),
+    ), [("maria", 7, 1)], [("203.0.113.9", 6, 2)])
+    assert (band["total"], band["failed"]) == (18, 3)
     assert band["buckets"][23]["counts"] == {"sign_in": 6, "files": 5}
-    assert band["buckets"][23]["total"] == 11
+    assert (band["buckets"][23]["total"], band["buckets"][23]["failed"]) == (11, 2)
     assert band["buckets"][10]["counts"] == {"legacy": 5}
-    assert band["buckets"][5] == {"start": band["buckets"][5]["start"], "total": 0, "counts": {}}
+    assert band["buckets"][5] == {"start": band["buckets"][5]["start"], "total": 0, "failed": 0, "counts": {}}
     assert band["sign_ins"] == {"succeeded": 4, "failed": 3, "locked": 1}
     assert [c["key"] for c in band["categories"]] == ["sign_in", "files", "legacy"]   # catalog order
-    assert band["categories"][0] == {"key": "sign_in", "label": "Sign-in and sessions", "count": 8}
+    assert band["categories"][0] == {"key": "sign_in", "label": "Sign-in and sessions", "count": 8, "failed": 3}
     assert band["categories"][-1]["label"] == audit_catalog.LEGACY_LABEL
-    assert band["top_users"][0] == {"username": "maria", "count": 7}
-    assert band["top_addresses"] == [{"ip_address": "203.0.113.9", "count": 6}]
+    # A name no account had is counted, never named.
+    assert band["no_account"] == {"total": 2, "failed": 2}
+    assert band["top_users"] == [{"username": "maria", "count": 7, "failed": 1}]
+    assert band["top_addresses"] == [{"ip_address": "203.0.113.9", "count": 6, "failed": 2}]
 
 
 def test_a_count_outside_the_window_is_left_out():
     w = s.window("24h", NOW)
-    band = s.shape(w, [(None, "login_success", 3), (24, "login_success", 2), (-1, "login_success", 1)], [], [])
+    band = s.shape(w, [(None, "login_success", False, False, 3), (24, "login_success", False, False, 2),
+                       (-1, "login_success", False, False, 1)], [], [])
     assert band["total"] == 0 and band["sign_ins"]["succeeded"] == 0
 
 
@@ -87,12 +92,14 @@ def test_bucket_times_are_utc_and_the_window_is_stated():
 
 def test_the_band_holds_counts_names_of_people_and_addresses_and_nothing_else():
     # No vault, file or folder name, no details: only what these keys hold.
-    band = s.shape(s.window("24h", NOW), [(1, "file_uploaded", 1)], [("maria", 1)], [("203.0.113.9", 1)])
-    assert set(band) == {"from", "to", "bucket_seconds", "buckets", "total", "categories", "sign_ins",
-                         "top_users", "top_addresses"}
-    assert set(band["buckets"][1]) == {"start", "total", "counts"}
-    assert set(band["top_users"][0]) == {"username", "count"}
-    assert set(band["top_addresses"][0]) == {"ip_address", "count"}
+    band = s.shape(s.window("24h", NOW), [(1, "file_uploaded", False, False, 1)], [("maria", 1, 0)],
+                   [("203.0.113.9", 1, 0)])
+    assert set(band) == {"from", "to", "bucket_seconds", "buckets", "total", "failed", "categories",
+                         "sign_ins", "top_users", "no_account", "top_addresses"}
+    assert set(band["buckets"][1]) == {"start", "total", "failed", "counts"}
+    assert set(band["top_users"][0]) == {"username", "count", "failed"}
+    assert set(band["top_addresses"][0]) == {"ip_address", "count", "failed"}
+    assert set(band["no_account"]) == {"total", "failed"}
 
 
 def test_every_sign_in_outcome_names_an_action_the_catalog_files_under_sign_in():

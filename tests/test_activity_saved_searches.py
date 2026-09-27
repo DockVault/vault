@@ -95,3 +95,27 @@ def test_a_saved_search_is_returned_with_utc_times():
     assert rules.view(row) == {"id": "1", "name": "n", "filters": {"status": ["failed"]}, "is_default": True,
                                "created_at": "2026-09-27T08:00:00+00:00",
                                "updated_at": "2026-09-27T09:00:00+00:00"}
+
+
+def test_the_events_filters_added_for_the_page_can_be_saved():
+    import uuid as _uuid
+    vid, tid = str(_uuid.uuid4()), str(_uuid.uuid4()).upper()
+    got = rules.clean_filters({"action": ["login_failure", "file_uploaded"], "user": "maria",
+                               "user_match": "exact", "no_account": True, "vault_id": vid,
+                               "temp_credential_id": tid, "range": "all"})
+    assert got == {"action": ["login_failure", "file_uploaded"], "user": "maria", "user_match": "exact",
+                   "no_account": True, "vault_id": vid, "temp_credential_id": tid.lower(), "range": "all"}
+    assert "no_account" not in rules.clean_filters({"no_account": False})
+
+
+@pytest.mark.parametrize("filters,says", [
+    ({"vault_id": "Finance"}, "vault_id must be an id"),          # a name is never kept, only an id
+    ({"temp_credential_id": "temp_contractor"}, "must be an id"),
+    ({"no_account": "yes"}, "true or false"),
+    ({"user_match": "starts"}, "must be one of contains, exact"),
+    ({"action": ["not_an_event"]}, "does not offer: not_an_event"),
+])
+def test_the_added_filters_refuse_what_the_page_would_not_send(filters, says):
+    with pytest.raises(rules.InvalidSearch) as err:
+        rules.clean_filters(filters)
+    assert says in str(err.value)

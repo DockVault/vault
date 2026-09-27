@@ -184,6 +184,10 @@ class MemoryQuery:
         self.limit_n = n
         return self
 
+    def offset(self, n):
+        self.offset_n = n
+        return self
+
     def _matching(self):
         if self.lock is not None:
             self.db.log.append(("lock", self.model, dict(self.lock)))
@@ -206,6 +210,7 @@ class MemoryQuery:
             out = [_Row(self.columns, [getattr(r, k) for k in self.columns]) for r in rows]
             if self.unique:
                 out = list(dict.fromkeys(out))
+        out = out[getattr(self, "offset_n", 0) or 0:]
         return out[:self.limit_n] if self.limit_n is not None else out
 
     def all(self):

@@ -6,6 +6,7 @@ would not take. Everything a person can do with their saved searches is in app/a
 (/activity/saved-searches); this module holds the rules and is testable without a database.
 """
 import unicodedata
+import uuid
 from typing import Any, Dict, Optional
 
 from app.core import audit_catalog
@@ -15,7 +16,7 @@ from app.services import activity_events as ev
 MAX_PER_USER = 50
 MAX_NAME = 80
 
-RANGES = ("24h", "7d", "30d")
+RANGES = ("24h", "7d", "30d", "all")
 
 # key -> (kind, bound): "choices" is a list of known values, "text" a string of at most `bound`
 # characters. `range` is a time range relative to when the search is loaded; from_date and to_date are
@@ -24,10 +25,15 @@ FIELDS = {
     "category": ("choices", None),
     "channel": ("choices", None),
     "status": ("choices", None),
+    "action": ("choices", None),
     "user": ("text", 128),
+    "user_match": ("choice", None),
+    "no_account": ("flag", None),
     "ip": ("text", 64),
     "q": ("text", 128),
     "temp_credential": ("text", 128),
+    "temp_credential_id": ("id", None),
+    "vault_id": ("id", None),
     "range": ("choice", None),
     "from_date": ("text", 64),
     "to_date": ("text", 64),
@@ -47,6 +53,10 @@ def _known(key: str):
         return list(ev.STATUS_GROUPS)
     if key == "range":
         return list(RANGES)
+    if key == "user_match":
+        return ["contains", "exact"]
+    if key == "action":
+        return [n for a in audit_catalog.ACTIONS for n in (a.name,) + a.aliases]
     return []
 
 
@@ -92,6 +102,17 @@ def clean_filters(raw: Any) -> Dict[str, Any]:
             if value not in _known(key):
                 raise InvalidSearch(f"{key} must be one of {', '.join(_known(key))}.")
             out[key] = value
+        elif kind == "flag":
+            if not isinstance(value, bool):
+                raise InvalidSearch(f"{key} must be true or false.")
+            if value:
+                out[key] = True
+        elif kind == "id":
+            # An id, never a name: a saved vault filter must not keep the vault's name.
+            try:
+                out[key] = str(uuid.UUID(str(value)))
+            except (ValueError, TypeError, AttributeError):
+                raise InvalidSearch(f"{key} must be an id.")
         else:
             if not isinstance(value, str):
                 raise InvalidSearch(f"{key} must be text.")
