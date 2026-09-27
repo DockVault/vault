@@ -137,6 +137,66 @@
       "id": null,
       "fixed_in": "0.32.5",
       "published": "2026-09-26"
+    },
+    "file-expiry-not-enforced": {
+      "title": "Files past their expiry were not deleted",
+      "description": "A vault can be set to delete its files a set time after upload, and an upload link sets such a retention on the files it receives. Each file was given its deadline at upload, but nothing ever removed or hid a file once the deadline passed: expired files stayed listed, downloadable over the web and SFTP, and reachable through shares and public file links.",
+      "impact": "Files were kept, and stayed readable to everyone with access to them, after the deletion the vault's settings promised. An organisation relying on the setting for a retention rule held data longer than its policy allows.",
+      "remediation": "Upgrade to 0.32.6. An expired file disappears from every path at once and is deleted, stored bytes included, within about a minute, with one audit record per file. Files already past their deadline are deleted soon after 0.32.6 first starts; to review them first, set ENFORCE_FILE_EXPIRY=false before upgrading, which keeps the 0.32.5 behaviour until you set it back. Turning a vault's expiry off now also removes the deadline from its files, and at start-up 0.32.6 removes any deadline left on a file in a vault whose expiry is off.",
+      "mitigation": "Until you upgrade, delete by hand the files that should have expired.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.6",
+      "published": "2026-09-27"
+    },
+    "links-kept-working-after-owner-locked": {
+      "title": "Links kept working after their owner was locked or deactivated",
+      "description": "Locking or deactivating an account ends its sessions, but its links were not always re-checked. Note links never looked at their owner, so they kept serving the note after an administrator locked or deactivated the owner. Public file links and upload links checked only a lock with an end time, so an administrator's lock, which has none, did not stop them.",
+      "impact": "After an administrator locked or deactivated an account, for example when someone left, anyone holding one of its links could still read the note or download the files it pointed to, and its upload links kept accepting anonymous uploads into the account's vault within the link's limits.",
+      "remediation": "Upgrade to 0.32.6. Note, file and upload links stop while their owner is deactivated or locked by an administrator, and work again when the account is reactivated or unlocked.",
+      "mitigation": "Until you upgrade, revoke an account's links by hand when you lock or deactivate it, or turn the link features off.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.6",
+      "published": "2026-09-27"
+    },
+    "ending-sessions-missed-older-web-sessions": {
+      "title": "Ending a user's sessions missed some of them",
+      "description": "Web requests do not refresh a session's last-activity time, so a periodic cleanup marks a web session inactive once TEMP_CRED_SESSION_GRACE_MINUTES (65 by default) have passed since sign-in, while its token stays valid until the session lifetime ends. Revoking an account's sessions only looked at sessions still marked active. When the session lifetime (the Session timeout setting, or JWT_ACCESS_TOKEN_EXPIRE_MINUTES) was longer than that grace time, ending a user's sessions, changing or resetting their password, and signing out other sessions after setting up a second factor all left older web sessions working. Separately, deactivating a user through two routes of the administration API, POST /api/user-management/users/{id}/toggle-active and PUT /api/user-management/users/{id}, revoked none of their sessions; the web app deactivates through a route that did.",
+      "impact": "A stolen web session token that had outlived the grace time kept working after the steps meant to cut it off, until the session lifetime ran out. With the default lifetime of 30 minutes the token expires first. A token held when an administrator deactivated its user through either of those API routes worked again once the account was reactivated. While an account is locked or deactivated its tokens are refused, because every request checks that.",
+      "remediation": "Upgrade to 0.32.6. Revocation now reaches every session that has not already been revoked, and every way of deactivating a user revokes their sessions.",
+      "mitigation": "Until you upgrade, keep the session lifetime shorter than TEMP_CRED_SESSION_GRACE_MINUTES (65 minutes by default), and deactivate users from the web app.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.6",
+      "published": "2026-09-27"
+    },
+    "zero-knowledge-key-rotated-by-non-holder": {
+      "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+      "description": "A zero-knowledge vault's key is rotated in the browser of whoever starts the rotation: it creates the new key and wraps it for the remaining members. The server let the vault's owner, any administrator or a manager of the vault start a rotation whether or not they held the vault's key, and a rotation does not have to remove anyone. An administrator who was not a member could therefore rotate the key and keep the new one while members went on working.",
+      "impact": "Such an administrator learned the key protecting every file uploaded to the vault after the rotation. Reading those files also needed their encrypted contents, which the administrator could get with access to the server's storage or through an account they gave access to the vault. Files uploaded before the rotation were not exposed. Every rotation is recorded in the audit log as zk_vault_rekeyed.",
+      "remediation": "Upgrade to 0.32.6. Only an account that holds the vault's current key can rotate it, share it or create its name-index key, and the account that rotates must stay a member. An administrator who removes a member without holding the key removes their access, and the vault then asks its key holders to rotate the key.",
+      "mitigation": "None through settings. Check the audit log for zk_vault_rekeyed entries by someone who is not a member of that vault.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:H/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.6",
+      "published": "2026-09-27"
+    },
+    "manager-could-lock-owner-out-of-zero-knowledge-vault": {
+      "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+      "description": "Removing a person from a vault through its permissions switched off that person's zero-knowledge keys before checking that there was a membership to remove. A vault's owner has no membership row, so a request to remove the owner answered that the user had no access to the vault, but had already switched off every key the owner held for it, for every key generation.",
+      "impact": "A manager of a zero-knowledge vault, or an administrator, could make the vault unreadable to its owner: the owner could no longer open its files or share it, and nothing in the product gave their keys back. Other members kept their access. If the owner was the only one holding the key, nobody could read the vault until an operator switched the owner's keys back on in the database. No content was exposed.",
+      "remediation": "Upgrade to 0.32.6. The owner cannot be removed through the vault's permissions, and a removal changes nothing unless it removes a membership. The upgrade does not restore an owner who was already locked out: their keys are kept in the vault_member_keys table, marked inactive, and an operator can mark them active again.",
+      "mitigation": "Until you upgrade, make only people you trust with the vault's availability its managers.",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:L/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.32.6",
+      "published": "2026-09-27"
     }
   },
   "versions": {
@@ -177,6 +237,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -217,6 +297,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -257,6 +357,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -297,6 +417,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -337,6 +477,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -377,6 +537,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -417,6 +597,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -457,6 +657,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -497,6 +717,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -537,6 +777,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -577,6 +837,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -617,6 +897,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -657,6 +957,26 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -707,6 +1027,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -757,6 +1102,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -807,6 +1177,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -857,6 +1252,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -907,6 +1327,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -957,6 +1402,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1007,6 +1477,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1057,6 +1552,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1107,6 +1627,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1157,6 +1702,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1207,6 +1777,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1257,6 +1852,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1307,6 +1927,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1357,6 +2002,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1407,6 +2077,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1457,6 +2152,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1507,6 +2227,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1557,6 +2302,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1607,6 +2377,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1672,6 +2467,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1737,6 +2557,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1792,6 +2637,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1832,6 +2702,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1862,6 +2757,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1892,6 +2812,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1922,6 +2867,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1952,6 +2922,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -1982,6 +2977,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -2007,6 +3027,31 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
@@ -2032,12 +3077,72 @@
           "advisory": "live-monitor-sent-names-to-every-admin",
           "title": "The live activity feed sent file and vault names to every administrator",
           "fixed_in": "0.32.5"
+        },
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
         }
       ]
     },
     "0.32.5": {
       "released": "2026-09-26",
       "notes": "Security fixes, three advisories. Sign-in attempts typed with a client's address as the username no longer count against that address. The client address is read from the whole forwarding chain, and only proxies listed in TRUSTED_PROXIES are believed. Another account's activity reaches an administrator watching the Live Monitor without file, folder or vault names. Before upgrading behind a proxy: a proxy that connects from 127.0.0.1 must be listed (TRUSTED_PROXIES=127.0.0.1), or every client appears as 127.0.0.1 and shares one sign-in limit; with TRUST_ALL_PROXIES=true the vault takes the address the nearest proxy saw, so list each proxy of a chain in TRUSTED_PROXIES instead; uvicorn's FORWARDED_ALLOW_IPS is no longer used. No schema change; a rollback to 0.32.4 is clean.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "file-expiry-not-enforced",
+          "title": "Files past their expiry were not deleted",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked",
+          "title": "Links kept working after their owner was locked or deactivated",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions",
+          "title": "Ending a user's sessions missed some of them",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder",
+          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
+          "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
+          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
+          "fixed_in": "0.32.6"
+        }
+      ]
+    },
+    "0.32.6": {
+      "released": "2026-09-27",
+      "notes": "Security fixes, five advisories. Files past their expiry are hidden at once and deleted within about a minute, with an audit record per file; turning a vault's expiry off removes its files' deadlines, and an expiry longer than 100 years is refused. Links stop while their owner is deactivated or locked by an administrator; a lock armed by wrong passwords no longer pauses them. Ending a user's sessions, changing or resetting a password, and signing out other sessions after setting up a second factor now also reach web sessions that went idle, and every way of deactivating a user now ends their sessions. Only an account that holds a zero-knowledge vault's current key can rotate it, share it or create its name-index key; a member removed by someone without the key stays removed, and the vault asks its key holders to rotate. A vault's owner can no longer be removed through the vault's permissions, which could switch off the owner's zero-knowledge keys. Administrators can no longer give themselves access to another person's vault or to a file shared with a department, cannot demote, deactivate or lock their own account, and the last active administrator cannot be removed. An SFTP sign-in is refused when its policy check fails. Automatic account locks and unlocks are audited, and finished session and sign-in rows are deleted after 30 days. Before upgrading: files already past their deadline are deleted soon after 0.32.6 first starts, so set ENFORCE_FILE_EXPIRY=false to review them first (a vault whose expiry is off keeps its files). With a single administrator, only a vault's owner can now give that administrator access to the vault. No schema change; a rollback to 0.32.5 is clean, but files deleted by expiry stay deleted.",
       "support": {
         "eol": false,
         "secure": true
@@ -2367,6 +3472,20 @@
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
+    },
+    {
+      "from": "0.32.5",
+      "to": "0.32.6",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true,
+      "conditions": [
+        {
+          "id": "expired-files-deleted",
+          "summary": "0.32.6 enforces file expiry, which no earlier release did: within about a minute of its first start it deletes every file whose deadline has passed in a vault whose expiry is on, stored bytes included, and that cannot be undone by rolling back. To review those files first, set ENFORCE_FILE_EXPIRY=false before upgrading, and set it back when you are done; turning a vault's expiry off keeps its files.",
+          "detect": "SELECT count(*) FROM files f JOIN vaults v ON v.id = f.vault_id WHERE f.expires_at IS NOT NULL AND f.expires_at < (now() AT TIME ZONE 'utc') AND v.expire_files_after_days > 0"
+        }
+      ]
     }
   ],
   "waivers": [
