@@ -160,7 +160,11 @@ def test_temp_admin_cannot_cleanup_upload_sessions(temp_admin_client):
 _ADMIN_ONLY_READ_ROUTES = [
     "/audit/events",
     "/audit/log",
-    "/audit/export",
+    "/activity/events",
+    "/activity/export",
+    "/activity/summary",
+    "/activity/usernames",
+    "/activity/saved-searches",
     "/api/security/metrics",
     "/api/security/alerts",
     "/dashboard/stats",
@@ -216,7 +220,7 @@ def scoped_temp_admin_client(admin):
 
 
 def test_scoped_temp_admin_denied_audit_and_security(scoped_temp_admin_client):
-    assert scoped_temp_admin_client.get("/audit/export").status_code == 403
+    assert scoped_temp_admin_client.get("/activity/export").status_code == 403
     assert scoped_temp_admin_client.get("/api/security/alerts").status_code == 403
     assert scoped_temp_admin_client.get("/users").status_code == 403
 

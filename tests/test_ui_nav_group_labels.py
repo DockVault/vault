@@ -37,13 +37,14 @@ def test_scoped_temp_cred_hides_empty_group_labels(page: Page, admin):
     body = admin.post("/auth/temp-credentials", json={
         "validity_minutes": 60, "scope": scope, "vault_access_mode": "all", "selected_vaults": []}).json()
     _login(page, body["temp_username"], body["credential"])
-    # non-vacuous anchor: the scope really took effect (temp-creds/monitor items are hidden), so the
+    # non-vacuous anchor: the scope really took effect (temp-creds/activity items are hidden), so the
     # hidden-label assertions below are about a genuinely empty run — not a missing v1-skin element
     expect(page.locator('.sidebar-item[data-section="temp-creds"]')).to_be_hidden()
-    expect(page.locator('.sidebar-item[data-section="monitor"]')).to_be_hidden()
+    expect(page.locator('.sidebar-item[data-section="activity"]')).to_have_count(1)
+    expect(page.locator('.sidebar-item[data-section="activity"]')).to_be_hidden()
     # the populated groups keep their header...
     expect(_label(page, "Overview")).to_be_visible()
     expect(_label(page, "Storage")).to_be_visible()
-    # ...and the headers over the hidden temp-creds/users/groups and monitor/settings runs are gone
+    # ...and the headers over the hidden temp-creds/users/groups and activity/settings runs are gone
     expect(_label(page, "Access")).to_be_hidden()
     expect(_label(page, "System")).to_be_hidden()

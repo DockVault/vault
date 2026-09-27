@@ -31,7 +31,8 @@ def test_download_class():
 
 @pytest.mark.parametrize("path", [
     "/audit/events", "/audit/log", "/notifications", "/notifications/unread-count",
-    "/monitor/stats", "/api/security/metrics", "/api/security/alerts", "/api/monitoring/metrics",
+    "/activity/events", "/activity/summary",
+    "/api/security/metrics", "/api/security/alerts", "/api/monitoring/metrics",
 ])
 def test_polled_reads_are_poll_class(path):
     assert classify_api_rate_limit("GET", path) == "poll"

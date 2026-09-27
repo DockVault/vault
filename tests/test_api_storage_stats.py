@@ -1,18 +1,9 @@
-"""GET /monitor/stats and GET /storage/stats — the Live Monitor + Storage panels.
+"""GET /storage/stats, the Settings -> Storage panel, and the routes removed with the pages they served.
 
-Both endpoints were missing (the frontend 404'd and fell back to 0 / N/A). Admin-only.
+/storage/stats was missing once (the panel fell back to N/A). Admin-only. /monitor/stats served only
+the Live Monitor page and /audit/export only the Settings -> Audit Log tab; both pages were removed in
+0.33.0, and the Activity page's /activity/summary and /activity/export replace them.
 """
-
-
-def test_monitor_stats_shape_and_counts(admin):
-    r = admin.get("/monitor/stats")
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert set(body) == {"active_users", "active_sessions"}
-    assert isinstance(body["active_users"], int) and isinstance(body["active_sessions"], int)
-    # the admin fixture is logged in, so at least one active user + session
-    assert body["active_users"] >= 1
-    assert body["active_sessions"] >= 1
 
 
 def test_storage_stats_shape(admin):
@@ -34,12 +25,19 @@ def test_storage_stats_shape(admin):
         assert body["available"] <= body["total"]
 
 
-def test_stats_endpoints_require_admin(admin):
+def test_storage_stats_require_admin(admin):
     u = admin.create_user(role="user")
     c = admin.clone_anonymous()
     c.login(u["_username"], u["_password"])
     try:
-        assert c.get("/monitor/stats").status_code == 403
         assert c.get("/storage/stats").status_code == 403
     finally:
         admin.delete_user(u["id"])
+
+
+def test_the_routes_of_the_removed_pages_are_gone(admin):
+    assert admin.get("/monitor/stats").status_code == 404
+    assert admin.get("/audit/export").status_code == 404
+    # What replaced them answers.
+    assert admin.get("/activity/summary").status_code == 200
+    assert admin.get("/activity/export", params={"q": "no-such-event-text"}).status_code == 200

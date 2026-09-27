@@ -142,7 +142,7 @@ def test_no_section_is_wider_than_the_phone(page: Page, phone_admin, skin):
     _login(page, phone_admin, skin)
     wide = {}
     for section in ("dashboard", "vaults", "shared", "notes", "temp-creds", "users", "groups",
-                    "monitor", "settings"):
+                    "activity", "settings"):
         _go(page, section)
         page.wait_for_load_state("networkidle")                  # measure the section as rendered
         doc_w = page.evaluate("() => document.documentElement.scrollWidth")

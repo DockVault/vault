@@ -1,41 +1,26 @@
-"""The Audit Log: two views, a remembered choice, a time-aware range, and live that is really live.
+"""The audit log's time range: a bare date means the whole day, an instant means exactly that.
 
-The Live Monitor page is not touched by any of this.
+`datetime.fromisoformat` accepts either spelling, but the end of the range used to add a whole day
+unconditionally: correct for a bare date, and a silent 24-hour widening for an instant, so "up to 14:30"
+also returned tomorrow lunchtime. The two are told apart in app/core/audit_range.py, which the Events API
+and the audit log API both use.
 
-THE PART WORTH READING: "live" here is a POLL, and the websocket is only an accelerator.
-
-The activity socket carries a small minority of what is audited — 19 broadcast sites against 91 that
-write an audit row, counted in the source rather than estimated. Creating a vault is one of the four
-in five that never reaches the socket. A socket-only implementation would therefore look live, tick
-its box, and silently miss most events; on a page whose entire purpose is completeness that is worse
-than offering nothing. So the poll is the mechanism and the socket nudge makes the events it does
-carry appear at once.
-
-The range filter gained a time. `datetime.fromisoformat` already accepted either spelling, but the
-end of the range unconditionally added a whole day — correct for a bare date, and a silent 24-hour
-widening for an instant, so "up to 14:30" also returned tomorrow lunchtime. The two are now told
-apart.
+The Settings -> Audit Log tab that this file also covered (its two views and its live poll) was removed in
+0.33.0; the Activity page replaced it.
 
 Lanes:
-  * unit — the end-of-range arithmetic for both spellings, and source guards that live does not rely
-           on the socket alone.
-  * ui   — the switch, the remembered choice, and live picking up a new event with NO manual refresh.
-           That last assertion is a strict increase: an earlier version asserted "not fewer", which
-           passes when live does nothing at all.
+  * unit        -- the range arithmetic for both spellings, and that the query uses the shared module.
+  * integration -- a window spelled in another zone finds a row written inside it.
 """
-import re
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page
 
 from app.core import audit_range
 
 ROOT = Path(__file__).resolve().parent.parent
 API = ROOT / "app" / "api" / "api_server.py"
-APP_JS = ROOT / "static" / "js" / "app.js"
 
 
 # --------------------------------------------------------------------------- unit lane
@@ -131,52 +116,6 @@ def test_the_query_uses_the_shared_range_rather_than_its_own_copy():
         "the query is doing range arithmetic of its own again; that is the copy this split removed")
 
 
-@pytest.mark.unit
-def test_live_does_not_depend_on_the_socket_alone():
-    """The finding this feature turns on.
-
-    If the poll is ever removed, live keeps working for the minority of actions the socket
-    broadcasts and quietly stops working for the rest — the worst possible failure for this page,
-    because it still looks live.
-    """
-    app = APP_JS.read_text(encoding="utf-8")
-    start = app.index("function setAuditLive(")
-    body = app[start:app.index("\nfunction ", start + 1)]
-    assert "setInterval" in body, (
-        "live must poll; the activity socket carries roughly one audited action in five")
-    assert "_AUDIT_LIVE_POLL_MS" in body, "the interval should be a named constant"
-    assert "clearInterval" in body, "switching live off must stop the poll"
-
-    # And switching off must not leave either timer running.
-    assert "_auditLiveTimer = null" in body and "_auditLivePoll = null" in body
-
-
-@pytest.mark.unit
-def test_the_two_views_render_from_one_page_slice():
-    """Two drawings of one list. If the card view fetched or sliced separately the two could
-    disagree about what is on screen, which on an audit page is a correctness problem."""
-    app = APP_JS.read_text(encoding="utf-8")
-    start = app.index("function renderAuditPage(")
-    body = app[start:app.index("\nfunction ", start + 1)]
-    assert "renderAuditCards(logs, start)" in body, (
-        "the detailed view must render from the same slice the table does")
-
-
-@pytest.mark.unit
-def test_the_live_monitor_page_is_untouched():
-    """The owner's explicit constraint. The audit hook is additive and must stay that way."""
-    app = APP_JS.read_text(encoding="utf-8")
-    assert "function handleMonitorEvent(" in app, "the monitor's handler must still exist"
-    start = app.index("function handleMonitorEvent(")
-    body = app[start:app.index("\nfunction ", start + 1)]
-    assert "auditLiveNote()" in body, "the audit view listens to the same feed"
-    assert "try { auditLiveNote(); }" in body, (
-        "the hook must be wrapped — a fault in the audit view must not take the monitor down")
-    # The monitor's own rendering must still be there.
-    assert "monitor-events-list" in app, "the Live Monitor feed element must not have been removed"
-    assert "function initMonitor" in app or "connectMonitorWebSocket" in app
-
-
 # --------------------------------------------------------------------------- integration lane
 
 @pytest.mark.integration
@@ -186,8 +125,7 @@ def test_a_window_spelled_in_another_zone_finds_a_row_written_inside_it(admin, t
     This pins the server's side of the contract: an instant is an instant however its zone is
     written. It is not the lane that goes red for the reported bug — a database that casts an
     offset-bearing literal itself can pass this on the old code too. What the page actually sent
-    was a zone-less local wall-clock, and the browser test in the audit-filter ui module is the one
-    that fails on that.
+    was a zone-less local wall-clock; the page's own conversion is the Activity page's to test.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -213,171 +151,3 @@ def test_a_window_spelled_in_another_zone_finds_a_row_written_inside_it(admin, t
     assert not any(x["resource_id"] == temp_vault["id"]
                    for x in admin.get("/audit/log", params=later).json()), (
         "a window that starts after the row must not contain it")
-
-
-# --------------------------------------------------------------------------- ui lane
-#
-# These three existed only as a claim until now. The commit that added the feature described this
-# lane in its own message, and the behaviour had been proved with a throwaway script rather than a
-# test in the repo — so anyone reading that commit would believe coverage existed where none did.
-# That is the settings-blob diff again, in prose: a description of a check nobody can run.
-
-
-def _login(page: Page, username: str, password: str):
-    """Sign in, waiting out the login rate limit rather than failing on it."""
-    for _ in range(8):
-        page.fill("#username", username)
-        page.fill("#password", password)
-        page.click("#login-form button[type=submit]")
-        try:
-            page.wait_for_selector("#dashboard-screen.active", timeout=8000)
-            return
-        except Exception:
-            msg = page.evaluate(
-                "() => (document.getElementById('login-error') || {}).textContent || ''")
-            m = re.search(r"(\d+) seconds", msg or "")
-            if not m:
-                raise AssertionError(f"login failed, and not because of rate limiting: {msg!r}")
-            time.sleep(int(m.group(1)) + 3)
-    raise AssertionError("login was rate limited on every attempt")
-
-
-def _open_audit_tab(page: Page):
-    page.evaluate("() => navigateToSection('settings')")
-    page.wait_for_selector("#settings-section.active", timeout=15000)
-    page.evaluate(
-        """() => { const t = [...document.querySelectorAll('.tabs .tab-btn')]
-               .find(x => x.getAttribute('data-tab') === 'audit'); if (t) t.click(); }"""
-    )
-    page.wait_for_selector("#settings-tab-audit.active", timeout=10000)
-
-
-def _which_view(page: Page) -> dict:
-    """What is on screen, by computed style — not by class name."""
-    return page.evaluate(
-        """() => {
-            const wrap = document.querySelector('#settings-tab-audit .data-table-wrapper');
-            const cards = document.getElementById('audit-log-cards');
-            const shown = (el) => el ? getComputedStyle(el).display !== 'none' : null;
-            let stored = null;
-            try { stored = localStorage.getItem('auditView'); } catch (_) { stored = 'BLOCKED'; }
-            return { table: shown(wrap), cards: shown(cards), stored };
-        }"""
-    )
-
-
-def _entry_count(page: Page) -> int:
-    text = page.evaluate("() => (document.getElementById('audit-count') || {}).textContent || ''")
-    m = re.search(r"(\d+)", text or "")
-    return int(m.group(1)) if m else -1
-
-
-def _wait_for_search(page: Page):
-    """Until the search has actually returned rows.
-
-    Counting `tr` elements is not that: the spinner row and the "no entries" placeholder are both
-    a `tr`, so on a slow, well-populated log the old wait returned while the request was still in
-    flight, and the assertions below read an empty page. The fetched set is the fact.
-    """
-    page.wait_for_function(
-        "() => Array.isArray(_auditLogs) && _auditLogs.length > 0"
-        " && !document.querySelector('#audit-log-body .loading-spinner')", timeout=20000)
-
-
-def _newest(page: Page):
-    """The identity of the newest row on the page: what moves when a new event arrives."""
-    return page.evaluate("() => _auditLogs.length ? [_auditLogs[0].timestamp, _auditLogs[0].action] : null")
-
-
-@pytest.mark.ui
-def test_the_range_filters_accept_a_time_not_just_a_date(page: Page, admin_creds):
-    page.goto("/")
-    _login(page, admin_creds["username"], admin_creds["password"])
-    _open_audit_tab(page)
-    kinds = page.evaluate(
-        """() => ({ from: (document.getElementById('audit-filter-from') || {}).type,
-                    to:   (document.getElementById('audit-filter-to')   || {}).type })"""
-    )
-    assert kinds == {"from": "datetime-local", "to": "datetime-local"}, (
-        f"the range must accept a time, since the endpoint distinguishes the spellings: {kinds}")
-
-
-@pytest.mark.ui
-def test_the_view_switches_and_the_choice_is_remembered(page: Page, admin_creds):
-    page.goto("/")
-    _login(page, admin_creds["username"], admin_creds["password"])
-    _open_audit_tab(page)
-    page.click("#audit-search-btn")
-    _wait_for_search(page)
-
-    start = _which_view(page)
-    assert start["table"] is True and start["cards"] is False, (
-        f"the compact table is the default: {start}")
-
-    page.click("#audit-view-cards")
-    page.wait_for_function(
-        "() => getComputedStyle(document.getElementById('audit-log-cards')).display !== 'none'",
-        timeout=10000)
-    switched = _which_view(page)
-    assert switched["cards"] is True and switched["table"] is False, switched
-    # Non-vacuous: the detailed view actually drew rows, rather than being an empty box that still
-    # counts as "displayed".
-    drawn = page.evaluate("() => document.querySelectorAll('#audit-log-cards .audit-card').length")
-    assert drawn > 0, "the detailed view is showing but drew nothing"
-
-    # Surviving a reload is the half a class toggle alone would not give.
-    page.reload()
-    page.wait_for_selector("#dashboard-screen.active", timeout=20000)
-    _open_audit_tab(page)
-    after = _which_view(page)
-    assert after["stored"] == "cards", f"the choice was not remembered: {after}"
-    assert after["cards"] is True and after["table"] is False, (
-        f"the choice was stored but not applied on load: {after}")
-
-
-@pytest.mark.ui
-def test_live_picks_up_a_new_event_without_being_asked(page: Page, admin_creds):
-    """The assertion is a STRICT increase.
-
-    An earlier version asked for "not fewer", which passes when live does nothing at all — and it did
-    pass, while live was doing nothing. Tightening it is what exposed that the activity socket
-    carries only a minority of audited actions, and why live polls rather than trusting the socket.
-    """
-    page.goto("/")
-    _login(page, admin_creds["username"], admin_creds["password"])
-    _open_audit_tab(page)
-    page.click("#audit-search-btn")
-    _wait_for_search(page)
-
-    # Tick live FIRST, and let its one-shot refresh settle, before reading the baseline.
-    #
-    # Reading the count before ticking made this vacuous: switching live on re-reads immediately, so
-    # it swept up whatever had been logged since the manual search — the login itself, the search —
-    # and the number rose whether or not live went on to track anything. Mutation caught it: removing
-    # the poll entirely left the test passing. The baseline has to be taken from the state live has
-    # already brought up to date, so the only thing left that can move it is the new event.
-    page.check("#audit-live")
-    page.wait_for_timeout(2500)
-    before = _newest(page)
-    assert before, "the newest row should be readable once live has settled"
-
-    # Creating a vault is chosen deliberately: it is one of the four in five audited actions the
-    # activity socket does NOT broadcast, so this can only pass if the poll is doing the work.
-    vault_id = page.evaluate(
-        """async () => { const v = await apiRequest('/vaults', { method: 'POST',
-               body: JSON.stringify({ name: 'audit-live-' + Date.now(), description: '' }) });
-               return v.id; }"""
-    )
-    # No manual search anywhere below. If the row appears, the page fetched it.
-    #
-    # THE ROW ITSELF, not the entry count. The search returns at most a page of five hundred, so
-    # on a busy deployment the count sits at its cap and a strict increase can never be observed
-    # — which is exactly where a full test run leaves the log. And not "the newest row changed"
-    # either: on a shared deployment someone else's event can be the newest. The row for the vault
-    # just created, found in the fetched set by its id, is what live means, however long the log
-    # is and whoever else is busy.
-    page.wait_for_function(
-        "(id) => _auditLogs.some(r => r.action === 'vault_created' && String(r.resource_id) === id)",
-        arg=vault_id, timeout=30000)
-    after = _newest(page)
-    assert after != before, f"live did not pick the event up on its own: {before} -> {after}"

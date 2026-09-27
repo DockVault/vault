@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- No <meta> Content-Security-Policy: the server sends a complete CSP header on every text/html
-         response (app/api/api_server.py), including connect-src 'self' ws: wss: for the monitor
+         response (app/api/api_server.py), including connect-src 'self' ws: wss: for the app
          WebSocket. A meta copy here was a stale, weaker duplicate (a maintenance hazard). -->
     <title>DockVault</title>
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
@@ -350,10 +350,6 @@
                     <a href="#" class="sidebar-item admin-only" data-section="groups" style="display: none;">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-shield"/></svg></span>
                         <span class="sidebar-text">Groups</span>
-                    </a>
-                    <a href="#" class="sidebar-item" data-section="monitor">
-                        <span class="sidebar-icon"><svg class="icon"><use href="#i-activity"/></svg></span>
-                        <span class="sidebar-text">Live Monitor</span>
                     </a>
                     <a href="#" class="sidebar-item admin-only" data-section="activity" style="display: none;">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-list"/></svg></span>
@@ -1456,97 +1452,6 @@
                     </div>
                 </div>
 
-                <!-- Live Monitor Section -->
-                <div id="monitor-section" class="content-section">
-                    <div class="flex justify-between items-center mb-lg">
-                        <div>
-                            <h2 class="text-2xl font-bold"><svg class="icon"><use href="#i-activity"/></svg> Live Monitor</h2>
-                            <p class="text-secondary">Real-time system activity and analytics</p>
-                        </div>
-                        <div id="monitor-connection-status" class="flex items-center gap-md">
-                            <div class="flex items-center gap-sm">
-                                <div id="monitor-status-dot" class="status-dot" style="width: 12px; height: 12px; border-radius: 50%; background: #888;"></div>
-                                <span id="monitor-status-text" class="text-sm">Connecting...</span>
-                            </div>
-                            <button id="monitor-reconnect-btn" class="btn btn-sm btn-secondary" style="display: none;">Reconnect</button>
-                        </div>
-                    </div>
-
-                    <!-- Metrics Cards -->
-                    <div class="grid grid-cols-3 gap-md mb-lg monitor-metrics">
-                        <div class="card">
-                            <div class="flex items-center gap-md">
-                                <div class="monitor-metric-icon mm-accent">
-                                    <svg class="icon"><use href="#i-users"/></svg>
-                                </div>
-                                <div class="flex-1">
-                                    <p class="text-sm text-secondary mb-xs">Active Users</p>
-                                    <p class="text-2xl font-bold" id="monitor-active-users">0</p>
-                                    <p class="text-xs text-secondary">Real-time</p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card">
-                            <div class="flex items-center gap-md">
-                                <div class="monitor-metric-icon mm-info">
-                                    <svg class="icon"><use href="#i-activity"/></svg>
-                                </div>
-                                <div class="flex-1">
-                                    <p class="text-sm text-secondary mb-xs">Events/Min</p>
-                                    <p class="text-2xl font-bold" id="monitor-events-rate">0</p>
-                                    <p class="text-xs text-secondary" id="monitor-total-events">0 total</p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card">
-                            <div class="flex items-center gap-md">
-                                <div class="monitor-metric-icon mm-success">
-                                    <svg class="icon"><use href="#i-power"/></svg>
-                                </div>
-                                <div class="flex-1">
-                                    <p class="text-sm text-secondary mb-xs">Active Sessions</p>
-                                    <p class="text-2xl font-bold" id="monitor-active-sessions">0</p>
-                                    <p class="text-xs text-secondary" id="monitor-session-info">No activity</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Event Filters -->
-                    <div class="card mb-lg">
-                        <div class="card-header">
-                            <h3>Event Filters</h3>
-                        </div>
-                        <div class="flex gap-md p-lg flex-wrap">
-                            <button class="btn btn-sm btn-secondary event-filter-btn active" data-type="all">All Events</button>
-                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="login"><svg class="icon icon-sm"><use href="#i-login"/></svg> Logins</button>
-                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="upload"><svg class="icon icon-sm"><use href="#i-upload"/></svg> Uploads</button>
-                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="download"><svg class="icon icon-sm"><use href="#i-download"/></svg> Downloads</button>
-                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="logout"><svg class="icon icon-sm"><use href="#i-logout"/></svg> Logouts</button>
-                            <button class="btn btn-sm btn-secondary event-filter-btn" data-type="security"><svg class="icon icon-sm"><use href="#i-alert-triangle"/></svg> Security</button>
-                            <button id="monitor-clear-events" class="btn btn-sm btn-outline ml-auto">Clear Events</button>
-                        </div>
-                    </div>
-
-                    <!-- Live Event Stream -->
-                    <div class="card">
-                        <div class="card-header flex justify-between items-center">
-                            <h3>Live Event Stream</h3>
-                            <span class="badge badge-primary" id="monitor-event-count">0 events</span>
-                        </div>
-                        <div id="monitor-events-list" class="monitor-events-container" style="max-height: 600px; overflow-y: auto;">
-                            <div class="text-center py-xl text-secondary">
-                                <div style="font-size: 3rem; margin-bottom: 1rem;"><svg class="icon icon-lg"><use href="#i-activity"/></svg></div>
-                                <p class="font-semibold mb-xs">Waiting for events...</p>
-                                <p class="text-sm">Real-time events will appear here</p>
-                            </div>
-                        </div>
-                        <div id="monitor-pagination" class="audit-pagination mt-md"></div>
-                    </div>
-                </div>
-
                 <!-- Activity (administrators): what happened, who did it, and how it came in. The Events tab
                      is the audit log, filterable by every kind of event. -->
                 <div id="activity-section" class="content-section">
@@ -1650,7 +1555,6 @@
                         <button class="tab-btn" data-tab="uploadlinks">Upload Links</button>
                         <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
-                        <button class="tab-btn" data-tab="audit">Audit Log</button>
                     </div>
 
                     <!-- General Settings Tab -->
@@ -2942,103 +2846,6 @@
                         </div>
                     </div>
 
-                    <!-- Audit Log Tab -->
-                    <div id="settings-tab-audit" class="settings-tab-content">
-                        <div class="alert alert-info mb-lg audit-moved">
-                            <span>The <strong>Activity</strong> page shows this log with more filters (event type, channel, status, address and text) and exports it as CSV or NDJSON.</span>
-                            <button type="button" class="btn btn-sm btn-primary" id="audit-open-activity">Open Activity</button>
-                        </div>
-                        <div class="card mb-lg">
-                            <div class="card-header">
-                                <h3>Audit Log Filters</h3>
-                            </div>
-                            <div class="p-lg">
-                                <div class="grid grid-cols-4 gap-md">
-                                    <div class="form-group">
-                                        <label for="audit-filter-user">User</label>
-                                        <select id="audit-filter-user" class="form-control">
-                                            <option value="">All Users</option>
-                                        </select>
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="audit-filter-action">Action</label>
-                                        <select id="audit-filter-action" class="form-control">
-                                            <option value="">All Actions</option>
-                                            <option value="login">Login</option>
-                                            <option value="logout">Logout</option>
-                                            <option value="upload">Upload</option>
-                                            <option value="download">Download</option>
-                                            <option value="delete">Delete</option>
-                                            <option value="vault_created">Vault Created</option>
-                                            <option value="user_created">User Created</option>
-                                        </select>
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="audit-filter-from">From (date &amp; time)</label>
-                                        <input type="datetime-local" id="audit-filter-from" class="form-control">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="audit-filter-to">To (date &amp; time)</label>
-                                        <input type="datetime-local" id="audit-filter-to" class="form-control">
-                                    </div>
-                                </div>
-                                <div class="flex gap-md">
-                                    <button id="audit-search-btn" class="btn btn-primary"><svg class="icon"><use href="#i-search"/></svg> Search</button>
-                                    <button id="audit-export-btn" class="btn btn-secondary"><svg class="icon"><use href="#i-download"/></svg> Export CSV</button>
-                                    <button id="audit-clear-filters-btn" class="btn btn-outline">Clear Filters</button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card">
-                            <div class="card-header flex justify-between items-center">
-                                <h3>Audit Log Entries</h3>
-                                <div class="flex items-center gap-sm">
-                                    <!-- Live updates: the same activity feed the monitor listens to, used here
-                                         only as a nudge to re-read the log, so every row stays a real audit row. -->
-                                    <label class="flex items-center gap-xs text-sm" for="audit-live">
-                                        <input type="checkbox" id="audit-live"> Live
-                                    </label>
-                                    <span class="badge" id="audit-live-dot" hidden>updating…</span>
-                                    <div class="view-switch" role="group" aria-label="View">
-                                        <button type="button" class="btn btn-sm" id="audit-view-table" data-audit-view="table"
-                                                aria-pressed="true" title="Compact table">
-                                            <svg class="icon icon-sm"><use href="#i-list"/></svg>
-                                        </button>
-                                        <button type="button" class="btn btn-sm" id="audit-view-cards" data-audit-view="cards"
-                                                aria-pressed="false" title="Detailed cards">
-                                            <svg class="icon icon-sm"><use href="#i-grid"/></svg>
-                                        </button>
-                                    </div>
-                                    <span class="badge badge-primary" id="audit-count">0 entries</span>
-                                </div>
-                            </div>
-                            <div class="data-table-wrapper">
-                                <table class="data-table">
-                                    <thead>
-                                        <tr>
-                                            <th>Timestamp</th>
-                                            <th>User</th>
-                                            <th>Action</th>
-                                            <th>Status</th>
-                                            <th>IP Address</th>
-                                            <th>Details</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="audit-log-body">
-                                        <tr>
-                                            <td colspan="6" class="text-center py-xl text-secondary">
-                                                Click "Search" to load audit log entries
-                                            </td>
-                                        </tr>
-                                    </tbody>
-                                </table>
-                            </div>
-                            <div id="audit-log-cards" class="audit-cards" hidden></div>
-                            <div id="audit-pagination" class="audit-pagination mt-md"></div>
-                        </div>
-                    </div>
-
                     <!-- Log Access Tab -->
                     <div id="settings-tab-logs" class="settings-tab-content">
                         <div class="card mb-lg">
@@ -4096,18 +3903,6 @@
                     <div class="modal-body">
                         <dl class="activity-event-fields" id="activity-event-fields"></dl>
                         <pre class="activity-event-details" id="activity-event-details" hidden></pre>
-                    </div>
-                </div>
-            </div>
-            <div id="audit-event-modal" class="modal" role="dialog" aria-modal="true" aria-label="Audit event details">
-                <div class="modal-content audit-event-content">
-                    <div class="modal-header">
-                        <h3>Audit event</h3>
-                        <button class="close-modal-btn modal-close" id="audit-event-close" aria-label="Close">×</button>
-                    </div>
-                    <div class="modal-body audit-event-body">
-                        <div class="audit-event-toc" id="audit-event-toc"></div>
-                        <div class="audit-event-detail" id="audit-event-detail"></div>
                     </div>
                 </div>
             </div>

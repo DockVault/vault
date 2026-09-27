@@ -387,7 +387,7 @@ def test_console_nav_sections_still_work(page: Page, fresh_admin):
     )
     assert labels == ["Overview", "Storage", "Access", "System"]
 
-    for section in ["vaults", "temp-creds", "users", "groups", "monitor",
+    for section in ["vaults", "temp-creds", "users", "groups", "activity",
                     "settings", "dashboard"]:
         page.evaluate(
             f"document.querySelector('.sidebar-item[data-section=\"{section}\"]').click()"

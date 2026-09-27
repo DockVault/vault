@@ -66,7 +66,7 @@ def test_audit_export_neutralises_formula_username(admin, anon):
     r = anon.post("/auth/login", json={"username": formula, "password": "wrong-Passw0rd!"})
     assert r.status_code == 401, r.text
 
-    export = admin.get("/audit/export")
+    export = admin.get("/activity/export", params={"user": marker})
     assert export.status_code == 200, export.text
     text = export.text
     # Non-vacuity: the row we just created is present.

@@ -227,7 +227,7 @@ function updateUIForPermissions() {
 // Sidebar sections a SCOPED temp credential can never access (temp_scope maps
 // these endpoint groups to '__deny__'). Hidden the moment we know it's a scoped
 // temp session, so a slow/failed /auth/session probe can't leave them painted.
-const TEMP_FORBIDDEN_SECTIONS = ['users', 'groups', 'settings', 'monitor', 'roles', 'notes'];
+const TEMP_FORBIDDEN_SECTIONS = ['users', 'groups', 'settings', 'activity', 'roles', 'notes'];
 function hideAdminNavForTempSession() {
     if (!isScopedTemp) return;
     TEMP_FORBIDDEN_SECTIONS.forEach(sec => {
@@ -391,16 +391,6 @@ function updateNavigationPermissions() {
             tempCredsNav.style.display = 'flex';
         } else {
             tempCredsNav.style.display = 'none';
-        }
-    }
-    
-    // Live Monitor navigation (admin only)
-    const monitorNav = document.querySelector('[data-section="monitor"]');
-    if (monitorNav) {
-        if (isAdmin) {
-            monitorNav.style.display = 'flex';
-        } else {
-            monitorNav.style.display = 'none';
         }
     }
     
@@ -1461,10 +1451,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Show dashboard
         showScreen('dashboard-screen');
 
-        // Open the live-monitor socket app-wide so this account is notified (on any
-        // page) when one of its temporary credentials signs in. The server filters
-        // events per connection (admins see all; everyone else only their own).
-        try { connectMonitorWebSocket(); } catch (_) {}
+        // Open the app-wide socket, so this account hears (on any page) about its notifications and
+        // its temporary credentials signing in, and an administrator's Activity page updates live.
+        try { connectAppSocket(); } catch (_) {}
 
         // Load the notification bell (persistent counterpart to the live temp-login toast)
         initNotifications();
@@ -1551,7 +1540,7 @@ async function finishSecondFactorLogin(accessToken) {
     // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
     // dashboard — the same boot a refreshed session runs.
     await enterAuthedSession();
-    try { connectMonitorWebSocket(); } catch (_) {}
+    try { connectAppSocket(); } catch (_) {}
 }
 
 function renderVerifyCard(box, opts) {
@@ -1883,18 +1872,8 @@ function logout() {
     // logs in on this same tab (no page refresh) is still prompted to set up a key.
     _zkInvitePrompted = false;
 
-    // Drop the Live Monitor feed + backfill state. The feed is now kept across section re-entry
-    // ("keep old results"), so it MUST be scrubbed here or the previous user's live activity — and
-    // the admin-only /audit/log history it may have backfilled (usernames, IPs, vault names) —
-    // would show to the NEXT user who logs in on this same tab (no page refresh). Re-arming
-    // monitorHistoryLoaded makes the next user's backfill run fresh under THEIR own permissions;
-    // cleanupMonitor closes this session's socket (the next initMonitor reconnects with the new
-    // token). monitorListenersAttached is intentionally left set — the filter/clear/reconnect DOM
-    // nodes are static and survive the SPA screen swap, so re-attaching would duplicate handlers.
-    monitorEvents = [];
-    monitorMetrics.totalEvents = 0;
-    monitorHistoryLoaded = false;
-    cleanupMonitor();
+    // Close this session's socket; the next sign-in opens one with its own token.
+    closeAppSocket();
 
     // Wipe the notification bell so a prior user's notifications never show to the next user on this
     // same tab, and stop the unread-count poll.
@@ -6618,160 +6597,77 @@ async function submitGroupTemplate() {
 //  view now uses loadGroups() above; role changes happen via the Users page edit.)
 
 // ============================================================================
-// LIVE MONITOR
+// APP-WIDE SOCKET
 // ============================================================================
+// One socket per signed-in tab, open on every page from sign-in to sign-out. The server passes it only
+// three things (app/core/socket_frames.py): the Activity signal (the id and category of each new audit
+// row) to an administrator's own session; a notification nudge to the person it is for; and "your
+// temporary credential signed in" to the account that made it. None of them carries a note, a file or a
+// vault name: a nudge makes the page fetch through its own authenticated calls. The Live Monitor page
+// that used to read the whole deployment's activity from this socket was removed in 0.33.0; the
+// Activity page replaced it.
 
-let monitorWebSocket = null;
-let monitorReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
-let monitorEvents = [];
-let monitorCurrentFilter = 'all';
-// Live-monitor pagination: page 0 is the newest events (kept live); older pages page back through the
-// buffered set. New events prepend, so page 0 stays fresh; a filter change resets to page 0.
-let _monitorPage = 0;
-const _MONITOR_PAGE_SIZE = 25;
-let monitorMetrics = {
-    activeUsers: 0,
-    eventsRate: 0,
-    activeSessions: 0,
-    totalEvents: 0
-};
-let monitorHistoryLoaded = false;     // one-time persisted-history backfill per page load
-let monitorListenersAttached = false; // guard: initMonitor runs on every section entry
-
-// Initialize Live Monitor
-function initMonitor() {
-    console.log('🔴 Initializing Live Monitor...');
-
-    // Keep whatever already accumulated this session ("keep old results and show them but also
-    // fetch new ones live") — re-render what we have instead of wiping on every re-entry.
-    updateMonitorUI();
-
-    // Connect to WebSocket for real-time events
-    connectMonitorWebSocket();
-
-    // Attach event listeners (once — this runs on every navigation to the section)
-    attachMonitorListeners();
-
-    // Fetch initial statistics
-    fetchMonitorStats();
-
-    // Seed persisted history so the feed isn't empty until the next live event (admin only).
-    backfillMonitorHistory();
-}
+let appSocket = null;
+let appSocketReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
 
 // Schedule at most ONE pending reconnect. Any newer schedule (or a direct connect) cancels the prior
-// timer, so repeated failures across the several entry points (init, reconnect button, onclose, and a
+// timer, so repeated failures across the entry points (sign-in, navigation, onclose, and a
 // WebSocket-constructor throw) can't stack into a burst of connection attempts.
-function scheduleMonitorReconnect() {
-    clearTimeout(monitorReconnectTimer);
-    monitorReconnectTimer = setTimeout(() => {
-        monitorReconnectTimer = null;
-        if (authToken) connectMonitorWebSocket();
+function scheduleAppSocketReconnect() {
+    clearTimeout(appSocketReconnectTimer);
+    appSocketReconnectTimer = setTimeout(() => {
+        appSocketReconnectTimer = null;
+        if (authToken) connectAppSocket();
     }, 5000);
 }
 
-// Connect to WebSocket
-function connectMonitorWebSocket() {
+function connectAppSocket() {
     // A direct (re)connect supersedes any pending auto-reconnect — don't let them stack.
-    clearTimeout(monitorReconnectTimer);
-    monitorReconnectTimer = null;
-    // Close existing connection if any
-    if (monitorWebSocket) {
-        monitorWebSocket.close();
-    }
-    
-    // Determine WebSocket URL
+    clearTimeout(appSocketReconnectTimer);
+    appSocketReconnectTimer = null;
+    if (appSocket) appSocket.close();
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/monitor`;
-    
-    console.log('Connecting to WebSocket:', wsUrl);
-    updateMonitorStatus('connecting', 'Connecting...');
-    
     try {
         // Capture this specific socket so its handlers can tell whether they still belong to the
-        // current connection: connect() may close a live socket and immediately open a new one, and a
+        // current connection: connect may close a live socket and immediately open a new one, and a
         // close/open handshake has no ordering guarantee — a stale event from a superseded socket must
-        // not touch shared state (re-arm the reconnect, flash "Disconnected") for the live one.
+        // not touch shared state (re-arm the reconnect) for the live one.
         const ws = new WebSocket(wsUrl);
-        monitorWebSocket = ws;
+        appSocket = ws;
 
         ws.onopen = () => {
-            if (monitorWebSocket !== ws) return;   // superseded by a newer connect
-            console.log('✓ WebSocket connected');
-            // Connected — cancel any pending reconnect scheduled by a prior close/error.
-            clearTimeout(monitorReconnectTimer);
-            monitorReconnectTimer = null;
-            updateMonitorStatus('connected', 'Connected');
-
-            // Send authentication token
-            if (authToken) {
-                ws.send(JSON.stringify({
-                    type: 'auth',
-                    token: authToken
-                }));
-            }
+            if (appSocket !== ws) return;   // superseded by a newer connect
+            clearTimeout(appSocketReconnectTimer);
+            appSocketReconnectTimer = null;
+            // The token goes in the first message, never the URL (logs, history, Referer).
+            if (authToken) ws.send(JSON.stringify({ type: 'auth', token: authToken }));
         };
-
         ws.onmessage = (event) => {
             try {
-                const data = JSON.parse(event.data);
-                handleMonitorEvent(data);
+                handleSocketFrame(JSON.parse(event.data));
             } catch (error) {
-                console.error('Failed to parse WebSocket message:', error);
+                console.error('Failed to read a socket frame:', error);
             }
         };
-
-        ws.onerror = (error) => {
-            if (monitorWebSocket !== ws) return;   // superseded by a newer connect
-            console.error('WebSocket error:', error);
-            updateMonitorStatus('error', 'Connection Error');
-        };
-
+        ws.onerror = () => { /* onclose follows and reconnects */ };
         ws.onclose = () => {
-            // A stale close from a socket we've already replaced must not re-arm the reconnect (it
-            // would tear down the healthy replacement 5s later) or flash a false "Disconnected".
-            if (monitorWebSocket !== ws) return;
-            console.log('WebSocket closed');
-            updateMonitorStatus('disconnected', 'Disconnected');
-
-            // Auto-reconnect while logged in (the socket is app-wide so the owner
-            // keeps receiving temp-credential login notifications on any page).
-            scheduleMonitorReconnect();
+            // A stale close from a socket already replaced must not re-arm the reconnect (it would
+            // tear down the healthy replacement 5s later).
+            if (appSocket !== ws) return;
+            scheduleAppSocketReconnect();
         };
-
     } catch (error) {
-        console.error('Failed to create WebSocket:', error);
-        updateMonitorStatus('error', 'Reconnecting…');
-        // The live event feed is WebSocket-only; retry the connection shortly (mirrors the
-        // onclose reconnect) rather than polling a non-existent endpoint.
-        scheduleMonitorReconnect();
+        console.error('Failed to open the socket:', error);
+        scheduleAppSocketReconnect();
     }
 }
 
-// Handle incoming monitor event
-function handleMonitorEvent(data) {
-    // Emitted types: login, logout, upload, download, security_incident, error (+ Path A operation_cancelled).
-    // Server broadcasts wrap the event under `event`; unwrap for inspection. (The historic bug read the
-    // row fields off the TOP-LEVEL `data`, so wrapped Path-A frames rendered as type:'unknown' with an
-    // empty message and were then filtered out — the whole feed looked dead. Build the row from `ev`.)
-    const ev = (data && data.event) ? data.event : data;
-
-    // Stats frames are top-level (never wrapped) — update metrics and stop.
-    if (data.type === 'stats') {
-        monitorMetrics.activeUsers = data.active_users || 0;
-        monitorMetrics.activeSessions = data.active_sessions || 0;
-        updateMonitorMetrics();
-        return;
-    }
-
-    // Control frames from the auth handshake / keepalive are not activity — the status dot already
-    // reflects the connection (ws.onopen), so don't render them as feed rows.
-    if (data.type === 'connected' || data.type === 'pong') {
-        return;
-    }
-
-    // The Activity signal: the id and category of each new audit row, sent only to an administrator's
-    // own session. It names nothing; the Activity page listens for this event and fetches the rows.
+function handleSocketFrame(data) {
+    if (!data || typeof data !== 'object') return;
+    // The Activity signal: sent only to an administrator's own session. It names nothing; the Activity
+    // page listens for this event and fetches the rows through the Events API.
     if (data.type === 'activity') {
         try {
             window.dispatchEvent(new CustomEvent('dockvault:activity',
@@ -6779,23 +6675,14 @@ function handleMonitorEvent(data) {
         } catch (_) { /* a listener's fault is not the socket's */ }
         return;
     }
+    const ev = data.event;
+    if (!ev || typeof ev !== 'object') return;   // control frames (connected, pong, error)
 
-    // Past the control frames, this is real activity, so nudge the Audit Log to re-read itself. It
-    // sat ABOVE these returns at first, which meant every stats and keepalive frame triggered a
-    // re-read: live appeared to work with the poll removed entirely, for a reason that had nothing
-    // to do with anything being audited. Wrapped, because a fault in the audit view must not take
-    // the Live Monitor down with it.
-    try { auditLiveNote(); } catch (_) { /* the audit view is not the monitor's problem */ }
-
-    // Live notification nudge: the server broadcasts one per recipient when it writes an in-app
-    // notification, so the bell (and an open target section, e.g. Notes) updates without a refresh.
-    // It carries no content — re-fetch via the authenticated endpoints. NEVER render it in the
-    // activity feed (an admin's socket sees every recipient's nudge; act only on my own).
-    if (ev && ev.type === 'notification') {
+    // A notification was written for me: refresh the bell (and an open Notes list) without a reload.
+    // It carries no content; the lists are re-fetched through their own authenticated calls.
+    if (ev.type === 'notification') {
         if (currentUser && String(ev.owner_user_id) === String(currentUser.id) && !isScopedTemp) {
             try { refreshNotifUnread(); } catch (_) {}
-            // Refresh the notes lists so a newly-received note appears live. Cheap + safe when the
-            // Notes section isn't the visible one (it just repopulates hidden lists + the badge).
             if (ev.target === '#notes' && typeof loadNotes === 'function') {
                 try { loadNotes(); } catch (_) {}
             }
@@ -6803,408 +6690,34 @@ function handleMonitorEvent(data) {
         return;
     }
 
-    // Owner notification: a temporary credential I created just signed in.
-    if (ev && ev.type === 'login' && ev.is_temporary && currentUser &&
+    // A temporary credential I created just signed in.
+    if (ev.type === 'login' && ev.is_temporary && currentUser &&
         String(ev.owner_user_id) === String(currentUser.id)) {
         showWarning(`Temporary credential ${ev.temp_username || ''} just signed in${ev.ip ? ' from ' + ev.ip : ''}`.trim());
         // Reflect it on the bell right away — the durable row is persisted server-side and the exact
         // list reconciles on the next poll / when the panel opens.
         if (!isScopedTemp) { notifUnread = (notifUnread || 0) + 1; updateNotifBadge(); }
     }
-
-    // Path B (ProgressTracker) publishes UNWRAPPED operation_start/complete/cancelled frames that
-    // duplicate the richer Path A upload/download lifecycle (same operation_id). Don't render them.
-    if (!(data && data.event) && typeof ev.type === 'string' && ev.type.indexOf('operation_') === 0) {
-        return;
-    }
-
-    ingestMonitorEvent(ev, 'live');
-    updateMonitorUI();
 }
 
-// Normalize a raw event (a live WS frame, or a backfilled audit row already shaped like one) into
-// the monitor's row model. Repeated frames of one operation (upload start -> progress -> complete)
-// share an operation_id and COALESCE into a single row that updates in place, so one transfer is one
-// row instead of a wall of progress lines.
-function ingestMonitorEvent(ev, source) {
-    const evt = {
-        id: Date.now() + Math.random(),
-        operationId: ev.operation_id || null,
-        timestamp: ev.timestamp || new Date().toISOString(),
-        type: ev.type || 'unknown',
-        user: ev.user || 'System',
-        // Server frames carry `description`/`title`; audit-backfill rows are pre-mapped to `description`.
-        message: ev.description || ev.title || '',
-        ip: ev.ip || '',
-        vaultName: ev.vault_name || '',
-        vaultType: ev.vault_type || '',        // 'zero_knowledge' | 'standard'
-        isTemporary: !!ev.is_temporary,
-        tempUsername: ev.temp_username || '',
-        fileName: ev.file_name || '',
-        completed: ev.completed === true,
-        cancelled: ev.cancelled === true,
-        source: source || 'live',
-        icon: getEventIcon(ev.type)
-    };
-
-    if (evt.operationId) {
-        const idx = monitorEvents.findIndex(e => e.operationId && e.operationId === evt.operationId);
-        if (idx !== -1) {
-            const prev = monitorEvents[idx];
-            evt.id = prev.id;         // keep the row's identity
-            evt.source = prev.source; // a live op stays "live" even as it updates
-            // MERGE, don't blindly replace: a follow-up frame for the same operation can be thin
-            // (the /api/operations/{id}/cancel endpoint emits a generic `operation_cancelled` with
-            // no vault fields and no specific type). Carry forward the enrichment it omits so the
-            // row doesn't lose its Vault/ZK/temp badges, and keep the specific transfer type rather
-            // than letting a generic operation_* status frame flip it out of the upload/download
-            // filter — just record the cancellation.
-            evt.vaultName = evt.vaultName || prev.vaultName;
-            evt.vaultType = evt.vaultType || prev.vaultType;
-            evt.isTemporary = evt.isTemporary || prev.isTemporary;
-            evt.tempUsername = evt.tempUsername || prev.tempUsername;
-            evt.fileName = evt.fileName || prev.fileName;
-            if (!evt.user || evt.user === 'System') evt.user = prev.user;
-            if (evt.type.indexOf('operation_') === 0 && prev.type.indexOf('operation_') !== 0) {
-                if (evt.type === 'operation_cancelled') evt.cancelled = true;
-                evt.type = prev.type;
-                evt.icon = getEventIcon(evt.type);
-            }
-            monitorEvents.splice(idx, 1);           // drop the old position; re-add at the top
-        }
-    }
-
-    monitorEvents.unshift(evt);
-    if (monitorEvents.length > 200) {
-        monitorEvents = monitorEvents.slice(0, 200);
-    }
-
-    monitorMetrics.totalEvents = monitorEvents.length;
-    // Events/min counts distinct LIVE rows seen in the last minute (history rows don't inflate it).
-    const oneMinuteAgo = new Date(Date.now() - 60000).toISOString();
-    monitorMetrics.eventsRate = monitorEvents.filter(e => e.source === 'live' && e.timestamp > oneMinuteAgo).length;
-}
-
-// Map a persisted audit action name to a monitor event type (the audit log and the live feed use
-// different vocabularies: `file_upload` vs `upload`, `login_success` vs `login`, etc.).
-function auditActionToType(action) {
-    const a = String(action || '').toLowerCase();
-    if (a.indexOf('login') === 0) return 'login';
-    if (a.indexOf('logout') === 0) return 'logout';
-    if (a.indexOf('file_upload') === 0 || a === 'upload') return 'upload';
-    if (a.indexOf('file_download') === 0 || a.indexOf('file.download') === 0 || a === 'download') return 'download';
-    if (a.indexOf('size_limit') === 0) return 'security_incident';
-    if (a.indexOf('fail') !== -1 || a.indexOf('error') !== -1 || a.indexOf('denied') !== -1 || a.indexOf('violation') !== -1) return 'error';
-    return 'info';
-}
-
-// One-line description for a backfilled audit row.
-function auditRowDescription(r, type) {
-    const det = (r && r.details) || {};
-    const fileName = det.file_name || '';
-    const label = String(r.action || type).replace(/_/g, ' ');
-    const status = (r.status && r.status !== 'success') ? ` (${r.status})` : '';
-    return (fileName ? fileName + ' — ' : '') + label + status;
-}
-
-// Seed the feed with persisted history so re-opening the monitor shows past activity, not just
-// live-from-now. The endpoint is admin-only; non-admins (403) or a transient error just get live.
-async function backfillMonitorHistory() {
-    if (monitorHistoryLoaded) return;
-    monitorHistoryLoaded = true;   // one attempt per page load, even on failure
-    try {
-        const rows = await apiRequest('/audit/log?limit=100', { silent: true });
-        if (!Array.isArray(rows) || rows.length === 0) return;
-        // Oldest first so the successive unshifts leave newest at the top; history sits below live.
-        rows.slice().reverse().forEach(r => {
-            const type = auditActionToType(r.action);
-            const det = r.details || {};
-            ingestMonitorEvent({
-                type: type,
-                timestamp: r.timestamp,
-                user: r.username || 'System',
-                description: auditRowDescription(r, type),
-                ip: r.ip_address || '',
-                vault_name: det.vault_name || '',
-                is_temporary: !!r.temp_credential_id,
-                file_name: det.file_name || ''
-            }, 'history');
-        });
-        updateMonitorUI();
-    } catch (e) {
-        console.log('Monitor history backfill unavailable (non-admin or transient)');
+// Close the socket (on sign-out only: it is app-wide, so navigation leaves it open).
+function closeAppSocket() {
+    clearTimeout(appSocketReconnectTimer);
+    appSocketReconnectTimer = null;
+    if (appSocket) {
+        const ws = appSocket;
+        appSocket = null;          // first, so its onclose does not schedule a reconnect
+        ws.close();
     }
 }
 
-// Get icon for event type (returns inline SVG markup from the sprite)
-function getEventIcon(type) {
-    const icons = {
-        'login': 'login',
-        'logout': 'logout',
-        'upload': 'upload',
-        'download': 'download',
-        'vault_access': 'unlock',
-        'vault_created': 'vault',
-        'temp_cred_created': 'clock',
-        'temp_cred_used': 'check',
-        'temp_cred_expired': 'clock',
-        'user_created': 'user',
-        'user_deleted': 'trash',
-        'security_incident': 'alert-triangle',
-        'operation_cancelled': 'info',
-        'error': 'alert-triangle',
-        'warning': 'alert-triangle',
-        'info': 'info'
-    };
-    return iconSvg(icons[type] || 'activity');
-}
-
-// Update monitor status indicator
-function updateMonitorStatus(status, text) {
-    const dot = document.getElementById('monitor-status-dot');
-    const statusText = document.getElementById('monitor-status-text');
-    const reconnectBtn = document.getElementById('monitor-reconnect-btn');
-    
-    if (!dot || !statusText) return;
-    
-    const colors = {
-        'connected': '#10b981',
-        'connecting': '#f59e0b',
-        'disconnected': '#6b7280',
-        'error': '#ef4444',
-        'polling': '#3b82f6'
-    };
-    
-    dot.style.background = colors[status] || colors.disconnected;
-    statusText.textContent = text;
-    
-    // Show reconnect button if disconnected or error
-    if (reconnectBtn) {
-        reconnectBtn.style.display = (status === 'disconnected' || status === 'error') ? 'block' : 'none';
-    }
-}
-
-// Update monitor metrics display
-function updateMonitorMetrics() {
-    document.getElementById('monitor-active-users').textContent = monitorMetrics.activeUsers;
-    document.getElementById('monitor-events-rate').textContent = monitorMetrics.eventsRate;
-    document.getElementById('monitor-total-events').textContent = `${monitorMetrics.totalEvents} total`;
-    document.getElementById('monitor-active-sessions').textContent = monitorMetrics.activeSessions;
-    
-    const sessionInfo = monitorMetrics.activeSessions > 0 
-        ? `${monitorMetrics.activeSessions} active` 
-        : 'No activity';
-    document.getElementById('monitor-session-info').textContent = sessionInfo;
-}
-
-// A filter chip may cover more than one raw event type (e.g. "Security" = error + size-limit
-// incidents). Types not listed here filter by exact equality (login/upload/download/logout).
-const MONITOR_FILTER_GROUPS = {
-    security: ['error', 'security_incident']
-};
-
-function monitorFilterMatches(eventType, filter) {
-    if (filter === 'all') return true;
-    const wanted = MONITOR_FILTER_GROUPS[filter] || [filter];
-    return wanted.indexOf(eventType) !== -1;
-}
-
-// Update monitor UI
-function updateMonitorUI() {
-    updateMonitorMetrics();
-
-    const eventsList = document.getElementById('monitor-events-list');
-    const eventCount = document.getElementById('monitor-event-count');
-
-    if (!eventsList) return;
-
-    // Filter events (chip may map to a group of raw types)
-    const filteredEvents = monitorEvents.filter(e => monitorFilterMatches(e.type, monitorCurrentFilter));
-
-    // Update count
-    if (eventCount) {
-        eventCount.textContent = `${filteredEvents.length} event${filteredEvents.length === 1 ? '' : 's'}`;
-    }
-
-    // Render events
-    if (filteredEvents.length === 0) {
-        const waitingFor = monitorCurrentFilter === 'all' ? 'activity' : monitorCurrentFilter + ' events';
-        eventsList.innerHTML = `
-            <div class="empty-state-center">
-                ${iconSvg('activity', 'icon-lg')}
-                <h3>No events yet</h3>
-                <p>Live ${escapeHtml(waitingFor)} will appear here as it happens.</p>
-            </div>
-        `;
-        return;
-    }
-
-    // Type -> border/badge colour
-    const typeColors = {
-        'login': 'success',
-        'logout': 'secondary',
-        'upload': 'primary',
-        'download': 'info',
-        'security_incident': 'danger',
-        'operation_cancelled': 'secondary',
-        'error': 'danger'
-    };
-
-    const _monPages = Math.max(1, Math.ceil(filteredEvents.length / _MONITOR_PAGE_SIZE));
-    if (_monitorPage >= _monPages) _monitorPage = _monPages - 1;
-    if (_monitorPage < 0) _monitorPage = 0;
-    const _monHtml = filteredEvents
-        .slice(_monitorPage * _MONITOR_PAGE_SIZE, (_monitorPage + 1) * _MONITOR_PAGE_SIZE)
-        .map(event => {
-        const time = parseServerTime(event.timestamp);
-        const timeStr = time ? time.toLocaleTimeString() : '—';
-        const badgeClass = typeColors[event.type] || 'secondary';
-
-        // Which-account (main vs temp) badge
-        const tempBadge = event.isTemporary
-            ? `<span class="badge badge-info" title="Acted via a temporary credential">temp${event.tempUsername ? ': ' + escapeHtml(event.tempUsername) : ''}</span>`
-            : '';
-        // Standard vs zero-knowledge vault badge
-        const zk = event.vaultType === 'zero_knowledge';
-        const vaultBadge = event.vaultType
-            ? `<span class="badge badge-${zk ? 'warning' : 'secondary'}" title="${zk ? 'Zero-knowledge vault' : 'Standard vault'}">${zk ? 'ZK' : 'Standard'}</span>`
-            : '';
-        // History (backfilled from the audit log) vs live
-        const histBadge = event.source === 'history'
-            ? `<span class="badge badge-secondary" title="From audit history">history</span>`
-            : '';
-
-        // Metadata line: vault name + client IP (file name is already in the message)
-        const meta = [];
-        if (event.vaultName) meta.push(`Vault: ${escapeHtml(event.vaultName)}`);
-        if (event.ip) meta.push(`IP: ${escapeHtml(event.ip)}`);
-        const metaLine = meta.length
-            ? `<div class="text-xs text-secondary mt-xs flex gap-md flex-wrap">${meta.map(m => `<span>${m}</span>`).join('')}</div>`
-            : '';
-
-        return `
-            <div class="monitor-event-item" style="border-left: 4px solid var(--${badgeClass}); padding: 0.6rem 0.85rem; margin-bottom: 0.4rem; background: var(--surface-1); border-radius: 8px;">
-                <div class="flex items-start gap-md">
-                    <span style="font-size: 1.25rem; line-height: 1.4;">${event.icon}</span>
-                    <div class="flex-1" style="min-width: 0;">
-                        <div class="flex items-center gap-sm mb-xs flex-wrap">
-                            <span class="font-semibold">${escapeHtml(event.user)}</span>
-                            <span class="badge badge-${badgeClass}">${escapeHtml(event.type.replace(/_/g, ' '))}</span>
-                            ${tempBadge}
-                            ${vaultBadge}
-                            ${histBadge}
-                            <span class="text-xs text-secondary ml-auto">${timeStr}</span>
-                        </div>
-                        <p class="text-sm text-secondary" style="word-break: break-word;">${escapeHtml(event.message || `${event.type} event`)}</p>
-                        ${metaLine}
-                    </div>
-                </div>
-            </div>
-        `;
-    }).join('');
-    eventsList.replaceChildren();
-    eventsList.insertAdjacentHTML('beforeend', _monHtml);
-    renderMonitorPagination(filteredEvents.length, _monPages);
-}
-
-function renderMonitorPagination(total, pages) {
-    const host = document.getElementById('monitor-pagination');
-    if (!host) return;
-    host.replaceChildren();
-    if (total <= _MONITOR_PAGE_SIZE) return;
-    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn btn-secondary btn-sm'; prev.textContent = '‹ Newer'; prev.disabled = _monitorPage === 0;
-    prev.addEventListener('click', () => { if (_monitorPage > 0) { _monitorPage--; updateMonitorUI(); } });
-    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn btn-secondary btn-sm'; next.textContent = 'Older ›'; next.disabled = _monitorPage >= pages - 1;
-    next.addEventListener('click', () => { if (_monitorPage < pages - 1) { _monitorPage++; updateMonitorUI(); } });
-    const label = document.createElement('span'); label.className = 'text-secondary text-sm';
-    const from = _monitorPage * _MONITOR_PAGE_SIZE + 1;
-    const to = Math.min(total, (_monitorPage + 1) * _MONITOR_PAGE_SIZE);
-    label.textContent = `${from}–${to} of ${total} · page ${_monitorPage + 1} of ${pages}`;
-    host.appendChild(prev); host.appendChild(label); host.appendChild(next);
-}
-
-// Fetch monitor statistics
-async function fetchMonitorStats() {
-    try {
-        const stats = await apiRequest('/monitor/stats', { silent: true });
-        
-        monitorMetrics.activeUsers = stats.active_users || 0;
-        monitorMetrics.activeSessions = stats.active_sessions || 0;
-        
-        updateMonitorMetrics();
-    } catch (error) {
-        console.log('Monitor stats endpoint not available');
-        // Use defaults if endpoint doesn't exist
-        monitorMetrics.activeUsers = 0;
-        monitorMetrics.activeSessions = 0;
-        updateMonitorMetrics();
-    }
-}
-
-// Attach monitor event listeners
-function attachMonitorListeners() {
-    // initMonitor() runs on every navigation to the section; attach the click handlers only once so
-    // the filter/clear/reconnect buttons don't accumulate duplicate listeners across re-entries.
-    if (monitorListenersAttached) return;
-    monitorListenersAttached = true;
-
-    // Event filter buttons
-    document.querySelectorAll('.event-filter-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            // Update active state
-            document.querySelectorAll('.event-filter-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            
-            // Update filter (back to the newest page — the filtered set changed)
-            monitorCurrentFilter = btn.dataset.type;
-            _monitorPage = 0;
-            updateMonitorUI();
-        });
-    });
-    
-    // Clear events button
-    const clearBtn = document.getElementById('monitor-clear-events');
-    if (clearBtn) {
-        clearBtn.addEventListener('click', async () => {
-            const confirmed = await showConfirm(
-                'This will clear all events from the monitor.',
-                'Clear all events?'
-            );
-            if (confirmed) {
-                monitorEvents = [];
-                monitorMetrics.totalEvents = 0;
-                updateMonitorUI();
-                showSuccess('Monitor events cleared');
-            }
-        });
-    }
-    
-    // Reconnect button
-    const reconnectBtn = document.getElementById('monitor-reconnect-btn');
-    if (reconnectBtn) {
-        reconnectBtn.addEventListener('click', () => {
-            connectMonitorWebSocket();
-        });
-    }
-}
-
-// Cleanup monitor (on LOGOUT). The socket is app-wide, so this is intentionally NOT called on
-// ordinary navigation any more -- only when the session ends.
-function cleanupMonitor() {
-    if (monitorWebSocket) {
-        monitorWebSocket.close();
-        monitorWebSocket = null;
-    }
-}
-
-// (Re)open the app-wide activity socket if it isn't currently open. A cheap no-op when it's already
-// connected; covers a socket that dropped while the user was on a page that doesn't manage it, so
-// live notifications keep working across navigation.
-function ensureMonitorSocket() {
+// (Re)open the socket if it isn't open. A cheap no-op when it's connected; covers a socket that
+// dropped while the user was on a page, so live notifications keep working across navigation.
+function ensureAppSocket() {
     if (!authToken) return;
-    const ws = monitorWebSocket;
+    const ws = appSocket;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-        connectMonitorWebSocket();
+        connectAppSocket();
     }
 }
 
@@ -7378,9 +6891,6 @@ async function initSettings() {
     
     // Load storage statistics
     loadStorageStats();
-    
-    // Load users for audit filter
-    loadAuditFilterUsers();
 }
 
 // A3 — Branding editor: maps each Settings brand input id to its /settings +
@@ -10495,91 +10005,7 @@ function renderSendResults(r) {
     });
 }
 
-// Load users for audit filter dropdown
-async function loadAuditFilterUsers() {
-    try {
-        // Silent: an unrestricted (NULL-scope) temp credential is still shown the admin nav even
-        // though the backend now 403s these admin routes; degrade quietly here instead of firing a
-        // permission-denied toast. (Full temp-cred nav alignment is a separate follow-up.)
-        const users = await apiRequest('/users', { silent: true });
-        const select = document.getElementById('audit-filter-user');
-        
-        if (select && users.length > 0) {
-            // Keep "All Users" option and add user options
-            const options = users.map(user => 
-                `<option value="${user.id}">${escapeHtml(user.username)}</option>`
-            ).join('');
-            
-            select.innerHTML = '<option value="">All Users</option>' + options;
-        }
-    } catch (error) {
-        console.error('Failed to load users for audit filter:', error);
-    }
-}
-
-// Search audit log
-// --- Audit log: client-side pagination + an event-detail modal with a page table-of-contents -------
-let _auditLogs = [];
-let _auditPage = 0;
-const _AUDIT_PAGE_SIZE = 25;
-
-function _auditPageSlice() {
-    const start = _auditPage * _AUDIT_PAGE_SIZE;
-    return { start, logs: _auditLogs.slice(start, start + _AUDIT_PAGE_SIZE) };
-}
-
-// ============================================================================
-// AUDIT LOG: LIVE UPDATES + A SWITCHABLE VIEW
-// ----------------------------------------------------------------------------
-// The Live Monitor page is untouched. This reuses the activity socket it already
-// opens app-wide, but only as a NUDGE: an event says "something happened", and the
-// audit log then re-reads itself from the server. It never renders a websocket
-// frame as an audit row.
-//
-// That distinction matters. A monitor frame and an audit row are different shapes
-// with different fields, and inventing a row from the wrong one would put entries
-// on screen that the server never recorded — a log you cannot trust is worse than
-// one that is a second out of date. Re-reading costs one request per burst and
-// every row remains exactly what /audit/log returned.
-// ============================================================================
-
-const AUDIT_VIEW_KEY = 'auditView';       // 'table' (compact) | 'cards' (detailed)
-let _auditLiveOn = false;
-let _auditLiveTimer = null;
-let _auditLivePoll = null;
-// Often enough to feel live on a page someone is watching; slow enough that leaving the tab
-// open all day is not a load problem.
-const _AUDIT_LIVE_POLL_MS = 5000;
-
-function auditView() {
-    try {
-        return localStorage.getItem(AUDIT_VIEW_KEY) === 'cards' ? 'cards' : 'table';
-    } catch (_) {
-        return 'table';   // private mode / storage blocked — the compact view is the safe default
-    }
-}
-
-function setAuditView(view) {
-    const next = view === 'cards' ? 'cards' : 'table';
-    try { localStorage.setItem(AUDIT_VIEW_KEY, next); } catch (_) { /* remembering is a convenience */ }
-    applyAuditView();
-    renderAuditPage();
-}
-
-function applyAuditView() {
-    const view = auditView();
-    const table = document.querySelector('#settings-tab-audit .data-table-wrapper');
-    const cards = document.getElementById('audit-log-cards');
-    if (table) table.hidden = (view !== 'table');
-    if (cards) cards.hidden = (view !== 'cards');
-    document.querySelectorAll('[data-audit-view]').forEach(btn => {
-        const on = btn.getAttribute('data-audit-view') === view;
-        btn.classList.toggle('btn-primary', on);
-        btn.classList.toggle('btn-ghost', !on);
-        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-    });
-}
-
+// The status badge for an audit row: shared with the Activity page (static/js/activity.js).
 // How each audit status reads at a glance. Only a failure or a refusal is red: "authorized" records
 // that a download or a rendered preview was allowed (a download's outcome is logged in a row of its
 // own), and "active"/"revoked" are states, not errors. A status this list does not know stays neutral rather than looking like a failure.
@@ -10589,321 +10015,6 @@ const _AUDIT_STATUS_BADGE = {
     failure: 'danger', failed: 'danger', error: 'danger', refused: 'danger',
 };
 function auditStatusBadge(status) { return _AUDIT_STATUS_BADGE[status] || 'secondary'; }
-
-// The detailed view. Same rows, same page, more of each row visible without opening
-// anything — which is the point of having two: the table scans, the cards read.
-function renderAuditCards(logs, start) {
-    const host = document.getElementById('audit-log-cards');
-    if (!host) return;
-    host.replaceChildren();
-    if (!logs.length) {
-        host.appendChild(_el('p', 'text-secondary text-center py-xl',
-            'No audit log entries found for the selected filters'));
-        return;
-    }
-    logs.forEach((log, i) => {
-        const gi = start + i;
-        const badge = auditStatusBadge(log.status);
-        const card = _el('div', 'audit-card' + (badge === 'danger' ? ' is-bad' : ''));
-
-        const head = _el('div', 'audit-card-head');
-        head.appendChild(_el('span', 'badge badge-secondary', (log.action || '').replace(/_/g, ' ')));
-        head.appendChild(_el('span', 'badge badge-' + badge, log.status || '-'));
-        head.appendChild(_el('span', 'audit-card-when', formatServerTime(log.timestamp)));
-        card.appendChild(head);
-
-        const who = _el('div', 'audit-card-who');
-        who.appendChild(_el('span', '', log.username || 'unknown user'));
-        if (log.ip_address) who.appendChild(_el('span', 'text-tertiary', ' · ' + log.ip_address));
-        if (log.resource_type) {
-            who.appendChild(_el('span', 'text-tertiary',
-                ' · ' + log.resource_type + (log.resource_id ? ' ' + log.resource_id : '')));
-        }
-        card.appendChild(who);
-
-        const view = _el('button', 'btn btn-ghost btn-sm', 'View details');
-        view.type = 'button';
-        view.addEventListener('click', () => openAuditEventModal(gi));
-        card.appendChild(view);
-
-        host.appendChild(card);
-    });
-}
-
-// --- live -------------------------------------------------------------------
-
-function setAuditLive(on) {
-    _auditLiveOn = !!on;
-    const dot = document.getElementById('audit-live-dot');
-    if (dot && !_auditLiveOn) dot.hidden = true;
-    if (_auditLiveTimer) { clearTimeout(_auditLiveTimer); _auditLiveTimer = null; }
-    if (_auditLivePoll) { clearInterval(_auditLivePoll); _auditLivePoll = null; }
-    if (!_auditLiveOn) return;
-
-    // Live means live from now: re-read once on switching on, so the view is not still showing
-    // whatever happened to be there when the box was ticked.
-    void auditLiveRefresh();
-
-    // THE POLL IS THE MECHANISM HERE, NOT A BACKSTOP, AND THAT IS DELIBERATE.
-    // The activity socket carries only a fraction of what is audited: 19 broadcast sites against 91
-    // that write an audit row -- counted, not estimated -- so roughly one auditable action in five
-    // ever reaches it. Creating a vault is one of the four in five that does not. A socket-only
-    // "live" would therefore LOOK live while silently missing most events, which on a page whose
-    // whole purpose is to be complete is worse than not offering live at all. The socket nudge is
-    // kept because it makes the events it does carry appear at once; the poll is what makes the
-    // claim true for the rest.
-    _auditLivePoll = setInterval(() => { void auditLiveRefresh(); }, _AUDIT_LIVE_POLL_MS);
-}
-
-// Called for every activity frame. Coalesced: a burst of twenty events is one re-read,
-// not twenty, and a quiet deployment costs nothing at all.
-function auditLiveNote() {
-    if (!_auditLiveOn || !auditTabIsOpen()) return;
-    if (_auditLiveTimer) return;
-    _auditLiveTimer = setTimeout(() => { _auditLiveTimer = null; auditLiveRefresh(); }, 600);
-}
-
-function auditTabIsOpen() {
-    const tab = document.getElementById('settings-tab-audit');
-    const section = document.getElementById('settings-section');
-    return !!(tab && section && section.classList.contains('active') && tab.classList.contains('active'));
-}
-
-async function auditLiveRefresh() {
-    if (!auditTabIsOpen()) return;
-    const dot = document.getElementById('audit-live-dot');
-    if (dot) dot.hidden = false;
-    try {
-        await searchAuditLog({ silent: true });
-    } finally {
-        if (dot) setTimeout(() => { dot.hidden = true; }, 400);
-    }
-}
-
-function renderAuditPage() {
-    const tbody = document.getElementById('audit-log-body');
-    if (!tbody) return;
-    const total = _auditLogs.length;
-    const pages = Math.max(1, Math.ceil(total / _AUDIT_PAGE_SIZE));
-    if (_auditPage >= pages) _auditPage = pages - 1;
-    const { start, logs } = _auditPageSlice();
-    tbody.replaceChildren();
-    if (!total) {
-        const tr = document.createElement('tr');
-        const td = document.createElement('td');
-        td.colSpan = 6; td.className = 'text-center py-xl text-secondary';
-        td.textContent = 'No audit log entries found for the selected filters';
-        tr.appendChild(td); tbody.appendChild(tr);
-    } else {
-        logs.forEach((log, i) => {
-            const gi = start + i;
-            const tr = document.createElement('tr');
-            const tdTime = document.createElement('td'); tdTime.textContent = formatServerTime(log.timestamp); tr.appendChild(tdTime);
-            const tdUser = document.createElement('td'); tdUser.textContent = log.username || '-'; tr.appendChild(tdUser);
-            const tdAction = document.createElement('td');
-            const ab = document.createElement('span'); ab.className = 'badge badge-secondary'; ab.textContent = (log.action || '').replace(/_/g, ' '); tdAction.appendChild(ab); tr.appendChild(tdAction);
-            const tdStatus = document.createElement('td');
-            const sb = document.createElement('span'); sb.className = 'badge badge-' + auditStatusBadge(log.status); sb.textContent = log.status || '-'; tdStatus.appendChild(sb); tr.appendChild(tdStatus);
-            const tdIp = document.createElement('td'); tdIp.textContent = log.ip_address || '-'; tr.appendChild(tdIp);
-            const tdDet = document.createElement('td');
-            const view = document.createElement('button'); view.type = 'button'; view.className = 'btn btn-ghost btn-sm'; view.textContent = 'View';
-            view.addEventListener('click', () => openAuditEventModal(gi));
-            tdDet.appendChild(view); tr.appendChild(tdDet);
-            tbody.appendChild(tr);
-        });
-    }
-    // The detailed view renders from the same page slice, so the two can never disagree about
-    // what is on screen — they are two drawings of one list, not two lists.
-    renderAuditCards(logs, start);
-    const countBadge = document.getElementById('audit-count');
-    if (countBadge) countBadge.textContent = total + (total === 1 ? ' entry' : ' entries');
-    renderAuditPagination(total, pages);
-}
-
-function renderAuditPagination(total, pages) {
-    const host = document.getElementById('audit-pagination');
-    if (!host) return;
-    host.replaceChildren();
-    if (total <= _AUDIT_PAGE_SIZE) return;
-    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn btn-secondary btn-sm'; prev.textContent = '‹ Prev'; prev.disabled = _auditPage === 0;
-    prev.addEventListener('click', () => { if (_auditPage > 0) { _auditPage--; renderAuditPage(); } });
-    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn btn-secondary btn-sm'; next.textContent = 'Next ›'; next.disabled = _auditPage >= pages - 1;
-    next.addEventListener('click', () => { if (_auditPage < pages - 1) { _auditPage++; renderAuditPage(); } });
-    const label = document.createElement('span'); label.className = 'text-secondary text-sm';
-    const from = _auditPage * _AUDIT_PAGE_SIZE + 1;
-    const to = Math.min(total, (_auditPage + 1) * _AUDIT_PAGE_SIZE);
-    label.textContent = `${from}–${to} of ${total} · page ${_auditPage + 1} of ${pages}`;
-    host.appendChild(prev); host.appendChild(label); host.appendChild(next);
-}
-
-function openAuditEventModal(index) {
-    const modal = document.getElementById('audit-event-modal');
-    if (!modal) return;
-    _renderAuditEventModal(index);
-    modal.classList.add('active');
-}
-
-function _renderAuditEventModal(selectedIndex) {
-    const toc = document.getElementById('audit-event-toc');
-    const detail = document.getElementById('audit-event-detail');
-    if (!toc || !detail) return;
-    const { start, logs } = _auditPageSlice();
-    // Left: a table of contents of every event on the current page (the page is shown in the header).
-    toc.replaceChildren();
-    const head = document.createElement('div'); head.className = 'audit-toc-head text-tertiary text-xs';
-    head.textContent = `Page ${_auditPage + 1} · ${logs.length} event${logs.length === 1 ? '' : 's'}`;
-    toc.appendChild(head);
-    logs.forEach((log, i) => {
-        const gi = start + i;
-        const item = document.createElement('button'); item.type = 'button';
-        item.className = 'audit-toc-item' + (gi === selectedIndex ? ' active' : '');
-        const a = document.createElement('div'); a.className = 'audit-toc-action'; a.textContent = (log.action || '').replace(/_/g, ' '); item.appendChild(a);
-        const m = document.createElement('div'); m.className = 'audit-toc-meta text-tertiary text-xs'; m.textContent = `${log.username || '-'} · ${formatServerTime(log.timestamp)}`; item.appendChild(m);
-        item.addEventListener('click', () => _renderAuditEventModal(gi));
-        toc.appendChild(item);
-    });
-    // Right: every field of the selected event, then the full details payload.
-    detail.replaceChildren();
-    const log = _auditLogs[selectedIndex];
-    if (!log) { const p = document.createElement('p'); p.className = 'text-tertiary'; p.textContent = 'Event not found.'; detail.appendChild(p); return; }
-    const fields = [
-        ['Timestamp', formatServerTime(log.timestamp)],
-        ['User', log.username || '-'],
-        ['Action', (log.action || '').replace(/_/g, ' ')],
-        ['Status', log.status || '-'],
-        ['IP address', log.ip_address || '-'],
-    ];
-    ['resource', 'resource_type', 'target', 'vault_name', 'user_agent', 'user_id'].forEach(k => { if (log[k]) fields.push([k.replace(/_/g, ' '), String(log[k])]); });
-    const grid = document.createElement('div'); grid.className = 'audit-detail-fields';
-    fields.forEach(([k, v]) => {
-        const row = document.createElement('div'); row.className = 'audit-detail-row';
-        const key = document.createElement('div'); key.className = 'audit-detail-key'; key.textContent = k; row.appendChild(key);
-        const val = document.createElement('div'); val.className = 'audit-detail-val'; val.textContent = v; row.appendChild(val);
-        grid.appendChild(row);
-    });
-    detail.appendChild(grid);
-    if (log.details && typeof log.details === 'object' && Object.keys(log.details).length) {
-        const h = document.createElement('div'); h.className = 'audit-detail-key mt-md'; h.textContent = 'Full details'; detail.appendChild(h);
-        const pre = document.createElement('pre'); pre.className = 'audit-detail-json'; pre.textContent = JSON.stringify(log.details, null, 2); detail.appendChild(pre);
-    }
-}
-
-// The From/To inputs are datetime-local: a wall-clock time in the viewer's zone, with no zone
-// attached. Sent as typed, the server read it as UTC, so every timed filter was off by the viewer's
-// UTC offset — an admin filtering around an event they could see on the same screen got nothing,
-// and the CSV export had the same hole. Both readers now send the instant the person meant, with
-// its zone made explicit. A zone-less value parses as local time, which is exactly what it is.
-function auditFilterInstant(id) {
-    const localWallClock = (document.getElementById(id) || {}).value;
-    if (!localWallClock) return '';
-    const at = new Date(localWallClock);
-    return Number.isNaN(at.getTime()) ? '' : at.toISOString();
-}
-
-async function searchAuditLog(options) {
-    const tbody = document.getElementById('audit-log-body');
-    const countBadge = document.getElementById('audit-count');
-    // A live re-read must not blink. The spinner belongs to a search someone asked for; showing it
-    // every few seconds on its own would make a quiet page look busy and hide the rows being read.
-    const quiet = !!(options && options.silent);
-
-    try {
-        if (!quiet) tbody.innerHTML = '<tr><td colspan="6" class="text-center py-lg"><div class="loading-spinner mx-auto"></div></td></tr>';
-        // Keep the reader where they were across a live refresh: re-reading is not a new search.
-        const keepPage = quiet ? _auditPage : 0;
-        
-        // Get filter values
-        const filters = {
-            user_id: document.getElementById('audit-filter-user').value,
-            action: document.getElementById('audit-filter-action').value,
-            from_date: auditFilterInstant('audit-filter-from'),
-            to_date: auditFilterInstant('audit-filter-to')
-        };
-        
-        // Build query string
-        const queryParams = new URLSearchParams();
-        if (filters.user_id) queryParams.append('user_id', filters.user_id);
-        if (filters.action) queryParams.append('action', filters.action);
-        if (filters.from_date) queryParams.append('from_date', filters.from_date);
-        if (filters.to_date) queryParams.append('to_date', filters.to_date);
-        
-        const logs = await apiRequest(`/audit/log?${queryParams.toString()}`, { silent: true });
-        
-        // Store the fetched set and render the first page. Rows and the event modal are built with
-        // DOM APIs (below) so all values go through textContent.
-        _auditLogs = Array.isArray(logs) ? logs : [];
-        _auditPage = quiet ? keepPage : 0;
-        renderAuditPage();
-    } catch (error) {
-        console.error('Failed to search audit log:', error);
-        tbody.innerHTML = `
-            <tr>
-                <td colspan="6" class="text-center py-lg">
-                    <div class="alert alert-error">Failed to load audit log: ${escapeHtml(error.message)}</div>
-                </td>
-            </tr>
-        `;
-    }
-}
-
-// Export audit log to CSV
-async function exportAuditLog() {
-    try {
-        // Same filters as search
-        const filters = {
-            user_id: document.getElementById('audit-filter-user').value,
-            action: document.getElementById('audit-filter-action').value,
-            from_date: auditFilterInstant('audit-filter-from'),
-            to_date: auditFilterInstant('audit-filter-to')
-        };
-
-        const queryParams = new URLSearchParams();
-        if (filters.user_id) queryParams.append('user_id', filters.user_id);
-        if (filters.action) queryParams.append('action', filters.action);
-        if (filters.from_date) queryParams.append('from_date', filters.from_date);
-        if (filters.to_date) queryParams.append('to_date', filters.to_date);
-
-        // Fetch with the bearer token (a plain <a href> navigation can't send it),
-        // then save the returned CSV as a blob.
-        const resp = await fetch(`${API_BASE}/audit/export?${queryParams.toString()}`, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-        const blob = await resp.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `audit-log-${new Date().toISOString().split('T')[0]}.csv`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-
-        showSuccess('Audit log exported');
-    } catch (error) {
-        console.error('Failed to export audit log:', error);
-        showError('Failed to export audit log: ' + error.message);
-    }
-}
-
-// Clear audit filters
-function clearAuditFilters() {
-    document.getElementById('audit-filter-user').value = '';
-    document.getElementById('audit-filter-action').value = '';
-    document.getElementById('audit-filter-from').value = '';
-    document.getElementById('audit-filter-to').value = '';
-    
-    // Clear table
-    document.getElementById('audit-log-body').innerHTML = `
-        <tr>
-            <td colspan="6" class="text-center py-xl text-secondary">
-                Click "Search" to load audit log entries
-            </td>
-        </tr>
-    `;
-    document.getElementById('audit-count').textContent = '0 entries';
-}
 
 // Attach settings event listeners
 function attachSettingsListeners() {
@@ -10986,37 +10097,6 @@ function attachSettingsListeners() {
         window.addEventListener('resize', _closeDynSubmenu);
         window.addEventListener('scroll', _closeDynSubmenu, true);
     }
-    
-    // Audit log buttons
-    const searchBtn = document.getElementById('audit-search-btn');
-    if (searchBtn) {
-        searchBtn.addEventListener('click', searchAuditLog);
-    }
-    
-    // Remembered view, live toggle. applyAuditView() runs here so the stored choice is in force on
-    // first paint rather than after the first search.
-    applyAuditView();
-    document.querySelectorAll('[data-audit-view]').forEach(btn => {
-        btn.addEventListener('click', () => setAuditView(btn.getAttribute('data-audit-view')));
-    });
-    const auditLive = document.getElementById('audit-live');
-    if (auditLive) auditLive.addEventListener('change', () => setAuditLive(auditLive.checked));
-
-    const exportBtn = document.getElementById('audit-export-btn');
-    if (exportBtn) {
-        exportBtn.addEventListener('click', exportAuditLog);
-    }
-    
-    const clearBtn = document.getElementById('audit-clear-filters-btn');
-    if (clearBtn) {
-        clearBtn.addEventListener('click', clearAuditFilters);
-    }
-
-    // Audit event modal: close on the × and on a backdrop click.
-    const aeModal = document.getElementById('audit-event-modal');
-    const aeClose = document.getElementById('audit-event-close');
-    if (aeClose && aeModal) aeClose.addEventListener('click', () => aeModal.classList.remove('active'));
-    if (aeModal) aeModal.addEventListener('click', (e) => { if (e.target === aeModal) aeModal.classList.remove('active'); });
 }
 
 // Open Vault (Placeholder - needs SFTP integration or file listing)
@@ -15408,7 +14488,9 @@ async function restoreLastView() {
         }
         return true;
     }
-    if (nav.section && nav.section !== 'dashboard') {
+    // A page this release no longer has (the Live Monitor, say) is not restored: the dashboard is.
+    if (nav.section && nav.section !== 'dashboard'
+            && document.querySelector(`.sidebar-item[data-section="${nav.section}"]`)) {
         navigateToSection(nav.section);
         return true;
     }
@@ -21302,13 +20384,10 @@ function copyToClipboard(elementId) {
 function cleanupPreviousView(newSection) {
     console.log('Cleaning up resources before switching to:', newSection);
     
-    // The activity socket is app-wide (it delivers live notifications on ANY page, e.g. a note you
-    // were just sent), so navigation must NOT close it -- it is torn down only on logout. Previously
-    // this closed it on every non-monitor navigation, which silently disabled live notifications
-    // after the first page change. Just make sure it's connected in case a prior drop left it closed.
-    if (newSection !== 'monitor') {
-        ensureMonitorSocket();
-    }
+    // The socket is app-wide (it delivers live notifications on ANY page, e.g. a note you were just
+    // sent), so navigation must NOT close it -- it is torn down only on logout. Just make sure it's
+    // connected in case a prior drop left it closed.
+    ensureAppSocket();
     
     // Cleanup temp creds refresh intervals
     if (newSection !== 'temp-creds') {
@@ -21737,8 +20816,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadUsers().catch(err => console.error('Failed to load users:', err));
                 } else if (section === 'groups') {
                     loadGroups().catch(err => console.error('Failed to load groups:', err));
-                } else if (section === 'monitor') {
-                    initMonitor();
                 } else if (section === 'activity') {
                     if (typeof initActivity === 'function') initActivity();
                 } else if (section === 'settings') {

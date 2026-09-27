@@ -2789,65 +2789,6 @@ def activity_export(
     )
 
 
-def _csv_formula_safe(value):
-    """Neutralise spreadsheet formula injection. A CSV cell that begins with =, +, -, @ (or a
-    leading tab / carriage return) is interpreted as a FORMULA by Excel / Google Sheets. Audit
-    cells carry attacker-influenced text (e.g. a failed-login username recorded verbatim), so a
-    value like ``=cmd|'/c calc'!A1`` would execute when an admin opens the export. Prefix any such
-    cell with a single quote so the spreadsheet treats it as literal text."""
-    if isinstance(value, str) and value[:1] in ('=', '+', '-', '@', '\t', '\r'):
-        return "'" + value
-    return value
-
-
-@app.get("/audit/export")
-async def export_audit_log(
-    user_id: Optional[str] = None,
-    action: Optional[str] = None,
-    from_date: Optional[str] = None,
-    to_date: Optional[str] = None,
-    current_user: User = Depends(require_interactive_admin),
-    db: Session = Depends(get_db),
-):
-    """Export the filtered audit log as CSV (admin only)."""
-    import csv
-    from app.core.models import AuditLog
-    rows = (
-        _build_audit_query(db, user_id, action, from_date, to_date)
-        .order_by(AuditLog.timestamp.desc())
-        .limit(10000)
-        .all()
-    )
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["Timestamp", "Username", "Temp Credential", "Action", "Status",
-                     "IP Address", "Resource Type", "Resource ID", "Details"])
-    for r in rows:
-        writer.writerow([_csv_formula_safe(cell) for cell in (
-            r.timestamp.isoformat() if r.timestamp else "",
-            r.username or "",
-            str(r.temp_credential_id) if r.temp_credential_id else "",
-            r.action or "",
-            r.status or "",
-            r.ip_address or "",
-            r.resource_type or "",
-            r.resource_id or "",
-            json.dumps(r.details) if r.details else "",
-        )])
-    # Recorded after the rows are written out: the audit write commits, which would expire every
-    # loaded row and reload each one with its own query.
-    _audit_change(db, current_user, "audit_exported", "audit_log", None, {
-        "rows": len(rows), "format": "csv",
-        "filters": {k: v for k, v in (("user_id", user_id), ("action", action),
-                                      ("from_date", from_date), ("to_date", to_date)) if v},
-    })
-    return Response(
-        content=buf.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=audit-log.csv"},
-    )
-
-
 # ---------------------------------------------------------------------------
 # Global application settings (admin Settings page)
 #
@@ -7700,24 +7641,6 @@ async def terminate_temp_credential_sessions(
         "message": f"Terminated {terminated_count} active session(s)",
         "terminated_count": terminated_count
     }
-
-
-@app.get("/monitor/stats")
-async def monitor_stats(
-    current_user: User = Depends(require_interactive_admin),
-    db: Session = Depends(get_db)
-):
-    """Live-monitor headline counts: users and sessions active in the last hour."""
-    from sqlalchemy import func, distinct
-    from app.core.models import ActiveSession
-    grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=65)
-    active_filter = (
-        ActiveSession.is_active == True,  # noqa: E712
-        ActiveSession.last_activity >= grace_cutoff,
-    )
-    active_users = db.query(func.count(distinct(ActiveSession.user_id))).filter(*active_filter).scalar() or 0
-    active_sessions = db.query(func.count(ActiveSession.id)).filter(*active_filter).scalar() or 0
-    return {"active_users": active_users, "active_sessions": active_sessions}
 
 
 @app.get("/storage/stats")

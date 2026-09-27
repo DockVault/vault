@@ -122,19 +122,6 @@ def test_the_events_export_downloads_the_rows_on_screen(page: Page, anon, activi
     expect(page.locator(".toast").last).to_contain_text("Exported 1 event")
 
 
-def test_settings_audit_log_points_to_the_events_tab(page: Page, activity_admin):
-    _login(page, activity_admin)
-    page.click('.sidebar-item[data-section="settings"]')
-    page.click('#settings-section .tab-btn[data-tab="audit"]')
-    page.click("#audit-open-activity")
-    expect(page.locator("#activity-section")).to_be_visible(timeout=10000)
-    expect(page.locator("#activity-tab-events")).to_be_visible()
-    expect(page.locator("#activity-tab-overview")).to_be_hidden()
-    # The tab is searched on arrival: at least this admin's own sign-in is listed.
-    expect(page.locator("#activity-rows tr.activity-row").first).to_be_visible(timeout=10000)
-    expect(page.locator("#activity-summary")).to_contain_text("Showing")
-
-
 def test_an_event_the_server_records_on_its_own_is_by_the_system(page: Page, activity_admin):
     """A file deleted at its expiry has no one behind it: the page says System, not Unknown, which
     stays for a row whose actor is simply not recorded. The events are served here, so the test does

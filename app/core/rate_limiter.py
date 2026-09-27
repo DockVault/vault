@@ -40,12 +40,13 @@ class RateLimitRule:
 
 
 # GET endpoints the UI POLLS on a timer (or fetches in bursts) — security events, notifications,
-# audit, monitor stats. They get their own lenient bucket so normal polling + browsing never trips
-# the shared "default" bucket. Matched exactly (path already stripped of any trailing slash).
+# audit, and the Activity page's list and summary, which it re-reads as events arrive. They get their
+# own lenient bucket so normal polling + browsing never trips the shared "default" bucket. Matched
+# exactly (path already stripped of any trailing slash).
 POLL_GET_PATHS = frozenset({
     "/audit/events", "/audit/log",
     "/notifications", "/notifications/unread-count",
-    "/monitor/stats",
+    "/activity/events", "/activity/summary",
     "/api/security/metrics", "/api/security/alerts", "/api/monitoring/metrics",
 })
 

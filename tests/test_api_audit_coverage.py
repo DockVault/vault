@@ -89,10 +89,10 @@ def test_vault_settings_are_recorded_with_what_changed(admin, temp_vault):
 
 def test_exporting_the_audit_log_is_recorded(admin):
     marker = unique("nobody")
-    r = admin.get("/audit/export", params={"action": marker})
+    r = admin.get("/activity/export", params={"q": marker})
     assert r.status_code == 200, r.text
     time.sleep(0.3)
     body = admin.get("/activity/events", params={"q": marker, "category": "administration"}).json()
     rows = [e for e in body["events"] if e["action"] == "audit_exported"]
     assert len(rows) == 1, body["events"]
-    assert rows[0]["details"]["filters"] == {"action": marker} and rows[0]["details"]["rows"] == 0
+    assert rows[0]["details"]["filters"] == {"q": marker} and rows[0]["details"]["rows"] == 0

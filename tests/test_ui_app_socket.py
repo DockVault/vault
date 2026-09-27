@@ -1,10 +1,13 @@
-"""The monitor WebSocket auto-reconnect coalesces to a single pending timer (no stacking).
+"""The app-wide socket in the page: it reconnects without stacking timers, hands the Activity signal to
+the page, and the pages it used to feed are gone.
 
-The live event feed connects a single app-wide WebSocket and auto-reconnects on close/error. It has
-several entry points (initial login, opening the Monitor page, the "Reconnect" button, the onclose
-handler, and a WebSocket-constructor throw). Without coalescing, each of those could schedule its own
-5s retry, so repeated failures fan out into a burst of connection attempts. This asserts that no matter
-how many times a (re)connect is triggered, at most ONE reconnect timer is ever pending.
+The socket is opened at sign-in and auto-reconnects on close or error. It has several entry points
+(sign-in, a navigation that finds it closed, the onclose handler, and a WebSocket-constructor throw).
+Without coalescing, each could schedule its own 5 s retry, so repeated failures fan out into a burst of
+connection attempts; at most ONE reconnect timer may ever be pending.
+
+Until 0.33.0 the socket also fed the Live Monitor page, and the Settings -> Audit Log tab read the log
+for itself; the Activity page replaced both.
 """
 import pytest
 from playwright.sync_api import Page, expect
@@ -39,9 +42,9 @@ def test_reconnect_timer_does_not_stack(page: Page, admin_creds):
             };
             window.clearTimeout = function (id) { active.delete(id); return realClear(id); };
             try {
-                // Hammer the entry point the way several sources (login + init + button) would.
-                for (let i = 0; i < 6; i++) connectMonitorWebSocket();
-                return active.size;   // coalesced fix: 1. stacking bug: 6.
+                // Hammer the entry point the way several sources (sign-in + navigation) would.
+                for (let i = 0; i < 6; i++) connectAppSocket();
+                return active.size;   // coalesced: 1. stacking: 6.
             } finally {
                 window.setTimeout = realSet;
                 window.clearTimeout = realClear;
@@ -55,8 +58,7 @@ def test_reconnect_timer_does_not_stack(page: Page, admin_creds):
 def test_stale_socket_close_does_not_rearm_reconnect(page: Page, admin_creds):
     """When a (re)connect supersedes a still-open socket, a LATE close event from the old socket must
     not re-arm the reconnect timer (which would tear down the healthy replacement 5s later), while the
-    CURRENT socket's close DOES arm exactly one reconnect. Exercises the real onclose path (the ctor-
-    throw test above only covers the catch path)."""
+    CURRENT socket's close DOES arm exactly one reconnect."""
     _login(page, admin_creds["username"], admin_creds["password"])
     res = page.evaluate(
         """() => {
@@ -77,15 +79,17 @@ def test_stale_socket_close_does_not_rearm_reconnect(page: Page, admin_creds):
             window.WebSocket = FakeWS;
             const out = {};
             try {
-                connectMonitorWebSocket();                  // socket A becomes current
+                connectAppSocket();                         // socket A becomes current
                 const a = created[created.length - 1];
-                connectMonitorWebSocket();                  // supersedes A; socket B becomes current
+                connectAppSocket();                         // supersedes A; socket B becomes current
                 const b = created[created.length - 1];
                 if (b.onopen) b.onopen();                   // B connects -> clears any pending reconnect
                 if (a.onclose) a.onclose();                 // STALE close from the superseded A
                 out.pendingAfterStaleClose = active.size;   // guarded: must be 0
                 if (b.onclose) b.onclose();                 // CURRENT close from B
                 out.pendingAfterCurrentClose = active.size; // onclose arms exactly one: must be 1
+                closeAppSocket();                           // sign-out: nothing left pending
+                out.pendingAfterSignOut = active.size;
                 return out;
             } finally {
                 window.setTimeout = realSet;
@@ -96,3 +100,47 @@ def test_stale_socket_close_does_not_rearm_reconnect(page: Page, admin_creds):
     )
     assert res["pendingAfterStaleClose"] == 0, f"a stale socket's close re-armed the reconnect: {res}"
     assert res["pendingAfterCurrentClose"] == 1, f"current close should arm exactly one reconnect: {res}"
+    assert res["pendingAfterSignOut"] == 0, f"signing out left a reconnect pending: {res}"
+
+
+def test_the_activity_signal_reaches_the_page_as_an_event(page: Page, admin_creds):
+    _login(page, admin_creds["username"], admin_creds["password"])
+    got = page.evaluate(
+        """() => {
+            const seen = [];
+            const listen = (e) => seen.push(e.detail);
+            window.addEventListener('dockvault:activity', listen);
+            try {
+                handleSocketFrame({ type: 'activity',
+                                    events: [{ id: '8c6f0d2e-1111-4a4a-9a9a-000000000001', category: 'sign_in' }] });
+                handleSocketFrame({ type: 'connected', message: 'Connected as admin' });
+                handleSocketFrame({ event: { type: 'upload', user: 'someone' } });
+                return seen;
+            } finally {
+                window.removeEventListener('dockvault:activity', listen);
+            }
+        }"""
+    )
+    assert got == [{"events": [{"id": "8c6f0d2e-1111-4a4a-9a9a-000000000001", "category": "sign_in"}]}]
+
+
+def test_the_live_monitor_and_the_settings_audit_log_are_gone(page: Page, admin_creds):
+    _login(page, admin_creds["username"], admin_creds["password"])
+    expect(page.locator('.sidebar-item[data-section="activity"]')).to_be_visible()
+    assert page.locator('.sidebar-item[data-section="monitor"]').count() == 0
+    assert page.locator("#monitor-section").count() == 0
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
+    assert page.locator('.tab-btn[data-tab="audit"]').count() == 0
+    assert page.locator("#settings-tab-audit").count() == 0
+
+
+def test_a_page_remembered_from_an_older_release_opens_the_dashboard(page: Page, admin_creds):
+    # A browser whose last view was the Live Monitor, before the upgrade.
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.evaluate("sessionStorage.setItem('dv_nav', JSON.stringify({ section: 'monitor' }))")
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#dashboard-section")).to_be_visible(timeout=10000)
+    # And the dashboard is loaded, not left as the empty shell a missing page used to leave behind.
+    expect(page.locator("#dashboard-vaults-count")).not_to_have_text("-", timeout=10000)

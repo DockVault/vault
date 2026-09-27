@@ -17,7 +17,7 @@
         { before: 'dashboard', label: 'Overview' },
         { before: 'vaults', label: 'Storage' },
         { before: 'temp-creds', label: 'Access' },
-        { before: 'monitor', label: 'System' }
+        { before: 'activity', label: 'System' }
     ];
 
     function injectGroupLabels() {

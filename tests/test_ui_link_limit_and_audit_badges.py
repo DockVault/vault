@@ -6,7 +6,8 @@ before sending anything, and the server's refusal, reached by a client that skip
 the same way.
 
 The audit log painted every status other than "success" red, so a download's "authorized" row
-(an allowed request) looked like a failure. Only failures and refusals are red now.
+(an allowed request) looked like a failure. Only failures and refusals are red now; the Activity page
+paints its rows with the same mapping (auditStatusBadge).
 """
 import pytest
 from playwright.sync_api import Page, expect
@@ -114,38 +115,3 @@ def test_only_a_failure_or_a_refusal_is_red_in_the_audit_log(page: Page, admin_c
         "unconfirmed": "warning", "failure": "danger", "failed": "danger", "error": "danger",
         "refused": "danger", "something-new": "secondary", "undefined": "secondary",
     }
-
-
-def test_an_authorized_download_row_is_not_painted_as_a_failure(page: Page, admin, admin_creds):
-    """The reported case, as a person meets it: the audit page itself, both views."""
-    rows = [
-        {"id": 1, "timestamp": "2026-09-25T10:00:00Z", "action": "file_download", "status": "authorized",
-         "username": "someone", "ip_address": "198.51.100.7", "resource_type": "file", "details": {}},
-        {"id": 2, "timestamp": "2026-09-25T10:00:01Z", "action": "login", "status": "failure",
-         "username": "someone", "ip_address": "198.51.100.7", "resource_type": "user", "details": {}},
-    ]
-    import json as _json
-
-    def _fulfil(route):
-        if route.request.method == "GET":
-            route.fulfill(status=200, content_type="application/json", body=_json.dumps(rows))
-        else:
-            route.continue_()
-
-    page.route(lambda url: "/audit/log" in url, _fulfil)
-    _login(page, admin_creds["username"], admin_creds["password"])
-    page.evaluate("() => navigateToSection('settings')")
-    page.wait_for_selector("#settings-section.active", timeout=15000)
-    page.evaluate("""() => { const t = [...document.querySelectorAll('.tabs .tab-btn')]
-                        .find(x => x.getAttribute('data-tab') === 'audit'); if (t) t.click(); }""")
-    page.wait_for_selector("#settings-tab-audit.active", timeout=10000)
-    page.click("#audit-search-btn")
-
-    for view, scope in (("table", "#settings-tab-audit .data-table-wrapper"), ("cards", "#audit-log-cards")):
-        page.click(f"#audit-view-{view}")
-        authorized = page.locator(f"{scope} .badge", has_text="authorized").first
-        expect(authorized).to_be_visible(timeout=10000)
-        expect(authorized).to_have_class("badge badge-info")
-        expect(page.locator(f"{scope} .badge", has_text="failure").first).to_have_class("badge badge-danger")
-    # In the detailed view only the failure's card is marked as bad news.
-    expect(page.locator("#audit-log-cards .audit-card.is-bad")).to_have_count(1)
