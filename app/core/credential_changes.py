@@ -1,6 +1,6 @@
 """Changes an administrator makes to someone else's sign-in credentials, and the rule on them.
 
-Four changes count, each as one change:
+These changes count, each as one change:
   * a password set by the administrator;
   * a password reset link, copied or emailed;
   * a second-factor reset;
