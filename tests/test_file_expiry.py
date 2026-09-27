@@ -147,14 +147,26 @@ def test_postponed_hides_nothing(postponed):
 
 
 def test_postponed_sweeps_nothing(postponed, monkeypatch):
-    """Not even a session is opened."""
+    """Not even a session is opened.
+
+    The stand-in records the attempt rather than raising: sweep_once catches every exception from a
+    batch and logs it, so an assertion raised in here would be swallowed, and the test would pass
+    whether or not the switch was checked."""
     import app.core.database as database
+    opened = []
 
-    def _boom():
-        raise AssertionError("the sweep opened a database session while postponed")
+    @contextlib.contextmanager
+    def _record():
+        opened.append(1)
+        yield object()
 
-    monkeypatch.setattr(database, "get_db_context", _boom)
+    monkeypatch.setattr(database, "get_db_context", _record)
     assert file_expiry.sweep_once() == 0
+    assert opened == [], "the sweep opened a database session while postponed"
+    # The same stand-in does see a session opened once enforcement is on, so it can tell.
+    monkeypatch.setattr(settings, "enforce_file_expiry", True)
+    file_expiry.sweep_once()
+    assert opened == [1]
 
 
 def test_the_setting_defaults_on_and_reads_false_from_the_env():
@@ -336,6 +348,30 @@ def test_a_vault_someone_else_holds_is_left_for_the_next_run(tmp_path):
     assert _names(db.log).count("lock") == 1, "the file rows are never locked"
     assert "delete" not in _names(db.log) and "add" not in _names(db.log)
     assert (tmp_path / "a").exists()
+
+
+def test_only_the_files_of_the_vaults_the_sweep_holds_are_deleted(tmp_path):
+    """Some vaults held by someone else, others free. The file rows of a held vault are not locked
+    by anyone, so only the file query's vault filter keeps the sweep off them -- and off counters
+    it does not hold the lock for. Run against a session that applies the filters it is given."""
+    from _memory_db import MemoryDB
+
+    due = datetime(2026, 1, 1)
+    vaults = [SimpleNamespace(id=uuid.uuid4(), expire_files_after_days=1) for _ in range(4)]
+    files = [_row(v.id, 10 + i, tmp_path, f"f{i}", due) for i, v in enumerate(vaults)]
+    db = MemoryDB({Vault: vaults, File: files})
+    db.held = {vaults[1].id, vaults[3].id}            # another session holds these vault rows
+    svc = _service(db, tmp_path)
+
+    out = svc.cleanup_expired_files(now=datetime(2026, 9, 26))
+
+    # (Rows due at the same moment come back in file-id order, which is random here.)
+    assert sorted((d["file_id"], d["vault_id"]) for d in out) == sorted(
+        (files[i].id, vaults[i].id) for i in (0, 2))
+    assert db.rows_of(File) == [files[1], files[3]]
+    assert svc.totals == {vaults[0].id: (-10, -1), vaults[2].id: (-12, -1)}
+    assert sorted(a.resource_id for a in db.added) == sorted(str(files[i].id) for i in (0, 2))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f1", "f3"]
 
 
 def test_a_failed_commit_rolls_back_and_destroys_nothing(tmp_path):
