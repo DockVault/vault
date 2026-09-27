@@ -14,6 +14,9 @@ written back, so failures arriving together each wrote the same number and all b
 These run the real code against the real users and audit_logs tables in a throwaway SQLite database.
 test_account_auto_lock_audit_live.py drives the same through sign-in on a running stack, including
 failures sent in parallel.
+
+The rows are built by AuditLogger.build_row, so they get what every audit row gets (the request's
+channel, method, route and user agent, and the name redaction) while committing with the lock itself.
 """
 import re
 import tempfile
@@ -29,6 +32,7 @@ from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
 
+from app.core import request_context as rc  # noqa: E402
 from app.core.models import AuditLog, RoleEnum, User  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.services import auth_service as A  # noqa: E402
@@ -292,11 +296,127 @@ def test_the_periodic_cleanup_releases_through_the_audited_path():
     assert not re.search(r'\{"is_locked": False, "failed_login_attempts": 0', reaper)
 
 
-def test_the_lock_rows_are_built_without_names():
-    """They are added to the caller's transaction directly, bypassing AuditLogger's name redaction,
-    so they must never carry a name key."""
+def test_a_lock_row_goes_through_the_loggers_name_redaction(db_factory):
     from app.services.audit_logger import REDACTED_NAME_KEYS
-    src = (ROOT / "app" / "services" / "auth_service.py").read_text(encoding="utf-8")
-    for call in re.findall(r"_lock_audit_row\((.*?)\}\)", src, re.S):
-        for key in REDACTED_NAME_KEYS:
-            assert key not in call, call
+    s = db_factory()
+    try:
+        row = A._lock_audit_row(s, A.AUTO_LOCKED_ACTION, uuid.uuid4(), "maria", IP,
+                                {"failed_attempts": 3, **{k: "a name" for k in REDACTED_NAME_KEYS}})
+    finally:
+        s.close()
+    assert row.details == {"failed_attempts": 3}
+
+
+# --------------------------------------------------------------------------- one transaction, one row
+
+class _Route:
+    path = "/auth/login"
+
+
+@pytest.fixture(params=["web", "sftp"])
+def signing_in(request):
+    """A sign-in as each server sees it: a web request, or the SFTP process, whose every row is
+    on the SFTP channel. Yields what the rows it writes should carry."""
+    if request.param == "web":
+        token = rc.set_request_context(rc.RequestContext("POST", "/auth/login", "Mozilla/5.0", "web",
+                                                         {"route": _Route()}))
+        yield ("web", "POST", "/auth/login", "Mozilla/5.0")
+        rc.reset_request_context(token)
+    else:
+        rc.set_process_default_channel("sftp")
+        yield ("sftp", None, None, None)
+        rc.set_process_default_channel(None)
+
+
+def _request_fields(row):
+    return (row.channel, row.method, row.endpoint, row.user_agent)
+
+
+def test_the_lock_row_carries_the_sign_in_that_armed_it(db_factory, limits, signing_in):
+    uid = _add_user(db_factory, failed_login_attempts=MAX_ATTEMPTS - 1)
+    _fail(db_factory, uid)
+    (row,) = _rows(db_factory, A.AUTO_LOCKED_ACTION)
+    assert _request_fields(row) == signing_in and row.ip_address == IP
+
+
+def test_the_unlock_row_carries_the_sign_in_that_cleared_it(db_factory, limits, signing_in):
+    uid = _add_user(db_factory, is_locked=True, locked_until=_now() - timedelta(minutes=2),
+                    failed_login_attempts=MAX_ATTEMPTS)
+    s, user = _load(db_factory, uid)
+    svc = A.AuthService(s)
+    svc._check_rate_limit = lambda *a, **k: None
+    try:
+        with pytest.raises(A.InvalidCredentialsError):
+            svc.authenticate_user(user.username, "wrong-password", IP)
+    finally:
+        s.close()
+    (row,) = _rows(db_factory, A.AUTO_UNLOCKED_ACTION)
+    assert _request_fields(row) == signing_in and row.ip_address == IP
+
+
+def test_the_timer_unlock_row_has_no_request(db_factory):
+    """The periodic cleanup runs outside any request: no channel, route or address."""
+    _add_user(db_factory, is_locked=True, locked_until=_now() - timedelta(minutes=2))
+    s = db_factory()
+    try:
+        assert A.release_expired_locks(s) == 1
+        s.commit()
+    finally:
+        s.close()
+    (row,) = _rows(db_factory, A.AUTO_UNLOCKED_ACTION)
+    assert _request_fields(row) == (None, None, None, None) and row.ip_address is None
+
+
+def _count_commits(s):
+    """Replace the session's commit with one that records, for each commit, the audit rows it
+    writes (those pending in the session at that moment)."""
+    commits, real = [], s.commit
+
+    def commit():
+        commits.append(sorted(o.action for o in s.new if isinstance(o, AuditLog)))
+        real()
+    s.commit = commit
+    return commits
+
+
+def test_the_lock_and_its_row_are_one_commit(db_factory, limits):
+    uid = _add_user(db_factory, failed_login_attempts=MAX_ATTEMPTS - 1)
+    s, user = _load(db_factory, uid)
+    commits = _count_commits(s)
+    try:
+        A.AuthService(s)._record_failed_login(user.username, IP, user)
+    finally:
+        s.close()
+    assert commits == [[A.AUTO_LOCKED_ACTION]], "one commit, and it writes the lock's row"
+    assert _state(db_factory, uid)[1] is True
+
+
+def test_a_lock_whose_commit_fails_leaves_neither_the_lock_nor_its_row(db_factory, limits):
+    uid = _add_user(db_factory, failed_login_attempts=MAX_ATTEMPTS - 1)
+    s, user = _load(db_factory, uid)
+
+    def failing_commit():
+        s.flush()                    # everything reached the database, then the commit failed
+        raise RuntimeError("commit failed")
+    s.commit = failing_commit
+    try:
+        with pytest.raises(RuntimeError):
+            A.AuthService(s)._record_failed_login(user.username, IP, user)
+        s.rollback()
+    finally:
+        s.close()
+    assert _state(db_factory, uid) == (MAX_ATTEMPTS - 1, False, None)
+    assert _rows(db_factory, A.AUTO_LOCKED_ACTION) == []
+
+
+def test_an_unlock_and_its_row_are_one_commit_made_by_the_caller(db_factory):
+    _add_user(db_factory, is_locked=True, locked_until=_now() - timedelta(minutes=2))
+    s = db_factory()
+    commits = _count_commits(s)
+    try:
+        assert A.release_expired_locks(s) == 1
+        assert commits == [], "release_expired_locks commits nothing itself"
+        s.commit()
+    finally:
+        s.close()
+    assert commits == [[A.AUTO_UNLOCKED_ACTION]]

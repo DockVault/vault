@@ -385,6 +385,65 @@ def test_a_failed_commit_rolls_back_and_destroys_nothing(tmp_path):
     assert (tmp_path / "a").exists(), "a row that is still live keeps its bytes"
 
 
+class _Discard:
+    """A session for log_action to write into and forget."""
+
+    def add(self, obj):
+        pass
+
+    def commit(self):
+        pass
+
+
+@pytest.mark.parametrize("in_request", [False, True], ids=["as-it-runs", "inside-a-request"])
+def test_each_audit_row_is_the_one_log_action_would_write(tmp_path, in_request):
+    """The rows are built by AuditLogger.build_row, so each is what log_action would store for the same
+    event, under the sweep's own clock. The sweep runs outside any request, so its rows carry no
+    channel, route or address; the second case sets up a request only to show that the logger's rules
+    are the ones applied (a row built by hand would ignore it)."""
+    from app.core import request_context as rc
+    from app.services.audit_logger import AuditLogger
+
+    v1, due, now = uuid.uuid4(), datetime(2026, 9, 26, 11, 0), datetime(2026, 9, 26, 12, 0)
+    rows = [_row(v1, 1, tmp_path, "a", due), _row(v1, 2, tmp_path, "b", due)]
+    db = _DB([[(v1,)], [(v1,)], rows])
+    token = rc.set_request_context(rc.RequestContext("POST", "/x", "ua", "web", {})) if in_request else None
+    try:
+        _service(db, tmp_path).cleanup_expired_files(now=now)
+        expected = [AuditLogger(_Discard()).log_action(
+            action="file_expired", status="success", resource_type="file", resource_id=str(r.id),
+            details={"vault_id": str(v1), "expires_at": due.isoformat()}) for r in rows]
+    finally:
+        if token is not None:
+            rc.reset_request_context(token)
+
+    columns = [c.name for c in AuditLog.__table__.columns if c.name not in ("id", "timestamp")]
+    assert [{c: getattr(a, c) for c in columns} for a in db.added] == [
+        {c: getattr(e, c) for c in columns} for e in expected]
+    assert [a.channel for a in db.added] == (["web"] * 2 if in_request else [None] * 2)
+    assert all(a.timestamp == now for a in db.added)
+
+
+def test_the_audit_rows_commit_and_roll_back_with_the_deletions(tmp_path):
+    v1, due = uuid.uuid4(), datetime(2026, 1, 1)
+    rows = [_row(v1, 1, tmp_path, "a", due), _row(v1, 2, tmp_path, "b", due)]
+    db = _DB([[(v1,)], [(v1,)], rows])
+    _service(db, tmp_path).cleanup_expired_files()
+    order = _names(db.log)
+    assert order.count("commit") == 1, "one commit for the deletions and every audit row"
+    assert order.count("add") == 2
+    assert max(i for i, k in enumerate(order) if k in ("delete", "add")) < order.index("commit")
+
+    rows = [_row(v1, 1, tmp_path, "c", due), _row(v1, 2, tmp_path, "d", due)]
+    db = _DB([[(v1,)], [(v1,)], rows], fail_commit=True)
+    with pytest.raises(RuntimeError):
+        _service(db, tmp_path).cleanup_expired_files()
+    order = _names(db.log)
+    # Both rows were in the transaction whose commit failed, and it was rolled back.
+    assert order.count("add") == 2 and "commit" not in order and order[-1] == "rollback"
+    assert max(i for i, k in enumerate(order) if k in ("delete", "add")) < order.index("rollback")
+
+
 def test_a_blob_that_is_already_gone_or_will_not_go_does_not_stop_the_others(tmp_path, monkeypatch):
     v1 = uuid.uuid4()
     rows = [_row(v1, 1, tmp_path, "a", datetime(2026, 1, 1)),

@@ -25,8 +25,9 @@ _last_audit_cleanup_at = None
 # tables (and, for a zero-knowledge vault, the residual plaintext label), so they must never be
 # persisted in an audit row's `details` JSON. log_action() strips them on every write, and the boot
 # migration app/core/audit_migrations.py purges them from legacy rows -- both read THIS ONE list, so
-# adding a key here covers both surfaces at once. Any code that constructs an AuditLog directly
-# (bypassing log_action) must not put one of these keys in `details`.
+# adding a key here covers both surfaces at once. A row that must commit with the caller's own
+# transaction is built with AuditLogger.build_row, which strips them too; nothing else constructs an
+# AuditLog (tests/test_audit_route_coverage.py holds that).
 REDACTED_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
 
 
@@ -73,6 +74,47 @@ class AuditLogger:
             
         Returns:
             Created AuditLog object
+        """
+        audit_log = self.build_row(
+            action=action, status=status, user=user, user_id=user_id, username=username,
+            resource_type=resource_type, resource_id=resource_id, ip_address=ip_address,
+            user_agent=user_agent, method=method, endpoint=endpoint, details=details,
+            error_message=error_message, channel=channel,
+        )
+        self.db.add(audit_log)
+        self.db.commit()
+
+        return audit_log
+
+    def build_row(
+        self,
+        action: str,
+        status: str,
+        user: Optional[User] = None,
+        user_id: Optional[uuid.UUID] = None,
+        username: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        method: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+        channel: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> AuditLog:
+        """The row log_action writes for these arguments, neither added to a session nor committed.
+
+        For a caller whose audit row must commit in the same transaction as the change it records
+        (an automatic account lock, the file-expiry sweep): it adds the row to its own session, so
+        its commit writes both and its rollback drops both. log_action cannot give that, because it
+        commits on its own. log_action is this method plus the add and the commit, so a row built
+        here gets everything log_action applies: the name redaction, the acting user's name and
+        temporary credential, and the request's channel, method, route, user agent and address
+        where they are known.
+
+        ``timestamp`` is the row's time, now by default, which is what log_action stores.
         """
         temp_credential_id = None
         if user:
@@ -130,7 +172,7 @@ class AuditLogger:
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=timestamp if timestamp is not None else datetime.now(timezone.utc),
             ip_address=ip_address,
             user_agent=user_agent,
             method=method,
@@ -140,10 +182,6 @@ class AuditLogger:
             details=details,
             error_message=error_message
         )
-        
-        self.db.add(audit_log)
-        self.db.commit()
-
         return audit_log
 
     def log_custom_action(

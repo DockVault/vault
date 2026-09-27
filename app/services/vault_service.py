@@ -2223,7 +2223,7 @@ class VaultService:
 
         Does not consult ENFORCE_FILE_EXPIRY; the caller decides whether to sweep. A database error
         rolls the batch back and is raised for the caller to log."""
-        from app.core.models import AuditLog
+        from app.services.audit_logger import AuditLogger
 
         now = file_expiry.as_stored_utc(now) if now is not None else file_expiry.utc_now()
         batch_size = max(1, int(batch_size))
@@ -2267,11 +2267,11 @@ class VaultService:
                 self._adjust_vault_totals_by_id(vault_id, -size, -count)
             self.db.query(File).filter(File.id.in_([r.id for r in rows])).delete(
                 synchronize_session=False)
+            audit = AuditLogger(self.db)
             for r in rows:
-                # Built directly rather than through AuditLogger.log_action, which commits on its
-                # own: the audit rows and the deletions must commit together or not at all. No
-                # name goes in `details` (see REDACTED_NAME_KEYS in the audit logger).
-                self.db.add(AuditLog(
+                # Built, not logged: log_action commits on its own, and the audit rows and the
+                # deletions must commit together or not at all. The row carries no name.
+                self.db.add(audit.build_row(
                     action='file_expired', status='success', resource_type='file',
                     resource_id=str(r.id), timestamp=now,
                     details={'vault_id': str(r.vault_id), 'expires_at': r.expires_at.isoformat()},

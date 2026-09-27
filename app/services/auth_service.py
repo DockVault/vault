@@ -219,14 +219,15 @@ def _iso(value) -> Optional[str]:
     return value.isoformat() if value is not None else None
 
 
-def _lock_audit_row(action: str, user_id, username, ip_address, details: dict) -> AuditLog:
-    """An audit row for an automatic lock or unlock, added to the caller's transaction so it commits
-    with the change it records, or not at all. Built directly rather than through
-    AuditLogger.log_action, which commits on its own. ``details`` holds no names (see
-    REDACTED_NAME_KEYS in the audit logger)."""
-    return AuditLog(user_id=user_id, username=username, action=action, status="success",
-                    resource_type="user", resource_id=str(user_id), ip_address=ip_address,
-                    timestamp=datetime.now(timezone.utc), details=details)
+def _lock_audit_row(db, action: str, user_id, username, ip_address, details: dict) -> AuditLog:
+    """An audit row for an automatic lock or unlock, for the caller to add to its transaction so it
+    commits with the change it records, or not at all. Built by AuditLogger.build_row, which applies
+    what log_action does (name redaction, the request's channel, route and user agent) but leaves the
+    commit to the caller: log_action commits on its own."""
+    from app.services.audit_logger import AuditLogger
+    return AuditLogger(db).build_row(
+        action=action, status="success", user_id=user_id, username=username,
+        resource_type="user", resource_id=str(user_id), ip_address=ip_address, details=details)
 
 
 def release_expired_locks(db, *, user=None, ip_address: Optional[str] = None) -> int:
@@ -255,7 +256,7 @@ def release_expired_locks(db, *, user=None, ip_address: Optional[str] = None) ->
         synchronize_session=False,
     )
     for r in expired:
-        db.add(_lock_audit_row(AUTO_UNLOCKED_ACTION, r.id, r.username, ip_address, {
+        db.add(_lock_audit_row(db, AUTO_UNLOCKED_ACTION, r.id, r.username, ip_address, {
             "locked_until": _iso(r.locked_until),
             "failed_attempts": r.failed_login_attempts,
             "cleared_by": "timer" if user is None else "sign_in",
@@ -2153,9 +2154,10 @@ class AuthService:
                 # be inferred. A failure against an account already under a timed lock only moves
                 # its end, and is not recorded again.
                 if not was_locked:
-                    self.db.add(_lock_audit_row(AUTO_LOCKED_ACTION, user.id, user.username, ip_address, {
-                        "failed_attempts": user.failed_login_attempts,
-                        "locked_until": _iso(user.locked_until),
-                    }))
+                    self.db.add(_lock_audit_row(
+                        self.db, AUTO_LOCKED_ACTION, user.id, user.username, ip_address, {
+                            "failed_attempts": user.failed_login_attempts,
+                            "locked_until": _iso(user.locked_until),
+                        }))
 
             self.db.commit()

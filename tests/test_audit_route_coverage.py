@@ -1,8 +1,9 @@
 """Every route that changes something writes an audit row, or is listed here with the reason it does not.
 
 The scan reads app/ as source (no app import). A route is a function decorated with a POST, PUT, PATCH or
-DELETE route. It records itself when its body calls an AuditLogger method, or a function of the same
-module that does (followed to any depth). A route that records nothing must be in NOT_RECORDED with a
+DELETE route. It records itself when its body calls an AuditLogger method (a log_... method, or build_row
+for a row committed with the route's own change), or a function of the same module that does (followed to
+any depth). A route that records nothing must be in NOT_RECORDED with a
 reason, so a new route cannot quietly join them.
 
 What it cannot see: which path writes. A route that records only its failures (or only one of two
@@ -65,8 +66,8 @@ NOT_RECORDED = {
 def _logger_methods():
     tree = ast.parse((APP / "services" / "audit_logger.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AuditLogger")
-    return {n.name for n in cls.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("log_")}
+    return {n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (n.name.startswith("log_") or n.name == "build_row")}
 
 
 LOGGER_METHODS = _logger_methods()
@@ -115,7 +116,7 @@ def test_the_scan_sees_the_routes():
     # A scan that found nothing would pass everything below.
     assert len(ROUTES) > 150, len(ROUTES)
     assert ("app/api/api_server.py", "POST /auth/login") in ROUTES
-    assert "log_action" in LOGGER_METHODS and "log_vault_created" in LOGGER_METHODS
+    assert {"log_action", "log_vault_created", "build_row"} <= LOGGER_METHODS
 
 
 def test_every_mutating_route_writes_an_audit_row_or_says_why_not():
@@ -130,7 +131,9 @@ def test_the_list_holds_only_routes_that_exist_and_record_nothing():
 
 
 def test_audit_rows_are_written_only_through_the_logger():
-    # A row built directly skips the name redaction, the request's address, channel and route.
+    # A row built directly skips the name redaction, the request's address, channel and route. A row
+    # that must commit in the caller's own transaction comes from AuditLogger.build_row, which applies
+    # them and leaves the commit to the caller.
     direct = []
     for path in sorted(APP.rglob("*.py")):
         if path.name == "audit_logger.py":
