@@ -48,6 +48,16 @@ NOT_RECORDED = {
         "the person's own notification state",
     ("app/api/api_server.py", "DELETE /notifications/{notification_id}"):
         "the person's own notification state",
+    ("app/api/api_server.py", "POST /activity/saved-searches"):
+        "the person's own saved searches on the Activity page",
+    ("app/api/api_server.py", "PATCH /activity/saved-searches/{search_id}"):
+        "the person's own saved searches on the Activity page",
+    ("app/api/api_server.py", "DELETE /activity/saved-searches/{search_id}"):
+        "the person's own saved searches on the Activity page",
+    ("app/api/api_server.py", "POST /activity/saved-searches/{search_id}/default"):
+        "the person's own saved searches on the Activity page",
+    ("app/api/api_server.py", "DELETE /activity/saved-searches/{search_id}/default"):
+        "the person's own saved searches on the Activity page",
     ("app/api/api_server.py", "PUT /vaults/{vault_id}/favorite"):
         "the person's own favourites",
     ("app/api/api_server.py", "DELETE /vaults/{vault_id}/favorite"):

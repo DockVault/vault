@@ -1261,6 +1261,35 @@ class UserPreference(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ActivitySavedSearch(Base):
+    """A named set of Events filters an administrator saved on the Activity page, to load again in one
+    click. Kept on the server so it follows the person across browsers and sign-ins; only its owner
+    reads or changes it. At most one per person is the default, which the page opens with.
+
+    A whole new table, so create_all builds it on fresh and upgraded databases alike, and a rollback to
+    an older release leaves it unused.
+    """
+    __tablename__ = 'activity_saved_searches'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    name = Column(String(80), nullable=False)
+    # The filters, as validated by app/services/activity_saved_searches.py: only the keys it lists.
+    filters = Column(JSON, nullable=False, default=dict)
+    is_default = Column(Boolean, nullable=False, default=False, server_default='false')
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_activity_saved_search_user', 'user_id'),
+        UniqueConstraint('user_id', 'name', name='uq_activity_saved_search_name'),
+        # At most one default per person; the write path clears the old default in the same
+        # transaction, and this is the backstop against two concurrent writers.
+        Index('uq_activity_saved_search_default', 'user_id', unique=True,
+              postgresql_where=text('is_default'), sqlite_where=text('is_default')),
+    )
+
+
 class LogPullToken(Base):
     """A named bearer token that may PULL the container logs via GET /logs.
 

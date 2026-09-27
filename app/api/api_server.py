@@ -2513,6 +2513,179 @@ def activity_usernames(
     return {"usernames": ev.username_suggestions(db, q, limit)}
 
 
+# --- Saved searches (the Activity page) ------------------------------------------------------------
+# Each administrator's own named filter sets. Only the owner reads or changes one; another person's id
+# answers 404, the same as an id that does not exist. The rules for what a search may hold are in
+# app/services/activity_saved_searches.py.
+
+class SavedSearchCreate(BaseModel):
+    name: str = Field(..., max_length=200)
+    filters: dict = Field(default_factory=dict)
+    is_default: bool = False
+
+
+class SavedSearchUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=200)
+    filters: Optional[dict] = None
+
+
+def _saved_search_rules():
+    from app.services import activity_saved_searches as rules
+    return rules
+
+
+def _lock_owner(db, user):
+    """Serialise one person's saved-search writes (the cap, the name check and the single default)
+    on their account row, so two tabs saving at once cannot pass a check together."""
+    db.query(User.id).filter(User.id == user.id).with_for_update().first()
+
+
+def _own_saved_search(db, user, search_id):
+    from app.core.models import ActivitySavedSearch
+    try:
+        sid = uuid.UUID(str(search_id))
+    except ValueError:
+        sid = None
+    row = sid and db.query(ActivitySavedSearch).filter(
+        ActivitySavedSearch.id == sid, ActivitySavedSearch.user_id == user.id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="That saved search does not exist.")
+    return row
+
+
+def _saved_search_name_taken(db, user, name, except_id=None) -> bool:
+    from sqlalchemy import func
+    from app.core.models import ActivitySavedSearch
+    q = db.query(ActivitySavedSearch.id).filter(
+        ActivitySavedSearch.user_id == user.id, func.lower(ActivitySavedSearch.name) == name.lower())
+    if except_id is not None:
+        q = q.filter(ActivitySavedSearch.id != except_id)
+    return q.first() is not None
+
+
+def _saved_searches_payload(db, user) -> dict:
+    from sqlalchemy import func
+    from app.core.models import ActivitySavedSearch
+    rules = _saved_search_rules()
+    rows = (db.query(ActivitySavedSearch).filter(ActivitySavedSearch.user_id == user.id)
+            .order_by(func.lower(ActivitySavedSearch.name), ActivitySavedSearch.created_at).all())
+    return {"searches": [rules.view(r) for r in rows], "limit": rules.MAX_PER_USER}
+
+
+def _set_default_saved_search(db, user, row) -> None:
+    from app.core.models import ActivitySavedSearch
+    db.query(ActivitySavedSearch).filter(
+        ActivitySavedSearch.user_id == user.id, ActivitySavedSearch.id != row.id,
+        ActivitySavedSearch.is_default == True,  # noqa: E712
+    ).update({"is_default": False}, synchronize_session=False)
+    db.flush()
+    row.is_default = True
+
+
+@app.get("/activity/saved-searches")
+def list_saved_searches(current_user: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """The caller's own saved searches, by name, and how many one person may keep (admin only)."""
+    return _saved_searches_payload(db, current_user)
+
+
+@app.post("/activity/saved-searches")
+def create_saved_search(body: SavedSearchCreate,
+                        current_user: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """Save the Events filters under a name, optionally as the search the page opens with."""
+    from app.core.models import ActivitySavedSearch
+    rules = _saved_search_rules()
+    try:
+        name, filters = rules.clean_name(body.name), rules.clean_filters(body.filters)
+    except rules.InvalidSearch as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _lock_owner(db, current_user)
+    have = db.query(ActivitySavedSearch.id).filter(ActivitySavedSearch.user_id == current_user.id).count()
+    if have >= rules.MAX_PER_USER:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=(
+            f"You have {rules.MAX_PER_USER} saved searches, the most you can keep. Delete one to save another."))
+    if _saved_search_name_taken(db, current_user, name):
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"You already have a saved search named \"{name}\".")
+    row = ActivitySavedSearch(user_id=current_user.id, name=name, filters=filters, is_default=False)
+    db.add(row)
+    db.flush()
+    if body.is_default:
+        _set_default_saved_search(db, current_user, row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Your saved searches changed meanwhile. Try again.")
+    db.refresh(row)
+    return rules.view(row)
+
+
+@app.patch("/activity/saved-searches/{search_id}")
+def update_saved_search(search_id: str, body: SavedSearchUpdate,
+                        current_user: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """Rename a saved search, replace its filters, or both."""
+    rules = _saved_search_rules()
+    try:
+        name = rules.clean_name(body.name) if body.name is not None else None
+        filters = rules.clean_filters(body.filters) if body.filters is not None else None
+    except rules.InvalidSearch as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _lock_owner(db, current_user)
+    row = _own_saved_search(db, current_user, search_id)
+    if name is not None and _saved_search_name_taken(db, current_user, name, except_id=row.id):
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"You already have a saved search named \"{name}\".")
+    if name is not None:
+        row.name = name
+    if filters is not None:
+        row.filters = filters
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Your saved searches changed meanwhile. Try again.")
+    db.refresh(row)
+    return rules.view(row)
+
+
+@app.delete("/activity/saved-searches/{search_id}")
+def delete_saved_search(search_id: str,
+                        current_user: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """Delete a saved search. Deleting the default leaves the page opening on the plain list."""
+    row = _own_saved_search(db, current_user, search_id)
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/activity/saved-searches/{search_id}/default")
+def set_default_saved_search(search_id: str,
+                             current_user: User = Depends(require_interactive_admin),
+                             db: Session = Depends(get_db)):
+    """Make a saved search the one the Activity page opens with; the previous default stops being one."""
+    _lock_owner(db, current_user)
+    row = _own_saved_search(db, current_user, search_id)
+    _set_default_saved_search(db, current_user, row)
+    db.commit()
+    return _saved_searches_payload(db, current_user)
+
+
+@app.delete("/activity/saved-searches/{search_id}/default")
+def clear_default_saved_search(search_id: str,
+                               current_user: User = Depends(require_interactive_admin),
+                               db: Session = Depends(get_db)):
+    """Stop a saved search being the default; the page then opens on the plain list."""
+    row = _own_saved_search(db, current_user, search_id)
+    row.is_default = False
+    db.commit()
+    return _saved_searches_payload(db, current_user)
+
+
 @app.get("/activity/summary")
 def activity_summary(
     range_: str = Query("24h", alias="range", pattern="^(24h|7d|30d)$"),
