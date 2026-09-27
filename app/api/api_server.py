@@ -19530,8 +19530,9 @@ async def delete_file(
         # Get file info before deletion. The file MUST belong to the vault it's
         # deleted through, so the password/access gate above covers it (cross-vault
         # guard — otherwise B's file could be deleted by routing through vault A).
+        # An expired file is gone here as on every read path; the sweep deletes it.
         file = db.query(File).filter(
-            File.id == file_id, File.vault_id == vault_id
+            File.id == file_id, File.vault_id == vault_id, file_expiry.live_clause()
         ).first()
         if not file:
             raise HTTPException(status_code=404, detail="File not found")
@@ -19576,9 +19577,12 @@ async def delete_file(
         raise
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
-    except VaultNotFoundError as e:
-        # A missing vault is a clean 404, not a 500.
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (VaultNotFoundError, FileNotFoundError) as e:
+        # A missing vault is a clean 404, not a 500; so is a file someone else deleted between the
+        # lookup above and the delete (the expiry sweep, a same-name replacement, another request).
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="File not found" if isinstance(e, FileNotFoundError) else str(e))
     except Exception as e:
         db.rollback()
         raise HTTPException(

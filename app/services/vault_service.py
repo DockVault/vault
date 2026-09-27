@@ -1385,11 +1385,15 @@ class VaultService:
         else:
             return []
         paths: List[str] = []
+        # Vault row, then the matching file rows, locked: the expiry sweep's order. A row the sweep
+        # deleted first is not returned by the locked read, so its size is not taken off the
+        # vault's counters a second time.
+        self.db.query(Vault.id).filter(Vault.id == vault_id).with_for_update(key_share=True).first()
         for ex in self.db.query(File).filter(
             File.vault_id == vault_id,
             File.folder_id == folder_id,
             match,
-        ).all():
+        ).with_for_update(of=File).all():
             paths.append(ex.storage_path)
             self._adjust_vault_totals(vault, -(ex.size_bytes or 0), -1)
             self.db.delete(ex)
@@ -1940,15 +1944,26 @@ class VaultService:
             user, file.vault_id, VaultPermissionEnum.DELETE
         )
         
-        vault = file.vault
-        storage_path = self.storage_path / file.storage_path
+        # Lock the vault row and then the file row -- the order the expiry sweep and a same-name
+        # replacement take them -- and read the file again under the lock. Until the lock is held,
+        # either of them may delete this row and take its size off the vault's counters; taking it
+        # off here as well would give the vault room under its size limit that it does not have.
+        # So the size is taken off only by whoever deletes the row, and a row that went meanwhile
+        # is not found.
+        vault_id = file.vault_id
+        self.db.query(Vault.id).filter(Vault.id == vault_id).with_for_update(key_share=True).first()
+        locked = (self.db.query(File.size_bytes, File.storage_path)
+                  .filter(File.id == file_id).with_for_update().first())
+        if locked is None:
+            raise FileNotFoundError(f"File not found: {file_id}")
+        storage_path = self.storage_path / locked.storage_path
 
         # Update stats, delete the row, and COMMIT before touching the blob. An irreversible
         # secure_delete sequenced BEFORE the commit would, on a commit failure, leave a live row
         # pointing at a destroyed blob (every download then 500s with FileNotFoundError). Destroying
         # the blob AFTER a successful commit leaves at most a recoverable/GC-able orphan on failure
         # (mirrors the _remove_blobs-after-commit ordering in finalize_streaming_upload).
-        self._adjust_vault_totals(vault, -(file.size_bytes or 0), -1)
+        self._adjust_vault_totals_by_id(vault_id, -(locked.size_bytes or 0), -1)
         self.db.delete(file)
         self.db.commit()
 

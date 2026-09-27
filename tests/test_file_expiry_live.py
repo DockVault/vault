@@ -222,6 +222,8 @@ def test_an_expired_file_is_gone_from_every_read_path_then_swept(admin, links_an
                               json={"dest_vault_id": vid}).status_code == 404
             assert admin.put(f"/vaults/{vid}/files/{fa}/rename",
                              json={"new_name": unique("renamed") + ".txt"}).status_code == 404
+            # Nor can it be deleted by hand: it is already gone, and the sweep removes it.
+            assert admin.post(f"/vaults/{vid}/files/{fa}/delete").status_code == 404
             # The public link answers as for a deleted file, and no new link or share can be made.
             for body in ({}, {"peek": True}):
                 assert anon.post(f"/public-links/{link['token']}/redeem",
@@ -248,6 +250,8 @@ def test_an_expired_file_is_gone_from_every_read_path_then_swept(admin, links_an
                     sftp.stat(f"/{vname}/{gone_name}")
                 with pytest.raises(IOError):
                     sftp.open(f"/{vname}/{gone_name}", "rb").read()
+                with pytest.raises(IOError):
+                    sftp.remove(f"/{vname}/{gone_name}")
                 sftp.close()
             finally:
                 transport.close()
