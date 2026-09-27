@@ -719,12 +719,6 @@ button.chip:hover { filter: brightness(1.05); }
 }
 
 /* ----------------------------------------------------------------------------
-   25. Live Monitor — padding fixes for cards built without .card-body
-   ---------------------------------------------------------------------------- */
-#monitor-section .grid.grid-cols-3 > .card { padding: var(--space-lg); }
-#monitor-events-list { padding: var(--space-sm) var(--space-lg) var(--space-lg); }
-
-/* ----------------------------------------------------------------------------
    26. Resumable upload tray — fixed bottom-right panel of in-progress uploads
    ---------------------------------------------------------------------------- */
 #upload-tray {
@@ -974,27 +968,6 @@ button.chip:hover { filter: brightness(1.05); }
 }
 .empty-state-center h3 { margin: 0; color: var(--text-primary); }
 .empty-state-center p { margin: 0; max-width: 38ch; }
-
-/* ============================================================================
-   24. Live Monitor — on-brand metric tiles + fixed active filter button
-   ============================================================================ */
-.monitor-metric-icon {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 48px; height: 48px; border-radius: var(--radius-md); color: #fff; flex: 0 0 auto;
-}
-.monitor-metric-icon .icon { width: 24px; height: 24px; }
-.mm-accent  { background: linear-gradient(135deg, var(--brand-secondary), var(--brand-accent)); }
-.mm-info    { background: linear-gradient(135deg, var(--info), var(--brand-accent)); }
-.mm-success { background: linear-gradient(135deg, var(--success), color-mix(in srgb, var(--success) 55%, var(--brand-accent))); }
-
-/* The active event filter used var(--primary) (undefined here) → blank button.
-   Use the accent so it matches the rest of the console. */
-.event-filter-btn.active {
-    background: var(--brand-secondary) !important;
-    color: #fff !important;
-    border-color: var(--brand-secondary) !important;
-}
-.event-filter-btn.active .icon { color: #fff; }
 
 /* ============================================================================
    25. Vault Info tab — compact stat strip (replaces 4 oversized hero cards)

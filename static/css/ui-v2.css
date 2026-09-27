@@ -1503,50 +1503,8 @@ button.chip:hover { filter: brightness(1.06); }
 }
 
 /* ----------------------------------------------------------------------------
-   24. Live Monitor + Settings + empty states + responsive + reduced-motion
+   24. Settings + empty states + responsive + reduced-motion
    ---------------------------------------------------------------------------- */
-/* Monitor padding fixes (cards built without .card-body). */
-#monitor-section .grid.grid-cols-3 > .card { padding: var(--space-md); box-shadow: none; border: 1px solid var(--line); }
-#monitor-events-list { padding: var(--space-sm) var(--space-md) var(--space-md); }
-
-/* Flat metric tiles (kill the v1 gradient fills → solid tinted squares). */
-.monitor-metric-icon {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 40px; height: 40px; border-radius: var(--radius-md); flex: 0 0 auto;
-}
-.monitor-metric-icon .icon { width: 20px; height: 20px; }
-.mm-accent  { background: color-mix(in srgb, var(--brand-secondary) 14%, var(--surface-0)); color: var(--brand-secondary); }
-.mm-info    { background: color-mix(in srgb, var(--info) 14%, var(--surface-0)); color: var(--info); }
-.mm-success { background: color-mix(in srgb, var(--success) 14%, var(--surface-0)); color: var(--success); }
-
-/* Connection-status indicator — small status dot + quiet label. */
-#monitor-connection-status { color: var(--text-secondary); }
-/* NOTE: #monitor-status-dot color is set inline by app.js (hardcoded hex per
-   state), so we only shape it here; the pulse is disabled under reduced-motion. */
-#monitor-status-dot { box-shadow: none; }
-
-/* Live event stream rows — flat, hairline-separated, left status accent.
-   NOTE: the left border color + surface are inline styles from app.js
-   (border-left var(--<class>), background var(--surface-1)); the color falls
-   back to transparent for the undefined-in-v2 primary/secondary/danger tokens.
-   We keep the flat surface and only quiet the hover (base adds translateX). */
-.monitor-event-item { border-radius: var(--radius-md); }
-.monitor-event-item:hover { transform: none; box-shadow: none; background: var(--surface-2); }
-
-/* Event filter buttons — the .active state used undefined --primary in v1;
-   drive it from the accent so it reads as the selected chip. */
-.event-filter-btn.active {
-    background: var(--brand-strong) !important;
-    color: var(--text-inverse) !important;
-    border-color: var(--brand-strong) !important;
-}
-[data-theme="dark"] .event-filter-btn.active {
-    background: var(--brand-secondary) !important;
-    color: #0b1220 !important;
-    border-color: var(--brand-secondary) !important;
-}
-.event-filter-btn.active .icon { color: currentColor; }
-
 /* ---- Settings panels ---- */
 /* Panel cards + inline padding wrappers (index uses .p-lg blocks, not .card-body). */
 #settings-section .card { box-shadow: none; border: 1px solid var(--line); }
@@ -1577,7 +1535,6 @@ button.chip:hover { filter: brightness(1.06); }
     .main-content { padding: var(--space-md); }
     .roles-summary { grid-template-columns: 1fr; }
     .groups-layout { grid-template-columns: 1fr; }
-    #monitor-section .grid.grid-cols-3 { grid-template-columns: 1fr; }
 }
 
 /* ---- Reduced motion: kill all animation/transition ---- */
