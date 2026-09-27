@@ -352,20 +352,48 @@ def _version_support(matrix, version):
     return support if isinstance(support, dict) else {}
 
 
+def _reference_title_and_fix(ref, advisories):
+    """A version's reference to an advisory, as (title, fixed_in).
+
+    A reference repeats its advisory's title and fixed_in today, because readers older than the
+    top-level `advisories` map read nothing else. A later matrix may carry only the advisory's id
+    ({"advisory": "<slug>"}); a field the reference leaves out is then taken from that advisory in the
+    same matrix, and a missing title falls back to the id, so the vulnerability is still counted and
+    named. A field the reference does carry wins, as it always has, so both forms of one advisory
+    dedupe to the same (title, fixed_in)."""
+    slug = ref.get("advisory") if isinstance(ref.get("advisory"), str) else None
+    record = advisories.get(slug) if slug is not None else None
+    record = record if isinstance(record, dict) else {}
+    title = ref["title"] if "title" in ref else (record.get("title") or slug)
+    fixed_in = ref["fixed_in"] if "fixed_in" in ref else record.get("fixed_in")
+    return title, fixed_in
+
+
 def _version_vulnerabilities(matrix, version):
     """The declared vulnerabilities for `version`, or []. Tolerant like _version_support. Each entry
     is normalised to {title, fixed_in} with BOTH coerced to a bounded str or None as it is read --
     before it ever reaches the dedupe -- so an unhashable JSON value ({} / []) in either field can
-    never blow the (title, fixed_in) dedupe key. A non-dict entry is dropped."""
+    never blow the (title, fixed_in) dedupe key. A non-dict entry is dropped. A reference that carries
+    only its advisory's id takes its title and fixed_in from the matrix's `advisories` map
+    (_reference_title_and_fix)."""
     if not isinstance(matrix, dict):
         return []
     version = (version or "").lstrip("vV")
     meta = (matrix.get("versions") or {}).get(version) or {}
+    if not isinstance(meta, dict):
+        return []
     vulns = meta.get("vulnerabilities")
     if not isinstance(vulns, list):
         return []
-    return [{"title": _bound(v.get("title")), "fixed_in": _bound(v.get("fixed_in"))}
-            for v in vulns if isinstance(v, dict)]
+    advisories = matrix.get("advisories")
+    advisories = advisories if isinstance(advisories, dict) else {}
+    out = []
+    for v in vulns:
+        if not isinstance(v, dict):
+            continue
+        title, fixed_in = _reference_title_and_fix(v, advisories)
+        out.append({"title": _bound(title), "fixed_in": _bound(fixed_in)})
+    return out
 
 
 def _knows_version(matrix, version):

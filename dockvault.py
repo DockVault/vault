@@ -1923,15 +1923,21 @@ def version_vulnerabilities(matrix, version):
     Each entry is normalised to {title, fixed_in, advisory, severity, cvss, impact, remediation,
     mitigation}. title and fixed_in are read from the version's own entry exactly as every older copy
     of this tool reads them, and coerced to a bounded str or None before they reach the dedupe -- so
-    an unhashable JSON value ({} / []) in either can never blow the (title, fixed_in) key. The rest
-    comes from the advisory the entry names in the matrix's top-level `advisories` (schema 3), or
-    from the entry itself when it carries the fields (an older matrix, or a list this tool has
-    already resolved and merged). Every string is bounded here and escape-stripped where printed; an
-    unrecognised severity reads as unrated. fixed_in None means no fix has been released yet."""
+    an unhashable JSON value ({} / []) in either can never blow the (title, fixed_in) key. An entry
+    may instead carry only its advisory's id ({"advisory": "<slug>"}); a title or fixed_in it leaves
+    out is then taken from that advisory, and a missing title falls back to the id, so the
+    vulnerability is still counted and named (the app's update check reads references the same way).
+    The rest comes from the advisory the entry names in the matrix's top-level `advisories`
+    (schema 3), or from the entry itself when it carries the fields (an older matrix, or a list this
+    tool has already resolved and merged). Every string is bounded here and escape-stripped where
+    printed; an unrecognised severity reads as unrated. fixed_in None means no fix has been released
+    yet."""
     if not isinstance(matrix, dict):
         return []
     version = (version or "").lstrip("vV")
     meta = (matrix.get("versions") or {}).get(version) or {}
+    if not isinstance(meta, dict):
+        return []
     vulns = meta.get("vulnerabilities")
     if not isinstance(vulns, list):
         return []
@@ -1949,9 +1955,12 @@ def version_vulnerabilities(matrix, version):
             value = _v.get(name)
             return value if value is not None else _record.get(name)
 
+        # A field the entry carries wins, as it always has; one it leaves out comes from its advisory.
+        title = v["title"] if "title" in v else (record.get("title") or slug)
+        fixed_in = v["fixed_in"] if "fixed_in" in v else record.get("fixed_in")
         out.append({
-            "title": _bound_scalar(v.get("title")),
-            "fixed_in": _bound_scalar(v.get("fixed_in")),
+            "title": _bound_scalar(title),
+            "fixed_in": _bound_scalar(fixed_in),
             "advisory": _bound_scalar(slug),
             "severity": _severity(detail("severity")),
             "cvss": _bound_scalar(detail("cvss")),

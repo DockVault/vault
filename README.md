@@ -348,7 +348,11 @@ top-level `advisories`: a title and description, its **impact** (what it let som
 **mitigation** (what to do before, or instead of, upgrading), a **CVSS v4.0 base vector** with the
 severity band it scores to, an optional advisory id, the release that fixes it (`fixed_in`) and the
 date it was published. Each affected version lists the advisories that apply to it. **A version
-affected by even one advisory, of any severity, is not secure.**
+affected by even one advisory, of any severity, is not secure.** Each entry in that list repeats its
+advisory's title and `fixed_in`, which is all that `dockvault.py` and the in-app check read before
+0.33.0; from 0.33.0 they also accept an entry that carries only the advisory's id and take the rest
+from `advisories`. The validator keeps requiring the repeated fields while releases that need them
+are still supported.
 
 The validator recomputes every vector's score and refuses a severity that does not match it, requires
 an advisory to be listed on every release from the first it affects up to its fix, and refuses a
