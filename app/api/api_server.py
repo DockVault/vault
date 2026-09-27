@@ -2745,36 +2745,83 @@ def clear_default_saved_search(search_id: str,
 
 @app.get("/activity/summary")
 def activity_summary(
-    range_: str = Query("24h", alias="range", pattern="^(24h|7d|30d)$"),
+    range_: str = Query("24h", alias="range", pattern="^(24h|7d|30d|custom|all)$"),
+    range_from: Optional[str] = Query(None, max_length=64),
+    range_to: Optional[str] = Query(None, max_length=64),
     tz_offset: int = Query(0, ge=-840, le=840),
     category: List[str] = Query([]),
     channel: List[str] = Query([]),
     status: List[str] = Query([]),
+    action: List[str] = Query([]),
     user: Optional[str] = Query(None, max_length=128),
+    user_match: str = Query("contains", pattern="^(contains|exact)$"),
+    no_account: bool = False,
     ip: Optional[str] = Query(None, max_length=64),
     q: Optional[str] = Query(None, max_length=128),
+    temp_credential_id: Optional[str] = Query(None, max_length=64),
     temp_credential: Optional[str] = Query(None, max_length=128),
+    vault_id: Optional[str] = Query(None, max_length=64),
+    from_date: Optional[str] = Query(None, max_length=64),
+    to_date: Optional[str] = Query(None, max_length=64),
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """The Activity page's summary band (admin only): over the last 24 hours, 7 days or 30 days, the
-    events in each hour, quarter day or day by category, the category mix, sign-in outcomes, the most
-    active usernames and addresses, and what is happening now (signed-in sessions, web transfers).
+    """The Activity page's summary band, in one request (admin only): the events in each bucket of the
+    range by category, the category mix, sign-in outcomes, the most active usernames and addresses, and
+    what is happening now (signed-in sessions, web transfers).
 
-    It counts what the Events list shows for the same filters and names nothing it does not: no vault,
-    file or folder name. `tz_offset` is the viewer's clock in minutes east of UTC, so days start at the
-    viewer's midnight. A plain def: its queries run in the thread pool, off the event loop."""
+    The range is the last 24 hours, 7 days or 30 days; a range the viewer chose (`range=custom`, from
+    `range_from` to `range_to`, or to now without one); or all time (`range=all`, charted from the oldest
+    row the Events block counts). Buckets start on the viewer's clock, `tz_offset` minutes east of UTC.
+
+    It takes every filter the Events list takes; `from_date` and `to_date` are a time picked on the
+    chart, inside the range. Each block counts under every filter but its own
+    (activity_summary.OWN_FILTERS), so each panel of the page keeps offering what could be picked next:
+    the Events block (buckets, total, failed) leaves out the time picked on the chart, the category mix
+    the category and event filters, the sign-in outcomes the event filter, the most active people the
+    person filters (`user`, `no_account`), and the most active addresses the address filter.
+
+    It names nothing the Events list does not: no vault, file or folder name. A plain def: its queries
+    run in the thread pool, off the event loop."""
+    from app.core import audit_range
     from app.core.models import AuditLog
     from app.services import activity_events as ev
     from app.services import activity_summary as summary
     now = datetime.now(timezone.utc).replace(tzinfo=None)          # the log stores naive UTC
-    win = summary.window(range_, now, tz_offset)
-    base = ev.build_events_query(
-        db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
-        username=user, ip=ip, text=q, temp_credential=temp_credential)
-    key = (range_, tz_offset, win.start, tuple(sorted(category)), tuple(sorted(channel)),
-           tuple(sorted(status)), user, ip, q, temp_credential)
-    band, age = summary.cached(key, range_, lambda: summary.summarize(db, base, AuditLog, win))
+    # The events the list would use: the first MAX_ACTIONS, so the cache key holds what was counted.
+    filters = dict(categories=category, channels=channel, statuses=status, actions=action[:ev.MAX_ACTIONS],
+                   username=user, user_exact=(user_match == "exact"), no_account=no_account, ip=ip, text=q,
+                   temp_credential_id=temp_credential_id, temp_credential=temp_credential, vault_id=vault_id,
+                   start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+    win = since = until = None
+    if range_ in summary.RANGES:
+        win = summary.window(range_, now, tz_offset)
+        since = win.start
+    else:
+        if range_to:
+            until = audit_range.upper_bound(range_to)
+            if until is None:
+                raise HTTPException(status_code=422, detail="The range's end (range_to) is not a date or a time.")
+        if range_ == "custom":
+            since = audit_range.lower_bound(range_from)
+            if since is None:
+                raise HTTPException(status_code=422, detail=(
+                    "A chosen range needs a start (range_from): a date or a time."))
+            win = summary.custom_window(since, min(until, now) if until else now, tz_offset)
+            if win is None:
+                raise HTTPException(status_code=422, detail=(
+                    "That range cannot be charted. Choose a start before its end, at most 48 years before it."))
+    key = (range_, since, until, tz_offset, win.start if win else None, summary.signature(filters))
+
+    def compute():
+        if win is not None:
+            return summary.summarize(db, AuditLog, win, filters, since=since, until=until)
+        end = min(until, now) if until else now
+        first = summary.oldest(db, AuditLog, filters, until)          # all time is charted from it
+        return summary.summarize(db, AuditLog, summary.all_time(first, end, tz_offset), filters,
+                                 until=until, from_=first if first is not None and first < end else None)
+
+    band, age = summary.cached(key, range_, compute)
     out = {"range": range_, **band, "age_seconds": round(age, 1)}
     out["now"] = summary.now_panel(db, now, _activity_transfers())
     return out
