@@ -9,17 +9,25 @@ file in between, both took the size off, and the vault got room under its limit 
 Now each of them locks the vault row and then the file row, as the sweep does, and takes off only the
 size of a row it still finds under that lock. These drive the real ``delete_file``,
 ``_stage_same_name_replacement`` and ``cleanup_expired_files`` against an in-memory session
-(tests/_memory_db.py), with the sweep let in at the exact moment the others go for the lock.
+(tests/_memory_db.py), with the sweep let in at the exact moment the others go for the lock, and
+the web delete route with the service's "file not found" coming back from ``delete_file``.
 """
+import inspect
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
+from _async_run import run_coroutine
+from _bare_api_env import set_bare_api_env
 from _memory_db import MemoryDB
-from app.core import file_expiry
-from app.core.models import File, Vault
+
+set_bare_api_env()
+
+from app.core import file_expiry  # noqa: E402
+from app.core.models import File, Vault  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -133,3 +141,52 @@ def test_a_replacement_the_sweep_beat_takes_nothing_off(tmp_path):
     assert paths == [], "nothing of the old file is left for the replacement to remove"
     assert totals == {vault.id: (-40, -1)}
     assert [e for e in db.log if e[0] == "orm-delete"] == []
+
+
+# ---------------------------------------------------------------------------------------------
+# The web delete route
+# ---------------------------------------------------------------------------------------------
+
+
+def _delete_route(monkeypatch, raised):
+    """Call POST /vaults/{id}/files/{id}/delete (below its permission decorators) on a file the
+    route finds, with the service's delete_file raising `raised`."""
+    import app.api.api_server as S
+    from app.services.vault_service import VaultService
+
+    vault = SimpleNamespace(id=uuid.uuid4())
+    f = SimpleNamespace(id=uuid.uuid4(), vault_id=vault.id, original_name="a.txt", expires_at=None)
+    db = MemoryDB({File: [f]})
+    monkeypatch.setattr(S, "PermissionService", lambda db: None)
+    monkeypatch.setattr(S, "AuditLogger", lambda db: None)
+    monkeypatch.setattr(S, "require_file_scope", lambda *a, **k: None)
+    monkeypatch.setattr(VaultService, "get_vault", lambda self, *a, **k: vault)
+
+    def delete_file(self, file_id, user):
+        raise raised(f"File not found: {file_id}")
+    monkeypatch.setattr(VaultService, "delete_file", delete_file)
+
+    with pytest.raises(HTTPException) as answered:
+        run_coroutine(inspect.unwrap(S.delete_file)(
+            vault_id=vault.id, file_id=f.id, request=None, current_user=SimpleNamespace(id=uuid.uuid4()),
+            db=db, x_vault_password=None))
+    return answered.value, db
+
+
+def test_a_delete_whose_file_went_meanwhile_answers_404(monkeypatch):
+    """The route found the file, and by the time the service locked it someone else had deleted it
+    (the sweep, a same-name replacement, another request). That is "not found", not a server error,
+    and the answer does not echo the id."""
+    from app.services.vault_service import FileNotFoundError as VaultFileNotFound
+
+    answer, db = _delete_route(monkeypatch, VaultFileNotFound)
+    assert (answer.status_code, answer.detail) == (404, "File not found")
+    assert ("rollback",) in db.log
+
+
+def test_any_other_failure_in_the_delete_is_still_a_server_error(monkeypatch):
+    """The control for the test above: the 404 is the mapping of "not found", not of every error."""
+    from app.services.vault_service import FileServiceError
+
+    answer, _db = _delete_route(monkeypatch, FileServiceError)
+    assert answer.status_code == 500

@@ -337,12 +337,31 @@ def test_the_sweep_never_deletes_from_a_vault_whose_expiry_is_off(tmp_path):
     assert [a.resource_id for a in db.added if isinstance(a, AuditLog)] == [str(gone.id)]
 
 
-def test_the_sweep_checks_the_setting_again_under_the_vault_lock(tmp_path):
+def test_the_sweep_leaves_a_vault_set_to_0_or_below_alone(tmp_path):
+    """0 is off, and so is a value below 0, which an earlier version could store: the sweep deletes
+    nothing from either, whatever deadlines their files carry."""
+    zero, negative, on = _vault(0), _vault(-2), _vault(7)
+    kept = [_stored(tmp_path, _file(zero, _past(), size=4)),
+            _stored(tmp_path, _file(negative, _past(days=9), size=5))]
+    gone = _stored(tmp_path, _file(on, _past(), size=6))
+    db = MemoryDB({Vault: [zero, negative, on], File: kept + [gone]})
+    svc = _sweeper(db, tmp_path)
+
+    assert svc.cleanup_expired_files() == [{"file_id": gone.id, "vault_id": on.id}]
+    assert db.rows_of(File) == kept
+    assert all((tmp_path / f.storage_path).exists() for f in kept)
+    assert svc.totals == {on.id: (-6, -1)}
+    assert svc.cleanup_expired_files() == [], "nothing is left for the next run either"
+    assert db.rows_of(File) == kept
+
+
+@pytest.mark.parametrize("off", [None, 0, -2])
+def test_the_sweep_checks_the_setting_again_under_the_vault_lock(tmp_path, off):
     """Expiry turned off between the sweep's first read and its lock: nothing is deleted."""
     vault = _vault(7)
     due = _stored(tmp_path, _file(vault, _past()))
     db = MemoryDB({Vault: [vault], File: [due]})
-    db.on_lock.append(lambda: setattr(vault, "expire_files_after_days", None))
+    db.on_lock.append(lambda: setattr(vault, "expire_files_after_days", off))
     svc = _sweeper(db, tmp_path)
 
     assert svc.cleanup_expired_files() == []
@@ -350,10 +369,12 @@ def test_the_sweep_checks_the_setting_again_under_the_vault_lock(tmp_path):
     assert ("rollback",) in db.log and ("commit",) not in db.log
 
 
-def test_a_leftover_deadline_in_a_vault_whose_expiry_is_off_does_not_hold_up_the_sweep(tmp_path):
+@pytest.mark.parametrize("setting", [None, 0, -2])
+def test_a_leftover_deadline_in_a_vault_whose_expiry_is_off_does_not_hold_up_the_sweep(tmp_path,
+                                                                                       setting):
     """The candidate read skips such vaults too. Were it to return one first, a batch could be taken
     up by a vault the locked read then refuses, and the files really due would wait behind it."""
-    off, on = _vault(None), _vault(7)
+    off, on = _vault(setting), _vault(7)
     stale = _stored(tmp_path, _file(off, _past(days=9)))
     due = _stored(tmp_path, _file(on, _past(days=1)))
     db = MemoryDB({Vault: [off, on], File: [stale, due]})
