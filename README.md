@@ -214,6 +214,23 @@ config); `down` mirrors `docker compose down` (the containers are removed, clear
 never passes `-v`, so your data volumes always survive). To clear *every* at-rest copy of the secrets in
 one step, use `python dockvault.py down --lock` (removes the containers **and** seals `.env`).
 
+### Account changes from the host
+
+An administrator may change someone else's sign-in details (a password, a reset link, the second
+factor, the email address, an SSH key) once in 14 days; a second change waits until another
+administrator approves it. On a deployment with one administrator, or when no administrator can sign
+in, whoever runs the server acts from the host instead:
+
+```bash
+python dockvault.py accounts   # reset a password or a second factor, approve a waiting change
+python dockvault.py accounts --action reset-password --username alice --confirm-username alice --non-interactive
+```
+
+The account's username has to be typed twice. A password reset link (or, with `--temporary-password`
+or when reset links are not configured, a temporary password) is shown once on your terminal and
+nowhere else. Each change is recorded and audited as the host operator's (`operator@host`), and the
+user is told.
+
 ### Sealing credentials at rest (optional)
 
 `.env` holds every secret (including `ENCRYPTION_KEY`). You can seal it while the deployment is off:

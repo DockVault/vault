@@ -11,6 +11,7 @@ Run with NO arguments for the interactive menu:
   Reset            tear down (optionally destroy data)
   Update           upgrade / downgrade the running image
   Logs             enable + pull the authenticated log endpoint
+  Accounts         reset a user's password or second factor, approve a change held for approval
 
 Or run a subcommand directly for unattended use:
 
@@ -51,6 +52,7 @@ MENU = [
     ("reset",   "Reset - tear down (optionally destroy data)"),
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
+    ("accounts", "Accounts - reset a user's password or second factor, approve a held change"),
 ]
 
 
@@ -2556,6 +2558,40 @@ def env_lock_open(fernet, enc_text, passphrase=None, recovery_key=None):
 
 
 # --- app -------------------------------------------------------------------------------------
+# --- accounts (host operator) ------------------------------------------------------------------
+ACCOUNT_ACTIONS = (
+    ("reset-password", "Reset a password (a one-time reset link)"),
+    ("reset-second-factor", "Reset a second factor (set up again at the next sign-in)"),
+    ("approve", "Approve a change waiting for a second administrator"),
+    ("list", "List the changes waiting for approval"),
+)
+
+
+def parse_operator_answer(stdout):
+    """The JSON answer the account tool inside the container prints as its LAST line, or None.
+
+    Anything the application prints while it starts comes before it, so only the last non-empty line
+    is read, and only a JSON object carrying "ok" counts."""
+    lines = [ln for ln in (stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    try:
+        answer = json.loads(lines[-1])
+    except ValueError:
+        return None
+    return answer if isinstance(answer, dict) and "ok" in answer else None
+
+
+def username_confirmation_problem(username, typed_again):
+    """Why an account change must not go ahead: the username was not given, or not typed again
+    exactly. None when it may. The container checks the same again."""
+    if not (username or "").strip():
+        return "no username given"
+    if typed_again != username:
+        return "the username typed again does not match - nothing was changed"
+    return None
+
+
 class DockVault:
     """The management app: holds the palette + repo root and dispatches menu/arg commands to the
     per-area handlers (setup / backup / volumes / reset / update / logs)."""
@@ -5163,6 +5199,152 @@ class DockVault:
         self._recreate_stack(build=False)
         print(pal.paint("  Applied.\n", "green"))
 
+    def _run_account_tool(self, *tool_args):
+        """Run `python -m app.core.host_operator ...` inside the running web container and return its
+        JSON answer. The one-container layout names the service `vault`, the split one `vault-api`.
+
+        Its output travels back through the exec pipe and is parsed here; nothing of it is printed
+        as is, so a reset link or temporary password in it reaches the terminal only through
+        _emit_secret."""
+        ok, why = docker_available()
+        if not ok:
+            self._fail("Docker is not available: %s" % why)
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.host_operator",
+                                 *tool_args, timeout=180)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("could not run the account tool: %s" % type(exc).__name__)
+            answer = parse_operator_answer(getattr(r, "stdout", ""))
+            if answer is not None:
+                return answer
+        self._fail("the account tool did not answer. Is the deployment running? "
+                   "(python dockvault.py status)")
+
+    def _account_or_fail(self, username):
+        answer = self._run_account_tool("lookup", "--username", username)
+        if not answer.get("ok"):
+            self._fail(answer.get("error") or "no such account")
+        return answer["account"]
+
+    def _show_account(self, account):
+        pal = self.pal
+        print(pal.paint("\n  Account", "cyan"))
+        print("  username:      %s" % account.get("username"))
+        print("  email:         %s" % (account.get("email") or "(none)"))
+        print("  role:          %s%s" % (account.get("role"), "" if account.get("active") else "  (deactivated)"))
+        print("  last sign-in:  %s" % (account.get("last_login") or "never"))
+        print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
+
+    def accounts(self, args=None):
+        """Act on an account as the person who runs the server: reset a password or a second factor,
+        or approve a change waiting for a second administrator.
+
+        An administrator may change someone else's sign-in details once in 14 days; a second change
+        waits for another administrator, and with none it is refused. This is the way round it, run on
+        the host against the deployment's own container. Each change is recorded and audited as the
+        host operator's, and the user is told. The account's username must be typed twice. A reset
+        link or temporary password is shown on this terminal only, never written to a file or log."""
+        pal = self.pal
+        interactive = not (args and getattr(args, "non_interactive", False))
+        action = getattr(args, "account_action", None) if args else None
+        if action is None:
+            if not interactive:
+                self._fail("say what to do with --action (%s)" % ", ".join(k for k, _ in ACCOUNT_ACTIONS))
+            print(pal.paint("\n  Accounts", "cyan"))
+            for i, (_key, label) in enumerate(ACCOUNT_ACTIONS, 1):
+                print("  %s) %s" % (pal.paint(str(i), "bold"), label))
+            try:
+                choice = parse_menu_choice(input(pal.paint("\nChoose: ", "cyan")), len(ACCOUNT_ACTIONS))
+            except EOFError:
+                choice = 0
+            if not choice:
+                print(pal.paint("  Left unchanged.\n", "yellow"))
+                return
+            action = ACCOUNT_ACTIONS[choice - 1][0]
+
+        if action == "list":
+            answer = self._run_account_tool("list")
+            if not answer.get("ok"):
+                self._fail(answer.get("error") or "the list could not be read")
+            rows = answer.get("requests") or []
+            if not rows:
+                print(pal.paint("  No change is waiting for approval.\n", "green"))
+                return
+            for r in rows:
+                print("  %s  %s for %s, asked by %s on %s; expires %s" % (
+                    r.get("id"), r.get("label"), r.get("target_username"), r.get("requested_by"),
+                    (r.get("requested_at") or "")[:10], (r.get("expires_at") or "")[:10]))
+            print()
+            return
+
+        if action == "approve":
+            request_id = (getattr(args, "request_id", None) if args else None) or (
+                ask("Request id (see: List)", pal) if interactive else None)
+            if not request_id:
+                self._fail("name the request with --request-id")
+            typed = getattr(args, "confirm_username", None) if args else None
+            if typed is None and interactive:
+                typed = ask("Type the username of the account it changes, to confirm", pal)
+            if not (typed or "").strip():
+                self._fail("type the account's username with --confirm-username to confirm")
+            answer = self._run_account_tool("approve", "--request-id", request_id,
+                                            "--confirm-username", typed)
+            if not answer.get("ok"):
+                self._fail(answer.get("error") or "the request was not approved")
+            req = answer.get("approved") or {}
+            print(pal.paint("  Approved: %s for %s, asked by %s. The change was made and recorded as the "
+                            "host operator's." % (req.get("label"), req.get("target_username"),
+                                                 req.get("requested_by")), "green"))
+            if answer.get("secret"):
+                self._emit_secret("\n".join([
+                    pal.paint("\n  ===== PASSWORD RESET LINK (shown once) =====", "bold", "yellow"),
+                    "    " + answer["secret"],
+                    pal.paint("  Give it to %s over a trusted channel. It works once." % req.get("target_username"),
+                              "yellow")]))
+            return
+
+        if action not in ("reset-password", "reset-second-factor"):
+            self._fail("unknown action: %s" % action)
+        username = (getattr(args, "username", None) if args else None) or (
+            ask("Username", pal) if interactive else None)
+        if not username:
+            self._fail("name the account with --username")
+        account = self._account_or_fail(username)
+        self._show_account(account)
+        typed = getattr(args, "confirm_username", None) if args else None
+        if typed is None and interactive:
+            typed = ask("Type the username again to confirm", pal)
+        problem = username_confirmation_problem(username, typed)
+        if problem:
+            self._fail(problem)
+        tool_args = [action, "--username", username, "--confirm-username", typed]
+        if action == "reset-password" and args is not None and getattr(args, "temporary_password", False):
+            tool_args.append("--temporary-password")
+        answer = self._run_account_tool(*tool_args)
+        if not answer.get("ok"):
+            self._fail(answer.get("error") or "nothing was changed")
+        if action == "reset-second-factor":
+            print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
+                            "with their own password, at the next sign-in." % username, "green"))
+            return
+        if answer.get("secret_kind") == "temporary_password":
+            heading = "TEMPORARY PASSWORD (shown once)"
+            advice = ("Give it to %s over a trusted channel, and ask them to change it as soon as they "
+                      "sign in. Reset links are not configured on this deployment." % username)
+        else:
+            heading = "PASSWORD RESET LINK (shown once)"
+            minutes = answer.get("expires_in_minutes")
+            advice = ("Give it to %s over a trusted channel. It works once%s, and signs the account out "
+                      "everywhere when used." % (username, " and expires in %s minutes" % minutes if minutes else ""))
+            if (answer.get("secret") or "").startswith("/"):
+                advice += " Open it on your vault's address (ALLOWED_HOSTS is not set, so it has no host)."
+        print(pal.paint("  Done for %s; recorded as the host operator's change." % username, "green"))
+        self._emit_secret("\n".join([
+            pal.paint("\n  ===== %s =====" % heading, "bold", "yellow"),
+            "    " + (answer.get("secret") or ""),
+            pal.paint("  " + advice, "yellow")]))
+
     def handler(self, key):
         """Resolve a menu/command key to its bound handler, or None if unknown. A hyphenated command
         (e.g. change-passphrase) maps to the underscore method name."""
@@ -5307,6 +5489,17 @@ def build_parser():
     lp = parsers["logs"]
     lp.add_argument("--enable", dest="enable", action="store_true", help="enable authenticated log pull (opt-in)")
     lp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    ac = parsers["accounts"]
+    ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
+                    help="reset-password | reset-second-factor | approve | list")
+    ac.add_argument("--username", dest="username", help="the account to act on")
+    ac.add_argument("--confirm-username", dest="confirm_username",
+                    help="the account's username typed again; nothing changes unless it matches")
+    ac.add_argument("--request-id", dest="request_id", help="approve: the waiting request (see --action list)")
+    ac.add_argument("--temporary-password", dest="temporary_password", action="store_true",
+                    help="reset-password: set a temporary password instead of creating a reset link")
+    ac.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lk = parsers["lock"]
     lk.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")
