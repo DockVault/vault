@@ -51,13 +51,13 @@ def _grouped(*rows):
 
 
 def test_grouped_counts_become_buckets_categories_and_sign_in_outcomes():
-    # (bucket, stored action, failed, under no account, count)
+    # (bucket, stored action, rows, failed, under no account, failed under no account)
     w = s.window("24h", NOW)
     band = s.shape(w, _grouped(
-        (23, "login_success", False, False, 4), (23, "login_failure", True, True, 2),
-        (22, "second_factor_failed", True, False, 1), (0, "account_auto_locked", False, False, 1),
-        (23, "file_uploaded", False, False, 3), (23, "file_upload", False, False, 2),
-        (10, "a_name_no_release_wrote", False, False, 5),
+        (23, "login_success", 4, 0, 0, 0), (23, "login_failure", 2, 2, 2, 2),
+        (22, "second_factor_failed", 1, 1, 0, 0), (0, "account_auto_locked", 1, 0, 0, 0),
+        (23, "file_uploaded", 3, 0, 0, 0), (23, "file_upload", 2, 0, 0, 0),
+        (10, "a_name_no_release_wrote", 5, 0, 0, 0),
     ), [("maria", 7, 1)], [("203.0.113.9", 6, 2)])
     assert (band["total"], band["failed"]) == (18, 3)
     assert band["buckets"][23]["counts"] == {"sign_in": 6, "files": 5}
@@ -76,8 +76,8 @@ def test_grouped_counts_become_buckets_categories_and_sign_in_outcomes():
 
 def test_a_count_outside_the_window_is_left_out():
     w = s.window("24h", NOW)
-    band = s.shape(w, [(None, "login_success", False, False, 3), (24, "login_success", False, False, 2),
-                       (-1, "login_success", False, False, 1)], [], [])
+    band = s.shape(w, [(None, "login_success", 3, 0, 0, 0), (24, "login_success", 2, 0, 0, 0),
+                       (-1, "login_success", 1, 0, 0, 0)], [], [])
     assert band["total"] == 0 and band["sign_ins"]["succeeded"] == 0
 
 
@@ -92,7 +92,7 @@ def test_bucket_times_are_utc_and_the_window_is_stated():
 
 def test_the_band_holds_counts_names_of_people_and_addresses_and_nothing_else():
     # No vault, file or folder name, no details: only what these keys hold.
-    band = s.shape(s.window("24h", NOW), [(1, "file_uploaded", False, False, 1)], [("maria", 1, 0)],
+    band = s.shape(s.window("24h", NOW), [(1, "file_uploaded", 1, 0, 0, 0)], [("maria", 1, 0)],
                    [("203.0.113.9", 1, 0)])
     assert set(band) == {"from", "to", "bucket_seconds", "buckets", "total", "failed", "categories",
                          "sign_ins", "top_users", "no_account", "top_addresses"}

@@ -11,7 +11,9 @@ anything a person typed into the username box, is counted in `no_account` and ne
 
 Cost on a large log: three aggregate queries over the window, each an index range scan on the
 timestamp, and one over the sessions table. The window is at most 30 days, whatever the log holds.
-Measured on 520,000 rows (about 260,000 in 30 days): 24 hours 70 ms, 7 days 290 ms, 30 days 770 ms.
+Measured on 520,000 rows (about 255,000 in 30 days) from a few hundred addresses: 24 hours about 90 ms,
+7 and 30 days about 300 to 400 ms. When nearly every row comes from its own address (an attack spread
+over many), ranking the addresses dominates and 30 days takes about 1.5 s.
 The page refreshes the band as events arrive, so the counts are kept for a few seconds (CACHE_SECONDS)
 and shared by everyone who asks for the same range and filters: they are the same for every
 administrator, since they name nothing that depends on who is looking. The "now" figures are never kept.
@@ -96,27 +98,26 @@ def category_of(action: Optional[str]) -> str:
 
 
 def shape(win: Window, grouped, top_users, top_addresses) -> dict:
-    """The band from the grouped counts. `grouped` is (bucket number, stored action, failed, no
-    account, count) rows; the tops are (value, count, failed) rows, already ordered."""
+    """The band from the grouped counts. `grouped` is (bucket number, stored action, rows, failed rows,
+    rows under no account, failed rows under no account) rows; the tops are (value, count, failed)
+    rows, already ordered."""
     buckets: List[Dict] = [{"counts": {}, "failed": 0} for _ in range(win.buckets)]
     mix: Dict[str, List[int]] = {}
     outcomes = {"succeeded": 0, "failed": 0, "locked": 0}
     no_account = {"total": 0, "failed": 0}
-    for bucket, action, failed, unowned, count in grouped:
+    for bucket, action, count, failed, unowned, unowned_failed in grouped:
         if bucket is None or not 0 <= int(bucket) < win.buckets:
             continue
-        n = int(count)
+        n, f = int(count), int(failed or 0)
         cat = category_of(action)
         slot = buckets[int(bucket)]
         slot["counts"][cat] = slot["counts"].get(cat, 0) + n
+        slot["failed"] += f
         tally = mix.setdefault(cat, [0, 0])
         tally[0] += n
-        if failed:
-            slot["failed"] += n
-            tally[1] += n
-        if unowned:
-            no_account["total"] += n
-            no_account["failed"] += n if failed else 0
+        tally[1] += f
+        no_account["total"] += int(unowned or 0)
+        no_account["failed"] += int(unowned_failed or 0)
         entry = audit_catalog.lookup(action or "")
         outcome = SIGN_IN_OUTCOMES.get(entry.name if entry else "")
         if outcome:
@@ -142,23 +143,24 @@ def shape(win: Window, grouped, top_users, top_addresses) -> dict:
 
 def summarize(db, base, AuditLog, win: Window) -> dict:
     """The band for the rows of `base` (the Events filters, already applied) inside the window."""
-    from sqlalchemy import case, func, literal_column, text
+    from sqlalchemy import and_, case, func, literal_column, text
     q = base.filter(AuditLog.timestamp >= win.start, AuditLog.timestamp <= win.end).order_by(None)
-    # The start of a row's bucket (date_bin, PostgreSQL 14 and later), whether it failed, and whether it
-    # is under no account. Written out, and grouped by position, so the SELECT and the GROUP BY are the
-    # same to the database; every value in them is the server's own, never the request's.
+    # The start of a row's bucket (date_bin, PostgreSQL 14 and later). Written out, and grouped by
+    # position, so the SELECT and the GROUP BY are the same to the database; both values in it are the
+    # server's own, never the request's. Failed and no-account rows are counted in the same pass.
     bucket = literal_column(
         f"date_bin('{int(win.size):d} seconds'::interval, audit_logs.timestamp, "
         f"timestamp '{win.start:%Y-%m-%d %H:%M:%S}')")
-    failed = literal_column(
-        "(audit_logs.status IN (" + ", ".join(f"'{s}'" for s in FAILED_STATUSES) + "))")
-    unowned = literal_column("(audit_logs.user_id IS NULL AND audit_logs.username IS NOT NULL)")
-    grouped = [(win.bucket_of(b), action, f, u, n) for b, action, f, u, n in
-               q.with_entities(bucket, AuditLog.action, failed, unowned, func.count())
-               .group_by(text("1"), text("2"), text("3"), text("4")).all()
+    is_failed = AuditLog.status.in_(FAILED_STATUSES)
+    unowned = and_(AuditLog.user_id.is_(None), AuditLog.username.isnot(None))
+    grouped = [(win.bucket_of(b), action, n, f, u, uf) for b, action, n, f, u, uf in
+               q.with_entities(bucket, AuditLog.action, func.count(),
+                               func.count().filter(is_failed), func.count().filter(unowned),
+                               func.count().filter(and_(unowned, is_failed)))
+               .group_by(text("1"), text("2")).all()
                if b is not None]
     count = func.count()
-    failures = func.sum(case((AuditLog.status.in_(FAILED_STATUSES), 1), else_=0))
+    failures = func.count().filter(is_failed)
 
     def top(col, *conds):
         return (q.filter(col.isnot(None), *conds).with_entities(col, count, failures).group_by(col)
