@@ -10,7 +10,8 @@ import time
 import functools
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, case
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy import and_, or_, case, func, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from fastapi import HTTPException, status
@@ -203,11 +204,68 @@ def account_locked(user) -> bool:
     return datetime.now(timezone.utc) < locked_until
 
 
-def clear_account_lock(user) -> None:
-    """Clear a lock + its failed-attempt counter (caller commits)."""
-    user.is_locked = False
-    user.failed_login_attempts = 0
-    user.locked_until = None
+# Audit actions for a failed-login lock that is armed, and later released, without anyone acting.
+# An administrator's lock and unlock are recorded by the routes that make them.
+AUTO_LOCKED_ACTION = "account_auto_locked"
+AUTO_UNLOCKED_ACTION = "account_auto_unlocked"
+
+
+def _utc_now_naive() -> datetime:
+    """Now as users.locked_until stores it: UTC with no time zone attached."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _iso(value) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def _lock_audit_row(action: str, user_id, username, ip_address, details: dict) -> AuditLog:
+    """An audit row for an automatic lock or unlock, added to the caller's transaction so it commits
+    with the change it records, or not at all. Built directly rather than through
+    AuditLogger.log_action, which commits on its own. ``details`` holds no names (see
+    REDACTED_NAME_KEYS in the audit logger)."""
+    return AuditLog(user_id=user_id, username=username, action=action, status="success",
+                    resource_type="user", resource_id=str(user_id), ip_address=ip_address,
+                    timestamp=datetime.now(timezone.utc), details=details)
+
+
+def release_expired_locks(db, *, user=None, ip_address: Optional[str] = None) -> int:
+    """Clear the failed-login locks whose time has run out, and record each as account_auto_unlocked.
+
+    Two callers. The periodic cleanup passes no ``user`` and clears every expired lock. A sign-in
+    passes the account it is signing in to, so its expired lock is cleared before the password is
+    checked, and the row carries that sign-in's address. ``cleared_by`` in the row says which.
+
+    Rows are claimed FOR UPDATE SKIP LOCKED and cleared by id, so the two never both record one
+    unlock: whichever claims the row first clears it, and the other finds nothing to do. The caller
+    commits, so an unlock and its audit row land together or not at all. An administrator's lock
+    (locked_until NULL) is never touched. Returns how many locks were cleared."""
+    q = db.query(User.id, User.username, User.locked_until, User.failed_login_attempts).filter(
+        User.is_locked == True,  # noqa: E712
+        User.locked_until.isnot(None),
+        User.locked_until < _utc_now_naive(),
+    )
+    if user is not None:
+        q = q.filter(User.id == user.id)
+    expired = q.with_for_update(skip_locked=True).all()
+    if not expired:
+        return 0
+    db.query(User).filter(User.id.in_([r.id for r in expired])).update(
+        {"is_locked": False, "failed_login_attempts": 0, "locked_until": None},
+        synchronize_session=False,
+    )
+    for r in expired:
+        db.add(_lock_audit_row(AUTO_UNLOCKED_ACTION, r.id, r.username, ip_address, {
+            "locked_until": _iso(r.locked_until),
+            "failed_attempts": r.failed_login_attempts,
+            "cleared_by": "timer" if user is None else "sign_in",
+        }))
+    if user is not None:
+        # The update went straight to the table. Bring the caller's copy of the account into step
+        # without marking it changed, so nothing writes the old values back.
+        for key, value in (("is_locked", False), ("failed_login_attempts", 0), ("locked_until", None)):
+            set_committed_value(user, key, value)
+    return len(expired)
 
 
 class AuthenticationError(Exception):
@@ -444,9 +502,10 @@ class AuthService:
             raise InvalidCredentialsError("Invalid username or password")
         
         # A failed-login auto-lock auto-expires (locked_until in the past) — clear it so the
-        # password is verified afresh; an admin lock (locked_until NULL) stays in force.
+        # password is verified afresh; an admin lock (locked_until NULL) stays in force. The release
+        # and its account_auto_unlocked row commit with whatever this sign-in commits next.
         if user.is_locked and not account_locked(user):
-            clear_account_lock(user)  # committed on success below, or re-counted on failure
+            release_expired_locks(self.db, user=user, ip_address=ip_address)
 
         # Verify the password FIRST, before any account-state branch, so a caller who does
         # NOT present valid credentials cannot distinguish existing/active/locked/deactivated
@@ -2052,7 +2111,25 @@ class AuthService:
         
         # Update user failed attempts if user exists
         if user:
-            user.failed_login_attempts += 1
+            # Counted in the database. `user.failed_login_attempts += 1` wrote back one more than
+            # the value this request had loaded, so failures arriving together each wrote the same
+            # number and all but one were lost. This UPDATE adds one to whatever is stored and
+            # returns the result with the lock state, and the row stays locked until the commit
+            # below, so the lock decision is made on the row as it stands. Anything pending on the
+            # row is written first, so the increment lands on top of it instead of under it.
+            self.db.flush()
+            users = User.__table__
+            row = self.db.execute(
+                update(users).where(users.c.id == user.id)
+                .values(failed_login_attempts=func.coalesce(users.c.failed_login_attempts, 0) + 1)
+                .returning(users.c.failed_login_attempts, users.c.is_locked, users.c.locked_until)
+            ).first()
+            if row is None:  # the account was deleted meanwhile; there is nothing to count or lock
+                self.db.commit()
+                return
+            for key, value in zip(("failed_login_attempts", "is_locked", "locked_until"), row):
+                set_committed_value(user, key, value)
+            was_locked = account_locked(user)
 
             # Lock account after too many failed attempts. TIME-BOX the lock (locked_until)
             # so it auto-unlocks — a permanent lock here is a trivial targeted DoS (5 wrong
@@ -2071,5 +2148,14 @@ class AuthService:
                 user.locked_until = (
                     datetime.utcnow() + timedelta(minutes=ttl) if ttl > 0 else None
                 )
+                # Record the failure that arms the lock. Every failure is already in the log as a
+                # login_failure with the same generic reason, so without this row a lock could only
+                # be inferred. A failure against an account already under a timed lock only moves
+                # its end, and is not recorded again.
+                if not was_locked:
+                    self.db.add(_lock_audit_row(AUTO_LOCKED_ACTION, user.id, user.username, ip_address, {
+                        "failed_attempts": user.failed_login_attempts,
+                        "locked_until": _iso(user.locked_until),
+                    }))
 
             self.db.commit()

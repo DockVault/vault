@@ -21173,7 +21173,7 @@ import asyncio
 
 async def cleanup_expired_sessions():
     """Background task to periodically clean up expired sessions."""
-    from app.core.models import ActiveSession, RateLimitRecord, User
+    from app.core.models import ActiveSession, RateLimitRecord
     from app.core.database import get_db_context
 
     while True:
@@ -21188,14 +21188,9 @@ async def cleanup_expired_sessions():
                 # Auto-unlock accounts whose failed-login lockout TTL has elapsed (locked_until
                 # in the past). authenticate_user also unlocks on the spot, but this clears the
                 # flag proactively so the inline is_locked checks (SFTP key auth, etc.) see it.
-                unlocked = db.query(User).filter(
-                    User.is_locked == True,  # noqa: E712
-                    User.locked_until.isnot(None),
-                    User.locked_until < datetime.utcnow(),
-                ).update(
-                    {"is_locked": False, "failed_login_attempts": 0, "locked_until": None},
-                    synchronize_session=False,
-                )
+                # Each unlock is recorded as account_auto_unlocked in the same commit.
+                from app.services.auth_service import release_expired_locks
+                unlocked = release_expired_locks(db)
                 if unlocked:
                     db.commit()
                     print(f"🔓 Auto-unlocked {unlocked} account(s) past their lockout TTL")
