@@ -46,7 +46,7 @@ class RateLimitRule:
 POLL_GET_PATHS = frozenset({
     "/audit/events", "/audit/log",
     "/notifications", "/notifications/unread-count",
-    "/activity/events", "/activity/summary",
+    "/activity/events", "/activity/summary", "/activity/now",
     "/api/security/metrics", "/api/security/alerts", "/api/monitoring/metrics",
 })
 

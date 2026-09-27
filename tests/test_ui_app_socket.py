@@ -124,6 +124,30 @@ def test_the_activity_signal_reaches_the_page_as_an_event(page: Page, admin_cred
     assert got == [{"events": [{"id": "8c6f0d2e-1111-4a4a-9a9a-000000000001", "category": "sign_in"}]}]
 
 
+def test_the_page_hears_how_the_socket_is_doing(page: Page, admin_creds):
+    _login(page, admin_creds["username"], admin_creds["password"])
+    # Signed in: the socket is open, and a page opened later can read that.
+    page.wait_for_function("() => window.dockvaultSocketState === 'open'", timeout=10000)
+    states = page.evaluate(
+        """() => {
+            const seen = [];
+            const listen = (e) => seen.push(e.detail.state);
+            window.addEventListener('dockvault:socket', listen);
+            const RealWS = window.WebSocket;
+            try {
+                window.WebSocket = function () { throw new Error('blocked by test'); };
+                connectAppSocket();                  // connecting, then error
+                closeAppSocket();                    // closed, as at sign-out
+                return seen;
+            } finally {
+                window.WebSocket = RealWS;
+                window.removeEventListener('dockvault:socket', listen);
+            }
+        }"""
+    )
+    assert states == ["connecting", "error", "closed"], states
+
+
 def test_the_live_monitor_and_the_settings_audit_log_are_gone(page: Page, admin_creds):
     _login(page, admin_creds["username"], admin_creds["password"])
     expect(page.locator('.sidebar-item[data-section="activity"]')).to_be_visible()

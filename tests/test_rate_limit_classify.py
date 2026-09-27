@@ -31,7 +31,7 @@ def test_download_class():
 
 @pytest.mark.parametrize("path", [
     "/audit/events", "/audit/log", "/notifications", "/notifications/unread-count",
-    "/activity/events", "/activity/summary",
+    "/activity/events", "/activity/summary", "/activity/now",
     "/api/security/metrics", "/api/security/alerts", "/api/monitoring/metrics",
 ])
 def test_polled_reads_are_poll_class(path):

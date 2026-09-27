@@ -6610,6 +6610,16 @@ async function submitGroupTemplate() {
 let appSocket = null;
 let appSocketReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
 
+// Tell the page how the socket is doing: the "dockvault:socket" event with detail.state one of
+// connecting, open, closed or error, and the latest in window.dockvaultSocketState for a page opened
+// later. The Activity page shows "Delayed" and polls faster while it is not open.
+function setAppSocketState(state) {
+    window.dockvaultSocketState = state;
+    try {
+        window.dispatchEvent(new CustomEvent('dockvault:socket', { detail: { state: state } }));
+    } catch (_) { /* a listener's fault is not the socket's */ }
+}
+
 // Schedule at most ONE pending reconnect. Any newer schedule (or a direct connect) cancels the prior
 // timer, so repeated failures across the entry points (sign-in, navigation, onclose, and a
 // WebSocket-constructor throw) can't stack into a burst of connection attempts.
@@ -6629,6 +6639,7 @@ function connectAppSocket() {
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/monitor`;
+    setAppSocketState('connecting');
     try {
         // Capture this specific socket so its handlers can tell whether they still belong to the
         // current connection: connect may close a live socket and immediately open a new one, and a
@@ -6641,6 +6652,7 @@ function connectAppSocket() {
             if (appSocket !== ws) return;   // superseded by a newer connect
             clearTimeout(appSocketReconnectTimer);
             appSocketReconnectTimer = null;
+            setAppSocketState('open');
             // The token goes in the first message, never the URL (logs, history, Referer).
             if (authToken) ws.send(JSON.stringify({ type: 'auth', token: authToken }));
         };
@@ -6651,15 +6663,19 @@ function connectAppSocket() {
                 console.error('Failed to read a socket frame:', error);
             }
         };
-        ws.onerror = () => { /* onclose follows and reconnects */ };
+        ws.onerror = () => {
+            if (appSocket === ws) setAppSocketState('error');   // onclose follows and reconnects
+        };
         ws.onclose = () => {
             // A stale close from a socket already replaced must not re-arm the reconnect (it would
             // tear down the healthy replacement 5s later).
             if (appSocket !== ws) return;
+            setAppSocketState('closed');
             scheduleAppSocketReconnect();
         };
     } catch (error) {
         console.error('Failed to open the socket:', error);
+        setAppSocketState('error');
         scheduleAppSocketReconnect();
     }
 }
@@ -6709,6 +6725,7 @@ function closeAppSocket() {
         appSocket = null;          // first, so its onclose does not schedule a reconnect
         ws.close();
     }
+    setAppSocketState('closed');
 }
 
 // (Re)open the socket if it isn't open. A cheap no-op when it's connected; covers a socket that
