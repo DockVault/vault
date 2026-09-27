@@ -15455,7 +15455,8 @@ def _can_manage_vault(db, vault, current_user) -> bool:
 # Nobody gives themselves access. Whoever may administer a vault's access (its owner, a Manager or
 # a global admin) may grant it to OTHER people, but a change that would widen the caller's OWN
 # access to a vault they do not own is refused, on every path that could widen it: a grant to
-# themselves, a grant to a department they belong to, and joining a department that has access.
+# themselves, a grant to a department they belong to, joining a department that has access or that
+# a share is addressed to, and removing their own member row when a department holds more.
 # Administrators are not members of every vault; without this, any admin could open any Standard
 # vault by granting it to themselves. The owner or another administrator can still grant them
 # access, so such a grant always has a second person behind it. Every refusal is audited.
@@ -15543,6 +15544,31 @@ def _shares_opened_by_joining(db, user, group_id) -> list:
         if not held.get("read"):
             opened.append(str(share.id))
     return opened
+
+
+def _removing_own_row_widens(db, vault, user) -> bool:
+    """True if deleting `user`'s own member row on `vault` would leave them holding more than the
+    row gave them.
+
+    A member row overrides department access (PermissionService.get_vault_permissions): an owner
+    can give an administrator read on a vault that the administrator's department may write to, and
+    the row is what holds them to read. Once it is gone they hold whatever their departments hold.
+    A department never reaches a zero-knowledge vault, and the owner holds everything, so neither
+    can widen."""
+    if vault.owner_id == user.id or getattr(vault, "type", "standard") == "zero_knowledge":
+        return False
+    from app.core.models import vault_members
+    row = db.execute(vault_members.select().where(
+        vault_members.c.vault_id == vault.id,
+        vault_members.c.user_id == user.id,
+    )).fetchone()
+    if row is None:
+        return False
+    had = {"read": bool(row.read_permission), "write": bool(row.write_permission),
+           "delete": bool(row.delete_permission),
+           "manage": bool(getattr(row, "manage_permission", False))}
+    after = PermissionService(db)._group_vault_permission(user, vault.id) or {}
+    return any(after.get(k) and not had[k] for k in _VAULT_PERMISSION_KEYS)
 
 
 @app.get("/vaults/{vault_id}/permissions")
@@ -15836,6 +15862,17 @@ async def revoke_vault_permission(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only the vault owner or an admin can revoke a manager"
             )
+
+        # Nobody widens their own access (see _gains_own_access). Removing your own member row falls
+        # back to what your departments hold on this vault, which can be more than the row gave
+        # (see _removing_own_row_widens). The owner or another administrator can still remove it.
+        if user_id == current_user.id and _removing_own_row_widens(db, vault, current_user):
+            _audit_access_change(db, current_user, "vault_self_access_refused", "vault", str(vault_id),
+                                 {"via": "remove_own_member_row"}, status="refused")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Removing your own access here would give you the wider access your "
+                       "department has to this vault; ask its owner or another administrator.")
 
         # Delete permission entry
         from app.core.models import vault_members

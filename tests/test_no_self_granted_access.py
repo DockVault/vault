@@ -9,7 +9,9 @@ of the three paths that could widen it:
   * a per-person grant to yourself (POST /vaults/{id}/permissions);
   * a grant to a department you belong to (POST /vaults/{id}/group-access);
   * adding yourself to a department that has access (POST /groups/{id}/members), whether the
-    department was granted the vault or is the audience of a share of something in it.
+    department was granted the vault or is the audience of a share of something in it;
+  * removing your own member row (DELETE /vaults/{id}/permissions/{your id}) when your departments
+    hold more on that vault than the row gave you: a member row overrides department access.
 
 The owner or another administrator can still grant the admin access, so such a grant always has a
 second person behind it. Every refusal is written to the audit log with status "refused".
@@ -301,6 +303,138 @@ def test_adding_only_other_people_is_not_limited(join):
     assert not isinstance(result, HTTPException), result
     assert len(db.executed) == 1
     assert not [a for a in audited if a[0] == "vault_self_access_refused"]
+
+
+# --------------------------------------------------------------------------- removing your own row
+
+class _MemberRowDB:
+    """Answers the member-row lookup with `row` (or no row)."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, statement, *a, **k):
+        return types.SimpleNamespace(fetchone=lambda: self.row)
+
+
+def _member_row(level):
+    perms = S._person_grant_permissions(level)
+    return types.SimpleNamespace(read_permission=perms["read"], write_permission=perms["write"],
+                                 delete_permission=perms["delete"], manage_permission=perms["manage"])
+
+
+@pytest.fixture
+def departments_hold(monkeypatch):
+    """Set what the caller's departments hold on the vault (None = nothing)."""
+    box = {"perms": None}
+
+    class _Permissions:
+        def __init__(self, db):
+            pass
+
+        def _group_vault_permission(self, user, vault_id):
+            return box["perms"]
+
+    monkeypatch.setattr(S, "PermissionService", _Permissions)
+    return box
+
+
+@pytest.mark.parametrize("row,departments,widens", [
+    ("read", WRITE, True),        # the owner held the admin to read; the department writes
+    ("read", READ, False),
+    ("read", None, False),        # no department access: removing the row only narrows
+    ("write", WRITE, False),
+    ("manage", WRITE, False),     # a department never holds delete or manage
+    (None, WRITE, False),         # no row to remove
+], ids=["read-dept-writes", "read-dept-reads", "read-no-dept", "write-dept-writes", "manage-dept-writes",
+        "no-row"])
+def test_removing_your_own_row_widens_only_when_a_department_holds_more(departments_hold, row,
+                                                                        departments, widens):
+    departments_hold["perms"] = departments
+    db = _MemberRowDB(_member_row(row) if row else None)
+    assert S._removing_own_row_widens(db, _vault(), _user()) is widens
+
+
+def test_neither_the_owner_nor_a_zero_knowledge_vault_can_widen(departments_hold):
+    departments_hold["perms"] = WRITE
+    user = _user()
+    db = _MemberRowDB(_member_row("read"))
+    assert S._removing_own_row_widens(db, _vault(owner_id=user.id), user) is False
+    assert S._removing_own_row_widens(db, _vault(kind="zero_knowledge"), user) is False
+
+
+class _RevokeDB:
+    """What DELETE /vaults/{id}/permissions/{user id} reads: the vault. Records the statements."""
+
+    def __init__(self, vault):
+        self.vault = vault
+        self.executed = []
+
+    def query(self, first, *more):
+        vault = self.vault
+
+        class _Q:
+            def filter(self, *a, **k):
+                return self
+
+            def first(self):
+                return vault
+
+        return _Q()
+
+    def execute(self, statement, *a, **k):
+        self.executed.append(statement)
+        return types.SimpleNamespace(rowcount=1)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+@pytest.fixture
+def revoke(monkeypatch):
+    """Call the real route as an administrator, with what removing the row would do set by the test."""
+    audited = []
+    monkeypatch.setattr(S, "_audit_access_change",
+                        lambda db, actor, action, rtype, rid, details=None, status="success":
+                        audited.append((action, details, status)))
+
+    def run(widens, *, own_row=True):
+        monkeypatch.setattr(S, "_removing_own_row_widens", lambda db, vault, user: widens)
+        me = types.SimpleNamespace(id=uuid.uuid4(), role=S.RoleEnum.ADMIN)
+        vault = _vault()
+        db = _RevokeDB(vault)
+        try:
+            result = run_coroutine(S.revoke_vault_permission(
+                vault_id=vault.id, user_id=me.id if own_row else uuid.uuid4(), current_user=me, db=db))
+        except HTTPException as e:
+            result = e
+        return result, db, audited
+
+    return run
+
+
+def test_removing_your_own_row_is_refused_when_it_widens(revoke):
+    result, db, audited = revoke(True)
+    assert isinstance(result, HTTPException) and result.status_code == 403
+    assert "ask its owner or another administrator" in result.detail
+    assert db.executed == [], "the row was removed anyway"
+    assert audited == [("vault_self_access_refused", {"via": "remove_own_member_row"}, "refused")]
+
+
+def test_removing_your_own_row_is_allowed_when_it_only_narrows(revoke):
+    result, db, audited = revoke(False)
+    assert not isinstance(result, HTTPException), result
+    assert len(db.executed) == 1
+    assert [a[0] for a in audited] == ["vault_permission_revoked"]
+
+
+def test_removing_someone_elses_row_is_not_limited(revoke):
+    result, db, audited = revoke(True, own_row=False)
+    assert not isinstance(result, HTTPException), result
+    assert len(db.executed) == 1
 
 
 # --------------------------------------------------------------------------- the routes ask first

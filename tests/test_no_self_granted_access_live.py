@@ -2,9 +2,9 @@
 
 A regular user owns a vault with a file in it. A freshly made administrator tries every way of
 reaching it themselves: a grant to themselves at each level, a grant to a department they belong to,
-joining a department that has access, and joining a department the file is shared with. Each is
-refused with 403, leaves them unable to reach the vault or the file, and is written to the audit log
-as refused. What must keep working: a second administrator
+joining a department that has access, joining a department the file is shared with, and removing
+their own read-only member row while their department may write. Each is refused with 403, leaves
+them no more than they had, and is written to the audit log as refused. What must keep working: a second administrator
 granting the first, the first granting other people, the owner sharing, and lowering or restating
 access you already hold.
 
@@ -287,3 +287,47 @@ def test_a_share_that_has_ended_does_not_stop_the_join(admin, scene, groups, dep
     assert r.status_code == 200, r.text
     assert _members(admin, dept) == {_uid(actor)}
     assert actor.post(f"/shares/{share_id}/claim").status_code == 410, "an ended share opens nothing"
+
+
+# --------------------------------------------------------------------------- removing your own row
+
+def _can_write(client, vault_id):
+    r = client.post(f"/vaults/{vault_id}/files",
+                    files=[("files", (unique("w") + ".txt", b"written", "text/plain"))])
+    assert r.status_code in (200, 201, 403), r.text
+    return r.status_code != 403
+
+
+def test_an_admin_cannot_drop_their_own_row_to_get_their_departments_wider_access(admin, scene, groups):
+    owner, actor, vid = scene["owner"], scene["actor"], scene["vault_id"]
+    dept = groups(admin)
+    # The owner lets the admin read, and gives the admin's department write: the member row is what
+    # holds the admin to read.
+    assert _grant(owner, vid, actor, "read").status_code == 200
+    assert admin.post(f"/groups/{dept}/members", json={"user_ids": [_uid(actor)]}).status_code == 200
+    r = owner.post(f"/vaults/{vid}/group-access", json={"group_id": dept, "permission": "write"})
+    assert r.status_code == 200, r.text
+    assert _can_list(actor, vid) and not _can_write(actor, vid), "anchor: the row holds the admin to read"
+
+    r = actor.delete(f"/vaults/{vid}/permissions/{_uid(actor)}")
+    assert r.status_code == 403, r.text
+    assert "ask its owner or another administrator" in r.json()["detail"], r.text
+    assert len(_refusals(admin, vid, "remove_own_member_row", actor.account["_username"])) == 1
+    listed = owner.get(f"/vaults/{vid}/permissions").json()
+    assert _uid(actor) in {str(m["user_id"]) for m in listed}, "the refused removal took the row"
+    assert not _can_write(actor, vid)
+
+    # The owner can remove it, and then the department's write is what the admin holds: the removal
+    # was worth refusing.
+    assert owner.delete(f"/vaults/{vid}/permissions/{_uid(actor)}").status_code == 200
+    assert _can_write(actor, vid)
+
+
+def test_an_admin_can_still_drop_their_own_row_when_it_only_narrows(admin, scene):
+    owner, actor, vid = scene["owner"], scene["actor"], scene["vault_id"]
+    assert _grant(owner, vid, actor, "read").status_code == 200
+    assert _can_list(actor, vid)
+
+    r = actor.delete(f"/vaults/{vid}/permissions/{_uid(actor)}")
+    assert r.status_code == 200, r.text
+    assert not _can_list(actor, vid)
