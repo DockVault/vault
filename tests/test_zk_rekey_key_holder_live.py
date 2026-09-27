@@ -107,12 +107,12 @@ def test_an_admin_without_the_key_cannot_rotate_it_and_the_owner_can(admin, temp
     assert _keys(temp_user_client, vid)["current_dek_version"] == 2
 
 
-def test_an_admin_without_the_team_key_cannot_rotate_a_hierarchical_vault(admin, temp_user_client):
-    """A routine hierarchical rotation needs no private key at all -- the new key is wrapped to the
-    team PUBLIC key -- so without the rule anyone who may manage the vault could run one."""
-    ensure_ecc_keypair(temp_user_client)
+def _team_vault(admin, owner_client):
+    """A team (hierarchical) zero-knowledge vault owned by `owner_client`'s user, with stand-in
+    wraps: its owner holds the team private key at team epoch 1."""
+    ensure_ecc_keypair(owner_client)
     with _zk_enabled(admin):
-        r = temp_user_client.post("/vaults", json={
+        r = owner_client.post("/vaults", json={
             "name": unique("hier"), "type": "zero_knowledge",
             "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "key_wrapping_mode": "hierarchical",
@@ -123,10 +123,20 @@ def test_an_admin_without_the_team_key_cannot_rotate_a_hierarchical_vault(admin,
             "team_privkey_ephemeral_public_key": ZK_EPHEMERAL_STUB,
         })
         r.raise_for_status()
-    vid = r.json()["id"]
-    routine = {"from_version": 1, "to_version": 2, "member_keys": [],
-               "team_dek_wrapped": ZK_WRAPPED_DEK_STUB,
-               "team_dek_ephemeral_public_key": ZK_EPHEMERAL_STUB}
+    return r.json()["id"]
+
+
+# A routine rotation of a team vault: a new key wrapped to the unchanged team public key.
+_ROUTINE_TEAM_ROTATION = {"from_version": 1, "to_version": 2, "member_keys": [],
+                          "team_dek_wrapped": ZK_WRAPPED_DEK_STUB,
+                          "team_dek_ephemeral_public_key": ZK_EPHEMERAL_STUB}
+
+
+def test_an_admin_without_the_team_key_cannot_rotate_a_hierarchical_vault(admin, temp_user_client):
+    """A routine hierarchical rotation needs no private key at all -- the new key is wrapped to the
+    team PUBLIC key -- so without the rule anyone who may manage the vault could run one."""
+    vid = _team_vault(admin, temp_user_client)
+    routine = _ROUTINE_TEAM_ROTATION
     try:
         r = admin.post(f"/ecc/vaults/{vid}/rekey", json=routine)
         assert r.status_code == 403, r.text
@@ -283,6 +293,54 @@ def test_a_share_rechecks_the_key_after_it_gets_the_lock(temp_user, temp_user_cl
     assert "current key" in r.json()["detail"]
     # Nothing was written for the member: they still have no key row, so no relationship at all.
     assert member_client.get(f"/ecc/vaults/{vid}/keys").status_code == 403
+
+
+def test_minting_the_name_index_key_rechecks_the_key_after_it_gets_the_lock(temp_user,
+                                                                           temp_user_client,
+                                                                           owned_vault):
+    """Minting the name-index key is for someone who holds the vault's key, checked under the lock
+    like a rotation. The owner's key is removed while the request waits for the lock: checked on
+    entry the owner would pass and the key would be minted; checked under the lock, it is refused."""
+    vid, uid = owned_vault, temp_user["id"]
+    body = {"wraps": [{"user_id": str(uid), "encrypted_index_key": ZK_WRAPPED_DEK_STUB,
+                       "ephemeral_public_key": ZK_EPHEMERAL_STUB}]}
+    holder = _hold_vault_row(vid, before_commit=(
+        f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
+    try:
+        r, elapsed = _timed(lambda: temp_user_client.put(f"/ecc/vaults/{vid}/index-key", json=body))
+    finally:
+        holder.wait(timeout=_HOLD + 5)
+    assert holder.returncode == 0, "the lock-holding transaction failed"
+    assert elapsed >= 2.0, f"the mint did not wait for the vault row lock ({elapsed:.2f}s)"
+    assert r.status_code == 403, r.text
+    assert "holds this vault's key" in r.json()["detail"]
+    rows = subprocess.run(
+        ["docker", "exec", DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
+         f"SELECT count(*) FROM vault_member_index_keys WHERE vault_id='{vid}'"],
+        capture_output=True, text=True, timeout=30)
+    assert rows.returncode == 0, rows.stderr
+    assert rows.stdout.strip() == "0", "a refused mint still stored the name-index key"
+
+
+def test_a_team_vault_rotation_rechecks_the_key_after_it_gets_the_lock(admin, temp_user,
+                                                                      temp_user_client):
+    """The same recheck in a team (hierarchical) vault, where the key to hold is the team private
+    key. It is removed while the rotation waits for the lock, and the rotation is refused."""
+    vid, uid = _team_vault(admin, temp_user_client), temp_user["id"]
+    try:
+        holder = _hold_vault_row(vid, before_commit=(
+            f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
+        try:
+            r, elapsed = _timed(lambda: temp_user_client.post(f"/ecc/vaults/{vid}/rekey",
+                                                              json=_ROUTINE_TEAM_ROTATION))
+        finally:
+            holder.wait(timeout=_HOLD + 5)
+        assert holder.returncode == 0, "the lock-holding transaction failed"
+        assert elapsed >= 2.0, f"the rotation did not wait for the vault row lock ({elapsed:.2f}s)"
+        assert r.status_code == 403, r.text
+        assert r.json()["detail"] == NOT_A_HOLDER
+    finally:
+        temp_user_client.delete_vault(vid)
 
 
 def _active_epochs(vid, uid):
