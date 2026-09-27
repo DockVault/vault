@@ -15856,6 +15856,17 @@ async def revoke_vault_permission(
                 detail="Only the vault owner or a manager can revoke permissions"
             )
 
+        # The owner's access comes from owning the vault, not from a member row, so there is nothing
+        # here to remove. Refused before anything is written, on every vault type: on a
+        # zero-knowledge vault the owner's keys would otherwise be switched off below, and nobody
+        # else may give the owner a new key, so they could no longer read, share or rotate their own
+        # vault. DELETE /ecc/vaults/{id}/members/{owner} refuses the owner the same way.
+        if user_id == vault.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The vault owner's access cannot be revoked"
+            )
+
         # A Manager cannot unseat a peer Manager — that stays owner/admin-only.
         if not _is_vault_owner_or_admin(vault, current_user) and _vault_member_manages(db, vault_id, user_id):
             raise HTTPException(
@@ -15893,6 +15904,16 @@ async def revoke_vault_permission(
         )
         result = db.execute(stmt)
 
+        # Nobody was removed: the user is not a member. Roll back (which also releases the vault row
+        # lock) and answer before touching their keys, so a request that removed nobody changes
+        # nothing at all.
+        if result.rowcount == 0:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User does not have access to this vault"
+            )
+
         # Zero-knowledge: deactivate the user's wrapped DEK(s) in the SAME transaction as
         # the authz removal, so a usable crypto key is never left behind after access is
         # revoked. The forward-secrecy guarantee (a NEW DEK epoch the removed user never
@@ -15917,12 +15938,6 @@ async def revoke_vault_permission(
                 mk.revoked_by = current_user.id
 
         db.commit()
-
-        if result.rowcount == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User does not have access to this vault"
-            )
 
         # Recorded AFTER the rowcount check, so the log says a revoke happened only when one did.
         # Logging before it would record every 404 as a successful revocation.
