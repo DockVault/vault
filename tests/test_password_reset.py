@@ -63,6 +63,9 @@ def _mp_clear():
 
 
 def _mp_token_for(email, timeout=15):
+    """The reset token in the newest message to ``email`` that carries one. An administrator's reset
+    link also sends the user a notice of the change, with no link in it, so the address can hold a
+    message that is not the link."""
     import re
     email = email.lower()
     deadline = time.time() + timeout
@@ -71,7 +74,8 @@ def _mp_token_for(email, timeout=15):
             if email in [a.get("Address", "").lower() for a in m.get("To", [])]:
                 full = requests.get(f"{MAILPIT_URL}/api/v1/message/{m['ID']}", timeout=10).json()
                 mm = re.search(r"[?&]reset=([A-Za-z0-9_-]+)", full.get("HTML", ""))
-                return mm.group(1) if mm else None
+                if mm:
+                    return mm.group(1)
         time.sleep(0.4)
     return None
 
