@@ -48,6 +48,9 @@ def _open_accounts_tab(page: Page):
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.click('#settings-section .tab-btn[data-tab="accounts"]')
     expect(page.locator(TAB)).to_be_visible()
+    # The settings load fills the form after the tab shows, and resets anything touched before it
+    # lands. This field starts empty and the load always fills it, so it says the load has landed.
+    expect(page.locator("#setting-password-reset-ttl-minutes")).not_to_have_value("", timeout=10000)
 
 
 def test_tab_renders_with_controls_and_summary(page: Page, admin_creds):
