@@ -1461,6 +1461,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Load dashboard stats
         loadDashboardStats();
 
+        // A copied link to an Activity search, opened before signing in, opens it now.
+        openActivityFromHash();
+
         // Prompt a keyless user who's been invited to a ZK vault to set up a key.
         zkMaybePromptPendingInvites();
 
@@ -1874,6 +1877,11 @@ function logout() {
 
     // Close this session's socket; the next sign-in opens one with its own token.
     closeAppSocket();
+
+    // The Activity page keeps its filters in the URL hash and in the page itself: neither may carry over
+    // to the next person who signs in on this tab.
+    if (location.hash) { try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {} }
+    if (typeof window.resetActivity === 'function') { try { window.resetActivity(); } catch (_) {} }
 
     // Wipe the notification bell so a prior user's notifications never show to the next user on this
     // same tab, and stop the unread-count poll.
@@ -14485,6 +14493,19 @@ function navigateToSection(section) {
     if (item) item.click();
 }
 
+// A link to the Activity page (#activity?range=7d&status=failed...) opens that page, for an administrator
+// in their own session; the page reads its filters from the hash. For anyone else the hash is dropped.
+// The hash never reaches the server. Returns true if it opened the page.
+function openActivityFromHash() {
+    if (!location.hash.startsWith('#activity')) return false;
+    if (currentUser && currentUser.role === 'admin' && !isScopedTemp) {
+        navigateToSection('activity');
+        return true;
+    }
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+    return false;
+}
+
 // Restore the saved view on app load. Returns true if it handled navigation.
 async function restoreLastView() {
     const nav = getNavState();
@@ -20473,7 +20494,7 @@ async function enterAuthedSession() {
 
     // Restore the section/vault/folder the user was on before a refresh.
     let restored = false;
-    try { restored = await restoreLastView(); } catch (e) { console.error('Restore failed:', e); }
+    try { restored = openActivityFromHash() || await restoreLastView(); } catch (e) { console.error('Restore failed:', e); }
     if (!restored) loadDashboardStats();
 
     // Load the notification bell after a refresh too.
