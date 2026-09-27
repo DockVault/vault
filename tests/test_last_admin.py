@@ -11,8 +11,9 @@ rules now hold on every route that can make such a change:
     unlocked administrator would remain, counted under a lock on the administrator rows.
 
 This file drives the shared rule (app/core/last_admin.py) against the real users table in a
-throwaway SQLite database, and pins that each route asks it before it changes anything.
-test_last_admin_live.py drives the routes.
+throwaway SQLite database, pins that each route asks it before it changes anything, and calls each
+of the six routes with the rule answering yes, expecting a refusal and no write.
+test_last_admin_live.py drives the routes against a running deployment.
 """
 import re
 import tempfile
@@ -226,3 +227,141 @@ def test_no_other_route_changes_a_role_activity_lock_or_deletes_a_user():
         "app/api/user_management_api.py: target_user.role = request.new_role",
         "app/services/auth_service.py: user.is_locked = True",
     ]), writers
+
+
+# --------------------------------------------------------------------------- the routes refuse
+#
+# The pins above check that each route ASKS; a route could keep the text and still ignore the answer.
+# So each of the six routes is also called here, with the rule answering that the change would leave
+# no administrator who can act: it must refuse with 400 before it changes anything.
+
+from _async_run import run_coroutine  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
+
+import app.api.api_server as S  # noqa: E402
+import app.api.user_management_api as UM  # noqa: E402
+
+
+class _Rows:
+    """Any db.query(...) chain: first() is the account the route looks up, and nothing else exists."""
+
+    def __init__(self, found):
+        self.found = found
+
+    def __getattr__(self, name):          # filter, order_by, with_for_update, ...
+        return lambda *a, **k: self
+
+    def first(self):
+        return self.found
+
+    def all(self):
+        return []
+
+    def count(self):
+        return 0
+
+    def update(self, *a, **k):
+        return 0
+
+
+class _RecordingDB:
+    """Records every call that would change the database."""
+
+    def __init__(self, target):
+        self.target = target
+        self.writes = []
+
+    def query(self, model, *more):
+        return _Rows(self.target if model is User else None)
+
+    def __getattr__(self, name):
+        if name in ("add", "delete", "merge", "execute", "flush", "commit"):
+            return lambda *a, **k: self.writes.append(name)
+        if name in ("refresh", "rollback", "expire", "expire_all"):
+            return lambda *a, **k: None
+        raise AttributeError(name)
+
+
+def _admin_account():
+    return types.SimpleNamespace(
+        id=uuid.uuid4(), username="the_last_admin", email=None, role=RoleEnum.ADMIN, is_active=True,
+        is_locked=False, locked_until=None, failed_login_attempts=0, sftp_enabled=True,
+        sftp_password_auth=True, storage_quota_bytes=None, updated_at=None)
+
+
+# name -> how to call the route on `target`, as `actor`
+_ROUTES = {
+    "PATCH /users/{id} role": lambda t, a, db: S.update_user(
+        user_id=t.id, user_update=S.UserUpdate(role=RoleEnum.USER), current_user=a, db=db, request=None),
+    "PATCH /users/{id} deactivate": lambda t, a, db: S.update_user(
+        user_id=t.id, user_update=S.UserUpdate(is_active=False), current_user=a, db=db, request=None),
+    "PATCH /users/{id} lock": lambda t, a, db: S.update_user(
+        user_id=t.id, user_update=S.UserUpdate(is_locked=True), current_user=a, db=db, request=None),
+    "PUT /api/user-management/users/{id} role": lambda t, a, db: UM.update_user(
+        user_id=t.id, update_data=UM.UserUpdateRequest(role=RoleEnum.USER), request=None,
+        current_user=a, db=db),
+    "PUT /api/user-management/users/{id} deactivate": lambda t, a, db: UM.update_user(
+        user_id=t.id, update_data=UM.UserUpdateRequest(is_active=False), request=None,
+        current_user=a, db=db),
+    "toggle-active": lambda t, a, db: UM.toggle_user_active(
+        user_id=t.id, current_user=a, db=db, request=None),
+    "toggle-locked": lambda t, a, db: UM.toggle_user_locked(
+        user_id=t.id, current_user=a, db=db, request=None),
+    "PATCH /api/user-management/users/{id}/role": lambda t, a, db: UM.change_user_role(
+        user_id=t.id, request=UM.ChangeRoleRequest(new_role=RoleEnum.USER), current_user=a, db=db,
+        http_request=None),
+    "POST /users/{id}/delete": lambda t, a, db: S.delete_user(
+        user_id=t.id, current_user=a, db=db, request=None),
+}
+
+
+@pytest.fixture
+def the_rule_says(monkeypatch):
+    """Make removes_last_admin answer `verdict`, and record whom each route asked about."""
+    asked = []
+
+    def answer(verdict):
+        def removes_last_admin(db, target):
+            asked.append(target)
+            return verdict
+        monkeypatch.setattr(S, "removes_last_admin", removes_last_admin)
+        monkeypatch.setattr(UM, "removes_last_admin", removes_last_admin)
+        return asked
+
+    return answer
+
+
+@pytest.mark.parametrize("route", sorted(_ROUTES))
+def test_each_route_refuses_before_it_writes_when_no_admin_would_remain(route, the_rule_says):
+    asked = the_rule_says(True)
+    target, actor = _admin_account(), _admin_account()
+    before = dict(vars(target))
+    db = _RecordingDB(target)
+
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(_ROUTES[route](target, actor, db))
+
+    assert refused.value.status_code == 400
+    assert refused.value.detail == L.LAST_ADMIN_DETAIL
+    assert asked == [target], "the route must ask about the account it changes"
+    assert db.writes == [], f"{route} wrote before refusing: {db.writes}"
+    assert vars(target) == before, f"{route} changed the account before refusing"
+
+
+@pytest.mark.parametrize("route", sorted(_ROUTES))
+def test_the_same_call_goes_ahead_when_another_admin_remains(route, the_rule_says):
+    """The control for the test above: with the rule answering no, the same call reaches the account
+    (whatever the stand-in database then does to the rest of the route), so a refusal above is the
+    rule's doing and not the stand-in's."""
+    the_rule_says(False)
+    target, actor = _admin_account(), _admin_account()
+    before = dict(vars(target))
+    db = _RecordingDB(target)
+
+    try:
+        run_coroutine(_ROUTES[route](target, actor, db))
+    except HTTPException as e:
+        assert e.detail != L.LAST_ADMIN_DETAIL, route
+    except Exception:  # noqa: BLE001 -- the stand-in cannot carry every later step; the change is made
+        pass
+    assert vars(target) != before or "delete" in db.writes, f"{route} did not reach the account"
