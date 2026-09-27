@@ -8,7 +8,8 @@ of the three paths that could widen it:
 
   * a per-person grant to yourself (POST /vaults/{id}/permissions);
   * a grant to a department you belong to (POST /vaults/{id}/group-access);
-  * adding yourself to a department that has access (POST /groups/{id}/members).
+  * adding yourself to a department that has access (POST /groups/{id}/members), whether the
+    department was granted the vault or is the audience of a share of something in it.
 
 The owner or another administrator can still grant the admin access, so such a grant always has a
 second person behind it. Every refusal is written to the audit log with status "refused".
@@ -22,7 +23,9 @@ import uuid
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
+from _async_run import run_coroutine
 from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
@@ -149,6 +152,157 @@ def test_joining_a_department_with_no_vault_access_opens_nothing(held):
     assert S._vaults_opened_by_joining(_GrantsDB([], []), _user(), uuid.uuid4()) == []
 
 
+# --------------------------------------------------------------------------- shares to a department
+#
+# A share addressed to a department can be claimed by anyone in that department at claim time, so
+# joining it reaches the shared item. Which shares are live (active, not expired, naming this
+# department) is the query's to decide and is driven live; what is decided here is which of those
+# would open something the joiner cannot read today.
+
+class _SharesDB:
+    """The live shares naming the department, the joiner's current departments, and the vaults."""
+
+    def __init__(self, shares, vaults, groups_now=()):
+        self.shares = shares
+        self.vaults = {v.id: v for v in vaults}
+        self.groups_now = [(g,) for g in groups_now]
+
+    def query(self, first, *more):
+        if first is S.Share:
+            return _GrantsDB._All(self.shares)
+        if first is S.Vault:
+            return _GrantsDB._ById(self.vaults)
+        return _GrantsDB._All(self.groups_now)          # user_groups.c.group_id
+
+
+def _share(vault, *departments):
+    return types.SimpleNamespace(id=uuid.uuid4(), vault_id=vault.id, claim_audience="departments",
+                                 audience_user_ids=[],
+                                 audience_department_ids=[str(d) for d in departments])
+
+
+def test_joining_names_exactly_the_shares_it_would_let_you_claim(held):
+    user, dept, other_dept = _user(), uuid.uuid4(), uuid.uuid4()
+    unreadable, readable = _vault(), _vault()
+    own, zero_knowledge = _vault(owner_id=user.id), _vault(kind="zero_knowledge")
+    held[readable.id] = READ
+    opens = _share(unreadable, dept)
+    shares = [
+        opens,
+        _share(readable, dept),                  # you read the vault already
+        _share(own, dept),                       # nothing widens the owner
+        _share(zero_knowledge, dept),            # never shared
+        _share(unreadable, dept, other_dept),    # you can claim it already, through another department
+        _share(_vault(), dept),                  # its vault is gone
+    ]
+    db = _SharesDB(shares, [unreadable, readable, own, zero_knowledge], groups_now=[other_dept])
+    assert S._shares_opened_by_joining(db, user, dept) == [str(opens.id)]
+
+
+def test_being_in_other_departments_does_not_stop_a_share_from_counting(held):
+    user, dept = _user(), uuid.uuid4()
+    vault = _vault()
+    share = _share(vault, dept)
+    db = _SharesDB([share], [vault], groups_now=[uuid.uuid4()])
+    assert S._shares_opened_by_joining(db, user, dept) == [str(share.id)]
+
+
+def test_no_share_naming_the_department_opens_nothing(held):
+    assert S._shares_opened_by_joining(_SharesDB([], []), _user(), uuid.uuid4()) == []
+
+
+# --------------------------------------------------------------------------- joining, end to end
+
+class _JoinDB:
+    """What POST /groups/{id}/members reads before it adds anyone: the department, its members (none)
+    and each person to add. Records the inserts."""
+
+    def __init__(self):
+        self.executed = []
+
+    def query(self, first, *more):
+        if first is S.Group or first is S.User:
+            found = types.SimpleNamespace(id=uuid.uuid4())
+        else:
+            found = None                                    # user_groups.c.user_id: no members yet
+
+        class _Q:
+            def filter(self, *a, **k):
+                return self
+
+            def with_for_update(self, *a, **k):
+                return self
+
+            def first(self):
+                return found
+
+            def all(self):
+                return []
+
+        return _Q()
+
+    def execute(self, statement, *a, **k):
+        self.executed.append(statement)
+
+    def commit(self):
+        pass
+
+
+@pytest.fixture
+def join(monkeypatch):
+    """Call the real route, with what joining would open set by the test."""
+    audited = []
+    monkeypatch.setattr(S, "_audit_access_change",
+                        lambda db, actor, action, rtype, rid, details=None, status="success":
+                        audited.append((action, details, status)))
+
+    def run(vaults, shares, *, include_self=True):
+        monkeypatch.setattr(S, "_vaults_opened_by_joining", lambda db, user, gid: list(vaults))
+        monkeypatch.setattr(S, "_shares_opened_by_joining", lambda db, user, gid: list(shares))
+        me, colleague = _user(), _user()
+        ids = [colleague.id] + ([me.id] if include_self else [])
+        db = _JoinDB()
+        try:
+            result = run_coroutine(S.add_group_members(
+                group_id=uuid.uuid4(), payload=S.GroupMembersAdd(user_ids=ids), current_user=me, db=db))
+        except HTTPException as e:
+            result = e
+        return result, db, audited
+
+    return run
+
+
+def test_a_share_to_the_department_refuses_the_whole_self_join(join):
+    result, db, audited = join([], ["share-1"])
+    assert isinstance(result, HTTPException) and result.status_code == 403
+    assert db.executed == [], "a refused request added someone"
+    assert audited == [("vault_self_access_refused",
+                        {"via": "department_membership", "vault_ids": [], "share_ids": ["share-1"]},
+                        "refused")]
+
+
+def test_a_grant_to_the_department_still_refuses_it(join):
+    result, db, audited = join(["vault-1"], [])
+    assert isinstance(result, HTTPException) and result.status_code == 403
+    assert db.executed == []
+    assert audited == [("vault_self_access_refused",
+                        {"via": "department_membership", "vault_ids": ["vault-1"], "share_ids": []},
+                        "refused")]
+
+
+def test_joining_a_department_that_opens_nothing_goes_ahead(join):
+    result, db, audited = join([], [])
+    assert not isinstance(result, HTTPException), result
+    assert len(db.executed) == 2, "both people are added"
+
+
+def test_adding_only_other_people_is_not_limited(join):
+    result, db, audited = join(["vault-1"], ["share-1"], include_self=False)
+    assert not isinstance(result, HTTPException), result
+    assert len(db.executed) == 1
+    assert not [a for a in audited if a[0] == "vault_self_access_refused"]
+
+
 # --------------------------------------------------------------------------- the routes ask first
 #
 # Each route must ask before it writes, lock the department row before asking where a department is
@@ -196,5 +350,7 @@ def test_joining_a_department_is_checked_under_the_department_lock():
     body = _endpoint_body("post", "/groups/{group_id}/members")
     lock = _once(body, "db.query(Group).filter(Group.id == group_id).with_for_update().first()")
     check = _once(body, "_vaults_opened_by_joining(")
+    shares = _once(body, "_shares_opened_by_joining(")
     assert lock < check < _once(body, "user_groups.insert()")
+    assert lock < shares < _once(body, "user_groups.insert()")
     _refusal_is_recorded(body, "department_membership")

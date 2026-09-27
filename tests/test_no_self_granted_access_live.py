@@ -2,20 +2,25 @@
 
 A regular user owns a vault with a file in it. A freshly made administrator tries every way of
 reaching it themselves: a grant to themselves at each level, a grant to a department they belong to,
-and joining a department that has access. Each is refused with 403, leaves them unable to list the
-vault, and is written to the audit log as refused. What must keep working: a second administrator
+joining a department that has access, and joining a department the file is shared with. Each is
+refused with 403, leaves them unable to reach the vault or the file, and is written to the audit log
+as refused. What must keep working: a second administrator
 granting the first, the first granting other people, the owner sharing, and lowering or restating
 access you already hold.
 
 test_no_self_granted_access.py covers the rule offline.
 """
+import os
+import subprocess
+
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, skip_if_container_absent, unique
 
 pytestmark = pytest.mark.integration
 
 _REFUSED_ACTION = "vault_self_access_refused"
+_DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
 
 class _Cast:
@@ -197,3 +202,88 @@ def test_an_admin_cannot_reach_a_vault_through_a_department(admin, scene, groups
     assert r.status_code == 403, r.text
     access = admin.get(f"/vaults/{vid}/group-access").json()
     assert [g["permission"] for g in access if g["group_id"] == dept] == ["read"], access
+
+
+# --------------------------------------------------------------------------- a share to a department
+
+@pytest.fixture
+def department_shares(admin, scene):
+    """Sharing switched on and a tag that lets the owner share with departments. Returns a function
+    that shares the owner's file with a department. Sharing is put back as it was."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    assert admin.put("/settings", json={"sharing_enabled": True}).status_code == 200
+    tag = admin.post("/share-tags", json={"name": unique("depttag"), "auto_enroll_new_users": True,
+                                          "allowed_audiences": ["users", "departments"],
+                                          "max_recipients_cap": 10})
+    assert tag.status_code == 200, tag.text
+    owner, vid = scene["owner"], scene["vault_id"]
+    items = owner.get(f"/vaults/{vid}/files").json()["items"]
+    file_id = next(it["id"] for it in items if it.get("name") == "private.txt")
+
+    def share_with(dept):
+        r = owner.post("/shares", json={"vault_id": vid, "tag_id": tag.json()["id"], "target_type": "file",
+                                        "target_file_id": file_id, "claim_audience": "departments",
+                                        "audience_department_ids": [dept]})
+        assert r.status_code == 200, r.text
+        return r.json()["id"]
+
+    yield share_with
+    admin.delete(f"/share-tags/{tag.json()['id']}")
+    admin.put("/settings", json={"sharing_enabled": bool(before)})
+
+
+def _psql(sql):
+    try:
+        r = subprocess.run(
+            ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db",
+             "-v", "ON_ERROR_STOP=1", "-Atc", sql],
+            capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker/psql unavailable: {exc}")
+    skip_if_container_absent(r, _DB_CONTAINER)
+    assert r.returncode == 0, r.stderr[:300]
+    return r.stdout.strip()
+
+
+def test_an_admin_cannot_reach_a_shared_file_by_joining_its_department(admin, scene, groups,
+                                                                       department_shares):
+    actor, second, colleague, vid = (scene["actor"], scene["second_admin"], scene["colleague"],
+                                     scene["vault_id"])
+    dept = groups(admin)
+    share_id = department_shares(dept)
+    assert actor.post(f"/shares/{share_id}/claim").status_code == 403, "anchor: not in the audience"
+
+    r = actor.post(f"/groups/{dept}/members", json={"user_ids": [_uid(actor)]})
+    assert r.status_code == 403, r.text
+    rows = _refusals(admin, dept, "department_membership", actor.account["_username"])
+    assert len(rows) == 1 and rows[0]["details"]["share_ids"] == [share_id], rows
+    assert rows[0]["details"]["vault_ids"] == [], "the department itself has no access to the vault"
+
+    # The whole request is refused, so nobody in it is added.
+    r = actor.post(f"/groups/{dept}/members", json={"user_ids": [_uid(colleague), _uid(actor)]})
+    assert r.status_code == 403, r.text
+    assert _members(admin, dept) == set(), "a refused request added someone"
+    assert actor.post(f"/shares/{share_id}/claim").status_code == 403
+    assert not _can_list(actor, vid)
+
+    # Another administrator may add them, and from there the share is theirs to claim: the join
+    # was worth refusing.
+    assert second.post(f"/groups/{dept}/members", json={"user_ids": [_uid(actor)]}).status_code == 200
+    assert actor.post(f"/shares/{share_id}/claim").status_code == 200
+
+
+@pytest.mark.parametrize("ended", ["revoked", "expired"])
+def test_a_share_that_has_ended_does_not_stop_the_join(admin, scene, groups, department_shares, ended):
+    owner, actor = scene["owner"], scene["actor"]
+    dept = groups(admin)
+    share_id = department_shares(dept)
+    if ended == "revoked":
+        assert owner.post(f"/shares/{share_id}/revoke").status_code == 200
+    else:
+        _psql("UPDATE shares SET expires_at = (now() AT TIME ZONE 'utc') - interval '1 minute' "
+              f"WHERE id = '{share_id}'")
+
+    r = actor.post(f"/groups/{dept}/members", json={"user_ids": [_uid(actor)]})
+    assert r.status_code == 200, r.text
+    assert _members(admin, dept) == {_uid(actor)}
+    assert actor.post(f"/shares/{share_id}/claim").status_code == 410, "an ended share opens nothing"

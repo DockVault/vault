@@ -13775,17 +13775,20 @@ async def add_group_members(
         row[0] for row in db.query(user_groups.c.user_id).filter(user_groups.c.group_id == group_id).all()
     }
     # Nobody widens their own access (see _gains_own_access): an admin may not join a department
-    # that reaches a vault they cannot otherwise open. Another administrator can add them. The
-    # whole request is refused, so nobody in it is added.
+    # that reaches a vault they cannot otherwise open, through a grant to the department or through
+    # a share addressed to it. Another administrator can add them. The whole request is refused, so
+    # nobody in it is added.
     if current_user.id in payload.user_ids and current_user.id not in existing:
         opened = _vaults_opened_by_joining(db, current_user, group_id)
-        if opened:
+        shares = _shares_opened_by_joining(db, current_user, group_id)
+        if opened or shares:
             _audit_access_change(db, current_user, "vault_self_access_refused", "group", str(group_id),
-                                 {"via": "department_membership", "vault_ids": opened}, status="refused")
+                                 {"via": "department_membership", "vault_ids": opened,
+                                  "share_ids": shares}, status="refused")
             raise HTTPException(
                 status_code=403,
-                detail="You cannot add yourself to this department: it has access to vaults you "
-                       "cannot otherwise open. Ask another administrator.")
+                detail="You cannot add yourself to this department: it has access to vaults or "
+                       "shared items you cannot otherwise open. Ask another administrator.")
     added = []
     for uid in payload.user_ids:
         if uid in existing:
@@ -15501,6 +15504,44 @@ def _vaults_opened_by_joining(db, user, group_id) -> list:
             continue
         if _gains_own_access(db, vault, user, _department_grant_permissions(permission)):
             opened.append(str(vault_id))
+    return opened
+
+
+def _shares_opened_by_joining(db, user, group_id) -> list:
+    """Ids of the shares that joining this department would let `user` claim, on vaults they cannot
+    read today.
+
+    A share addressed to a department can be claimed by whoever is in that department when they
+    claim it, so joining it reaches the shared file or folder as surely as a vault grant to the
+    department would. Counted: a share that is active and not past its expiry. Not counted: one the
+    user can already claim through another department, one on a vault they already read (as owner,
+    member or through a department; a share claim does not count), and one on a zero-knowledge
+    vault, which is never shared. A share whose vault has since gained a password, or is at its
+    recipient limit, still counts: either can change back without anyone joining anything."""
+    now = datetime.utcnow()
+    shares = db.query(Share).filter(
+        Share.claim_audience == "departments",
+        Share.status == "active",
+        Share.expires_at > now,
+        Share.audience_department_ids.contains([str(group_id)]),
+    ).all()
+    if not shares:
+        return []
+    groups_now = _user_group_ids(db, user.id)
+    opened = []
+    for share in shares:
+        if sharing_policy.user_matches_claim_audience(
+                share.claim_audience, share.audience_user_ids, share.audience_department_ids,
+                user.id, groups_now):
+            continue
+        vault = db.query(Vault).filter(Vault.id == share.vault_id).first()
+        if vault is None or getattr(vault, "type", "standard") == "zero_knowledge":
+            continue
+        if vault.owner_id == user.id:
+            continue
+        held = PermissionService(db).get_vault_permissions(user, vault.id) or {}
+        if not held.get("read"):
+            opened.append(str(share.id))
     return opened
 
 
