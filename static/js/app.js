@@ -19721,6 +19721,9 @@ const RC_DEFAULT_TOTAL_MB = 1024;   // 1 GB
 const rcSessionUrls = Object.create(null);
 
 function _mbFromBytes(b) { return (b != null && b > 0) ? Math.round(b / _MB) : ''; }
+// A size to read, in MB. _mbFromBytes gives '' for nothing, which is right for a field left empty and
+// wrong where it is shown: an empty drop vault read " / 10 MB".
+function _mbShown(b) { return String(_mbFromBytes(b) || 0); }
 function _bytesFromMb(mb) { const n = parseInt(mb, 10); return Number.isFinite(n) && n > 0 ? n * _MB : null; }
 
 // Availability: feature on + at least one tag the user can create with. Toggles the nav item.
@@ -19780,8 +19783,8 @@ function renderReceiverVaults(receivers) {
         ring.appendChild(hole); ringWrap.appendChild(ring);
         const usage = document.createElement('div'); usage.className = 'text-tertiary text-xs';
         usage.textContent = r.max_total_bytes
-            ? (_mbFromBytes(used) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB')
-            : (_mbFromBytes(used) + ' MB used');
+            ? (_mbShown(used) + ' / ' + _mbShown(r.max_total_bytes) + ' MB')
+            : (_mbShown(used) + ' MB used');
         ringWrap.appendChild(usage); card.appendChild(ringWrap);
         const files = document.createElement('div'); files.className = 'text-tertiary text-xs';
         files.textContent = (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads + ' files') : ((r.upload_count || 0) + ' files');
@@ -19829,7 +19832,7 @@ function openReceiverInfoModal(r) {
         ['Files', (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads) : String(r.upload_count || 0)],
         // stored_bytes, not reserved_bytes — the same distinction the card's ring got wrong: reserved
         // is in-flight and refunded on finalize, so this row read 0 however full the vault was.
-        ['Storage', r.max_total_bytes ? (_mbFromBytes(r.stored_bytes || 0) + ' / ' + _mbFromBytes(r.max_total_bytes) + ' MB') : (_mbFromBytes(r.stored_bytes || 0) + ' MB used')],
+        ['Storage', r.max_total_bytes ? (_mbShown(r.stored_bytes) + ' / ' + _mbShown(r.max_total_bytes) + ' MB') : (_mbShown(r.stored_bytes) + ' MB used')],
     ];
     const modal = document.createElement('div'); modal.className = 'modal active rc-info-modal';
     modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
