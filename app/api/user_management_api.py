@@ -595,7 +595,13 @@ async def update_user(
         user.role = update_data.role
     
     if update_data.is_active is not None:
+        was_active = user.is_active
         user.is_active = update_data.is_active
+        # Offboarding also revokes the user's sessions durably (see toggle_user_active); their
+        # zero-knowledge vault keys were switched off above.
+        if was_active and not user.is_active:
+            from app.api.api_server import _revoke_sessions
+            _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
 
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -658,6 +664,13 @@ async def toggle_user_active(
         _enforce_user_cap(db)
 
     user.is_active = not user.is_active
+    if not user.is_active:
+        # Offboarding also revokes the user's sessions, durably, as PATCH /users/{id} does (their
+        # zero-knowledge vault keys were switched off above). The per-request check refuses them
+        # only while the account is off: a token that is not revoked works again the moment the
+        # account is reactivated.
+        from app.api.api_server import _revoke_sessions
+        _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     
