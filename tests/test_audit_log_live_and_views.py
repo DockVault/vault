@@ -59,11 +59,20 @@ def test_a_range_end_only_ever_widens_for_a_bare_date():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("bad", [None, "", "   ", "not-a-date", "2026-13-45"])
+@pytest.mark.parametrize("bad", [None, "", "   ", "not-a-date", "2026-13-45",
+                                 # Instants that, moved to UTC, fall off either end of the calendar.
+                                 "0001-01-01T00:00:00+01:00", "9999-12-31T23:30:00-01:00"])
 def test_an_unusable_filter_value_is_ignored_rather_than_fatal(bad):
     """A filter nobody can parse must drop out of the query, not 500 the page."""
     assert audit_range.upper_bound(bad) is None
     assert audit_range.lower_bound(bad) is None
+
+
+@pytest.mark.unit
+def test_the_calendars_last_day_runs_to_its_end():
+    """A day ends at the next midnight, which the last day of the calendar does not have."""
+    assert audit_range.upper_bound("9999-12-31") == datetime.max
+    assert audit_range.upper_bound("9999-12-31T23:00:00") == datetime(9999, 12, 31, 23, 0)
 
 
 @pytest.mark.unit

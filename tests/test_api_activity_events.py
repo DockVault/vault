@@ -123,6 +123,14 @@ def test_an_export_holds_the_filtered_rows_and_is_itself_recorded(admin, anon):
     assert exports[1]["details"]["filters"] == {"user": prefix} and exports[1]["details"]["rows"] == 3
 
 
+def test_a_date_at_the_edge_of_the_calendar_is_not_an_error(admin):
+    # The calendar's last day runs to its end; an instant that is off the calendar in UTC is no date.
+    for params in ({"to_date": "9999-12-31"}, {"from_date": "0001-01-01T00:00:00+01:00"},
+                   {"to_date": "9999-12-31T23:30:00-01:00"}):
+        assert admin.get("/activity/events", params={"limit": 1, **params}).status_code == 200, params
+        assert admin.get("/activity/summary", params=params).status_code == 200, params
+
+
 def test_an_export_refuses_an_unknown_format_and_a_non_admin(admin, temp_user_client):
     assert admin.get("/activity/export", params={"format": "xlsx"}).status_code == 422
     assert temp_user_client.get("/activity/export").status_code == 403

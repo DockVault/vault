@@ -45,10 +45,10 @@ def as_naive_utc(value: Optional[str]) -> Optional[datetime]:
         return None
     try:
         parsed = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError):     # OverflowError: in UTC it is off the calendar
         return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
 
 
@@ -73,6 +73,9 @@ def upper_bound(to_date: Optional[str]) -> Optional[datetime]:
     lunchtime's events. That was invisible until the filter inputs gained a time.
     """
     parsed = as_naive_utc(to_date)
-    if parsed is None:
-        return None
-    return parsed + timedelta(days=1) if is_date_only(to_date) else parsed
+    if parsed is None or not is_date_only(to_date):
+        return parsed
+    try:
+        return parsed + timedelta(days=1)
+    except OverflowError:                              # the calendar's last day: through its end
+        return datetime.max
