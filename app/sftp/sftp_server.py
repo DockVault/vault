@@ -210,11 +210,40 @@ def _strip_ctrl(name: str) -> str:
     return ''.join(c for c in (name or '') if ord(c) >= 32 and ord(c) != 127)
 
 
-def _group_requires_temp_cred_for_sftp(db, user) -> bool:
+class _PolicyUnreadable(Exception):
+    """A temporary-credential policy could not be evaluated for a sign-in (see _policy_unreadable)."""
+
+
+def _policy_unreadable(db, user, exc, fail_closed: bool) -> bool:
+    """What a temporary-credential policy check does when it cannot be evaluated.
+
+    At sign-in (``fail_closed=True``) it raises _PolicyUnreadable, and the password and key sign-ins
+    turn that into a refusal: a check that cannot run must not let anyone past the policy it enforces.
+    A caller that does not catch it refuses too, through its own catch-all. The session is rolled back
+    first, because a failed statement leaves the transaction aborted and the password sign-in still
+    has to revoke the session it opened and record the refusal.
+
+    On a live session's per-operation re-check (``fail_closed=False``) it answers "not required", so a
+    brief database problem does not cut every open connection. That session passed the same check,
+    failing closed, when it signed in; the re-check only picks up a policy change made since.
+
+    Either way the exception class is logged, never its text (see app/core/safe_log.py)."""
+    safe_event('auth.policy-check.failed', exc, user=getattr(user, "id", None))
+    if not fail_closed:
+        return False
+    try:
+        db.rollback()
+    except Exception:  # noqa: BLE001 — the refusal stands whether or not the rollback works
+        pass
+    raise _PolicyUnreadable() from exc
+
+
+def _group_requires_temp_cred_for_sftp(db, user, *, fail_closed: bool = False) -> bool:
     """Org SFTP-auth policy: a user in any group listed under the global setting
     ``sftp_require_temp_cred_groups`` may ONLY use a temporary credential for SFTP — direct password and
     SSH-key auth are refused. Per-group by design (a global force would break SSH-key automation). Reads
-    the admin Settings store (SystemSetting 'global'); fails OPEN (no extra restriction) on any error."""
+    the admin Settings store (SystemSetting 'global'). If it cannot be read, _policy_unreadable decides:
+    the sign-in is refused, a live session's re-check answers "not required"."""
     try:
         from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
@@ -229,16 +258,17 @@ def _group_requires_temp_cred_for_sftp(db, user) -> bool:
             ).fetchall()
         }
         return bool(required & user_gids)
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception as e:  # noqa: BLE001
+        return _policy_unreadable(db, user, e, fail_closed)
 
 
-def _mfa_sftp_requires_temp_cred(db, user) -> bool:
+def _mfa_sftp_requires_temp_cred(db, user, *, fail_closed: bool = False) -> bool:
     """MFA SFTP-auth policy: when the org sets ``mfa_sftp_policy=temp_credential_only``, a user whose
     second factor is IN EFFECT (enrolled, or required by mode / department / user) may reach SFTP ONLY
     through a temporary credential — direct password / SSH-key auth is refused, so SFTP cannot become a
     single-factor back door around MFA. Reuses the exact per-group temp-cred mechanism. Reads the admin
-    Settings store; fails OPEN (no extra restriction) on any error."""
+    Settings store. If it cannot be evaluated, _policy_unreadable decides: the sign-in is refused, a
+    live session's re-check answers "not required"."""
     try:
         from app.core.models import SystemSetting, SecondFactorEnrollment, user_groups
         from app.core import second_factor_policy as pol
@@ -261,15 +291,19 @@ def _mfa_sftp_requires_temp_cred(db, user) -> bool:
             required_user_ids=p["mfa_required_user_ids"], user_group_ids=user_gids,
             user_id=user.id, has_active_enrollment=has_active)
         return bool(eff["in_effect"])
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception as e:  # noqa: BLE001
+        return _policy_unreadable(db, user, e, fail_closed)
 
 
-def _user_requires_temp_cred_for_sftp(db, user) -> bool:
+def _user_requires_temp_cred_for_sftp(db, user, *, fail_closed: bool = False) -> bool:
     """A non-temp session must use a temporary credential for SFTP when EITHER the per-group rule
     (``sftp_require_temp_cred_groups``) OR the MFA SFTP policy (``mfa_sftp_policy=temp_credential_only``,
-    for a user whose second factor is in effect) applies. Both fail OPEN independently."""
-    return _group_requires_temp_cred_for_sftp(db, user) or _mfa_sftp_requires_temp_cred(db, user)
+    for a user whose second factor is in effect) applies. The password and key sign-ins pass
+    ``fail_closed=True``: a check that cannot be evaluated then raises _PolicyUnreadable and the
+    sign-in is refused. The per-operation re-check keeps the default and lets a live session carry on
+    (see _policy_unreadable)."""
+    return (_group_requires_temp_cred_for_sftp(db, user, fail_closed=fail_closed)
+            or _mfa_sftp_requires_temp_cred(db, user, fail_closed=fail_closed))
 
 
 class _PathNotFound(Exception):
@@ -1053,7 +1087,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # if the user's group(s) now mandate a temp credential and this is a DIRECT (non-temp)
         # session, cut it on the next op — so adding a user to a require-temp-cred group takes
         # effect on an already-live direct session (parity with lock/deactivate/sftp_enabled).
-        # _user_requires_temp_cred_for_sftp fails OPEN, so it never wrongly severs a session.
+        # Left failing OPEN here on purpose (no fail_closed): a policy that cannot be read for a
+        # moment must not sever every open session, and this one passed the fail-closed check at
+        # sign-in. See _policy_unreadable.
         if not getattr(user, "_is_temp_session", False) and _user_requires_temp_cred_for_sftp(db, user):
             return None
         # Carry the connection's client address on the principal so a scope-denial audit (which fires
@@ -2270,13 +2306,18 @@ class SFTPServer(paramiko.ServerInterface):
                         # or disable password SFTP (key-only); and the org may require
                         # a temp credential for SFTP for this user's group(s).
                         # authenticate_user already created a session, so revoke it.
+                        # A policy that cannot be checked refuses the sign-in too.
                         deny = None
                         if not user.sftp_enabled:
                             deny = "SFTP disabled for this account"
                         elif not user.sftp_password_auth:
                             deny = "SFTP password auth disabled (use an SSH key)"
-                        elif _user_requires_temp_cred_for_sftp(db, user):
-                            deny = "SFTP requires a temporary credential for this account"
+                        else:
+                            try:
+                                if _user_requires_temp_cred_for_sftp(db, user, fail_closed=True):
+                                    deny = "SFTP requires a temporary credential for this account"
+                            except _PolicyUnreadable:
+                                deny = "SFTP sign-in policy could not be checked"
                         if deny is not None:
                             db.query(ActiveSession).filter(
                                 ActiveSession.session_token == hash_session_token(session_token)
@@ -2335,8 +2376,12 @@ class SFTPServer(paramiko.ServerInterface):
                 if user is None or not user.is_active or account_locked(user) or not user.sftp_enabled:
                     return paramiko.AUTH_FAILED
                 # Org policy: this user's group(s) may require a temp credential for
-                # SFTP, which refuses SSH-key (and password) auth.
-                if _user_requires_temp_cred_for_sftp(db, user):
+                # SFTP, which refuses SSH-key (and password) auth. A policy that cannot be
+                # checked refuses the key too.
+                try:
+                    if _user_requires_temp_cred_for_sftp(db, user, fail_closed=True):
+                        return paramiko.AUTH_FAILED
+                except _PolicyUnreadable:
                     return paramiko.AUTH_FAILED
                 from app.core.models import UserSSHKey
                 matched = None
