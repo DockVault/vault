@@ -23,7 +23,8 @@ deployment that answers requests until something touches the column that never a
 
 Owns its stack end to end: its own compose project, its own volume prefix, its own ports. Teardown
 removes only what it created, by exact name -- never a prune, never `down -v`, both of which reach
-volumes on this host that have nothing to do with this test.
+volumes on this host that have nothing to do with this test. How the stack keeps to itself (its
+environment, the volume check, teardown in `finally`) is in tests/_throwaway_stack.py.
 """
 
 from __future__ import annotations
@@ -33,7 +34,6 @@ import io
 import os
 import secrets
 import shutil
-import subprocess
 import time
 import uuid
 
@@ -41,6 +41,9 @@ import pytest
 
 from conftest import host_cannot_take_a_stack
 import requests
+
+from _throwaway_stack import (compose_command, refuse_volumes_in_use, run, stack_volumes,
+                              tear_down)
 
 pytestmark = [pytest.mark.integration, pytest.mark.docker, pytest.mark.slow,
               pytest.mark.disruptive]
@@ -59,26 +62,27 @@ PAYLOAD = bytes((i * 31 + 7) % 256 for i in range(4096))
 
 
 def _run(cmd, cwd=None, timeout=600):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    """Every docker command here, with the throwaway stack's minimal environment."""
+    return run(cmd, cwd=cwd, timeout=timeout)
 
 
 @pytest.fixture(scope="module")
-def drill():
+def drill(tmp_path_factory):
     """A deployment on the oldest drill release, for the stepped walk."""
-    yield from _install_oldest()
+    yield from _install_oldest(tmp_path_factory)
 
 
 @pytest.fixture(scope="module")
-def direct_drill():
+def direct_drill(tmp_path_factory):
     """A second deployment on the oldest release, for the single-jump upgrade.
 
     Its own stack, because the two tests cannot share one: the stepped walk ends on the candidate,
     and a jump has to start from the old release.
     """
-    yield from _install_oldest()
+    yield from _install_oldest(tmp_path_factory)
 
 
-def _install_oldest():
+def _install_oldest(tmp_path_factory):
     for tag in DRILL_TAGS:
         image = IMAGE % tag
         if _run(["docker", "image", "inspect", image]).returncode != 0:
@@ -87,8 +91,9 @@ def _install_oldest():
                 pytest.skip(f"cannot pull {image}: {pulled.stderr[-300:]}")
 
     project = f"drill{uuid.uuid4().hex[:8]}"
-    workdir = os.path.join(REPO, ".pytest-drill", project)
-    os.makedirs(workdir, exist_ok=True)
+    # Outside the repository: the directory holds the stack's .env, secrets included, and a copy
+    # left in the worktree could be committed or sent to a build.
+    workdir = str(tmp_path_factory.mktemp(project))
     port = 30700 + (int(uuid.uuid4().hex[:4], 16) % 200)
     shutil.copytree(os.path.join(REPO, "deploy"), os.path.join(workdir, "deploy"))
 
@@ -132,10 +137,7 @@ def _install_oldest():
             f"    ports: !override\n      - \"127.0.0.1:{port + 1}:2222\"\n")
 
     def compose(*args, timeout=900):
-        return _run(["docker", "compose", "-p", project,
-                     "--env-file", os.path.join(workdir, ".env"),
-                     "-f", os.path.join(workdir, "deploy", "docker-compose.yml"),
-                     "-f", os.path.join(workdir, "drill.override.yml")] + list(args),
+        return _run(compose_command(project, workdir, "drill.override.yml") + list(args),
                     cwd=workdir, timeout=timeout)
 
     def wait_healthy(timeout=300):
@@ -165,40 +167,38 @@ def _install_oldest():
         """Why the stack is not up. Gathered before teardown, which destroys the evidence."""
         health = _run(["docker", "inspect", f"{project}-api",
                        "--format", "{{json .State.Health}}"], timeout=30).stdout.strip()
-        logs = compose("logs", "--no-color", "--tail", "60", timeout=120).stdout
-        return f"{note}\n  api health: {health[:600]}\n  logs:\n{logs[-2000:]}"
-
-    def purge():
-        """Stop the project and remove ONLY the volumes it created, by exact name. Never
-        `down -v` and never a prune -- both can reach unrelated volumes on this host."""
-        compose("down", timeout=300)
-        for name in _run(["docker", "volume", "ls", "-q"], timeout=60).stdout.split():
-            if name.startswith(project):
-                _run(["docker", "volume", "rm", name], timeout=60)
-        shutil.rmtree(workdir, ignore_errors=True)
+        logs = compose("logs", "--no-color", "--tail", "60", timeout=120).stdout or ""
+        return f"{note}\n  api health: {(health or '')[:600]}\n  logs:\n{logs[-2000:]}"
 
     override(IMAGE % DRILL_TAGS[0])
-    up = compose("up", "-d")
-    # vault-sftp waits on the API being healthy, so `up` already blocks on it: a released image
-    # that starts and then reports itself sick returns non-zero here rather than reaching
-    # wait_healthy(). Either way, only the host running out of ports or disk is a reason to
-    # stand down. An image that will not boot against the shipped compose is the breakage this
-    # drill exists to catch, and skipping it leaves the suite green having proved nothing.
-    boot = wait_healthy() if up.returncode == 0 else "never started"
-    if up.returncode != 0 or boot != "healthy":
-        note = (f"the {DRILL_TAGS[0]} stack did not come up (rc={up.returncode}, api={boot}): "
-                f"{(up.stderr or '')[-400:]}")
-        if host_cannot_take_a_stack(up):
-            purge()
-            pytest.skip(f"this host cannot take another stack right now: {note}")
-        detail = diagnose(note)
-        purge()
-        pytest.fail(f"the published {DRILL_TAGS[0]} image does not come up against the shipped "
-                    f"compose, so nothing below it was proved.\n{detail}")
+    # The volumes this stack will use, checked before anything starts: none may exist yet, and all
+    # must carry this project's name. Teardown removes exactly these, by name.
+    volumes = stack_volumes(compose)
+    refuse_volumes_in_use(volumes, project)
 
-    yield state
+    try:
+        up = compose("up", "-d")
+        # vault-sftp waits on the API being healthy, so `up` already blocks on it: a released image
+        # that starts and then reports itself sick returns non-zero here rather than reaching
+        # wait_healthy(). Either way, only the host running out of ports or disk is a reason to
+        # stand down. An image that will not boot against the shipped compose is the breakage this
+        # drill exists to catch, and skipping it leaves the suite green having proved nothing.
+        boot = wait_healthy() if up.returncode == 0 else "never started"
+        if up.returncode != 0 or boot != "healthy":
+            note = (f"the {DRILL_TAGS[0]} stack did not come up (rc={up.returncode}, api={boot}): "
+                    f"{(up.stderr or '')[-400:]}")
+            if host_cannot_take_a_stack(up):
+                pytest.skip(f"this host cannot take another stack right now: {note}")
+            # Gathered here, before the teardown below destroys the evidence.
+            detail = diagnose(note)
+            pytest.fail(f"the published {DRILL_TAGS[0]} image does not come up against the shipped "
+                        f"compose, so nothing below it was proved.\n{detail}")
 
-    purge()
+        yield state
+    finally:
+        # Stop the project and remove ONLY the volumes named above. Never `down -v` and never a
+        # prune -- both can reach unrelated volumes on this host.
+        tear_down(compose, volumes)
 
 
 def _token(state):

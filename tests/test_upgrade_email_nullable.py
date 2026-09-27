@@ -14,7 +14,9 @@ candidate up against the SAME volumes. Asserting nullability on a fresh install 
 
 The test owns its stack end to end: its own compose project, its own volume prefix, its own ports.
 Teardown removes only resources it created and names explicitly — never a prune, and never
-``down -v``, which on this host can reach volumes that have nothing to do with this test.
+``down -v``, which on this host can reach volumes that have nothing to do with this test. How the
+stack keeps to itself (its environment, the volume check, teardown in ``finally``) is in
+tests/_throwaway_stack.py.
 """
 import base64
 import io
@@ -23,7 +25,6 @@ import os
 import re
 import secrets
 import shutil
-import subprocess
 import time
 import uuid
 
@@ -31,6 +32,9 @@ import pytest
 
 from conftest import host_cannot_take_a_stack
 import requests
+
+from _throwaway_stack import (compose_command, refuse_volumes_in_use, run, stack_volumes,
+                              tear_down)
 
 pytestmark = [pytest.mark.integration, pytest.mark.docker, pytest.mark.slow,
               pytest.mark.disruptive]
@@ -42,10 +46,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _run(args, **kw):
-    kw.setdefault("capture_output", True)
-    kw.setdefault("text", True)
-    kw.setdefault("timeout", 600)
-    return subprocess.run(args, **kw)
+    """Every docker command here, with the throwaway stack's minimal environment."""
+    return run(args, **kw)
 
 
 def _candidate_image():
@@ -62,14 +64,27 @@ def _candidate_image():
 @pytest.fixture(scope="module")
 def upgrade_stack(tmp_path_factory):
     """A throwaway stack, booted on the OLD image, torn down by exact name."""
+    yield from _upgraded_stack(tmp_path_factory)
+
+
+def _upgraded_stack(tmp_path_factory):
+    """The upgrade_stack fixture, as a plain generator.
+
+    The booted stack is closed in `finally`. It used to be iterated with `for ... yield`, which left
+    the stack running whenever seeding or the upgrade skipped or failed: the loop was abandoned at
+    its yield, and nothing after that yield ever ran.
+    """
     if _run(["docker", "image", "inspect", BASELINE_IMAGE]).returncode != 0:
         pulled = _run(["docker", "pull", BASELINE_IMAGE], timeout=900)
         if pulled.returncode != 0:
             pytest.skip(f"cannot pull {BASELINE_IMAGE}: {pulled.stderr[-300:]}")
-    for state in _boot_stack(tmp_path_factory, BASELINE_IMAGE, "upg"):
+    stack = _boot_stack(tmp_path_factory, BASELINE_IMAGE, "upg")
+    state = next(stack)
+    try:
         _seed_then_upgrade(state)
         yield state
-
+    finally:
+        stack.close()
 
 
 def _seed_then_upgrade(st):
@@ -151,12 +166,8 @@ def _boot_stack(tmp_path_factory, image, prefix):
         )
 
     def compose(*args, timeout=600):
-        return _run(
-            ["docker", "compose", "-p", project, "--env-file", os.path.join(workdir, ".env"),
-             "-f", os.path.join(workdir, "deploy", "docker-compose.yml"),
-             "-f", os.path.join(workdir, "round.override.yml")] + list(args),
-            cwd=workdir, timeout=timeout,
-        )
+        return _run(compose_command(project, workdir, "round.override.yml") + list(args),
+                    cwd=workdir, timeout=timeout)
 
     def wait_healthy(timeout=240):
         deadline = time.time() + timeout
@@ -180,36 +191,33 @@ def _boot_stack(tmp_path_factory, image, prefix):
         "base_url": f"http://127.0.0.1:{port}",
     }
 
-    def purge():
-        # Stop the project, then remove ONLY the volumes this test created, by exact name.
-        # Never `down -v` and never a prune -- both can reach unrelated volumes on this host.
-        compose("down", timeout=300)
-        listed = _run(["docker", "volume", "ls", "-q"], timeout=60).stdout.split()
-        for name in listed:
-            if name.startswith(project):
-                _run(["docker", "volume", "rm", name], timeout=60)
-
     override(image)
-    up = compose("up", "-d")
-    # As in the other drill: sftp waits on the API's health, so `up` blocks and an image that
-    # comes up sick returns non-zero. Only the host being unable to take another stack is a
-    # reason to skip; an image that will not boot is the thing under test.
-    healthy = wait_healthy() if up.returncode == 0 else False
-    if up.returncode != 0 or not healthy:
-        note = (f"{prefix} stack did not come up (rc={up.returncode}, healthy={healthy}): "
-                f"{(up.stderr or '')[-400:]}")
-        if host_cannot_take_a_stack(up):
-            purge()
-            pytest.skip(f"this host cannot take another stack right now: {note}")
-        logs = compose("logs", "--no-color", "--tail", "60", timeout=120).stdout
-        purge()
-        pytest.fail(f"the {prefix} image does not come up against the shipped compose, so the "
-                    f"nullable-column upgrade below was never exercised.\n{note}\n"
-                    f"  logs:\n{logs[-2000:]}")
+    # The volumes this stack will use, checked before anything starts: none may exist yet, and all
+    # must carry this project's name. Teardown removes exactly these, by name.
+    volumes = stack_volumes(compose)
+    refuse_volumes_in_use(volumes, project)
 
-    yield state
+    try:
+        up = compose("up", "-d")
+        # As in the other drill: sftp waits on the API's health, so `up` blocks and an image that
+        # comes up sick returns non-zero. Only the host being unable to take another stack is a
+        # reason to skip; an image that will not boot is the thing under test.
+        healthy = wait_healthy() if up.returncode == 0 else False
+        if up.returncode != 0 or not healthy:
+            note = (f"{prefix} stack did not come up (rc={up.returncode}, healthy={healthy}): "
+                    f"{(up.stderr or '')[-400:]}")
+            if host_cannot_take_a_stack(up):
+                pytest.skip(f"this host cannot take another stack right now: {note}")
+            logs = compose("logs", "--no-color", "--tail", "60", timeout=120).stdout or ""
+            pytest.fail(f"the {prefix} image does not come up against the shipped compose, so the "
+                        f"nullable-column upgrade below was never exercised.\n{note}\n"
+                        f"  logs:\n{logs[-2000:]}")
 
-    purge()
+        yield state
+    finally:
+        # Stop the project and remove ONLY the volumes named above. Never `down -v` and never a
+        # prune -- both can reach unrelated volumes on this host.
+        tear_down(compose, volumes)
 
 
 def _login(base_url, username, password):
