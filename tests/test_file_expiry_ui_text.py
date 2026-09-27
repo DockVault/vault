@@ -63,6 +63,8 @@ def test_the_dialog_says_what_a_change_does_to_the_files_already_there():
     text = _help_text()
     assert "New files are deleted this long after upload." in text
     assert "Files already in the vault keep their current deadline." in text
+    # Copy and a move between vaults upload the file afresh (tests/test_file_expiry_copy_move_live.py).
+    assert "A copy, or a file moved in from another vault, counts as a new file from the moment it "            "arrives." in text
     assert "0 turns expiry off and removes the deadline from every file in the vault." in text
     assert "older than" not in INDEX.lower().split('id="set-expiry-modal"')[1].split("</form>")[0]
 
