@@ -114,6 +114,7 @@ def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_u
 
     mine = _request_for(admin, temp_user["id"])
     assert (mine["is_mine"], mine["can_approve"], mine["requested_by"]) == (True, False, "admin")
+    assert mine["label"][0].isupper() and " " in mine["label"], "named by what it asks for"
     theirs = _request_for(other_admin[1], temp_user["id"])
     assert (theirs["is_mine"], theirs["can_approve"]) == (False, True)
 

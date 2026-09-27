@@ -5439,7 +5439,8 @@ def _credential_request_dict(change, target_username, viewer_id=None) -> dict:
     return {
         "id": str(change.id),
         "kind": change.kind,
-        "label": cc.label(change.kind),
+        # What it asks for ("Add an SSH key"), since a waiting change has not been made.
+        "label": cc.request_label(change.kind),
         "status": change.status,
         "target_user_id": str(change.target_user_id),
         "target_username": target_username,

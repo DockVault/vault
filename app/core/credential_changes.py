@@ -90,6 +90,13 @@ def phrase(kind: str) -> str:
     return KIND_PHRASES.get(kind, "change sign-in details")
 
 
+def request_label(kind: str) -> str:
+    """What a request waiting for approval asks for, as a heading: "Add an SSH key". A change that
+    was made is named by label() instead ("SSH key added")."""
+    text = phrase(kind)
+    return text[:1].upper() + text[1:]
+
+
 def last_applied(db, target_id, now: Optional[datetime] = None) -> Optional[CredentialChange]:
     """The newest change applied to this account within the window, or None."""
     now = now or utcnow()

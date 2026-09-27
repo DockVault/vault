@@ -187,6 +187,14 @@ def test_recent_by_account_gives_each_account_its_newest_change(db):
     assert recent[carol.id].id == newest.id
 
 
+def test_a_waiting_change_is_named_by_what_it_asks_for():
+    assert cc.request_label(cc.SSH_KEY) == "Add an SSH key"
+    assert cc.label(cc.SSH_KEY) == "SSH key added"
+    assert {cc.request_label(k) for k in cc.KIND_LABELS} == {
+        "Set a new password", "Create a password reset link", "Reset the second factor",
+        "Change the email address", "Add an SSH key"}
+
+
 def test_the_host_operator_name_cannot_be_a_username():
     # The records name the host operator by a string no account can carry.
     from app.api.api_server import _validate_new_username
