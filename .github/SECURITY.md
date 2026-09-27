@@ -5,8 +5,22 @@ project — and of everyone who self-hosts it — seriously.
 
 ## Supported versions
 
-Security fixes are applied to the latest release on `main`. Self-hosters should track
-the latest tagged release.
+| Version | Security fixes |
+|---|---|
+| The latest release | Yes |
+| The minor line before the latest, 0.33.x and later lines only | Yes, until six months after the next minor release ships |
+| Anything else, including 0.32.x once 0.33.0 ships | No. Upgrade to the latest release. |
+
+Until 0.33.0 ships, security fixes go to the latest release only, and 0.32.x receives none after
+that. Starting with 0.33, each minor release line (0.33.x, 0.34.x, ...) receives security fixes
+until six months after the next minor release ships, so for a while two lines are supported: the
+latest and the one before it. (The README's "minimum supported version" is a different thing: the
+oldest release `dockvault.py update` can upgrade from.)
+
+Security fixes ship as patch releases. Every fixed vulnerability is published as an advisory,
+with a CVSS v4 score, in the upgrade matrix (`docs/upgrade-matrix.json`), which marks each
+release that has a known advisory as not secure. `dockvault.py update`, the in-app update notice
+and the upgrades page of the documentation site read that matrix.
 
 ## Reporting a vulnerability
 
@@ -18,8 +32,16 @@ pull request, or discussion for a security report.
 - Please include the affected version/commit, a description, and reproduction steps or
   a proof of concept.
 
-We will acknowledge the report, work on a fix, and coordinate disclosure. Please allow a
-reasonable window to release a fix before any public disclosure.
+What to expect:
+
+- an acknowledgement within 5 business days;
+- a first assessment within 10 business days: whether we can reproduce it, and its severity
+  (CVSS v4);
+- a fix within 30 days for Critical and High severity and within 90 days for Medium; Low
+  findings are fixed in a later regular release.
+
+We will keep you informed, coordinate disclosure with you, and credit you in the release notes
+unless you ask us not to. Please allow us to release a fix before any public disclosure.
 
 ## Deploying securely
 
