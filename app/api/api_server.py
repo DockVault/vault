@@ -6466,7 +6466,16 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     durable=True (logout / lock / deactivate) ALSO sets ActiveSession.revoked so a regular-user
     web JWT is rejected per request even during a Redis outage. durable=False (e.g. disabling
     only SFTP) tears down live transports WITHOUT durably revoking the web token — the user's
-    web session must keep working. Mutates session rows in `db` but does NOT commit."""
+    web session must keep working. Mutates session rows in `db` but does NOT commit.
+
+    A durable revocation also covers a regular session whose row is already inactive but not
+    revoked, and counts it. The periodic cleanup marks a session inactive once it has been idle for
+    its grace window, and a web request never updates that idle time, so any web session older than
+    about an hour is inactive -- yet a regular token is refused only when its row is missing or
+    revoked, so it kept working until it expired. Those rows get no force-close signal: an SFTP
+    connection re-reads its row on every operation and stops once the row is inactive, and a
+    live-monitor socket re-checks the revoked flag on its own every few seconds, so the signal
+    would reach nothing that can still act."""
     from app.core.models import ActiveSession
     from app.core.database import redis_client
 
@@ -6486,23 +6495,25 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
         ).all():
             up.status = 'cancelled'
 
-    q = db.query(ActiveSession).filter(ActiveSession.is_active == True)  # noqa: E712
+    matching = db.query(ActiveSession)
     if user_id is not None:
-        q = q.filter(ActiveSession.user_id == user_id)
+        matching = matching.filter(ActiveSession.user_id == user_id)
     if temp_credential_id is not None:
-        q = q.filter(ActiveSession.temp_credential_id == temp_credential_id)
+        matching = matching.filter(ActiveSession.temp_credential_id == temp_credential_id)
+    # Optionally keep the caller's OWN session (e.g. enrolling a second factor should revoke the
+    # account's OTHER sessions but leave the one doing the enrollment logged in). except_session_token
+    # is the PLAINTEXT token; the stored value is its hash, so we hash at the comparison — never
+    # compare a session token plaintext.
+    if except_session_token is not None:
+        matching = matching.filter(ActiveSession.session_token != hash_session_token(except_session_token))
     count = 0
-    for s in q.all():
-        # Optionally keep the caller's OWN session (e.g. enrolling a second factor should revoke the
-        # account's OTHER sessions but leave the one doing the enrollment logged in). except_session_token
-        # is the PLAINTEXT token; the stored value is its hash, so we hash at the comparison — never
-        # compare a session token plaintext.
-        if except_session_token is not None and s.session_token == hash_session_token(except_session_token):
-            continue
+    handled_ids = []
+    for s in matching.filter(ActiveSession.is_active == True).all():  # noqa: E712
         s.is_active = False
         if durable:
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
         count += 1
+        handled_ids.append(s.id)
         try:
             sent = _guarded_publish_force('session_terminations', json.dumps({
                 'session_token': s.session_token,
@@ -6518,6 +6529,18 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
                       f"skipped (cache guard), teardown falls to the session's own recheck")
         except Exception as e:  # noqa: BLE001
             print(f"❌ Failed to publish termination signal: {e}")
+    if durable and temp_credential_id is None:
+        # The regular sessions already inactive but never revoked (see the docstring), in one
+        # statement: an account can hold a month of them. A temporary credential's token is refused
+        # as soon as its row is inactive, so its rows need nothing more. The rows handled above are
+        # left out by id, so a row the cleanup marks inactive while this runs is counted once,
+        # whichever pass sees it.
+        stale = matching.filter(ActiveSession.temp_credential_id.is_(None),
+                                ActiveSession.is_active == False,  # noqa: E712
+                                ActiveSession.revoked == False)  # noqa: E712
+        if handled_ids:
+            stale = stale.filter(ActiveSession.id.notin_(handled_ids))
+        count += stale.update({ActiveSession.revoked: True}, synchronize_session=False)
     return count
 
 
@@ -9138,7 +9161,7 @@ async def terminate_user_sessions(
     )
 
     return {
-        "message": f"Terminated {terminated_count} active session(s)",
+        "message": f"Terminated {terminated_count} session(s)",
         "terminated_count": terminated_count
     }
 
