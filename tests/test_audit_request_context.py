@@ -49,6 +49,59 @@ def test_the_endpoint_is_the_route_template_once_routing_has_run():
     assert ctx.endpoint == "/vaults/{vault_id}/files/{file_id}/download"
 
 
+@pytest.fixture
+def trusted_proxy(monkeypatch):
+    from app.api.api_server import ClientIPMiddleware     # imported first: importing the app reloads
+    from app.core import net_utils                        # the proxy settings
+    monkeypatch.setattr(net_utils.settings, "trusted_proxies", "172.16.0.0/12", raising=False)
+    monkeypatch.setattr(net_utils.settings, "trust_all_proxies", False, raising=False)
+    net_utils._trusted_networks.cache_clear()
+    yield ClientIPMiddleware
+    net_utils._trusted_networks.cache_clear()
+
+
+def test_behind_a_tls_proxy_the_row_stores_the_route_template(trusted_proxy):
+    # A trusted proxy's X-Forwarded-Proto makes ClientIPMiddleware pass the app a NEW scope dict, with
+    # the forwarded scheme. The router later puts the matched route into that dict, and a row's route
+    # template is read from the scope its request context holds, so the context must hold the new dict.
+    # One holding the scope the middleware was given, or a copy of either, never sees the route, and
+    # every row written behind a TLS proxy would store the raw path instead.
+    from fastapi import FastAPI, Request
+    from _async_run import run_coroutine
+
+    seen = {}
+    inner = FastAPI()
+
+    @inner.get("/vaults/{vault_id}")
+    async def read_vault(vault_id: str, request: Request):
+        seen["scheme"] = request.url.scheme
+        seen["row"] = AuditLogger(_FakeDB()).build_row(action="file_download", status="success")
+        return {"ok": True}
+
+    scope = {"type": "http", "http_version": "1.1", "method": "GET", "path": "/vaults/7f3a9c",
+             "raw_path": b"/vaults/7f3a9c", "root_path": "", "query_string": b"", "scheme": "http",
+             "headers": [(b"host", b"vault.example"), (b"x-forwarded-proto", b"https"),
+                         (b"x-forwarded-for", b"203.0.113.50"), (b"user-agent", b"Mozilla/5.0")],
+             "client": ("172.18.0.5", 40000), "server": ("vault", 8000)}
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    run_coroutine(trusted_proxy(inner)(scope, receive, send))
+
+    assert sent and sent[0]["status"] == 200, sent
+    # The forwarded scheme reached the route, so the middleware did pass on a new scope.
+    assert seen["scheme"] == "https"
+    row = seen["row"]
+    assert row.endpoint == "/vaults/{vault_id}", row.endpoint
+    assert (row.method, row.channel, row.user_agent, row.ip_address) == (
+        "GET", "web", "Mozilla/5.0", "203.0.113.50")
+
+
 def test_an_unrouted_link_path_is_stored_without_its_token():
     ctx = rc.RequestContext("GET", "/l/SeCrEtToKeN123", None, "public_link", {})
     assert "SeCrEtToKeN123" not in (ctx.endpoint or "")
