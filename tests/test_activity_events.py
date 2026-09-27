@@ -1,10 +1,8 @@
 """The Events tab's filters, paging and row view, without a database.
 
 The SQL is checked by compiling the query for PostgreSQL and reading it; the live API tests run it."""
-import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -125,9 +123,10 @@ def test_the_lock_expiry_and_self_grant_events_are_named_and_filed(action, statu
     assert f"'{action}'" not in _sql(categories=others)
 
 
-# The Overview's tiles, as static/js/activity.js asks the Events API for them. Every tile also starts
-# 24 hours back, which is the same for all and left out here.
-OVERVIEW_TILES = {
+# Filter sets whose counts must put the lock, file-expiry and self-grant events where they belong: the
+# Events filters as the page sends them for "failed sign-ins", "refusals and denials" and "failed or
+# refused".
+FILTER_SETS = {
     "Events": {},
     "Failed sign-ins": {"categories": ["sign_in"], "statuses": ["failed"]},
     "Refusals and denials": {"categories": ["security"]},
@@ -135,15 +134,7 @@ OVERVIEW_TILES = {
 }
 
 
-def test_the_tiles_here_are_the_ones_the_page_asks_for():
-    src = (Path(__file__).resolve().parents[1] / "static" / "js" / "activity.js").read_text(encoding="utf-8")
-    tiles = re.findall(r"\['([^']+)', new URLSearchParams\(\{ from_date: since(?:, ([^}]*))? \}\)\]", src)
-    names = {"category": "categories", "status": "statuses"}
-    asked = {label: {names[k]: [v] for k, v in re.findall(r"(\w+): '([^']+)'", rest)} for label, rest in tiles}
-    assert asked == OVERVIEW_TILES
-
-
-def test_the_overview_counts_locks_expiry_and_self_grant_refusals_where_they_belong():
+def test_the_filters_count_locks_expiry_and_self_grant_refusals_where_they_belong():
     """Run through the Events query against rows held in memory. The lock is the outcome of failures
     already counted as failed sign-ins, and succeeds as a lock, so it is not a failed sign-in again; a
     file deleted at its expiry is an event and nothing else; a self-grant refused is a refusal."""
@@ -158,7 +149,7 @@ def test_the_overview_counts_locks_expiry_and_self_grant_refusals_where_they_bel
     )]
     db = MemoryDB({AuditLog: rows})
     counted = {tile: sorted(r.action for r in ev.build_events_query(db.query(AuditLog), AuditLog, **f).all())
-               for tile, f in OVERVIEW_TILES.items()}
+               for tile, f in FILTER_SETS.items()}
     assert counted == {
         "Events": sorted(r.action for r in rows),
         "Failed sign-ins": ["login_failure"],

@@ -1,4 +1,4 @@
-"""UI — the Activity page: an administrator's Overview counts and the Events tab, wide and on a phone.
+"""UI — the Activity page: the summary band, the events list and its detail, wide and on a phone.
 
 Logs in as a THROWAWAY admin, so a skin or preference stored on the shared account cannot change the page."""
 import pytest
@@ -38,18 +38,25 @@ def test_the_activity_page_is_for_administrators_only(page: Page, admin, temp_us
     expect(page.locator('.sidebar-item[data-section="activity"]')).to_be_hidden()
 
 
-def test_the_overview_counts_and_opens_events(page: Page, anon, activity_admin):
+def _filter_by_person(page: Page, name):
+    """Type a name into the filter panel's Person field: free text is a "contains" match."""
+    page.click("#act-filter-btn")
+    field = page.locator("#act-fp-user")
+    expect(field).to_be_visible()
+    field.fill(name)
+    field.press("Enter")
+
+
+def test_the_band_counts_and_filters_the_list(page: Page, anon, activity_admin):
     anon.post("/auth/login", json={"username": unique("ghost"), "password": "not-it-1"})
     _login(page, activity_admin)
     _open_activity(page)
-    tiles = page.locator("#activity-stats .activity-stat")
-    expect(tiles).to_have_count(4)
-    expect(tiles.nth(1)).to_contain_text("Failed sign-ins")
-    expect(tiles.nth(1).locator(".activity-stat-num")).not_to_have_text("…", timeout=10000)
-    tiles.nth(1).click()                                     # the tile opens Events, filtered
-    expect(page.locator("#activity-tab-events")).to_be_visible()
-    expect(page.locator("#activity-status")).to_have_value("failed")
-    expect(page.locator("#activity-rows tr").first).to_contain_text("Sign-in failed", timeout=10000)
+    failed = page.locator("#act-p-signin .act-signin-row").nth(1)
+    expect(failed).to_contain_text("Failed", timeout=10000)
+    assert int(failed.locator(".act-rank-count").inner_text().replace(",", "")) >= 1
+    page.click("#act-p-time .act-key-btn[data-fkey=key-bad]")          # the "failed or refused" key
+    expect(page.locator("#act-chips")).to_contain_text("Status: Failed or refused")
+    expect(page.locator("#activity-rows tr.act-row").first).to_contain_text("Failed", timeout=10000)
 
 
 def test_events_filter_by_user_and_open_a_row(page: Page, anon, activity_admin):
@@ -57,62 +64,61 @@ def test_events_filter_by_user_and_open_a_row(page: Page, anon, activity_admin):
     anon.post("/auth/login", json={"username": name, "password": "not-it-1"})
     _login(page, activity_admin)
     _open_activity(page)
-    page.click('[data-activity-tab="events"]')
-    page.fill("#activity-user", name)
-    page.click("#activity-search")
-    rows = page.locator("#activity-rows tr.activity-row")
+    _filter_by_person(page, name)
+    rows = page.locator("#activity-rows tr.act-row")
     expect(rows).to_have_count(1, timeout=10000)
-    expect(page.locator("#activity-summary")).to_have_text("Showing 1 of 1 event")
+    expect(page.locator("#activity-summary")).to_have_text("1–1 of 1")
+    expect(page.locator("#act-chips")).to_contain_text(f"Person contains: {name}")
+    page.keyboard.press("Escape")                                           # closes the filter panel
     rows.first.click()
-    modal = page.locator("#activity-event-modal")
-    expect(modal).to_be_visible()
-    expect(modal).to_contain_text("Sign-in failed")
-    expect(modal).to_contain_text("POST /auth/login")
-    expect(modal).to_contain_text(name)
+    pane = page.locator("#act-detail")
+    expect(pane).to_be_visible()
+    expect(pane).to_contain_text("Sign-in failed")
+    expect(pane).to_contain_text("POST /auth/login")
+    expect(pane).to_contain_text(name)
     page.keyboard.press("Escape")
-    expect(modal).to_be_hidden()
+    expect(pane).to_be_hidden()
 
 
-def test_on_a_phone_the_filters_fold_and_results_are_cards(page: Page, anon, activity_admin):
+def test_on_a_phone_the_filters_are_a_sheet_and_results_are_rows(page: Page, anon, activity_admin):
     name = unique("ghost")
     anon.post("/auth/login", json={"username": name, "password": "not-it-1"})
     _login(page, activity_admin, width=390, height=844)
     _open_activity(page)
-    page.click('[data-activity-tab="events"]')
-    expect(page.locator("#activity-filters")).to_be_hidden()
-    expect(page.locator(".activity-table-wrap")).to_be_hidden()
-    page.click("#activity-filters-toggle")
-    expect(page.locator("#activity-filters")).to_be_visible()
-    page.fill("#activity-user", name)
-    page.click("#activity-search")
-    expect(page.locator("#activity-filters")).to_be_hidden()            # folds away after a search
-    expect(page.locator("#activity-filters-toggle")).to_have_text("Filters (1)")
-    expect(page.locator("#activity-cards .activity-card")).to_have_count(1, timeout=10000)
+    expect(page.locator("#act-table")).to_be_hidden()
+    page.click("#act-filter-btn")
+    sheet = page.locator("#act-filter-modal")
+    expect(sheet).to_be_visible()
+    page.fill("#act-fp-user", name)
+    page.locator("#act-fp-user").press("Enter")
+    expect(page.locator("#act-fp-done")).to_have_text("Show 1 event", timeout=10000)
+    page.click("#act-fp-done")
+    expect(sheet).to_be_hidden()
+    expect(page.locator("#act-filter-label")).to_have_text("Filters 1")
+    expect(page.locator("#activity-cards .act-card")).to_have_count(1, timeout=10000)
     assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
 
 
-def test_one_checklist_open_at_a_time(page: Page, activity_admin):
+def test_the_filter_panel_closes_on_a_click_elsewhere(page: Page, activity_admin):
     _login(page, activity_admin)
     _open_activity(page)
-    page.click('[data-activity-tab="events"]')
-    page.click("#activity-pick-category summary")
-    expect(page.locator("#activity-pick-category")).to_have_attribute("open", "")
-    page.click("#activity-pick-channel summary")
-    expect(page.locator("#activity-pick-category")).not_to_have_attribute("open", "")
+    page.click("#act-filter-btn")
+    expect(page.locator("#act-filter-panel")).to_be_visible()
+    expect(page.locator("#act-filter-btn")).to_have_attribute("aria-expanded", "true")
     page.click("#activity-section h2")                                   # a click elsewhere closes it
-    expect(page.locator("#activity-pick-channel")).not_to_have_attribute("open", "")
+    expect(page.locator("#act-filter-panel")).to_be_hidden()
+    expect(page.locator("#act-filter-btn")).to_have_attribute("aria-expanded", "false")
 
 
-def test_the_events_export_downloads_the_rows_on_screen(page: Page, anon, activity_admin):
+def test_the_events_export_downloads_the_rows_that_match(page: Page, anon, activity_admin):
     name = unique("ghost")
     anon.post("/auth/login", json={"username": name, "password": "not-it-1"})
     _login(page, activity_admin)
     _open_activity(page)
-    page.click('[data-activity-tab="events"]')
-    page.fill("#activity-user", name)
-    page.click("#activity-search")
-    expect(page.locator("#activity-rows tr.activity-row")).to_have_count(1, timeout=10000)
-    page.fill("#activity-user", "someone-else")          # the export uses the filters searched with
+    _filter_by_person(page, name)
+    expect(page.locator("#activity-rows tr.act-row")).to_have_count(1, timeout=10000)
+    page.keyboard.press("Escape")
+    page.click("#activity-export")
     with page.expect_download() as dl:
         page.click('[data-activity-export="csv"]')
     path = dl.value.path()
@@ -143,9 +149,7 @@ def test_an_event_the_server_records_on_its_own_is_by_the_system(page: Page, act
                lambda route: route.fulfill(status=200, content_type="application/json", body=body))
     _login(page, activity_admin)
     _open_activity(page)
-    page.click('[data-activity-tab="events"]')
-    page.click("#activity-search")
-    rows = page.locator("#activity-rows tr.activity-row")
+    rows = page.locator("#activity-rows tr.act-row")
     expect(rows).to_have_count(2, timeout=10000)
     expect(rows.nth(0).locator("td").nth(2)).to_have_text("System")
     expect(rows.nth(1).locator("td").nth(2)).to_have_text("Unknown")

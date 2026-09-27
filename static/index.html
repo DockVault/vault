@@ -24,7 +24,7 @@
          ui-boot.js + the Interface switcher in the profile dropdown. -->
     <link rel="stylesheet" href="/static/css/redesign.css?v=20260926b" id="skin-v1" disabled>
     <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260926b" id="skin-v2">
-    <link rel="stylesheet" href="/static/css/activity.css?v=20260926b">
+    <link rel="stylesheet" href="/static/css/activity.css?v=20260928a">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260926b">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
@@ -88,6 +88,10 @@
         <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
         <symbol id="i-chevron-right" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
         <symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+        <symbol id="i-chevron-left" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+        <symbol id="i-chevron-up" viewBox="0 0 24 24"><polyline points="18 15 12 9 6 15"/></symbol>
+        <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></symbol>
+        <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"/></symbol>
         <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
         <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
         <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
@@ -352,7 +356,7 @@
                         <span class="sidebar-text">Groups</span>
                     </a>
                     <a href="#" class="sidebar-item admin-only" data-section="activity" style="display: none;">
-                        <span class="sidebar-icon"><svg class="icon"><use href="#i-list"/></svg></span>
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-activity"/></svg></span>
                         <span class="sidebar-text">Activity</span>
                     </a>
                     <a href="#" class="sidebar-item admin-only" data-section="settings" style="display: none;">
@@ -1452,84 +1456,90 @@
                     </div>
                 </div>
 
-                <!-- Activity (administrators): what happened, who did it, and how it came in. The Events tab
-                     is the audit log, filterable by every kind of event. -->
-                <div id="activity-section" class="content-section">
-                    <div class="flex justify-between items-center mb-lg">
-                        <div>
-                            <h2 class="text-2xl font-bold">Activity</h2>
-                            <p class="text-secondary">What happened, who did it, and how it came in.</p>
-                        </div>
-                    </div>
-                    <div class="tabs mb-lg" role="tablist" aria-label="Activity views">
-                        <button class="tab-btn active" type="button" role="tab" id="activity-tabbtn-overview" data-activity-tab="overview" aria-selected="true" aria-controls="activity-tab-overview">Overview</button>
-                        <button class="tab-btn" type="button" role="tab" id="activity-tabbtn-events" data-activity-tab="events" aria-selected="false" aria-controls="activity-tab-events">Events</button>
-                    </div>
-
-                    <div id="activity-tab-overview" class="activity-tab" role="tabpanel" aria-labelledby="activity-tabbtn-overview">
-                        <p class="text-tertiary text-sm mb-md">The last 24 hours.</p>
-                        <div class="activity-stats" id="activity-stats"></div>
-                        <div class="card mt-lg">
-                            <div class="card-header"><h3 class="text-lg font-bold">Latest failures and refusals</h3></div>
-                            <div class="card-body" id="activity-overview-recent"></div>
-                        </div>
-                    </div>
-
-                    <div id="activity-tab-events" class="activity-tab" role="tabpanel" aria-labelledby="activity-tabbtn-events" hidden>
-                        <button type="button" class="btn btn-secondary activity-filters-toggle" id="activity-filters-toggle" aria-expanded="false" aria-controls="activity-filters">Filters</button>
-                        <form id="activity-filters" class="activity-filters" autocomplete="off">
-                            <details class="activity-pick" id="activity-pick-category">
-                                <summary><span class="activity-pick-label">Events</span> <span class="activity-pick-value" id="activity-pick-category-value">All</span></summary>
-                                <div class="activity-pick-list" id="activity-category-list"></div>
-                            </details>
-                            <details class="activity-pick" id="activity-pick-channel">
-                                <summary><span class="activity-pick-label">Channel</span> <span class="activity-pick-value" id="activity-pick-channel-value">All</span></summary>
-                                <div class="activity-pick-list" id="activity-channel-list"></div>
-                            </details>
-                            <label class="activity-field"><span>Status</span>
-                                <select class="form-control" id="activity-status">
-                                    <option value="">Any</option>
-                                    <option value="success">Succeeded</option>
-                                    <option value="authorized">Allowed</option>
-                                    <option value="failed">Failed or refused</option>
-                                </select>
-                            </label>
-                            <label class="activity-field"><span>User</span>
-                                <input class="form-control" type="search" id="activity-user" maxlength="128" placeholder="Any user, including failed sign-ins">
-                            </label>
-                            <label class="activity-field"><span>IP address</span>
-                                <input class="form-control" type="search" id="activity-ip" maxlength="64" placeholder="203.0.113.7 or 203.0.113.0/24">
-                            </label>
-                            <label class="activity-field"><span>Contains</span>
-                                <input class="form-control" type="search" id="activity-q" maxlength="128" placeholder="Text in the event">
-                            </label>
-                            <label class="activity-field"><span>From</span>
-                                <input class="form-control" type="datetime-local" id="activity-from">
-                            </label>
-                            <label class="activity-field"><span>To</span>
-                                <input class="form-control" type="datetime-local" id="activity-to">
-                            </label>
-                            <div class="activity-actions">
-                                <button type="submit" class="btn btn-primary" id="activity-search">Search</button>
-                                <button type="button" class="btn btn-ghost" id="activity-reset">Clear filters</button>
+                <!-- Activity (administrators): what happened, who did it, and how it came in. One page: the
+                     header, a summary band whose marks are filters, and the live events list with the
+                     selected event's detail beside it. static/js/activity.js draws it. -->
+                <div id="activity-section" class="content-section activity">
+                    <header class="act-head">
+                        <h2 class="text-2xl font-bold act-title">Activity</h2>
+                        <span class="act-live" id="act-live" data-state="connecting" title="Connecting to the live updates."><span class="act-live-dot" aria-hidden="true"></span><span class="act-live-label" id="act-live-label">Connecting…</span></span>
+                        <div class="act-head-tools">
+                            <div class="seg-filter act-range" id="act-range" role="radiogroup" aria-label="Time range">
+                                <button type="button" class="seg-btn" role="radio" aria-checked="false" data-range="24h">24 h</button>
+                                <button type="button" class="seg-btn" role="radio" aria-checked="false" data-range="7d">7 d</button>
+                                <button type="button" class="seg-btn" role="radio" aria-checked="false" data-range="30d">30 d</button>
+                                <button type="button" class="seg-btn act-range-custom" role="radio" aria-checked="false" data-range="custom" id="act-range-custom">Custom…</button>
                             </div>
-                        </form>
-                        <div class="activity-results-bar">
-                            <div class="activity-summary text-secondary text-sm" id="activity-summary" aria-live="polite"></div>
-                            <div class="activity-export" id="activity-export" hidden>
-                                <button type="button" class="btn btn-ghost btn-sm" data-activity-export="csv">Export CSV</button>
-                                <button type="button" class="btn btn-ghost btn-sm" data-activity-export="ndjson">Export NDJSON</button>
+                            <button type="button" class="btn btn-secondary btn-sm act-pause" id="act-pause" aria-pressed="false" aria-label="Pause"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-pause"/></svg><span class="act-btn-text">Pause</span></button>
+                            <div class="menu-wrap act-menu-wrap">
+                                <button type="button" class="btn btn-secondary btn-sm act-export-btn" id="activity-export" aria-haspopup="true" aria-expanded="false" aria-controls="act-export-menu" aria-label="Export"><svg class="icon icon-sm act-export-more" aria-hidden="true"><use href="#i-more"/></svg><span class="act-btn-text">Export</span><svg class="icon icon-sm act-chevron" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+                                <div class="dropdown-menu act-menu act-export-menu" id="act-export-menu" role="menu" hidden>
+                                    <button type="button" role="menuitem" data-activity-export="csv">Export as CSV</button>
+                                    <button type="button" role="menuitem" data-activity-export="ndjson">Export as NDJSON</button>
+                                    <p class="act-menu-hint">Exports every event that matches the filters, up to 100,000.</p>
+                                </div>
                             </div>
                         </div>
-                        <div class="data-table-wrapper activity-table-wrap">
-                            <table class="data-table activity-table">
-                                <thead><tr><th>When</th><th>Event</th><th>Who</th><th>Channel</th><th>Status</th><th>IP address</th></tr></thead>
+                    </header>
+
+                    <div class="act-blocked" id="act-blocked" hidden></div>
+
+                    <section id="act-band" class="act-band" aria-label="Summary">
+                        <div class="act-panel act-now" id="act-p-now"></div>
+                        <div class="act-panel act-time" id="act-p-time"></div>
+                        <div class="act-panel act-cat" id="act-p-cat"></div>
+                        <div class="act-panel act-signin" id="act-p-signin"></div>
+                        <div class="act-panel act-active" id="act-p-active"></div>
+                        <button type="button" class="act-more-charts" id="act-more-charts" aria-expanded="false" aria-controls="act-band"><span class="act-more-text">More charts</span><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+                    </section>
+
+                    <div class="act-toolbar toolbar" id="act-toolbar">
+                        <div class="toolbar-search act-search">
+                            <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+                            <input type="search" class="form-control" id="act-search" maxlength="128" placeholder="Search events" aria-label="Search events" autocomplete="off" title="Finds text in the event name, the person, what was affected, the error and the recorded details.">
+                        </div>
+                        <div class="act-filter-wrap">
+                            <button type="button" class="btn btn-secondary btn-sm act-filter-btn" id="act-filter-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="act-filter-panel"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-filter"/></svg><span id="act-filter-label">Filter</span></button>
+                            <div class="act-filter-panel" id="act-filter-panel" role="dialog" aria-label="Filters" hidden><div class="act-fp-content" id="act-fp-content"></div></div>
+                        </div>
+                        <div class="menu-wrap act-saved-wrap">
+                            <button type="button" class="btn btn-secondary btn-sm act-saved-btn" id="act-saved-btn" aria-haspopup="true" aria-expanded="false" aria-controls="act-saved-menu"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-star"/></svg><span id="act-saved-label" class="act-btn-text">Saved</span><svg class="icon icon-sm act-chevron" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+                            <div class="dropdown-menu act-menu act-saved-menu" id="act-saved-menu" role="menu" hidden></div>
+                        </div>
+                        <div class="act-chips" id="act-chips" hidden></div>
+                        <div class="act-count-wrap">
+                            <span class="toolbar-count" id="activity-summary"></span>
+                            <button type="button" class="act-page-btn" id="act-prev" aria-label="Previous page"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg></button>
+                            <button type="button" class="act-page-btn" id="act-next" aria-label="Next page"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-right"/></svg></button>
+                        </div>
+                    </div>
+
+                    <div class="act-body" id="act-body">
+                        <div class="act-pill-row"><button type="button" class="btn btn-secondary btn-sm act-new-pill" id="act-new-pill" hidden></button></div>
+                        <div class="act-list" id="act-list" aria-busy="false">
+                            <div class="act-progress" aria-hidden="true"></div>
+                            <div class="alert alert-error act-list-alert" id="act-list-alert" role="alert" hidden></div>
+                            <table class="data-table activity-table" id="act-table" aria-label="Events">
+                                <thead>
+                                    <tr>
+                                        <th scope="col" class="act-c-time" id="act-th-time">Time</th>
+                                        <th scope="col" class="act-c-ev">Event</th>
+                                        <th scope="col" class="act-c-who">Person</th>
+                                        <th scope="col" class="act-c-ch">Channel</th>
+                                        <th scope="col" class="act-c-ip">Address</th>
+                                        <th scope="col" class="act-c-st">Status</th>
+                                    </tr>
+                                </thead>
                                 <tbody id="activity-rows"></tbody>
                             </table>
+                            <ul class="act-cards" id="activity-cards" aria-label="Events" hidden></ul>
+                            <div class="act-empty" id="act-empty" hidden></div>
+                            <div class="act-pager" id="act-pager" hidden></div>
                         </div>
-                        <div class="activity-cards" id="activity-cards"></div>
-                        <div class="activity-more"><button type="button" class="btn btn-secondary" id="activity-more" hidden>Load more</button></div>
+                        <section class="act-detail" id="act-detail" aria-labelledby="act-detail-title" hidden></section>
                     </div>
+                    <div class="sr-only" id="act-announce" aria-live="polite"></div>
+                    <div class="sr-only" id="act-announce-new" aria-live="polite"></div>
                 </div>
 
                 <!-- Settings Section -->
@@ -3893,16 +3903,57 @@
                 </div>
             </div>
 
-            <!-- Audit event detail modal (80vw): left = the page's events (TOC), right = full detail -->
-            <div id="activity-event-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="activity-event-title">
-                <div class="modal-content">
+            <!-- Activity: an event's detail on a phone (full screen, Newer and Older, closed by Back). Wider
+                 screens show the detail beside the list instead. Filled by static/js/activity.js. -->
+            <div id="activity-event-modal" class="modal act-full-modal" role="dialog" aria-modal="true" aria-labelledby="activity-event-title">
+                <div class="modal-content act-ev-sheet"></div>
+            </div>
+
+            <!-- Activity: the filters on a phone. Changes are staged until "Show N events". -->
+            <div id="act-filter-modal" class="modal act-full-modal act-activity-dialog" role="dialog" aria-modal="true" aria-labelledby="act-filter-modal-title">
+                <div class="modal-content act-fm-sheet">
                     <div class="modal-header">
-                        <h3 id="activity-event-title">Event</h3>
-                        <button type="button" class="close-modal-btn modal-close" aria-label="Close">&times;</button>
+                        <h3 id="act-filter-modal-title">Filters</h3>
+                        <button type="button" class="modal-close act-fm-close" aria-label="Close">&times;</button>
                     </div>
-                    <div class="modal-body">
-                        <dl class="activity-event-fields" id="activity-event-fields"></dl>
-                        <pre class="activity-event-details" id="activity-event-details" hidden></pre>
+                    <div class="modal-body act-fm-body" id="act-filter-modal-body"></div>
+                </div>
+            </div>
+
+            <!-- Activity: save the current search -->
+            <div id="act-save-modal" class="modal act-activity-dialog" role="dialog" aria-modal="true" aria-labelledby="act-save-title">
+                <div class="modal-content act-save-dialog">
+                    <form id="act-save-form" novalidate>
+                        <div class="modal-header">
+                            <h3 id="act-save-title">Save search</h3>
+                            <button type="button" class="modal-close act-dlg-close" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="form-group">
+                                <label for="act-save-name">Name</label>
+                                <input type="text" class="form-control" id="act-save-name" maxlength="80" autocomplete="off" aria-describedby="act-save-error">
+                                <p class="form-error" id="act-save-error" hidden></p>
+                            </div>
+                            <label class="checkbox-label act-save-default"><input type="checkbox" id="act-save-default"> Open Activity with this search</label>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" id="act-save-cancel">Cancel</button>
+                            <button type="submit" class="btn btn-primary" id="act-save-submit">Save</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Activity: manage saved searches -->
+            <div id="act-manage-modal" class="modal act-activity-dialog" role="dialog" aria-modal="true" aria-labelledby="act-manage-title">
+                <div class="modal-content act-manage-dialog">
+                    <div class="modal-header">
+                        <h3 id="act-manage-title">Saved searches</h3>
+                        <button type="button" class="modal-close act-dlg-close" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="modal-body" id="act-manage-body"></div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" id="act-manage-close">Close</button>
                     </div>
                 </div>
             </div>
@@ -3914,7 +3965,7 @@
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20260923a"></script>
     <script src="/static/js/app.js?v=20260926b"></script>
-    <script src="/static/js/activity.js?v=20260926b"></script>
+    <script src="/static/js/activity.js?v=20260928a"></script>
 </body>
 </html>
 
