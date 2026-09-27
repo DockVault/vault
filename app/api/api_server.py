@@ -15874,6 +15874,15 @@ async def revoke_vault_permission(
                 detail="Removing your own access here would give you the wider access your "
                        "department has to this vault; ask its owner or another administrator.")
 
+        is_zk = getattr(vault, 'type', 'standard') == 'zero_knowledge'
+        if is_zk:
+            # Take the vault row lock a key rotation holds from its key-holder check to its commit,
+            # before touching membership or keys. The member's keys below are then read after any
+            # rotation in flight has committed, so a key it just wrote for them at the new epoch is
+            # deactivated with the rest (and the vault reports the rotation it now owes) instead of
+            # being left active; and a rotation that starts after this sees them already removed.
+            db.query(Vault).populate_existing().filter(Vault.id == vault_id).with_for_update().first()
+
         # Delete permission entry
         from app.core.models import vault_members
         from sqlalchemy import delete as sql_delete
@@ -15887,12 +15896,15 @@ async def revoke_vault_permission(
         # Zero-knowledge: deactivate the user's wrapped DEK(s) in the SAME transaction as
         # the authz removal, so a usable crypto key is never left behind after access is
         # revoked. The forward-secrecy guarantee (a NEW DEK epoch the removed user never
-        # gets) is the rekey flow's job — the web UI calls /ecc/.../rekey before this DELETE,
-        # by which point these rows are already inactive (this becomes a no-op). For any
-        # non-rekey caller (admin tooling, a direct API DELETE) this closes the window where
-        # the removed user could still fetch their current-epoch DEK until the reconciler
-        # swept it. Keeps the authz and crypto planes consistent on every revoke path.
-        if getattr(vault, 'type', 'standard') == 'zero_knowledge':
+        # gets) is the rekey flow's job. When the remover holds the vault's key, the web UI
+        # calls /ecc/.../rekey before this DELETE, by which point these rows are already
+        # inactive (this becomes a no-op). When they do not (only a key holder may rotate),
+        # the UI removes with this DELETE alone, and the vault then reports rekey_owed to its
+        # key holders, who are asked to rotate. For any other caller (admin tooling, a direct
+        # API DELETE) this closes the window where the removed user could still fetch their
+        # current-epoch DEK until the reconciler swept it. Keeps the authz and crypto planes
+        # consistent on every revoke path.
+        if is_zk:
             from app.core.models import VaultMemberKey
             now = datetime.now(timezone.utc)
             for mk in db.query(VaultMemberKey).filter(

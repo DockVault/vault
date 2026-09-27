@@ -18,7 +18,10 @@ import uuid
 
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique, create_zk_vault, zk_chunked_upload
+from conftest import (
+    ApiClient, BASE_URL, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, create_zk_vault,
+    ensure_ecc_keypair, unique, zk_chunked_upload,
+)
 
 # The vault's Postgres container. Env-overridable so the suite can be pointed at a second
 # stack instead of silently targeting whatever "vault-db" happens to be running.
@@ -204,6 +207,12 @@ def test_ecc_rekey_manager_cannot_unseat_peer_manager(admin):
                 "seed a Manager membership")
         c1 = ApiClient(BASE_URL)
         c1.login(m1["_username"], m1["_password"])
+        # M1 must hold the vault's key: only a key holder may rotate at all, so without one M1 is
+        # refused before the peer-Manager rule is reached and this would test the wrong refusal.
+        ensure_ecc_keypair(c1)
+        admin.post(f"/ecc/vaults/{vid}/members", json={
+            "user_id": m1["id"], "wrapped_dek": ZK_WRAPPED_DEK_STUB,
+            "ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
         # M1 (a Manager, not owner/admin) tries to strip peer Manager M2 via rekey.
         r = c1.post(f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": m2["id"], "member_keys": []})

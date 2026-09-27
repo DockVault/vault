@@ -436,7 +436,7 @@ def test_a_stale_next_generation_wrap_is_pruned_like_any_other(admin):
 
 
 @pytest.mark.integration
-def test_a_deactivated_next_generation_wrap_still_forces_a_team_rotation(admin):
+def test_a_deactivated_next_generation_wrap_still_forces_a_team_rotation(admin, temp_user, temp_user_client):
     """The silent one: rotation-owed must fire on a next-generation row too.
 
     A deactivated team-private row at the current epoch is the signature of a bare revoke, and it
@@ -454,11 +454,19 @@ def test_a_deactivated_next_generation_wrap_still_forces_a_team_rotation(admin):
         admin.put("/settings", json={"zero_knowledge_enabled": False})
 
     try:
+        # A second team member, whose row is the one deactivated below: only someone who holds the
+        # current team key may rotate at all, so the owner must keep theirs to reach this check.
+        ensure_ecc_keypair(temp_user_client)
+        admin.post(f"/ecc/vaults/{vid}/members", json={
+            "user_id": str(temp_user["id"]), "wrapped_team_privkey": _stub("tpriv"),
+            "team_ephemeral_public_key": _stub("tpeph"),
+        }).raise_for_status()
         safe_vault = str(vid).replace("'", "''")
+        safe_member = str(temp_user["id"]).replace("'", "''")
         _relabel(vid, 1, TEAMPRIV_ALGO_V2)
         out = _psql(
             "UPDATE vault_member_keys SET is_active = FALSE "
-            f"WHERE vault_id = '{safe_vault}' AND key_version = 1;"
+            f"WHERE vault_id = '{safe_vault}' AND key_version = 1 AND user_id = '{safe_member}';"
         )
         assert out == "UPDATE 1", out
 

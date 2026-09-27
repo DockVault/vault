@@ -924,6 +924,39 @@ def _rekey_owed(db: Session, vault: Vault) -> bool:
     ).first() is not None
 
 
+# Managing a vault and holding its key are different things. The owner, a global admin or a Manager
+# may change who is a member; only someone who holds the key may rotate it. A rotation runs in the
+# caller's browser, which mints the new key and wraps it for every remaining member, so whoever runs
+# one learns the key that protects every file uploaded after it. Allowed to someone who does not hold
+# the key, it would give them that key while the members keep working and notice nothing.
+_NOT_A_KEY_HOLDER = "Only someone who holds this vault's key can rotate it"
+
+
+def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
+    """True if `user_id` holds an ACTIVE key for the vault's CURRENT epoch.
+
+    DIRECT: a wrapped-DEK row at dek_version. HIERARCHICAL: a team-private-key row at
+    team_key_version, the key every current DEK epoch is wrapped under. A row at an older epoch does
+    not count: it opens files written before a rotation, not the key in use now.
+
+    Pass the vault row the handler LOCKED (populate_existing + with_for_update), so the epoch is the
+    live one, and a removal of the caller that takes the same lock is either already visible here or
+    waits until the write that depends on this answer has committed."""
+    if _is_hierarchical(vault):
+        epoch = getattr(vault, 'team_key_version', 1) or 1
+        kind = VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS)
+    else:
+        epoch = getattr(vault, 'dek_version', 1) or 1
+        kind = VaultMemberKey.wrapping_algorithm.in_(DIRECT_DEK_ALGOS)
+    return db.query(VaultMemberKey.id).filter(
+        VaultMemberKey.vault_id == vault.id,
+        VaultMemberKey.user_id == user_id,
+        VaultMemberKey.key_version == epoch,
+        kind,
+        VaultMemberKey.is_active == True,  # noqa: E712
+    ).first() is not None
+
+
 class IndexKeyWrap(BaseModel):
     """One member's wrapped copy of the vault name-index key."""
     user_id: str
@@ -1536,6 +1569,12 @@ async def revoke_member_key(
         peer = _member_row(db, vault.id, user_id)
         if peer and peer.manage_permission:
             raise HTTPException(status_code=403, detail="Only the vault owner or an admin can revoke a manager")
+    # Take the vault row lock a rotation holds from its key-holder check to its commit. The rows
+    # below are then read after any rotation in flight has committed, so a key it just wrote for
+    # this member at the new epoch is deactivated with the rest (and the vault reports the rotation
+    # it now owes) instead of being left active; and a rotation that starts after this one sees the
+    # member's keys already gone.
+    db.query(Vault).populate_existing().filter(Vault.id == vault_id).with_for_update().first()
     rows = db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault_id,
         VaultMemberKey.user_id == user_id,
@@ -1678,7 +1717,9 @@ async def rekey_vault(
     removal, not retroactive secrecy for content the removed member already accessed.
 
     Authorization: owner / global admin / Manager (parity with /vaults permission changes —
-    a security-critical op must not be a weaker authz surface than a plain permission edit).
+    a security-critical op must not be a weaker authz surface than a plain permission edit),
+    AND the caller must hold the vault's current key and stay one of the members the new key is
+    wrapped for. Whoever runs the rotation learns the new key (see _holds_current_key).
     """
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -1701,6 +1742,14 @@ async def rekey_vault(
     # read before the lock, so two concurrent rotations could both satisfy the check below.
     locked = (db.query(Vault).populate_existing()
               .filter(Vault.id == vault_id).with_for_update().first())
+    if locked is None:
+        # Hard-deleted between the entry read and here.
+        raise HTTPException(status_code=404, detail="Vault not found")
+    # Only someone who holds the current key may rotate it. Checked under the lock and before
+    # anything in the request body is used: the epoch is the live one, and a removal of the caller
+    # (which takes this same lock) has either committed and is visible here, or waits for us.
+    if not _holds_current_key(db, locked, current_user.id):
+        raise HTTPException(status_code=403, detail=_NOT_A_KEY_HOLDER)
     current = getattr(locked, 'dek_version', 1) or 1
 
     # Optimistic-lock: the client must have rotated from the live epoch.
@@ -1728,9 +1777,16 @@ async def rekey_vault(
     now = datetime.now(timezone.utc)
 
     def _validate_cover(remaining: set, *, recipient_label: str):
-        """Shared rekey invariant: member_keys must cover EXACTLY the remaining authorized
-        members, the revoked user must not be among them, no dups, every recipient has a
-        keypair, and the OWNER must be present (recovery guarantee)."""
+        """Shared rekey invariant: the caller is one of the remaining members, member_keys must
+        cover EXACTLY the remaining authorized members, the revoked user must not be among them,
+        no dups, every recipient has a keypair, and the OWNER must be present (recovery guarantee)."""
+        # Whoever runs the rotation learns the new key, so they must be one of the members it is
+        # wrapped for. Otherwise a caller removing themselves, or a key holder who is no longer a
+        # member, would come away holding the key to files written after they left.
+        if str(current_user.id) not in remaining:
+            raise HTTPException(status_code=403, detail=(
+                "Whoever rotates this vault's key learns the new key, so they must remain a member "
+                "who receives it. To leave the vault, remove your access without rotating the key."))
         supplied = {mk.user_id for mk in request.member_keys}
         if len(supplied) != len(request.member_keys):
             raise HTTPException(status_code=400, detail="Duplicate user_id in member_keys")
