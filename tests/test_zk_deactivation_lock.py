@@ -119,7 +119,8 @@ def _active(Session, user_id, vault_id=None):
 
 def _locked_ids(lock):
     _, sql, params = lock
-    assert "ORDER BY vaults.id" in sql, f"the vaults are not locked in id order: {sql}"
+    assert "ORDER BY vaults.id" in sql and "ORDER BY vaults.id DESC" not in sql, (
+        f"the vaults are not locked in ascending id order: {sql}")
     (ids,) = [v for v in params.values() if isinstance(v, (list, tuple))]
     return set(ids)
 
