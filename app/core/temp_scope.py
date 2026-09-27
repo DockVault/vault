@@ -18,6 +18,7 @@ get_current_user) with these transient attributes:
     _temp_scope      : dict | None     (the scope document, or None = legacy)
     _temp_vault_mode : 'all' | 'selected'
     _temp_cred_id    : uuid | None
+    _temp_cred_username : str | None  (the credential's name, for the audit log)
     _temp_vault_caps : { str(vault_id): [cap, ...] }   (only for mode 'selected')
 """
 from typing import Optional, List, Dict
@@ -165,6 +166,7 @@ def attach_scope(db, user, temp_cred) -> None:
     a NULL scope leaves the principal effectively unrestricted (legacy)."""
     user._is_temp_session = True
     user._temp_cred_id = temp_cred.id
+    user._temp_cred_username = getattr(temp_cred, "temp_username", None)
     user._temp_scope = temp_cred.scope
     user._temp_vault_mode = getattr(temp_cred, "vault_access_mode", "selected") or "selected"
     user._temp_can_create = bool(getattr(temp_cred, "can_create_temp_credentials", False))

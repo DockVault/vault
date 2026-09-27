@@ -102,3 +102,19 @@ def names_for(db, viewer, events: List[dict]) -> List[Dict[str, Optional[str]]]:
             item_name = (getattr(obj, "original_name", None) or getattr(obj, "name", None)) if obj else DELETED_ITEM
         out.append({"vault": vault_name, "item": item_name})
     return out
+
+
+def temp_credential_names(db, events: List[dict]) -> None:
+    """Fill in the temporary credential's name on events that record only its id (rows written before
+    0.33.0 kept the id alone), while that credential still exists. Changes the events in place."""
+    from app.core.models import TemporaryCredential
+    missing = {_uuid(e.get("temp_credential_id")) for e in events
+               if e.get("temp_credential_id") and not e.get("temp_credential_name")}
+    missing.discard(None)
+    if not missing:
+        return
+    found = {str(i): n for i, n in db.query(TemporaryCredential.id, TemporaryCredential.temp_username)
+             .filter(TemporaryCredential.id.in_(missing)).all()}
+    for e in events:
+        if e.get("temp_credential_id") and not e.get("temp_credential_name"):
+            e["temp_credential_name"] = found.get(str(e["temp_credential_id"]))

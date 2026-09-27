@@ -1190,6 +1190,10 @@ class AuditLog(Base):
     # answer "what did the credential I handed that contractor actually do?", and anything it
     # did wrong is recorded under the account owner's name.
     temp_credential_id = Column(UUID(as_uuid=True), nullable=True)
+    # That credential's name (temp_...), kept with the row so the row still says which credential it
+    # was after the credential is deleted. NULL on rows written before 0.33.0 and on rows no
+    # credential wrote.
+    temp_credential_name = Column(String(255), nullable=True)
     resource_type = Column(String(50), nullable=True)
     resource_id = Column(String(255), nullable=True)
     
@@ -1219,6 +1223,10 @@ class AuditLog(Base):
         Index('idx_audit_timestamp', 'timestamp'),
         Index('idx_audit_user', 'user_id'),
         Index('idx_audit_action', 'action'),
+        # idx_audit_username_prefix, for the Activity page's username typeahead, is created by the boot
+        # DDL list in app/api/api_server.py on fresh and upgraded databases alike. It is not declared
+        # here because it is a Postgres expression index (in the "C" collation), and this model also
+        # builds the table in SQLite for tests.
     )
 
 

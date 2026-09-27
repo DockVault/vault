@@ -2415,18 +2415,34 @@ def activity_events(
     ip: Optional[str] = Query(None, max_length=64),
     q: Optional[str] = Query(None, max_length=128),
     temp_credential_id: Optional[str] = Query(None, max_length=64),
+    temp_credential: Optional[str] = Query(None, max_length=128),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
     cursor: Optional[str] = Query(None, max_length=200),
+    page: Optional[int] = Query(None, ge=1, le=1_000_000),
+    after: Optional[str] = Query(None, max_length=64),
+    ids: List[str] = Query([], max_length=200),
     limit: int = 50,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """The Activity page's Events tab: the audit log filtered by category, channel, status, user, IP or
-    CIDR, text, temporary credential and time, newest first, a page at a time (admin only).
+    """The Activity page's Events list: the audit log filtered by category, channel, status, user, IP or
+    CIDR, text, temporary credential (by id or name) and time, newest first (admin only).
+
+    Four ways to read it, which never mix:
+    - numbered pages: `page` and `limit` (the page size), with the total and the page count. The page
+      starts at `cursor` when given (the `next_cursor` of the page before it, so walking through the
+      pages never makes the database skip rows), otherwise after skipping the rows of the pages before
+      it, up to activity_events.MAX_OFFSET rows;
+    - progressive loading ("All"): no `page`; each call continues from `cursor`, and the first also
+      returns the total;
+    - newer rows for a live list: `after`, a row id; the rows after that row, newest first, at most
+      `limit`, with `more` true when there were more (or the row is gone), meaning reload instead;
+    - specific rows: `ids`, the row ids the live signal named, each returned only if it matches the
+      filters.
 
     A plain def, so FastAPI runs it in its thread pool: a count and a page over a large audit table
-    must not hold the event loop. The first page also returns how many rows match."""
+    must not hold the event loop."""
     from app.core import audit_range
     from app.core.models import AuditLog
     from app.services import activity_events as ev
@@ -2434,23 +2450,67 @@ def activity_events(
     base = ev.build_events_query(
         db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
         username=user, ip=ip, text=q, temp_credential_id=temp_credential_id,
+        temp_credential=temp_credential, ids=ids,
         start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
-    after = ev.decode_cursor(cursor)
-    total = base.order_by(None).count() if after is None else None
-    rows = (ev.after_cursor(base, AuditLog, after)
-            .order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
-            .limit(limit + 1).all())
-    more = len(rows) > limit
-    rows = rows[:limit]
+    newest_first = (AuditLog.timestamp.desc(), AuditLog.id.desc())
+    out = {"events": [], "next_cursor": None, "total": None}
+
+    if ids:
+        rows = base.order_by(*newest_first).limit(ev.MAX_IDS).all()
+    elif after:
+        anchor = None
+        try:
+            anchor = db.query(AuditLog.timestamp, AuditLog.id).filter(
+                AuditLog.id == uuid.UUID(after)).first()
+        except ValueError:
+            pass
+        if anchor is None:
+            return {**out, "more": True}
+        rows = ev.newer_than(base, AuditLog, (anchor[0], anchor[1])).order_by(*newest_first).limit(limit + 1).all()
+        out["more"] = len(rows) > limit
+        rows = rows[:limit]
+    else:
+        start_at = ev.decode_cursor(cursor)
+        q_rows = ev.after_cursor(base, AuditLog, start_at).order_by(*newest_first)
+        if page is not None:
+            total = base.order_by(None).count()
+            out.update(total=total, page=page, pages=ev.page_count(total, limit), page_size=limit)
+            if start_at is None and page > 1:
+                offset = ev.page_offset(page, limit)
+                if offset is None:
+                    raise HTTPException(status_code=400, detail=(
+                        "That page is too far in to open directly. Narrow the filters, or move to it "
+                        "a page at a time."))
+                q_rows = q_rows.offset(offset)
+        elif start_at is None:
+            out["total"] = base.order_by(None).count()
+        rows = q_rows.limit(limit + 1).all()
+        if len(rows) > limit:
+            rows = rows[:limit]
+            out["next_cursor"] = ev.encode_cursor(rows[-1].timestamp, rows[-1].id)
+
     events = [ev.row_view(r) for r in rows]
-    from app.services.activity_names import names_for
+    from app.services.activity_names import names_for, temp_credential_names
     for event, names in zip(events, names_for(db, current_user, events)):
         event["names"] = names
-    return {
-        "events": events,
-        "next_cursor": ev.encode_cursor(rows[-1].timestamp, rows[-1].id) if more and rows else None,
-        "total": total,
-    }
+    temp_credential_names(db, events)
+    out["events"] = events
+    return out
+
+
+@app.get("/activity/usernames")
+def activity_usernames(
+    q: str = Query("", max_length=64),
+    limit: int = Query(10, ge=1, le=20),
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Usernames that start with `q`, for the Events filter's typeahead (admin only): the accounts, and
+    every other name the audit log has seen, such as a name typed at a failed sign-in or a deleted
+    account. Each says whether it is an account now. At most 20, and cheap on a large log (see
+    activity_events.username_suggestions)."""
+    from app.services import activity_events as ev
+    return {"usernames": ev.username_suggestions(db, q, limit)}
 
 
 @app.get("/activity/export")
@@ -2463,6 +2523,7 @@ def activity_export(
     ip: Optional[str] = Query(None, max_length=64),
     q: Optional[str] = Query(None, max_length=128),
     temp_credential_id: Optional[str] = Query(None, max_length=64),
+    temp_credential: Optional[str] = Query(None, max_length=128),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
     current_user: User = Depends(require_interactive_admin),
@@ -2477,17 +2538,19 @@ def activity_export(
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
     from app.services import activity_events as ev
+    from app.services.activity_names import temp_credential_names
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
         statuses=status, username=user, ip=ip, text=q, temp_credential_id=temp_credential_id,
-        start=audit_range.lower_bound(from_date))
+        temp_credential=temp_credential, start=audit_range.lower_bound(from_date))
     total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
     _audit_change(db, current_user, "audit_exported", "audit_log", None, {
         "format": format, "rows": min(total, ev.EXPORT_CAP), "total": total,
         "filters": {k: v for k, v in (("category", category), ("channel", channel), ("status", status),
                                       ("user", user), ("ip", ip), ("q", q),
                                       ("temp_credential_id", temp_credential_id),
+                                      ("temp_credential", temp_credential),
                                       ("from_date", from_date), ("to_date", to_date)) if v},
     })
 
@@ -2496,7 +2559,9 @@ def activity_export(
         try:
             got = ev.export_page(s.query(AuditLog), AuditLog, filters, after).all()
             nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
-            return [ev.row_view(r) for r in got], nxt
+            views = [ev.row_view(r) for r in got]
+            temp_credential_names(s, views)
+            return views, nxt
         finally:
             s.close()
 
@@ -22109,6 +22174,13 @@ def _run_lightweight_migrations():
             # The way an audited request came in (web, sftp, a public or upload link, device sync).
             # Nullable, so rows from before it read as unknown and an older release ignores it.
             "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS channel VARCHAR(20)",
+            # The name of the temporary credential that wrote a row, kept after the credential is
+            # deleted. Nullable: older rows have none and an older release ignores the column.
+            "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS temp_credential_name VARCHAR(255)",
+            # The Activity page's username typeahead: a prefix search over every name the log has seen,
+            # in byte order ("C") so a prefix is one contiguous range of the index. Building it on a
+            # large audit log makes the first start of this release slower.
+            'CREATE INDEX IF NOT EXISTS idx_audit_username_prefix ON audit_logs ((lower(username) COLLATE "C"))',
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",

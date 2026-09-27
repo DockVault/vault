@@ -117,6 +117,7 @@ class AuditLogger:
         ``timestamp`` is the row's time, now by default, which is what log_action stores.
         """
         temp_credential_id = None
+        temp_credential_name = None
         if user:
             user_id = user.id
             username = user.username
@@ -124,6 +125,7 @@ class AuditLogger:
             # a new one cannot forget. A temp session is the account object with this stamped
             # on it, which is exactly why `username` alone is not attribution.
             temp_credential_id = getattr(user, '_temp_cred_id', None)
+            temp_credential_name = getattr(user, '_temp_cred_username', None) if temp_credential_id else None
         elif user_id and not username:
             # A caller that passed only the id: store the name too, or the row reads "Unknown" in the
             # Activity page and cannot be found by a username filter.
@@ -169,6 +171,7 @@ class AuditLogger:
             user_id=user_id,
             username=username,
             temp_credential_id=temp_credential_id,
+            temp_credential_name=temp_credential_name,
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,

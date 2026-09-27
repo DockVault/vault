@@ -127,3 +127,18 @@ def test_a_built_row_is_timed_now_unless_the_caller_gives_the_time():
     at = datetime(2026, 9, 26, 12, 0)
     assert AuditLogger(_Session()).build_row(action="file_expired", status="success",
                                              timestamp=at).timestamp == at
+
+
+def test_a_temporary_credentials_row_keeps_its_name():
+    # So the row still says which credential acted after the credential is deleted.
+    temp = SimpleNamespace(id=uuid.uuid4(), username="maria", _temp_cred_id=uuid.uuid4(),
+                           _temp_cred_username="temp_contractor")
+    row = AuditLogger(_Session()).build_row(action="login_success", status="success", user=temp)
+    assert (row.temp_credential_id, row.temp_credential_name) == (temp._temp_cred_id, "temp_contractor")
+
+
+def test_the_account_itself_writes_no_credential_name():
+    # A stale name left on the account object without a credential id is not attribution.
+    owner = SimpleNamespace(id=uuid.uuid4(), username="maria", _temp_cred_username="temp_stale")
+    row = AuditLogger(_Session()).build_row(action="login_success", status="success", user=owner)
+    assert (row.temp_credential_id, row.temp_credential_name) == (None, None)

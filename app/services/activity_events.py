@@ -28,6 +28,16 @@ LEGACY_CATEGORY = "legacy"
 
 MAX_PAGE = 200
 MAX_TEXT = 128
+# The page sizes the Activity page offers. The API takes any size up to MAX_PAGE.
+PAGE_SIZES = (25, 50, 100)
+# The furthest a numbered page may start (page x size). A page past it is reached by walking the pages
+# before it, each continuing from the last one's cursor, so the database never skips this many rows.
+MAX_OFFSET = 100_000
+# The most row ids one request for specific rows (the live list's `ids`) may name.
+MAX_IDS = 200
+# A username typeahead's longest prefix and most suggestions.
+MAX_PREFIX = 64
+MAX_SUGGESTIONS = 20
 
 
 def statuses_for(choices: Iterable[str]) -> List[str]:
@@ -74,10 +84,11 @@ def like_escape(value: str) -> str:
 def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels: Sequence[str] = (),
                        statuses: Sequence[str] = (), username: Optional[str] = None,
                        ip: Optional[str] = None, text: Optional[str] = None,
-                       temp_credential_id: Optional[str] = None,
+                       temp_credential_id: Optional[str] = None, temp_credential: Optional[str] = None,
+                       ids: Sequence[str] = (),
                        start: Optional[datetime] = None, end: Optional[datetime] = None):
     """Apply the Events filters to a query over AuditLog. Unknown choices are ignored, never errors."""
-    from sqlalchemy import String, and_, case, cast, false, literal, or_
+    from sqlalchemy import String, and_, case, cast, false, literal, or_, select
 
     if categories:
         known = [c for c in categories if audit_catalog.category_label(c)]
@@ -136,6 +147,22 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
         except (ValueError, TypeError):
             q = q.filter(false())
 
+    if temp_credential:
+        # By name: the name the row stored (0.33.0 on), or for an older row the name of the credential
+        # it records, while that credential still exists.
+        from app.core.models import TemporaryCredential
+        like = f"%{like_escape(temp_credential[:MAX_TEXT])}%"
+        q = q.filter(or_(
+            AuditLog.temp_credential_name.ilike(like, escape="\\"),
+            and_(AuditLog.temp_credential_name.is_(None),
+                 AuditLog.temp_credential_id.in_(
+                     select(TemporaryCredential.id).where(TemporaryCredential.temp_username.ilike(like, escape="\\")))),
+        ))
+
+    if ids:
+        wanted = parse_ids(ids)
+        q = q.filter(AuditLog.id.in_(wanted) if wanted else false())
+
     if start is not None:
         q = q.filter(AuditLog.timestamp >= start)
     if end is not None:
@@ -146,6 +173,41 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
 def _inet():
     from sqlalchemy.dialects.postgresql import INET
     return INET()
+
+
+def parse_ids(values: Iterable[str]) -> List[uuid.UUID]:
+    """The row ids that read as UUIDs, at most MAX_IDS, each once; the rest are ignored."""
+    out: List[uuid.UUID] = []
+    for v in values:
+        try:
+            u = uuid.UUID(str(v))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if u not in out:
+            out.append(u)
+        if len(out) >= MAX_IDS:
+            break
+    return out
+
+
+def newer_than(q, AuditLog, anchor: Tuple[datetime, uuid.UUID]):
+    """Rows after the anchor in time (the live list's `after`), the id breaking a tie as the page
+    order does."""
+    from sqlalchemy import and_, or_
+    ts, row_id = anchor
+    return q.filter(or_(AuditLog.timestamp > ts, and_(AuditLog.timestamp == ts, AuditLog.id > row_id)))
+
+
+def page_count(total: int, size: int) -> int:
+    """How many numbered pages `total` rows fill, at least one (an empty result is page 1 of 1)."""
+    return max(1, -(-max(0, total) // max(1, size)))
+
+
+def page_offset(page: int, size: int) -> Optional[int]:
+    """The rows before a numbered page, or None when that is more than MAX_OFFSET (the page is then
+    reached through the cursors of the pages before it)."""
+    offset = (max(1, page) - 1) * max(1, size)
+    return offset if offset <= MAX_OFFSET else None
 
 
 def after_cursor(q, AuditLog, cursor: Optional[Tuple[datetime, uuid.UUID]]):
@@ -167,6 +229,7 @@ def row_view(r) -> dict:
         "timestamp": ts.isoformat() if ts else None,
         "username": r.username,
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
+        "temp_credential_name": getattr(r, "temp_credential_name", None),
         "action": r.action,
         "label": entry.label if entry else audit_catalog.LEGACY_LABEL,
         "category": entry.category if entry else LEGACY_CATEGORY,
@@ -186,6 +249,69 @@ def row_view(r) -> dict:
     }
 
 
+# --- Username typeahead ---------------------------------------------------------------------------
+
+# The top of the prefix range: in byte order (the index's "C" collation), every UTF-8 string that
+# starts with the prefix sorts before the prefix followed by the highest code point.
+_TOP = "\U0010ffff"
+
+# Each distinct name in the log that starts with the prefix, found one at a time: each step asks the
+# index for the next name after the last one, so a name written a million times costs one probe, not a
+# million rows. idx_audit_username_prefix is on exactly this expression.
+_LOG_NAMES_SQL = """
+WITH RECURSIVE seen(n) AS (
+    (SELECT lower(username) COLLATE "C" FROM audit_logs
+      WHERE lower(username) COLLATE "C" >= :lo AND lower(username) COLLATE "C" < :hi
+      ORDER BY 1 LIMIT 1)
+  UNION ALL
+    SELECT (SELECT lower(a.username) COLLATE "C" FROM audit_logs a
+             WHERE lower(a.username) COLLATE "C" > seen.n AND lower(a.username) COLLATE "C" < :hi
+             ORDER BY 1 LIMIT 1)
+      FROM seen WHERE seen.n IS NOT NULL
+)
+SELECT n FROM seen WHERE n IS NOT NULL LIMIT :limit
+"""
+
+# One stored spelling of a name found above (the log keeps the case it was typed in).
+_LOG_SPELLING_SQL = """
+SELECT username FROM audit_logs WHERE lower(username) COLLATE "C" = :n LIMIT 1
+"""
+
+
+def typeahead_prefix(text: Optional[str]) -> Optional[str]:
+    """The prefix a typeahead searches for: trimmed and lower-cased, None when empty or too long."""
+    text = (text or "").strip().lower()
+    if not text or len(text) > MAX_PREFIX:
+        return None
+    return text
+
+
+def username_suggestions(db, text: Optional[str], limit: int = 10) -> List[dict]:
+    """Usernames that start with `text`, from the accounts and from every name the audit log has seen
+    (attempted sign-ins and deleted accounts included), in name order, at most `limit`
+    (MAX_SUGGESTIONS). Each says whether it is an account now. Bounded work: the accounts table is
+    small and searched on its username; the log is walked name by name through its index."""
+    from sqlalchemy import func, text as sql
+    from app.core.models import User
+    prefix = typeahead_prefix(text)
+    limit = max(1, min(int(limit or 10), MAX_SUGGESTIONS))
+    if prefix is None:
+        return []
+    like = like_escape(prefix) + "%"
+    accounts = [u for (u,) in db.query(User.username)
+                .filter(func.lower(User.username).like(like, escape="\\"))
+                .order_by(func.lower(User.username).collate("C")).limit(limit).all() if u]
+    out = {u.lower(): {"username": u, "account": True} for u in accounts}
+    found = [n for (n,) in db.execute(sql(_LOG_NAMES_SQL),
+                                      {"lo": prefix, "hi": prefix + _TOP, "limit": limit}).all()]
+    for n in found:
+        if n in out:
+            continue
+        spelled = db.execute(sql(_LOG_SPELLING_SQL), {"n": n}).scalar()
+        out[n] = {"username": spelled or n, "account": False}
+    return [out[k] for k in sorted(out)][:limit]
+
+
 # --- Export ----------------------------------------------------------------------------------------
 
 # The most rows one export holds. A larger result stops here and says so in its last line.
@@ -196,10 +322,10 @@ EXPORT_FORMATS = ("csv", "ndjson")
 # (column heading, row_view key), in the order a CSV export lists them.
 EXPORT_COLUMNS = (
     ("Time (UTC)", "timestamp"), ("Event", "label"), ("Action", "action"), ("Category", "category"),
-    ("Status", "status"), ("User", "username"), ("Temporary credential", "temp_credential_id"),
+    ("Status", "status"), ("User", "username"), ("Temporary credential", "temp_credential_name"),
     ("Channel", "channel"), ("IP address", "ip_address"), ("Method", "method"), ("Route", "endpoint"),
     ("User agent", "user_agent"), ("Resource type", "resource_type"), ("Resource ID", "resource_id"),
-    ("Details", "details"), ("Error", "error_message"),
+    ("Details", "details"), ("Error", "error_message"), ("Temporary credential ID", "temp_credential_id"),
 )
 
 

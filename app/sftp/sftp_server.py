@@ -1032,7 +1032,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
     # -- principal / scope helpers ------------------------------------------
     # Temp-credential scope attributes (plain, non-ORM-mapped) attached at auth.
     _SCOPE_ATTRS = (
-        "_is_temp_session", "_temp_cred_id", "_temp_scope",
+        "_is_temp_session", "_temp_cred_id", "_temp_cred_username", "_temp_scope",
         "_temp_vault_mode", "_temp_can_create", "_temp_vault_caps",
         "_temp_vault_pw_fp",
         # Per-vault ID-based file/folder restriction ({files, folders} | None). Without re-applying
