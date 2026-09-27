@@ -27,7 +27,7 @@ HOST = "operator@host"
 def tool(*args):
     try:
         r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.host_operator", *args],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         pytest.skip(f"docker unavailable: {exc}")
     skip_if_container_absent(r, API)
@@ -56,7 +56,9 @@ def test_a_reset_link_from_the_host_even_inside_the_window(admin, temp_user):
     rows = _audit(admin, "password_reset_link_minted", uid)
     assert rows and rows[0]["username"] == HOST
     assert token not in json.dumps(rows), "the link is never in the audit log"
-    logs = subprocess.run(["docker", "logs", "--since", "3m", API], capture_output=True, text=True, timeout=60)
+    # The log is UTF-8 (warnings carry symbols); decoded with the host's code page it can fail to read.
+    logs = subprocess.run(["docker", "logs", "--since", "3m", API], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=60)
     assert token not in logs.stdout + logs.stderr, "the link is never in the container's log"
 
 

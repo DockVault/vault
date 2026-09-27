@@ -251,9 +251,10 @@ def test_a_real_upload_leaves_no_filename_in_the_container_log(admin, temp_vault
 
     combined = ""
     for name in reachable:
+        # UTF-8, not the host's code page: some log lines carry symbols that code page cannot decode.
         logs = subprocess.run(
             ["docker", "logs", "--since", since, name],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
         combined += logs.stdout + logs.stderr
     offending = [ln for ln in combined.splitlines() if sentinel in ln]

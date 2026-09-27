@@ -68,9 +68,10 @@ def _recent_logs(window="5m"):
     puts the window in the future on any host behind UTC, so the test sees no logs and fails for
     a reason that has nothing to do with the code. A duration has no timezone to get wrong.
     """
+    # UTF-8, not the host's code page: some log lines carry symbols that code page cannot decode.
     out = subprocess.run(
         ["docker", "logs", API, "--since", window],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
     )
     return out.stdout + out.stderr
 
