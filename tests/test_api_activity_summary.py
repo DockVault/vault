@@ -155,6 +155,23 @@ def test_a_chosen_range_that_cannot_be_charted_is_refused(admin):
     assert admin.get("/activity/summary", params={"range": "all", "range_to": "soon"}).status_code == 422
 
 
+def test_days_follow_the_viewers_time_zone(admin):
+    """Athens moved its clocks forward on 29 March 2026: its days start at 22:00 UTC before that and at
+    21:00 UTC after, and 29 March is 23 hours long. With only the offset every day starts at the same
+    time in UTC; a name that cannot be a zone is refused."""
+    span = {"range": "custom", "range_from": "2026-03-20T12:00:00+00:00", "range_to": "2026-04-05T00:00:00+00:00"}
+    band = _summary(admin, tz="Europe/Athens", tz_offset=180, **span)
+    assert band["time_zone"] == "Europe/Athens" and band["bucket_seconds"] == 86400
+    starts = [b["start"] for b in band["buckets"]]
+    assert starts[0] == "2026-03-19T22:00:00+00:00" and starts[-1] == "2026-04-04T21:00:00+00:00"
+    day = starts.index("2026-03-28T22:00:00+00:00")
+    assert band["buckets"][day]["end"] == "2026-03-29T21:00:00+00:00"
+    fixed = _summary(admin, tz="Mars/Olympus_Mons", tz_offset=180, **span)
+    assert fixed["time_zone"] is None
+    assert {b["start"][11:] for b in fixed["buckets"]} == {"21:00:00+00:00"}
+    assert admin.get("/activity/summary", params={"tz": "../../etc/passwd"}).status_code == 422
+
+
 def test_what_is_happening_now_counts_this_session(admin):
     now = _summary(admin)["now"]
     assert set(now) == {"as_of", "sessions", "people", "temporary_credentials", "transfers_in_progress",

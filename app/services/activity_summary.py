@@ -6,7 +6,10 @@ Events list does not: event categories, usernames and addresses, never a vault, 
 
 The range is split into buckets on the viewer's clock: whole hours for 24 hours, six-hour blocks for 7
 days, whole days for 30 days, and for a chosen range or all time the smallest of AUTO_SIZES that needs no
-more than MAX_BUCKETS. The last bucket of a range that ends now is the one in progress.
+more than MAX_BUCKETS. The last bucket of a range that ends now is the one in progress. The viewer's
+clock is their time zone when the server knows it (an IANA name, from the browser): six-hour blocks and
+days then follow it across a daylight-saving change, so the block or day holding the change is an hour
+longer or shorter and the next still starts at 00:00, 06:00... Without one it is a fixed offset from UTC.
 
 The band has five blocks, and each counts under every filter but its own (OWN_FILTERS), so each panel of
 the page keeps offering the values that could be picked next: the Events block (the buckets and the
@@ -33,7 +36,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, List, Optional, Tuple
 
 from app.core import audit_catalog
@@ -111,9 +114,21 @@ class Window:
         return self.bounds[i + 1]
 
 
-def _clock(tz_offset_minutes: int):
-    """The viewer's clock: a fixed offset from UTC, at most the 14 hours time zones use."""
-    return timezone(timedelta(minutes=max(-14 * 60, min(14 * 60, int(tz_offset_minutes or 0)))))
+def time_zone(name: Optional[str]) -> Optional[tzinfo]:
+    """The IANA time zone called `name`, or None when this server has none by that name (its time zone
+    database can be older than the browser's): the band then keeps to the viewer's offset from UTC."""
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - unknown, not a zone's name, or unreadable: use the offset
+        return None
+
+
+def _clock(tz_offset_minutes: int, zone: Optional[tzinfo] = None):
+    """The viewer's clock: their time zone, else a fixed offset from UTC (at most the 14 hours zones use)."""
+    return zone or timezone(timedelta(minutes=max(-14 * 60, min(14 * 60, int(tz_offset_minutes or 0)))))
 
 
 def _local(utc: datetime, clock) -> datetime:
@@ -148,18 +163,19 @@ def _bounds(size: int, t: datetime, clock, back: int, count: int) -> Tuple[datet
     return tuple(_utc(first + i * step, clock) for i in range(count + 1))
 
 
-def window(range_key: str, now: datetime, tz_offset_minutes: int = 0) -> Window:
+def window(range_key: str, now: datetime, tz_offset_minutes: int = 0, zone: Optional[tzinfo] = None) -> Window:
     """The window for a range ending at `now` (naive UTC). Buckets start on the viewer's hour, six-hour
-    or day boundaries (`tz_offset_minutes` east of UTC, as a browser reports it negated), and the last one
-    holds `now`."""
+    or day boundaries (in `zone`, else `tz_offset_minutes` east of UTC, as a browser reports it negated),
+    and the last one holds `now`."""
     buckets, size = RANGES.get(range_key, RANGES[DEFAULT_RANGE])
-    clock = _clock(tz_offset_minutes)
+    clock = _clock(tz_offset_minutes, zone)
     bounds = _bounds(size, now, clock, back=buckets - 1, count=buckets)
     return Window(start=bounds[0], end=now, size=size, buckets=buckets, offset=_offset(now, clock),
                   bounds=bounds)
 
 
-def custom_window(start: datetime, end: datetime, tz_offset_minutes: int = 0) -> Optional[Window]:
+def custom_window(start: datetime, end: datetime, tz_offset_minutes: int = 0,
+                  zone: Optional[tzinfo] = None) -> Optional[Window]:
     """The window for a range the viewer chose, from `start` to `end` (naive UTC), in buckets of the
     smallest size in AUTO_SIZES that needs no more than MAX_BUCKETS. Buckets shorter than a day start on
     the viewer's hour or six-hour boundaries; a day or longer starts at the viewer's midnight on the
@@ -168,7 +184,7 @@ def custom_window(start: datetime, end: datetime, tz_offset_minutes: int = 0) ->
     `start`, or the range is longer than LONGEST."""
     if end <= start or end - start > LONGEST:
         return None
-    clock = _clock(tz_offset_minutes)
+    clock = _clock(tz_offset_minutes, zone)
     for size in AUTO_SIZES:
         bounds = _bounds(size, start, clock, back=0, count=MAX_BUCKETS)
         n = next((i for i in range(1, MAX_BUCKETS + 1) if bounds[i] >= end), None)
@@ -178,12 +194,13 @@ def custom_window(start: datetime, end: datetime, tz_offset_minutes: int = 0) ->
     return None
 
 
-def all_time(first: Optional[datetime], end: datetime, tz_offset_minutes: int = 0) -> Window:
+def all_time(first: Optional[datetime], end: datetime, tz_offset_minutes: int = 0,
+             zone: Optional[tzinfo] = None) -> Window:
     """The window for all time up to `end`: from `first`, the oldest row the Events block counts, in the
     smallest buckets that fit; the hour before `end` when there is no such row; and at most
     ALL_TIME_LONGEST before `end`, so a row with an absurd date cannot make the range unchartable."""
     start = first if first is not None and first < end else end - timedelta(hours=1)
-    return custom_window(max(start, end - ALL_TIME_LONGEST), end, tz_offset_minutes)
+    return custom_window(max(start, end - ALL_TIME_LONGEST), end, tz_offset_minutes, zone)
 
 
 def block_filters(filters: dict) -> Dict[str, dict]:

@@ -2748,6 +2748,7 @@ def activity_summary(
     range_: str = Query("24h", alias="range", pattern="^(24h|7d|30d|custom|all)$"),
     range_from: Optional[str] = Query(None, max_length=64),
     range_to: Optional[str] = Query(None, max_length=64),
+    tz: Optional[str] = Query(None, max_length=64, pattern=r"^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$"),
     tz_offset: int = Query(0, ge=-840, le=840),
     category: List[str] = Query([]),
     channel: List[str] = Query([]),
@@ -2772,7 +2773,9 @@ def activity_summary(
 
     The range is the last 24 hours, 7 days or 30 days; a range the viewer chose (`range=custom`, from
     `range_from` to `range_to`, or to now without one); or all time (`range=all`, charted from the oldest
-    row the Events block counts). Buckets start on the viewer's clock, `tz_offset` minutes east of UTC.
+    row the Events block counts). Buckets start on the viewer's clock: their time zone `tz` (an IANA name,
+    so days follow it across a daylight-saving change) when this server knows it, else `tz_offset`
+    minutes east of UTC. `time_zone` says which zone was used (null: the offset).
 
     It takes every filter the Events list takes; `from_date` and `to_date` are a time picked on the
     chart, inside the range. Each block counts under every filter but its own
@@ -2788,6 +2791,7 @@ def activity_summary(
     from app.services import activity_events as ev
     from app.services import activity_summary as summary
     now = datetime.now(timezone.utc).replace(tzinfo=None)          # the log stores naive UTC
+    zone = summary.time_zone(tz)
     # The events the list would use: the first MAX_ACTIONS, so the cache key holds what was counted.
     filters = dict(categories=category, channels=channel, statuses=status, actions=action[:ev.MAX_ACTIONS],
                    username=user, user_exact=(user_match == "exact"), no_account=no_account, ip=ip, text=q,
@@ -2795,7 +2799,7 @@ def activity_summary(
                    start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
     win = since = until = None
     if range_ in summary.RANGES:
-        win = summary.window(range_, now, tz_offset)
+        win = summary.window(range_, now, tz_offset, zone)
         since = win.start
     else:
         if range_to:
@@ -2807,22 +2811,23 @@ def activity_summary(
             if since is None:
                 raise HTTPException(status_code=422, detail=(
                     "A chosen range needs a start (range_from): a date or a time."))
-            win = summary.custom_window(since, min(until, now) if until else now, tz_offset)
+            win = summary.custom_window(since, min(until, now) if until else now, tz_offset, zone)
             if win is None:
                 raise HTTPException(status_code=422, detail=(
                     "That range cannot be charted. Choose a start before its end, at most 48 years before it."))
-    key = (range_, since, until, tz_offset, win.start if win else None, summary.signature(filters))
+    zone_name = getattr(zone, "key", None)
+    key = (range_, since, until, zone_name, tz_offset, win.start if win else None, summary.signature(filters))
 
     def compute():
         if win is not None:
             return summary.summarize(db, AuditLog, win, filters, since=since, until=until)
         end = min(until, now) if until else now
         first = summary.oldest(db, AuditLog, filters, until)          # all time is charted from it
-        return summary.summarize(db, AuditLog, summary.all_time(first, end, tz_offset), filters,
+        return summary.summarize(db, AuditLog, summary.all_time(first, end, tz_offset, zone), filters,
                                  until=until, from_=first if first is not None and first < end else None)
 
     band, age = summary.cached(key, range_, compute)
-    out = {"range": range_, **band, "age_seconds": round(age, 1)}
+    out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1)}
     out["now"] = summary.now_panel(db, now, _activity_transfers())
     return out
 

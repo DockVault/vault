@@ -1,6 +1,6 @@
 """The Activity page's summary band, without a database: its window and buckets, how grouped counts
 become the band, what the band may contain, and how long a band is reused."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -70,6 +70,85 @@ def test_a_chosen_range_starts_on_the_viewers_hour_and_midnight():
     assert days.start == datetime(2026, 3, 1, 22, 0, 0)               # the viewer's midnight, 2 March
     weeks = s.custom_window(start, start + timedelta(days=200), tz_offset_minutes=120)
     assert weeks.start == days.start                                   # weeks count from that midnight
+
+
+H = timedelta(hours=1)
+
+
+class _Athens(tzinfo):
+    """A zone like Europe/Athens in 2026, so the test needs no time zone database (a Windows machine has
+    none): two hours east of UTC, three from 29 March 01:00 UTC to 25 October 01:00 UTC. On 29 March its
+    clock skips 03:00-04:00; on 25 October it shows 03:00-04:00 twice."""
+    SPRING = datetime(2026, 3, 29, 1, 0)
+    AUTUMN = datetime(2026, 10, 25, 1, 0)
+
+    def fromutc(self, dt):
+        u = dt.replace(tzinfo=None)
+        local = u + (3 * H if self.SPRING <= u < self.AUTUMN else 2 * H)
+        return local.replace(tzinfo=self, fold=1 if self.AUTUMN <= u < self.AUTUMN + H else 0)
+
+    def utcoffset(self, dt):
+        local = dt.replace(tzinfo=None)
+        if local < self.SPRING + 2 * H:
+            return 2 * H
+        if local < self.SPRING + 3 * H:                  # skipped: read with the offset before (PEP 495)
+            return 3 * H if dt.fold else 2 * H
+        if local < self.AUTUMN + 2 * H:
+            return 3 * H
+        if local < self.AUTUMN + 3 * H:                  # shown twice: the first time unless fold
+            return 2 * H if dt.fold else 3 * H
+        return 2 * H
+
+    def dst(self, dt):
+        return self.utcoffset(dt) - 2 * H
+
+    def tzname(self, dt):
+        return None
+
+
+def _wall(w, zone):
+    """Each bucket's start as the viewer's clock shows it."""
+    return [w.bucket_start(i).replace(tzinfo=timezone.utc).astimezone(zone).replace(tzinfo=None)
+            for i in range(w.buckets)]
+
+
+def test_days_follow_the_viewers_time_zone_across_a_clock_change():
+    zone = _Athens()
+    w = s.custom_window(datetime(2026, 3, 20, 12, 0), datetime(2026, 4, 5, 0, 0), zone=zone)
+    assert w.size == 86400 and w.start == datetime(2026, 3, 19, 22, 0)          # midnight, two hours east
+    assert all(t.time() == datetime.min.time() for t in _wall(w, zone))          # every day at midnight
+    lengths = {w.bucket_start(i).date(): w.bucket_end(i) - w.bucket_start(i) for i in range(w.buckets)}
+    assert lengths[datetime(2026, 3, 28).date()] == 23 * H                       # 29 March, from 22:00 UTC
+    assert sorted(set(lengths.values())) == [23 * H, 24 * H]
+    # With only the offset the days are fixed: after the change they start at 01:00 on the viewer's clock.
+    fixed = s.custom_window(datetime(2026, 3, 20, 12, 0), datetime(2026, 4, 5, 0, 0), tz_offset_minutes=120)
+    assert _wall(fixed, zone)[-1].hour == 1
+
+
+def test_six_hour_blocks_follow_the_viewers_time_zone_across_a_clock_change():
+    zone = _Athens()
+    now = datetime(2026, 10, 27, 12, 0)
+    w = s.window("7d", now, zone=zone)
+    assert w.buckets == 28 and w.bucket_of(now) == 27
+    assert all(t.hour in (0, 6, 12, 18) and (t.minute, t.second) == (0, 0) for t in _wall(w, zone))
+    lengths = [w.bucket_end(i) - w.bucket_start(i) for i in range(w.buckets)]
+    assert lengths.count(7 * H) == 1 and lengths.count(6 * H) == 27               # 25 October 00:00-06:00
+    assert w.offset == 2 * 3600
+
+
+def test_hours_are_real_hours_on_the_viewers_clock_across_a_clock_change():
+    zone = _Athens()
+    now = datetime(2026, 3, 29, 12, 30)
+    w = s.window("24h", now, zone=zone)
+    assert w.end - w.start < 24 * H + timedelta(minutes=31) and w.bucket_of(now) == 23
+    assert all(w.bucket_end(i) - w.bucket_start(i) == H for i in range(24))
+    assert all((t.minute, t.second) == (0, 0) for t in _wall(w, zone))
+
+
+def test_a_time_zone_the_server_does_not_know_is_no_zone():
+    assert s.time_zone(None) is None and s.time_zone("") is None
+    assert s.time_zone("Mars/Olympus_Mons") is None
+    assert s.time_zone("../../etc/passwd") is None
 
 
 def test_an_empty_or_endless_range_has_no_window():
