@@ -6,7 +6,7 @@ Provides REST endpoints for user management, vault operations, and administratio
 Performance: Key endpoints support ETag-based conditional responses to reduce traffic.
 """
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import hashlib
 import hmac
@@ -910,6 +910,13 @@ class UserResponse(BaseModel):
     # Whether the account has an active second factor (TOTP) enrolled. Not an ORM column — the
     # admin users list fills it in from a batched enrollment query; elsewhere it stays False.
     second_factor_enabled: bool = False
+    # An administrator reset the second factor and the user has not set it up again yet: the next
+    # sign-in asks them to. Filled in by the admin users list.
+    second_factor_reset_pending: bool = False
+    # The newest credential change an administrator made to this account within the last 14 days
+    # ({kind, label, by, at, window_ends}), or None. Until window_ends, a further change needs a
+    # second administrator's approval. Filled in by the admin users list.
+    credential_change: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -5246,6 +5253,275 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
         "message": "If an account matches and self-service reset is enabled, a reset link has been sent."})
 
 
+# --- Credential changes an administrator makes to someone else's account -------------------------
+# The rule (one change per account per 14 days, a second one held for another administrator) lives
+# in app/core/credential_changes.py. Every route that makes such a change goes through
+# _credential_change, and approving a held request applies it through _apply_credential_change,
+# the same code the route would have run.
+
+class _CredentialOutcome:
+    """What _credential_change did: applied the change now (held False, `result` holds what the route
+    returns), or held it (`change` is the request, `last` the change that opened the window)."""
+    __slots__ = ("change", "held", "result", "last")
+
+    def __init__(self, change, held, result=None, last=None):
+        self.change = change
+        self.held = held
+        self.result = result or {}
+        self.last = last
+
+
+def _cc_date(value) -> str:
+    return value.strftime("%Y-%m-%d") if value else ""
+
+
+def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name, request=None,
+                             for_someone_else=True) -> dict:
+    """Apply one credential change to ``target`` in the caller's transaction, and return what the
+    caller shows. The routes run it for a change made at once, approving a held request runs it with
+    the payload stored at the time, and the host operator runs it too. ``for_someone_else`` is False
+    only when an administrator changes their own account through an administrator's route.
+
+    A password reset link is minted through the reset-link helpers, which commit on their own."""
+    from app.core import credential_changes as cc
+    payload = payload or {}
+    if kind == cc.PASSWORD:
+        target.password_hash = payload["password_hash"]
+        target.updated_at = datetime.now(timezone.utc)
+        # A stolen session must not outlive the response to a suspected compromise.
+        _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
+        return {}
+    if kind == cc.RESET_LINK:
+        from app.core.email_actions import public_base_url as _configured_base_url
+        base_url = _public_base_url(request) if request is not None else _configured_base_url(None)
+        if payload.get("delivery") == "email":
+            if not (target.email or "").strip():
+                raise HTTPException(status_code=400,
+                                    detail="That user has no email address to send a reset link to.")
+            if not _smtp_configured(db):
+                raise HTTPException(status_code=400, detail="Email is not configured. Add a sending "
+                                    "profile in Settings -> Email first.")
+            return {"email_sent": bool(_mint_and_send_reset(db, target, base_url, created_by_id=actor_id))}
+        link = _mint_reset_link(db, target, base_url, created_by_id=actor_id)
+        if not link:
+            raise HTTPException(status_code=400, detail="Password reset is not configured on this "
+                                "deployment (LOG_TOKEN_PEPPER is unset).")
+        _, ttl = _password_reset_policy(db)
+        return {"reset_link": link, "expires_in_minutes": ttl, "username": target.username}
+    if kind == cc.SECOND_FACTOR:
+        had_factor = db.query(SecondFactorEnrollment.id).filter(
+            SecondFactorEnrollment.user_id == target.id,
+            SecondFactorEnrollment.status == "active").first() is not None
+        db.query(SecondFactorEnrollment).filter(
+            SecondFactorEnrollment.user_id == target.id).delete(synchronize_session=False)
+        db.query(SecondFactorRecoveryCode).filter(
+            SecondFactorRecoveryCode.user_id == target.id).delete(synchronize_session=False)
+        if had_factor and for_someone_else:
+            # The user signs in with their own password and sets the factor up again, whether the
+            # deployment's policy requires a second factor or leaves it optional.
+            target.second_factor_reset_at = datetime.utcnow()
+        # A change to how the account authenticates should not leave standing sessions.
+        _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
+        return {"had_second_factor": had_factor}
+    if kind == cc.EMAIL:
+        new_email = payload.get("email")
+        if new_email is not None and (email_in_use(db, new_email, exclude_user_id=target.id)
+                                      or _email_has_pending_invite(db, new_email)):
+            raise HTTPException(status_code=400, detail="That email address is already in use.")
+        old_email = target.email
+        target.email = new_email
+        target.updated_at = datetime.now(timezone.utc)
+        return {"old_email": old_email, "new_email": new_email}
+    if kind == cc.SSH_KEY:
+        from app.core.models import UserSSHKey
+        if db.query(UserSSHKey.id).filter(UserSSHKey.user_id == target.id,
+                                          UserSSHKey.fingerprint == payload["fingerprint"]).first():
+            raise HTTPException(status_code=409, detail="This key is already registered for the user")
+        key = UserSSHKey(user_id=target.id, name=payload["name"], key_type=payload.get("key_type"),
+                         public_key=payload["public_key"], fingerprint=payload["fingerprint"],
+                         created_by=actor_id)
+        db.add(key)
+        db.flush()
+        return {"ssh_key": key}
+    raise ValueError(f"unknown credential change: {kind}")
+
+
+def _credential_change(db, actor, target, kind, *, summary, payload, request=None) -> _CredentialOutcome:
+    """The one place the two-person rule is applied to a credential change on ``target``.
+
+    ``actor`` is the administrator asking, or None for the host operator. Changing your own
+    credentials is not affected: it is applied and not recorded. Otherwise the change is applied now
+    and recorded (the first in the window), or held for another administrator (a second one), in the
+    caller's transaction; the caller commits. With nobody else to approve, the whole request is
+    refused with 409: this rolls the session back, records the refusal, and raises."""
+    from app.core import credential_changes as cc
+    if actor is not None and actor.id == target.id:
+        return _CredentialOutcome(None, False, _apply_credential_change(
+            db, kind, target, payload, actor_id=actor.id, actor_name=actor.username, request=request,
+            for_someone_else=False))
+    requester_id = actor.id if actor is not None else None
+    requester_name = actor.username if actor is not None else cc.HOST_OPERATOR
+    now = cc.utcnow()
+    try:
+        last = cc.decide(db, requester_id=requester_id, target_id=target.id, now=now)
+    except cc.NoApprover as refused:
+        target_id, target_name = target.id, target.username
+        detail = (f"{target_name}'s sign-in details were already changed by an administrator on "
+                  f"{_cc_date(refused.last_change.applied_at)}. A second change within 14 days needs "
+                  "another administrator's approval, and there is no other active administrator. "
+                  "The person who runs the server can make this change on the host with: "
+                  "python dockvault.py accounts")
+        db.rollback()   # the whole request is refused, so nothing it changed may be kept
+        try:
+            AuditLogger(db).log_action(
+                action="credential_change_refused", status="failure", user=actor,
+                resource_type="user", resource_id=str(target_id),
+                details={"kind": kind, "target_username": target_name,
+                         "reason": "no other administrator can approve a second change"})
+        except Exception:  # noqa: BLE001 - the refusal stands without its row
+            db.rollback()
+        raise HTTPException(status_code=409, detail=detail)
+    if last is None:
+        change = cc.record_made(db, kind=kind, target_id=target.id, requester_id=requester_id,
+                                requester_name=requester_name, summary=summary, now=now)
+        result = _apply_credential_change(db, kind, target, payload, actor_id=requester_id,
+                                          actor_name=requester_name, request=request)
+        return _CredentialOutcome(change, False, result)
+    change = cc.hold(db, kind=kind, target_id=target.id, requester_id=requester_id,
+                     requester_name=requester_name, summary=summary, payload=payload, now=now)
+    db.add(AuditLogger(db).build_row(
+        action="credential_change_held", status="success", user=actor,
+        resource_type="user", resource_id=str(target.id),
+        details={"kind": kind, "change_id": str(change.id), "target_username": target.username,
+                 "expires_at": change.expires_at.isoformat() + "Z"}))
+    return _CredentialOutcome(change, True, last=last)
+
+
+def _credential_request_dict(change, target_username, viewer_id=None) -> dict:
+    from app.core import credential_changes as cc
+    return {
+        "id": str(change.id),
+        "kind": change.kind,
+        "label": cc.label(change.kind),
+        "status": change.status,
+        "target_user_id": str(change.target_user_id),
+        "target_username": target_username,
+        "summary": change.summary,
+        "requested_by": change.requested_by_name,
+        "requested_at": change.requested_at.isoformat() + "Z" if change.requested_at else None,
+        "expires_at": change.expires_at.isoformat() + "Z" if change.expires_at else None,
+        "is_mine": viewer_id is not None and change.requested_by_id == viewer_id,
+        "can_approve": viewer_id is not None and cc.may_approve(change, viewer_id),
+    }
+
+
+def _held_body(outcome, target, viewer_id) -> dict:
+    """The response to a request whose change was held: what is waiting, and why, in words."""
+    from app.core import credential_changes as cc
+    change = outcome.change
+    return {
+        "held": True,
+        "request": _credential_request_dict(change, target.username, viewer_id),
+        "message": (f"{target.username}'s sign-in details were already changed by an administrator on "
+                    f"{_cc_date(outcome.last.applied_at)}, and a second change within 14 days needs "
+                    f"another administrator's approval. Your request to {cc.phrase(change.kind)} is "
+                    f"waiting for approval, and expires on {_cc_date(change.expires_at)} if nobody "
+                    "decides."),
+    }
+
+
+def _announce_held_change(db, change, target) -> None:
+    """Tell the administrator who asked, the administrators who can approve, and the user, that a
+    change is waiting. After the commit; best-effort."""
+    from app.core import credential_changes as cc
+    try:
+        what, who, until = cc.phrase(change.kind), change.requested_by_name, _cc_date(change.expires_at)
+        if change.requested_by_id is not None:
+            _notify_users([str(change.requested_by_id)], "credential_change_held",
+                          title="Your change is waiting for approval",
+                          body=(f"Your request to {what} for {target.username} needs another "
+                                f"administrator's approval, because {target.username}'s sign-in details "
+                                f"were changed less than 14 days ago. It expires on {until} if nobody "
+                                "decides."),
+                          target="#users")
+        approver_ids = [str(a.id) for a in cc.approvers(db, change.requested_by_id)
+                        if a.id != target.id]
+        _notify_users(approver_ids, "credential_change_approval_needed",
+                      title="A change needs your approval",
+                      body=(f"{who} asked to {what} for {target.username}. Approve or deny it on the "
+                            f"Users page. The request expires on {until}."),
+                      target="#users")
+        _notify_users([str(target.id)], "credential_change_held",
+                      title="A change to your account is waiting for approval",
+                      body=(f"The administrator {who} asked to {what} for your account. It takes effect "
+                            "only if another administrator approves it. If you did not expect this, "
+                            "tell your administrators."))
+    except Exception as e:  # noqa: BLE001 - a notice never undoes the request
+        print(f"⚠ held-change notice skipped: {type(e).__name__}")
+
+
+def _announce_decided_change(change, target_id, target_username, outcome: str) -> None:
+    """Tell the administrator who asked and the user how a held request ended: approved, denied,
+    withdrawn or expired. After the commit; best-effort."""
+    from app.core import credential_changes as cc
+    what, who, by = cc.phrase(change.kind), change.requested_by_name, change.decided_by_name
+    requester = [str(change.requested_by_id)] if change.requested_by_id is not None else []
+    try:
+        if outcome == cc.APPROVED:
+            _notify_users(requester, "credential_change_approved", title="Your change was approved",
+                          body=f"{by} approved your request to {what} for {target_username}. It is done.",
+                          target="#users")
+            _notify_users([str(target_id)], "credential_change_approved",
+                          title="A change to your account was approved",
+                          body=(f"{by} approved the request by {who} to {what} for your account, and it "
+                                "was made. If you did not expect this, tell your administrators at once."))
+        elif outcome == cc.DENIED:
+            _notify_users(requester, "credential_change_denied", title="Your change was denied",
+                          body=f"{by} denied your request to {what} for {target_username}. Nothing was changed.",
+                          target="#users")
+            _notify_users([str(target_id)], "credential_change_denied",
+                          title="A requested change to your account was turned down",
+                          body=f"{by} denied the request by {who} to {what} for your account. Nothing was changed.")
+        elif outcome == cc.WITHDRAWN:
+            _notify_users([str(target_id)], "credential_change_withdrawn",
+                          title="A requested change to your account was withdrawn",
+                          body=f"{who} withdrew the request to {what} for your account. Nothing was changed.")
+        elif outcome == cc.EXPIRED:
+            _notify_users(requester, "credential_change_expired", title="Your change request expired",
+                          body=(f"Nobody approved your request to {what} for {target_username} within 7 "
+                                "days, so nothing was changed."),
+                          target="#users")
+            _notify_users([str(target_id)], "credential_change_expired",
+                          title="A requested change to your account expired",
+                          body=(f"Nobody approved the request by {who} to {what} for your account within "
+                                "7 days, so nothing was changed."))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ decided-change notice skipped: {type(e).__name__}")
+
+
+def _expire_held_credential_changes(db) -> int:
+    """Expire the held requests whose seven days ran out, record each, and tell who asked and the
+    user. Run by the periodic cleanup. Returns how many expired."""
+    from app.core import credential_changes as cc
+    due = cc.expire_due(db)
+    if not due:
+        return 0
+    names = dict(db.query(User.id, User.username).filter(
+        User.id.in_([c.target_user_id for c in due])).all())
+    for change in due:
+        db.add(AuditLogger(db).build_row(
+            action="credential_change_expired", status="success",
+            resource_type="user", resource_id=str(change.target_user_id),
+            details={"kind": change.kind, "change_id": str(change.id),
+                     "target_username": names.get(change.target_user_id),
+                     "requested_by": change.requested_by_name}))
+    db.commit()
+    for change in due:
+        _announce_decided_change(change, change.target_user_id, names.get(change.target_user_id, ""),
+                                 cc.EXPIRED)
+    return len(due)
+
+
 @app.post("/users/{user_id}/send-reset-link")
 @require_endpoint_permission("USER_MANAGE")
 @require_step_up("admin.user.manage")
@@ -5263,14 +5539,23 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     if not _smtp_configured(db):
         raise HTTPException(status_code=400,
                             detail="Email is not configured. Add a sending profile in Settings -> Email first.")
-    sent = _mint_and_send_reset(db, user, _public_base_url(request), created_by_id=current_user.id)
+    # A reset link for someone else is a credential change: the second one within 14 days waits for
+    # another administrator (app/core/credential_changes.py).
+    outcome = _credential_change(db, current_user, user, "reset_link",
+                                 summary="Email a password reset link", payload={"delivery": "email"},
+                                 request=request)
+    if outcome.held:
+        db.commit()
+        _announce_held_change(db, outcome.change, user)
+        return JSONResponse(status_code=202, content=_held_body(outcome, user, current_user.id))
+    sent = bool(outcome.result.get("email_sent"))
     try:
         AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=current_user,
                                    ip_address=get_client_ip(request),
-                                   details={"target_user_id": str(user_id), "email_sent": bool(sent)})
+                                   details={"target_user_id": str(user_id), "email_sent": sent})
     except Exception:  # noqa: BLE001
         pass
-    return {"email_sent": bool(sent)}
+    return {"email_sent": sent}
 
 
 @app.post("/users/{user_id}/reset-link")
@@ -5292,11 +5577,20 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
     if not getattr(user, "is_active", True):
         raise HTTPException(status_code=400,
                             detail="That account is inactive; reactivate it before issuing a reset link.")
-    link = _mint_reset_link(db, user, _public_base_url(request), created_by_id=current_user.id)
-    if not link:
+    from app.core.password_reset import pepper_ok
+    if not pepper_ok(_reset_pepper()):
         raise HTTPException(status_code=400,
                             detail="Password reset is not configured on this deployment (LOG_TOKEN_PEPPER is unset).")
-    _, ttl = _password_reset_policy(db)
+    # A reset link for someone else is a credential change: the second one within 14 days waits for
+    # another administrator (app/core/credential_changes.py).
+    outcome = _credential_change(db, current_user, user, "reset_link",
+                                 summary="Create a password reset link to copy", payload={"delivery": "copy"},
+                                 request=request)
+    if outcome.held:
+        db.commit()
+        _announce_held_change(db, outcome.change, user)
+        return JSONResponse(status_code=202, content=_held_body(outcome, user, current_user.id))
+    link, ttl = outcome.result["reset_link"], outcome.result["expires_in_minutes"]
     try:
         # Audit the ACT (who reset whom) — never the token/link, which would defeat single-use secrecy.
         AuditLogger(db).log_action(action="password_reset_link_minted", status="success", user=current_user,
@@ -6094,14 +6388,21 @@ def _second_factor_effective(db, user) -> dict:
     return pol.effective_second_factor(
         mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
         required_user_ids=p["mfa_required_user_ids"], user_group_ids=_sf_user_group_ids(db, user),
-        user_id=user.id, has_active_enrollment=has_active)
+        user_id=user.id, has_active_enrollment=has_active,
+        reset_by_admin=getattr(user, "second_factor_reset_at", None) is not None)
 
 
 def _login_second_factor_in_effect(db, user) -> bool:
     """Whether the login flow presents the second factor for this user. The `login` action row is the
     admin's master on/off switch (default require_otp ON): with it OFF the login step never asks for a
     factor, even for an enrolled or policy-required user (they still use their factor for step-ups). With
-    it ON, the factor applies when it is otherwise in effect (enrolled, or required by mode/dept/user)."""
+    it ON, the factor applies when it is otherwise in effect (enrolled, or required by mode/dept/user).
+
+    One exception: after an administrator reset the account's second factor, the next sign-in takes
+    the user through setting it up again whatever the switch or the policy says. They sign in with their
+    own password and enroll a factor of their own; nobody else chose it."""
+    if getattr(user, "second_factor_reset_at", None) is not None:
+        return True
     login_otp, _ = _sf_action_toggles(db, "login")
     if not login_otp:
         return False
@@ -8244,10 +8545,22 @@ async def list_users(
         .distinct()
         .all()
     }
+    # The last credential change each account had within the window, in one query, so an administrator
+    # sees before acting that a further change would wait for a second administrator.
+    from app.core import credential_changes as cc
+    recent = cc.recent_by_account(db, [u.id for u in users])
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
         item.second_factor_enabled = user.id in mfa_user_ids
+        item.second_factor_reset_pending = user.second_factor_reset_at is not None
+        change = recent.get(user.id)
+        if change is not None:
+            item.credential_change = {
+                "kind": change.kind, "label": cc.label(change.kind), "by": change.requested_by_name,
+                "at": change.applied_at.isoformat() + "Z",
+                "window_ends": cc.window_ends(change).isoformat() + "Z",
+            }
         result.append(item)
     return result
 
@@ -8752,6 +9065,8 @@ async def acknowledge_recovery_codes(
     if _sf_recovery_remaining(db, current_user.id) == 0:
         raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
     enr.status = "active"
+    # Set up again after an administrator's reset: the requirement that asked for it is met.
+    current_user.second_factor_reset_at = None
     db.commit()
 
     if pending is not None:
@@ -9260,6 +9575,7 @@ async def update_user(
 
     # Track changes for audit log
     changes = {}
+    held = []   # credential changes waiting for another administrator's approval
 
     # Non-admin users can only update their own email and password.
     # "email" omitted leaves the address alone; sent as an explicit null clears it.
@@ -9290,9 +9606,19 @@ async def update_user(
                 status_code=400,
                 detail="This admin's email is the sign-in identifier for the deployment and can't be "
                        "removed: it would lock every administrator out.")
-        changes['email'] = {'old': user.email, 'new': new_email}
-        user.email = new_email
-    
+        # Someone else's address is a credential change: the second one within 14 days waits for
+        # another administrator (app/core/credential_changes.py). Resaving the same address is not a
+        # change, and neither counts nor is recorded.
+        if new_email != user.email:
+            outcome = _credential_change(
+                db, current_user, user, "email",
+                summary=f"Change the email address to {new_email}" if new_email else "Remove the email address",
+                payload={"email": new_email}, request=request)
+            if outcome.held:
+                held.append(outcome)
+            else:
+                changes['email'] = {'old': outcome.result['old_email'], 'new': new_email}
+
     if user_update.password is not None:
         # Setting your OWN password here would sidestep the re-proof its sibling requires.
         # PATCH /users/me demands the current password before a password or email change,
@@ -9310,14 +9636,15 @@ async def update_user(
                        "current password.",
             )
         _validate_password_policy(db, user_update.password)
-        user.password_hash = hash_password(user_update.password)
-        changes['password'] = 'changed'
-
-    # A password change must evict the account's sessions (a stolen token must not survive the
-    # response to a suspected compromise), matching the self-service and reset paths. Deduped against
-    # the lock/deactivate revoke below, which already covers those cases with the same durable revoke.
-    if 'password' in changes and not (user_update.is_locked is True or user_update.is_active is False):
-        _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
+        # A credential change like the address above. Applying it also ends the account's sessions:
+        # a stolen token must not survive the response to a suspected compromise.
+        outcome = _credential_change(
+            db, current_user, user, "password", summary="Set a password the administrator chose",
+            payload={"password_hash": hash_password(user_update.password)}, request=request)
+        if outcome.held:
+            held.append(outcome)
+        else:
+            changes['password'] = 'changed'
 
     # SFTP controls — a user may manage their own (or an admin, anyone's).
     if user_update.sftp_enabled is not None:
@@ -9394,7 +9721,16 @@ async def update_user(
     audit_logger.log_user_updated(
         user, current_user, get_client_ip(request), changes
     )
-    
+
+    if held:
+        # Everything else in the request was saved; the held credential changes wait. 202 with the
+        # account as it now stands, plus what is waiting and why.
+        for outcome in held:
+            _announce_held_change(db, outcome.change, user)
+        body = UserResponse.model_validate(user).model_dump(mode="json")
+        body["held_changes"] = [_held_body(o, user, current_user.id) for o in held]
+        body["message"] = " ".join(h["message"] for h in body["held_changes"])
+        return JSONResponse(status_code=202, content=body)
     return UserResponse.model_validate(user)
 
 
@@ -9470,17 +9806,25 @@ async def add_ssh_key(
 ):
     """Add an SSH public key authorizing this user's SFTP access (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db, write=True)
+    target = _ssh_key_target_user(user_id, current_user, db, write=True)
     key_type, normalized, fingerprint = _parse_ssh_public_key(body.public_key)
     if db.query(UserSSHKey).filter(
         UserSSHKey.user_id == user_id, UserSSHKey.fingerprint == fingerprint
     ).first():
         raise HTTPException(status_code=409, detail="This key is already registered for the user")
-    key = UserSSHKey(
-        user_id=user_id, name=body.name.strip(), key_type=key_type,
-        public_key=normalized, fingerprint=fingerprint, created_by=current_user.id,
-    )
-    db.add(key)
+    # A key added to someone else's account is a credential change: the second one within 14 days
+    # waits for another administrator (app/core/credential_changes.py). Your own key is not affected.
+    outcome = _credential_change(
+        db, current_user, target, "ssh_key",
+        summary=f"Add the SSH key \"{body.name.strip()}\" ({fingerprint})",
+        payload={"name": body.name.strip(), "key_type": key_type, "public_key": normalized,
+                 "fingerprint": fingerprint},
+        request=request)
+    if outcome.held:
+        db.commit()
+        _announce_held_change(db, outcome.change, target)
+        return JSONResponse(status_code=202, content=_held_body(outcome, target, current_user.id))
+    key = outcome.result["ssh_key"]
     db.commit()
     db.refresh(key)
     try:
@@ -9554,17 +9898,17 @@ async def admin_reset_second_factor(
                 raise HTTPException(status_code=400, detail=(
                     "You can't reset your own second factor while MFA is required and you are the only "
                     "enrolled administrator. Have another admin enroll first, or reset it from the host."))
-    db.query(SecondFactorEnrollment).filter(
-        SecondFactorEnrollment.user_id == target.id).delete(synchronize_session=False)
-    db.query(SecondFactorRecoveryCode).filter(
-        SecondFactorRecoveryCode.user_id == target.id).delete(synchronize_session=False)
-    db.commit()
-    # A change to how the account authenticates should not leave standing sessions.
-    try:
-        _revoke_sessions(db, user_id=target.id, actor_username=current_user.username)
+    # Someone else's second factor: a credential change, so the second one within 14 days waits for
+    # another administrator (app/core/credential_changes.py). The reset itself (enrollment and
+    # recovery codes removed, sessions ended, set-up asked for at the next sign-in) is
+    # _apply_credential_change's.
+    outcome = _credential_change(db, current_user, target, "second_factor",
+                                 summary="Reset the second factor", payload={}, request=request)
+    if outcome.held:
         db.commit()
-    except Exception:      # noqa: BLE001 - the reset already committed; the revoke is best-effort
-        db.rollback()
+        _announce_held_change(db, outcome.change, target)
+        return JSONResponse(status_code=202, content=_held_body(outcome, target, current_user.id))
+    db.commit()
     try:
         AuditLogger(db).log_action(action="second_factor_admin_reset", status="success", user=current_user,
                                    resource_type="user", resource_id=str(target.id),
@@ -9581,6 +9925,116 @@ async def admin_reset_second_factor(
     except Exception:      # noqa: BLE001
         pass
     return {"reset": True}
+
+
+# --- Held credential changes: the list, and approving or denying one ------------------------------
+
+def _open_credential_request(db, change_id):
+    """The held request and its account, locked for the decision; 404 or 409 when it cannot be
+    decided (gone, already decided, or its seven days ran out)."""
+    from app.core import credential_changes as cc
+    from app.core.models import CredentialChange
+    change = (db.query(CredentialChange).filter(CredentialChange.id == change_id)
+              .with_for_update().first())
+    if change is None:
+        raise HTTPException(status_code=404, detail="That request was not found.")
+    if change.status != cc.HELD:
+        raise HTTPException(status_code=409, detail=f"That request was already {change.status}.")
+    if not cc.is_open(change):
+        raise HTTPException(status_code=409, detail=(
+            f"That request expired on {_cc_date(change.expires_at)}, so nothing was changed."))
+    target = db.query(User).filter(User.id == change.target_user_id).first()
+    if target is None:
+        raise HTTPException(status_code=404, detail="The account that request was for no longer exists.")
+    return change, target
+
+
+def _approve_credential_change(db, change, target, *, approver, request=None) -> dict:
+    """Apply a held request as it was asked for, mark it approved, record it and tell who asked and
+    the user. ``approver`` is the administrator approving, or None for the host operator. Returns what
+    the change produced that the approver needs (a reset link to pass on, whether an email went)."""
+    from app.core import credential_changes as cc
+    approver_id = approver.id if approver is not None else None
+    approver_name = approver.username if approver is not None else cc.HOST_OPERATOR
+    kind, requested_by = change.kind, change.requested_by_name
+    result = _apply_credential_change(db, kind, target, change.payload, actor_id=change.requested_by_id,
+                                      actor_name=requested_by, request=request)
+    cc.approve(change, approver_id=approver_id, approver_name=approver_name)
+    db.add(AuditLogger(db).build_row(
+        action="credential_change_approved", status="success", user=approver,
+        username=None if approver is not None else cc.HOST_OPERATOR,
+        resource_type="user", resource_id=str(target.id),
+        details={"kind": kind, "change_id": str(change.id), "target_username": target.username,
+                 "requested_by": requested_by, "approved_by": approver_name}))
+    db.commit()
+    _announce_decided_change(change, target.id, target.username, cc.APPROVED)
+    return {k: result[k] for k in ("reset_link", "expires_in_minutes", "email_sent") if k in result}
+
+
+@app.get("/admin/credential-requests")
+@require_endpoint_permission("USER_VIEW")
+async def list_credential_requests(
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """The credential changes waiting for a second administrator's approval, oldest first. Each says
+    whether the viewer may approve it: anyone but the administrator who asked."""
+    from app.core import credential_changes as cc
+    rows = cc.open_requests(db)
+    names = dict(db.query(User.id, User.username).filter(
+        User.id.in_([r.target_user_id for r in rows])).all()) if rows else {}
+    return {"requests": [_credential_request_dict(r, names.get(r.target_user_id), current_user.id)
+                         for r in rows]}
+
+
+@app.post("/admin/credential-requests/{change_id}/approve")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def approve_credential_request(
+    change_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Approve a held credential change: it is made as it was asked for. The administrator who asked
+    cannot approve it."""
+    from app.core import credential_changes as cc
+    change, target = _open_credential_request(db, change_id)
+    if not cc.may_approve(change, current_user.id):
+        raise HTTPException(status_code=403, detail=(
+            "A change you asked for needs another administrator's approval. You can withdraw it."))
+    result = _approve_credential_change(db, change, target, approver=current_user, request=request)
+    return {"status": cc.APPROVED,
+            "request": _credential_request_dict(change, target.username, current_user.id),
+            **result}
+
+
+@app.post("/admin/credential-requests/{change_id}/deny")
+@require_endpoint_permission("USER_MANAGE")
+async def deny_credential_request(
+    change_id: uuid.UUID,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Turn a held credential change down; nothing is changed. The administrator who asked withdraws
+    it; any other administrator denies it."""
+    from app.core import credential_changes as cc
+    change, target = _open_credential_request(db, change_id)
+    outcome = cc.deny(change, decider_id=current_user.id, decider_name=current_user.username)
+    details = {"kind": change.kind, "change_id": str(change.id), "target_username": target.username,
+               "requested_by": change.requested_by_name}
+    if outcome == cc.WITHDRAWN:
+        db.add(AuditLogger(db).build_row(action="credential_change_withdrawn", status="success",
+                                         user=current_user, resource_type="user",
+                                         resource_id=str(target.id), details=details))
+    else:
+        db.add(AuditLogger(db).build_row(action="credential_change_denied", status="success",
+                                         user=current_user, resource_type="user",
+                                         resource_id=str(target.id), details=details))
+    db.commit()
+    _announce_decided_change(change, target.id, target.username, outcome)
+    return {"status": outcome,
+            "request": _credential_request_dict(change, target.username, current_user.id)}
 
 
 @app.post("/users/{user_id}/delete")
@@ -22026,6 +22480,16 @@ async def cleanup_expired_sessions():
                     db.commit()
                     print(f"🔓 Auto-unlocked {unlocked} account(s) past their lockout TTL")
 
+                # Held credential changes nobody decided within seven days expire: recorded, and the
+                # administrator who asked and the user are told. Nothing is changed.
+                try:
+                    expired_requests = _expire_held_credential_changes(db)
+                    if expired_requests:
+                        print(f"🕒 Expired {expired_requests} credential change request(s)")
+                except Exception as expire_err:
+                    db.rollback()
+                    print(f"⚠ credential change expiry failed: {type(expire_err).__name__}")
+
                 # Find sessions that are still marked active but have expired
                 expired_sessions = db.query(ActiveSession).filter(
                     ActiveSession.is_active == True,
@@ -22654,6 +23118,9 @@ END $$;""",
             "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN NOT NULL DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_password_auth BOOLEAN NOT NULL DEFAULT TRUE",
+            # An administrator's second-factor reset asks the user to set the factor up again at the
+            # next sign-in. Nullable, so a rollback to a release that does not know it is unaffected.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS second_factor_reset_at TIMESTAMP",
             # DB-backed login throttle (RateLimitRecord, used when Redis is down):
             # first collapse any duplicate (identifier, action) rows, then add the
             # UNIQUE constraint the ON CONFLICT upsert relies on. create_all adds it

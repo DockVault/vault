@@ -186,6 +186,11 @@ class User(Base):
     locked_until = Column(DateTime, nullable=True)
     failed_login_attempts = Column(Integer, default=0)
     last_login = Column(DateTime, nullable=True)
+    # Set when an administrator (or the host operator) reset this account's second factor while it
+    # had one. The next sign-in then takes the user through setting it up again, with their own
+    # password, whatever the deployment's second-factor policy; enrolling clears it. Nullable and
+    # added by the boot DDL, so an earlier release reads the table without it.
+    second_factor_reset_at = Column(DateTime, nullable=True)
 
     # SFTP access controls (per account). sftp_enabled gates ALL direct SFTP login
     # for this user; sftp_password_auth allows password-based SFTP (key auth via
@@ -2716,4 +2721,44 @@ class PendingLogin(Base):
 
     __table_args__ = (
         Index('idx_pending_login_user', 'user_id'),
+    )
+
+
+class CredentialChange(Base):
+    """One change an administrator made, or asked to make, to someone else's sign-in credentials.
+
+    Four kinds count: a password set by the administrator, a password reset link (copied or
+    emailed), a second-factor reset, an email address change, and an SSH key added to the account.
+    One such change may be made to an account within 14 days; a second one in that window is held
+    here as a request another administrator must approve (see app/core/credential_changes.py).
+
+    A NEW table, so create_all builds it on an existing deployment and a release that does not know
+    it simply ignores it. Rows cascade with the account they describe; the audit log keeps the
+    history of a deleted account.
+
+    ``payload`` holds what approving a held request applies (a password hash, an address, a key). It
+    is cleared once the request is decided or expires, so nothing waits here longer than needed."""
+    __tablename__ = 'credential_changes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    target_user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    kind = Column(String(32), nullable=False)        # password | reset_link | second_factor | email | ssh_key
+    # made (applied at once) | held (waiting for approval) | approved | denied | withdrawn | expired
+    status = Column(String(16), nullable=False)
+    # Who asked. NULL with requested_by_name set is the host operator, or an account since deleted.
+    requested_by_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=False)
+    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # When the change took effect: at once for a made change, at approval for a held one.
+    applied_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)     # a held request's deadline
+    decided_by_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    summary = Column(String(500), nullable=True)     # what the change is, as the approver reads it
+    payload = Column(JSON(none_as_null=True), nullable=True)   # None is stored as SQL NULL
+
+    __table_args__ = (
+        Index('idx_credential_change_target', 'target_user_id', 'applied_at'),
+        Index('idx_credential_change_status', 'status'),
     )

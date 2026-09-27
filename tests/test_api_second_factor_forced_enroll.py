@@ -89,11 +89,26 @@ def test_admin_reset_clears_enrollment_and_revokes_sessions(admin, temp_user, te
     assert r.status_code == 200 and r.json()["reset"] is True, r.text
     # The enrollment is gone and the user's session was revoked.
     assert temp_user_client.get("/users/me/second-factor").status_code == 401
-    # A fresh login is one-step again (no factor, mode is optional).
+    # The next sign-in, with the user's own password, asks them to set a factor up again, although
+    # the deployment leaves the second factor optional: no session until they have.
     fresh = ApiClient()
     lr = fresh.session.post(f"{BASE_URL}/auth/login",
                             json={"username": temp_user["_username"], "password": temp_user["_password"]})
-    assert lr.status_code == 200 and lr.json().get("access_token"), lr.text
+    assert lr.status_code == 200, lr.text
+    body = lr.json()
+    assert body.get("access_token") is None and body["enrollment_required"] is True, body
+    pre = {"Authorization": f"Bearer {body['pre_auth_token']}"}
+    secret = fresh.session.post(f"{BASE_URL}/users/me/second-factor/totp/enroll", headers=pre,
+                                json={"current_password": temp_user["_password"]}).json()["secret"]
+    confirm = fresh.session.post(f"{BASE_URL}/users/me/second-factor/totp/confirm", headers=pre,
+                                 json={"code": totp(secret)})
+    assert confirm.status_code == 200, confirm.text
+    done = fresh.session.post(f"{BASE_URL}/users/me/second-factor/recovery/acknowledge", headers=pre)
+    assert done.status_code == 200 and done.json().get("access_token"), done.text
+    # Set up again: the requirement is met, and the next sign-in presents the new factor as usual.
+    again = fresh.session.post(f"{BASE_URL}/auth/login",
+                               json={"username": temp_user["_username"], "password": temp_user["_password"]})
+    assert again.json()["enrollment_required"] is False and again.json()["methods"], again.text
 
 
 def test_admin_cannot_reset_own_factor_as_last_enrolled_admin_when_required(admin):

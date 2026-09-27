@@ -204,6 +204,14 @@ def account_locked(user) -> bool:
     return datetime.now(timezone.utc) < locked_until
 
 
+def admin_locked(user) -> bool:
+    """Whether an administrator has locked the account: locked, with no end time.
+
+    Such a lock stays until an administrator lifts it. A lock with an end time was armed by wrong
+    passwords and runs out on its own."""
+    return bool(getattr(user, 'is_locked', False)) and getattr(user, 'locked_until', None) is None
+
+
 # Audit actions for a failed-login lock that is armed, and later released, without anyone acting.
 # An administrator's lock and unlock are recorded by the routes that make them.
 AUTO_LOCKED_ACTION = "account_auto_locked"

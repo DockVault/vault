@@ -634,6 +634,19 @@ label.checkbox-label,
 .ssh-key-name-text { font-weight: 600; color: var(--text-primary); }
 .ssh-key-fp { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Sign-in changes waiting for a second administrator (Users page) */
+.credential-requests { margin-bottom: var(--space-lg); padding: var(--space-md); border: 1px solid var(--warning); border-radius: var(--radius-md); background: color-mix(in srgb, var(--warning) 8%, var(--surface-0)); }
+.credential-requests h3 { margin: 0 0 .25rem; }
+.credential-requests > p { margin: 0 0 var(--space-sm); }
+.credential-request-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-sm) var(--space-md); padding: var(--space-sm) 0; border-top: 1px solid var(--surface-3); }
+.credential-request-text { display: flex; flex-direction: column; gap: .15rem; min-width: 0; flex: 1 1 320px; }
+.credential-request-summary { font-size: var(--text-sm); color: var(--text-secondary); overflow-wrap: anywhere; }
+.credential-request-meta { font-size: var(--text-xs); color: var(--text-tertiary); }
+.credential-request-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-sm); }
+.credential-request-waiting { font-size: var(--text-sm); color: var(--text-tertiary); }
+.credential-change-note { display: flex; flex-direction: column; gap: .25rem; font-size: var(--text-sm); color: var(--text-secondary); padding: .5rem .7rem; border-left: 3px solid var(--warning); background: color-mix(in srgb, var(--warning) 7%, transparent); border-radius: var(--radius-sm); }
+.credential-change-note[hidden] { display: none; }
+
 /* temp-cred status accent on the row's first cell */
 .cred-row td:first-child { box-shadow: inset 3px 0 0 var(--surface-4); }
 .cred-row[data-status="active"]  td:first-child { box-shadow: inset 3px 0 0 var(--success); }

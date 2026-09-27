@@ -117,6 +117,9 @@
 
     /* Pending invitations: each row's name, email, status, expiry and Revoke wrap onto more lines. */
     .invite-row { flex-wrap: wrap; row-gap: var(--space-xs); }
+    /* Changes waiting for approval: the buttons take their own line, large enough to tap. */
+    .credential-request-actions { flex: 1 1 100%; }
+    .credential-request-actions .btn { flex: 1 1 auto; min-height: 40px; }
 
     /* A dropdown keeps clear room for its arrow, so a long choice is cut short rather than running
        under the arrow. */

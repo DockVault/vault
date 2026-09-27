@@ -59,14 +59,17 @@ def effective_policy(blob: Optional[dict]) -> dict:
 
 
 def effective_second_factor(*, mode, required_group_ids, required_user_ids,
-                            user_group_ids, user_id, has_active_enrollment) -> dict:
+                            user_group_ids, user_id, has_active_enrollment, reset_by_admin=False) -> dict:
     """The user's effective second-factor state — computed, never stored. `required` if the mode is
-    `required` OR the user is in a required department OR the user is on the per-user required list;
+    `required` OR the user is in a required department OR the user is on the per-user required list
+    OR an administrator reset the user's factor and it has not been set up again (`reset_by_admin`);
     `state` is setup / pending / not_setup; `in_effect` gates whether login demands a factor and the
     matrix rows bite for this user."""
     required, source = (mode == "required"), None
     if required:
         source = "global"
+    if not required and reset_by_admin:
+        required, source = True, "reset"
     if not required and user_id is not None and str(user_id) in {str(x) for x in (required_user_ids or [])}:
         required, source = True, "user"
     if not required and (set(str(g) for g in (user_group_ids or []))

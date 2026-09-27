@@ -4,6 +4,7 @@ machinery — single-use, TTL-bounded, and it revokes the target's sessions when
 import pytest
 
 from conftest import ApiClient, BASE_URL
+from _account_change_helpers import second_admin
 
 pytestmark = pytest.mark.integration
 
@@ -56,10 +57,17 @@ def test_reset_link_is_single_use(admin):
 
 
 def test_minting_again_invalidates_the_previous_link(admin):
+    # A second reset link within 14 days is a second credential change, so it waits for another
+    # administrator; approving it mints the new link and hands it to the approver.
     u = admin.create_user(role="user", email=None)
     try:
         t1 = _token_from_link(admin.post(f"/users/{u['id']}/reset-link").json()["reset_link"])
-        t2 = _token_from_link(admin.post(f"/users/{u['id']}/reset-link").json()["reset_link"])
+        with second_admin(admin) as (_other, other_client):
+            held = admin.post(f"/users/{u['id']}/reset-link")
+            assert held.status_code == 202, held.text
+            approved = other_client.post(f"/admin/credential-requests/{held.json()['request']['id']}/approve")
+            assert approved.status_code == 200, approved.text
+            t2 = _token_from_link(approved.json()["reset_link"])
         assert t1 != t2
         # The first link is now dead (a fresh mint deletes the prior unconsumed token).
         assert ApiClient(BASE_URL).get(f"/reset/{t1}").status_code == 404

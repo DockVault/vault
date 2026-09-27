@@ -4947,6 +4947,7 @@ async function loadUsers() {
         } catch (_) { /* keep the prior currentSettings */ }
         updateActionButtonPermissions();
         loadInvites();
+        loadCredentialRequests();
     } catch (error) {
         console.error('Failed to load users:', error);
         container.innerHTML = `<div class="alert alert-error">Failed to load users: ${escapeHtml(error.message)}</div>`;
@@ -5083,6 +5084,145 @@ async function revokeInvite(id) {
     } catch (err) {
         showError('Could not revoke the invitation: ' + err.message);
     }
+}
+
+// ---- Sign-in changes waiting for a second administrator -------------------------------------
+// An administrator may make one change to someone else's sign-in details (password, reset link,
+// second factor, email address, SSH key) within 14 days; a second one waits here until a different
+// administrator approves it. Built with DOM APIs: no data goes through innerHTML.
+
+// Say plainly that a change was held and why, then show it in the waiting list.
+function showHeldChange(r) {
+    const messages = (r && r.held_changes) ? r.held_changes.map(h => h.message) : [r && r.message];
+    showToast(messages.filter(Boolean).join(' ') || 'The change is waiting for another administrator.', 'warning', 15000);
+    loadCredentialRequests();
+}
+
+async function loadCredentialRequests() {
+    const block = document.getElementById('credential-requests-block');
+    const list = document.getElementById('credential-requests-list');
+    if (!block || !list) return;
+    if (!currentUser || currentUser.role !== 'admin' || isScopedTemp) {
+        block.style.display = 'none';
+        return;
+    }
+    try {
+        const data = await apiRequest('/admin/credential-requests', { silent: true });
+        renderCredentialRequests((data && data.requests) || []);
+    } catch (_) {
+        block.style.display = 'none';
+    }
+}
+
+function renderCredentialRequests(requests) {
+    const block = document.getElementById('credential-requests-block');
+    const list = document.getElementById('credential-requests-list');
+    list.replaceChildren();
+    if (!requests.length) {
+        block.style.display = 'none';
+        return;
+    }
+    block.style.display = '';
+    requests.forEach(req => {
+        const row = _el('div', 'credential-request-row');
+        row.setAttribute('data-request-id', req.id);
+        const text = _el('div', 'credential-request-text');
+        const title = _el('div', 'credential-request-title');
+        title.appendChild(_el('strong', null, req.label));
+        title.appendChild(document.createTextNode(' for '));
+        title.appendChild(_el('strong', null, req.target_username || 'an account that no longer exists'));
+        text.appendChild(title);
+        if (req.summary) text.appendChild(_el('div', 'credential-request-summary', req.summary));
+        text.appendChild(_el('div', 'credential-request-meta',
+            'Asked by ' + req.requested_by + ', ' + formatServerTime(req.requested_at)
+            + '. Expires ' + formatServerTime(req.expires_at) + ' if nobody decides.'));
+        row.appendChild(text);
+
+        const actions = _el('div', 'credential-request-actions');
+        if (req.can_approve) {
+            const approve = _el('button', 'btn btn-sm btn-primary', 'Approve');
+            approve.type = 'button';
+            approve.addEventListener('click', () => decideCredentialRequest(req, 'approve', approve));
+            const deny = _el('button', 'btn btn-sm btn-secondary', 'Deny');
+            deny.type = 'button';
+            deny.addEventListener('click', () => decideCredentialRequest(req, 'deny', deny));
+            actions.appendChild(approve);
+            actions.appendChild(deny);
+        } else if (req.is_mine) {
+            actions.appendChild(_el('span', 'credential-request-waiting', 'Waiting for another administrator'));
+            const withdraw = _el('button', 'btn btn-sm btn-secondary', 'Withdraw');
+            withdraw.type = 'button';
+            withdraw.addEventListener('click', () => decideCredentialRequest(req, 'withdraw', withdraw));
+            actions.appendChild(withdraw);
+        }
+        row.appendChild(actions);
+        list.appendChild(row);
+    });
+}
+
+async function decideCredentialRequest(req, action, btn) {
+    const who = req.target_username || 'this account';
+    const prompts = {
+        approve: [req.label + ' for ' + who + ', asked by ' + req.requested_by + '. It is made as soon as you approve it.',
+                  'Approve this change?'],
+        deny: ['Nothing will be changed. ' + req.requested_by + ' and ' + who + ' are told.', 'Deny this change?'],
+        withdraw: ['Nothing will be changed. ' + who + ' is told the request was withdrawn.', 'Withdraw your request?'],
+    };
+    if (!await showConfirm(prompts[action][0], prompts[action][1])) return;
+    if (btn) btn.disabled = true;
+    const path = '/admin/credential-requests/' + encodeURIComponent(req.id) + (action === 'approve' ? '/approve' : '/deny');
+    try {
+        const r = await apiRequest(path, { method: 'POST' });
+        if (action === 'approve') {
+            if (r && r.reset_link) _showResetLinkModal(r.reset_link, who, r.expires_in_minutes);
+            else if (r && r.email_sent === false) showError('Approved, but the reset link could not be emailed. Check the email settings.');
+            else showSuccess('Approved. The change was made.');
+        } else {
+            showSuccess(action === 'withdraw' ? 'Request withdrawn. Nothing was changed.' : 'Request denied. Nothing was changed.');
+        }
+    } catch (e) {
+        showError('Could not ' + action + ' the request: ' + (e.message || ''));
+    } finally {
+        if (btn) btn.disabled = false;
+        loadUsers();
+    }
+}
+
+async function resetUserSecondFactor(userId, btn) {
+    const u = (usersView.users || []).find(x => x.id === userId);
+    const name = u ? u.username : 'this user';
+    if (!await showConfirm(name + ' will be signed out everywhere and asked to set up a new second factor, with their own password, at their next sign-in.',
+        'Reset the second factor?')) return;
+    if (btn) btn.disabled = true;
+    try {
+        const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/second-factor/reset', { method: 'POST' });
+        if (r && r.held) showHeldChange(r);
+        else showSuccess('Second factor reset. ' + name + ' sets it up again at the next sign-in.');
+        await loadUsers();
+    } catch (e) {
+        showError('Could not reset the second factor: ' + (e.message || ''));
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// The note inside each user's details: the last change an administrator made to their sign-in
+// details within 14 days, and until when a further change needs another administrator.
+function fillCredentialChangeNotes() {
+    document.querySelectorAll('.credential-change-note').forEach(note => {
+        const u = (usersView.users || []).find(x => x.id === note.getAttribute('data-user-id'));
+        const lines = [];
+        if (u && u.credential_change) {
+            const c = u.credential_change;
+            lines.push(c.label + ' by ' + c.by + ' on ' + formatServerTime(c.at) + '. Until '
+                + formatServerTime(c.window_ends) + ', another change to this account’s sign-in details needs a second administrator’s approval.');
+        }
+        if (u && u.second_factor_reset_pending) {
+            lines.push('Second factor reset: they set up a new one at their next sign-in.');
+        }
+        note.replaceChildren(...lines.map(t => _el('div', null, t)));
+        note.hidden = lines.length === 0;
+    });
 }
 
 // Fill the "department" filter dropdown from loaded groups
@@ -5281,6 +5421,7 @@ function renderUserDetail(u) {
                     <button type="button" class="btn btn-sm btn-secondary ssh-key-add-btn" data-user-id="${u.id}">${iconSvg('plus', 'icon-sm')} Add key</button>
                 </div>
             </div>
+            <div class="credential-change-note" data-user-id="${u.id}" hidden></div>
             <div class="entity-actions">
                 <button class="btn btn-sm btn-secondary edit-user-btn" data-user-id="${u.id}">${iconSvg('edit', 'icon-sm')} Edit</button>
                 ${u.is_locked
@@ -5289,6 +5430,7 @@ function renderUserDetail(u) {
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
                 ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 <button class="btn btn-sm btn-secondary copy-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('link', 'icon-sm')} Copy reset link</button>
+                ${u.second_factor_enabled && u.username !== currentUser.username ? `<button class="btn btn-sm btn-secondary reset-second-factor-btn" data-user-id="${u.id}">${iconSvg('shield', 'icon-sm')} Reset second factor</button>` : ''}
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
@@ -5408,10 +5550,11 @@ async function addSshKey(userId, root = document) {
         return;
     }
     try {
-        await apiRequest(`/users/${userId}/ssh-keys`, { method: 'POST', body: JSON.stringify({ name, public_key: publicKey }) });
+        const r = await apiRequest(`/users/${userId}/ssh-keys`, { method: 'POST', body: JSON.stringify({ name, public_key: publicKey }) });
         if (nameEl) nameEl.value = '';
         if (pubEl) pubEl.value = '';
-        showSuccess('SSH key added');
+        if (r && r.held) showHeldChange(r);
+        else showSuccess('SSH key added');
         await loadUserSshKeys(userId, root);
     } catch (e) {
         showError('Failed to add SSH key: ' + e.message);
@@ -5725,7 +5868,8 @@ function attachUserListeners() {
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
-                if (r && r.email_sent) showSuccess('Reset link sent to ' + username + '.');
+                if (r && r.held) showHeldChange(r);
+                else if (r && r.email_sent) showSuccess('Reset link sent to ' + username + '.');
                 else showError('Could not send the reset link (check email configuration).');
             } catch (e) {
                 showError('Could not send the reset link: ' + (e.message || ''));
@@ -5742,13 +5886,22 @@ function attachUserListeners() {
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/reset-link', { method: 'POST' });
-                if (r && r.reset_link) _showResetLinkModal(r.reset_link, r.username || username, r.expires_in_minutes);
+                if (r && r.held) showHeldChange(r);
+                else if (r && r.reset_link) _showResetLinkModal(r.reset_link, r.username || username, r.expires_in_minutes);
                 else showError('Could not create a reset link.');
             } catch (e) {
                 showError('Could not create a reset link: ' + (e.message || ''));
             } finally { btn.disabled = false; }
         });
     });
+
+    // Reset second factor buttons (a credential change: may be held for a second administrator)
+    document.querySelectorAll('.reset-second-factor-btn').forEach(btn => {
+        btn.addEventListener('click', () => resetUserSecondFactor(btn.getAttribute('data-user-id'), btn));
+    });
+
+    // What the last credential change was, and until when a further one needs a second administrator
+    fillCredentialChangeNotes();
 
     // Lock user buttons
     document.querySelectorAll('.lock-user-btn').forEach(btn => {
@@ -6772,7 +6925,7 @@ let notifUnread = 0;
 
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
-const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes' };
+const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users' };
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -21244,7 +21397,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             try {
-                await apiRequest(`/users/${userId}`, {
+                const r = await apiRequest(`/users/${userId}`, {
                     method: 'PATCH',
                     body: JSON.stringify({
                         // Clearing the box CLEARS the address, so send an explicit null rather
@@ -21257,7 +21410,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     })
                 });
 
-                showSuccess('User updated successfully');
+                // An address change can be held for a second administrator; the rest was saved.
+                if (r && r.held_changes) showHeldChange(r);
+                else showSuccess('User updated successfully');
                 closeModal();
                 loadUsers();
             } catch (error) {
@@ -21289,12 +21444,13 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             try {
-                await apiRequest(`/users/${userId}`, {
+                const r = await apiRequest(`/users/${userId}`, {
                     method: 'PATCH',
                     body: JSON.stringify({ password: newPassword })
                 });
 
-                showSuccess('Password changed successfully');
+                if (r && r.held_changes) showHeldChange(r);
+                else showSuccess('Password changed successfully');
                 closeModal();
                 changePasswordForm.reset();
             } catch (error) {

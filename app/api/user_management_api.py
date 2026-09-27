@@ -572,6 +572,7 @@ async def update_user(
             raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
 
     # Update fields
+    held = []   # credential changes waiting for another administrator's approval
     # Omitting "email" leaves the address alone; sending it as an explicit null clears it. The
     # previous `is not None` test collapsed those two into one, so an address could be replaced but
     # never removed.
@@ -589,8 +590,18 @@ async def update_user(
         # Case-insensitive: the previous `==` let an admin store BOB@x.com beside bob@x.com.
         if new_email is not None and email_in_use(db, new_email, exclude_user_id=user_id):
             raise HTTPException(status_code=400, detail="Email already in use")
-        user.email = new_email
-    
+        # Someone else's address is a credential change: the second one within 14 days waits for
+        # another administrator. The same rule and code as PATCH /users/{id}
+        # (app/core/credential_changes.py). Resaving the same address is not a change.
+        if new_email != user.email:
+            from app.api.api_server import _credential_change
+            outcome = _credential_change(
+                db, current_user, user, "email",
+                summary=f"Change the email address to {new_email}" if new_email else "Remove the email address",
+                payload={"email": new_email}, request=request)
+            if outcome.held:
+                held.append(outcome)
+
     if update_data.role is not None:
         user.role = update_data.role
     
@@ -621,9 +632,22 @@ async def update_user(
     # whose wrapper reads current_user and db out of **kwargs. Called positionally they arrive as
     # *args, the wrapper sees None for both, and every call returned 401 -- AFTER this function had
     # already committed the change. The caller saw a failure that had in fact succeeded.
-    return await get_user_detail(
+    detail = await get_user_detail(
         user_id=user_id, request=request, current_user=current_user, db=db
     )
+    if held:
+        # The rest of the update was saved; the address change waits. 202 with the account as it now
+        # stands, plus what is waiting and why.
+        from app.api.api_server import _announce_held_change, _held_body
+        for outcome in held:
+            _announce_held_change(db, outcome.change, user)
+        # get_user_detail answers with the JSON bytes (and an ETag), or 304 when they match.
+        raw = getattr(detail, "body", b"") or b""
+        body = json.loads(raw) if raw else {"id": str(user_id)}
+        body["held_changes"] = [_held_body(o, user, current_user.id) for o in held]
+        body["message"] = " ".join(h["message"] for h in body["held_changes"])
+        return JSONResponse(status_code=202, content=body)
+    return detail
 
 @router.post("/users/{user_id}/toggle-active")
 @require_endpoint_permission("USER_MANAGE")

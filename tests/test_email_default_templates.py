@@ -95,7 +95,12 @@ def test_tokened_email_links_are_wired_through_public_base_url():
     src = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
     norm = re.sub(r"\s+", " ", src)
     assert "_mint_and_send_reset_async(user.id, _public_base_url(request))" in norm     # public forgot-password
-    assert "_mint_and_send_reset(db, user, _public_base_url(request)," in norm           # admin send-reset-link
+    # admin send-reset-link and copy-reset-link, both applied by _apply_credential_change: the request's
+    # link base, or with no request (the host operator) the configured host alone
+    assert ("base_url = _public_base_url(request) if request is not None else _configured_base_url(None)"
+            in norm)
+    assert "_mint_and_send_reset(db, target, base_url, created_by_id=actor_id)" in norm
+    assert "_mint_reset_link(db, target, base_url, created_by_id=actor_id)" in norm
     assert 'base = _public_base_url(request) if request is not None else ""' in norm     # invitation mint
     # the tokened links still exist AND are never assembled straight from the request Host
     assert "/?reset=" in norm and "/?invite=" in norm
