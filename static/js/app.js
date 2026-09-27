@@ -17954,9 +17954,7 @@ async function loadVaultInfo() {
                 ? `<span class="badge badge-success">${iconSvg('lock', 'icon-sm')} Password protected</span>`
                 : `<span class="badge badge-secondary">${iconSvg('unlock', 'icon-sm')} Open access</span>`;
         }
-        setText('info-file-expiration', vault.expire_files_after_days
-            ? `${vault.expire_files_after_days} ${vault.expire_files_unit || 'days'}`
-            : 'Never');
+        setText('info-file-expiration', describeFileExpiry(vault));
 
         // Who paid for this vault's size, and the caller's own share of it.
         await loadVaultStorageCard();
@@ -18504,13 +18502,7 @@ async function loadVaultSettings() {
         }
         
         const expiryEl = document.getElementById('settings-file-expiry');
-        if (expiryEl) {
-            if (vault.expire_files_after_days) {
-                expiryEl.textContent = `${vault.expire_files_after_days} days`;
-            } else {
-                expiryEl.textContent = 'Never';
-            }
-        }
+        if (expiryEl) expiryEl.textContent = describeFileExpiry(vault);
         
         // Setup button event listeners with permission checks
         setupVaultSettingsButtons();
@@ -18894,6 +18886,15 @@ async function handleChangeVaultPassword(e) {
         console.error('Failed to change password:', error);
         showError(error.message || 'Failed to change vault password');
     }
+}
+
+// A vault's file expiry as its info and settings panels show it. The deadline is stamped on each file
+// at upload, so the setting describes files uploaded from now on: "7 days after upload", or "Never".
+function describeFileExpiry(vault) {
+    const n = vault ? Number(vault.expire_files_after_days) : 0;
+    if (!Number.isFinite(n) || n <= 0) return 'Never';
+    const unit = (vault.expire_files_unit || 'days');
+    return `${n} ${n === 1 ? unit.replace(/s$/, '') : unit} after upload`;
 }
 
 async function handleSetExpiry(e) {

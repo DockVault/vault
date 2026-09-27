@@ -12,7 +12,7 @@ import uuid
 import mimetypes
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
@@ -276,6 +276,11 @@ def is_refundable_serve_failure(exc) -> bool:
     return isinstance(exc, (FileServiceError, ChecksumMismatch, EncryptionError))
 
 
+# "Leave this setting as it is", for set_file_expiry: None already means "expiry off".
+_UNCHANGED = object()
+FILE_EXPIRY_UNITS = ('minutes', 'hours', 'days')
+
+
 def calculate_file_expiration(vault) -> Optional[datetime]:
     """Calculate file expiration datetime based on vault's expiration policy.
     
@@ -287,7 +292,7 @@ def calculate_file_expiration(vault) -> Optional[datetime]:
         column stores: an aware value would be converted through the database session's time
         zone on the way in (see app/core/file_expiry.py).
     """
-    if not vault.expire_files_after_days:
+    if file_expiry.expiry_is_off(vault.expire_files_after_days):
         return None
     
     now = file_expiry.utc_now()
@@ -941,13 +946,56 @@ class VaultService:
                     vault.password_hash = hash_password(password)
         
         if expire_files_after_days is not None:
-            vault.expire_files_after_days = expire_files_after_days
+            self.set_file_expiry(vault, expire_files_after_days=expire_files_after_days)
         
         vault.updated_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(vault)
         
         return vault
+
+    def set_file_expiry(self, vault, *, expire_files_after_days=_UNCHANGED,
+                        expire_files_unit=_UNCHANGED) -> int:
+        """Change a vault's "expire files after" setting, in the caller's transaction (no commit),
+        and return how many files lost their deadline. Either argument may be left out.
+
+        ``expire_files_after_days`` is a whole number of units (``expire_files_unit``: minutes,
+        hours or days): each file uploaded from now on is deleted that long after its upload. None
+        or 0 turns expiry off. Raises ValueError for anything else, with a message fit to show.
+
+        A file's deadline is stamped on it at upload, and changing the setting does not move it:
+        files already in the vault keep the deadline they have. Turning expiry off is different. It
+        takes the deadline off every file in the vault, in this same transaction, so a vault whose
+        expiry is off never has a file that can expire.
+
+        The vault row is locked first, FOR NO KEY UPDATE, the order every path that deletes a file
+        takes. An upload finishing at the same moment either commits first, and loses its deadline
+        with the others, or waits for this change and sees it (finalize_streaming_upload re-reads
+        the setting under the same row lock)."""
+        value, unit = expire_files_after_days, expire_files_unit
+        if value is not _UNCHANGED and value is not None:
+            bad = ValueError("expire_files_after_days must be a whole number, 0 or more "
+                             "(0 turns expiry off)")
+            if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+                raise bad
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise bad from None
+            if value < 0:
+                raise bad
+            value = value or None
+        if unit is not _UNCHANGED and unit not in FILE_EXPIRY_UNITS:
+            raise ValueError("expire_files_unit must be 'minutes', 'hours', or 'days'")
+
+        self.db.query(Vault.id).filter(Vault.id == vault.id).with_for_update(key_share=True).first()
+        if value is not _UNCHANGED:
+            vault.expire_files_after_days = value
+        if unit is not _UNCHANGED:
+            vault.expire_files_unit = unit
+        if file_expiry.expiry_is_off(vault.expire_files_after_days):
+            return file_expiry.clear_vault_deadlines(self.db, vault.id)
+        return 0
     
     def delete_vault(self, vault_id: uuid.UUID, user: User):
         """
@@ -1515,6 +1563,16 @@ class VaultService:
             },
             synchronize_session=False,
         )
+
+        # The deadline was worked out when the upload started. If the owner has turned the vault's
+        # expiry off since, this file must not keep it: turning expiry off took the deadline off
+        # every file in the vault, and this one was not there yet. The UPDATE above holds the vault
+        # row, which set_file_expiry locks before it changes anything, so this read sees any change
+        # committed before it, and none can commit until this transaction ends.
+        if file.expires_at is not None and file_expiry.expiry_is_off(
+                self.db.query(Vault.expire_files_after_days)
+                .filter(Vault.id == vault.id).scalar()):
+            file.expires_at = None
 
         try:
             self.db.commit()
@@ -2114,6 +2172,9 @@ class VaultService:
         is the same setting on the link's vault), stamped on the row at upload as ``expires_at`` --
         UTC, without a time zone, so it is compared with a naive UTC "now" (file_expiry.utc_now).
 
+        Only vaults whose expiry is on are swept. Turning expiry off takes the deadlines off the
+        vault's files, but an earlier version did not, and such a leftover must not delete a file.
+
         One transaction, which never waits on another:
 
         * Lock order is the vault row, then the file row, as on every other path that deletes a
@@ -2142,16 +2203,21 @@ class VaultService:
         try:
             # Which vaults have something due. Read without a lock; the files are re-selected
             # under lock below, so one that stopped being due (or was deleted) in between is skipped.
+            # Only vaults whose expiry is on: a deadline left in a vault whose expiry is off (an
+            # earlier version wrote them) is never acted on.
+            expiring_vaults = select(Vault.id).where(file_expiry.vault_expiry_on())
             due_vaults = [vid for (vid,) in self.db.query(File.vault_id)
-                          .filter(file_expiry.expired_clause(now))
+                          .filter(file_expiry.expired_clause(now),
+                                  File.vault_id.in_(expiring_vaults))
                           .distinct().limit(batch_size).all()]
             if not due_vaults:
                 self.db.rollback()
                 return []
             # FOR NO KEY UPDATE, the strength of the counter UPDATE below: it does not block a new
-            # row that merely references the vault.
+            # row that merely references the vault. Expiry is checked again under the lock, so a
+            # vault whose owner turned expiry off since the read above is left alone.
             held = [vid for (vid,) in self.db.query(Vault.id)
-                    .filter(Vault.id.in_(due_vaults))
+                    .filter(Vault.id.in_(due_vaults), file_expiry.vault_expiry_on())
                     .order_by(Vault.id)
                     .with_for_update(key_share=True, skip_locked=True).all()]
             rows = []

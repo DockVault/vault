@@ -119,7 +119,9 @@ enforced by `_enforce_vault_size` at `POST /vaults`), `expire_files_after_days` 
 `POST|DELETE /vaults/{vault_id}/permissions/...`) plus `vault_group_access`. Creation goes through
 `_resolve_vault_type_for_create` (the deployment's allowed types, the ZK opt-in and cap, the force-ZK
 department rule). The owner can later rewrite `size_limit` and `expire_files_after_days` through
-`PATCH /vaults/{vault_id}/settings`. A receiver is exactly this object with a wrapper around it (§3.1) —
+`PATCH /vaults/{vault_id}/settings` (`VaultService.set_file_expiry`: a changed value leaves every
+deadline already stamped where it is; turning expiry off takes the deadline off every file in the
+vault, and the sweep only deletes from vaults whose expiry is on). A receiver is exactly this object with a wrapper around it (§3.1) —
 and that last route is one of the things the wrapper has to constrain.
 
 ### 1.4 Uploads

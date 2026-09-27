@@ -15162,19 +15162,16 @@ async def update_vault_settings(
             _apply_vault_total(db, vault, current_user, size_limit)
             updated_fields.append('size_limit')
         
-        if 'expire_files_after_days' in settings_update:
-            vault.expire_files_after_days = settings_update['expire_files_after_days']
-            updated_fields.append('expire_files_after_days')
-        
-        if 'expire_files_unit' in settings_update:
-            unit = settings_update['expire_files_unit']
-            if unit not in ['minutes', 'hours', 'days']:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="expire_files_unit must be 'minutes', 'hours', or 'days'"
-                )
-            vault.expire_files_unit = unit
-            updated_fields.append('expire_files_unit')
+        # File expiry. Files already in the vault keep the deadline they were given at upload;
+        # turning expiry off (null or 0) takes it off every one of them, in this transaction.
+        expiry_changes = {k: settings_update[k] for k in ('expire_files_after_days', 'expire_files_unit')
+                          if k in settings_update}
+        if expiry_changes:
+            try:
+                vault_service.set_file_expiry(vault, **expiry_changes)
+            except ValueError as e:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+            updated_fields.extend(expiry_changes)
 
         if 'unlock_remember_minutes' in settings_update:
             urm = settings_update['unlock_remember_minutes']
@@ -22576,12 +22573,14 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(cleanup_expired_sessions())
     print("[OK] Session cleanup task started")
 
-    # File expiry: say once how many files are already past their expiry, then sweep every minute on
-    # a loop of its own. Only this process runs it, so a split deployment's SFTP container never
-    # runs a second sweeper. With ENFORCE_FILE_EXPIRY=false each pass returns without touching
-    # anything.
-    file_expiry.report_at_startup()
-    expiry_task = asyncio.create_task(file_expiry.run_forever())
+    # File expiry. First, before the sweep can run: take the deadline off the files in vaults whose
+    # expiry is off, which versions before enforcement left there, and say how many files are past
+    # their expiry. Then sweep every minute on a loop of its own; if that clearing failed, the loop
+    # retries it before sweeping anything. Only this process runs it, so a split deployment's SFTP
+    # container never runs a second sweeper. With ENFORCE_FILE_EXPIRY=false each pass returns
+    # without touching anything.
+    expiry_cleared = file_expiry.prepare_at_startup()
+    expiry_task = asyncio.create_task(file_expiry.run_forever(cleared=expiry_cleared))
 
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.

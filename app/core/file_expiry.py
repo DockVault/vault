@@ -19,6 +19,12 @@ The comparison is always made against a naive UTC "now" (:func:`utc_now`). An aw
 into a query against this column is converted through the database session's time zone, so on a
 server not running in UTC it would be wrong by the zone's offset.
 
+A vault whose expiry is off has no file deadlines. Changing the setting leaves the deadlines files
+already have, but turning it off takes the deadline off every file in the vault in the same
+transaction (``VaultService.set_file_expiry``). Versions before enforcement did not, so at boot, before
+the sweep's first run, the web process clears the deadlines left in vaults whose expiry is off
+(:func:`prepare_at_startup`); and the sweep itself only ever deletes from vaults whose expiry is on.
+
 ``ENFORCE_FILE_EXPIRY=false`` switches both off, so an operator can postpone enforcement while
 reviewing what it would remove: nothing is hidden and nothing is deleted. Deadlines are still stamped
 at upload, so turning enforcement back on applies them, including to files that expired meanwhile.
@@ -28,10 +34,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_, or_, true
+from sqlalchemy import and_, or_, select, true
 
 from app.core.config import settings
-from app.core.models import File
+from app.core.models import File, Vault
 from app.core.safe_log import safe_event
 
 # How often the sweep runs, how many files one transaction deletes, and how many batches one run
@@ -103,6 +109,66 @@ def expired_clause(now: Optional[datetime] = None):
     return and_(File.expires_at.isnot(None), File.expires_at <= now)
 
 
+def expiry_is_off(value) -> bool:
+    """True when a vault's "expire files after" value means its files never expire: blank or 0.
+    A value below 0 counts as off too; this version refuses to store one, but earlier ones did not
+    check, and a negative retention must never make every upload expire on arrival."""
+    return value is None or value <= 0
+
+
+def vault_expiry_on():
+    """A filter for ``Vault`` queries: vaults whose files expire (a positive setting)."""
+    return Vault.expire_files_after_days > 0
+
+
+def vault_expiry_off():
+    """The complement of :func:`vault_expiry_on`, NULL included: vaults whose files never expire."""
+    return or_(Vault.expire_files_after_days.is_(None), Vault.expire_files_after_days <= 0)
+
+
+def clear_vault_deadlines(db, vault_id) -> int:
+    """Take the deadline off every file in one vault, in the caller's transaction, and return how
+    many files had one. For a vault whose expiry has just been turned off.
+
+    The files' modified time is kept: removing a deadline does not change a file."""
+    return (db.query(File)
+            .filter(File.vault_id == vault_id, File.expires_at.isnot(None))
+            .update({File.expires_at: None, File.updated_at: File.updated_at},
+                    synchronize_session=False))
+
+
+def clear_deadlines_where_expiry_is_off(db) -> int:
+    """Take the deadline off every file whose vault has expiry off, in the caller's transaction,
+    and return how many files had one.
+
+    Turning a vault's expiry off did not always do this: before enforcement, deadlines stayed on
+    the files, harmless because nothing read them. Enforcing them would delete files from a vault
+    whose owner turned expiry off long ago. One statement; with nothing to clear it changes no row,
+    so it can run on every boot."""
+    off_vaults = select(Vault.id).where(vault_expiry_off())
+    return (db.query(File)
+            .filter(File.expires_at.isnot(None), File.vault_id.in_(off_vaults))
+            .update({File.expires_at: None, File.updated_at: File.updated_at},
+                    synchronize_session=False))
+
+
+def clear_at_startup() -> bool:
+    """:func:`clear_deadlines_where_expiry_is_off` in a session of its own. Returns whether it ran;
+    never raises. Runs whether or not expiry is enforced: a deadline in a vault whose expiry is off
+    is wrong either way, and would be enforced the moment enforcement is switched on."""
+    try:
+        from app.core.database import get_db_context
+        with get_db_context() as db:
+            n = clear_deadlines_where_expiry_is_off(db)
+    except Exception as e:  # noqa: BLE001
+        safe_event('file-expiry.clear-off-vaults.failed', e)
+        return False
+    if n:
+        print(f"[OK] File expiry: removed the deadline from {n} file(s) in vaults whose expiry is "
+              f"off")
+    return True
+
+
 def count_past_expiry(db, now: Optional[datetime] = None) -> int:
     """How many stored files are past their deadline right now, whether or not it is enforced."""
     from sqlalchemy import func
@@ -126,6 +192,16 @@ def report_at_startup() -> None:
     else:
         print(f"⚠ File expiry is NOT enforced (ENFORCE_FILE_EXPIRY=false): {n} file(s) are past "
               f"their expiry and are being kept")
+
+
+def prepare_at_startup() -> bool:
+    """What the web process does once at boot, before the sweep's first run: clear the deadlines left
+    in vaults whose expiry is off (:func:`clear_at_startup`), then report what is past its expiry.
+    Returns whether the deadlines were cleared; pass it to :func:`run_forever`, which retries the
+    clearing before it sweeps anything if it did not. Never raises."""
+    cleared = clear_at_startup()
+    report_at_startup()
+    return cleared
 
 
 def sweep_once(batch_size: int = SWEEP_BATCH_SIZE, max_batches: int = SWEEP_MAX_BATCHES) -> int:
@@ -166,14 +242,22 @@ def _executor() -> ThreadPoolExecutor:
     return _sweep_executor
 
 
-async def run_forever(interval_seconds: float = SWEEP_INTERVAL_SECONDS) -> None:
+async def run_forever(interval_seconds: float = SWEEP_INTERVAL_SECONDS, *,
+                      cleared: bool = False) -> None:
     """The web process's expiry loop: :func:`sweep_once` every ``interval_seconds``, on a thread
     of its own. Started only by the web process, so a split deployment's SFTP container never runs
-    a second sweeper. Survives any error; ends only when cancelled."""
+    a second sweeper. Survives any error; ends only when cancelled.
+
+    ``cleared`` says whether the deadlines left in vaults whose expiry is off have been cleared
+    (:func:`prepare_at_startup`). Until they have, each pass retries that instead of sweeping."""
     loop = asyncio.get_running_loop()
     while True:
         await asyncio.sleep(interval_seconds)
         try:
+            if not cleared:
+                cleared = await loop.run_in_executor(_executor(), clear_at_startup)
+                if not cleared:
+                    continue
             await loop.run_in_executor(_executor(), sweep_once)
         except asyncio.CancelledError:
             raise

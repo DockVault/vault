@@ -443,7 +443,7 @@ def test_the_loop_survives_a_pass_that_raises(monkeypatch):
     monkeypatch.setattr(file_expiry, "sweep_once", flaky)
 
     async def body():
-        task = asyncio.create_task(file_expiry.run_forever(interval_seconds=0.01))
+        task = asyncio.create_task(file_expiry.run_forever(interval_seconds=0.01, cleared=True))
         for _ in range(500):
             await asyncio.sleep(0.01)
             if len(calls) >= 3:
@@ -555,10 +555,15 @@ def test_the_download_lookups_answer_404_before_any_bytes_or_budget():
 
 
 def test_the_web_process_starts_the_sweep_and_the_sftp_process_does_not():
+    """After the startup step, which clears the deadlines left in vaults whose expiry is off, and
+    passing on whether that worked: the loop sweeps nothing until it has (tests/test_file_expiry_off)."""
     start = API.index("async def lifespan")
     lifespan = API[start:API.index("app.router.lifespan_context", start)]
-    assert lifespan.count("file_expiry.report_at_startup()") == 1
-    assert lifespan.count("expiry_task = asyncio.create_task(file_expiry.run_forever())") == 1
+    prepare = "expiry_cleared = file_expiry.prepare_at_startup()"
+    loop = "expiry_task = asyncio.create_task(file_expiry.run_forever(cleared=expiry_cleared))"
+    assert lifespan.count(prepare) == 1 and lifespan.count(loop) == 1
+    assert lifespan.index(prepare) < lifespan.index(loop)
+    assert "run_forever" not in lifespan.replace(loop, "")
     assert lifespan.count("expiry_task.cancel()") == 1
     assert "run_forever" not in SFTP and "sweep_once" not in SFTP
     assert "cleanup_expired_files" not in SFTP
