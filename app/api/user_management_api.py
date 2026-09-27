@@ -487,14 +487,42 @@ def _blacklist_user_vault_keys(db: Session, user_id, revoked_by) -> int:
     reconciler skips owner rows). Blacklisting the owner's row would drop the vault's guaranteed
     key-holder — and for a sole-owner vault that is irreversible (no client left holds the DEK to
     re-wrap it), bricking the vault. A departing OWNER is an ownership-transfer problem, not a
-    key-blacklist one, so their owned vaults are left intact. Returns the count blacklisted."""
+    key-blacklist one, so their owned vaults are left intact. Returns the count blacklisted.
+
+    LOCKING: each affected vault's row is locked (SELECT ... FOR UPDATE, in ascending id order)
+    before that vault's keys are read and switched off. It is the lock a key rotation holds from its
+    key-holder check to its commit, and that removing a member takes. Without it, a rotation in
+    flight could commit an active key for this user at the new epoch just after the old ones were
+    switched off here, and the vault would report no rotation owed. With it, a rotation in flight
+    commits first and the key it wrote is switched off here with the rest; one that starts later
+    finds this user's keys already off.
+
+    Call this BEFORE anything in the same transaction locks a user row (the last-administrator
+    check locks every administrator's). A path that holds a vault row lock may go on to wait for a
+    user row -- writing a key row checks the users it names -- so vault rows are always locked
+    first. Nothing is committed here; the caller commits."""
     from app.core.models import VaultMemberKey, Vault
     now = datetime.now(timezone.utc)
     owned_vault_ids = {vid for (vid,) in db.query(Vault.id).filter(Vault.owner_id == user_id).all()}
-    rows = db.query(VaultMemberKey).filter(
-        VaultMemberKey.user_id == user_id,
-        VaultMemberKey.is_active == True,  # noqa: E712
-    ).all()
+
+    def active_keys():
+        # populate_existing: a row read before a lock is re-read as it stands after it.
+        return db.query(VaultMemberKey).populate_existing().filter(
+            VaultMemberKey.user_id == user_id,
+            VaultMemberKey.is_active == True,  # noqa: E712
+        ).all()
+
+    locked = set()
+    rows = active_keys()
+    while True:
+        # Every vault on the first pass. A later pass finds one only if the user was given a key
+        # in another vault while this waited for a lock; it is locked then, after the others.
+        waiting = {mk.vault_id for mk in rows} - owned_vault_ids - locked
+        if not waiting:
+            break
+        db.query(Vault.id).filter(Vault.id.in_(waiting)).order_by(Vault.id).with_for_update().all()
+        locked |= waiting
+        rows = active_keys()   # read again under the locks: a rotation that held one has committed
     blacklisted = 0
     for mk in rows:
         if mk.vault_id in owned_vault_ids:
@@ -533,6 +561,12 @@ async def update_user(
             raise HTTPException(status_code=400, detail="Cannot change your own role")
         if update_data.is_active is False:
             raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
+    # Offboarding: deactivating a user switches off their zero-knowledge vault keys. That locks the
+    # vaults the keys belong to, so it comes before the check below locks the administrator rows:
+    # vault rows are always locked before user rows (see _blacklist_user_vault_keys). Nothing is
+    # committed unless every check passes.
+    if update_data.is_active is False and user.is_active:
+        _blacklist_user_vault_keys(db, user.id, current_user.id)
     if user.role == RoleEnum.ADMIN and (changes_role or update_data.is_active is False):
         if removes_last_admin(db, user):
             raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
@@ -561,11 +595,7 @@ async def update_user(
         user.role = update_data.role
     
     if update_data.is_active is not None:
-        was_active = user.is_active
         user.is_active = update_data.is_active
-        # Offboarding: deactivating a user blacklists their zero-knowledge vault keys.
-        if was_active and not user.is_active:
-            _blacklist_user_vault_keys(db, user.id, current_user.id)
 
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -608,6 +638,12 @@ async def toggle_user_active(
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
 
+    # Offboarding: deactivating a user switches off their zero-knowledge vault keys, locking the
+    # vaults they belong to before the check below locks the administrator rows (see
+    # _blacklist_user_vault_keys). Nothing is committed unless the check passes.
+    if user.is_active:
+        _blacklist_user_vault_keys(db, user.id, current_user.id)
+
     # Never deactivate the last administrator who can act (see app/core/last_admin.py).
     if user.is_active and user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
         raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
@@ -622,9 +658,6 @@ async def toggle_user_active(
         _enforce_user_cap(db)
 
     user.is_active = not user.is_active
-    # Offboarding: deactivating a user blacklists their zero-knowledge vault keys.
-    if not user.is_active:
-        _blacklist_user_vault_keys(db, user.id, current_user.id)
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     

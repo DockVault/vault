@@ -8,7 +8,8 @@ the vault reporting rekey_owed to its key holder until they rotate. Minting the 
 members then use for every name they write, follows the same rule.
 
 It also holds the vault row lock from outside, which is the only way to observe the lock: a rotation
-must re-check the caller's key after it gets the lock, and the two removal routes must wait for it.
+must re-check the caller's key after it gets the lock, and the two removal routes, and the three
+routes that deactivate a user, must wait for it.
 """
 import contextlib
 import os
@@ -282,3 +283,54 @@ def test_a_share_rechecks_the_key_after_it_gets_the_lock(temp_user, temp_user_cl
     assert "current key" in r.json()["detail"]
     # Nothing was written for the member: they still have no key row, so no relationship at all.
     assert member_client.get(f"/ecc/vaults/{vid}/keys").status_code == 403
+
+
+def _active_epochs(vid, uid):
+    """The epochs at which `uid` holds an active key row for the vault, read from the database."""
+    out = subprocess.run(
+        ["docker", "exec", DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
+         f"SELECT key_version FROM vault_member_keys WHERE vault_id='{vid}' AND user_id='{uid}' "
+         f"AND is_active ORDER BY key_version"],
+        capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return [int(v) for v in out.stdout.split()]
+
+
+def _key_row(vid, uid, epoch):
+    """SQL for an active direct key row, as a rotation writes one."""
+    return ("INSERT INTO vault_member_keys (id, vault_id, user_id, encrypted_dek, ephemeral_public_key, "
+            "wrapping_algorithm, key_version, granted_at, is_active) VALUES (gen_random_uuid(), "
+            f"'{vid}', '{uid}', 'stub', 'stub', 'ECDH-P384-AES-GCM-DIRECT-V2', {epoch}, now(), true);")
+
+
+_DEACTIVATE = {
+    "toggle-active": lambda admin, uid: admin.post(f"/api/user-management/users/{uid}/toggle-active"),
+    "PATCH /users/{id}": lambda admin, uid: admin.patch(f"/users/{uid}", json={"is_active": False}),
+    "PUT /api/user-management/users/{id}": lambda admin, uid: admin.put(
+        f"/api/user-management/users/{uid}", json={"is_active": False}),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_DEACTIVATE))
+def test_deactivating_a_member_waits_for_the_vault_row_lock(route, admin, temp_user, temp_user_client,
+                                                           owned_vault, second_member):
+    """Deactivating a user switches off their keys under the lock a rotation holds. The lock-holding
+    transaction stands in for a rotation that, while the deactivation waits, moves the vault to
+    epoch 2 and commits a key there for the member. Read before the lock, that key would be left
+    active, and with no key at epoch 2 switched off the vault would report no rotation owed."""
+    vid, owner = owned_vault, temp_user["id"]
+    member, member_client = second_member
+    _share(temp_user_client, vid, member, member_client)
+    rotation = (f"UPDATE vaults SET dek_version=2 WHERE id='{vid}'; "
+                + _key_row(vid, owner, 2) + _key_row(vid, member["id"], 2))
+    holder = _hold_vault_row(vid, before_commit=rotation)
+    try:
+        r, elapsed = _timed(lambda: _DEACTIVATE[route](admin, member["id"]))
+    finally:
+        holder.wait(timeout=_HOLD + 5)
+    assert holder.returncode == 0, "the lock-holding transaction failed"
+    assert r.status_code == 200, r.text
+    assert elapsed >= 2.0, f"the deactivation did not wait for the vault row lock ({elapsed:.2f}s)"
+    assert _active_epochs(vid, member["id"]) == [], "a key written while it waited was left active"
+    keys = _keys(temp_user_client, vid)
+    assert keys["current_dek_version"] == 2 and keys["rekey_owed"] is True, keys

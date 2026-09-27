@@ -8717,6 +8717,18 @@ async def update_user(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="Cannot lock your own account")
 
+    # Deactivation also offboards the user's zero-knowledge key access, parity with the
+    # user-management deactivate/toggle paths: their active wrapped-DEK rows are switched off (owner
+    # rows carved out) so the server can no longer hand them a ZK vault key, and the affected vaults
+    # report 'rekey owed' to their key holders. Idempotent (only active rows). It locks the vaults
+    # those keys belong to, so it runs before the check below locks the administrator rows: vault
+    # rows are always locked before user rows (see _blacklist_user_vault_keys). Nothing is committed
+    # unless every check below passes.
+    n_bl = 0
+    if is_admin and user_update.is_active is False:
+        from app.api.user_management_api import _blacklist_user_vault_keys
+        n_bl = _blacklist_user_vault_keys(db, user.id, current_user.id)
+
     # Nor may any change leave the deployment without an administrator who can act. Checked before
     # anything below touches the row, because the check reloads it under a lock.
     if is_admin and user.role == RoleEnum.ADMIN and (
@@ -8850,19 +8862,11 @@ async def update_user(
             changes['storage_quota_bytes'] = {'old': user.storage_quota_bytes, 'new': new_quota}
             user.storage_quota_bytes = new_quota
 
-        # Deactivation also offboards the user's zero-knowledge key access — parity with the
-        # user-management deactivate/toggle paths. Blacklist their active wrapped-DEK rows (owner
-        # rows carved out) so the server can no longer hand them a ZK vault key; the affected
-        # vaults surface 'rekey owed' to managers. Idempotent (only active rows), committed below.
-        if user_update.is_active is False:
-            from app.api.user_management_api import _blacklist_user_vault_keys
-            n_bl = _blacklist_user_vault_keys(db, user.id, current_user.id)
-            if n_bl:
-                print(f"🔑 Blacklisted {n_bl} ZK key(s) for deactivated user {user.username}")
-
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(user)
+    if n_bl:
+        print(f"🔑 Blacklisted {n_bl} ZK key(s) for deactivated user {user.username}")
     
     # Audit log
     audit_logger = AuditLogger(db)
