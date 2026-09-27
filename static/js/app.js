@@ -11170,6 +11170,9 @@ async function openVault(vaultId, options) {
         state.tempVaultCaps = tempVaultCaps(vaultId);
         applyVaultViewPermissions(isOwner, canWrite, canManage);
         startVaultAccessWatch(vaultId);
+        // Zero-knowledge: tell a key holder if the vault owes a key rotation. Not awaited, so the
+        // extra request never holds up the open; it clears any notice from the previous vault.
+        refreshZkRekeyNotice();
 
         // Show vault view section (don't hide navbar/sidebar)
         document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
@@ -14150,11 +14153,77 @@ async function zkMaybePromptPendingInvites() {
     if (ok) { try { await setupEncryptionKey(); } catch (_) { /* user cancelled / handled inside */ } }
 }
 
+// Whether the signed-in user holds this zero-knowledge vault's CURRENT key, and whether the vault
+// owes a key rotation (someone was removed without one). Asked fresh, not from the DEK cache: both
+// answers change when someone else removes a member or rotates. The server reports rekey_owed only
+// to a key holder. Any failure reads as "not a holder", which is the safe side: the caller then
+// removes access without rotating, and the vault asks its key holders to rotate.
+async function zkVaultKeyStatus(vaultId) {
+    try {
+        const keys = await apiRequest(`/ecc/vaults/${vaultId}/keys`, { silent: true });
+        const holdsKey = !!(keys && keys.has_access);
+        return { holdsKey, rekeyOwed: holdsKey && !!keys.rekey_owed };
+    } catch (_) {
+        return { holdsKey: false, rekeyOwed: false };
+    }
+}
+
+// The notice a key holder sees when their zero-knowledge vault owes a rotation: someone was removed
+// by a person who does not hold the key (only a key holder may rotate it), or from outside the web
+// app. The removed member's keys are already switched off, but they may have kept a copy of the key,
+// so until it is rotated they could open files added from now on. Shown on the open vault to a user
+// who holds the key and may manage the vault; its button runs a rotation that removes nobody.
+async function refreshZkRekeyNotice() {
+    const box = document.getElementById('vault-rekey-notice');
+    if (!box) return;
+    const vault = state.currentVault;
+    box.replaceChildren();
+    box.hidden = true;
+    if (!vault || !isZkVault(vault) || !state.canManageCurrentVault
+        || !vaultCapAllowed('vault.change_permissions')) return;
+    const status = await zkVaultKeyStatus(vault.id);
+    // Another vault may have been opened while the answer was on its way.
+    if (!state.currentVault || state.currentVault.id !== vault.id) return;
+    if (!status.holdsKey || !status.rekeyOwed) return;
+
+    const notice = document.createElement('div');
+    notice.className = 'alert alert-warning flex-wrap items-center justify-between';
+    notice.setAttribute('role', 'status');
+    const text = document.createElement('span');
+    text.style.flex = '1 1 16rem';   // shares the row with the button; wraps above it on a phone
+    text.textContent = 'Someone was removed from this vault without a key rotation. Rotating the '
+        + 'key stops them from opening files added from now on.';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-sm btn-primary';
+    btn.id = 'vault-rekey-notice-btn';
+    btn.textContent = 'Rotate key';
+    btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+            await zkRekeyForRevoke(vault.id, null);
+        } catch (e) {
+            showError('The vault key could not be rotated. Please retry. ('
+                + (e && e.message ? e.message : e) + ')');
+            btn.disabled = false;
+            return;
+        }
+        showSuccess('Vault key rotated.');
+        await refreshZkRekeyNotice();
+    });
+    notice.append(text, btn);
+    box.appendChild(notice);
+    box.hidden = false;
+}
+
 // Forward-only DEK rotation when revoking a zero-knowledge member. Mints a fresh DEK in
 // the browser, re-wraps it for every REMAINING member, and atomically bumps the vault
 // epoch server-side — so the revoked member (who still holds the old DEK) can no longer
 // read NEW content. Existing files keep their old epoch and remain readable by remaining
 // members. The server never sees the DEK. Retries once on a concurrent-rekey 409.
+// revokedUserId null rotates without removing anyone: what a vault that owes a rotation needs,
+// since the member it was owed for is already gone. Only someone who holds the vault's key may
+// run this (they learn the new key); the server refuses anyone else.
 // NOTE (claims discipline): this does NOT retroactively protect content the removed member
 // could already read — the DEK was extractable in their browser. See the revoke UI copy.
 async function zkRekeyForRevoke(vaultId, revokedUserId) {
@@ -18095,14 +18164,27 @@ async function changeVaultPermissionLevel(userId, level) {
 // Revoke vault permission
 async function revokeVaultPermission(userId) {
     const zk = isZkVault(state.currentVault);
-    const confirmed = await showConfirm(
-        zk
-            ? 'Revoke access? The vault key will be rotated so this user can no longer open '
-              + 'NEW files. Files they could already open should be treated as already seen '
-              + '(their key cannot be un-shown).'
-            : 'Are you sure you want to revoke access for this user?',
-        'Revoke Permission'
-    );
+    // Zero-knowledge: rotating the key hands whoever rotates it the new key, so only someone who
+    // holds the key may do it (the server refuses anyone else), and nobody rotates themselves out.
+    // Anyone else who may manage the vault removes the access alone: the server switches off the
+    // member's keys, and the vault asks its key holders to rotate (see refreshZkRekeyNotice).
+    const self = String(userId) === String(currentUser.id);
+    const rotate = zk && !self && (await zkVaultKeyStatus(state.currentVault.id)).holdsKey;
+    let message = 'Are you sure you want to revoke access for this user?';
+    if (rotate) {
+        message = 'Revoke access? The vault key will be rotated so this user can no longer open '
+            + 'NEW files. Files they could already open should be treated as already seen '
+            + '(their key cannot be un-shown).';
+    } else if (zk && self) {
+        message = "Remove your own access? It is removed now. Someone who holds this vault's key "
+            + "will be asked to rotate it, so that you can't open files added after that.";
+    } else if (zk) {
+        message = "Revoke access? It is removed now. You don't hold this vault's key, so it can't "
+            + 'be rotated from here: someone who holds the key will be asked to rotate it, so that '
+            + "this user can't open files added after that. Files they could already open should "
+            + 'be treated as already seen.';
+    }
+    const confirmed = await showConfirm(message, 'Revoke Permission');
     if (!confirmed) return;
 
     try {
@@ -18112,11 +18194,12 @@ async function revokeVaultPermission(userId) {
             headers['X-Vault-Password'] = state.vaultPassword;
         }
 
-        // Zero-knowledge: rotate the DEK FIRST (mint a new epoch, re-wrap for remaining
-        // members, deactivate this user's keys) as a HARD step. If it fails, abort the
-        // whole revoke — leaving access intact and consistent rather than half-revoked —
+        // Zero-knowledge, key holder: rotate the DEK FIRST (mint a new epoch, re-wrap for
+        // remaining members, deactivate this user's keys) as a HARD step. If it fails, abort
+        // the whole revoke — leaving access intact and consistent rather than half-revoked —
         // and surface the error. Only once the crypto cut-off is committed do we drop authz.
-        if (zk) {
+        // Without the key, the DELETE below is the whole removal (see above).
+        if (rotate) {
             try {
                 await zkRekeyForRevoke(state.currentVault.id, userId);
             } catch (e) {
@@ -18131,10 +18214,13 @@ async function revokeVaultPermission(userId) {
             headers
         });
 
-        showSuccess('Permission revoked successfully');
+        showSuccess(zk && !rotate
+            ? "Access removed. Someone who holds this vault's key will be asked to rotate it."
+            : 'Permission revoked successfully');
 
-        // Reload permissions
+        // Reload permissions, and the rotation notice (a rotation above clears an owed one).
         await loadVaultPermissions();
+        if (zk) refreshZkRekeyNotice();
     } catch (error) {
         console.error('Failed to revoke permission:', error);
         showError('Failed to revoke permission: ' + error.message);

@@ -596,6 +596,9 @@
                         <button class="tab-btn" data-vault-tab="settings"><svg class="icon icon-sm"><use href="#i-settings"/></svg> Settings</button>
                     </div>
 
+                    <!-- Zero-knowledge: shown to a key holder when the vault owes a key rotation (filled by app.js) -->
+                    <div id="vault-rekey-notice" hidden></div>
+
                     <!-- Files Tab -->
                     <div id="vault-files-tab" class="vault-tab-content active">
                         <!-- Toolbar: breadcrumb + view switch + per-folder actions -->
