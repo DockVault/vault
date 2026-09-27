@@ -120,6 +120,17 @@ def test_an_admin_cannot_grant_themselves_another_persons_vault(admin, scene):
     assert _uid(actor) not in {str(m["user_id"]) for m in listed}, "a refused grant left a member row"
     assert len(_refusals(admin, vid, "grant_to_self", actor.account["_username"])) == 4
 
+    # The Activity page counts each as a refusal, and does not name the vault to an administrator
+    # who is not in it.
+    r = admin.get("/activity/events", params={"user": actor.account["_username"], "category": "security",
+                                              "status": "failed"})
+    assert r.status_code == 200, r.text
+    refused = [e for e in r.json()["events"] if e["action"] == _REFUSED_ACTION]
+    assert len(refused) == 4, refused
+    for e in refused:
+        assert (e["label"], e["status"], e["resource_id"]) == ("Self-granted vault access refused", "refused", vid)
+        assert e["names"]["vault"] == "Not shown: you are not a member of this vault", e["names"]
+
 
 def test_a_second_admin_can_grant_the_first_who_may_then_lower_but_not_raise_it(admin, scene):
     actor, second, vid = scene["actor"], scene["second_admin"], scene["vault_id"]

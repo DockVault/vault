@@ -39,10 +39,15 @@ class AuditAction(NamedTuple):
     label: str
     severity: str
     aliases: Tuple[str, ...] = ()
+    # The server writes the row on its own, with no person acting (the file-expiry sweep). Such a row
+    # has no user, and the Activity page says the system did it rather than "Unknown".
+    automatic: bool = False
 
 
 ACTIONS: Tuple[AuditAction, ...] = (
     # Sign-in and sessions
+    AuditAction("account_auto_locked", "sign_in", "Account locked after failed sign-ins", "warning"),
+    AuditAction("account_auto_unlocked", "sign_in", "Account unlocked when its lock ran out", "info"),
     AuditAction("login_failure", "sign_in", "Sign-in failed", "warning"),
     AuditAction("login_password_ok", "sign_in", "Password accepted, second factor pending", "info"),
     AuditAction("login_success", "sign_in", "Signed in", "info"),
@@ -92,6 +97,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("file_download", "files", "File download started", "info", ("file_downloaded",)),
     AuditAction("file_download_completed", "files", "File download finished", "info"),
     AuditAction("file_download_range", "files", "Part of a file downloaded", "info"),
+    AuditAction("file_expired", "files", "File deleted at its expiry", "info", automatic=True),
     AuditAction("file_move", "files", "File moved", "info"),
     AuditAction("file_preview_rendered", "files", "File preview shown", "info"),
     AuditAction("file_rename", "files", "File renamed", "info"),
@@ -224,6 +230,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("security_alert_resolved", "security", "Security alert resolved", "notice"),
     AuditAction("vault_cap_denied", "security", "Vault action outside the credential's rights refused", "warning"),
     AuditAction("vault_scope_denied", "security", "Vault outside the granted scope refused", "warning"),
+    AuditAction("vault_self_access_refused", "security", "Self-granted vault access refused", "warning"),
 )
 
 _CATEGORY_LABELS: Dict[str, str] = dict(CATEGORIES)

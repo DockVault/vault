@@ -8,6 +8,8 @@
   because it only fires every five minutes.
 * Failed sign-ins sent in parallel each add one to the count. The count was read, increased and
   written back, so parallel failures overwrote each other and most were lost.
+* The Activity page's Events feed lists both under sign-ins, with the request that made them (none for
+  the timer).
 
 test_account_auto_lock_audit.py covers the same offline.
 """
@@ -82,6 +84,19 @@ def _latest(admin, action, username):
     return rows[0]    # newest first
 
 
+def _event(admin, action, username, **params):
+    """The Events feed's view of the newest row of this action for this account."""
+    r = admin.get("/activity/events", params={"user": username, "category": "sign_in", "limit": 200, **params})
+    assert r.status_code == 200, r.text
+    events = [e for e in r.json()["events"] if e["action"] == action and e["username"] == username]
+    assert events, f"the Events feed has no {action} row for {username}"
+    return events[0]
+
+
+def _request(event):
+    return (event["channel"], event["method"], event["endpoint"])
+
+
 def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recorded(admin, temp_user):
     uid, name, password = temp_user["id"], temp_user["_username"], temp_user["_password"]
     _psql(f"UPDATE users SET failed_login_attempts={PRIMED} WHERE id='{uid}'")
@@ -100,6 +115,9 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     failure = _latest(admin, "login_failure", name)
     assert row["ip_address"] and row["ip_address"] == failure["ip_address"], (row, failure)
     assert "lock" not in r.text.lower(), "the caller still sees only the generic failure"
+    event = _event(admin, LOCKED, name)
+    assert (event["label"], event["status"]) == ("Account locked after failed sign-ins", "success")
+    assert _request(event) == ("web", "POST", "/auth/login")
 
     # A failure against the running lock moves its end but is not recorded again.
     assert _login(client, name, "definitely-the-wrong-password").status_code == 401
@@ -123,6 +141,9 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     assert released[0]["details"]["failed_attempts"] == PRIMED + 2
     success = _latest(admin, "login_success", name)
     assert released[0]["ip_address"] == success["ip_address"], (released[0], success)
+    event = _event(admin, UNLOCKED, name)
+    assert event["label"] == "Account unlocked when its lock ran out"
+    assert _request(event) == ("web", "POST", "/auth/login")
 
 
 def test_the_timer_clears_an_expired_lock_and_records_it(admin, temp_user):
@@ -145,6 +166,8 @@ def test_the_timer_clears_an_expired_lock_and_records_it(admin, temp_user):
     assert rows[0]["details"]["failed_attempts"] == 7
     assert rows[0]["ip_address"] is None
     assert _rows(admin, LOCKED, uid) == [], "nothing here armed a lock"
+    event = _event(admin, UNLOCKED, temp_user["_username"], channel="unknown")
+    assert _request(event) == (None, None, None), "the timer is not a request"
 
 
 def test_failures_sent_in_parallel_each_count(temp_user):

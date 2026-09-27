@@ -171,6 +171,8 @@ def row_view(r) -> dict:
         "label": entry.label if entry else audit_catalog.LEGACY_LABEL,
         "category": entry.category if entry else LEGACY_CATEGORY,
         "severity": entry.severity if entry else "info",
+        # Written by the server on its own (the file-expiry sweep): no person acted.
+        "automatic": bool(entry and entry.automatic),
         "status": r.status,
         "channel": r.channel,
         "ip_address": r.ip_address,

@@ -1,14 +1,17 @@
 """The Events tab's filters, paging and row view, without a database.
 
 The SQL is checked by compiling the query for PostgreSQL and reading it; the live API tests run it."""
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Query
 
+from app.core import audit_catalog
 from app.core.models import AuditLog
 from app.services import activity_events as ev
 
@@ -97,6 +100,71 @@ def test_a_row_names_its_event_and_keeps_utc():
     r.action = "something_old"
     v = ev.row_view(r)
     assert (v["label"], v["category"]) == ("Other (legacy)", "legacy")
+    assert v["automatic"] is False
+
+
+def _stored(action, status, **extra):
+    row = dict(id=uuid.uuid4(), timestamp=datetime(2026, 9, 26, 3, 4, 5), username=None, temp_credential_id=None,
+               action=action, status=status, channel=None, ip_address=None, method=None, endpoint=None,
+               user_agent=None, resource_type=None, resource_id=None, details=None, error_message=None)
+    row.update(extra)
+    return SimpleNamespace(**row)
+
+
+@pytest.mark.parametrize("action, status, category, label, automatic", [
+    ("account_auto_locked", "success", "sign_in", "Account locked after failed sign-ins", False),
+    ("account_auto_unlocked", "success", "sign_in", "Account unlocked when its lock ran out", False),
+    ("file_expired", "success", "files", "File deleted at its expiry", True),
+    ("vault_self_access_refused", "refused", "security", "Self-granted vault access refused", False),
+])
+def test_the_lock_expiry_and_self_grant_events_are_named_and_filed(action, status, category, label, automatic):
+    v = ev.row_view(_stored(action, status))
+    assert (v["label"], v["category"], v["automatic"]) == (label, category, automatic)
+    assert f"'{action}'" in _sql(categories=[category])
+    others = [k for k, _ in audit_catalog.CATEGORIES if k != category]
+    assert f"'{action}'" not in _sql(categories=others)
+
+
+# The Overview's tiles, as static/js/activity.js asks the Events API for them. Every tile also starts
+# 24 hours back, which is the same for all and left out here.
+OVERVIEW_TILES = {
+    "Events": {},
+    "Failed sign-ins": {"categories": ["sign_in"], "statuses": ["failed"]},
+    "Refusals and denials": {"categories": ["security"]},
+    "Failed or refused": {"statuses": ["failed"]},
+}
+
+
+def test_the_tiles_here_are_the_ones_the_page_asks_for():
+    src = (Path(__file__).resolve().parents[1] / "static" / "js" / "activity.js").read_text(encoding="utf-8")
+    tiles = re.findall(r"\['([^']+)', new URLSearchParams\(\{ from_date: since(?:, ([^}]*))? \}\)\]", src)
+    names = {"category": "categories", "status": "statuses"}
+    asked = {label: {names[k]: [v] for k, v in re.findall(r"(\w+): '([^']+)'", rest)} for label, rest in tiles}
+    assert asked == OVERVIEW_TILES
+
+
+def test_the_overview_counts_locks_expiry_and_self_grant_refusals_where_they_belong():
+    """Run through the Events query against rows held in memory. The lock is the outcome of failures
+    already counted as failed sign-ins, and succeeds as a lock, so it is not a failed sign-in again; a
+    file deleted at its expiry is an event and nothing else; a self-grant refused is a refusal."""
+    from _memory_db import MemoryDB
+
+    rows = [_stored(a, s) for a, s in (
+        ("login_failure", "failure"),
+        ("account_auto_locked", "success"),
+        ("account_auto_unlocked", "success"),
+        ("file_expired", "success"),
+        ("vault_self_access_refused", "refused"),
+    )]
+    db = MemoryDB({AuditLog: rows})
+    counted = {tile: sorted(r.action for r in ev.build_events_query(db.query(AuditLog), AuditLog, **f).all())
+               for tile, f in OVERVIEW_TILES.items()}
+    assert counted == {
+        "Events": sorted(r.action for r in rows),
+        "Failed sign-ins": ["login_failure"],
+        "Refusals and denials": ["vault_self_access_refused"],
+        "Failed or refused": ["login_failure", "vault_self_access_refused"],
+    }
 
 
 def _batches(rows, size):

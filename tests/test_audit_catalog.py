@@ -1,10 +1,12 @@
 """The audit action catalog stays complete: every action name the code can store is catalogued.
 
-The scan reads app/ as source (no app import). An audit write is a call to AuditLogger.log_action or
-log_custom_action, whose first argument is the action, or to a module's own `_audit...` helper that takes an
-`action` parameter, checked at that parameter's position. A literal action must be in the catalog. A
-non-literal one is either a wrapper passing its own `action` parameter through (its callers are checked
-instead) or one of the few names built at run time, pinned below with every name it can produce.
+The scan reads app/ as source (no app import). An audit write is a call to AuditLogger.log_action,
+log_custom_action or build_row, whose first argument is the action, or to a module's own `_audit...` helper
+(or a wrapper listed in PASS_THROUGH) that takes an `action` parameter, checked at that parameter's
+position. A literal action must be in the catalog, and so must one passed by the name of a module-level
+constant (`AUTO_LOCKED_ACTION = "account_auto_locked"`), whose text the scan reads. Any other non-literal
+is either a wrapper passing its own `action` parameter through (its callers are checked instead) or one
+of the few names built at run time, pinned below with every name it can produce.
 """
 import ast
 from pathlib import Path
@@ -17,7 +19,7 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "app"
-METHODS = {"log_action": 0, "log_custom_action": 0}
+METHODS = {"log_action": 0, "log_custom_action": 0, "build_row": 0}
 
 # Wrappers that pass their own `action` parameter to the logger: the check moves to their callers.
 PASS_THROUGH = {
@@ -29,10 +31,12 @@ PASS_THROUGH = {
     ("app/api/ecc_router.py", "_audit_zk"),
     ("app/api/email_studio_router.py", "_audit"),
     ("app/core/temp_scope.py", "_audit_scope_denial"),
+    ("app/services/audit_logger.py", "log_action"),
     ("app/services/audit_logger.py", "log_custom_action"),
     ("app/services/audit_logger.py", "log_error"),
     ("app/api/api_server.py", "_audit_change"),
     ("app/sftp/sftp_server.py", "_audit"),
+    ("app/services/auth_service.py", "_lock_audit_row"),
 }
 
 # Names built at run time: (file, enclosing function, source of the expression) -> every name it yields.
@@ -52,25 +56,63 @@ def _action_param_index(fn):
     return names.index("action") if "action" in names else None
 
 
+def _module_name(path):
+    return ".".join(path.relative_to(ROOT).with_suffix("").parts)
+
+
+def _string_constants(tree):
+    """A module's top-level `NAME = "text"` assignments."""
+    out = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            out.update({t.id: node.value.value for t in node.targets if isinstance(t, ast.Name)})
+    return out
+
+
+def _local_names(fn):
+    """Names a function binds itself (parameters, assignments), which hide a module constant."""
+    if fn is None:
+        return set()
+    args = fn.args
+    names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+    names |= {a.arg for a in (args.vararg, args.kwarg) if a}
+    names |= {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    return names
+
+
 def _scan():
-    literal, dynamic = [], []
-    for path in sorted(APP.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    literal, dynamic, from_constants = [], [], []
+    trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in sorted(APP.rglob("*.py"))}
+    constants = {_module_name(path): _string_constants(tree) for path, tree in trees.items()}
+    for path, tree in trees.items():
         rel = path.relative_to(ROOT).as_posix()
+        # The constants this module can name: its own, and those it imports from another app module.
+        known = dict(constants[_module_name(path)])
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in constants:
+                for alias in node.names:
+                    if alias.name in constants[node.module]:
+                        known[alias.asname or alias.name] = constants[node.module][alias.name]
         helpers = {}
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("_audit"):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                    node.name.startswith("_audit") or (rel, node.name) in PASS_THROUGH):
                 idx = _action_param_index(node)
                 if idx is not None:
                     helpers[node.name] = idx
         parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
-        def enclosing(node):
+        def enclosing_fn(node):
             while node in parents:
                 node = parents[node]
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    return node.name
-            return "<module>"
+                    return node
+            return None
+
+        def enclosing(node):
+            fn = enclosing_fn(node)
+            return fn.name if fn is not None else "<module>"
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -89,18 +131,31 @@ def _scan():
                 continue
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 literal.append((rel, node.lineno, arg.value))
+            elif (isinstance(arg, ast.Name) and arg.id in known
+                  and arg.id not in _local_names(enclosing_fn(node))):
+                literal.append((rel, node.lineno, known[arg.id]))
+                from_constants.append((rel, arg.id, known[arg.id]))
             else:
                 dynamic.append((rel, enclosing(node), ast.unparse(arg)))
-    return literal, dynamic
+    return literal, dynamic, from_constants
 
 
-LITERAL, DYNAMIC = _scan()
+LITERAL, DYNAMIC, FROM_CONSTANTS = _scan()
 
 
 def test_the_scan_sees_the_audit_writes():
     # A scan that found nothing would pass everything below.
     assert len(LITERAL) > 150, len(LITERAL)
-    assert {"login_success", "file_download", "note_link_create", "zk_vault_rekeyed"} <= {n for _, _, n in LITERAL}
+    assert {"login_success", "file_download", "note_link_create", "zk_vault_rekeyed",
+            "vault_self_access_refused", "file_expired"} <= {n for _, _, n in LITERAL}
+
+
+def test_actions_passed_by_a_constants_name_are_read_as_their_text():
+    # The automatic account lock and unlock pass their action by a constant's name (AUTO_LOCKED_ACTION,
+    # AUTO_UNLOCKED_ACTION). The scan reads the constant, so the name it holds is checked against the
+    # catalog like a literal, and so is any name a new constant holds.
+    assert {("app/services/auth_service.py", "AUTO_LOCKED_ACTION", "account_auto_locked"),
+            ("app/services/auth_service.py", "AUTO_UNLOCKED_ACTION", "account_auto_unlocked")} <= set(FROM_CONSTANTS)
 
 
 def test_every_literal_action_is_catalogued():

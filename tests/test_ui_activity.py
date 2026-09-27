@@ -133,3 +133,32 @@ def test_settings_audit_log_points_to_the_events_tab(page: Page, activity_admin)
     # The tab is searched on arrival: at least this admin's own sign-in is listed.
     expect(page.locator("#activity-rows tr.activity-row").first).to_be_visible(timeout=10000)
     expect(page.locator("#activity-summary")).to_contain_text("Showing")
+
+
+def test_an_event_the_server_records_on_its_own_is_by_the_system(page: Page, activity_admin):
+    """A file deleted at its expiry has no one behind it: the page says System, not Unknown, which
+    stays for a row whose actor is simply not recorded. The events are served here, so the test does
+    not wait for the sweep."""
+    import json
+
+    def event(action, label, automatic):
+        return {"id": action, "timestamp": "2026-09-26T12:00:00+00:00", "action": action, "label": label,
+                "category": "files", "severity": "info", "automatic": automatic, "status": "success",
+                "channel": None, "username": None, "temp_credential_id": None, "ip_address": None,
+                "method": None, "endpoint": None, "user_agent": None, "resource_type": "file",
+                "resource_id": action, "details": {}, "error_message": None,
+                "names": {"vault": None, "item": None}}
+
+    body = json.dumps({"events": [event("file_expired", "File deleted at its expiry", True),
+                                  event("file_download", "File download started", False)],
+                       "next_cursor": None, "total": 2})
+    page.route(lambda url: "/activity/events" in url,
+               lambda route: route.fulfill(status=200, content_type="application/json", body=body))
+    _login(page, activity_admin)
+    _open_activity(page)
+    page.click('[data-activity-tab="events"]')
+    page.click("#activity-search")
+    rows = page.locator("#activity-rows tr.activity-row")
+    expect(rows).to_have_count(2, timeout=10000)
+    expect(rows.nth(0).locator("td").nth(2)).to_have_text("System")
+    expect(rows.nth(1).locator("td").nth(2)).to_have_text("Unknown")

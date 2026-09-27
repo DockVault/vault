@@ -15,6 +15,7 @@ has passed. Releasing the lock then lets the sweep (every 60 s) delete it.
 ENFORCE_FILE_EXPIRY=false is covered at unit level (tests/test_file_expiry.py): flipping it here
 would mean restarting the stack under test.
 """
+import json
 import os
 import subprocess
 import time
@@ -321,6 +322,15 @@ def test_an_upload_link_retention_is_enforced_the_same_way(admin, receivers_enab
                       f"AND resource_id = '{fid}'")
         assert audit == vid
         assert _psql(f"SELECT file_count FROM vaults WHERE id = '{vid}'") == "0"
+        # The Activity page lists it as a file deleted at its expiry, by the system, and names it
+        # only as deleted.
+        found = admin.get("/activity/events", params={"category": "files", "q": fid})
+        assert found.status_code == 200, found.text
+        (event,) = [e for e in found.json()["events"] if e["action"] == "file_expired"]
+        assert (event["label"], event["automatic"], event["username"], event["channel"]) == (
+            "File deleted at its expiry", True, None, None)
+        assert set(event["details"]) == {"vault_id", "expires_at"} and name not in json.dumps(event)
+        assert event["names"]["item"] == "Deleted", event["names"]
     finally:
         admin.post(f"/receivers/{rec['id']}/revoke")
         admin.delete_vault(vid)

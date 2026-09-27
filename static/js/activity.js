@@ -100,9 +100,10 @@
     }
 
     function whoText(ev) {
-        // An anonymous link visitor has no account; say what they had instead of "unknown".
+        // An anonymous link visitor has no account; say what they had instead of "unknown". An event
+        // the server records on its own (a file deleted at its expiry) has no one behind it.
         const anonymous = ev.channel === 'public_link' || ev.channel === 'upload_link';
-        const who = ev.username || (anonymous ? 'Someone with the link' : 'Unknown');
+        const who = ev.username || (anonymous ? 'Someone with the link' : ev.automatic ? 'System' : 'Unknown');
         return ev.temp_credential_id ? `${who} (temporary credential)` : who;
     }
 
