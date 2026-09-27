@@ -5434,8 +5434,9 @@ function renderUserDetail(u) {
             <div class="entity-actions">
                 <button class="btn btn-sm btn-secondary edit-user-btn" data-user-id="${u.id}">${iconSvg('edit', 'icon-sm')} Edit</button>
                 ${u.is_locked || u.sign_in_block
-                    ? `<button class="btn btn-sm btn-success unlock-user-btn" data-user-id="${u.id}">${iconSvg('unlock', 'icon-sm')} Unlock</button>`
-                    : `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>`}
+                    ? `<button class="btn btn-sm btn-success unlock-user-btn" data-user-id="${u.id}">${iconSvg('unlock', 'icon-sm')} Unlock</button>` : ''}
+                ${!u.is_locked
+                    ? `<button class="btn btn-sm btn-warning lock-user-btn" data-user-id="${u.id}">${iconSvg('lock', 'icon-sm')} Lock</button>` : ''}
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
                 ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 <button class="btn btn-sm btn-secondary copy-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('link', 'icon-sm')} Copy reset link</button>
@@ -6107,8 +6108,10 @@ function renderUserQuotaField(user) {
 
 // Lock user
 async function lockUser(userId) {
+    // An administrator's lock is not the pause failed sign-ins put on new sign-ins: it also ends every
+    // session, device and SFTP connection the account has.
     const confirmed = await showConfirm(
-        'They will not be able to log in until unlocked.',
+        'They are signed out everywhere, their devices and SFTP connections stop, and they cannot sign in until unlocked.',
         'Lock this user?'
     );
     if (!confirmed) return;
