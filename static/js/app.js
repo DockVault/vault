@@ -1961,6 +1961,12 @@ function logout() {
     const vaultDescEl = document.getElementById('vault-view-description');
     if (vaultDescEl) { vaultDescEl.textContent = ''; vaultDescEl.style.display = 'none'; }
 
+    // The previous person's preferences, the notes screen among them: the next person's come from
+    // their own account when they sign in.
+    state.userPreferences = null;
+    state.notesHideText = undefined;
+    state.notesRevealed = new Set();
+
     // Drop remembered vault passwords + restored-view so they can't leak to
     // another user who logs in on this same tab without a refresh.
     state.rememberedVaults = {};
@@ -19480,16 +19486,14 @@ async function deactivateNoteLinkTag(tag) {
 
 // ================= Notes =====================================================================
 // Personal server-side notes + "send note" (a snapshot copy to another user). Note text can be
-// masked with the "Hide note text" toggle (a local privacy screen, remembered per browser); the
-// per-note eye reveals one. All names/text render via _el (textContent) — never HTML.
+// masked with the "Hide note text" toggle (a privacy screen, saved on the account); the per-note eye
+// reveals one. All names/text render via _el (textContent) — never HTML.
 function _notesState() {
     if (!state.notes) state.notes = [];
     if (!state.notesReceived) state.notesReceived = [];
     if (!(state.notesRevealed instanceof Set)) state.notesRevealed = new Set();
-    if (typeof state.notesHideText !== 'boolean') {
-        try { state.notesHideText = localStorage.getItem('notesHideText') === '1'; }
-        catch (_) { state.notesHideText = false; }
-    }
+    // Set from the account's preference at sign-in (applyNotesHidePref); off until then.
+    if (typeof state.notesHideText !== 'boolean') state.notesHideText = false;
     if (!state.notesTab) {
         // Restore the last-viewed tab across a page reload (mine / received / shared).
         let saved = 'mine';
@@ -21191,7 +21195,9 @@ function wireNotesOnce() {
     const hide = document.getElementById('notes-hide-toggle');
     if (hide) hide.addEventListener('change', () => {
         state.notesHideText = hide.checked;
-        try { localStorage.setItem('notesHideText', hide.checked ? '1' : '0'); } catch (_) {}
+        // Saved on the account, so it stays on after signing out, in a new sign-in and in another
+        // browser, until it is turned off.
+        saveUserPreference({ hide_note_text: hide.checked ? 'on' : 'off' });
         state.notesRevealed = new Set();  // a fresh mask reveals nothing
         renderNotes();
     });
@@ -21406,6 +21412,10 @@ async function applyServerPreferences() {
     // Vault-list ordering. Applied before any early-return below so the list is ordered the
     // account's way on first paint rather than jumping after a later refresh.
     applyVaultOrderPrefs(prefs);
+    // Kept for the pages that read their own choices when they open (the Activity page's page size
+    // and live updates).
+    state.userPreferences = Object.assign({}, prefs);
+    applyNotesHidePref(prefs);
 
     // Per-user "never remember my vault password" preference (stored as 'on'/'off'). Apply it
     // before any early-return below so the opt-out always takes effect.
@@ -21454,6 +21464,33 @@ async function applyServerPreferences() {
         }
     }
     return false;
+}
+
+// "Hide note text" follows the account: the server keeps it, so a sign-out, a new sign-in or another
+// browser does not turn it off. Before 0.33.0 it lived in this browser's storage ('notesHideText');
+// such a value is moved to the account once, when the account has no choice saved yet, and the browser's
+// copy is removed either way so it cannot apply to the next person who signs in here.
+function applyNotesHidePref(prefs) {
+    let choice = prefs && prefs.hide_note_text;
+    let legacy = null;
+    try { legacy = localStorage.getItem('notesHideText'); } catch (_) {}
+    if (legacy !== null) {
+        try { localStorage.removeItem('notesHideText'); } catch (_) {}
+        if (choice !== 'on' && choice !== 'off' && legacy === '1' && !isScopedTemp) {
+            choice = 'on';
+            saveUserPreference({ hide_note_text: 'on' });
+        }
+    }
+    const hidden = choice === 'on';
+    if (state.notesHideText !== hidden) {
+        state.notesHideText = hidden;
+        state.notesRevealed = new Set();
+        const toggle = document.getElementById('notes-hide-toggle');
+        if (toggle) toggle.checked = hidden;
+        if (Array.isArray(state.notes) && typeof renderNotes === 'function') {
+            try { renderNotes(); } catch (_) { /* the notes page draws itself when opened */ }
+        }
+    }
 }
 
 // Persist a UI preference change to the server (fire-and-forget) so it follows the

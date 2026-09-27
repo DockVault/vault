@@ -56,11 +56,15 @@ def test_hide_text_masks_the_body(page: Page, admin, admin_creds):
     _create_note(page, title, "secret content")
     card = page.locator("#notes-list .card", has_text=title)
     expect(card.locator(".note-body")).to_have_text("secret content")
-    page.check("#notes-hide-toggle")
-    # The body is masked; the literal text is gone and a "hidden" marker shows.
-    expect(page.locator("#notes-list .note-body", has_text="secret content")).to_have_count(0)
-    expect(card).to_contain_text("hidden")
-    page.uncheck("#notes-hide-toggle")
+    try:
+        page.check("#notes-hide-toggle")
+        # The body is masked; the literal text is gone and a "hidden" marker shows.
+        expect(page.locator("#notes-list .note-body", has_text="secret content")).to_have_count(0)
+        expect(card).to_contain_text("hidden")
+        page.uncheck("#notes-hide-toggle")
+    finally:
+        # The choice is saved on the account, which later tests share: never leave it on.
+        admin.put("/users/me/preferences", json={"hide_note_text": "off"})
 
 
 def test_send_note_then_recipient_receives_and_adopts(page: Page, admin, admin_creds):

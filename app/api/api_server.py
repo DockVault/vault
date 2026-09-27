@@ -8446,7 +8446,18 @@ _PREF_ALLOWED = {
     # Where this user's decrypted downloads are written, when the organisation delegates the
     # choice. Consulted only then -- see app/core/download_sink.py for the precedence.
     "download_sink": {"buffered", "streaming"},
+    # The Notes page's "Hide note text" privacy screen. Kept here, not in the browser, so it stays on
+    # across sign-outs, new sign-ins and other browsers until the person turns it off.
+    "hide_note_text": {"on", "off"},
+    # The Activity page: rows per page ("all" loads as the list scrolls) and whether new events
+    # appear as they happen.
+    "activity_page_size": {"25", "50", "100", "all"},
+    "activity_live": {"on", "off"},
 }
+
+# Preferences that belong to the account's own pages, which a temporary credential's session cannot
+# open (Notes, Activity): such a session may read them but not change them for the account.
+_PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size", "activity_live"})
 
 
 def _sanitize_preferences(data) -> dict:
@@ -8472,6 +8483,9 @@ class PreferencesUpdate(BaseModel):
     vault_sort_dir: Optional[str] = None
     vault_fav_group: Optional[str] = None
     download_sink: Optional[str] = None
+    hide_note_text: Optional[str] = None
+    activity_page_size: Optional[str] = None
+    activity_live: Optional[str] = None
 
 
 def _current_session_hash(request) -> Optional[str]:
@@ -8913,6 +8927,8 @@ async def update_my_preferences(
     """Merge the provided (whitelisted) preferences into the current user's saved
     set and return the merged result. Creates the row lazily on first use."""
     incoming = _sanitize_preferences(update.model_dump(exclude_none=True))
+    if getattr(current_user, "_is_temp_session", False):
+        incoming = {k: v for k, v in incoming.items() if k not in _PREF_NOT_FOR_TEMP_SESSIONS}
     # Lock the row for the read-modify-write so two concurrent partial updates can't
     # lose a field (last-writer-wins on the whole JSON blob).
     row = (db.query(UserPreference)
