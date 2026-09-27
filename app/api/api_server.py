@@ -21243,6 +21243,20 @@ async def cleanup_expired_sessions():
                     db.commit()
                     print(f"🧹 Pruned {pruned} stale rate-limit record(s)")
 
+                # Delete finished session and pending-login rows once they are past retention.
+                # Each holds the address a sign-in came from, and nothing else ever removed them
+                # (see app/core/session_retention.py).
+                try:
+                    from app.core.session_retention import purge_old_session_data
+                    purged_sessions, purged_pending = purge_old_session_data(db)
+                    if purged_sessions or purged_pending:
+                        db.commit()
+                        print(f"🧹 Deleted {purged_sessions} old session row(s) and "
+                              f"{purged_pending} old pending sign-in row(s)")
+                except Exception as purge_err:
+                    db.rollback()
+                    print(f"⚠ session retention purge failed: {type(purge_err).__name__}")
+
                 # Prune abandoned chunked-upload sessions AND reclaim their buffered chunks
                 # on disk. A terminal/expired session holds the plaintext filename/MIME as
                 # transfer working state, and its raw chunks sit under _uploads/<sid>/. The
