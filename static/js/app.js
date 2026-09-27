@@ -14379,11 +14379,18 @@ async function deleteVaultItem(itemId, itemName, type) {
         await apiRequest(path, { method: 'POST', headers });
 
         showSuccess('Deleted successfully');
-        
+
         // Reload files
         await loadVaultFiles();
     } catch (error) {
         console.error('Delete failed:', error);
+        if (type === 'folder' && error && error.status === 409) {
+            // The folder was kept because a file in it could not be removed, and the files before
+            // that one are gone. Say so in the server's words, and show what is left.
+            showError(error.message);
+            try { await loadVaultFiles(); } catch (_) { /* the message above already stands */ }
+            return;
+        }
         showError('Failed to delete item');
     }
 }

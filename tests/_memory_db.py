@@ -14,11 +14,15 @@ Rows are plain objects (``types.SimpleNamespace`` is enough) filed under their m
 
 A query for columns (``db.query(File.id, File.size_bytes)``) returns rows that unpack like tuples
 and read like objects. ``with_for_update`` is recorded in ``db.log``; with ``skip_locked=True`` it
-skips the rows whose id is in ``db.held`` (locked by someone else). Anything this does not model
-raises, so a test never passes by accident on an expression it silently ignored.
+skips the rows whose id is in ``db.held`` (locked by someone else). Without it, a locking read that
+reaches a held row fails as Postgres fails it when the app's lock_timeout runs out: OperationalError,
+and the transaction is then unusable -- any further query, and a commit, fails until a rollback.
+Anything this does not model raises, so a test never passes by accident on an expression it silently
+ignored.
 """
 import operator
 
+from sqlalchemy.exc import InternalError, OperationalError
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql import elements, operators
 from sqlalchemy.sql.selectable import ScalarSelect, Select
@@ -52,6 +56,7 @@ class MemoryDB:
         self.log = []            # ("lock", model, kw) / ("update", model, n) / ("delete", model, n) / ...
         self.on_lock = []        # callables run once, in order, before the next locking read
         self.added, self.deleted = [], []
+        self.aborted = False     # a statement failed; only a rollback makes the session usable again
 
     # -- the session surface the code under test uses ---------------------------------------
     def query(self, *entities):
@@ -62,6 +67,7 @@ class MemoryDB:
         self.log.append(("add", obj))
 
     def delete(self, obj):
+        self.usable()
         for rows in self.tables.values():
             if obj in rows:
                 rows.remove(obj)
@@ -69,13 +75,21 @@ class MemoryDB:
         self.log.append(("orm-delete", obj))
 
     def flush(self):
+        self.usable()
         self.log.append(("flush",))
 
     def commit(self):
+        self.usable()
         self.log.append(("commit",))
 
     def rollback(self):
+        self.aborted = False
         self.log.append(("rollback",))
+
+    def usable(self):
+        if self.aborted:
+            raise InternalError("(statement)", {}, Exception(
+                "current transaction is aborted, commands ignored until end of transaction block"))
 
     def refresh(self, obj):
         pass
@@ -189,6 +203,7 @@ class MemoryQuery:
         return self
 
     def _matching(self):
+        self.db.usable()
         if self.lock is not None:
             self.db.log.append(("lock", self.model, dict(self.lock)))
             while self.db.on_lock:
@@ -197,6 +212,11 @@ class MemoryQuery:
                 if all(self.db.truth(c, r) is True for c in self.criteria)]
         if self.lock is not None and self.lock.get("skip_locked"):
             rows = [r for r in rows if getattr(r, "id", None) not in self.db.held]
+        elif self.lock is not None and any(getattr(r, "id", None) in self.db.held for r in rows):
+            self.db.aborted = True
+            self.db.log.append(("lock-timeout", self.model))
+            raise OperationalError("(statement)", {}, Exception(
+                "canceling statement due to lock timeout"))
         for col in reversed(self.order):
             desc = isinstance(col, elements.UnaryExpression) and col.modifier is operators.desc_op
             key = (col.element if isinstance(col, elements.UnaryExpression) else col).key

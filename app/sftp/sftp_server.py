@@ -2086,44 +2086,38 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
             if not self._scope_ok_folder(db, user, vault.id, folder_id):
                 return paramiko.SFTP_NO_SUCH_FILE
 
-            # Recursively wipe contained files (storage + rows + stats), then
-            # sub-folders, then the folder — mirrors the web delete_folder handler.
-            def _purge(fid):
-                n = 0
-                for child in db.query(File).filter(File.folder_id == fid).all():
-                    try:
-                        vault_service.delete_file(child.id, user)
-                        n += 1
-                    except PermissionDeniedError:
-                        # Never destroy a file the caller can't delete — abort the whole
-                        # rmdir (defense-in-depth behind the vault-level DELETE gate above).
-                        raise
-                    except Exception as ex:  # noqa: BLE001
-                        safe_event('rmdir.child-delete.failed', ex, file=child.id)
-                for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
-                    n += _purge(sub.id)
-                    db.delete(sub)
-                return n
+            # Every file first, each deleted as a file delete is (bytes, row and the vault's
+            # counters); the folders only when none is left -- mirrors the web delete_folder
+            # handler. A file that cannot be deleted stops it and the folder is kept: removing it
+            # anyway would take that file's row with it, and leave its bytes on disk and its size
+            # in the vault's counters.
             try:
-                _rmdir_deleted = _purge(folder_id)
-                folder = db.query(Folder).filter(Folder.id == folder_id).first()
-                if folder is not None:
-                    db.delete(folder)
-                db.commit()
-                # Feed the whole subtree to the bulk-deletion detector as ONE record (SFTP rmdir is a
-                # high-throughput deletion vector). Best-effort: monitoring must never fail the rmdir.
-                if _rmdir_deleted:
-                    try:
-                        from app.services.security_monitor import get_security_monitor
-                        get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=_rmdir_deleted)
-                    except Exception:
-                        pass
+                outcome = vault_service.delete_folder_tree(vault.id, folder_id, user)
             except PermissionDeniedError:
                 db.rollback()
                 return paramiko.SFTP_PERMISSION_DENIED
+            except FolderNotFoundError:
+                db.rollback()
+                return paramiko.SFTP_NO_SUCH_FILE
             except Exception as e:  # noqa: BLE001
                 db.rollback()
                 safe_event('rmdir.failed', e, vault=vault.id)
+                return paramiko.SFTP_FAILURE
+            # Feed the whole subtree to the bulk-deletion detector as ONE record (SFTP rmdir is a
+            # high-throughput deletion vector), also when it stopped part way. Best-effort:
+            # monitoring must never fail the rmdir.
+            if outcome.deleted:
+                try:
+                    from app.services.security_monitor import get_security_monitor
+                    get_security_monitor(db).record_file_deletion(str(user.id), str(vault.id), file_count=outcome.deleted)
+                except Exception:
+                    pass
+            if not outcome.folder_deleted:
+                safe_event('rmdir.incomplete', vault=vault.id, removed=outcome.deleted)
+                self._audit(user, "folder_delete", str(folder_id),
+                            {"vault_id": str(vault.id), "via": "sftp",
+                             "files_deleted": outcome.deleted, "files_left": outcome.left},
+                            status="failure")
                 return paramiko.SFTP_FAILURE
             self._audit(user, "folder_delete", str(folder_id),
                         {"vault_id": str(vault.id), "via": "sftp"})
@@ -2134,12 +2128,12 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         return paramiko.SFTP_OP_UNSUPPORTED
 
     # -- audit --------------------------------------------------------------
-    def _audit(self, user, action: str, resource_id: str, details: dict):
+    def _audit(self, user, action: str, resource_id: str, details: dict, status: str = "success"):
         try:
             with get_db_context() as db:
                 AuditLogger(db).log_action(
                     action=action,
-                    status="success",
+                    status=status,
                     user=user,
                     resource_type=("folder" if "folder" in action else "file"),
                     resource_id=resource_id,

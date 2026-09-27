@@ -21179,7 +21179,9 @@ async def delete_folder(
     db: Session = Depends(get_db),
     x_vault_password: Optional[str] = Header(None)
 ):
-    """Delete a folder and everything inside it (recursive, secure file wipe)."""
+    """Delete a folder and everything inside it (recursive, secure file wipe). When a file in it
+    cannot be deleted, the delete stops there and answers 409: the folder is kept, with that file and
+    the ones not reached yet."""
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -21189,7 +21191,7 @@ async def delete_folder(
         require_folder_scope(db, current_user, vault_id, folder_id)
         # folder deletion recursively wipes every file in the subtree — require DELETE
         # permission, not the mere READ that get_vault checks. Without this a read-only member
-        # could destroy a whole folder tree (the per-file delete_file errors below were
+        # could destroy a whole folder tree (the per-file delete_file errors were once
         # swallowed, so the folder records were removed regardless). Owner/admin/delete-member.
         from app.core.models import VaultPermissionEnum
         if not permission_service.can_access_vault(current_user, vault_id, VaultPermissionEnum.DELETE):
@@ -21200,27 +21202,32 @@ async def delete_folder(
             raise HTTPException(status_code=404, detail="Folder not found")
         folder_name = folder.name
 
-        # Recurse: securely delete each file (storage + record + vault stats),
-        # then remove sub-folders, then the folder itself. Returns the count of files deleted.
-        def _purge(fid):
-            n = 0
-            for f in db.query(File).filter(File.folder_id == fid).all():
-                try:
-                    vault_service.delete_file(f.id, current_user)
-                    n += 1
-                except PermissionDeniedError:
-                    # Never destroy a file the caller can't delete — abort the whole operation
-                    # (defense-in-depth behind the vault-level DELETE gate above).
-                    raise
-                except Exception as ex:
-                    print(f"Warning: failed to delete file {f.id} during folder delete: {ex}")
-            for sub in db.query(Folder).filter(Folder.parent_folder_id == fid).all():
-                n += _purge(sub.id)
-                db.delete(sub)
-            return n
-        deleted_count = _purge(folder_id)
-        db.delete(folder)
-        db.commit()
+        # Every file first, each deleted as a file delete is (bytes, row and the vault's counters);
+        # the folders only when none is left. A file that cannot be deleted stops it and the folder
+        # is kept: deleting it anyway would take that file's row with it and leave its bytes on disk
+        # and its size in the vault's counters.
+        outcome = vault_service.delete_folder_tree(vault_id, folder_id, current_user)
+
+        # A folder delete is the highest-throughput deletion vector — feed the whole subtree to the
+        # bulk-deletion detector as ONE record (not per-file, to avoid hammering the alert row), also
+        # when it stopped part way. Best-effort: monitoring must never fail the delete.
+        if outcome.deleted:
+            try:
+                from app.services.security_monitor import get_security_monitor
+                get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=outcome.deleted)
+            except Exception:
+                pass
+
+        if not outcome.folder_deleted:
+            audit_logger.log_action(
+                action='folder_delete', status='failure', user=current_user,
+                resource_type='folder', resource_id=str(folder_id),
+                details={'vault_id': str(vault_id), 'folder_name': folder_name,
+                         'files_deleted': outcome.deleted, 'files_left': outcome.left},
+                error_message='The folder was kept',
+                ip_address=get_client_ip(request)
+            )
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=outcome.refusal())
 
         audit_logger.log_action(
             action='folder_delete', status='success', user=current_user,
@@ -21228,16 +21235,6 @@ async def delete_folder(
             details={'vault_id': str(vault_id), 'folder_name': folder_name},
             ip_address=get_client_ip(request)
         )
-
-        # A folder delete is the highest-throughput deletion vector — feed the whole subtree to the
-        # bulk-deletion detector as ONE record (not per-file, to avoid hammering the alert row).
-        # Best-effort: monitoring must never fail the delete.
-        if deleted_count:
-            try:
-                from app.services.security_monitor import get_security_monitor
-                get_security_monitor(db).record_file_deletion(str(current_user.id), str(vault_id), file_count=deleted_count)
-            except Exception:
-                pass
 
         return {'message': f'Folder "{folder_name}" deleted'}
     except (PasswordRequiredError, InvalidPasswordError) as e:

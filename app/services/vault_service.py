@@ -6,7 +6,7 @@ import os
 import shutil
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Tuple, BinaryIO
+from typing import Optional, List, NamedTuple, Tuple, BinaryIO
 import itertools
 import uuid
 import mimetypes
@@ -243,6 +243,29 @@ class DuplicateNameError(FileServiceError):
     clash path deletes the prior row first; this surfaces only on a lost concurrent race
     (or a folder-create clash) and the API layer maps it to HTTP 409."""
     pass
+
+
+def _files(n: int) -> str:
+    return f"{n} file" if n == 1 else f"{n} files"
+
+
+class FolderDeletion(NamedTuple):
+    """What VaultService.delete_folder_tree did: how many files it deleted, how many are still in
+    the folder, and whether the folder went -- which it does only when no file is left in it."""
+    deleted: int
+    left: int
+    folder_deleted: bool
+
+    def refusal(self) -> str:
+        """What to tell the person whose folder was kept."""
+        if self.left:
+            done = ("Nothing was deleted." if not self.deleted else
+                    f"{_files(self.deleted)} {'was' if self.deleted == 1 else 'were'} deleted.")
+            return f"The folder was kept: {_files(self.left)} in it could not be removed. {done}"
+        if self.deleted:
+            return (f"The {_files(self.deleted)} in the folder {'was' if self.deleted == 1 else 'were'} "
+                    "deleted, but the folder itself could not be. Try again.")
+        return "The folder could not be deleted. Try again."
 
 
 def is_refundable_serve_failure(exc) -> bool:
@@ -2006,7 +2029,103 @@ class VaultService:
                         storage_path.unlink()
                     except Exception:
                         pass
-    
+
+    def delete_folder_tree(self, vault_id: uuid.UUID, folder_id: uuid.UUID,
+                           user: User) -> "FolderDeletion":
+        """Delete a folder, the folders under it and every file in them -- or, when a file cannot
+        be deleted, stop and keep the folder.
+
+        Deleting a folder row takes every file row in it along (files.folder_id cascades), and the
+        cascade does none of what a file delete must: the file's stored bytes stay on disk and its
+        size and count stay in the vault's counters. So the files go first, one at a time, through
+        delete_file -- the vault row and then the file row locked, the size taken off by whoever
+        deletes the row, the bytes destroyed after the commit. The first file that cannot be
+        deleted stops it: that file, the files not reached yet and every folder are left as they
+        are.
+
+        Then the folders go, but only once they are locked and hold no file. A locked folder gains
+        no file and no subfolder until this commits (a new row that names it waits for the lock),
+        so a file uploaded or moved in while the files were being deleted is counted and keeps the
+        folder, instead of going with it.
+
+        Returns how many files were deleted, how many are still in the folder, and whether the
+        folder was deleted. Raises FolderNotFoundError if the folder is not in the vault, and
+        PermissionDeniedError, deleting no further file, if `user` may not delete one.
+        """
+        tree = self._folder_tree_ids(vault_id, folder_id, lock=False)
+        if not tree:
+            raise FolderNotFoundError(f"Folder not found: {folder_id}")
+        file_ids = [fid for (fid,) in self.db.query(File.id)
+                    .filter(File.folder_id.in_(tree)).order_by(File.id).all()]
+        deleted = 0
+        for position, fid in enumerate(file_ids):
+            try:
+                self.delete_file(fid, user)
+            except FileNotFoundError:
+                # Deleted meanwhile by someone else (the expiry sweep, another request), who took its
+                # size off. Nothing is owed for it; the rollback lets go of the vault row.
+                self.db.rollback()
+                continue
+            except PermissionDeniedError:
+                self.db.rollback()
+                raise
+            except Exception as e:  # noqa: BLE001
+                # A row lock that was not let go in time, a lost connection, anything. The session
+                # is rolled back (a failed statement leaves its transaction unusable) and nothing
+                # more is deleted: this file and the ones after it stay, and so does every folder.
+                self.db.rollback()
+                safe_event('folder-delete.file-failed', e, file=fid, vault=vault_id)
+                return FolderDeletion(deleted, len(file_ids) - position, False)
+            deleted += 1
+
+        try:
+            # The vault row first, as every other writer takes it, then the folders from the top.
+            self.db.query(Vault.id).filter(Vault.id == vault_id).with_for_update(key_share=True).first()
+            tree = self._folder_tree_ids(vault_id, folder_id, lock=True)
+            if not tree:
+                # Deleted meanwhile by someone else: gone, as asked.
+                self.db.rollback()
+                return FolderDeletion(deleted, 0, True)
+            left = self.db.query(File.id).filter(File.folder_id.in_(tree)).count()
+            if left:
+                self.db.rollback()
+                return FolderDeletion(deleted, left, False)
+            # A bulk delete, so the ORM's own cascade from Folder.files is not run either.
+            self.db.query(Folder).filter(Folder.id.in_(tree)).delete(synchronize_session=False)
+            self.db.commit()
+        except Exception as e:  # noqa: BLE001
+            # The files are gone, each accounted for; only the empty folders are left.
+            self.db.rollback()
+            safe_event('folder-delete.folders-failed', e, vault=vault_id)
+            return FolderDeletion(deleted, 0, False)
+        return FolderDeletion(deleted, 0, True)
+
+    def _folder_tree_ids(self, vault_id, folder_id, *, lock: bool) -> list:
+        """The ids of a folder and of every folder under it, the folder first; empty when the folder
+        is not in the vault.
+
+        With `lock`, each level is locked FOR UPDATE before the next is read, so the tree read is
+        the tree that stays: no folder can be added under a locked one (the new row's reference
+        waits for the lock), and none can be moved out (the move updates its own row, locked too).
+        """
+        def rows(q):
+            return q.with_for_update().all() if lock else q.all()
+
+        if not rows(self.db.query(Folder.id).filter(Folder.id == folder_id,
+                                                    Folder.vault_id == vault_id)):
+            return []
+        ids, level = [folder_id], [folder_id]
+        seen = {folder_id}
+        while level:
+            level = [cid for (cid,) in rows(
+                self.db.query(Folder.id).filter(Folder.vault_id == vault_id,
+                                                Folder.parent_folder_id.in_(level))
+                .order_by(Folder.id))
+                if cid not in seen]
+            seen.update(level)
+            ids.extend(level)
+        return ids
+
     def rename_file(self, file_id: uuid.UUID, new_name: str, user: User,
                     vault_id: Optional[uuid.UUID] = None, *,
                     zk_enc_name: Optional[str] = None,
