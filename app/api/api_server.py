@@ -2513,6 +2513,46 @@ def activity_usernames(
     return {"usernames": ev.username_suggestions(db, q, limit)}
 
 
+@app.get("/activity/summary")
+def activity_summary(
+    range_: str = Query("24h", alias="range", pattern="^(24h|7d|30d)$"),
+    tz_offset: int = Query(0, ge=-840, le=840),
+    category: List[str] = Query([]),
+    channel: List[str] = Query([]),
+    status: List[str] = Query([]),
+    user: Optional[str] = Query(None, max_length=128),
+    ip: Optional[str] = Query(None, max_length=64),
+    q: Optional[str] = Query(None, max_length=128),
+    temp_credential: Optional[str] = Query(None, max_length=128),
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """The Activity page's summary band (admin only): over the last 24 hours, 7 days or 30 days, the
+    events in each hour, quarter day or day by category, the category mix, sign-in outcomes, the most
+    active usernames and addresses, and what is happening now (signed-in sessions, web transfers).
+
+    It counts what the Events list shows for the same filters and names nothing it does not: no vault,
+    file or folder name. `tz_offset` is the viewer's clock in minutes east of UTC, so days start at the
+    viewer's midnight. A plain def: its queries run in the thread pool, off the event loop."""
+    from app.core.models import AuditLog
+    from app.services import activity_events as ev
+    from app.services import activity_summary as summary
+    now = datetime.now(timezone.utc).replace(tzinfo=None)          # the log stores naive UTC
+    win = summary.window(range_, now, tz_offset)
+    base = ev.build_events_query(
+        db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
+        username=user, ip=ip, text=q, temp_credential=temp_credential)
+    key = (range_, tz_offset, win.start, tuple(sorted(category)), tuple(sorted(channel)),
+           tuple(sorted(status)), user, ip, q, temp_credential)
+    band, age = summary.cached(key, range_, lambda: summary.summarize(db, base, AuditLog, win))
+    out = {"range": range_, **band, "age_seconds": round(age, 1)}
+    out["now"] = summary.now_panel(db, now, {
+        "in_progress": get_active_operations_count(),
+        "waiting": transfer_admission.stats()["waiting"],
+    })
+    return out
+
+
 @app.get("/activity/export")
 def activity_export(
     format: str = Query("csv", pattern="^(csv|ndjson)$"),
