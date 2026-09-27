@@ -52,17 +52,21 @@ def _person(role=RoleEnum.ADMIN, **kw):
 
 # --------------------------------------------------------------------------- who can act
 
-@pytest.mark.parametrize("person,able", [
-    (_person(), True),
-    (_person(role=RoleEnum.USER), False),
-    (_person(role=RoleEnum.EXTERNAL), False),
-    (_person(is_active=False), False),
-    (_person(is_locked=True), False),                                            # an admin's lock
-    (_person(is_locked=True, locked_until=_now() + timedelta(minutes=5)), False),  # a running timed lock
-    (_person(is_locked=True, locked_until=_now() - timedelta(minutes=5)), True),   # one that ran out
+# A timed lock is given as minutes from now and built when the test runs: a deadline computed at
+# collection has already passed by the time a long suite reaches this test.
+@pytest.mark.parametrize("fields,lock_minutes,able", [
+    ({}, None, True),
+    ({"role": RoleEnum.USER}, None, False),
+    ({"role": RoleEnum.EXTERNAL}, None, False),
+    ({"is_active": False}, None, False),
+    ({"is_locked": True}, None, False),        # an admin's lock
+    ({"is_locked": True}, 5, False),           # a running timed lock
+    ({"is_locked": True}, -5, True),           # one that ran out
 ])
-def test_who_can_administer(person, able):
-    assert L.can_administer(person) is able
+def test_who_can_administer(fields, lock_minutes, able):
+    if lock_minutes is not None:
+        fields = dict(fields, locked_until=_now() + timedelta(minutes=lock_minutes))
+    assert L.can_administer(_person(**fields)) is able
 
 
 def test_the_last_able_admin_is_the_only_one_who_can_act():
