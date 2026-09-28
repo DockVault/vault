@@ -721,11 +721,20 @@
 
     // A vault chip is named from this viewer's own vault list, as the Vaults page names it (a locked
     // zero-knowledge vault by its label); a vault not in it is shown by the start of its id. A saved
-    // search holds the id only.
+    // search holds the id only. The app's list is not read yet when a link or a saved search opens the
+    // page straight after signing in, so this viewer's own list is read once and the chip named again.
+    let vaultNamesAsked = false;
     function vaultChipName(id) {
         const pool = [].concat((typeof state !== 'undefined' && state.allVaults) || [], S.vaultList || []);
         const v = pool.find((x) => x && String(x.id) === String(id));
         if (v) return typeof vaultDisplayName === 'function' ? vaultDisplayName(v) : (v.name || 'Vault');
+        if (!S.vaultList && !vaultNamesAsked && S.active && !S.blocked) {
+            vaultNamesAsked = true;
+            vaultList().then(() => {
+                vaultNamesAsked = false;
+                if (S.active && !S.blocked) renderChips();
+            });
+        }
         return `name not shown (${String(id).slice(0, 6)})`;
     }
 
