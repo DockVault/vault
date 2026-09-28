@@ -1228,11 +1228,6 @@ class AuditLog(Base):
         Index('idx_audit_timestamp', 'timestamp'),
         Index('idx_audit_user', 'user_id'),
         Index('idx_audit_action', 'action'),
-        # idx_audit_username_prefix, for the Activity page's username typeahead, is built after
-        # startup, concurrently, by app/core/optional_indexes.py on fresh and upgraded databases
-        # alike. It is not declared here because it is a Postgres expression index (in the "C"
-        # collation), and this model also builds the table in SQLite for tests; nor would create_all
-        # build it concurrently.
     )
 
 

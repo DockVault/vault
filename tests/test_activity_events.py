@@ -299,6 +299,21 @@ def test_the_username_typeahead_suggests_accounts_and_never_reads_the_log():
     assert ev.username_suggestions(db, "", 10) == []
 
 
+def test_nothing_builds_an_index_over_the_audit_logs_usernames():
+    """With suggestions from the accounts table only, nothing searches the log by a name's prefix, so
+    nothing builds the index that search used (idx_audit_username_prefix, in the "C" collation): it
+    would only cost a build over the whole audit log at the first start, and the space. No released
+    version had it."""
+    import re
+    from pathlib import Path
+    app = Path(__file__).resolve().parents[1] / "app"
+    sources = {p.relative_to(app).as_posix(): p.read_text(encoding="utf-8") for p in app.rglob("*.py")}
+    assert "services/activity_events.py" in sources and len(sources) > 50
+    building = sorted(name for name, text in sources.items()
+                      if "idx_audit_username_prefix" in text or re.search(r'lower\(username\)\s*COLLATE', text))
+    assert building == [], building
+
+
 def test_the_host_operator_is_told_apart_from_a_name_typed_at_sign_in():
     """The host tool's rows carry the internal name operator@host and no account: the page shows them as
     the server's operator. The same text typed at a failed sign-in stays what it is, a typed name."""
