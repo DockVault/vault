@@ -343,6 +343,7 @@ def test_every_row_the_host_tool_writes_is_known_as_the_operators():
     ("credential_change_expired", "Held change expired"),
     ("credential_change_withdrawn", "Held change withdrawn"),
     ("credential_change_refused", "Sign-in change refused (no approver)"),
+    ("credential_change_approval_refused", "Approval refused (not independent)"),
 ])
 def test_the_held_change_events_are_short_enough_for_a_phone_row(action, label):
     """A phone row is about 36 characters of label wide: "Sign-in change held for a second admini..."
