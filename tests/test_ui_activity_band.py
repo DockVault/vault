@@ -57,6 +57,8 @@ def test_every_panel_filters_the_list_and_its_chip_undoes_it(page: Page, anon, a
     # By category: a row is a category filter. The panel keeps listing the other categories, dimmed, so
     # the next one can be added; the panels that count under it say so.
     cats = page.locator("#act-p-cat .act-rank-row")
+    # The band is read again without the status filter; the title changes at once, the rows on arrival.
+    page.wait_for_function("() => document.querySelectorAll('#act-p-cat .act-rank-row').length >= 2", timeout=10000)
     listed = cats.count()
     assert listed >= 2, "the log should hold events of more than one category by now"
     label = cats.first.locator(".act-rank-label").inner_text()
