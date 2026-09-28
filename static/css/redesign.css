@@ -1049,6 +1049,7 @@ button.chip:hover { filter: brightness(1.05); }
 .tc-restrict-row:hover { background: var(--hover-overlay); }
 .tc-restrict-row .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tc-restrict-row input[type="checkbox"] { accent-color: var(--brand-strong); flex: 0 0 auto; }
+.rc-retention-editor input[type="checkbox"] { accent-color: var(--brand-strong); }
 .tc-restrict-row .open { cursor: pointer; color: var(--brand-strong); background: none; border: none;
     padding: 0 .25rem; font-size: var(--text-sm, .82rem); flex: 0 0 auto; }
 .tc-restrict-row .open:hover { text-decoration: underline; }

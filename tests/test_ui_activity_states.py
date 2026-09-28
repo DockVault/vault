@@ -148,3 +148,22 @@ def test_a_copied_link_shows_another_administrator_only_the_names_they_may_see(p
     finally:
         admin.delete_user(other["id"])
         owner.delete_vault(vault["id"])
+
+
+def test_classic_filter_checkboxes_take_the_skins_accent(page: Page, activity_admin):
+    """In Classic the filter panel's checkboxes are drawn in the skin's accent, not the browser's blue."""
+    page.add_init_script("try { localStorage.setItem('ui', 'v1'); } catch (e) {}")
+    login(page, activity_admin)
+    open_activity(page)
+    page.click("#act-filter-btn")
+    box = page.locator("#act-filter-panel .act-fp-check input[type=checkbox]").first
+    expect(box).to_be_visible()
+    got = box.evaluate("""(b) => {
+        const probe = document.createElement('span');
+        probe.style.color = 'var(--brand-strong)';
+        document.body.appendChild(probe);
+        const strong = getComputedStyle(probe).color;
+        probe.remove();
+        return { strong, accent: getComputedStyle(b).accentColor };
+    }""")
+    assert got["accent"] == got["strong"], got

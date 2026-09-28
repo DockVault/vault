@@ -212,3 +212,33 @@ def test_a_created_upload_link_says_it_cannot_be_retrieved(page: Page, admin_cre
             f"the dialog should say a lost link can be replaced: {shown!r}")
     finally:
         admin.put("/settings", json={"public_receivers_enabled": False})
+
+
+_STRONG = """(sel) => {
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--brand-strong)';
+    document.body.appendChild(probe);
+    const strong = getComputedStyle(probe).color;
+    probe.remove();
+    return { strong, accent: getComputedStyle(document.querySelector(sel)).accentColor };
+}"""
+
+
+def test_the_retention_editors_keep_box_takes_the_classic_accent(page: Page, admin):
+    """In Classic the upload link's "Keep uploads until I delete them" box is drawn in the skin's accent,
+    as its other checkboxes are, not the browser's blue. The link is stood in for: only the dialog is
+    looked at."""
+    user = admin.create_user(role="admin")
+    try:
+        page.add_init_script("try { localStorage.setItem('ui', 'v1'); } catch (e) {}")
+        _login(page, user["_username"], user["_password"])
+        page.evaluate("""() => openReceiverInfoModal({ id: 'R', vault_id: 'V', label: 'Drop', tag_name: 'Normal',
+            status: 'active', secret_kind: null, expires_at: null, max_uploads: null, upload_count: 0,
+            retention_days: 7, retention_limit_days: 3650, retention_may_keep: true, max_total_bytes: null,
+            stored_bytes: 0 })""")
+        page.click("#rc-info-retention-change")
+        expect(page.locator("#rc-info-retention-keep")).to_be_visible()
+        got = page.evaluate(_STRONG, "#rc-info-retention-keep")
+        assert got["accent"] == got["strong"], got
+    finally:
+        admin.delete_user(user["id"])
