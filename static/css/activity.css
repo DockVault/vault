@@ -635,7 +635,8 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 
     .act-band { grid-template-columns: minmax(0, 1fr); grid-template-areas: "time" "more" "cat" "signin" "active" "now"; margin-bottom: 8px; }
     .act-panel, .act-panel + .act-panel { border-left: 0; border-top: 0; }
-    .act-now, .act-cat, .act-signin, .act-active { display: none; border-top: 1px solid var(--act-line); }
+    /* As specific as the rule above, and after it, so each expanded panel keeps its rule on top. */
+    .act-band .act-now, .act-band .act-cat, .act-band .act-signin, .act-band .act-active { display: none; border-top: 1px solid var(--act-line); }
     .act-band.show-more .act-now, .act-band.show-more .act-cat, .act-band.show-more .act-signin, .act-band.show-more .act-active { display: block; }
     .act-time { padding: 8px 12px 4px; }
     .act-time .act-plot { height: 44px; margin-top: 6px; }

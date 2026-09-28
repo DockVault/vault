@@ -332,3 +332,17 @@ def test_the_band_stays_one_row_in_classic_at_1280_px(page: Page, activity_admin
     # One row, Most active's choice wrapped under its title: about 168 px, against 299 for two rows.
     assert at["rows"] == 1 and at["overflow"] == 0 and at["height"] < 190, at
     assert rows(page).first.bounding_box()["y"] < 450
+
+
+@pytest.mark.parametrize("skin", ["v2", "v1"])
+def test_on_a_phone_the_expanded_charts_are_ruled_apart(page: Page, activity_admin, skin):
+    """"More charts" opens By category, Sign-ins, Most active and Now under the Events chart, each with a
+    hairline above it so they do not run together."""
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin, width=390, height=844)
+    open_activity(page)
+    page.click("#act-more-charts")
+    expect(page.locator("#act-p-cat")).to_be_visible()
+    rules = page.evaluate("""() => ['cat', 'signin', 'active', 'now']
+        .map((k) => getComputedStyle(document.getElementById('act-p-' + k)).borderTopWidth)""")
+    assert rules == ["1px"] * 4, rules
