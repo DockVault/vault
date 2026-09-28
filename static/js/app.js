@@ -1268,6 +1268,20 @@ function _renderInviteForm(token, info) {
     if (emailInput) emailInput.focus(); else pw.focus();
 }
 
+// Leave the invitation or reset screen for sign-in with a REAL load of the clean page, never an
+// in-place screen switch. The startup handler stops at an /?invite= or /?reset= link (it runs that
+// flow instead of the app's), so on this load the sidebar, the menus, sign-out and the rest were
+// never wired: switching screens in place let the person sign in to an app that ignored every click
+// until they reloaded. The token left the URL on arrival, so the address is already the bare path:
+// replace() loads it without adding a history entry, and nothing signs anyone in — the new page does
+// what any fresh load does. The confirmation's button and its timer can both fire; one load is enough.
+let _signInReloadStarted = false;
+function _reloadToSignIn() {
+    if (_signInReloadStarted) return;
+    _signInReloadStarted = true;
+    location.replace(location.pathname);
+}
+
 function _inviteAccepted(username) {
     // Strip the token from the URL so a reload of a now-consumed link doesn't show "invalid",
     // release the invite screen gate, and route to login — the visitor is NOT auto-signed-in.
@@ -1280,10 +1294,10 @@ function _inviteAccepted(username) {
         body.appendChild(_el('p', 'text-secondary mb-lg',
             'Your account is ready. Sign in with your new password to continue.'));
         const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
-        go.addEventListener('click', () => showScreen('login-screen'));
+        go.addEventListener('click', _reloadToSignIn);
         body.appendChild(go);
     }
-    setTimeout(() => { showScreen('login-screen'); }, 2500);
+    setTimeout(_reloadToSignIn, 2500);
 }
 
 // Reached via /?reset=<token>. Bare fetch only; DOM built with _el/textContent; every failure shows
@@ -1359,10 +1373,10 @@ function _resetDone() {
         body.appendChild(_el('p', 'text-secondary mb-lg',
             'Your password has been changed. Sign in with your new password to continue.'));
         const go = _el('button', 'btn btn-primary btn-block', 'Go to sign in');
-        go.addEventListener('click', () => showScreen('login-screen'));
+        go.addEventListener('click', _reloadToSignIn);
         body.appendChild(go);
     }
-    setTimeout(() => { showScreen('login-screen'); }, 2500);
+    setTimeout(_reloadToSignIn, 2500);
 }
 
 // Login
@@ -20748,6 +20762,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // An /?invite=... link is the invitation-acceptance flow: an anonymous visitor sets a password
     // and claims a pre-created account. It takes precedence over any cached session and never enters
     // the app — run it and stop here so the login/session bootstrap below is skipped.
+    //
+    // Everything below the two early returns (sidebar, menus, sign-out, uploads, ...) is therefore
+    // NOT wired on this load. So these flows must leave with a real page load (_reloadToSignIn),
+    // never with an in-place showScreen() into the sign-in or app screens.
     const inviteToken = new URLSearchParams(location.search).get('invite');
     if (inviteToken) {
         // Strip ?invite=<token> from the URL immediately (keep the token only in JS memory), so the
