@@ -209,3 +209,20 @@ def test_the_band_is_a_few_tab_stops_and_works_from_the_keyboard(page: Page, ano
     expect(page.locator("#act-chips")).to_contain_text(f"Category: {label}")
     page.keyboard.press("/")
     expect(page.locator("#act-search")).to_be_focused()
+
+
+@pytest.mark.parametrize("skin", ["v2", "v1"])
+def test_no_title_count_or_header_is_cut_short(page: Page, anon, activity_admin, skin):
+    """The band's titles, its counts and labels, and the table's headers fit their room in both skins; a
+    long category or person name is the only thing that may be ellipsized, with the full text in its
+    title."""
+    failed_sign_in(anon)
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin)
+    open_activity(page)
+    cut = page.evaluate("""() => ['.act-ptitle-text', '.act-ptitle-note', '.act-now-row', '.act-now-label',
+                                  '.act-signin-label', '.act-key-text', '#act-table thead th']
+        .flatMap((sel) => Array.from(document.querySelectorAll(sel)))
+        .filter((e) => e.offsetParent && e.scrollWidth > e.clientWidth)
+        .map((e) => e.textContent.trim())""")
+    assert cut == []

@@ -258,3 +258,26 @@ def test_using_the_page_writes_nothing_to_the_log(page: Page, admin, anon, activ
     written = admin.get("/activity/events", params={"after": newest, "user": activity_admin["_username"],
                                                     "user_match": "exact", "limit": 200}).json()["events"]
     assert [(e["action"], e["endpoint"]) for e in written] == []
+
+
+@pytest.mark.parametrize("skin,height", [("v2", 32), ("v1", 38)])
+def test_every_row_is_one_height_a_status_badge_included(page: Page, anon, activity_admin, skin, height):
+    failed_sign_in(anon)                                    # a row with a status badge on the first page
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin)
+    open_activity(page)
+    assert page.locator("#activity-rows tr.act-row .badge").count() >= 1
+    heights = rows(page).evaluate_all("rs => rs.map((r) => Math.round(r.getBoundingClientRect().height))")
+    assert set(heights) == {height}, heights
+
+
+def test_the_list_stays_put_as_the_detail_opens(page: Page, activity_admin):
+    """The row under the pointer does not move when its detail opens beside it."""
+    login(page, activity_admin)
+    open_activity(page)
+    before = page.locator("#act-list").bounding_box()
+    rows(page).nth(3).click()
+    expect(page.locator("#act-detail")).to_be_visible()
+    after = page.locator("#act-list").bounding_box()
+    assert after["y"] == before["y"], (before, after)
+    assert page.locator("#act-detail").bounding_box()["y"] == after["y"]
