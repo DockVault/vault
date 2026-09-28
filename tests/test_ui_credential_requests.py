@@ -155,3 +155,26 @@ def test_a_held_change_made_on_a_phone_shows_as_waiting_and_can_be_withdrawn(pag
     assert psql(f"SELECT status FROM credential_changes WHERE target_user_id='{uid}' AND kind='reset_link'") == \
         "withdrawn"
     assert psql(f"SELECT count(*) FROM password_reset_tokens WHERE user_id='{uid}'") == "0"
+
+
+def test_an_open_users_page_shows_a_request_the_moment_it_is_made(page: Page, admin, page_admin, temp_user):
+    """Another administrator's held change reaches an open Users page with its notice, with no reload:
+    the request appears with Approve. Before, the notice moved only the bell, and the block showed the
+    request after a reload. The socket's nudge is also handed to the page's own frame handler here, as
+    the socket does (the frame carries only the notice's type, target and owner), so the test does not
+    depend on the socket having connected in time."""
+    uid = temp_user["id"]
+    _login(page, page_admin, "v2", DESKTOP)
+    _open_users(page)
+    page.wait_for_timeout(500)                                                 # the block has been read
+    assert admin.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
+    held = admin.patch(f"/users/{uid}", json={"email": f"{unique('live')}@example.com"})
+    assert held.status_code == 202, held.text                                  # the second: held
+    request_id = held.json()["held_changes"][0]["request"]["id"]
+    row = page.locator(f'#credential-requests-block [data-request-id="{request_id}"]')
+    # The page's socket may deliver the real notice first; either way the page must read the list again.
+    page.evaluate("""() => handleSocketFrame({ event: { type: 'notification', target: '#users',
+        notification_type: 'credential_change_approval_needed', owner_user_id: currentUser.id } })""")
+    expect(row).to_be_visible(timeout=10000)
+    expect(row.get_by_role("button", name="Approve")).to_be_visible()
+    admin.post(f"/admin/credential-requests/{request_id}/deny")               # leave nothing waiting

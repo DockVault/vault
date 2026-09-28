@@ -5145,6 +5145,18 @@ function showHeldChange(r) {
     loadCredentialRequests();
 }
 
+// A change waiting for approval was asked for, approved, denied, withdrawn or expired (the notices of
+// those point at the Users page): an open Users page shows it at once, rather than a Withdraw that
+// then fails or a request nobody sees until a reload. The whole list is read again, so each account's
+// note is current too, unless someone is typing in it (an SSH key, a search): then only the block.
+function refreshUsersAfterApprovalNotice() {
+    const section = document.getElementById('users-section');
+    if (!section || !section.classList.contains('active')) return;
+    const a = document.activeElement;
+    const typing = a && section.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+    if (typing) loadCredentialRequests(); else loadUsers();
+}
+
 async function loadCredentialRequests() {
     const block = document.getElementById('credential-requests-block');
     const list = document.getElementById('credential-requests-list');
@@ -6949,6 +6961,9 @@ function handleSocketFrame(data) {
             try { refreshNotifUnread(); } catch (_) {}
             if (ev.target === '#notes' && typeof loadNotes === 'function') {
                 try { loadNotes(); } catch (_) {}
+            }
+            if (ev.target === '#users') {
+                try { refreshUsersAfterApprovalNotice(); } catch (_) {}
             }
         }
         return;
