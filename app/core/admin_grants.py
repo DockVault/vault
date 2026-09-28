@@ -13,10 +13,12 @@ A row is written, in the caller's transaction, whenever an account becomes an ad
 one, promoted to one, or by accepting an administrator's invitation (granted by whoever invited). An
 administrator's invitation keeps its inviter's lineage from the moment it is made (lineage_through),
 and the account that accepts it inherits that lineage, so demoting or deleting the inviter in between
-cannot shorten it. An administrator from before this record existed, and the first one the server set
-up, have no row: the person who runs the server made them, they count as administrators of long
-standing, and nothing restricts them. A demotion deletes the row; a later promotion writes a new one,
-by whoever made it, from that moment.
+cannot shorten it. (Demoting, deactivating, locking or deleting the inviter also revokes their pending
+administrator invitations, and acceptance refuses one whose inviter is no longer an administrator who
+can act: app/api/api_server.py. The kept lineage is the second guard.) An administrator from before
+this record existed, and the first one the server set up, have no row: the person who runs the server
+made them, they count as administrators of long standing, and nothing restricts them. A demotion
+deletes the row; a later promotion writes a new one, by whoever made it, from that moment.
 
 Every administrator is told when an administrator is created or promoted (the routes do that, after
 their commit), so a new administrator never appears unnoticed.

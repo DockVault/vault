@@ -4916,6 +4916,25 @@ def _resolve_valid_invite(db: Session, token: str):
         return None
 
 
+def _invitation_inviter_can_act(db: Session, inv, *, lock: bool = False) -> bool:
+    """Whether an invitation still stands on its maker's word: always for one that does not make an
+    administrator; for one that does, only while whoever made it is an administrator who can act
+    (active, and not locked by an administrator). A deleted inviter (created_by NULL) is not.
+
+    Demoting, deactivating, locking or deleting an administrator revokes their pending administrator
+    invitations (_revoke_admin_invitations_of); this refuses one that was left pending anyway (made
+    before that was done). With ``lock``, the inviter's row is read under a share lock: a demotion in
+    progress (which locks every administrator's row first) finishes before it is read, and one that
+    starts later waits for the acceptance."""
+    from app.core import credential_changes as cc
+    if inv.role != RoleEnum.ADMIN.value:
+        return True
+    q = db.query(User).filter(User.id == inv.created_by)   # no row for a deleted inviter
+    if lock:
+        q = q.populate_existing().with_for_update(read=True)
+    return cc.can_approve(q.first())
+
+
 def _audit_accept_failure(db: Session, prefix: str, ip: str, reason: str) -> None:
     """Record a failed acceptance attempt (anonymous — no user yet). Never carries the raw token,
     only its public prefix; never raises."""
@@ -4949,7 +4968,7 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
         raise HTTPException(status_code=503,
                             detail="Invitations are unavailable: the invite-token secret is not configured.")
     inv = _resolve_valid_invite(db, token)
-    if inv is None:
+    if inv is None or not _invitation_inviter_can_act(db, inv):
         raise HTTPException(status_code=404, detail="Invitation not found.")
     pol = _account_policy(db)
     return {
@@ -5007,6 +5026,11 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     inv = _resolve_valid_invite(db, token)
     if inv is None:
         _audit_accept_failure(db, prefix, client_ip, reason="unresolved")
+        raise generic_miss
+    # An administrator's invitation whose maker is no longer an administrator who can act is refused,
+    # like a revoked one (_invitation_inviter_can_act).
+    if not _invitation_inviter_can_act(db, inv, lock=True):
+        _audit_accept_failure(db, prefix, client_ip, reason="inviter_not_admin")
         raise generic_miss
 
     # (c)-(e) Post-resolution validation. A rejection here is a legitimate-but-invalid submission on an
@@ -5985,12 +6009,42 @@ _WITHDRAWN_BECAUSE = {
 }
 
 
+def _revoke_admin_invitations_of(db, user, *, actor, because) -> int:
+    """``user`` is about to stop being an administrator who can act (as for _withdraw_requests_of).
+    Revoke every pending invitation they made that would make someone an administrator, in the caller's
+    transaction, with an audit row each, and return how many. Whoever accepted one would become an
+    administrator on the word of someone who is no longer one; acceptance refuses such an invitation
+    too (_invitation_inviter_can_act), and revoking it here shows it as revoked in the list.
+
+    Taken FOR UPDATE: an acceptance in progress has claimed its row, and finishes first; the invitation
+    is then accepted and is left alone (acceptance read the inviter under a lock too)."""
+    from app.core.models import AccountInvitation
+    now = datetime.utcnow()
+    rows = (db.query(AccountInvitation)
+            .filter(AccountInvitation.created_by == user.id,
+                    AccountInvitation.role == RoleEnum.ADMIN.value,
+                    AccountInvitation.revoked_at.is_(None),
+                    AccountInvitation.accepted_at.is_(None),
+                    AccountInvitation.expires_at > now)
+            .order_by(AccountInvitation.created_at)
+            .with_for_update().all())
+    for inv in rows:
+        inv.revoked_at = now
+        db.add(AuditLogger(db).build_row(
+            action="account_invitation_revoked", status="success", user=actor,
+            resource_type="account_invitation", resource_id=str(inv.id),
+            details={"username": inv.username, "email": inv.email, "token_prefix": inv.token_prefix,
+                     "role": inv.role, "invited_by": user.username, "revoked_because": because}))
+    return len(rows)
+
+
 def _withdraw_requests_of(db, user, *, actor, because) -> list:
     """``user`` is about to stop being an administrator who can act (``because``: demoted, deactivated,
     locked by an administrator, or deleted, by ``actor``). Withdraw every request they have open, in
     the caller's transaction, with an audit row each, and return what _announce_withdrawn_requests
     tells after the commit. Call it BEFORE the change to ``user`` is made in the session: who was asked
-    to approve each request is read from the records as they stand.
+    to approve each request is read from the records as they stand. Their pending invitations that
+    would make an administrator are revoked too (_revoke_admin_invitations_of).
 
     A request whose asker can no longer act is never approved (credential_changes.approval_refusal);
     withdrawing it too takes it off every administrator's list and tells the user it will not happen.
@@ -5999,6 +6053,7 @@ def _withdraw_requests_of(db, user, *, actor, because) -> list:
     from app.core import credential_changes as cc
     if user is None or user.id is None:
         return []
+    _revoke_admin_invitations_of(db, user, actor=actor, because=because)
     open_now = cc.open_requests(db)
     mine = [c for c in open_now if c.requested_by_id == user.id]
     if not mine:

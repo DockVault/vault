@@ -323,12 +323,21 @@ def test_accepting_an_administrators_invitation_records_who_invited(admin, invit
         _cleanup_user(admin, uname)
 
 
-@pytest.mark.parametrize("fate", ["demoted", "deleted"])
-def test_an_administrators_invitation_keeps_its_inviters_lineage(admin, invites_on, fate):
-    # An administrator the session's administrator made invites a new administrator, and is demoted (which
-    # deletes their record) or deleted before the invitation is accepted. The new administrator used to
-    # descend from the inviter alone, or from nobody, so the session's administrator dropped out of its
-    # lineage and could have approved through it. The invitation keeps the lineage from when it was made.
+# How an administrator stops being one who can act, by the session's administrator, and the undoing.
+FATES = {
+    "demoted": lambda admin, uid: admin.patch(f"/users/{uid}", json={"role": "user"}),
+    "deactivated": lambda admin, uid: admin.post(f"/api/user-management/users/{uid}/toggle-active"),
+    "locked": lambda admin, uid: admin.post(f"/api/user-management/users/{uid}/toggle-locked"),
+    "deleted": lambda admin, uid: admin.delete_user(uid),
+}
+
+
+@pytest.mark.parametrize("fate", sorted(FATES))
+def test_an_administrators_invitation_goes_with_its_inviter(admin, invites_on, fate):
+    # An administrator the session's administrator made invites a new administrator, and is then demoted,
+    # deactivated, locked or deleted before the invitation is accepted. The invitation is revoked with
+    # them, recorded, and cannot be accepted: its account would have been an administrator on the word of
+    # someone who no longer is one. It kept the inviter's lineage when it was made all the same.
     me = admin.get("/users/me").json()
     inviter = admin.create_user(role="admin")
     inviter_client = ApiClient()
@@ -339,20 +348,43 @@ def test_an_administrators_invitation_keeps_its_inviters_lineage(admin, invites_
         kept = _psql(f"SELECT inviter_lineage::text FROM account_invitations "
                      f"WHERE token_prefix={_q(inv['token_prefix'])}")
         assert inviter["id"] in kept and me["id"] in kept, kept
-        if fate == "demoted":
-            assert admin.patch(f"/users/{inviter['id']}", json={"role": "user"}).status_code == 200
-            assert _psql(f"SELECT count(*) FROM admin_grants WHERE user_id={_q(inviter['id'])}") == "0"
-        else:
-            admin.delete_user(inviter["id"])
+        assert FATES[fate](admin, inviter["id"]).status_code == 200
+        listed = [i for i in admin.get("/invites").json() if i["id"] == inv["id"]]
+        assert [i["status"] for i in listed] == ["revoked"], listed
+        row = _psql("SELECT user_id::text || '|' || (details->>'revoked_because') || '|' || "
+                    "(details->>'invited_by') FROM audit_logs WHERE action = 'account_invitation_revoked' "
+                    f"AND resource_id = {_q(inv['id'])}")
+        assert row == f"{me['id']}|{fate}|{inviter['_username']}", row
+        assert _anon().get(f"/invites/{inv['token']}").status_code == 404
         r = _anon().post(f"/invites/{inv['token']}/accept", json={"password": STRONG_PW})
-        assert r.status_code == 200, r.text
-        lineage = _psql("SELECT g.lineage::text FROM admin_grants g "
-                        f"JOIN users u ON u.id = g.user_id WHERE u.username={_q(uname)}")
-        assert inviter["id"] in lineage and me["id"] in lineage, lineage
+        assert r.status_code == 404, r.text
+        assert _psql(f"SELECT count(*) FROM users WHERE username={_q(uname)}") == "0"
     finally:
         _cleanup_user(admin, uname)
-        if fate == "demoted":
+        if fate != "deleted":
             admin.delete_user(inviter["id"])
+
+
+def test_an_administrators_invitation_left_pending_by_a_departed_inviter_is_refused(admin, invites_on):
+    # One left pending although its inviter was demoted (by a release that did not revoke it, or by a
+    # change made outside the routes): acceptance refuses it, and records why.
+    inviter = admin.create_user(role="admin")
+    inviter_client = ApiClient()
+    inviter_client.login(inviter["_username"], inviter["_password"])
+    uname = unique("invleft")
+    inv = _mint(inviter_client, username=uname, role="admin")
+    try:
+        _psql(f"UPDATE users SET role = 'USER' WHERE id = {_q(inviter['id'])}", fetch=False)
+        assert _anon().get(f"/invites/{inv['token']}").status_code == 404
+        r = _anon().post(f"/invites/{inv['token']}/accept", json={"password": STRONG_PW})
+        assert r.status_code == 404, r.text
+        assert _psql("SELECT count(*) FROM audit_logs WHERE action = 'account_invitation_accept_failed' "
+                     f"AND details->>'token_prefix' = {_q(inv['token_prefix'])} "
+                     "AND details->>'reason' = 'inviter_not_admin'") == "1"
+        assert _psql(f"SELECT count(*) FROM users WHERE username={_q(uname)}") == "0"
+    finally:
+        admin.delete(f"/invites/{inv['id']}")
+        admin.delete_user(inviter["id"])
 
 
 def test_a_user_invitation_keeps_no_lineage(admin, invites_on):
