@@ -203,6 +203,17 @@ def test_a_note_of_the_largest_size_an_admin_can_allow_still_saves(admin):
         admin.put("/settings", json={"note_max_chars": before if before else 100000})
 
 
+def test_a_rejected_sign_in_does_not_repeat_what_was_typed():
+    marker = "Typed-Into-The-Wrong-Field-" + unique("pw")
+    status, text, _ = _post("/auth/login", json.dumps(
+        {"username": marker + "x" * 300, "password": "p"}).encode())
+    assert status == 422, text
+    assert marker not in text, "the 422 repeated the username field back"
+    detail = json.loads(text)["detail"]
+    assert detail[0]["loc"] == ["body", "username"] and detail[0]["msg"]
+    assert all(set(e) == {"type", "loc", "msg"} for e in detail)
+
+
 # ------------------------------------------------------------------------------ still accepted
 
 def test_a_normal_sign_in_still_works(admin_creds):

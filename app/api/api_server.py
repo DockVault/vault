@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exception_handlers import http_exception_handler as fastapi_http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request as StarletteRequest
@@ -225,6 +226,15 @@ async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPE
             headers=getattr(exc, "headers", None),
         )
     return await fastapi_http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error_handler(request: StarletteRequest, exc: RequestValidationError):
+    """A 422 names the field and says what is wrong with it, and never repeats the value: the default
+    handler echoed every rejected input back (a password typed into the username field included) and
+    serialized a large body a second time on the event loop. See app/core/validation_errors.py."""
+    from app.core.validation_errors import public_validation_errors
+    return JSONResponse(status_code=422, content={"detail": public_validation_errors(exc.errors())})
 
 
 # Every request body is bounded by its route's limit as it arrives, declared or chunked (see
