@@ -59,16 +59,21 @@ def _post(path, body, *, chunked=False, headers=None):
 
 
 class _Memory:
-    """Allocated memory of the API container (page cache excluded), sampled ten times a second."""
+    """Allocated memory of the API container (page cache excluded), sampled ten times a second.
 
-    SCRIPT = ("while :; do cur=$(cat /sys/fs/cgroup/memory.current); "
+    Ending the `docker exec` client does not end the loop it started inside the container, so the loop
+    reports its own pid, stop() kills it there, and it ends by itself after ten minutes regardless."""
+
+    SCRIPT = ("echo pid:$$; end=$(( $(date +%s) + 600 )); "
+              "while [ $(date +%s) -lt $end ]; do cur=$(cat /sys/fs/cgroup/memory.current); "
               "fil=$(awk '/^inactive_file /{a=$2} /^active_file /{b=$2} END{print a+b}' "
               "/sys/fs/cgroup/memory.stat); echo $((cur - ${fil:-0})); sleep 0.1; done")
 
     def __init__(self):
-        container = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+        self.container = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+        self.pid = None
         try:
-            self.proc = subprocess.Popen(["docker", "exec", container, "sh", "-c", self.SCRIPT],
+            self.proc = subprocess.Popen(["docker", "exec", self.container, "sh", "-c", self.SCRIPT],
                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError as exc:
             pytest.skip(f"cannot reach the API container to read its memory: {exc}")
@@ -86,10 +91,15 @@ class _Memory:
     def _read(self):
         for line in self.proc.stdout:
             line = line.strip()
-            if line.isdigit():
+            if line.startswith("pid:") and line[4:].isdigit():
+                self.pid = int(line[4:])
+            elif line.isdigit():
                 self.samples.append(int(line))
 
     def stop(self):
+        if self.pid is not None:
+            subprocess.run(["docker", "exec", self.container, "kill", str(self.pid)],
+                           capture_output=True, timeout=30)
         self.proc.terminate()
         try:
             self.proc.wait(10)
