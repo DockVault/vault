@@ -805,10 +805,16 @@ def _validate_new_username(v):
     """The rules a newly-created username must satisfy, shared by account creation and invitations so
     they cannot drift. Rejects '<'/'>' markup and '@' — a username that looked like an email would,
     under an 'either' login policy (username tried first), shadow the real owner of that address.
+    Rejects control, format and other invisible characters (Unicode category C): an escape byte in a
+    username acts on the terminal of whoever prints it (the host tool, a log viewer), and an invisible
+    one makes two usernames look the same.
     NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode."""
+    import unicodedata
     v = _reject_markup_chars(v, 'username')
     if v is not None and '@' in v:
         raise ValueError("username may not contain '@'")
+    if v is not None and any(unicodedata.category(ch).startswith('C') for ch in v):
+        raise ValueError("username may not contain control or invisible characters")
     return v
 
 

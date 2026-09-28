@@ -2582,6 +2582,18 @@ def parse_operator_answer(stdout):
     return answer if isinstance(answer, dict) and "ok" in answer else None
 
 
+def server_text(value, default=""):
+    """A string the account tool read from the server, made safe to print on this terminal.
+
+    Usernames, email addresses and refusal texts come from the deployment's database. A username
+    created before the server refused control characters can carry an escape sequence that would act on
+    the operator's terminal (a colour, a cursor move, a window title, a hyperlink), so each is passed
+    through clean_matrix_text first. None prints as `default`."""
+    if value is None:
+        return default
+    return clean_matrix_text(value if isinstance(value, str) else str(value))
+
+
 def username_confirmation_problem(username, typed_again):
     """Why an account change must not go ahead: the username was not given, or not typed again
     exactly. None when it may. The container checks the same again."""
@@ -5224,16 +5236,16 @@ class DockVault:
     def _account_or_fail(self, username):
         answer = self._run_account_tool("lookup", "--username", username)
         if not answer.get("ok"):
-            self._fail(answer.get("error") or "no such account")
+            self._fail(server_text(answer.get("error")) or "no such account")
         return answer["account"]
 
     def _show_account(self, account):
         pal = self.pal
         print(pal.paint("\n  Account", "cyan"))
-        print("  username:      %s" % account.get("username"))
-        print("  email:         %s" % (account.get("email") or "(none)"))
-        print("  role:          %s%s" % (account.get("role"), "" if account.get("active") else "  (deactivated)"))
-        print("  last sign-in:  %s" % (account.get("last_login") or "never"))
+        print("  username:      %s" % server_text(account.get("username")))
+        print("  email:         %s" % (server_text(account.get("email")) or "(none)"))
+        print("  role:          %s%s" % (server_text(account.get("role")), "" if account.get("active") else "  (deactivated)"))
+        print("  last sign-in:  %s" % (server_text(account.get("last_login")) or "never"))
         print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
 
     def accounts(self, args=None):
@@ -5266,15 +5278,16 @@ class DockVault:
         if action == "list":
             answer = self._run_account_tool("list")
             if not answer.get("ok"):
-                self._fail(answer.get("error") or "the list could not be read")
+                self._fail(server_text(answer.get("error")) or "the list could not be read")
             rows = answer.get("requests") or []
             if not rows:
                 print(pal.paint("  No change is waiting for approval.\n", "green"))
                 return
             for r in rows:
                 print("  %s  %s for %s, asked by %s on %s; expires %s" % (
-                    r.get("id"), r.get("label"), r.get("target_username"), r.get("requested_by"),
-                    (r.get("requested_at") or "")[:10], (r.get("expires_at") or "")[:10]))
+                    server_text(r.get("id")), server_text(r.get("label")), server_text(r.get("target_username")),
+                    server_text(r.get("requested_by")), server_text(r.get("requested_at"))[:10],
+                    server_text(r.get("expires_at"))[:10]))
             print()
             return
 
@@ -5291,17 +5304,17 @@ class DockVault:
             answer = self._run_account_tool("approve", "--request-id", request_id,
                                             "--confirm-username", typed)
             if not answer.get("ok"):
-                self._fail(answer.get("error") or "the request was not approved")
+                self._fail(server_text(answer.get("error")) or "the request was not approved")
             req = answer.get("approved") or {}
             print(pal.paint("  Approved: %s for %s, asked by %s. The change was made and recorded as the "
-                            "host operator's." % (req.get("label"), req.get("target_username"),
-                                                 req.get("requested_by")), "green"))
+                            "host operator's." % (server_text(req.get("label")), server_text(req.get("target_username")),
+                                                 server_text(req.get("requested_by"))), "green"))
             if answer.get("secret"):
                 self._emit_secret("\n".join([
                     pal.paint("\n  ===== PASSWORD RESET LINK (shown once) =====", "bold", "yellow"),
                     "    " + answer["secret"],
-                    pal.paint("  Give it to %s over a trusted channel. It works once." % req.get("target_username"),
-                              "yellow")]))
+                    pal.paint("  Give it to %s over a trusted channel. It works once."
+                              % server_text(req.get("target_username")), "yellow")]))
             return
 
         if action not in ("reset-password", "reset-second-factor"):
@@ -5323,7 +5336,7 @@ class DockVault:
             tool_args.append("--temporary-password")
         answer = self._run_account_tool(*tool_args)
         if not answer.get("ok"):
-            self._fail(answer.get("error") or "nothing was changed")
+            self._fail(server_text(answer.get("error")) or "nothing was changed")
         if action == "reset-second-factor":
             print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
                             "with their own password, at the next sign-in." % username, "green"))

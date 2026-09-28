@@ -172,3 +172,42 @@ def test_the_tool_runs_in_the_web_service_of_either_layout(app, monkeypatch):
     assert app._run_account_tool("list") == {"ok": True, "requests": []}
     assert [a[:3] for a in seen] == [("exec", "-T", "vault"), ("exec", "-T", "vault-api")]
     assert seen[-1][3:] == ("python", "-m", "app.core.host_operator", "list")
+
+
+ESC = chr(27)
+HOSTILE = f"ev{ESC}]0;owned{chr(7)}il{ESC}[2J{chr(0x9b)}31m"   # a window title, a screen clear, a C1 CSI
+
+
+def _no_control(text):
+    return not any(ord(ch) < 32 and ch != "\n" or 0x7f <= ord(ch) < 0xa0 for ch in text)
+
+
+def test_a_username_from_the_server_cannot_act_on_the_terminal(app, monkeypatch, capsys):
+    # A username stored before the server refused control characters reaches this terminal through the
+    # lookup, the list and the approval. Each is printed with its escape sequences removed.
+    account = {"ok": True, "account": {"username": HOSTILE, "email": f"x{ESC}[1m@example.com", "role": "user",
+                                       "active": True, "last_login": f"2026{ESC}[H", "second_factor": False}}
+    tool = _Tool({"lookup": account, "reset-second-factor": {"ok": True, "account": HOSTILE},
+                  "list": {"ok": True, "requests": [{"id": "r1", "label": "Password reset link",
+                                                     "target_username": HOSTILE, "requested_by": HOSTILE,
+                                                     "requested_at": "2026-09-01", "expires_at": "2026-09-08"}]},
+                  "approve": {"ok": True, "approved": {"label": "Password reset link", "target_username": HOSTILE,
+                                                       "requested_by": HOSTILE}}})
+    monkeypatch.setattr(app, "_run_account_tool", tool)
+    app.accounts(_args("--action", "reset-second-factor", "--username", "evil", "--confirm-username", "evil",
+                       "--non-interactive"))
+    app.accounts(_args("--action", "list", "--non-interactive"))
+    app.accounts(_args("--action", "approve", "--request-id", "r1", "--confirm-username", "evil",
+                       "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "evil" in out and "r1" in out
+    assert _no_control(out), repr(out)
+
+
+def test_a_refusal_from_the_server_cannot_act_on_the_terminal(app, monkeypatch, capsys):
+    tool = _Tool({"lookup": {"ok": False, "error": f"No account {HOSTILE}."}})
+    monkeypatch.setattr(app, "_run_account_tool", tool)
+    with pytest.raises(SystemExit):
+        app.accounts(_args("--action", "reset-password", "--username", "evil", "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "No account evil" in out and _no_control(out), repr(out)
