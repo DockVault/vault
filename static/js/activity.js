@@ -860,6 +860,9 @@
 
     function whoText(ev) {
         const anonymous = ev.channel === 'public_link' || ev.channel === 'upload_link';
+        if (ev.host_operator) {
+            return { text: 'Server operator', quiet: true, title: `The server's operator, working on the host (${ev.username})` };
+        }
         if (ev.username) return { text: ev.username, quiet: false };
         if (anonymous) return { text: 'Someone with the link', quiet: true };
         if (ev.automatic) return { text: 'System', quiet: true };
@@ -925,7 +928,7 @@
         const who = whoText(ev);
         const whoWrap = el('div', 'act-who');
         const name = el('span', 'act-who-name' + (who.quiet ? ' is-quiet' : ''), who.text);
-        name.title = who.text;
+        name.title = who.title || who.text;
         whoWrap.appendChild(name);
         if (ev.temp_credential_id) whoWrap.appendChild(tempBadge(ev));
         whoTd.appendChild(whoWrap);
@@ -1580,7 +1583,9 @@
         const frag = document.createDocumentFragment();
         const who = section('Who');
         const w = whoText(ev);
-        field(who.dl, 'Person', el('span', 'act-d-value' + (w.quiet ? ' is-quiet' : ''), w.text),
+        const person = el('span', 'act-d-value' + (w.quiet ? ' is-quiet' : ''), w.text);
+        if (w.title) person.title = w.title;
+        field(who.dl, 'Person', person,
             [ev.username ? detailFilter("Show this person's events", { user: ev.username, userMatch: 'exact', noAccount: false }) : null]);
         if (ev.temp_credential_id) {
             const name = ev.temp_credential_name || String(ev.temp_credential_id).slice(0, 8);

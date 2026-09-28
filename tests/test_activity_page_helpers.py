@@ -382,3 +382,15 @@ reconcileTotals();
 console.log(JSON.stringify({ timers: timers.length }));
 """)
     assert out == {"timers": 0}
+
+
+def test_the_server_operator_is_named_so_not_by_its_internal_name():
+    out = _node(_fn("whoText") + """
+console.log(JSON.stringify({
+    host: whoText({ host_operator: true, username: 'operator@host', channel: 'unknown' }),
+    person: whoText({ username: 'alice', channel: 'web' }),
+}));
+""")
+    assert out["host"]["text"] == "Server operator" and out["host"]["quiet"] is True
+    assert "operator@host" in out["host"]["title"]
+    assert out["person"] == {"text": "alice", "quiet": False}

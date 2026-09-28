@@ -56,7 +56,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("logout", "sign_in", "Signed out", "info"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
-    AuditAction("second_factor_admin_reset", "sign_in", "Second factor reset by an admin", "warning"),
+    # By an administrator or by the server's operator on the host: the label names neither.
+    AuditAction("second_factor_admin_reset", "sign_in", "Second factor reset for another user", "warning"),
     AuditAction("second_factor_disabled", "sign_in", "Second factor turned off", "notice"),
     AuditAction("second_factor_enrolled", "sign_in", "Second factor set up", "notice"),
     AuditAction("second_factor_failed", "sign_in", "Second-factor code rejected", "warning"),

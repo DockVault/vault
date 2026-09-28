@@ -331,6 +331,19 @@ def after_cursor(q, AuditLog, cursor: Optional[Tuple[datetime, uuid.UUID]]):
     return q.filter(or_(AuditLog.timestamp < ts, and_(AuditLog.timestamp == ts, AuditLog.id < row_id)))
 
 
+# The rows the host tool (dockvault.py accounts) writes under credential_changes.HOST_OPERATOR, with no
+# account behind them. A name typed at a failed sign-in can be the same text, so the action decides.
+HOST_OPERATOR_ACTIONS = frozenset({"user_updated", "password_reset_link_minted", "second_factor_admin_reset",
+                                   "credential_change_approved"})
+
+
+def is_host_operator(r) -> bool:
+    """Whether a row is the server's operator acting from the host, not a person with an account."""
+    from app.core.credential_changes import HOST_OPERATOR
+    return (getattr(r, "user_id", None) is None and r.username == HOST_OPERATOR
+            and r.action in HOST_OPERATOR_ACTIONS)
+
+
 def row_view(r) -> dict:
     entry = audit_catalog.lookup(r.action or "")
     ts = r.timestamp
@@ -343,6 +356,8 @@ def row_view(r) -> dict:
         "cursor": encode_cursor(r.timestamp, r.id) if r.timestamp is not None else None,
         "timestamp": ts.isoformat() if ts else None,
         "username": r.username,
+        # Shown as "Server operator", not as its internal name.
+        "host_operator": is_host_operator(r),
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
         "temp_credential_name": getattr(r, "temp_credential_name", None),
         "action": r.action,

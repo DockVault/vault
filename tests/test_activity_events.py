@@ -297,3 +297,25 @@ def test_the_username_typeahead_suggests_accounts_and_never_reads_the_log():
     assert ev.username_suggestions(db, "ana", 10) == [{"username": "ana-account", "account": True, "active": True}]
     assert db.log_reads == 0
     assert ev.username_suggestions(db, "", 10) == []
+
+
+def test_the_host_operator_is_told_apart_from_a_name_typed_at_sign_in():
+    """The host tool's rows carry the internal name operator@host and no account: the page shows them as
+    the server's operator. The same text typed at a failed sign-in stays what it is, a typed name."""
+    host = ev.row_view(_stored("second_factor_admin_reset", "success", username="operator@host", user_id=None,
+                               details={"by": "host operator"}))
+    typed = ev.row_view(_stored("login_failure", "failure", username="operator@host", user_id=None))
+    account = ev.row_view(_stored("second_factor_admin_reset", "success", username="operator@host",
+                                  user_id=uuid.uuid4()))
+    assert (host["host_operator"], typed["host_operator"], account["host_operator"]) == (True, False, False)
+    assert "admin" not in host["label"].lower()                      # the operator is not an administrator
+
+
+def test_every_row_the_host_tool_writes_is_known_as_the_operators():
+    """A row the host tool starts writing later must be added to HOST_OPERATOR_ACTIONS, or the page
+    would show the operator by its internal name."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "core" / "host_operator.py").read_text(encoding="utf-8")
+    written = set(re.findall(r'action="([a-z_]+)", status="success", username=cc\.HOST_OPERATOR', src))
+    assert written and written <= ev.HOST_OPERATOR_ACTIONS, written
