@@ -1092,3 +1092,62 @@ def test_the_cache_hold_lets_one_attempt_at_a_time_and_fails_open(monkeypatch):
         assert store.hold("k") is None, "the cache down: no hold, and the attempt goes ahead"
     finally:
         redis_guard.guard_record_success()      # leave the shared guard as it was found
+
+
+def test_an_administrators_locked_account_guessed_from_one_address_gets_only_the_login_limit(Session, limits,
+                                                                                              monkeypatch):
+    # The address half of count_at_limit: from ONE address, an account an administrator locked is checked
+    # the login limit's number of times, then refused unchecked with the address's scope. The account-wide
+    # count alone would have let that address check the whole backstop.
+    uid = _add_user(Session, is_locked=True, locked_until=None)
+    checked = _slow_checks(monkeypatch, seconds=0)
+    seen = []
+    for _ in range(THRESHOLD + 2):
+        try:
+            _sign_in(Session, uid, ATTACKER, password="a-guess")
+        except A.AccountLockedError as e:
+            seen.append(e.scope)
+        except A.InvalidCredentialsError:
+            seen.append("wrong")
+    assert len(checked) == THRESHOLD, (len(checked), seen)
+    assert seen == ["wrong"] * THRESHOLD + ["address"] * 2, seen
+    assert _audit(Session, L.AUTO_LOCKED_ACTION) == [], "no automatic lock on top of an administrator's"
+
+
+class _SharedRedis:
+    """Redis, in memory and safe across threads: the calls the name mimicry's cache makes."""
+
+    def __init__(self):
+        import threading
+        self.values, self.guard = {}, threading.Lock()
+
+    def set(self, key, value, nx=False, px=None, ex=None):
+        with self.guard:
+            if nx and key in self.values:
+                return None
+            self.values[key] = value
+            return True
+
+    def get(self, key):
+        with self.guard:
+            return self.values.get(key)
+
+    def delete(self, key):
+        with self.guard:
+            self.values.pop(key, None)
+
+
+def test_a_burst_on_a_name_that_is_no_account_waits_its_turn_like_one_on_an_account(Session, limits, monkeypatch):
+    # Through the real cache hold, waited for as long as an account's turn. With no wait, every attempt but
+    # the first of a burst on a name that is no account was refused as busy, while the same burst on an
+    # account waited and was checked: which told a guesser whether the account existed.
+    from app.core import database, redis_guard
+    monkeypatch.setattr(database, "redis_client", _SharedRedis())
+    monkeypatch.setattr(redis_guard, "_guard_open_until", 0.0)
+    _add_user(Session, username="real-person")
+    checked = _slow_checks(monkeypatch, seconds=0.2)
+    real = _burst(Session, "real-person", [ATTACKER] * 6)
+    nobody = _burst(Session, "nobody-here", [ATTACKER] * 6)
+    assert real == nobody == ["address"] * 3 + ["wrong"] * THRESHOLD, (real, nobody)
+    assert checked.running["most"] == 1, "two checks ran at once"
+    assert L._CacheStore.WAIT_SECONDS == L.TURN_WAIT_SECONDS, "waited for as long as an account's turn"

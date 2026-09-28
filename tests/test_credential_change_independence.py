@@ -303,6 +303,83 @@ def test_every_route_that_can_take_an_administrator_away_withdraws_their_request
     assert _functions_calling(tree, "_announce_withdrawn_requests") - {"_announce_withdrawn_requests"} == removing
 
 
+# Each route that takes an administrator away, called (test_last_admin.py's stand-ins: the account the
+# route looks up, and a database that records its writes), with the withdrawal it must make first. The
+# structural test above checks each such route CALLS the withdrawal; these check each one calls it for the
+# change it makes, before making it, and not for a change that takes nobody away.
+from test_last_admin import _ROUTES, _RecordingDB, _admin_account  # noqa: E402
+import app.api.user_management_api as _UM  # noqa: E402
+
+LEAVES = {
+    "PATCH /users/{id} role": "demoted",
+    "PATCH /users/{id} deactivate": "deactivated",
+    "PATCH /users/{id} lock": "locked",
+    "PUT /api/user-management/users/{id} role": "demoted",
+    "PUT /api/user-management/users/{id} deactivate": "deactivated",
+    "toggle-active": "deactivated",
+    "toggle-locked": "locked",
+    "PATCH /api/user-management/users/{id}/role": "demoted",
+    "POST /users/{id}/delete": "deleted",
+}
+
+
+@pytest.fixture
+def withdrawn_as(monkeypatch):
+    """The withdrawals the routes ask for, each with the account as it stood when asked:
+    (because, role, is_active, is_locked)."""
+    calls = []
+
+    def withdraw(db, user, *, actor, because):
+        calls.append((because, user.role, user.is_active, user.is_locked))
+        return []
+
+    monkeypatch.setattr(api, "_withdraw_requests_of", withdraw)
+    monkeypatch.setattr(api, "removes_last_admin", lambda db, target: False)
+    monkeypatch.setattr(_UM, "removes_last_admin", lambda db, target: False)
+    return calls
+
+
+def _run_route(route, target):
+    try:
+        run_coroutine(_ROUTES[route](target, _admin_account(), _RecordingDB(target)))
+    except Exception:  # noqa: BLE001 -- the stand-in cannot carry every later step; the withdrawal came first
+        pass
+
+
+def test_the_routes_cover_every_way_to_take_an_administrator_away():
+    assert set(LEAVES) == set(_ROUTES)
+
+
+@pytest.mark.parametrize("route", sorted(LEAVES))
+def test_each_route_withdraws_the_administrators_requests_before_it_takes_them_away(route, withdrawn_as):
+    target = _admin_account()
+    _run_route(route, target)
+    assert withdrawn_as == [(LEAVES[route], RoleEnum.ADMIN, True, False)], withdrawn_as
+
+
+@pytest.mark.parametrize("route,already", [
+    ("PATCH /users/{id} lock", {"is_locked": True, "locked_until": None}),      # locked by an administrator
+    ("PATCH /users/{id} deactivate", {"is_active": False}),
+    ("PATCH /users/{id} role", {"role": RoleEnum.USER}),                          # not an administrator
+    ("PUT /api/user-management/users/{id} role", {"role": RoleEnum.USER}),
+    ("PUT /api/user-management/users/{id} deactivate", {"is_active": False}),
+])
+def test_a_change_that_takes_nobody_away_withdraws_nothing(route, already, withdrawn_as):
+    target = _admin_account()
+    for key, value in already.items():
+        setattr(target, key, value)
+    _run_route(route, target)
+    assert withdrawn_as == [], withdrawn_as
+
+
+def test_a_lock_that_wrong_passwords_armed_does_not_stop_an_administrators_lock_withdrawing(withdrawn_as):
+    # Only an administrator's lock (no end time) had already taken them away.
+    target = _admin_account()
+    target.is_locked, target.locked_until = True, cc.utcnow() + timedelta(minutes=10)
+    _run_route("PATCH /users/{id} lock", target)
+    assert [c[0] for c in withdrawn_as] == ["locked"], withdrawn_as
+
+
 def test_withdrawing_your_own_request_tells_who_was_asked_to_approve(db, told, monkeypatch):
     alice, bob, carol = _user(db, "alice"), _user(db, "bob"), _user(db, "carol", role=RoleEnum.USER)
     change = cc.hold(db, kind=cc.RESET_LINK, target_id=carol.id, requester_id=alice.id, requester_name="alice",
