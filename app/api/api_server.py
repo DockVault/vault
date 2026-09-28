@@ -227,6 +227,12 @@ async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPE
     return await fastapi_http_exception_handler(request, exc)
 
 
+# Every request body is bounded by its route's limit as it arrives, declared or chunked (see
+# app/core/body_limit.py). Added FIRST so it is the innermost middleware: the CORS, rate-limit and
+# security-header layers all wrap its 413, and a request the rate limiter refuses is never read.
+from app.core.body_limit import BodyLimitMiddleware  # noqa: E402
+app.add_middleware(BodyLimitMiddleware)
+
 # Add CORS middleware. Bearer-token auth (no cookies anywhere) already makes credentialed
 # cross-origin theft impossible, but don't bake a dev origin into a production image: read the
 # allow-list from CORS_ALLOW_ORIGINS (comma-separated) and fall back to the localhost dev origin
@@ -342,13 +348,8 @@ def _is_loopback_host(host: str) -> bool:
 # limit: a client uploads as fast as its link allows, just in <= this-many-byte pieces.
 _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 
-# Absolute ceiling on a single NON-MULTIPART request body (defense-in-depth vs a JSON/octet-stream
-# in-memory DoS, on top of the starlette >=0.40 multipart-parser fix). MULTIPART uploads are EXEMPT
-# (metered per-file in-stream and bounded by the vault size limit), so this ceiling is DECOUPLED
-# from max_file_size_mb: the largest legitimate non-multipart body is one resumable chunk PUT, so a
-# few multiples of the chunk cap covers every real request while still tripping on an abusive body.
-# Decoupling it keeps a large file cap (e.g. 10 GB) from widening this in-memory backstop.
-_MAX_REQUEST_BODY_BYTES = 4 * _MAX_UPLOAD_CHUNK_BYTES  # 256 MiB
+# Request bodies are bounded per route by BodyLimitMiddleware (app/core/body_limit.py), counted as
+# they arrive whether or not a Content-Length was declared. Its chunk limit is this chunk cap.
 
 # Upper bound on the configurable session_timeout (JWT + web-session lifetime), in minutes. Clamped
 # at settings-write time so a token can't be minted effectively immortal; the session row's absolute
@@ -394,25 +395,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     
     async def dispatch(self, request: StarletteRequest, call_next):
-        # Defense-in-depth request-body cap on a DECLARED Content-Length. MULTIPART uploads are EXEMPT:
-        # they are metered per-file in-stream and bounded by the target vault's own size limit (and the
-        # multipart parser itself is bounded by starlette >=0.40), so an aggregate cap here would wrongly
-        # reject a legitimate multi-file batch. A missing/chunked Content-Length is metered downstream.
-        # The rejection is assigned to `response` (not returned early) so it still flows through the
-        # hardening-header code below.
+        # The request-body limit is BodyLimitMiddleware's (app/core/body_limit.py), inside this one,
+        # so its 413 still flows through the hardening-header code below.
         import time as _t
         _req_started = _t.monotonic()
-        _oversize_response = None
-        _cl = request.headers.get("content-length")
-        _ctype = request.headers.get("content-type", "").lower()
-        if _cl is not None and not _ctype.startswith("multipart/"):
-            try:
-                if int(_cl) > _MAX_REQUEST_BODY_BYTES:
-                    _oversize_response = JSONResponse(status_code=413, content={"detail": "Request body too large."})
-            except ValueError:
-                _oversize_response = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header."})
         try:
-            response = _oversize_response if _oversize_response is not None else await call_next(request)
+            response = await call_next(request)
         except HTTPException:
             # Re-raise HTTPExceptions (they're handled by FastAPI)
             raise

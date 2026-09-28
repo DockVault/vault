@@ -271,8 +271,9 @@ could not cover them in any case.
 **What the ceiling does not cover.** A multipart upload's body is received and spooled by the web
 framework before the endpoint runs, so those bytes arrive whether or not the deployment has a slot
 free — the ceiling governs the encryption work that follows, not the receive. Each part is spooled
-to disk above 1 MB, so this is bounded per request rather than per file, but it is not zero and it
-is not counted here. The resumable path the browser uses does not have this property: its chunks
+to a temporary file above 1 MB (under `/tmp`, a tmpfs in the shipped compose files: see Request
+bodies below), so this is bounded per request rather than per file, but it is not zero and it is
+not counted here. The resumable path the browser uses does not have this property: its chunks
 are written straight to disk by the application itself.
 
 **What the ceiling costs, stated plainly.** A slot is held for as long as its transfer takes, and a
@@ -286,6 +287,31 @@ process being killed rather than in callers being asked to come back. Recovery i
 stalled clients disconnect, and a proxy with a response timeout in front of the deployment removes
 the exposure entirely. Bounding how long
 a slot may be held with no forward progress is the proper fix and is not in this change.
+
+## Request bodies
+
+The web framework reads a JSON body whole and parses it on the event loop, and reads a multipart
+form whole, before any of the route's own code runs, so before it knows who is calling. Every body
+is therefore bounded as it arrives, whether or not it declared a length, and a body past its limit
+is answered `413` without the rest being read (`app/core/body_limit.py`):
+
+| Routes | Limit |
+|---|---|
+| Sign-in, second factor, signup, invitation and reset acceptance, forgot-password, the public note, file and upload link endpoints, device sync | 64 KiB |
+| Every other route, unless listed below | 1 MiB |
+| A resumable chunk, signed in or through an upload link | 64 MiB (the chunk size cap) |
+| A note, an email template | 8 MiB, signed in only |
+| Sealing zero-knowledge names | 4 MiB, signed in only |
+| A logo or favicon; an email image | 3 MiB; 6 MiB, signed in only |
+| A multipart file upload | none here (each file is held to the maximum file size and the quotas), signed in only |
+
+"Signed in only" means the larger limit needs a session token the server signed; any other caller
+meets the 1 MiB limit on that route. Measured on this change: a 20 MB chunked body to `/auth/login`
+is refused in 0.2 s and the API's memory rises by under 2 MiB, where it used to be read whole.
+
+A signed-in multipart upload is still received whole before the handler runs. Its parts are spooled
+to `/tmp`, which the shipped compose files mount as a tmpfs, so until the handler has read them they
+are held in memory. The resumable path (what the browser uses) is the one for large files.
 
 ## On the 500 MB target
 
