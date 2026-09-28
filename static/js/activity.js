@@ -215,11 +215,14 @@
         try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; }
     }
 
+    // A call `ms` after the last one. `now` calls at once; `flush` calls at once only if a call is
+    // waiting.
     function debounce(fn, ms) {
-        let t = null;
-        const d = (...args) => { clearTimeout(t); t = setTimeout(() => { t = null; fn(...args); }, ms); };
+        let t = null, last = [];
+        const d = (...args) => { last = args; clearTimeout(t); t = setTimeout(() => { t = null; fn(...args); }, ms); };
         d.cancel = () => { clearTimeout(t); t = null; };
         d.now = (...args) => { clearTimeout(t); t = null; fn(...args); };
+        d.flush = () => { if (t) { clearTimeout(t); t = null; fn(...last); } };
         return d;
     }
 
@@ -4446,7 +4449,7 @@
         reloadSoon.cancel();
         nowSoon.cancel();
         searchSoon.cancel();
-        savePrefs.now();
+        savePrefs.flush();
     }
 
     function minuteTick() {
