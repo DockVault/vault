@@ -8384,7 +8384,7 @@ def _ws_sees_activity(user_id: str, is_temporary: bool) -> bool:
             db.close()
         return role == RoleEnum.ADMIN
     except Exception as e:  # noqa: BLE001
-        print(f"[WS] activity access check failed (no signal): {e}")
+        print(f"[WS] activity access check failed (no signal): {type(e).__name__}")
         return False
 
 
@@ -12801,7 +12801,7 @@ def _audit_access_change(db, actor, action, resource_type, resource_id, details=
             details=details or {},
         )
     except Exception as e:                                   # noqa: BLE001 - see docstring
-        print(f"⚠ audit write skipped for {action}: {e}")
+        print(f"⚠ audit write skipped for {action}: {type(e).__name__}")
 
 
 _SF_METHOD_NAMES = ("totp", "recovery", "email", "password")
@@ -12818,7 +12818,11 @@ def _sf_method_name(method) -> str:
 def _audit_change(db, actor, action, resource_type, resource_id, details=None, status="success"):
     """One audit row for a change a route has already committed. Best-effort, for the same reason as
     _audit_access_change: the change succeeded, so a failed audit write must not turn it into an error.
-    The address comes from the request (AuditLogger fills it)."""
+    The address comes from the request (AuditLogger fills it).
+
+    A failure is logged by its exception class alone. The database's error text carries the statement's
+    bound values (usernames, addresses, old and new email addresses), and the process log can be pulled
+    through Log access."""
     try:
         AuditLogger(db).log_action(
             action=action,
@@ -12829,7 +12833,7 @@ def _audit_change(db, actor, action, resource_type, resource_id, details=None, s
             details=details or None,
         )
     except Exception as e:                                   # noqa: BLE001 - see docstring
-        print(f"⚠ audit write skipped for {action}: {e}")
+        print(f"⚠ audit write skipped for {action}: {type(e).__name__}")
         try:
             db.rollback()
         except Exception:                                    # noqa: BLE001
@@ -14282,7 +14286,7 @@ async def create_share(
                             db.query(User).filter(User.id.in_([str(x) for x in recipient_ids])).all()]
             _fire_action_email_bulk(db, "share_created", _share_pairs, _share_ctx)
     except Exception as e:
-        print(f"⚠ share notification skipped: {e}")
+        print(f"⚠ share notification skipped: {type(e).__name__}")
     out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
     return out
 
@@ -14738,7 +14742,7 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
                                      "target": target, "owner_user_id": str(uid)}},
                           include_metrics=False)
     except Exception as e:
-        print(f"⚠ notification write skipped: {e}")
+        print(f"⚠ notification write skipped: {type(e).__name__}")
 
 
 def _notification_dict(n) -> dict:
@@ -23832,7 +23836,7 @@ def _purge_audit_log_names():
         if purged:
             print(f"[OK] Redacted residual names from {purged} legacy audit-log row(s)")
     except Exception as e:  # noqa: BLE001 — best-effort hardening migration, never block boot
-        print(f"⚠ audit-log name redaction skipped: {e}")
+        print(f"⚠ audit-log name redaction skipped: {type(e).__name__}")
 
 
 def _backfill_notelink_tokens():
