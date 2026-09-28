@@ -10061,8 +10061,15 @@ async def add_ssh_key(
     db: Session = Depends(get_db),
 ):
     """Add an SSH public key authorizing this user's SFTP access (admin or self)."""
+    from app.core.endpoint_permissions import check_endpoint_permission
     from app.core.models import UserSSHKey
     target = _ssh_key_target_user(user_id, current_user, db, write=True)
+    if target.id != current_user.id:
+        # A key on someone else's account is one of the five credential changes, and signs in to SFTP
+        # as them: it takes the same permission and step-up as setting their password or resetting
+        # their second factor. Adding your own key is not an administrator's action.
+        check_endpoint_permission(db, current_user, "USER_MANAGE")
+        _enforce_step_up(db, current_user, request, "admin.user.manage")
     key_type, normalized, fingerprint = _parse_ssh_public_key(body.public_key)
     if db.query(UserSSHKey).filter(
         UserSSHKey.user_id == user_id, UserSSHKey.fingerprint == fingerprint

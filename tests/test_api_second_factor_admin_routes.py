@@ -8,9 +8,17 @@ A wrinkle unique to admin.user.manage: once it is ON, the shared un-enrolled `ad
 users, so it cannot be used to flip the toggle back. That test edits the matrix DIRECTLY as an enrolled
 actor (the matrix write is gated by account.second_factor, not admin.user.manage), sidestepping the loop.
 """
+import base64
+import os
+import struct
 import uuid
 
 from _sf_helpers import enroll_totp, enrolled_admin, step_up_receipt, set_action_require_otp   # noqa: E402
+
+
+def _ssh_key():
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + os.urandom(32)
+    return "ssh-ed25519 " + base64.b64encode(blob).decode()
 
 
 def test_admin_user_manage_gates_user_routes(admin):
@@ -48,6 +56,19 @@ def test_admin_user_manage_gates_user_routes(admin):
                                                                    recovery_codes=codes)})
             assert r.status_code in (200, 201), r.text
             extra_id = r.json()["id"]
+
+            # An SSH key added to someone else's account is a credential change and is gated the same
+            # way. The target's first change in the window, so it is made at once (not held).
+            keys = f"/users/{target['id']}/ssh-keys"
+            key = {"name": "gated", "public_key": _ssh_key()}
+            r = c.post(keys, json=key)
+            assert r.status_code == 403 and r.json()["detail"]["action"] == "admin.user.manage", r.text
+            r = c.post(keys, json=key, headers={"X-Second-Factor": step_up_receipt(
+                c, action="admin.user.manage", recovery_codes=codes)})
+            assert r.status_code == 200, r.text
+            # The administrator's own key is not an administrator's action: no receipt needed.
+            r = c.post(f"/users/{ta['id']}/ssh-keys", json={"name": "mine", "public_key": _ssh_key()})
+            assert r.status_code == 200, r.text
         finally:
             _set_user_manage(False)   # back OFF before any un-enrolled cleanup below
     finally:
