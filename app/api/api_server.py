@@ -5519,9 +5519,11 @@ def _notify_account_change(db, user, *, ntype, title, change, by, email=None) ->
     commit; best-effort, it never undoes the change."""
     when = _change_time_text()
     try:
+        # No time in the text: the notice's own time is shown beside it, in the reader's zone. A second,
+        # in UTC, read as a different time. The email has no other time, so it keeps its own.
         _notify_users([str(user.id)], ntype, title=title,
-                      body=(f"{change} When: {when}. By: {by}. If you did not expect this, contact your "
-                            "administrators at once."),
+                      body=(f"{change} By: {by}. If you did not expect this, contact your administrators "
+                            "at once."),
                       target="#profile")
     except Exception as e:  # noqa: BLE001
         print(f"⚠ account-change notice skipped: {type(e).__name__}")

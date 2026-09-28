@@ -43,7 +43,10 @@ def test_a_notice_says_what_when_by_whom_and_what_to_do(sent):
     assert row["ids"] == ["u-1"] and row["title"] == "Your password was changed"
     body = row["body"]
     assert "An administrator set a new password." in body and "By: alice" in body
-    assert "UTC" in body and "If you did not expect this" in body
+    assert "If you did not expect this" in body
+    # One time, the notice's own, shown beside it in the reader's zone: none in the text. The email,
+    # with no other time, says when.
+    assert "UTC" not in body and "When:" not in body
     (mail,) = sent["email"]
     assert (mail["key"], mail["email"]) == ("account_changed_by_admin", "carol@example.com")
     assert mail["context"]["change"] == "An administrator set a new password."
@@ -116,3 +119,16 @@ def test_the_email_is_a_system_action_that_must_say_what_changed():
         assert token in spec["default_body_html"]
     # A customised body that drops what changed falls back to the built-in one.
     assert ea._fallback_body_if_missing_required_token(ea.SYSTEM, "<p>Hello</p>", spec) == spec["default_body_html"]
+
+
+def test_a_held_change_is_told_with_its_date_in_words(sent, monkeypatch):
+    """The user, the asker and the approvers are told when a held change expires: "by 5 October 2026",
+    never "by 2026-10-05", which read as a code and broke across two lines on a phone."""
+    from datetime import datetime
+    monkeypatch.setattr(cc, "approvers", lambda db, requester_id: [SimpleNamespace(id="a-2")])
+    change = SimpleNamespace(kind=cc.RESET_LINK, requested_by_id="a-1", requested_by_name="alice",
+                             expires_at=datetime(2026, 10, 5, 9, 0))
+    api._announce_held_change(None, change, USER)
+    bodies = [row["body"] for row in sent["app"]]
+    assert len(bodies) == 3 and all("5 October 2026" in b for b in bodies), bodies
+    assert not any("2026-10" in b for b in bodies)

@@ -38,7 +38,8 @@ def _assert_told(user, title, *words):
     matching = [body for t, body in notices if t == title]
     assert matching, (title, notices)
     body = matching[-1]
-    assert "By: admin" in body and "UTC" in body and "If you did not expect this" in body, body
+    assert "By: admin" in body and "If you did not expect this" in body, body
+    assert "UTC" not in body and "When:" not in body, body      # the notice's own time is the one shown
     for w in words:
         assert w in body, (w, body)
 
