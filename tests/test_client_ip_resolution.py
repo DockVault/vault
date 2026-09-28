@@ -132,9 +132,10 @@ def test_a_username_that_looks_like_an_ip_has_its_own_bucket():
     # The address itself, logging in as someone else, is untouched.
     svc._redis_rate_limit(limiter, "alice", "203.0.113.50", 5, 1, 60)
     assert limiter.hits["rate_limit:login_ip:203.0.113.50"] == 1
+    from app.core.name_keys import name_key
     assert set(limiter.hits) == {
-        "rate_limit:login_user:203.0.113.50|198.51.100.9", "rate_limit:login_ip:198.51.100.9",
-        "rate_limit:login_user:alice|203.0.113.50", "rate_limit:login_ip:203.0.113.50",
+        f"rate_limit:login_user:{name_key('203.0.113.50')}|198.51.100.9", "rate_limit:login_ip:198.51.100.9",
+        f"rate_limit:login_user:{name_key('alice')}|203.0.113.50", "rate_limit:login_ip:203.0.113.50",
     }
 
 
@@ -149,7 +150,8 @@ def test_a_name_throttled_from_one_address_signs_in_from_another():
         for _ in range(6):
             svc._redis_rate_limit(limiter, "alice", "203.0.113.66", 5, 100, 60)
     svc._redis_rate_limit(limiter, "alice", "198.51.100.10", 5, 100, 60)   # not raised
-    assert limiter.hits["rate_limit:login_user:alice|198.51.100.10"] == 1
+    from app.core.name_keys import name_key
+    assert limiter.hits[f"rate_limit:login_user:{name_key('alice')}|198.51.100.10"] == 1
 
 
 def test_a_known_temporary_name_is_throttled_in_the_name_bucket_only(monkeypatch):
@@ -164,7 +166,8 @@ def test_a_known_temporary_name_is_throttled_in_the_name_bucket_only(monkeypatch
     monkeypatch.setattr(auth_service.rate_limit_settings, "effective", lambda name: 5 if "attempts" in name else 60)
     svc = AuthService.__new__(AuthService)
     svc._check_username_rate_limit("203.0.113.50")
-    assert set(limiter.hits) == {"rate_limit:login_user:203.0.113.50"}
+    from app.core.name_keys import name_key
+    assert set(limiter.hits) == {f"rate_limit:login_user:{name_key('203.0.113.50')}"}
 
 
 def test_under_a_trusted_list_an_all_trusted_chain_resolves_to_the_left_most(trust):

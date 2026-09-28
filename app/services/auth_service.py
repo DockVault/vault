@@ -205,8 +205,10 @@ def account_locked(user) -> bool:
 
 def login_user_key(identifier, ip_address, *, prefixed=True) -> str:
     """The sign-in throttle's per-name bucket: one per name AND source address. ``prefixed`` gives
-    the cache key; without it, the durable fallback's identifier (its column is bounded)."""
-    bucket = f"{identifier}|{ip_address}"
+    the cache key; without it, the durable fallback's identifier (its column is bounded). The name is
+    kept as its keyed stand-in, never as typed (app/core/name_keys.py)."""
+    from app.core.name_keys import name_key
+    bucket = f"{name_key(identifier)}|{ip_address}"
     return f"login_user:{bucket}" if prefixed else bucket[:255]
 
 
@@ -1966,12 +1968,13 @@ class AuthService:
         NULL), is still bounded, just in a bucket of its own, so a client looping on it cannot spend
         the human's per-IP login budget and lock the owner out. Same fail-closed posture as the login
         throttle: on a Redis outage it drops to the durable DB fallback, keyed by username."""
+        from app.core.name_keys import name_key
         from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
         user_limit = rate_limit_settings.effective("max_login_attempts")
         window = rate_limit_settings.effective("rate_limit_login_window_seconds")
         try:
             allowed, remaining, reset = rate_limiter.check_rate_limit(
-                f"login_user:{username}", user_limit, window,
+                f"login_user:{name_key(username)}", user_limit, window,
                 prefix="rate_limit", fail_open=False,
             )
             if not allowed:
@@ -1982,7 +1985,7 @@ class AuthService:
                 )
             return {'limit': user_limit, 'remaining': remaining, 'reset': reset}
         except RateLimiterUnavailable:
-            allowed, retry = self._db_throttle_hit(username, "login_user", user_limit, window)
+            allowed, retry = self._db_throttle_hit(name_key(username), "login_user", user_limit, window)
             if not allowed:
                 raise RateLimitExceededError(
                     f"Too many login attempts. Please try again in {retry} seconds.",

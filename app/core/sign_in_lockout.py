@@ -374,8 +374,11 @@ def _phantom_store():
 
 
 def _phantom_keys(identifier, address):
-    return (f"{PHANTOM_PREFIX}:{source_of(address)}|{identifier}",
-            f"{PHANTOM_PREFIX}:{ACCOUNT_WIDE}|{identifier}")
+    """The cache keys for a name from an address, and from everywhere. The name is kept as its keyed
+    stand-in, never as typed (app/core/name_keys.py)."""
+    from app.core.name_keys import name_key
+    name = name_key(identifier)
+    return (f"{PHANTOM_PREFIX}:{source_of(address)}|{name}", f"{PHANTOM_PREFIX}:{ACCOUNT_WIDE}|{name}")
 
 
 def _phantom_in_force(state, now) -> bool:

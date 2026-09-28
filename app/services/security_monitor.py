@@ -121,7 +121,10 @@ class SecurityMonitor:
             reason: Failure reason
         """
         now = time.time()
-        identifier = f"{username}:{ip_address}"
+        # The counter's key carries the name's keyed stand-in, never the name as typed, which can be a
+        # password typed into the wrong box (app/core/name_keys.py).
+        from app.core.name_keys import name_key
+        identifier = f"{name_key(username)}:{ip_address}"
 
         # Keep an in-memory trail purely as a Redis-outage fallback (see _windowed_count).
         self._login_attempts[identifier].append(now)
