@@ -188,7 +188,8 @@ console.log(JSON.stringify(['203.0.113.7', '2001:db8::1', '2001:0db8:0000:0042:0
     ("203.0.113.7", True), ("203.0.113.0/24", True), ("0.0.0.0/0", True), ("256.1.1.1", False),
     ("203.0.113.7/33", False), ("2001:db8::1", True), ("2001:db8::/32", True), ("::1", True),
     ("::ffff:192.0.2.1", True), ("1:2:3:4:5:6:7:8", True), ("1:2:3", False), ("2001:db8::1/129", False),
-    ("1::2::3", False), ("::", True), ("1:2:3:4:5:6:192.0.2.1", True),
+    ("1::2::3", False), ("2001:db8:::1", False), (":1::2", False), ("1::2:", False),
+    ("1::2:3:4:5:6:7:8", False), ("::", True), ("1:2:3:4:5:6:192.0.2.1", True), ("::ffff:192.0.2.256", False),
     ("alex", False), ("203.0.113", False), ("", False),
 ])
 def test_an_address_is_checked_before_anything_is_sent(value, ok):

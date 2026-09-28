@@ -3800,11 +3800,20 @@
             return bits == null || bits <= 32;
         }
         if (host.includes(':') && /^[0-9a-fA-F:.]+$/.test(host)) {
-            const parts = host.split('::');
-            if (parts.length > 2) return false;
-            const groups = host.replace('::', ':').split(':').filter(Boolean);
-            if (!groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g) || /^\d{1,3}(\.\d{1,3}){3}$/.test(g))) return false;
-            if (parts.length === 1 && groups.length !== 8 && !groups.some((g) => g.includes('.'))) return false;
+            // Eight groups, or fewer around one "::"; an IPv4 tail counts as two. An empty group (":::",
+            // or a single ":" at either end) is not an address.
+            const halves = host.split('::');
+            if (halves.length > 2) return false;
+            const side = (s) => (s ? s.split(':') : []);
+            const groups = side(halves[0]).concat(halves.length === 2 ? side(halves[1]) : []);
+            let count = 0;
+            for (let i = 0; i < groups.length; i++) {
+                const g = groups[i];
+                if (/^[0-9a-fA-F]{1,4}$/.test(g)) count += 1;
+                else if (i === groups.length - 1 && /^\d{1,3}(\.\d{1,3}){3}$/.test(g) && g.split('.').every((p) => Number(p) <= 255)) count += 2;
+                else return false;
+            }
+            if (halves.length === 2 ? count > 7 : count !== 8) return false;
             return bits == null || bits <= 128;
         }
         return false;
