@@ -6996,6 +6996,9 @@ let notifUnread = 0;
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
 const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users' };
+// Targets that open a dialog rather than a page: a notice about the reader's own account (a password,
+// an email address or a second factor an administrator changed) opens "Your account".
+const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -7077,6 +7080,8 @@ async function onNotifClick(n) {
     if (section) {
         const item = document.querySelector('.sidebar-item[data-section="' + section + '"]');
         if (item) item.click();
+    } else if (_NOTIF_TARGET_OPEN[n.target]) {
+        _NOTIF_TARGET_OPEN[n.target]();
     }
 }
 

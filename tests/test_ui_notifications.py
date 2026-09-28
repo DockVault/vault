@@ -76,3 +76,22 @@ def test_bell_badge_thresholds_and_empty_state(page: Page, admin_creds):
     assert res["zeroHidden"] is True, "badge hides at zero unread"
     assert res["emptyShown"] is True, "empty state shows when there are no notifications"
     assert res["capped"] == "99+" and res["cappedShown"] is True, res
+
+
+def test_a_notice_about_your_own_account_opens_your_account(page: Page, admin):
+    """A notice that an administrator changed your sign-in details points at your own account
+    (#profile): clicking it opens "Your account", where it can be seen and acted on, rather than only
+    marking the notice read. A real notice: an administrator creates a reset link for the account."""
+    user = admin.create_user()
+    try:
+        assert admin.post(f"/users/{user['id']}/reset-link").status_code == 200
+        _login(page, user["_username"], user["_password"])
+        page.click("#notif-btn")
+        notice = page.locator("#notif-list .notif-item", has_text="password reset link was created")
+        expect(notice).to_have_count(1, timeout=10000)
+        expect(page.locator("#user-settings-modal")).to_be_hidden()
+        notice.click()
+        expect(page.locator("#user-settings-modal")).to_be_visible(timeout=5000)
+        expect(page.locator("#us-username")).to_have_text(user["_username"])
+    finally:
+        admin.delete_user(user["id"])
