@@ -71,7 +71,7 @@
             // Live.
             paused: false, pausedAt: null, kept: new Set(), keptOver: false, keptCount: null,
             held: [], heldExtra: 0, heldBurst: false, heldIds: new Set(), fetchQueue: new Set(), recent: [], burst: false,
-            newestRow: null, newMarks: new Map(), lastRead: null, vaultList: null,
+            newestRow: null, newMarks: new Map(), lastRead: null, vaultList: null, tcStates: {},
             socketState: window.dockvaultSocketState || 'connecting', socketDownSince: null,
             liveState: null, liveAnnounced: null, highlightOff: false, batches: [],
             lastPointer: 0, pointerDown: false, lastKey: 0,
@@ -1567,7 +1567,9 @@
             [ev.username ? detailFilter("Show this person's events", { user: ev.username, userMatch: 'exact', noAccount: false }) : null]);
         if (ev.temp_credential_id) {
             const name = ev.temp_credential_name || String(ev.temp_credential_id).slice(0, 8);
-            field(who.dl, 'Temporary credential', name,
+            const known = S.tcStates[ev.temp_credential_id];
+            if (known === undefined && ev.temp_credential_name) lookupTcState(ev.temp_credential_id, ev.temp_credential_name);
+            field(who.dl, 'Temporary credential', known ? `${name} · ${known}` : name,
                 [detailFilter("Show this credential's events", { tcId: ev.temp_credential_id, tcName: ev.temp_credential_name || '' })]);
         }
         if (ev.ip_address) {
@@ -1655,6 +1657,27 @@
         det.appendChild(el('p', 'act-d-stored', `Stored as ${ev.action} · id ${String(ev.id).slice(0, 8)}…`));
         frag.appendChild(det);
         return frag;
+    }
+
+    // A temporary credential's state for the detail ("active · expires 30 Sep", "expired 12 Sep",
+    // "revoked"), looked up once by its name; a deleted credential has none.
+    function tcStateText(t) {
+        const exp = toDate(t.expires_at);
+        if (t.state === 'active') return exp ? `active · expires ${dayMonth(exp)}` : 'active';
+        if (t.state === 'expired') return exp ? `expired ${dayMonth(exp)}` : 'expired';
+        return 'revoked';
+    }
+
+    async function lookupTcState(id, name) {
+        if (id in S.tcStates || String(name).length < 2) return;
+        S.tcStates[id] = null;
+        try {
+            const d = await get(`/activity/temp-credentials?q=${encodeURIComponent(String(name).slice(0, 64))}&limit=20`);
+            const t = (d.temp_credentials || []).find((x) => String(x.id) === String(id));
+            if (!t) return;
+            S.tcStates[id] = tcStateText(t);
+            if (S.detailOpen && S.detail && S.detail.temp_credential_id === id) renderDetail();
+        } catch (_) { /* the name alone is shown */ }
     }
 
     function titleWithBadge(tag, id, ev) {
