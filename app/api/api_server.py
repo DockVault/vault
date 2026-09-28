@@ -6991,12 +6991,16 @@ async def login(
         # already holds its slot, so this adds no new pool pressure.
         await run_offloaded(_record_failed_login_bg, login_request.username, client_ip, str(e))
 
-        # A lock is only raised AFTER the password verified (verify-first ordering in
-        # authenticate_user), so the caller has already proven they know the credential — telling
-        # them the account is locked (and when it frees) reveals nothing an attacker couldn't
-        # already determine, and unlike the generic message it tells a legitimate user why they're
-        # stuck. Wrong password / nonexistent / inactive still get the uniform generic 401 so the
-        # response body can't enumerate accounts or their state.
+        # An administrator's lock is raised only AFTER the password verified (verify-first ordering
+        # in authenticate_user), so the caller has already proven they know the credential. An
+        # automatic lock is raised BEFORE the password is checked, so guessing stops while it lasts,
+        # and a name that is no account is refused the same way at the same count
+        # (app/core/sign_in_lockout.py), so that refusal does not tell an account from none. Either
+        # way, telling the caller about the lock (and when it frees) reveals nothing an attacker
+        # couldn't already determine, and unlike the generic message it tells a legitimate user why
+        # they're stuck. Otherwise a wrong password (an administrator's lock included), a name that is
+        # no account and an inactive account all get the uniform generic 401, so the response body
+        # can't enumerate accounts or their state.
         if isinstance(e, AccountLockedError):
             raise _sign_in_lock_refusal(e)
         raise HTTPException(
