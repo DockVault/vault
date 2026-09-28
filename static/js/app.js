@@ -14498,7 +14498,11 @@ function navigateToSection(section) {
 // The hash never reaches the server. Returns true if it opened the page.
 function openActivityFromHash() {
     if (!location.hash.startsWith('#activity')) return false;
-    if (currentUser && currentUser.role === 'admin' && !isScopedTemp) {
+    // A temporary credential, scoped or not, is never an administrator's own session. After a password
+    // sign-in the session probe has already said so; on a restored session it has not run yet, and the
+    // page itself then shows that it needs the administrator's own sign-in, without asking the server.
+    const temporary = isScopedTemp || !!(sessionAccess && sessionAccess.is_temp_session);
+    if (currentUser && currentUser.role === 'admin' && !temporary) {
         navigateToSection('activity');
         return true;
     }
