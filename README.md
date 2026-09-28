@@ -262,11 +262,15 @@ DockVault encrypts **file contents** (AES-256-GCM, per-file keys derived from th
 **file/folder names + MIME types** at rest, so a raw read of the storage volume yields ciphertext, not
 your files or their names.
 
-It does **not** encrypt the rest of the database. The Postgres volume (`vault_pg_data`) holds usernames,
-emails, vault names, note text, and audit records (usernames, client IPs, user agents) in **plaintext**,
-recoverable by anyone who can mount that volume — no password required. All server-side at-rest
-protection also derives from the single `ENCRYPTION_KEY`; there is no per-tenant key separation, so that
-key plus the volumes is total compromise.
+It does **not** encrypt the rest of the database. Vault names and note text are sealed, but the Postgres
+volume (`vault_pg_data`) holds usernames, emails, and audit records (usernames, client IPs, user agents)
+in **plaintext**, recoverable by anyone who can mount that volume — no password required. All
+server-side at-rest protection also derives from the single `ENCRYPTION_KEY`; there is no per-tenant key
+separation, so that key plus the volumes is total compromise.
+
+Every place a deployment keeps personal data — database tables, cache keys, files, logs, emails,
+exports — with its fields, purpose, retention and how it is erased, is listed in
+[docs/data-inventory.md](docs/data-inventory.md), written for an operator's record of processing.
 
 **Host full-disk encryption (LUKS/dm-crypt, BitLocker, FileVault, or an encrypted cloud volume) is
 therefore a prerequisite — not an optional extra — for protecting the database and at-rest metadata.**

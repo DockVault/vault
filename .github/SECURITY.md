@@ -62,7 +62,10 @@ Use the hardened production path, not the local-trial default:
 
 The vault encrypts file **contents** at rest, and recent releases also seal sensitive
 **metadata** in the database — note titles/bodies, file/folder names, and vault
-names/descriptions — so they are not stored in the clear.
+names/descriptions — so they are not stored in the clear. What stays in the clear, and every
+other place a deployment keeps personal data (the audit log, sessions, cache, logs, emails and
+exports), with its retention and how it is erased, is listed in
+[docs/data-inventory.md](../docs/data-inventory.md).
 
 When you **upgrade an existing deployment**, the boot migrations seal the rows that were
 written in the clear by an older version, in place. This is an important caveat for a
