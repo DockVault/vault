@@ -5213,6 +5213,10 @@ function renderCredentialRequests(requests) {
             withdraw.type = 'button';
             withdraw.addEventListener('click', () => decideCredentialRequest(req, 'withdraw', withdraw));
             actions.appendChild(withdraw);
+        } else if (req.cannot_approve) {
+            // Made an administrator by the one who asked, or after the request: say why there is no
+            // Approve, rather than showing a row with no way to act on it.
+            actions.appendChild(_el('span', 'credential-request-waiting', req.cannot_approve));
         }
         row.appendChild(actions);
         list.appendChild(row);

@@ -5081,6 +5081,12 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
 
     # (h) Grant the role's default permissions inside this same transaction (commit=False).
     grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
+    # An administrator's invitation makes an administrator: recorded as made by whoever invited (who
+    # held the link, and could have accepted it themselves), for the two-administrator rule.
+    inviter = db.get(User, inv.created_by) if (role == RoleEnum.ADMIN and inv.created_by) else None
+    if role == RoleEnum.ADMIN:
+        _record_admin_grant(db, user, by=inviter, by_name=inviter.username if inviter is not None
+                            else "an administrator since deleted")
 
     # (i) One commit for the whole accept.
     try:
@@ -5097,6 +5103,9 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
             details={"username": inv.username, "role": str(user.role), "token_prefix": prefix})
     except Exception:
         pass
+    if role == RoleEnum.ADMIN:
+        _announce_admin_granted(db, user, by_name=inviter.username if inviter is not None
+                                else "an administrator since deleted", how="invited")
 
     # Optionally welcome the freshly-created account by email (opt-in). Best-effort.
     _fire_action_email(db, "account_welcome", email=user.email, username=user.username)
@@ -5494,8 +5503,33 @@ def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fing
     return None
 
 
-def _credential_request_dict(change, target_username, viewer_id=None) -> dict:
+def _approval_refusal_text(reason, requester, *, short=False) -> str:
+    """What an administrator is told when they may not approve a held request (see
+    credential_changes.approval_refusal). ``short`` is the line the Users page shows beside it."""
     from app.core import credential_changes as cc
+    if reason == cc.MADE_BY_REQUESTER:
+        if short:
+            return f"You cannot approve this: {requester} made you an administrator."
+        return (f"{requester} made you an administrator, directly or through an administrator they made, "
+                "so you cannot approve their request. Another administrator, or the person who runs the "
+                "server (python dockvault.py accounts), can.")
+    if reason == cc.BECAME_ADMIN_AFTER:
+        if short:
+            return "You cannot approve this: you became an administrator after it was asked for."
+        return ("You became an administrator after this request was made, so you cannot approve it. An "
+                "administrator who was one before it, or the person who runs the server (python "
+                "dockvault.py accounts), can.")
+    return "A change you asked for needs another administrator's approval. You can withdraw it."
+
+
+def _credential_request_dict(change, target_username, viewer_id=None, db=None) -> dict:
+    """A held request as the lists show it. With ``db``, whether the viewer may approve it follows the
+    administrator records too (credential_changes.approval_refusal); without, only who asked."""
+    from app.core import credential_changes as cc
+    refusal = None
+    if viewer_id is not None and db is not None:
+        refusal = cc.approval_refusal(db, change, viewer_id)
+    can_approve = viewer_id is not None and (refusal is None if db is not None else cc.may_approve(change, viewer_id))
     return {
         "id": str(change.id),
         "kind": change.kind,
@@ -5509,7 +5543,10 @@ def _credential_request_dict(change, target_username, viewer_id=None) -> dict:
         "requested_at": change.requested_at.isoformat() + "Z" if change.requested_at else None,
         "expires_at": change.expires_at.isoformat() + "Z" if change.expires_at else None,
         "is_mine": viewer_id is not None and change.requested_by_id == viewer_id,
-        "can_approve": viewer_id is not None and cc.may_approve(change, viewer_id),
+        "can_approve": can_approve,
+        # Why the viewer may not approve it, when that is not simply that they asked for it.
+        "cannot_approve": (_approval_refusal_text(refusal, change.requested_by_name, short=True)
+                           if refusal not in (None, cc.ASKED) else None),
     }
 
 
@@ -5664,6 +5701,40 @@ def _notify_account_status_changes(db, user, *, by_name, locked=None, active=Non
                                change=f"An administrator changed your role from {role[0]} to {role[1]}.", by=by)
 
 
+def _record_admin_grant(db, user, *, by, by_name=None) -> None:
+    """``user`` has just become an administrator, made so by ``by`` (a User, or None for the host
+    operator): record who and when, in the caller's transaction, for the two-administrator rule
+    (app/core/admin_grants.py). Call it only on the change INTO the role."""
+    from app.core import admin_grants
+    from app.core import credential_changes as cc
+    admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
+                        granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR))
+
+
+def _announce_admin_granted(db, user, *, by_name, how) -> None:
+    """Tell every other administrator, in the app and by email, that ``user`` became an administrator.
+    ``how`` is "created", "promoted" or "invited". After the commit; best-effort.
+
+    An administrator can change other people's accounts and approve changes to them, so a new one must
+    never appear unnoticed: this is how the others see an account made to approve its maker's changes."""
+    try:
+        by = _actor_text(by_name)
+        what = {"created": f"{by} created the administrator account {user.username}.",
+                "invited": f"{user.username} accepted an invitation from {by} and is now an administrator.",
+                }.get(how, f"{by} made {user.username} an administrator.")
+        when = _change_time_text()
+        others = [a for a in db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
+                  if a.id != user.id]
+        _notify_users([str(a.id) for a in others], "administrator_added", title="A new administrator",
+                      body=(f"{what} When: {when}. An administrator can change other people's accounts. If "
+                            "you did not expect this, check the Users page at once."),
+                      target="#users")
+        _fire_action_email_bulk(db, "administrator_added", [(a.email, a.username) for a in others],
+                                {"change": what, "by": by, "when": when})
+    except Exception as e:  # noqa: BLE001 - a notice never undoes the change
+        print(f"⚠ new-administrator notice skipped: {type(e).__name__}")
+
+
 def _announce_held_change(db, change, target) -> None:
     """Tell the administrator who asked, the administrators who can approve, and the user, that a
     change is waiting. After the commit; best-effort."""
@@ -5678,7 +5749,7 @@ def _announce_held_change(db, change, target) -> None:
                                 f"were changed less than 14 days ago. It expires on {until} if nobody "
                                 "decides."),
                           target="#users")
-        approver_ids = [str(a.id) for a in cc.approvers(db, change.requested_by_id)
+        approver_ids = [str(a.id) for a in cc.approvers(db, change.requested_by_id, change)
                         if a.id != target.id]
         _notify_users(approver_ids, "credential_change_approval_needed",
                       title="A change needs your approval",
@@ -8735,13 +8806,17 @@ async def create_user(
     # Admin password policy (min length + complexity) beyond the model's 8-char floor.
     _validate_password_policy(db, user_create.password)
 
+    is_admin_role = user_create.role == RoleEnum.ADMIN
     try:
         new_user = auth_service.create_user(
             username=user_create.username,
             email=user_create.email,
             password=user_create.password,
             role=user_create.role,
-            created_by=current_user.id
+            created_by=current_user.id,
+            # An administrator account records who made it one, in the same commit: the
+            # two-administrator rule refuses that administrator's approval of its maker's changes.
+            before_commit=(lambda u: _record_admin_grant(db, u, by=current_user)) if is_admin_role else None,
         )
         
         # Grant default permissions based on role
@@ -8749,6 +8824,8 @@ async def create_user(
         grant_default_permissions_for_role(str(new_user.id), new_user.role, db)
         
         audit_logger.log_user_created(new_user, current_user, client_ip)
+        if is_admin_role:
+            _announce_admin_granted(db, new_user, by_name=current_user.username, how="created")
 
         # Optionally send the new account a welcome email (opt-in). Best-effort.
         _fire_action_email(db, "account_welcome", email=new_user.email, username=new_user.username)
@@ -9906,9 +9983,18 @@ async def update_user(
         _revoke_sessions(db, user_id=user.id, actor_username=current_user.username, durable=False)
 
     # Admin-only fields
+    admin_granted = False
     if is_admin:
         if user_update.role is not None:
             changes['role'] = {'old': user.role.value, 'new': user_update.role.value}
+            # Who made an administrator one is recorded with the change, for the two-administrator
+            # rule; a demotion drops the record (app/core/admin_grants.py).
+            if user_update.role == RoleEnum.ADMIN and user.role != RoleEnum.ADMIN:
+                _record_admin_grant(db, user, by=current_user)
+                admin_granted = True
+            elif user_update.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
+                from app.core import admin_grants as _grants
+                _grants.forget(db, user.id)
             user.role = user_update.role
         
         if user_update.is_active is not None:
@@ -9983,6 +10069,8 @@ async def update_user(
         _notify_account_status_changes(db, user, by_name=current_user.username, locked=_pair("is_locked"),
                                        active=_pair("is_active"), role=_pair("role"),
                                        sign_in_locks_cleared=changes.get("sign_in_locks_cleared", 0))
+    if admin_granted:
+        _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
@@ -10259,7 +10347,7 @@ async def list_credential_requests(
     rows = cc.open_requests(db)
     names = dict(db.query(User.id, User.username).filter(
         User.id.in_([r.target_user_id for r in rows])).all()) if rows else {}
-    return {"requests": [_credential_request_dict(r, names.get(r.target_user_id), current_user.id)
+    return {"requests": [_credential_request_dict(r, names.get(r.target_user_id), current_user.id, db=db)
                          for r in rows]}
 
 
@@ -10273,12 +10361,24 @@ async def approve_credential_request(
     db: Session = Depends(get_db),
 ):
     """Approve a held credential change: it is made as it was asked for. The administrator who asked
-    cannot approve it."""
+    cannot approve it, nor an administrator they made one, nor one made an administrator after the
+    request (app/core/admin_grants.py)."""
     from app.core import credential_changes as cc
     change, target = _open_credential_request(db, change_id)
-    if not cc.may_approve(change, current_user.id):
-        raise HTTPException(status_code=403, detail=(
-            "A change you asked for needs another administrator's approval. You can withdraw it."))
+    refusal = cc.approval_refusal(db, change, current_user.id)
+    if refusal is not None:
+        requester, target_id = change.requested_by_name, change.target_user_id
+        db.rollback()   # release the request's row lock
+        if refusal == cc.ASKED:     # withdrawing is theirs to do; nothing to record
+            raise HTTPException(status_code=403, detail=_approval_refusal_text(refusal, requester))
+        try:
+            AuditLogger(db).log_action(
+                action="credential_change_approval_refused", status="failure", user=current_user,
+                resource_type="user", resource_id=str(target_id),
+                details={"change_id": str(change_id), "requested_by": requester, "reason": refusal})
+        except Exception:  # noqa: BLE001 - the refusal stands without its row
+            db.rollback()
+        raise HTTPException(status_code=403, detail=_approval_refusal_text(refusal, requester))
     result = _approve_credential_change(db, change, target, approver=current_user, request=request)
     return {"status": cc.APPROVED,
             "request": _credential_request_dict(change, target.username, current_user.id),

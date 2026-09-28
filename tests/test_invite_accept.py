@@ -305,3 +305,19 @@ def test_post_resolution_validation_failure_is_audited(admin, invites_on):
     finally:
         admin.put("/settings", json={"password_min_length": None, "require_special": False})
         _cleanup_user(admin, inv["username"])
+
+
+def test_accepting_an_administrators_invitation_records_who_invited(admin, invites_on):
+    # Whoever invited held the link and could have accepted it themselves, so the new administrator is
+    # recorded as made by them: it may not approve their held changes (app/core/admin_grants.py).
+    uname = unique("invadm")
+    me = admin.get("/users/me").json()
+    inv = _mint(admin, username=uname, role="admin")
+    try:
+        r = _anon().post(f"/invites/{inv['token']}/accept", json={"password": STRONG_PW})
+        assert r.status_code == 200, r.text
+        row = _psql("SELECT g.granted_by_name || '|' || (g.granted_by_id::text) FROM admin_grants g "
+                    f"JOIN users u ON u.id = g.user_id WHERE u.username={_q(uname)}")
+        assert row == f"{me['username']}|{me['id']}"
+    finally:
+        _cleanup_user(admin, uname)

@@ -115,9 +115,12 @@ def test_saving_the_edit_form_unchanged_tells_nobody(admin, temp_user):
 
 def test_a_held_change_tells_the_user_too(admin, temp_user):
     from _account_change_helpers import second_admin
-    with second_admin(admin):
+    with second_admin(admin) as (_other, other_client):
+        # Asked by the second administrator: the first made it, and so may approve its request (the
+        # first's own second change would be refused, with nobody it did not make to approve it).
         assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
-        assert admin.patch(f"/users/{temp_user['id']}", json={"password": "Admin-Chosen-8x!"}).status_code == 202
+        assert other_client.patch(f"/users/{temp_user['id']}",
+                                  json={"password": "Admin-Chosen-8x!"}).status_code == 202
     out = psql(f"SELECT title FROM notifications WHERE user_id='{temp_user['id']}' AND type='credential_change_held'")
     assert out == "A change to your account is waiting for approval"
 

@@ -14,6 +14,10 @@ denied, is withdrawn, or expires after 7 days. With nobody else to approve it, i
 and a pointer to the host tool. Changing your own credentials is not affected. The account keeps
 working while a request waits.
 
+The session's administrator made every other administrator on a fresh stack, so none of them may
+approve its changes, and its own second change is refused outright. So in these tests the module's
+second administrator asks, and the session's administrator approves.
+
 test_credential_change_rule.py covers the rule itself offline.
 """
 import base64
@@ -103,8 +107,9 @@ def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_u
         enroll_totp({**temp_user, "_password": NEW_PASSWORD},
                     signed_in({**temp_user, "_password": NEW_PASSWORD}))
     before = _state(admin, temp_user)
+    other, other_client = other_admin
 
-    r = MAKERS[second](admin, temp_user)
+    r = MAKERS[second](other_client, temp_user)
     assert r.status_code == 202, r.text
     body = r.json()
     held = body["held_changes"][0] if "held_changes" in body else body
@@ -112,11 +117,11 @@ def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_u
     assert "14 days" in held["message"] and "approval" in held["message"]
     assert _state(admin, temp_user) == before, "a held change must change nothing"
 
-    mine = _request_for(admin, temp_user["id"])
-    assert (mine["is_mine"], mine["can_approve"], mine["requested_by"]) == (True, False, "admin")
+    mine = _request_for(other_client, temp_user["id"])
+    assert (mine["is_mine"], mine["can_approve"], mine["requested_by"]) == (True, False, other["_username"])
     assert mine["label"][0].isupper() and " " in mine["label"], "named by what it asks for"
-    theirs = _request_for(other_admin[1], temp_user["id"])
-    assert (theirs["is_mine"], theirs["can_approve"]) == (False, True)
+    theirs = _request_for(admin, temp_user["id"])
+    assert (theirs["is_mine"], theirs["can_approve"], theirs["cannot_approve"]) == (False, True, None)
 
 
 @pytest.mark.parametrize("first", sorted(MAKERS))
@@ -129,11 +134,14 @@ def test_every_kind_opens_the_window(admin, temp_user, other_admin, mail, first)
     r = MAKERS["ssh_key"](other_admin[1], temp_user)
     assert r.status_code == 202, r.text
     assert r.json()["request"]["requested_by"] == other_admin[0]["_username"]
+    # The administrator who made the asker one did not become one through them, so may approve it.
+    theirs = _request_for(admin, temp_user["id"])
+    assert (theirs["is_mine"], theirs["can_approve"], theirs["cannot_approve"]) == (False, True, None)
 
 
 def test_an_address_and_a_password_saved_together_are_two_changes(admin, temp_user, other_admin):
     new_email = f"{unique('both')}@example.com"
-    r = admin.patch(f"/users/{temp_user['id']}", json={"email": new_email, "password": NEW_PASSWORD,
+    r = other_admin[1].patch(f"/users/{temp_user['id']}", json={"email": new_email, "password": NEW_PASSWORD,
                                                        "sftp_enabled": False})
     assert r.status_code == 202, r.text
     body = r.json()
@@ -152,19 +160,22 @@ def test_resaving_the_same_address_is_not_a_change(admin, temp_user):
 
 
 def test_another_administrator_approves_and_the_change_is_made(admin, temp_user, other_admin):
+    # The second administrator asks; the one who made it an administrator did not become one through
+    # it, so may approve.
     other, other_client = other_admin
+    me = admin.get("/users/me").json()["username"]
     assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
     user_client = signed_in(temp_user)
-    assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 202
+    assert other_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 202
     req = _request_for(admin, temp_user["id"])
 
     # The account keeps working while the request waits.
     assert user_client.get("/users/me").status_code == 200
 
-    refused = admin.post(f"/admin/credential-requests/{req['id']}/approve")
+    refused = other_client.post(f"/admin/credential-requests/{req['id']}/approve")
     assert refused.status_code == 403, refused.text
 
-    ok = other_client.post(f"/admin/credential-requests/{req['id']}/approve")
+    ok = admin.post(f"/admin/credential-requests/{req['id']}/approve")
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "approved"
     assert ApiClient(BASE_URL).login(temp_user["_username"], NEW_PASSWORD)
@@ -172,19 +183,20 @@ def test_another_administrator_approves_and_the_change_is_made(admin, temp_user,
     assert not [r for r in _requests(admin) if r["id"] == req["id"]], "a decided request leaves the list"
 
     row = psql(f"SELECT status, decided_by_name, payload IS NULL FROM credential_changes WHERE id='{req['id']}'")
-    assert row == f"approved|{other['_username']}|t"
+    assert row == f"approved|{me}|t"
     audit = admin.get("/audit/log", params={"action": "credential_change_approved", "limit": 500}).json()
-    assert [a for a in audit if a["resource_id"] == temp_user["id"] and a["username"] == other["_username"]]
-    assert [n for n in notifications(admin, "credential_change_approved") if temp_user["_username"] in (n["body"] or "")]
+    assert [a for a in audit if a["resource_id"] == temp_user["id"] and a["username"] == me]
+    assert [n for n in notifications(other_client, "credential_change_approved")
+            if temp_user["_username"] in (n["body"] or "")]
     user_notes = notifications(signed_in({**temp_user, "_password": NEW_PASSWORD}), "credential_change_approved")
-    assert user_notes and "admin" in user_notes[0]["body"]
+    assert user_notes and me in user_notes[0]["body"] and other["_username"] in user_notes[0]["body"]
 
 
 def test_approving_a_held_reset_link_gives_the_link_to_the_approver(admin, temp_user, other_admin):
     assert admin.patch(f"/users/{temp_user['id']}", json={"email": f"{unique('x')}@example.com"}).status_code == 200
-    assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 202
+    assert other_admin[1].post(f"/users/{temp_user['id']}/reset-link").status_code == 202
     req = _request_for(admin, temp_user["id"])
-    r = other_admin[1].post(f"/admin/credential-requests/{req['id']}/approve")
+    r = admin.post(f"/admin/credential-requests/{req['id']}/approve")
     assert r.status_code == 200, r.text
     token = r.json()["reset_link"].split("?reset=", 1)[1]
     assert ApiClient(BASE_URL).get(f"/reset/{token}").json()["username"] == temp_user["_username"]
@@ -192,25 +204,28 @@ def test_approving_a_held_reset_link_gives_the_link_to_the_approver(admin, temp_
 
 def test_a_denied_or_withdrawn_request_changes_nothing(admin, temp_user, other_admin):
     other, other_client = other_admin
+    me = admin.get("/users/me").json()["username"]
     assert admin.post(f"/users/{temp_user['id']}/ssh-keys", json={"name": "a", "public_key": _ssh_key()}).status_code == 200
     before = _state(admin, temp_user)
 
-    assert admin.post(f"/users/{temp_user['id']}/ssh-keys", json={"name": "b", "public_key": _ssh_key()}).status_code == 202
+    assert other_client.post(f"/users/{temp_user['id']}/ssh-keys",
+                             json={"name": "b", "public_key": _ssh_key()}).status_code == 202
     first = _request_for(admin, temp_user["id"])
-    r = other_client.post(f"/admin/credential-requests/{first['id']}/deny")
+    r = admin.post(f"/admin/credential-requests/{first['id']}/deny")
     assert (r.status_code, r.json()["status"]) == (200, "denied")
 
-    assert admin.post(f"/users/{temp_user['id']}/ssh-keys", json={"name": "c", "public_key": _ssh_key()}).status_code == 202
+    assert other_client.post(f"/users/{temp_user['id']}/ssh-keys",
+                             json={"name": "c", "public_key": _ssh_key()}).status_code == 202
     second = _request_for(admin, temp_user["id"])
-    r = admin.post(f"/admin/credential-requests/{second['id']}/deny")
+    r = other_client.post(f"/admin/credential-requests/{second['id']}/deny")
     assert (r.status_code, r.json()["status"]) == (200, "withdrawn")
 
     assert _state(admin, temp_user) == before
-    assert other_client.post(f"/admin/credential-requests/{first['id']}/approve").status_code == 409
+    assert admin.post(f"/admin/credential-requests/{first['id']}/approve").status_code == 409
     user_client = signed_in(temp_user)
     assert notifications(user_client, "credential_change_denied")
     assert notifications(user_client, "credential_change_withdrawn")
-    assert [n for n in notifications(admin, "credential_change_denied") if other["_username"] in n["body"]]
+    assert [n for n in notifications(other_client, "credential_change_denied") if me in n["body"]]
     for action in ("credential_change_denied", "credential_change_withdrawn"):
         rows = admin.get("/audit/log", params={"action": action, "limit": 500}).json()
         assert [a for a in rows if a["resource_id"] == temp_user["id"]], action
@@ -218,11 +233,11 @@ def test_a_denied_or_withdrawn_request_changes_nothing(admin, temp_user, other_a
 
 def test_a_request_nobody_decides_expires_after_seven_days(admin, temp_user, other_admin):
     assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
-    assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 202
+    assert other_admin[1].post(f"/users/{temp_user['id']}/reset-link").status_code == 202
     req = _request_for(admin, temp_user["id"])
     psql(f"UPDATE credential_changes SET expires_at = (now() AT TIME ZONE 'utc') - interval '1 minute' "
          f"WHERE id='{req['id']}'")
-    r = other_admin[1].post(f"/admin/credential-requests/{req['id']}/approve")
+    r = admin.post(f"/admin/credential-requests/{req['id']}/approve")
     assert r.status_code == 409 and "expired" in r.text, r.text
 
     # The periodic cleanup's own call, on the real database.
@@ -235,7 +250,8 @@ def test_a_request_nobody_decides_expires_after_seven_days(admin, temp_user, oth
     assert psql(f"SELECT status, payload IS NULL FROM credential_changes WHERE id='{req['id']}'") == "expired|t"
     rows = admin.get("/audit/log", params={"action": "credential_change_expired", "limit": 500}).json()
     assert [a for a in rows if a["resource_id"] == temp_user["id"]]
-    assert [n for n in notifications(admin, "credential_change_expired") if temp_user["_username"] in n["body"]]
+    assert [n for n in notifications(other_admin[1], "credential_change_expired")
+            if temp_user["_username"] in n["body"]]
     user_client = signed_in({**temp_user, "_password": NEW_PASSWORD})
     assert notifications(user_client, "credential_change_expired")
 
@@ -253,7 +269,10 @@ def test_with_no_other_administrator_the_second_change_is_refused(admin, temp_us
             assert admin.patch(f"/users/{u['id']}", json={"is_locked": True}).status_code == 200
             locked.append(u["id"])
         assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
-        r = admin.post(f"/users/{temp_user['id']}/second-factor/reset")
+        # An administrator account the session's admin makes now is not another administrator: it
+        # could only approve its maker's change, which the rule refuses.
+        with second_admin(admin):
+            r = admin.post(f"/users/{temp_user['id']}/second-factor/reset")
         assert r.status_code == 409, r.text
         detail = r.json()["detail"]
         assert "no other active administrator" in detail and "dockvault.py accounts" in detail
@@ -327,3 +346,94 @@ def test_two_administrators_approving_at_once_apply_the_change_once(admin, temp_
     approvals = admin.get("/audit/log", params={"action": "credential_change_approved", "limit": 500}).json()
     assert len([a for a in approvals if (a.get("details") or {}).get("change_id") == req["id"]]) == 1
     assert psql(f"SELECT status FROM credential_changes WHERE id='{req['id']}'") == "approved"
+
+
+def test_an_administrator_the_requester_made_cannot_approve(admin, temp_user, other_admin):
+    # The review's scenario: the administrator whose change is held makes a new administrator account,
+    # signs in as it and approves. Refused, and so is an administrator that one made; every other
+    # administrator is told of each new one; an administrator the asker did not make may approve.
+    asker, asker_client = other_admin
+    me = admin.get("/users/me").json()["username"]
+    assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    held = asker_client.post(f"/users/{temp_user['id']}/reset-link")
+    assert held.status_code == 202, held.text
+    req_id = held.json()["request"]["id"]
+    with second_admin(asker_client) as (puppet, puppet_client):
+        r = puppet_client.post(f"/admin/credential-requests/{req_id}/approve")
+        assert r.status_code == 403, r.text
+        assert f"{asker['_username']} made you an administrator" in r.json()["detail"]
+        with second_admin(puppet_client) as (grandchild, grandchild_client):
+            r = grandchild_client.post(f"/admin/credential-requests/{req_id}/approve")
+            assert r.status_code == 403 and "made you an administrator" in r.json()["detail"], r.text
+        assert psql(f"SELECT status FROM credential_changes WHERE id='{req_id}'") == "held"
+        assert psql(f"SELECT count(*) FROM password_reset_tokens WHERE user_id='{temp_user['id']}'") == "0"
+        refusals = admin.get("/audit/log", params={"action": "credential_change_approval_refused",
+                                                   "limit": 500}).json()
+        assert len([a for a in refusals if (a.get("details") or {}).get("change_id") == req_id]) == 2
+        told = [n["body"] for n in notifications(admin, "administrator_added")
+                if f"created the administrator account {puppet['_username']}." in n["body"]]
+        assert told and told[0].startswith(f"{asker['_username']} created"), told
+        assert psql(f"SELECT granted_by_name FROM admin_grants WHERE user_id='{puppet['id']}'") == asker["_username"]
+    ok = admin.post(f"/admin/credential-requests/{req_id}/approve")
+    assert ok.status_code == 200, ok.text
+    assert psql(f"SELECT decided_by_name FROM credential_changes WHERE id='{req_id}'") == me
+
+
+def test_with_only_administrators_it_made_the_first_administrator_is_refused_outright(admin, temp_user,
+                                                                                     other_admin):
+    # On this stack the session's administrator made every other one, so none of them counts as
+    # someone who could approve its second change: refused, with the pointer to the host tool.
+    assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
+    r = admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD})
+    if r.status_code == 202:
+        pytest.skip("this stack has an administrator the session's administrator did not make")
+    assert r.status_code == 409 and "dockvault.py accounts" in r.json()["detail"], r.text
+
+def test_an_administrator_made_after_the_request_cannot_approve_it(admin, temp_user, other_admin):
+    # Made by someone other than the one who asked, but after the request: still refused.
+    other, other_client = other_admin
+    assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    held = other_client.post(f"/users/{temp_user['id']}/reset-link")
+    assert held.status_code == 202, held.text
+    req_id = held.json()["request"]["id"]
+    promoted = admin.create_user(role="user")
+    try:
+        assert admin.patch(f"/users/{promoted['id']}", json={"role": "admin"}).status_code == 200
+        late = signed_in(promoted)
+        r = late.post(f"/admin/credential-requests/{req_id}/approve")
+        assert r.status_code == 403 and "after this request was made" in r.json()["detail"], r.text
+        row = next(q for q in _requests(late) if q["id"] == req_id)
+        assert row["can_approve"] is False and "after it was asked for" in row["cannot_approve"]
+        # Demoted, the record goes; the rule has nothing left to read for that account.
+        assert admin.patch(f"/users/{promoted['id']}", json={"role": "user"}).status_code == 200
+        assert psql(f"SELECT count(*) FROM admin_grants WHERE user_id='{promoted['id']}'") == "0"
+    finally:
+        admin.delete_user(promoted["id"])
+    assert admin.post(f"/admin/credential-requests/{req_id}/deny").status_code == 200
+
+
+@pytest.mark.parametrize("route", ["post_users", "patch_users", "put_user_management", "patch_role"])
+def test_every_route_that_makes_an_administrator_records_who_did(admin, route):
+    me = admin.get("/users/me").json()
+    if route == "post_users":
+        account = admin.create_user(role="admin")
+    else:
+        account = admin.create_user(role="user")
+        uid = account["id"]
+        r = {"patch_users": lambda: admin.patch(f"/users/{uid}", json={"role": "admin"}),
+             "put_user_management": lambda: admin.put(f"/api/user-management/users/{uid}", json={"role": "admin"}),
+             "patch_role": lambda: admin.patch(f"/api/user-management/users/{uid}/role",
+                                               json={"new_role": "admin"})}[route]()
+        assert r.status_code == 200, r.text
+    try:
+        row = psql(f"SELECT granted_by_name || '|' || (granted_by_id::text) || '|' || lineage::text "
+                   f"FROM admin_grants WHERE user_id='{account['id']}'")
+        name, by_id, lineage = row.split("|", 2)
+        assert (name, by_id) == (me["username"], me["id"])
+        assert me["id"] in lineage
+        if route != "post_users":
+            back = admin.patch(f"/api/user-management/users/{account['id']}/role", json={"new_role": "user"})
+            assert back.status_code == 200, back.text
+            assert psql(f"SELECT count(*) FROM admin_grants WHERE user_id='{account['id']}'") == "0"
+    finally:
+        admin.delete_user(account["id"])

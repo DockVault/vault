@@ -68,9 +68,17 @@ def test_another_administrators_request_is_approved_from_the_block(page: Page, a
                                                                      temp_user, skin):
     uid = temp_user["id"]
     new_email = f"{unique('approved')}@example.com"
-    assert admin.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
-    held = admin.patch(f"/users/{uid}", json={"email": new_email})             # the second: held
-    assert held.status_code == 202, held.text
+    # Asked by another administrator: not the shared admin, who made page_admin an administrator and
+    # so could not have its request approved by it.
+    asker_account = admin.create_user(role="admin")
+    asker = ApiClient(BASE_URL)
+    asker.login(asker_account["_username"], asker_account["_password"])
+    try:
+        assert asker.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
+        held = asker.patch(f"/users/{uid}", json={"email": new_email})             # the second: held
+        assert held.status_code == 202, held.text
+    finally:
+        admin.delete_user(asker_account["id"])
     request_id = held.json()["held_changes"][0]["request"]["id"]
 
     _login(page, page_admin, skin, DESKTOP)
@@ -209,3 +217,33 @@ def test_the_reset_link_dialog_is_readable_in_every_skin_and_theme(page: Page, p
     got = page.evaluate(_READABLE)
     assert got["title"] >= 4.5 and got["text"] >= 4.5, got
     page.locator(".reset-link-overlay").get_by_role("button", name="Close").click()
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+def test_an_administrator_the_asker_made_is_told_why_there_is_no_approve(page: Page, admin, temp_user, skin):
+    # Made an administrator by the one who asked, so not someone who may approve it: the row says so,
+    # and offers no Approve.
+    uid = temp_user["id"]
+    asker_account = admin.create_user(role="admin")
+    asker = ApiClient(BASE_URL)
+    asker.login(asker_account["_username"], asker_account["_password"])
+    puppet = asker.create_user(role="admin")
+    try:
+        assert asker.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
+        held = asker.patch(f"/users/{uid}", json={"email": f"{unique('madeby')}@example.com"})
+        assert held.status_code == 202, held.text
+        request_id = held.json()["held_changes"][0]["request"]["id"]
+
+        _login(page, puppet, skin, PHONE)
+        _open_users(page)
+        row = page.locator(f'#credential-requests-block [data-request-id="{request_id}"]')
+        expect(row).to_be_visible(timeout=10000)
+        expect(row).to_contain_text(f"You cannot approve this: {asker_account['_username']} made you an "
+                                    "administrator.")
+        expect(row.get_by_role("button", name="Approve")).to_have_count(0)
+        widest = row.evaluate("r => Math.max(...[r, ...r.querySelectorAll('*')].map(e => "
+                              "e.getBoundingClientRect().right))")
+        assert widest <= PHONE["width"] + 1, "the reason fits the phone's screen"
+    finally:
+        asker.delete_user(puppet["id"])
+        admin.delete_user(asker_account["id"])

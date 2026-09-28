@@ -218,8 +218,11 @@ one step, use `python dockvault.py down --lock` (removes the containers **and** 
 
 An administrator may change someone else's sign-in details (a password, a reset link, the second
 factor, the email address, an SSH key) once in 14 days; a second change waits until another
-administrator approves it. On a deployment with one administrator, or when no administrator can sign
-in, whoever runs the server acts from the host instead:
+administrator approves it. The approver may not be one the asking administrator made an administrator
+(directly, or through an administrator they made), nor one made an administrator after the request,
+and every administrator is told when an administrator is created or promoted. On a deployment with
+one administrator, or when no administrator can sign in, whoever runs the server acts from the host
+instead:
 
 ```bash
 python dockvault.py accounts   # reset a password or a second factor, approve a waiting change

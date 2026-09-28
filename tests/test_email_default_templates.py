@@ -21,7 +21,8 @@ _ACTION_KEYS = {a["key"] for a in ea.ACTION_CATALOG}
 _REQUIRED_TOKEN = {"email_change": "action.code",
                    "password_reset": "action.link",
                    "account_invite": "action.link",
-                   "account_changed_by_admin": "action.change"}
+                   "account_changed_by_admin": "action.change",
+                   "administrator_added": "action.change"}
 
 
 def test_every_action_has_a_default_template():

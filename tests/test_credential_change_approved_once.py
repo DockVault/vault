@@ -20,7 +20,7 @@ set_bare_api_env()
 
 from app.api import api_server as api  # noqa: E402
 from app.core import credential_changes as cc  # noqa: E402
-from app.core.models import AuditLog, CredentialChange, RoleEnum, User  # noqa: E402
+from app.core.models import AdminGrant, AuditLog, CredentialChange, RoleEnum, User  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -29,7 +29,7 @@ pytestmark = pytest.mark.unit
 def factory():
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'approve.db'}")
-        for model in (User, CredentialChange, AuditLog):
+        for model in (User, CredentialChange, AuditLog, AdminGrant):
             model.__table__.create(engine)
         yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
         engine.dispose()

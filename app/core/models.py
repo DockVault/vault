@@ -2767,6 +2767,29 @@ class CredentialChange(Base):
     )
 
 
+class AdminGrant(Base):
+    """Who made an account an administrator, and when: what the two-administrator rule reads to refuse
+    an approver the requester made (see app/core/admin_grants.py).
+
+    One row per administrator, written in the transaction that makes the account one: created as an
+    administrator, promoted to one, or an administrator's invitation accepted. ``lineage`` lists the
+    administrators the grant descends from, nearest first (who granted it, who granted theirs, ...), so
+    an administrator made through another one still leads back to the requester. An administrator from
+    before this record existed, or the first one the server set up, has no row. A demotion deletes the
+    row; a later promotion writes a new one.
+
+    A NEW table, so create_all builds it on an existing deployment and a release that does not know it
+    simply ignores it. Rows go with the account."""
+    __tablename__ = 'admin_grants'
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    # NULL with granted_by_name set: the host operator, or an administrator since deleted.
+    granted_by_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    granted_by_name = Column(String(255), nullable=False)
+    granted_at = Column(DateTime, nullable=False)
+    lineage = Column(JSON, nullable=False, default=list)   # administrator ids (strings), nearest first
+
+
 class SignInLockout(Base):
     """Failed sign-ins to one account, counted per source address and across all addresses, and the
     automatic lock they arm (see app/core/sign_in_lockout.py).

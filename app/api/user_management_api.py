@@ -606,7 +606,17 @@ async def update_user(
             else:
                 made.append(outcome)
 
+    admin_granted = False
     if update_data.role is not None:
+        # Who made an administrator one is recorded with the change, for the two-administrator rule;
+        # a demotion drops the record (app/core/admin_grants.py).
+        if update_data.role == RoleEnum.ADMIN and user.role != RoleEnum.ADMIN:
+            from app.api.api_server import _record_admin_grant
+            _record_admin_grant(db, user, by=current_user)
+            admin_granted = True
+        elif update_data.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
+            from app.core import admin_grants
+            admin_grants.forget(db, user.id)
         user.role = update_data.role
     
     if update_data.is_active is not None:
@@ -639,6 +649,9 @@ async def update_user(
         _notify_account_status_changes(
             db, user, by_name=current_user.username, active=(old_active, user.is_active),
             role=(old_role, user.role.value if user.role is not None else None))
+    if admin_granted:
+        from app.api.api_server import _announce_admin_granted
+        _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
     
     # Return updated details
     # Keyword args, not positional: get_user_detail is wrapped by require_endpoint_permission,
@@ -1231,7 +1244,15 @@ async def change_user_role(
             detail=f"User already has role '{new_role}'"
         )
     
-    # Update role
+    # Update role. Who made an administrator one is recorded in the same commit, for the
+    # two-administrator rule; a demotion drops the record (app/core/admin_grants.py).
+    admin_granted = request.new_role == RoleEnum.ADMIN
+    if admin_granted:
+        from app.api.api_server import _record_admin_grant
+        _record_admin_grant(db, target_user, by=current_user)
+    elif old_role == RoleEnum.ADMIN.value:
+        from app.core import admin_grants
+        admin_grants.forget(db, target_user.id)
     target_user.role = request.new_role
     target_user.updated_at = datetime.now(timezone.utc)
     
@@ -1249,6 +1270,9 @@ async def change_user_role(
     )
     from app.api.api_server import _notify_account_status_changes
     _notify_account_status_changes(db, target_user, by_name=current_user.username, role=(old_role, new_role))
+    if admin_granted:
+        from app.api.api_server import _announce_admin_granted
+        _announce_admin_granted(db, target_user, by_name=current_user.username, how="promoted")
 
     return ChangeRoleResponse(
         message=f"Role changed successfully from '{old_role}' to '{new_role}'",

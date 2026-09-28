@@ -154,6 +154,20 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "administrator_added": {
+        "name": "New administrator",
+        "subject": "A new administrator on {{vault.name}}",
+        "body_html": (
+            "<h2>A new administrator</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>An administrator can change other people's accounts. If you did not expect this, check "
+            "the Users page at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -179,6 +193,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Sent to a user when an administrator changes their password, reset link, second factor, email "
      "address (to the old address), SSH keys, lock, activation or role — says what, when and by whom.",
      SYSTEM),
+    ("administrator_added", "New administrator",
+     "Sent to every administrator when an account is created as, promoted to or invited as an "
+     "administrator — says who, when and by whom.", SYSTEM),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(

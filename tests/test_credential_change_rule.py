@@ -21,7 +21,7 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 from app.core import credential_changes as cc  # noqa: E402
-from app.core.models import CredentialChange, RoleEnum, User  # noqa: E402
+from app.core.models import AdminGrant, CredentialChange, RoleEnum, User  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -32,6 +32,7 @@ def db():
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'changes.db'}")
         User.__table__.create(engine)
         CredentialChange.__table__.create(engine)
+        AdminGrant.__table__.create(engine)
         # The application's own session flags: nothing is flushed before a query unless asked.
         session = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
         yield session
@@ -283,6 +284,7 @@ def two_sessions():
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'race.db'}")
         User.__table__.create(engine)
         CredentialChange.__table__.create(engine)
+        AdminGrant.__table__.create(engine)
         factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         first, second = factory(), factory()
         yield first, second
@@ -331,3 +333,74 @@ def test_an_expired_or_decided_request_cannot_be_claimed(db):
     assert cc.claim_approval(db, denied, approver_id=bob.id, approver_name=bob.username, now=now) is False
     db.rollback()
     assert (old.status, denied.status) == (cc.HELD, cc.DENIED)
+
+
+# --------------------------------------------------------------------------- who may approve
+
+def _grant(db, user, by, now=None):
+    from app.core import admin_grants
+    admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
+                        granted_by_name=by.username if by is not None else cc.HOST_OPERATOR, now=now)
+    db.commit()
+
+
+def _held_by(db, requester, target, now=None):
+    change = cc.hold(db, kind=cc.RESET_LINK, target_id=target.id, requester_id=requester.id,
+                     requester_name=requester.username, summary="s", payload={"delivery": "copy"}, now=now)
+    db.commit()
+    return change
+
+
+def test_an_administrator_the_requester_made_cannot_approve(db):
+    # The review's scenario: one administrator makes a second administrator account and approves their
+    # own held change with it. Made before the request or after, directly or through another one.
+    alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    puppet, grandchild = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN)
+    _grant(db, puppet, alice, now=now - timedelta(days=30))
+    _grant(db, grandchild, puppet, now=now - timedelta(days=29))
+    change = _held_by(db, alice, carol, now=now)
+    assert cc.approval_refusal(db, change, puppet.id) == cc.MADE_BY_REQUESTER
+    assert cc.approval_refusal(db, change, grandchild.id) == cc.MADE_BY_REQUESTER
+    assert cc.approval_refusal(db, change, alice.id) == cc.ASKED
+    assert cc.approval_refusal(db, change, bob.id) is None, "an administrator alice did not make may"
+    assert cc.approval_refusal(db, change, None) is None, "the host operator may approve any"
+    assert [a.id for a in cc.approvers(db, alice.id, change)] == [bob.id]
+
+
+def test_an_administrator_made_after_the_request_cannot_approve_it(db):
+    alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    change = _held_by(db, alice, carol, now=now - timedelta(hours=1))
+    late = _user(db, RoleEnum.ADMIN)
+    _grant(db, late, bob, now=now)                      # made by someone else, but after the request
+    assert cc.approval_refusal(db, change, late.id) == cc.BECAME_ADMIN_AFTER
+    early = _user(db, RoleEnum.ADMIN)
+    _grant(db, early, bob, now=now - timedelta(hours=2))
+    assert cc.approval_refusal(db, change, early.id) is None
+    assert {a.id for a in cc.approvers(db, alice.id, change)} == {bob.id, early.id}
+
+
+def test_one_administrator_with_accounts_they_made_is_refused_a_second_change(db):
+    # A deployment with one real administrator stays unable to approve its own second change: only the
+    # host operator can make it. Accounts that administrator made do not count as another.
+    alice, carol = _user(db, RoleEnum.ADMIN), _user(db)
+    for _ in range(2):
+        _grant(db, _user(db, RoleEnum.ADMIN), alice)
+    _made(db, carol, alice)
+    db.commit()
+    with pytest.raises(cc.NoApprover):
+        cc.decide(db, requester_id=alice.id, target_id=carol.id)
+
+
+def test_a_demotion_forgets_who_made_the_administrator(db):
+    from app.core import admin_grants
+    alice, bob, carol, x = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db), _user(db, RoleEnum.ADMIN)
+    now = cc.utcnow()
+    _grant(db, x, alice, now=now - timedelta(days=3))
+    admin_grants.forget(db, x.id)
+    db.commit()
+    _grant(db, x, bob, now=now - timedelta(days=2))     # made one again, by bob this time
+    change = _held_by(db, alice, carol, now=now)
+    assert cc.approval_refusal(db, change, x.id) is None
+    assert admin_grants.of(db, [x.id])[x.id].lineage == [str(bob.id)]

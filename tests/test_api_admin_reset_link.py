@@ -63,9 +63,11 @@ def test_minting_again_invalidates_the_previous_link(admin):
     try:
         t1 = _token_from_link(admin.post(f"/users/{u['id']}/reset-link").json()["reset_link"])
         with second_admin(admin) as (_other, other_client):
-            held = admin.post(f"/users/{u['id']}/reset-link")
+            # Asked by the second administrator and approved by the first: an administrator may not
+            # approve a request from one they made, but the reverse is fine.
+            held = other_client.post(f"/users/{u['id']}/reset-link")
             assert held.status_code == 202, held.text
-            approved = other_client.post(f"/admin/credential-requests/{held.json()['request']['id']}/approve")
+            approved = admin.post(f"/admin/credential-requests/{held.json()['request']['id']}/approve")
             assert approved.status_code == 200, approved.text
             t2 = _token_from_link(approved.json()["reset_link"])
         assert t1 != t2

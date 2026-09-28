@@ -13,6 +13,11 @@ approve, and it expires after 7 days. With no other administrator who could appr
 change is refused, and the person who runs the server can make it on the host (``dockvault.py
 accounts``), where it is recorded as the host operator's.
 
+A different administrator means one the requester did not make: not made an administrator by the
+requester (directly, or through an administrator the requester made), and not made one after the
+request was asked for (app/core/admin_grants.py). Otherwise one administrator could create a second
+administrator account and approve their own second change with it.
+
 Why: taking over an account takes two credential changes (move its email, then reset its password;
 reset its password, then its second factor). One administrator acting alone, or one whose session was
 stolen, can no longer make both. A lock is deliberately not part of it: the account keeps working while
@@ -123,10 +128,29 @@ def can_approve(admin) -> bool:
             and not admin_locked(admin))
 
 
-def approvers(db, requester_id) -> List[User]:
-    """The administrators, other than the one asking, who could approve a held change."""
+# Why an administrator may not approve a held request (approval_refusal), each with what the refusal
+# says.
+ASKED = "asked"                  # the administrator who asked
+MADE_BY_REQUESTER = "made"       # made an administrator by the one who asked
+BECAME_ADMIN_AFTER = "after"     # made an administrator after the request was asked for
+
+
+def approvers(db, requester_id, change: Optional[CredentialChange] = None) -> List[User]:
+    """The administrators who could approve a change asked for by ``requester_id``: active, able to sign
+    in, not the one asking, and not made an administrator by the one asking. With ``change``, also not
+    made an administrator after it was asked for."""
+    from app.core import admin_grants
     admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
-    return [a for a in admins if a.id != requester_id and can_approve(a)]
+    grants = admin_grants.of(db, [a.id for a in admins])
+    out = []
+    for a in admins:
+        grant = grants.get(a.id)
+        if a.id == requester_id or not can_approve(a) or admin_grants.made_by(grant, requester_id):
+            continue
+        if change is not None and admin_grants.granted_after(grant, change.requested_at):
+            continue
+        out.append(a)
+    return out
 
 
 def _lock_account(db, target_id) -> None:
@@ -191,8 +215,25 @@ def is_open(change: CredentialChange, now: Optional[datetime] = None) -> bool:
 
 
 def may_approve(change: CredentialChange, approver_id) -> bool:
-    """Anyone but the administrator who asked. None is the host operator, who may approve any."""
+    """Anyone but the administrator who asked, on the request alone. None is the host operator, who may
+    approve any. approval_refusal adds what the administrator records say."""
     return approver_id is None or approver_id != change.requested_by_id
+
+
+def approval_refusal(db, change: CredentialChange, approver_id) -> Optional[str]:
+    """Why ``approver_id`` may not approve ``change`` (ASKED, MADE_BY_REQUESTER or BECAME_ADMIN_AFTER),
+    or None when they may. None is the host operator, who may approve any request."""
+    from app.core import admin_grants
+    if approver_id is None:
+        return None
+    if approver_id == change.requested_by_id:
+        return ASKED
+    grant = admin_grants.of(db, [approver_id]).get(approver_id)
+    if admin_grants.made_by(grant, change.requested_by_id):
+        return MADE_BY_REQUESTER
+    if admin_grants.granted_after(grant, change.requested_at):
+        return BECAME_ADMIN_AFTER
+    return None
 
 
 def _decide(change, status, decider_id, decider_name, now):

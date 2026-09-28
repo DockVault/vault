@@ -407,10 +407,15 @@ class AuthService:
         email: Optional[str],
         password: str,
         role: RoleEnum = RoleEnum.USER,
-        created_by: Optional[uuid.UUID] = None
+        created_by: Optional[uuid.UUID] = None,
+        before_commit=None,
     ) -> User:
         """
         Create a new user account.
+
+        ``before_commit``, when given, is called with the new account after it is written and before
+        the commit, so what the caller records about it (who made it an administrator) lands in the
+        same transaction or not at all.
 
         Args:
             username: Unique username
@@ -467,6 +472,9 @@ class AuthService:
         )
         
         self.db.add(user)
+        if before_commit is not None:
+            self.db.flush()
+            before_commit(user)
         self.db.commit()
         self.db.refresh(user)
         
