@@ -46,8 +46,10 @@ class AuditAction(NamedTuple):
 
 ACTIONS: Tuple[AuditAction, ...] = (
     # Sign-in and sessions
-    AuditAction("account_auto_locked", "sign_in", "Account locked after failed sign-ins", "warning"),
-    AuditAction("account_auto_unlocked", "sign_in", "Account unlocked when its lock ran out", "info"),
+    # An automatic lock pauses new sign-ins from one address, or from every address; sessions carry on.
+    # A row says which (ROW_LABELS); these are the labels the filters list.
+    AuditAction("account_auto_locked", "sign_in", "New sign-ins paused after failed sign-ins", "warning"),
+    AuditAction("account_auto_unlocked", "sign_in", "Sign-ins resumed", "info"),
     AuditAction("login_failure", "sign_in", "Sign-in failed", "warning"),
     AuditAction("login_password_ok", "sign_in", "Password accepted, second factor pending", "info"),
     AuditAction("login_success", "sign_in", "Signed in", "info"),
@@ -258,6 +260,36 @@ def label_for(stored_name: str) -> str:
     """What the Activity page shows for a stored action name."""
     entry = lookup(stored_name)
     return entry.label if entry else LEGACY_LABEL
+
+
+# Labels that depend on what a row recorded. An automatic lock and its end read by the lock's scope,
+# in the Users page's words. A row written before 0.33.0 records no scope: its lock then held the whole
+# account, so it keeps the words it had.
+ROW_LABELS: Dict[str, Dict[Optional[str], str]] = {
+    "account_auto_locked": {"address": "New sign-ins paused from one address",
+                            "account": "New sign-ins paused from every address",
+                            None: "Account locked after failed sign-ins"},
+    "account_auto_unlocked": {"address": "Sign-ins resumed", "account": "Sign-ins resumed",
+                              None: "Account unlocked when its lock ran out"},
+}
+
+
+def row_label(stored_name: str, details=None) -> str:
+    """What the Activity page shows for one stored row: its entry's label, or the one for what the row
+    recorded (ROW_LABELS)."""
+    entry = lookup(stored_name)
+    if entry is None:
+        return LEGACY_LABEL
+    by_scope = ROW_LABELS.get(entry.name)
+    if not by_scope:
+        return entry.label
+    scope = details.get("scope") if isinstance(details, dict) else None
+    return by_scope.get(scope if scope in by_scope else None)
+
+
+def labels_of(entry: AuditAction) -> Tuple[str, ...]:
+    """Every label an entry's rows can show: what a search for the page's words must match."""
+    return (entry.label,) + tuple(v for v in ROW_LABELS.get(entry.name, {}).values() if v != entry.label)
 
 
 def category_label(key: str) -> Optional[str]:

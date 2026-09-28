@@ -225,7 +225,8 @@ def actions_labelled(text: str) -> List[str]:
     t = (text or "").strip().lower()
     if not t:
         return []
-    return [n for a in audit_catalog.ACTIONS if t in a.label.lower() for n in (a.name,) + a.aliases]
+    return [n for a in audit_catalog.ACTIONS if any(t in label.lower() for label in audit_catalog.labels_of(a))
+            for n in (a.name,) + a.aliases]
 
 
 def split_ids(values: Iterable[str]) -> List[str]:
@@ -345,7 +346,7 @@ def row_view(r) -> dict:
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
         "temp_credential_name": getattr(r, "temp_credential_name", None),
         "action": r.action,
-        "label": entry.label if entry else audit_catalog.LEGACY_LABEL,
+        "label": audit_catalog.row_label(r.action or "", r.details),
         "category": entry.category if entry else LEGACY_CATEGORY,
         "severity": entry.severity if entry else "info",
         # Written by the server on its own (the file-expiry sweep): no person acted.

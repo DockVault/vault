@@ -87,7 +87,8 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     failure = _latest(admin, "login_failure", name)
     assert row["ip_address"] and row["ip_address"] == failure["ip_address"], (row, failure)
     event = _event(admin, LOCKED, name)
-    assert (event["label"], event["status"]) == ("Account locked after failed sign-ins", "success")
+    # Named by its scope, in the Users page's words: this lock pauses one address, sessions carry on.
+    assert (event["label"], event["status"]) == ("New sign-ins paused from one address", "success")
     assert _request(event) == ("web", "POST", "/auth/login")
 
     # While it holds, a sign-in from here is refused before its password is checked: a guess counts
@@ -120,7 +121,7 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     success = _latest(admin, "login_success", name)
     assert released[0]["ip_address"] == success["ip_address"], (released[0], success)
     event = _event(admin, UNLOCKED, name)
-    assert event["label"] == "Account unlocked when its lock ran out"
+    assert event["label"] == "Sign-ins resumed"
     assert _request(event) == ("web", "POST", "/auth/login")
 
 

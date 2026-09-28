@@ -110,17 +110,36 @@ def _stored(action, status, **extra):
 
 
 @pytest.mark.parametrize("action, status, category, label, automatic", [
-    ("account_auto_locked", "success", "sign_in", "Account locked after failed sign-ins", False),
-    ("account_auto_unlocked", "success", "sign_in", "Account unlocked when its lock ran out", False),
+    ("account_auto_locked", "success", "sign_in", "New sign-ins paused after failed sign-ins", False),
+    ("account_auto_unlocked", "success", "sign_in", "Sign-ins resumed", False),
     ("file_expired", "success", "files", "File deleted at its expiry", True),
     ("vault_self_access_refused", "refused", "security", "Self-granted vault access refused", False),
 ])
 def test_the_lock_expiry_and_self_grant_events_are_named_and_filed(action, status, category, label, automatic):
-    v = ev.row_view(_stored(action, status))
-    assert (v["label"], v["category"], v["automatic"]) == (label, category, automatic)
+    """The label the filters list for each event (a row with details may read more exactly, below)."""
+    assert audit_catalog.label_for(action) == label
+    v = ev.row_view(_stored(action, status, details={}))
+    assert (v["label"], v["category"], v["automatic"]) == (
+        audit_catalog.row_label(action, {}), category, automatic)
     assert f"'{action}'" in _sql(categories=[category])
     others = [k for k, _ in audit_catalog.CATEGORIES if k != category]
     assert f"'{action}'" not in _sql(categories=others)
+
+
+@pytest.mark.parametrize("action, details, label", [
+    ("account_auto_locked", {"scope": "address", "address": "10.0.0.7"}, "New sign-ins paused from one address"),
+    ("account_auto_locked", {"scope": "account"}, "New sign-ins paused from every address"),
+    ("account_auto_unlocked", {"scope": "address"}, "Sign-ins resumed"),
+    ("account_auto_unlocked", {"scope": "account", "cleared_by": "timer"}, "Sign-ins resumed"),
+    # Written before 0.33.0, with no scope: the lock then held the whole account.
+    ("account_auto_locked", {"failed_attempts": 5}, "Account locked after failed sign-ins"),
+    ("account_auto_unlocked", None, "Account unlocked when its lock ran out"),
+])
+def test_an_automatic_lock_reads_by_its_scope_in_the_users_pages_words(action, details, label):
+    """Most automatic locks now pause new sign-ins from one address and leave sessions running: a row
+    says so rather than "Account locked", and a search for its words finds it."""
+    assert ev.row_view(_stored(action, "success", details=details))["label"] == label
+    assert action in ev.actions_labelled(label.split(" from ")[0])
 
 
 # Filter sets whose counts must put the lock, file-expiry and self-grant events where they belong: the
