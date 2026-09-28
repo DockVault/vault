@@ -616,6 +616,26 @@ def test_an_address_count_left_for_a_day_is_gone_for_both(clocked):
     assert "address" not in [x[0] for x in seen["real-person"] if isinstance(x, tuple)]
 
 
+@pytest.fixture
+def closed_guards():
+    """Both guards in front of the cache closed, as a test that talks to a fake Redis needs them, and
+    closed again after it. The cache guard also stays open while the rate limiter's breaker is open
+    (redis_guard.guard_is_open), and an earlier test that failed Redis on purpose can leave that breaker
+    open for its cooldown: every cache read then answers "unavailable" without asking the fake."""
+    from app.core import rate_limiter, redis_guard
+
+    def close():
+        rate_limiter._cb_record_success()
+        redis_guard.guard_record_success()
+        with rate_limiter._cb_lock:
+            rate_limiter._cb_probe_thread = None
+            rate_limiter._cb_last_attempt_at = rate_limiter._cb_monotonic()
+
+    close()
+    yield
+    close()
+
+
 def test_the_name_mimicry_fails_open_when_the_cache_is_down(monkeypatch, limits):
     class _Down:
         def get(self, key):
@@ -629,7 +649,7 @@ def test_the_name_mimicry_fails_open_when_the_cache_is_down(monkeypatch, limits)
     assert L.phantom_lock("nobody", ATTACKER) is None
 
 
-def test_the_cache_store_reads_back_what_it_wrote_and_fails_open(monkeypatch):
+def test_the_cache_store_reads_back_what_it_wrote_and_fails_open(monkeypatch, closed_guards):
     from app.core import database, redis_guard
 
     class _Redis:
@@ -1047,7 +1067,7 @@ def test_an_administrators_locked_account_is_counted_too(Session, limits, monkey
     assert _audit(Session, L.AUTO_LOCKED_ACTION) == [], "no automatic lock on top of an administrator's"
 
 
-def test_the_cache_hold_lets_one_attempt_at_a_time_and_fails_open(monkeypatch):
+def test_the_cache_hold_lets_one_attempt_at_a_time_and_fails_open(monkeypatch, closed_guards):
     import threading
     from app.core import database, redis_guard
 
@@ -1137,7 +1157,8 @@ class _SharedRedis:
             self.values.pop(key, None)
 
 
-def test_a_burst_on_a_name_that_is_no_account_waits_its_turn_like_one_on_an_account(Session, limits, monkeypatch):
+def test_a_burst_on_a_name_that_is_no_account_waits_its_turn_like_one_on_an_account(Session, limits, monkeypatch,
+                                                                                   closed_guards):
     # Through the real cache hold, waited for as long as an account's turn. With no wait, every attempt but
     # the first of a burst on a name that is no account was refused as busy, while the same burst on an
     # account waited and was checked: which told a guesser whether the account existed.
