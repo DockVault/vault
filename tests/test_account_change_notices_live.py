@@ -152,3 +152,25 @@ def test_an_email_change_is_told_to_the_old_address_only(admin, mail):
         assert mail_to(new, subject_contains="A change to your", timeout=3) is None
     finally:
         admin.delete_user(user["id"])
+
+
+@needs_mailpit
+def test_the_email_still_goes_out_with_its_template_reset_to_the_built_in_one(admin, mail):
+    # "Built-in default" leaves the action with no template bound. A system action then sends its
+    # built-in body; this one used to send nothing at all until a restart bound it again.
+    key = "account_changed_by_admin"
+    before = {a["key"]: a for a in admin.get("/email/actions").json()["actions"]}[key]
+    bound = (before.get("template") or {}).get("id") or before.get("template_id")
+    r = admin.put(f"/email/actions/{key}", json={"template_id": None})
+    assert r.status_code == 200, r.text
+    old, new = f"{unique('builtin-old')}@example.com", f"{unique('builtin-new')}@example.com"
+    user = admin.create_user(email=old)
+    try:
+        assert admin.patch(f"/users/{user['id']}", json={"email": new}).status_code == 200
+        message = mail_to(old, subject_contains="A change to your")
+        assert message, "no email reached the old address with the template reset to the built-in one"
+        assert f"from {old} to" in message["text"], message
+    finally:
+        admin.delete_user(user["id"])
+        if bound:
+            admin.put(f"/email/actions/{key}", json={"template_id": bound})

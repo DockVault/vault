@@ -153,3 +153,57 @@ def test_a_held_change_is_told_with_its_date_in_words(sent, monkeypatch):
     bodies = [row["body"] for row in sent["app"]]
     assert len(bodies) == 3 and all("5 October 2026" in b for b in bodies), bodies
     assert not any("2026-10" in b for b in bodies)
+
+
+class _ActionDb:
+    """A stand-in session whose only use is looking up the email action by key."""
+
+    def __init__(self, action):
+        self.action = action
+
+    def get(self, _model, _key):
+        return self.action
+
+
+@pytest.fixture
+def handed_off(monkeypatch):
+    """The emails handed to the send helper, with its thread run at once and no database needed."""
+    import contextlib
+    from app.core import database
+
+    out = []
+
+    class _Now:
+        def __init__(self, target, args=(), daemon=None):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(api.threading, "Thread", _Now)
+    monkeypatch.setattr(database, "get_db_context", lambda: contextlib.nullcontext(None))
+    monkeypatch.setattr(ea, "send_action_email", lambda s, key, *, recipient, action_context=None:
+                        out.append((key, recipient["email"])))
+    return out
+
+
+@pytest.mark.parametrize("action", [
+    SimpleNamespace(category=ea.SYSTEM, enabled=True, template_id=None),     # reset to "Built-in default"
+    None,                                                                    # not seeded yet
+], ids=["built-in default", "not seeded"])
+def test_the_account_change_email_goes_out_with_no_template_bound(handed_off, action):
+    # A system action has no switch; send_action_email answers an unbound one with the built-in body.
+    # The gate for optional actions used to stop it, so resetting the template stopped every notice.
+    api._fire_action_email(_ActionDb(action), "account_changed_by_admin", email="carol@example.com",
+                           username="carol", action_context={"change": "x"})
+    assert handed_off == [("account_changed_by_admin", "carol@example.com")]
+
+
+@pytest.mark.parametrize("action", [
+    SimpleNamespace(category=ea.OPTIONAL, enabled=True, template_id=None),
+    SimpleNamespace(category=ea.OPTIONAL, enabled=False, template_id="t-1"),
+    None,
+], ids=["unbound", "switched off", "not seeded"])
+def test_an_optional_email_still_needs_to_be_on_and_bound(handed_off, action):
+    api._fire_action_email(_ActionDb(action), "share_created", email="carol@example.com", username="carol")
+    assert handed_off == []

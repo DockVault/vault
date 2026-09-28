@@ -3638,18 +3638,24 @@ def _smtp_configured(db: Session) -> bool:
 
 
 def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=None) -> None:
-    """Best-effort trigger for an OPTIONAL automated email to one or more recipients.
+    """Best-effort trigger for an automated email to one or more recipients.
 
-    Uses the request ``db`` ONLY for a fast enabled-check, so a disabled action (the default) costs a
-    single indexed lookup on the hot path and spawns nothing. When the action is on and bound, the
-    render + SMTP fan-out runs on a daemon thread in its OWN session, so mail latency never delays the
-    triggering request (a sign-in, a share, a member add …) and a mail failure can't touch its
-    transaction. ``recipients`` is an iterable of ``(email, username)``. Never raises."""
+    Uses the request ``db`` ONLY for a fast enabled-check, so a disabled optional action (the default)
+    costs a single indexed lookup on the hot path and spawns nothing. When the action is on and bound,
+    the render + SMTP fan-out runs on a daemon thread in its OWN session, so mail latency never delays
+    the triggering request (a sign-in, a share, a member add …) and a mail failure can't touch its
+    transaction. ``recipients`` is an iterable of ``(email, username)``. Never raises.
+
+    A SYSTEM action (the notice that an administrator changed someone's account) always goes out: it
+    has no switch, and an admin who resets its template to "Built-in default" leaves it unbound, which
+    send_action_email answers with the built-in body. Only an optional action is gated here."""
     try:
+        from app.core.email_actions import OPTIONAL, SPEC_BY_KEY, SYSTEM
         from app.core.models import EmailAction
         a = db.get(EmailAction, key)
+        category = a.category if a is not None else SPEC_BY_KEY.get(key, {}).get("category", OPTIONAL)
         # An optional action only sends when explicitly enabled AND bound to a template.
-        if not (a is not None and a.enabled and a.template_id is not None):
+        if category != SYSTEM and not (a is not None and a.enabled and a.template_id is not None):
             return
         pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
         if not pairs:
