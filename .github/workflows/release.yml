@@ -49,6 +49,8 @@ jobs:
             --repository-owner "$REPOSITORY_OWNER" \
             --github-output "$GITHUB_OUTPUT"
 
+  # Every job of the Tests workflow, not one of them: the full suite and the configuration
+  # scenarios run there as two jobs on two stacks, and this call succeeds only when both have.
   tests:
     name: Required full Docker integration
     needs: validate

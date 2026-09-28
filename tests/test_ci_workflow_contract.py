@@ -31,6 +31,29 @@ def _step(name: str, next_name: str) -> str:
     return _WORKFLOW.split(f"- name: {name}", 1)[1].split(f"- name: {next_name}", 1)[0]
 
 
+def _job_text(name: str, next_name: str | None) -> str:
+    """One job of tests.yml as text, sliced at the next job's key (exactly once each)."""
+    assert _WORKFLOW.count(f"\n  {name}:\n") == 1, name
+    body = _WORKFLOW.split(f"\n  {name}:\n", 1)[1]
+    if next_name is None:
+        return body
+    assert body.count(f"\n  {next_name}:\n") == 1, next_name
+    return body.split(f"\n  {next_name}:\n", 1)[0]
+
+
+# The six configuration scenarios. Each reconfigures the stack, so they run in a job of their own.
+_SCENARIO_STEPS = (
+    "Exercise the transfer ceiling on a deployment that refuses",
+    "Exercise the log-pull endpoint with its ceiling on",
+    "Exercise the vault-type allowlist against a forbidden type",
+    "Exercise the general API fail-open during a Redis outage",
+    "Exercise login throttling and Redis outage fallback",
+    "Exercise the device-sync pre-flight states",
+)
+# The setup both stack jobs share, from the checkout to the browser check.
+_LAST_SETUP_STEP = "Verify Chromium launches against the API"
+
+
 def test_preflight_blocks_expensive_integration_work():
     caller = _WORKFLOW.split("  preflight:", 1)[1].split("  integration:", 1)[0]
     integration = _WORKFLOW.split("  integration:", 1)[1]
@@ -42,6 +65,79 @@ def test_preflight_blocks_expensive_integration_work():
     assert '-m "unit and not docker" --maxfail=1' in _PREFLIGHT
     assert "docker compose" not in _PREFLIGHT
     assert "playwright install" not in _PREFLIGHT
+
+
+def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
+    """The six reconfiguring scenarios used to follow the suite in one job and one 60-minute cap,
+    which the suite plus 0.33.0's new tests would have run out. They now run in a second job, beside
+    the suite, on a stack of their own. What must hold for that to be the same check, not a weaker one:
+
+    - both jobs build the stack with the same setup, step for step, so a scenario still starts
+      from the stack the suite runs on;
+    - every scenario is in the new job and none is left behind in the suite's;
+    - both jobs need only preflight (in parallel, not one after the other) and neither can be
+      skipped, because a release publishes only when every job of this workflow succeeded;
+    - each job keeps its own logs, teardown and uniquely named failure pictures;
+    - the suite's cap is 75 minutes.
+    """
+    import yaml
+
+    jobs = yaml.safe_load(_WORKFLOW)["jobs"]
+    suite, scenarios = jobs["integration"], jobs["scenarios"]
+
+    for job in (suite, scenarios):
+        assert job["needs"] == "preflight"
+        assert "if" not in job                   # a skipped job counts as passed for publication
+        assert job["runs-on"] == "ubuntu-latest"
+    assert suite["timeout-minutes"] == 75
+    assert 15 <= scenarios["timeout-minutes"] <= 45
+
+    def names(job):
+        return [step.get("name", step.get("uses", "")) for step in job["steps"]]
+
+    suite_names, scenario_names = names(suite), names(scenarios)
+    cut_suite = suite_names.index(_LAST_SETUP_STEP) + 1
+    cut_scenarios = scenario_names.index(_LAST_SETUP_STEP) + 1
+    # The same setup, compared as parsed steps: names, commands, pins, masks and all.
+    assert cut_suite == cut_scenarios == 9
+    assert suite["steps"][:cut_suite] == scenarios["steps"][:cut_scenarios]
+
+    # The scenarios, all of them, in their old order, straight after the setup.
+    assert scenario_names[cut_scenarios:cut_scenarios + len(_SCENARIO_STEPS)] == list(_SCENARIO_STEPS)
+    for name in _SCENARIO_STEPS:
+        assert name not in suite_names
+    # The suite, its report and its count audit stay in the suite's job only.
+    for name in (
+        "Run the full test suite",
+        "Keep the test report (durations + results)",
+        "Audit the successful full report",
+    ):
+        assert name in suite_names and name not in scenario_names
+    assert suite_names[cut_suite:cut_suite + 3] == [
+        "Run the full test suite",
+        "Keep the test report (durations + results)",
+        "Audit the successful full report",
+    ]
+
+    # Each job ends by keeping its failure picture and logs, then tearing its own stack down.
+    artifacts = []
+    for job in (suite, scenarios):
+        tail = job["steps"][-3:]
+        assert [s["name"] for s in tail] == [
+            "Keep the picture of a failed browser test",
+            "Container logs",
+            "Tear the stack down",
+        ]
+        assert tail[0]["if"] == "failure()"
+        assert tail[1]["if"] == "${{ failure() || cancelled() }}"
+        assert tail[2]["if"] == "always()"
+        assert tail[2]["run"] == "docker compose down -v --remove-orphans"
+        artifacts += [
+            s["with"]["name"] for s in job["steps"]
+            if s.get("uses", "").startswith("actions/upload-artifact@")
+        ]
+    # Artifact names are unique within a run: a second upload under a taken name fails its step.
+    assert len(artifacts) == len(set(artifacts)) == 3
 
 
 def test_a_candidate_or_release_tests_run_includes_the_fast_lanes():
@@ -102,8 +198,16 @@ def test_fast_host_pytest_job_installs_the_cross_platform_locked_environment():
     ("workflow", "first_pytest_command"),
     [
         (_PREFLIGHT, "python -m pytest --collect-only -q"),
-        (_WORKFLOW, "python -m pytest --maxfail=1 --junitxml=pytest-results.xml"),
+        (
+            _job_text("integration", "scenarios"),
+            "python -m pytest --maxfail=1 --junitxml=pytest-results.xml",
+        ),
+        (
+            _job_text("scenarios", None),
+            "python -m pytest tests/test_transfer_admission_live.py",
+        ),
     ],
+    ids=["preflight", "integration", "scenarios"],
 )
 def test_linux_host_pytest_jobs_layer_the_hash_locked_production_environment(
     workflow: str, first_pytest_command: str

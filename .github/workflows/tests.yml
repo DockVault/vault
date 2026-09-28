@@ -1,8 +1,9 @@
 name: Tests
 
 # Run strict collection and the offline lane before any image build or browser install.
-# The full job then exercises the same-commit image over the real Postgres, Redis, API,
-# browser, and SFTP stack. Every credential is generated for one disposable runner.
+# Two full jobs then exercise the same-commit image over the real Postgres, Redis, API,
+# browser, and SFTP stack: the suite, and the configuration scenarios on a stack of their own.
+# Every credential is generated for one disposable runner.
 
 on:
   pull_request:
@@ -65,11 +66,31 @@ jobs:
       expected_sha: ${{ inputs.expected_sha }}
     permissions:
       contents: read
+  # The suite and the configuration scenarios are two jobs, each on its own runner and its own
+  # disposable stack built from this commit. Both need only preflight, so they run side by side.
+  #
+  # - integration: the whole suite, once, against the shipped configuration.
+  # - scenarios: six steps that each reconfigure the stack (a transfer ceiling that refuses, log
+  #   pull switched on, a vault-type allowlist, a Redis outage, a login limit of five, a small
+  #   device-sync limit), recreate the API, run the few files that need that configuration, and
+  #   put the shipped value back.
+  #
+  # The scenarios used to follow the suite in this job and took about 7.4 of its minutes. With
+  # them in, the 0.32.6 job measured 49.5 minutes against a 60-minute cap, and the tests 0.33.0
+  # adds were estimated to take it to 58-64. On their own runner they no longer compete with the
+  # suite for one budget, and a failure in one does not hide a result from the other.
+  #
+  # A release calls this whole workflow (the `tests` job in release.yml), and a called workflow
+  # succeeds only when every job in it succeeds, so publication waits for both jobs. Neither may
+  # carry an `if` that would skip it on a tag: a skipped job counts as passed.
   integration:
     name: Full suite (API + browser + SFTP)
     needs: preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The suite alone is expected at about 51-57 minutes with this release's tests. 75 is a
+    # safety margin for a slow runner, not a budget to grow into: past about 60, split the suite
+    # itself (browser and API tests in two jobs whose JUnit reports are audited together).
+    timeout-minutes: 75
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -272,6 +293,220 @@ jobs:
           python .github/scripts/pytest_result_audit.py pytest-results.xml
           --expected-total "${{ needs.preflight.outputs.test-count }}"
 
+      # A browser failure here used to leave only the accessibility dump Playwright prints, which
+      # says what the page contained and not why. One such failure cost an hour of hypotheses --
+      # each plausible, each wrong -- that a picture of the page would have settled at once: an
+      # error toast shows in a screenshot and is absent from the tree. Kept only when something
+      # failed, so a green run uploads nothing.
+      - name: Keep the picture of a failed browser test
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-failure-screenshots
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # On a failure AND on a cancel, quiet on green. `failure()` alone skipped exactly the case that
+      # most needs the logs: a job killed by its cap is `cancelled`, not `failure`, and three capped
+      # runs left no container log at all. Not `!success()`, tempting as it reads: once a job is
+      # cancelled GitHub skips every remaining step unless its condition NAMES `always()` or
+      # `cancelled()` -- a condition that merely evaluates true is not enough -- so the
+      # cancel-aware function has to be spelled out here for the step to run at all.
+      - name: Container logs
+        if: ${{ failure() || cancelled() }}
+        run: docker compose logs --no-color --tail=400
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # The configuration scenarios, on a stack of their own. The setup below is the integration
+  # job's setup, step for step (a contract test compares the two), so every scenario starts from
+  # the stack the suite runs on and changes only the one setting it is about. Each step puts that
+  # setting back before the next, as it did when these steps followed the suite.
+  scenarios:
+    name: Configuration scenarios (API + browser + SFTP)
+    needs: preflight
+    runs-on: ubuntu-latest
+    # In the suite's job, setup took about two minutes and the six steps 7.4. 30 minutes is about
+    # three times that: room for a slow day, and a hang is still reported in half an hour rather
+    # than consuming the suite's cap.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
+          # Tags, because part of the suite checks the upgrade matrix against the releases that
+          # actually exist. The default checkout is shallow and tagless, which made that check skip
+          # -- silently, and specifically here, in the job that gates publication. Tags only, not
+          # full history: the check reads `git tag -l`.
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify requested commit
+        if: ${{ inputs.expected_sha != '' }}
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            tests/requirements-test.lock
+
+      - name: Generate and mask throwaway credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+          JWT_SECRET_KEY="$(openssl rand -hex 32)"
+          VAULT_DB_PASSWORD="$(openssl rand -hex 16)"
+          ADMIN_PASSWORD="$(openssl rand -base64 24)"
+          for value in "$ENCRYPTION_KEY" "$JWT_SECRET_KEY" "$VAULT_DB_PASSWORD" "$ADMIN_PASSWORD"; do
+            echo "::add-mask::${value}"
+          done
+          {
+            echo "ENCRYPTION_KEY=${ENCRYPTION_KEY}"
+            echo "JWT_SECRET_KEY=${JWT_SECRET_KEY}"
+            echo "VAULT_DB_PASSWORD=${VAULT_DB_PASSWORD}"
+            echo "ADMIN_USERNAME=admin"
+            echo "ADMIN_EMAIL=admin@dockvault-ci.com"
+            echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
+            echo "API_USE_HTTPS=false"
+            echo "ENVIRONMENT=development"
+            echo "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240"
+            echo "RATE_LIMIT_LOGIN_ATTEMPTS=2000"
+            echo "RATE_LIMIT_VAULT_ATTEMPTS=2000"
+            echo "RATE_LIMIT_VAULT_ATTEMPTS_ADMIN=2000"
+            echo "RATE_LIMIT_API_DEFAULT=100000"
+            echo "RATE_LIMIT_API_AUTH=100000"
+            echo "RATE_LIMIT_API_UPLOAD=100000"
+            echo "RATE_LIMIT_API_DOWNLOAD=100000"
+            # The shipped default, stated rather than left implicit: the SSH-key throttle
+            # test asks the deployment what budget it is enforcing, so that it can tell a
+            # throttle which should have engaged from a deployment that cannot show one.
+            echo "RATE_LIMIT_SFTP_KEY_ATTEMPTS=30"
+            # A real storage ceiling, so the suite exercises the bounded admin limit
+            # (the panel offers 0..MAX_STORAGE_GB) rather than only the unlimited default.
+            echo "MAX_STORAGE_GB=64"
+          } > .env
+          {
+            echo "VAULT_ADMIN_USER=admin"
+            echo "VAULT_ADMIN_PASS=${ADMIN_PASSWORD}"
+            echo "VAULT_API_CONTAINER=vault-api"
+            echo "VAULT_DB_CONTAINER=vault-db"
+            echo "VAULT_REDIS_CONTAINER=vault-redis"
+            echo "VAULT_SFTP_HOST=127.0.0.1"
+            echo "VAULT_SFTP_PORT=2322"
+            echo "VAULT_SAME_COMMIT_CI=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the image and start the stack
+        # Measured at 42 seconds. Same reasoning as the step below: a stalled pull or build should
+        # say so rather than being read later as a slow test suite.
+        timeout-minutes: 20
+        run: docker compose up -d --build
+
+      - name: Wait for the API health gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            body=""
+            if body="$(curl -fsS --max-time 5 http://127.0.0.1:8200/health 2>/dev/null)"; then
+              case "$body" in
+                *'"database":"connected"'*)
+                  echo "Vault healthy after ${attempt} attempt(s): ${body}"
+                  exit 0
+                  ;;
+              esac
+            fi
+            sleep 5
+          done
+          echo "::error::Vault never reported healthy at http://127.0.0.1:8200/health"
+          docker compose ps
+          docker compose logs --no-color --tail=200
+          exit 1
+
+      - name: Wait for the SFTP banner
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            banner=""
+            if banner="$(timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2322; head -c 4 <&3' 2>/dev/null)"; then
+              case "$banner" in
+                SSH-*)
+                  echo "SFTP greeting received after ${attempt} attempt(s)"
+                  exit 0
+                  ;;
+              esac
+            fi
+            sleep 2
+          done
+          echo "::error::SFTP never presented an SSH banner on 127.0.0.1:2322"
+          docker compose logs --no-color --tail=200 vault-sftp
+          exit 1
+
+      - name: Install locked test dependencies and Chromium
+        # Measured at 46 seconds on a healthy runner. It has hung for 35+ minutes twice, and with
+        # no deadline of its own it consumes the job's whole budget and reports as a timeout of
+        # the SUITE -- which is where someone then goes looking, and it is the wrong place.
+        #
+        # Established from the log of the second occurrence: it stalls in `apt-get update`, which
+        # `--with-deps` invokes. The Azure mirror answered `Ign:` on every line, apt fell back to
+        # archive.ubuntu.com, and the last output was `Get:5 noble-security InRelease` at
+        # 02:27:10 -- then nothing for 43 minutes. Pip was never reached.
+        #
+        # The signature to recognise: the step's log ends mid-`apt-get update` with no error. That
+        # is the shape a deadline turns into a ten-minute answer instead of a lost hour, and it is
+        # also why the deadline goes on the step rather than being left to the job's.
+        #
+        # Ten minutes is thirteen times the measured cost: generous for a bad day, and a clear
+        # answer instead of a lost hour.
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python -m pip install -r tests/requirements-test.lock
+          python -m pip install --force-reinstall --require-hashes -r requirements.lock
+          python -m pip check
+          # NOT --with-deps. That flag is the only thing here that invokes apt, and apt is the
+          # only thing here that has ever hung: three times now, each stalling on a mirror
+          # mid-fetch with no error. Bounding it helped only in that the job now fails in ten
+          # minutes instead of consuming forty-five -- the stall itself kept recurring, once
+          # for nine minutes on a single HTTPS GET despite a twenty-second timeout, because
+          # those timeouts bound a connection attempt and not a transfer that trickles.
+          #
+          # The runner image already ships the shared libraries Chromium needs -- which is why
+          # Playwright's browsers come preinstalled on it. Nothing is taken on trust either:
+          # the next step launches Chromium against the running API and fails loudly if a
+          # library really is missing, which is a better signal than a silent apt stall.
+          python -m playwright install chromium
+
+      - name: Verify Chromium launches against the API
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              page = browser.new_page()
+              response = page.goto(
+                  "http://127.0.0.1:8200/",
+                  wait_until="domcontentloaded",
+                  timeout=15_000,
+              )
+              if response is None or not response.ok:
+                  raise SystemExit("Chromium could not load the running vault")
+              browser.close()
+          PY
+
       # Eight tests in tests/test_transfer_admission_live.py are gated on a deployment configured
       # to refuse rather than queue, and nothing set that up, so they ran nowhere. Same shape as
       # the throttle step below: reconfigure, recreate, run, put it back.
@@ -376,15 +611,6 @@ jobs:
             sleep 3
           done
 
-      # This check gates on VAULT_REDIS_OUTAGE_TEST, which was set only on the command line
-      # of an invocation naming a different file -- so the assertion that the general API
-      # classes stay available while Redis is down was selected nowhere.
-      #
-      # It runs before the step below rather than inside it: that step lowers the login limit
-      # to five on purpose, and the rest of this file logs in often enough to be refused by
-      # it. Nothing here needs the lowered limit -- the flag is read by the test, not the
-      # server -- so the two are kept apart. The test pauses the container and unpauses it in
-      # a finally, waiting for health before it returns.
       # The allowlist of creatable vault types is a comma-list that ships empty, meaning
       # everything is permitted, and no workflow has ever set it -- so the check that a
       # forbidden type is refused, and that nothing is persisted when it is, has never run.
@@ -422,6 +648,15 @@ jobs:
             sleep 3
           done
 
+      # This check gates on VAULT_REDIS_OUTAGE_TEST, which was set only on the command line
+      # of an invocation naming a different file -- so the assertion that the general API
+      # classes stay available while Redis is down was selected nowhere.
+      #
+      # It runs before the step below rather than inside it: that step lowers the login limit
+      # to five on purpose, and the rest of this file logs in often enough to be refused by
+      # it. Nothing here needs the lowered limit -- the flag is read by the test, not the
+      # server -- so the two are kept apart. The test pauses the container and unpauses it in
+      # a finally, waiting for health before it returns.
       - name: Exercise the general API fail-open during a Redis outage
         shell: bash
         run: |
@@ -557,7 +792,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ui-failure-screenshots
+          name: ui-failure-screenshots-scenarios
           path: test-results/
           if-no-files-found: ignore
           retention-days: 7

@@ -118,6 +118,39 @@ def test_publish_waits_for_both_same_commit_reusable_gates():
     assert 'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"' in publish
 
 
+def test_publication_needs_the_suite_and_the_configuration_scenarios():
+    """The Tests workflow runs its stack in two jobs: the suite, and the configuration scenarios that
+    used to follow it. The release's `tests` job calls that whole workflow, and a called workflow
+    succeeds only when every job in it does, so `needs: tests` holds publication for both -- as long
+    as neither job can be skipped on a tag (a skipped job counts as a pass) and neither one runs
+    only after the other has passed (a scenario must not quietly depend on the suite's leftovers)."""
+    import yaml
+
+    release = yaml.safe_load(_WORKFLOW)["jobs"]
+    assert release["tests"]["uses"] == "./.github/workflows/tests.yml"
+    assert "tests" in release["publish"]["needs"]
+
+    jobs = yaml.safe_load(_TESTS)["jobs"]
+    stack_jobs = {
+        name for name, job in jobs.items()
+        if any("docker compose up -d --build" in step.get("run", "") for step in job.get("steps", []))
+    }
+    assert stack_jobs == {"integration", "scenarios"}
+    for name in stack_jobs:
+        assert "if" not in jobs[name], name
+        assert jobs[name]["needs"] == "preflight", name
+    scenario_runs = " ".join(step.get("run", "") for step in jobs["scenarios"]["steps"])
+    for scenario_file in (
+        "tests/test_transfer_admission_live.py",
+        "tests/test_api_log_pull.py",
+        "tests/test_vault_type_allowlist.py",
+        "tests/test_auth_survives_cache_outage.py",
+        "tests/test_login_throttle.py",
+        "tests/test_device_sync_preflight_live.py",
+    ):
+        assert scenario_file in scenario_runs, scenario_file
+
+
 def test_each_reusable_gate_checks_out_and_verifies_the_requested_sha():
     preflight = (_WORKFLOWS / "preflight.yml").read_text(encoding="utf-8")
     # Called by Tests on a candidate and inside a release, so it gates the published commit too.
