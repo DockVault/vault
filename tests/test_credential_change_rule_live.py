@@ -526,3 +526,99 @@ def test_every_route_that_makes_an_administrator_records_who_did(admin, route):
             assert psql(f"SELECT count(*) FROM admin_grants WHERE user_id='{account['id']}'") == "0"
     finally:
         admin.delete_user(account["id"])
+
+
+# --------------------------------------------------------------------------- the asker gone, the account's own
+
+def _lock_every_other_administrator(admin, keep):
+    """Lock every active administrator but the session's and those in ``keep``; returns their ids, for
+    _unlock. Locking one withdraws the requests it had open."""
+    me = admin.get("/users/me").json()["id"]
+    others = [u for u in admin.get("/users").json()
+              if u["role"] == "admin" and u["is_active"] and not u["is_locked"] and u["id"] != me
+              and u["id"] not in keep]
+    locked = []
+    for u in others:
+        assert admin.patch(f"/users/{u['id']}", json={"is_locked": True}).status_code == 200
+        locked.append(u["id"])
+    return locked
+
+
+def test_with_two_administrators_one_cannot_take_the_other_over(admin, other_admin, third_admin):
+    """Only the session's administrator and bob can act. The session's administrator makes an
+    administrator account, which changes bob's password and asks for a reset link for him. Bob could
+    have approved that before (a change to his own account), so it was held, and demoting the account
+    that asked then let its maker approve it. A change is never approved by the person it is for: with
+    nobody else, the second change is refused and only the host tool can make it."""
+    me = admin.get("/users/me").json()
+    with second_admin(admin, independent=True) as (bob, _bob_client):
+        locked = _lock_every_other_administrator(admin, keep={bob["id"]})
+        try:
+            with second_admin(admin) as (puppet, puppet_client):
+                r = puppet_client.patch(f"/users/{bob['id']}", json={"password": NEW_PASSWORD})
+                assert r.status_code == 200, r.text
+                r = puppet_client.post(f"/users/{bob['id']}/reset-link")
+                assert r.status_code == 409, r.text
+                detail = r.json()["detail"]
+                assert f"{bob['_username']} may not approve a change to their own account" in detail, detail
+                assert f"{me['username']} made you an administrator" in detail, detail
+                assert "dockvault.py accounts" in detail
+                r = admin.post(f"/users/{bob['id']}/reset-link")
+                assert r.status_code == 409, r.text
+                assert "may not approve a change to their own account" in r.json()["detail"]
+            assert psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id='{bob['id']}' "
+                        "AND status='held'") == "0", "nothing is held for bob to be taken over through"
+        finally:
+            for uid in locked:
+                admin.patch(f"/users/{uid}", json={"is_locked": False})
+            for account, client in (other_admin, third_admin):
+                client.login(account["_username"], account["_password"])
+
+
+LEAVING = {
+    "patch_demote": lambda c, uid: c.patch(f"/users/{uid}", json={"role": "user"}),
+    "patch_deactivate": lambda c, uid: c.patch(f"/users/{uid}", json={"is_active": False}),
+    "patch_lock": lambda c, uid: c.patch(f"/users/{uid}", json={"is_locked": True}),
+    "delete": lambda c, uid: c.post(f"/users/{uid}/delete"),
+    "put_demote": lambda c, uid: c.put(f"/api/user-management/users/{uid}", json={"role": "user"}),
+    "role_demote": lambda c, uid: c.patch(f"/api/user-management/users/{uid}/role", json={"new_role": "user"}),
+    "toggle_active": lambda c, uid: c.post(f"/api/user-management/users/{uid}/toggle-active"),
+    "toggle_locked": lambda c, uid: c.post(f"/api/user-management/users/{uid}/toggle-locked"),
+}
+BECAUSE = {"patch_demote": "demoted", "put_demote": "demoted", "role_demote": "demoted",
+           "patch_deactivate": "deactivated", "toggle_active": "deactivated",
+           "patch_lock": "locked", "toggle_locked": "locked", "delete": "deleted"}
+
+
+@pytest.mark.parametrize("route", sorted(LEAVING))
+def test_an_administrator_who_leaves_has_their_open_requests_withdrawn(admin, temp_user, route):
+    """An administrator makes the first change to an account and asks for the second, which is held. They
+    are then demoted, deactivated, locked or deleted, through every route that can: the request is
+    withdrawn at once and audited, the user and the administrator who could approve it are told, and it
+    can no longer be approved."""
+    me = admin.get("/users/me").json()
+    with second_admin(admin, independent=True) as (asker, asker_client):
+        assert asker_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+        assert asker_client.post(f"/users/{temp_user['id']}/reset-link").status_code == 202
+        req = _request_for(admin, temp_user["id"])
+        assert req["can_approve"] is True, req
+
+        r = LEAVING[route](admin, asker["id"])
+        assert r.status_code == 200, r.text
+
+        assert psql(f"SELECT status || '|' || decided_by_name FROM credential_changes "
+                    f"WHERE id='{req['id']}'") == f"withdrawn|{me['username']}"
+        assert not [x for x in _requests(admin) if x["id"] == req["id"]], "it leaves the list"
+        refused = admin.post(f"/admin/credential-requests/{req['id']}/approve")
+        assert refused.status_code == 409 and "withdrawn" in refused.json()["detail"], refused.text
+
+        rows = admin.get("/audit/log", params={"action": "credential_change_withdrawn", "limit": 500}).json()
+        mine = [a for a in rows if a["resource_id"] == temp_user["id"]]
+        assert mine and mine[0]["username"] == me["username"], mine
+        assert mine[0]["details"]["withdrawn_because"] == BECAUSE[route], mine[0]["details"]
+        told = [n for n in notifications(admin, "credential_change_withdrawn")
+                if asker["_username"] in (n["body"] or "") and temp_user["_username"] in (n["body"] or "")]
+        assert told and "nothing left to approve" in told[0]["body"], told
+        user_notes = notifications(signed_in({**temp_user, "_password": NEW_PASSWORD}),
+                                   "credential_change_withdrawn")
+        assert user_notes and "the administrator who asked" in user_notes[0]["body"], user_notes

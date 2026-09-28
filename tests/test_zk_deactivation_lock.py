@@ -37,7 +37,7 @@ import app.api.api_server as S  # noqa: E402
 import app.api.user_management_api as UM  # noqa: E402
 from app.api.ecc_router import _rekey_owed  # noqa: E402
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO  # noqa: E402
-from app.core.models import RoleEnum, User, Vault, VaultMemberKey, vault_members  # noqa: E402
+from app.core.models import CredentialChange, RoleEnum, User, Vault, VaultMemberKey, vault_members  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -49,7 +49,9 @@ def db():
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'offboard.db'}",
                                   connect_args={"check_same_thread": False})
-        for table in (User.__table__, Vault.__table__, vault_members, VaultMemberKey.__table__):
+        # credential_changes: deactivating an administrator withdraws the requests they have open.
+        for table in (User.__table__, Vault.__table__, vault_members, VaultMemberKey.__table__,
+                      CredentialChange.__table__):
             table.create(engine)
         # The application's own session flags (app/core/database.py).
         Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)

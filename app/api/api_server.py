@@ -5572,6 +5572,15 @@ def _approval_refusal_text(reason, requester, *, short=False) -> str:
     applied (credential_changes.refusal_reason). ``short`` is the line the Users page shows beside it;
     the long one is the refusal of the approval (403)."""
     from app.core import credential_changes as cc
+    if reason == cc.OWN_ACCOUNT:
+        if short:
+            return "You cannot approve this: it is a change to your own account."
+        return f"This is a change to your own account, so you cannot approve it. {_OTHERS_CAN}"
+    if reason == cc.REQUESTER_GONE:
+        if short:
+            return f"You cannot approve this: {requester} is no longer an administrator."
+        return (f"{requester}, who asked for this change, is no longer an active administrator, so nobody "
+                "can approve it.")
     if reason == cc.MADE_BY_REQUESTER:
         if short:
             return f"You cannot approve this: {requester} made you an administrator."
@@ -5623,6 +5632,8 @@ def _no_approver_text(refusals, target_name) -> str:
         return "an administrator" if len(names) == 1 else "administrators"
 
     clauses = []
+    if by_reason.get(cc.OWN_ACCOUNT):
+        clauses.append(f"{target_name} may not approve a change to their own account")
     made = by_reason.get(cc.MADE_BY_REQUESTER)
     if made:
         clauses.append(f"you made {_names_text(made)} {admins(made)}")
@@ -5886,9 +5897,18 @@ def _announce_held_change(db, change, target) -> None:
         print(f"⚠ held-change notice skipped: {type(e).__name__}")
 
 
-def _announce_decided_change(db, change, target, outcome: str, result=None) -> None:
+def _held_change_approver_ids(db, change) -> list:
+    """The administrators told that ``change`` needs their approval (_announce_held_change): who may
+    approve it, as the records stand. Read before anything the caller does takes that away."""
+    from app.core import credential_changes as cc
+    return [str(a.id) for a in cc.approvers(db, change.requested_by_id, change) if a.id != change.target_user_id]
+
+
+def _announce_decided_change(db, change, target, outcome: str, result=None, approver_ids=()) -> None:
     """Tell the administrator who asked and the user how a held request ended: approved (the user gets
-    the notice of the change itself), denied, withdrawn or expired. After the commit; best-effort."""
+    the notice of the change itself), denied, withdrawn or expired. After the commit; best-effort.
+    ``approver_ids``: for a withdrawal, the administrators who were asked to approve it, told that
+    there is nothing left to approve."""
     from app.core import credential_changes as cc
     what, who, by = cc.phrase(change.kind), change.requested_by_name, change.decided_by_name
     requester = [str(change.requested_by_id)] if change.requested_by_id is not None else []
@@ -5909,6 +5929,10 @@ def _announce_decided_change(db, change, target, outcome: str, result=None) -> N
                 change=f"An administrator's request to {what} for your account was denied. Nothing was changed.",
                 by=f"{_actor_text(who)} asked; {_actor_text(by)} denied it")
         elif outcome == cc.WITHDRAWN:
+            _notify_users(list(approver_ids), "credential_change_withdrawn", title="A request was withdrawn",
+                          body=(f"{who} withdrew their request to {what} for {target.username}. Nothing was "
+                                "changed, and there is nothing left to approve."),
+                          target="#users")
             _notify_account_change(
                 db, target, ntype="credential_change_withdrawn",
                 title="A requested change to your account was withdrawn",
@@ -5927,6 +5951,76 @@ def _announce_decided_change(db, change, target, outcome: str, result=None) -> N
                 by=_actor_text(who))
     except Exception as e:  # noqa: BLE001
         print(f"⚠ decided-change notice skipped: {type(e).__name__}")
+
+
+# Why an administrator's open requests were withdrawn for them (_withdraw_requests_of): what happened
+# to them, as the notices say it, by the key the audit row keeps.
+_WITHDRAWN_BECAUSE = {
+    "demoted": "is no longer an administrator",
+    "deactivated": "was deactivated",
+    "locked": "was locked by an administrator",
+    "deleted": "was deleted",
+}
+
+
+def _withdraw_requests_of(db, user, *, actor, because) -> list:
+    """``user`` is about to stop being an administrator who can act (``because``: demoted, deactivated,
+    locked by an administrator, or deleted, by ``actor``). Withdraw every request they have open, in
+    the caller's transaction, with an audit row each, and return what _announce_withdrawn_requests
+    tells after the commit. Call it BEFORE the change to ``user`` is made in the session: who was asked
+    to approve each request is read from the records as they stand.
+
+    A request whose asker can no longer act is never approved (credential_changes.approval_refusal);
+    withdrawing it too takes it off every administrator's list and tells the user it will not happen.
+    Without this, demoting or deleting the one who asked cleared the way for the administrator who made
+    them to approve it."""
+    from app.core import credential_changes as cc
+    if user is None or user.id is None:
+        return []
+    open_now = cc.open_requests(db)
+    mine = [c for c in open_now if c.requested_by_id == user.id]
+    if not mine:
+        return []
+    told = {c.id: _held_change_approver_ids(db, c) for c in mine}
+    withdrawn = cc.withdraw_open(db, user.id, decider_id=actor.id if actor is not None else None,
+                                 decider_name=actor.username if actor is not None else cc.HOST_OPERATOR)
+    targets = {u.id: u for u in db.query(User).filter(
+        User.id.in_([c.target_user_id for c in withdrawn])).all()} if withdrawn else {}
+    out = []
+    for change in withdrawn:
+        target = targets.get(change.target_user_id)
+        db.add(AuditLogger(db).build_row(
+            action="credential_change_withdrawn", status="success", user=actor,
+            resource_type="user", resource_id=str(change.target_user_id),
+            details={"kind": change.kind, "change_id": str(change.id),
+                     "target_username": target.username if target is not None else None,
+                     "requested_by": change.requested_by_name, "withdrawn_because": because}))
+        out.append((change, target, told.get(change.id, []), because))
+    return out
+
+
+def _announce_withdrawn_requests(db, withdrawn) -> None:
+    """Tell the user and the administrators who were asked to approve, for each request
+    _withdraw_requests_of withdrew. After the commit; best-effort."""
+    from app.core import credential_changes as cc
+    for change, target, approver_ids, because in withdrawn:
+        if target is None:
+            continue
+        try:
+            what, who = cc.phrase(change.kind), change.requested_by_name
+            why = _WITHDRAWN_BECAUSE.get(because, "can no longer act as an administrator")
+            _notify_users(list(approver_ids), "credential_change_withdrawn", title="A request was withdrawn",
+                          body=(f"{who}'s request to {what} for {target.username} was withdrawn, because {who} "
+                                f"{why}. Nothing was changed, and there is nothing left to approve."),
+                          target="#users")
+            _notify_account_change(
+                db, target, ntype="credential_change_withdrawn",
+                title="A requested change to your account was withdrawn",
+                change=(f"An administrator's request to {what} for your account was withdrawn, because the "
+                        f"administrator who asked {why}. Nothing was changed."),
+                by=_actor_text(change.decided_by_name))
+        except Exception as e:  # noqa: BLE001 - a notice never undoes the withdrawal
+            print(f"⚠ withdrawn-request notice skipped: {type(e).__name__}")
 
 
 def _expire_held_credential_changes(db) -> int:
@@ -10104,7 +10198,18 @@ async def update_user(
 
     # Admin-only fields
     admin_granted = False
+    withdrawn = []
     if is_admin:
+        # An administrator demoted, deactivated or locked here has their open requests withdrawn, before
+        # any of that is set: who was asked to approve them is read as it stands.
+        from app.services.auth_service import admin_locked
+        for because, leaves in (("demoted", user_update.role is not None and user_update.role != RoleEnum.ADMIN
+                                 and user.role == RoleEnum.ADMIN),
+                                ("deactivated", user_update.is_active is False and user.is_active),
+                                ("locked", user_update.is_locked is True and not admin_locked(user))):
+            if leaves:
+                withdrawn = _withdraw_requests_of(db, user, actor=current_user, because=because)
+                break
         if user_update.role is not None:
             changes['role'] = {'old': user.role.value, 'new': user_update.role.value}
             # Who made an administrator one is recorded with the change, for the two-administrator
@@ -10191,6 +10296,7 @@ async def update_user(
                                        sign_in_locks_cleared=changes.get("sign_in_locks_cleared", 0))
     if admin_granted:
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
+    _announce_withdrawn_requests(db, withdrawn)
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
@@ -10522,6 +10628,8 @@ async def deny_credential_request(
     it; any other administrator denies it."""
     from app.core import credential_changes as cc
     change, target = _open_credential_request(db, change_id)
+    # Who was asked to approve it, read before it is decided: told when its asker withdraws it.
+    told = _held_change_approver_ids(db, change) if change.requested_by_id == current_user.id else []
     outcome = cc.deny(change, decider_id=current_user.id, decider_name=current_user.username)
     details = {"kind": change.kind, "change_id": str(change.id), "target_username": target.username,
                "requested_by": change.requested_by_name}
@@ -10534,7 +10642,7 @@ async def deny_credential_request(
                                          user=current_user, resource_type="user",
                                          resource_id=str(target.id), details=details))
     db.commit()
-    _announce_decided_change(db, change, target, outcome)
+    _announce_decided_change(db, change, target, outcome, approver_ids=told)
     return {"status": outcome,
             "request": _credential_request_dict(change, target.username, current_user.id)}
 
@@ -10582,6 +10690,8 @@ async def delete_user(
         )
 
     username = user.username
+    # Their open requests are withdrawn first: deleting the account would leave them with no asker.
+    withdrawn = _withdraw_requests_of(db, user, actor=current_user, because="deleted")
     db.delete(user)
     db.commit()
     
@@ -10590,6 +10700,7 @@ async def delete_user(
     audit_logger.log_user_deleted(
         username, user_id, current_user, get_client_ip(request)
     )
+    _announce_withdrawn_requests(db, withdrawn)
     
     return {"message": f"User {username} deleted successfully"}
 
@@ -23652,6 +23763,10 @@ END $$;""",
             # An administrator's invitation keeps its inviter's lineage from the moment it is made, for
             # the two-administrator rule (app/core/admin_grants.py). Nullable, for the same reason.
             "ALTER TABLE account_invitations ADD COLUMN IF NOT EXISTS inviter_lineage JSON",
+            # A held credential change keeps what its approval rule read when it was held
+            # (credential_changes.snapshot). For a database whose table an earlier build of this
+            # release made; create_all builds it with the column everywhere else. Nullable.
+            "ALTER TABLE credential_changes ADD COLUMN IF NOT EXISTS approval_snapshot JSON",
             # DB-backed login throttle (RateLimitRecord, used when Redis is down):
             # first collapse any duplicate (identifier, action) rows, then add the
             # UNIQUE constraint the ON CONFLICT upsert relies on. create_all adds it

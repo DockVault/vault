@@ -2763,6 +2763,12 @@ class CredentialChange(Base):
     decided_at = Column(DateTime, nullable=True)
     summary = Column(String(500), nullable=True)     # what the change is, as the approver reads it
     payload = Column(JSON(none_as_null=True), nullable=True)   # None is stored as SQL NULL
+    # A held request's approval rule, as it stood when the request was held: who asked, who made them
+    # an administrator (their lineage), and who had changed the account in the 14 days before. An
+    # approval is checked against this AND the records as they stand, so demoting or deleting whoever
+    # asked cannot clear the way for their maker (credential_changes.snapshot). NULL for a change
+    # made at once.
+    approval_snapshot = Column(JSON(none_as_null=True), nullable=True)
 
     __table_args__ = (
         Index('idx_credential_change_target', 'target_user_id', 'applied_at'),

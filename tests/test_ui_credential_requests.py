@@ -75,31 +75,33 @@ def test_another_administrators_request_is_approved_from_the_block(page: Page, a
     asker = ApiClient(BASE_URL)
     asker.login(asker_account["_username"], asker_account["_password"])
     _independent(page_admin, asker_account["id"])
+    # The asker is deleted only once the request is decided: deleting an administrator withdraws the
+    # requests they have open.
     try:
         assert asker.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
         held = asker.patch(f"/users/{uid}", json={"email": new_email})             # the second: held
         assert held.status_code == 202, held.text
+        request_id = held.json()["held_changes"][0]["request"]["id"]
+
+        _login(page, page_admin, skin, DESKTOP)
+        _open_users(page)
+        row = page.locator(f'#credential-requests-block [data-request-id="{request_id}"]')
+        expect(row).to_be_visible(timeout=10000)
+        expect(row).to_contain_text("Change the email address")
+        expect(row).to_contain_text(temp_user["_username"])
+        # Under the heading, only what it does not say.
+        expect(row.locator(".credential-request-summary")).to_have_text(f"New address: {new_email}")
+        expect(row.get_by_role("button", name="Deny")).to_be_visible()
+        expect(row.get_by_role("button", name="Withdraw")).to_have_count(0)
+
+        row.get_by_role("button", name="Approve").click()
+        _confirm(page)
+        expect(row).to_have_count(0, timeout=10000)
+        assert admin.get(f"/users/{uid}").json()["email"] == new_email
+        assert psql(f"SELECT status, decided_by_name FROM credential_changes WHERE id='{request_id}'") == \
+            f"approved|{page_admin['_username']}"
     finally:
         admin.delete_user(asker_account["id"])
-    request_id = held.json()["held_changes"][0]["request"]["id"]
-
-    _login(page, page_admin, skin, DESKTOP)
-    _open_users(page)
-    row = page.locator(f'#credential-requests-block [data-request-id="{request_id}"]')
-    expect(row).to_be_visible(timeout=10000)
-    expect(row).to_contain_text("Change the email address")
-    expect(row).to_contain_text(temp_user["_username"])
-    # Under the heading, only what it does not say.
-    expect(row.locator(".credential-request-summary")).to_have_text(f"New address: {new_email}")
-    expect(row.get_by_role("button", name="Deny")).to_be_visible()
-    expect(row.get_by_role("button", name="Withdraw")).to_have_count(0)
-
-    row.get_by_role("button", name="Approve").click()
-    _confirm(page)
-    expect(row).to_have_count(0, timeout=10000)
-    assert admin.get(f"/users/{uid}").json()["email"] == new_email
-    assert psql(f"SELECT status, decided_by_name FROM credential_changes WHERE id='{request_id}'") == \
-        f"approved|{page_admin['_username']}"
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])

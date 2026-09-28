@@ -32,7 +32,7 @@ set_bare_api_env()
 import app.api.api_server as S  # noqa: E402
 import app.api.user_management_api as UM  # noqa: E402
 from app.core.models import (  # noqa: E402
-    ActiveSession, RoleEnum, User, Vault, VaultMemberKey,
+    ActiveSession, CredentialChange, RoleEnum, User, Vault, VaultMemberKey,
 )
 from app.core.session_hash_utils import hash_session_token  # noqa: E402
 
@@ -59,8 +59,9 @@ def db(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'users.db'}")
+        # credential_changes: deactivating an account withdraws the requests it has open.
         for table in (User.__table__, Vault.__table__, VaultMemberKey.__table__,
-                      ActiveSession.__table__):
+                      ActiveSession.__table__, CredentialChange.__table__):
             table.create(engine)
         s = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
         s.sent = sent
