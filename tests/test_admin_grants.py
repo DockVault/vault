@@ -71,13 +71,15 @@ def test_the_host_operators_grant_has_no_lineage_and_a_new_grant_replaces_an_old
     assert db.query(AdminGrant).one().lineage == [str(b.id)]
 
 
-def test_a_lineage_is_bounded_and_never_names_the_account_itself(db):
-    users = [_user(db, f"u{i}") for i in range(admin_grants.MAX_LINEAGE + 5)]
+def test_a_lineage_is_kept_whole_and_never_names_the_account_itself(db):
+    # Cut at 64, the end of a longer chain no longer led back to its start (test_credential_change_
+    # independence.py has what that let through).
+    users = [_user(db, f"u{i}") for i in range(70)]
     for parent, child in zip(users, users[1:]):
         admin_grants.record(db, child.id, granted_by_id=parent.id, granted_by_name=parent.username)
     db.commit()
     last = admin_grants.of(db, [users[-1].id])[users[-1].id]
-    assert len(last.lineage) == admin_grants.MAX_LINEAGE
+    assert last.lineage == [str(u.id) for u in reversed(users[:-1])]
     # A made b, b makes a an administrator again: a's lineage does not loop back to a.
     a, b = users[0], users[1]
     admin_grants.record(db, a.id, granted_by_id=b.id, granted_by_name=b.username)

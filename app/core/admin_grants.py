@@ -28,9 +28,11 @@ from typing import Dict, Iterable, List, Optional
 
 from app.core.models import AdminGrant
 
-# The longest lineage kept. A chain of administrators made one from another longer than this is not
-# something a deployment has; the bound only keeps a row from growing without limit.
-MAX_LINEAGE = 64
+# A lineage is kept whole, however long the chain. It names each administrator at most once and never
+# the account itself (record), so it can grow no longer than the number of accounts ever made
+# administrators. A cut at a fixed length dropped the oldest makers first: the administrator at the
+# end of a long enough chain no longer led back to the one at its start, who could then approve
+# through it.
 
 
 def utcnow() -> datetime:
@@ -48,7 +50,7 @@ def lineage_through(db, admin_id) -> List[str]:
     if admin_id is None:
         return []
     parent = db.get(AdminGrant, admin_id)
-    return ([str(admin_id)] + [str(x) for x in ((parent.lineage or []) if parent else [])])[:MAX_LINEAGE]
+    return [str(admin_id)] + [str(x) for x in ((parent.lineage or []) if parent else [])]
 
 
 def record(db, user_id, *, granted_by_id, granted_by_name, now: Optional[datetime] = None,
@@ -69,7 +71,7 @@ def record(db, user_id, *, granted_by_id, granted_by_name, now: Optional[datetim
     row.granted_by_id = granted_by_id
     row.granted_by_name = (granted_by_name or "")[:255]
     row.granted_at = now
-    row.lineage = lineage[:MAX_LINEAGE]
+    row.lineage = lineage
     db.flush()
     return row
 
