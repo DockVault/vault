@@ -366,6 +366,13 @@ def cached(key: tuple, range_key: str, compute):
     return value, 0.0
 
 
+def fresh_for(range_key: str, age: float) -> float:
+    """Seconds until a set of counts `age` seconds old is counted again rather than reused. The page
+    reads the band again then when its total and the list's disagree (a row written just after the band
+    was counted), so the two agree without waiting for the next event."""
+    return max(0.0, CACHE_SECONDS.get(range_key, 0) - age)
+
+
 def _live_sessions(db, now: datetime):
     from app.core.models import ActiveSession
     cutoff = now - timedelta(minutes=SESSION_GRACE_MINUTES)

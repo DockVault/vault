@@ -340,3 +340,45 @@ let S = { vaultList: null };
 })();
 """)
     assert out == {"got": [], "kept": ["Mine"], "own": ["Mine"]}
+
+
+# ---- the band's total and the list's -------------------------------------------------------------
+
+RECONCILE = _line("let reconcileTimer") + _fn("reconcileTotals") + """
+const timers = [];
+const setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+const reads = [];
+const loadBand = (live) => { reads.push(live); };
+let S = { band: { total: 100, fresh_seconds: 3.2 }, listLoaded: true, total: 101, f: { time: null },
+          paused: false, active: true };
+"""
+
+
+def test_a_band_behind_the_list_is_read_again_once_the_server_counts_afresh():
+    """A row written just after the shared band was counted: the list says 101, the band 100. The band is
+    read again once, when the server's counts are fresh, and not again for the same pair of totals."""
+    out = _node(RECONCILE + """
+reconcileTotals();
+const first = timers.map((t) => t.ms);
+reconcileTotals();                                  // a timer is waiting: nothing more
+timers[0].fn();                                     // it fires
+S.band = { total: 100, fresh_seconds: 0 };          // the same stale count came back
+reconcileTotals();                                  // the same pair: not read a third time
+const afterSame = timers.length;
+S.total = 102;                                      // a new row: a new pair
+reconcileTotals();
+S.f.time = { from: 'a', to: 'b' };                   // a time on the chart: the totals differ on purpose
+S.total = 103;
+reconcileTotals();
+console.log(JSON.stringify({ first, afterSame, timers: timers.length, reads, last: timers[timers.length - 1].ms }));
+""")
+    assert out == {"first": [3450], "afterSame": 1, "timers": 2, "reads": [True], "last": 250}
+
+
+def test_equal_totals_ask_for_nothing():
+    out = _node(RECONCILE + """
+S.total = 100;
+reconcileTotals();
+console.log(JSON.stringify({ timers: timers.length }));
+""")
+    assert out == {"timers": 0}

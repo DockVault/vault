@@ -1089,6 +1089,7 @@
     function plural(n, one, many) { return `${nf(n)} ${n === 1 ? one : many}`; }
 
     function renderCount() {
+        reconcileTotals();
         const c = $('activity-summary');
         if (!c) return;
         if (!S.listLoaded || !S.rows.length) { c.textContent = ''; return; }
@@ -2095,6 +2096,7 @@
         if (!S.now && data.now) S.now = data.now;
         renderBand();
         renderPanelState();
+        reconcileTotals();
         // The list starts where the band does: when the server snapped the range's start differently
         // from the page (a daylight-saving corner), read the list again from the server's start.
         if (PRESETS.includes(S.range.kind) && data.range === S.range.kind && !S.f.time && S.listFromUsed) {
@@ -3355,6 +3357,23 @@
 
     // ---- the band and Now on signals ----
 
+    // The band's counts are shared between administrators for a few seconds, so a row written just
+    // after they were counted is in the list's total and not yet in the band's. When the two disagree,
+    // read the band again once the server counts afresh (it says when: fresh_seconds), once for each
+    // pair of totals, so a lasting difference never becomes a loop. A time picked on the chart narrows
+    // the list and not the band: the totals are not the same count then.
+    let reconcileTimer = null, reconciledFor = null;
+    function reconcileTotals() {
+        const b = S.band;
+        if (reconcileTimer || !b || !S.listLoaded || S.total == null || S.f.time || S.paused || !S.active) return;
+        if (b.total === S.total) { reconciledFor = null; return; }
+        const pair = `${b.total}|${S.total}`;
+        if (pair === reconciledFor) return;
+        reconciledFor = pair;
+        const wait = Math.max(0, Number(b.fresh_seconds) || 0);
+        reconcileTimer = setTimeout(() => { reconcileTimer = null; loadBand(true); }, wait * 1000 + 250);
+    }
+
     let bandTimer = null, bandFirst = 0;
     function bandSoon() {
         if (S.paused || document.hidden) { S.bandDirty = true; return; }
@@ -4529,7 +4548,8 @@
         clearTimeout(fetchTimer);
         clearTimeout(pausedTimer);
         clearInterval(heldTimer);
-        nowTimer = minuteTimer = pollTimer = bandTimer = fetchTimer = pausedTimer = heldTimer = null;
+        clearTimeout(reconcileTimer);
+        nowTimer = minuteTimer = pollTimer = bandTimer = fetchTimer = pausedTimer = heldTimer = reconcileTimer = null;
         bandFirst = 0;
         reloadSoon.cancel();
         nowSoon.cancel();

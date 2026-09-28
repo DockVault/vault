@@ -319,3 +319,14 @@ def test_only_so_many_bands_are_kept(clock):
         s.cached((i,), "30d", lambda i=i: i)
     assert len(s._cache) == s.CACHE_ENTRIES
     assert s.cached((0,), "30d", lambda: "again")[0] == "again"      # the oldest went first
+
+
+def test_a_band_says_how_long_until_it_is_counted_afresh(clock):
+    """The page reads the band again when the list's total has moved past it; the reply says when the
+    shared counts will next be computed rather than reused."""
+    s.cached(("fresh",), "7d", lambda: 1)
+    clock["t"] += 4
+    _value, age = s.cached(("fresh",), "7d", lambda: 2)
+    assert s.fresh_for("7d", age) == s.CACHE_SECONDS["7d"] - 4
+    assert s.fresh_for("24h", 0.0) == s.CACHE_SECONDS["24h"]
+    assert s.fresh_for("30d", 99.0) == 0.0 and s.fresh_for("no-such-range", 0.0) == 0.0

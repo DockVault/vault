@@ -2870,7 +2870,8 @@ def activity_summary(
                                  until=until, from_=first if first is not None and first < end else None)
 
     band, age = summary.cached(key, range_, compute)
-    out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1)}
+    out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1),
+           "fresh_seconds": round(summary.fresh_for(range_, age), 1)}
     out["now"] = summary.now_panel(db, now, _activity_transfers())
     return out
 

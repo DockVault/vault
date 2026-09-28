@@ -6,7 +6,7 @@ import re
 import pytest
 from playwright.sync_api import Page, expect
 
-from _activity_ui import activity_admin, failed_sign_in, login, open_activity, rows  # noqa: F401
+from _activity_ui import activity_admin, failed_sign_in, login, open_activity, rows, summary, total_of  # noqa: F401
 
 pytestmark = pytest.mark.ui
 
@@ -346,3 +346,28 @@ def test_on_a_phone_the_expanded_charts_are_ruled_apart(page: Page, activity_adm
     rules = page.evaluate("""() => ['cat', 'signin', 'active', 'now']
         .map((k) => getComputedStyle(document.getElementById('act-p-' + k)).borderTopWidth)""")
     assert rules == ["1px"] * 4, rules
+
+
+def test_the_band_catches_up_with_the_lists_total(page: Page, activity_admin):
+    """The band's counts are shared between administrators for a few seconds, so a row written just after
+    they were counted can be in the list's total and not the band's. The page then reads the band again
+    once the server counts afresh, and the two totals agree. The first band is served one short here."""
+    served = {"n": 0}
+
+    def one_short(route):
+        response = route.fetch()
+        body = response.json()
+        served["n"] += 1
+        if served["n"] == 1:
+            body["total"] = max(0, body["total"] - 1)
+            body["fresh_seconds"] = 0
+        route.fulfill(response=response, json=body)
+
+    page.route(re.compile(r".*/activity/summary(\?.*)?$"), one_short)
+    login(page, activity_admin)
+    open_activity(page)
+    listed = total_of(summary(page))
+    # The second read may still get the shared counts (another test's, a few seconds old): the page then
+    # waits out what is left of them, at most the 7-day range's CACHE_SECONDS (15 s).
+    expect(page.locator("#act-p-time [data-fkey=key-all] .act-num")).to_have_text(f"{listed:,}", timeout=20000)
+    assert served["n"] >= 2
