@@ -1654,7 +1654,8 @@
         det.open = storeGet('activity.detailsOpen') === '1';
         det.addEventListener('toggle', () => storeSet('activity.detailsOpen', det.open ? '1' : '0'));
         const sum = el('summary', 'act-d-raw-sum');
-        sum.appendChild(el('span', 'act-d-sec-title', 'Recorded details'));
+        // The summary is a flex row, which drops the browser's own marker: a chevron says it opens.
+        sum.append(icon('chevron-right', 'act-d-raw-chev'), el('span', 'act-d-sec-title', 'Recorded details'));
         const hasDetails = ev.details && typeof ev.details === 'object' && Object.keys(ev.details).length;
         const json = hasDetails ? JSON.stringify(ev.details, null, 2) : '';
         if (hasDetails) {

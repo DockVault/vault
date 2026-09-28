@@ -341,3 +341,22 @@ def test_the_detail_and_the_filter_panel_end_inside_the_window(page: Page, activ
     for sel in ("#act-filter-panel", "#act-fp-done"):
         b = page.locator(sel).bounding_box()
         assert b["y"] + b["height"] <= 900, (sel, b)
+
+
+def test_recorded_details_shows_that_it_opens(page: Page, activity_admin):
+    """"Recorded details" is a disclosure: a chevron beside it points right while it is closed and down
+    once it is open, so the section does not read as empty apart from its Copy link."""
+    page.emulate_media(reduced_motion="reduce")                         # the chevron turns at once
+    login(page, activity_admin)
+    open_activity(page)
+    rows(page).first.click()
+    raw = page.locator("#act-detail details.act-d-raw")
+    chev = raw.locator("summary .act-d-raw-chev")
+    expect(chev).to_be_visible()
+    turned = "(e) => getComputedStyle(e).transform"
+    if raw.evaluate("(d) => d.open"):
+        raw.locator("summary").click()
+    assert chev.evaluate(turned) == "none"
+    raw.locator("summary").click()
+    expect(raw).to_have_attribute("open", "")
+    assert chev.evaluate(turned).startswith("matrix(0")                 # a quarter turn: pointing down

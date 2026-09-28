@@ -521,7 +521,10 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 .act-d-ua-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
 .act-d-ua.is-clamped { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .act-d-raw { margin-top: 14px; }
-.act-d-raw-sum { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.act-d-raw-sum { display: flex; align-items: center; gap: 6px; cursor: pointer; list-style: none; }
+.act-d-raw-sum::-webkit-details-marker { display: none; }
+.act-d-raw-chev { width: 12px; height: 12px; flex: none; color: var(--text-tertiary); transition: transform .12s ease; }
+.act-d-raw[open] .act-d-raw-chev { transform: rotate(90deg); }
 .act-d-raw-sum .act-d-sec-title { margin: 0; }
 .act-d-raw-copy { margin-left: auto; }
 .act-d-json {
@@ -675,5 +678,5 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 @media (prefers-reduced-motion: reduce) {
     .activity-table tbody tr.act-row.is-fading, .act-card.is-fading { transition: none; }
     .act-progress::before { animation: none; width: 100%; }
-    .act-col, .act-fp-disclose .icon { transition: none; }
+    .act-col, .act-fp-disclose .icon, .act-d-raw-chev { transition: none; }
 }
