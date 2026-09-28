@@ -226,3 +226,46 @@ def test_no_title_count_or_header_is_cut_short(page: Page, anon, activity_admin,
         .filter((e) => e.offsetParent && e.scrollWidth > e.clientWidth)
         .map((e) => e.textContent.trim())""")
     assert cut == []
+
+
+_NOW_CUT = """() => Array.from(document.querySelectorAll('#act-p-now .act-now-label'))
+    .filter((e) => e.offsetParent && e.scrollWidth > e.clientWidth).map((e) => e.textContent.trim())"""
+
+
+@pytest.mark.parametrize("skin", ["v2", "v1"])
+def test_the_now_panel_fits_four_digit_counts_without_widening_the_band(page: Page, activity_admin, skin):
+    """A busy server has hundreds of sessions and temporary credentials. Now grows to fit its widest row
+    rather than cutting "Temp. credentials", and only into the room the charts would share: at the
+    narrowest section that keeps the band on one row, the band still fits. Web transfers keeps its count
+    under its label, so that row does not widen the panel."""
+    def busy(route):
+        response = route.fetch()
+        body = response.json()
+        body.update(people=1234, sessions=1234, temporary_credentials=1234)
+        route.fulfill(response=response, json=body)
+
+    page.route(re.compile(r".*/activity/now(\?.*)?$"), busy)
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin)
+    open_activity(page)
+    temp = page.locator("#act-p-now .act-now-row").nth(2)
+    expect(temp.locator(".act-now-value")).to_contain_text("234")
+    assert page.evaluate(_NOW_CUT) == []
+    transfers = page.locator("#act-p-now .act-now-transfers")
+    label_box = transfers.locator(".act-now-label").bounding_box()
+    value_box = transfers.locator(".act-now-value").bounding_box()
+    assert value_box["y"] >= label_box["y"] + label_box["height"] - 1, "the transfer count sits under its label"
+
+    # The section's content box is what the band's container query measures; bring it to 980 px.
+    content = "() => { const s = document.querySelector('#activity-section'), cs = getComputedStyle(s); " \
+              "return s.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight); }"
+    page.set_viewport_size({"width": 1440 - round(page.evaluate(content) - 980), "height": 900})
+    expect(page.locator("#act-p-now")).to_be_visible()
+    assert abs(page.evaluate(content) - 980) <= 1
+    one_row = page.evaluate("""() => {
+        const band = document.querySelector('.act-band');
+        const tops = ['now', 'time', 'cat', 'signin', 'active']
+            .map((k) => document.querySelector('#act-p-' + k).getBoundingClientRect().top);
+        return {overflow: band.scrollWidth - band.clientWidth, rows: new Set(tops.map(Math.round)).size};
+    }""")
+    assert one_row == {"overflow": 0, "rows": 1}, one_row

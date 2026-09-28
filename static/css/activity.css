@@ -99,9 +99,13 @@
 
 /* ---- summary band ------------------------------------------------------------------------------ */
 
+/* Now is at least 136 px and grows, out of the space the charts would share, to fit its widest row: with
+   a two-digit count "Temp. credentials" needs about 146 px in Console and 142 px in Classic. Growing
+   takes only free space, so the minimums still sum to 972 px and the band stays one row from a 980 px
+   section. */
 .act-band {
     display: grid; position: relative; margin: 0 0 12px;
-    grid-template-columns: 136px minmax(276px, 2fr) minmax(208px, 1.3fr) minmax(160px, 1fr) minmax(192px, 1.4fr);
+    grid-template-columns: minmax(136px, max-content) minmax(276px, 2fr) minmax(208px, 1.3fr) minmax(160px, 1fr) minmax(192px, 1.4fr);
     grid-template-areas: "now time cat signin active";
     background: var(--surface-0); border: 1px solid var(--act-line); border-radius: var(--radius-md);
 }
@@ -146,11 +150,11 @@
 button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-decoration: underline; text-underline-offset: 2px; }
 .act-now-value { flex: none; color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
 .act-now-wait .act-now-label { color: var(--text-secondary); }
-/* "Web transfers" and its "2 / 8" do not fit the panel's width on one line: the value goes under it. */
-.act-now-row.act-now-transfers { flex-wrap: wrap; height: auto; }
+/* "Web transfers" and its "2 / 8" do not fit the panel's width on one line: the value always goes under
+   it, as the design draws it, so this row never widens the panel (the band sizes Now to its widest row). */
+.act-now-row.act-now-transfers { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; height: auto; }
 .act-now-transfers > span { line-height: var(--act-row-h); }
-.act-now-transfers .act-now-label { flex: none; }
-.act-now-transfers .act-now-value { margin-left: auto; }
+.act-now-transfers .act-now-value { justify-self: end; }
 .act-warn-icon { width: 11px; height: 11px; color: var(--warning); flex: none; }
 
 .act-pop {
