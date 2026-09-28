@@ -5497,7 +5497,7 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
         target_id, target_name = target.id, target.username
         detail = (f"{_earlier_changer(refused.last_change, requester_id)} already changed {target_name}'s "
                   f"sign-in details on {_cc_date(refused.last_change.applied_at)}. A second change within 14 "
-                  "days needs another administrator's approval, and there is no other active administrator. "
+                  "days needs another administrator's approval, and no other administrator may approve it. "
                   "The person who runs the server can make this change on the host with: "
                   "python dockvault.py accounts")
         db.rollback()   # the whole request is refused, so nothing it changed may be kept

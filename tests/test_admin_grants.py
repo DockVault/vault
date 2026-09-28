@@ -175,3 +175,23 @@ def test_the_approve_route_refuses_an_administrator_the_asker_made_and_records_i
     assert db.get(CredentialChange, change_id).status == cc.HELD
     rows = db.query(AuditLog).filter(AuditLog.action == "credential_change_approval_refused").all()
     assert len(rows) == 1 and rows[0].user_id == puppet.id and rows[0].details["reason"] == cc.MADE_BY_REQUESTER
+
+
+def test_the_refusal_of_a_second_change_says_no_other_administrator_may_approve(db):
+    """Alice is the only administrator but for one she made, who may not approve her change. The
+    refusal used to say there was no other ACTIVE administrator, which read as wrong beside the active
+    one on the Users page: it says that no other may approve."""
+    from fastapi import HTTPException
+    from app.core.models import AuditLog
+    AuditLog.__table__.create(db.get_bind())
+    alice, carol = _user(db, "alice"), _user(db, "carol", role=RoleEnum.USER)
+    puppet = _user(db, "puppet")
+    admin_grants.record(db, puppet.id, granted_by_id=alice.id, granted_by_name="alice")
+    cc.record_made(db, kind=cc.PASSWORD, target_id=carol.id, requester_id=alice.id, requester_name="alice")
+    db.commit()
+    with pytest.raises(HTTPException) as refused:
+        api._credential_change(db, alice, carol, cc.RESET_LINK, summary="s", payload={"delivery": "copy"})
+    assert refused.value.status_code == 409
+    detail = refused.value.detail
+    assert "no other administrator may approve it" in detail and "dockvault.py accounts" in detail, detail
+    assert "active" not in detail, detail

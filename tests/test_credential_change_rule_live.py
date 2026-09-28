@@ -275,7 +275,7 @@ def test_with_no_other_administrator_the_second_change_is_refused(admin, temp_us
             r = admin.post(f"/users/{temp_user['id']}/second-factor/reset")
         assert r.status_code == 409, r.text
         detail = r.json()["detail"]
-        assert "no other active administrator" in detail and "dockvault.py accounts" in detail
+        assert "no other administrator may approve it" in detail and "dockvault.py accounts" in detail
         assert psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id='{temp_user['id']}' "
                     "AND status='held'") == "0"
         rows = admin.get("/audit/log", params={"action": "credential_change_refused", "limit": 500}).json()
