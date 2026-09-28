@@ -235,6 +235,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("update_settings_updated", "administration", "Update check interval changed", "notice"),
     # Security and denials
     AuditAction("access_denied", "security", "Access denied", "warning"),
+    # Someone who is not an administrator, given the permission to manage users, reaching for an
+    # administrator's account (or one above their role): refused (app/core/account_authority.py).
+    AuditAction("account_change_refused_role", "security", "Change to a higher role's account refused",
+                "warning"),
     AuditAction("admin_access_denied", "security", "Admin-only action refused", "warning"),
     AuditAction("device_access_denied", "security", "Device management refused", "warning"),
     AuditAction("device_secret_reuse_revoke", "security", "Old device key reused, device revoked", "warning"),

@@ -6052,18 +6052,44 @@ def _expire_held_credential_changes(db) -> int:
     return len(due)
 
 
+def _refuse_change_above_caller(db, actor, target, *, what) -> None:
+    """Refuse with 403, and record, a change to ``target``'s account by a caller whose role is below
+    it: above all, someone who is not an administrator (a user given the permission to manage users)
+    acting on an administrator's account (app/core/account_authority.py). ``what`` names the change in
+    the record. Call it once the account has been found and before anything is changed."""
+    from app.core import account_authority
+    from app.core.net_utils import current_client_ip
+    reason = account_authority.refusal(actor, target)
+    if reason is None:
+        return
+    target_id, target_name = target.id, target.username
+    target_role = getattr(target.role, "value", target.role)
+    db.rollback()   # nothing the request did so far is kept
+    try:
+        AuditLogger(db).log_action(
+            action="account_change_refused_role", status="failure", user=actor,
+            resource_type="user", resource_id=str(target_id), ip_address=current_client_ip(),
+            details={"change": what, "target_username": target_name, "target_role": target_role,
+                     "reason": reason})
+    except Exception:  # noqa: BLE001 - the refusal stands without its row
+        db.rollback()
+    raise HTTPException(status_code=403, detail=account_authority.DETAILS[reason])
+
+
 @app.post("/users/{user_id}/send-reset-link")
 @require_endpoint_permission("USER_MANAGE")
 @require_step_up("admin.user.manage")
 async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
                                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Admin action: email a password-reset link to a user. Always available (independent of the public
-    self-service switch), interactive-admin only."""
+    """Email a password-reset link to a user. Always available (independent of the public self-service
+    switch). An administrator, or a user given the permission to manage users, who may not send one to
+    an administrator nor to anyone whose role is above theirs (_refuse_change_above_caller)."""
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not (user.email or "").strip():
         raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
     if not _smtp_configured(db):
@@ -6096,17 +6122,20 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
 @require_step_up("admin.user.manage")
 async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
                                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Admin action: MINT a password-reset link for a user and return it ONCE for the admin to copy — no
-    email required, so an email-less account can still be reset. The link carries a single-use,
-    hash-at-rest, TTL-bounded token identical to the emailed path; using it (POST /reset) atomically
-    consumes the token and revokes the target's sessions. Interactive-admin only; audited (the target +
-    TTL, never the token). This is a password-reset primitive, not a lockout change, so there is no
-    self-target / last-admin restriction (an admin can already reset/deactivate users they manage)."""
+    """MINT a password-reset link for a user and return it ONCE to copy — no email required, so an
+    email-less account can still be reset. The link carries a single-use, hash-at-rest, TTL-bounded
+    token identical to the emailed path; using it (POST /reset) atomically consumes the token and
+    revokes the target's sessions. Audited (the target + TTL, never the token). This is a
+    password-reset primitive, not a lockout change, so there is no self-target / last-admin restriction.
+    An administrator, or a user given the permission to manage users, who may not make one for an
+    administrator nor for anyone whose role is above theirs: whoever holds the link can take the account
+    (_refuse_change_above_caller)."""
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage users.")
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not getattr(user, "is_active", True):
         raise HTTPException(status_code=400,
                             detail="That account is inactive; reactivate it before issuing a reset link.")
@@ -10074,6 +10103,10 @@ async def update_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+    # Only an administrator reaches someone else's account here (the check above); this keeps it that
+    # way should that check ever widen (app/core/account_authority.py).
+    if not is_self:
+        _refuse_change_above_caller(db, current_user, user, what="update")
 
     # An administrator cannot change their own role, deactivate or lock themselves here, exactly as
     # the dedicated role, activate and lock endpoints refuse it, each with the same message. Undoing
@@ -10360,6 +10393,10 @@ def _ssh_key_target_user(user_id, current_user, db, *, write=False):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if write and not is_self:
+        # Only an administrator reaches someone else's keys (the check above); this keeps it that way
+        # should that check ever widen (app/core/account_authority.py).
+        _refuse_change_above_caller(db, current_user, user, what="ssh_key")
     return user
 
 
