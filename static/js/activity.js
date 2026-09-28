@@ -1732,7 +1732,7 @@
     function renderDetail() {
         if (!S.detailOpen) return;
         if (isNarrow()) renderPhoneDetail();
-        else renderPane();
+        else { renderPane(); fitOverlays(); }
     }
 
     // Draw the detail again, keeping the focus on the same control (Newer, Older) when it was in it.
@@ -3929,6 +3929,7 @@
             $('act-filter-panel').appendChild(content);
             $('act-filter-panel').hidden = false;
             btn.setAttribute('aria-expanded', 'true');
+            fitOverlays();
         }
         renderPanelState();
         const done = $('act-fp-done');
@@ -4517,6 +4518,33 @@
     // The page lays out by its own width (a container query), so a collapsed sidebar or Classic's wider
     // margins do not change which layout it uses.
 
+    // The detail pane and the filter popover are sized from where they start on the screen. Until the page
+    // scrolls them under the toolbar they start below the band, and a height counted from the navbar ran
+    // past the bottom of the window: the pane's footer and the popover's Done were cut off. The CSS takes
+    // the smaller of this and the height they have once stuck under the toolbar.
+    const FIT_GAP = 16, FIT_MIN = 240;
+    function fitFrom(node) {
+        const top = Math.max(0, Math.round(node.getBoundingClientRect().top));
+        return `max(${FIT_MIN}px, calc(100dvh - ${top}px - ${FIT_GAP}px))`;
+    }
+
+    function fitOverlays() {
+        const pane = $('act-detail');
+        if (S.detailOpen && !isNarrow() && pane && !pane.hidden) {
+            // The desktop pane is sticky itself; the tablet drawer's panel is the sticky part.
+            const sticky = getComputedStyle(pane).position === 'sticky' ? pane : pane.querySelector('.act-detail-inner');
+            if (sticky) pane.style.setProperty('--act-detail-fit', fitFrom(sticky));
+        }
+        const panel = $('act-filter-panel');
+        if (P.open && !P.staged && panel && !panel.hidden) panel.style.setProperty('--act-fp-fit', fitFrom(panel));
+    }
+
+    let fitFrame = 0;
+    function fitSoon() {
+        if (fitFrame || !S.active) return;
+        fitFrame = requestAnimationFrame(() => { fitFrame = 0; fitOverlays(); });
+    }
+
     function layoutFor(width) {
         if (width >= WIDE_MIN) return 'wide';
         if (width >= MEDIUM_MIN) return 'medium';
@@ -4531,6 +4559,7 @@
             const w = entries[0].contentRect.width;
             if (!w) return;
             fitDaySpans();
+            fitSoon();
             const next = layoutFor(w);
             if (next === S.layout) return;
             const was = S.layout;
@@ -4539,7 +4568,10 @@
         }).observe(section);
         new ResizeObserver(() => {
             section.style.setProperty('--act-toolbar-h', `${toolbar.offsetHeight}px`);
+            fitSoon();
         }).observe(toolbar);
+        // The band above the list changes height as it loads, moving where the pane starts.
+        new ResizeObserver(() => fitSoon()).observe($('act-band'));
     }
 
     function onLayoutChange(was) {
@@ -4585,7 +4617,9 @@
             const nav = document.querySelector('.navbar');
             const top = nav ? nav.getBoundingClientRect().bottom : 0;
             bar.classList.toggle('is-stuck', window.scrollY > 0 && bar.getBoundingClientRect().top <= top + 0.5);
+            fitSoon();
         }, { passive: true });
+        window.addEventListener('resize', () => fitSoon(), { passive: true });
         document.addEventListener('visibilitychange', () => {
             if (!S.active || S.blocked || !S.ready || document.hidden) return;
             if (!S.paused) {

@@ -315,3 +315,29 @@ def test_the_tablet_drawer_stays_on_screen_as_the_list_scrolls(page: Page, activ
     page.keyboard.press("j")
     expect(page.locator("#act-detail .act-d-pos")).to_have_text(re.compile(r"^3 of"))
     expect(page.locator("#act-detail .act-d-older")).to_be_in_viewport()
+
+
+@pytest.mark.parametrize("skin", ["v2", "v1"])
+def test_the_detail_and_the_filter_panel_end_inside_the_window(page: Page, activity_admin, skin):
+    """Opened before the page scrolls, the pane starts below the band and the filter popover below the
+    toolbar: each is sized from its own top, so the pane's footer and the popover's Done are on screen.
+    Once the page scrolls the pane under the toolbar it fills the window below it again."""
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin, width=1440, height=900)
+    open_activity(page)
+    rows(page).nth(2).click()
+    foot = page.locator("#act-detail .act-d-foot")
+    expect(foot).to_be_visible()
+    box = foot.bounding_box()
+    assert box["y"] + box["height"] <= 900, box
+    page.evaluate("() => window.scrollTo(0, 400)")
+    page.wait_for_function("() => { const r = document.querySelector('#act-detail .act-d-foot').getBoundingClientRect();"
+                           " return Math.abs(innerHeight - 16 - r.bottom) <= 2; }", timeout=5000)
+    page.keyboard.press("Escape")
+    page.evaluate("() => window.scrollTo(0, 0)")
+    page.click("#act-filter-btn")
+    done = page.locator("#act-fp-done")
+    expect(done).to_be_visible()
+    for sel in ("#act-filter-panel", "#act-fp-done"):
+        b = page.locator(sel).bounding_box()
+        assert b["y"] + b["height"] <= 900, (sel, b)

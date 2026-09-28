@@ -290,7 +290,9 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 /* The filter panel: a popover under Filter from a tablet up. */
 .act-filter-panel {
     position: absolute; top: calc(100% + 4px); left: 0; z-index: 40;
-    width: 520px; max-width: calc(100cqi - 8px); max-height: 70vh; overflow: auto;
+    width: 520px; max-width: calc(100cqi - 8px); overflow: auto;
+    /* --act-fp-fit is the room from the popover's own top to the bottom of the window (activity.js). */
+    max-height: min(70vh, var(--act-fp-fit, 70vh));
     background: var(--surface-0); border: 1px solid var(--act-line); border-radius: var(--radius-md); box-shadow: var(--shadow-lg);
 }
 .act-fp-content { display: flex; flex-direction: column; min-height: 100%; }
@@ -462,9 +464,12 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 
 /* ---- the detail -------------------------------------------------------------------------------- */
 
+/* Stuck under the toolbar, the pane fills the window below it. Before the page has scrolled it there it
+   starts lower, below the band, and --act-detail-fit (set by activity.js from the pane's own top) keeps
+   its footer inside the window. */
 .act-detail {
     position: sticky; top: calc(var(--navbar-height) + var(--act-toolbar-h, 44px) + 8px);
-    height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 24px);
+    height: min(calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 24px), var(--act-detail-fit, 100dvh));
     min-width: 0; align-self: start;
 }
 .act-detail-inner {
@@ -578,7 +583,7 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     .act-detail { position: absolute; top: 0; right: 0; bottom: 0; width: min(440px, 60%); height: auto; z-index: 25; align-self: stretch; }
     .act-detail-inner {
         position: sticky; top: calc(var(--navbar-height) + var(--act-toolbar-h, 44px));
-        height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 16px);
+        height: min(calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 16px), var(--act-detail-fit, 100dvh));
         border-radius: 0; border-width: 0 0 0 1px; box-shadow: var(--shadow-lg);
     }
 }
