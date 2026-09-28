@@ -107,9 +107,13 @@ def _wait_for_background_work(started_before, timeout=30.0):
     it exits. Give the ones this run started time to finish."""
     import threading
     import time
+    from app.core import audit_signal
     deadline = time.monotonic() + timeout
+    # The Activity page's signals for this run's audit rows go out first. Their publisher lives as long
+    # as the process, so it is flushed, never joined: a join would always wait out the whole timeout.
+    audit_signal.flush(min(timeout, 5.0))
     for t in threading.enumerate():
-        if t not in started_before and t is not threading.current_thread():
+        if t not in started_before and t is not threading.current_thread() and t.name != "audit-signal":
             t.join(max(0.0, deadline - time.monotonic()))
 
 

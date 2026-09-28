@@ -154,11 +154,25 @@ def _drain_batch(first) -> List[Tuple[str, str]]:
 
 def _run() -> None:
     while True:
+        batch = []
         try:
             batch = _drain_batch(_queue.get())
             _publish(message(batch))
         except Exception:  # noqa: BLE001 - the worker outlives any one failed publish
             logger.debug("audit signal publish failed", exc_info=True)
+        finally:
+            for _ in batch:
+                _queue.task_done()
+
+
+def flush(timeout: float) -> bool:
+    """Wait, at most `timeout` seconds, until every queued signal has been handed to Redis. For a
+    short-lived process (the host account tool), which would otherwise exit before they go out."""
+    import time
+    deadline = time.monotonic() + timeout
+    while _queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return not _queue.unfinished_tasks
 
 
 def _ensure_worker() -> None:
