@@ -313,3 +313,16 @@ def test_an_invitation_keeps_its_inviters_lineage_through_a_demotion_or_a_deleti
     # And the kept lineage never names the account itself, nor repeats anyone.
     admin_grants.record(db, alice.id, granted_by_id=p.id, granted_by_name="p", inherited=kept + [str(p.id)])
     assert admin_grants.of(db, [alice.id])[alice.id].lineage == [str(p.id)]
+
+
+def test_an_invitation_that_keeps_no_lineage_stores_null(db):
+    # A user's invitation keeps none: SQL NULL, not a JSON null, so "no lineage" reads the same way in
+    # the database as for an invitation made before the column existed.
+    import sqlalchemy as sa
+    from datetime import datetime
+    from app.core.models import AccountInvitation
+    AccountInvitation.__table__.create(db.get_bind())
+    db.add(AccountInvitation(username="plain", role="user", token_prefix="p", token_hash="h",
+                             expires_at=datetime(2030, 1, 1), inviter_lineage=None))
+    db.commit()
+    assert db.execute(sa.text("SELECT inviter_lineage IS NULL FROM account_invitations")).scalar() == 1

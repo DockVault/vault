@@ -1407,7 +1407,7 @@ class AccountInvitation(Base):
     # deleting the inviter before it is accepted cannot shorten it (app/core/admin_grants.py). NULL for
     # any other invitation, and for one made before this column existed. Added to existing deployments
     # by the lightweight migrations; a release that does not know it ignores it.
-    inviter_lineage = Column(JSON, nullable=True)
+    inviter_lineage = Column(JSON(none_as_null=True), nullable=True)   # None is stored as SQL NULL
 
     __table_args__ = (
         Index('idx_account_invitation_prefix', 'token_prefix'),
