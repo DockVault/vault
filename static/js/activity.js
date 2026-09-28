@@ -688,7 +688,12 @@
                 refused(new RequestError((data && data.detail) || 'Refused', 403, null));
                 return;
             }
-            if (!resp.ok) throw new Error(`the server answered ${resp.status}`);
+            if (!resp.ok) {
+                // Say the server's reason: an export it could not record in the audit log is refused (503).
+                let data = null;
+                try { data = await resp.json(); } catch (_) { /* no body */ }
+                throw new Error((data && typeof data.detail === 'string' && data.detail) || `the server answered ${resp.status}`);
+            }
             const totalHeader = resp.headers.get('X-Export-Total');
             const total = Number(totalHeader || 0);
             const rows = Number(resp.headers.get('X-Export-Rows') || 0);

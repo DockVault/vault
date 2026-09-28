@@ -128,6 +128,19 @@ def test_the_events_export_downloads_the_rows_that_match(page: Page, anon, activ
     expect(page.locator(".toast").last).to_contain_text("Exported 1 event")
 
 
+def test_an_export_the_server_refuses_says_why(page: Page, activity_admin):
+    """An export the server could not record in the audit log is refused (503): the page says the
+    server's reason rather than a bare status number. The refusal is served here."""
+    reason = "The export could not be recorded in the audit log, so it was not made. Try again shortly."
+    page.route("**/activity/export?*", lambda route: route.fulfill(status=503, json={"detail": reason}))
+    _login(page, activity_admin)
+    _open_activity(page)
+    expect(page.locator("#activity-rows tr.act-row").first).to_be_visible(timeout=15000)
+    page.click("#activity-export")
+    page.click('[data-activity-export="csv"]')
+    expect(page.locator(".toast").last).to_contain_text(f"Export failed: {reason}")
+
+
 def test_an_event_the_server_records_on_its_own_is_by_the_system(page: Page, activity_admin):
     """A file deleted at its expiry has no one behind it: the page says System, not Unknown, which
     stays for a row whose actor is simply not recorded. The events are served here, so the test does

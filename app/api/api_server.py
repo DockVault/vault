@@ -2932,7 +2932,8 @@ def activity_export(
 
     Streamed a batch at a time, each batch in its own short database session, so a large export neither
     holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
-    started, stops at activity_events.EXPORT_CAP rows (the last line says so), and is itself recorded."""
+    started, stops at activity_events.EXPORT_CAP rows (the last line says so), and is itself recorded
+    before a row is sent: when that record cannot be written the export is refused with 503."""
     from app.core import audit_range
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
@@ -2945,17 +2946,31 @@ def activity_export(
         no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
         temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date))
     total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
-    _audit_change(db, current_user, "audit_exported", "audit_log", None, {
-        "format": format, "rows": min(total, ev.EXPORT_CAP), "total": total,
-        # The filters that narrowed it: how a user was matched only when it was exactly.
-        "filters": {k: v for k, v in (("category", category), ("channel", channel), ("status", status),
-                                      ("action", action), ("user", user),
-                                      ("user_match", "exact" if user and user_match == "exact" else None),
-                                      ("no_account", no_account), ("ip", ip), ("q", q),
-                                      ("temp_credential_id", temp_credential_id),
-                                      ("temp_credential", temp_credential), ("vault_id", vault_id),
-                                      ("from_date", from_date), ("to_date", to_date)) if v},
-    })
+    # Recorded before a row is sent, and required: an export of up to EXPORT_CAP rows of personal data
+    # that left no trace would be a gap in the log's own account of who read it. So when the row cannot
+    # be written (the database refusing inserts, say) the export is refused, not sent unrecorded.
+    try:
+        AuditLogger(db).log_action(
+            action="audit_exported", status="success", user=current_user, resource_type="audit_log",
+            details={
+                "format": format, "rows": min(total, ev.EXPORT_CAP), "total": total,
+                # The filters that narrowed it: how a user was matched only when it was exactly.
+                "filters": {k: v for k, v in (("category", category), ("channel", channel), ("status", status),
+                                              ("action", action), ("user", user),
+                                              ("user_match", "exact" if user and user_match == "exact" else None),
+                                              ("no_account", no_account), ("ip", ip), ("q", q),
+                                              ("temp_credential_id", temp_credential_id),
+                                              ("temp_credential", temp_credential), ("vault_id", vault_id),
+                                              ("from_date", from_date), ("to_date", to_date)) if v},
+            })
+    except Exception as e:                                   # noqa: BLE001 - refused below, whatever it was
+        print(f"⚠ export refused: its audit row could not be written ({type(e).__name__})")
+        try:
+            db.rollback()
+        except Exception:                                    # noqa: BLE001
+            pass
+        raise HTTPException(status_code=503, detail=(
+            "The export could not be recorded in the audit log, so it was not made. Try again shortly."))
 
     def fetch(after):
         s = SessionLocal()
