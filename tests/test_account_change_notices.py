@@ -75,6 +75,27 @@ def test_an_email_change_is_told_to_the_old_address(sent):
     assert [m["email"] for m in sent["email"]] == ["old@example.com"]
 
 
+def test_the_email_to_the_old_address_masks_the_new_one_and_the_app_does_not(sent):
+    # The old mailbox may now be someone else's (a former employer, a recycled address), who should not
+    # learn the person's new address. The in-app notice, which only the person can read, keeps it.
+    api._notify_credential_change(None, cc.EMAIL, USER, {"old_email": "old@example.com",
+                                                         "new_email": "newname@example.org"}, by_name="alice")
+    (mail,) = sent["email"]
+    assert "n***@example.org" in mail["context"]["change"]
+    assert "newname" not in mail["context"]["change"]
+    assert "old@example.com" in mail["context"]["change"]
+    (row,) = sent["app"]
+    assert "to newname@example.org" in row["body"]
+
+
+@pytest.mark.parametrize("address,masked", [
+    ("newname@example.org", "n***@example.org"), ("x@y.z", "x***@y.z"), ("", "(none)"), (None, "(none)"),
+    ("no-at-sign", "***"),
+])
+def test_an_address_is_masked_to_its_first_letter_and_domain(address, masked):
+    assert api._mask_email(address) == masked
+
+
 def test_an_address_added_where_there_was_none_is_emailed_nowhere(sent):
     api._notify_credential_change(None, cc.EMAIL, USER, {"old_email": None, "new_email": "new@example.com"},
                                   by_name="alice")

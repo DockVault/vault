@@ -146,7 +146,9 @@ def test_an_email_change_is_told_to_the_old_address_only(admin, mail):
     try:
         assert admin.patch(f"/users/{user['id']}", json={"email": new}).status_code == 200
         message = mail_to(old, subject_contains="A change to your")
-        assert message and f"from {old} to {new}" in message["text"], message
+        # The old mailbox may be someone else's now: it is told the new address masked.
+        assert message and f"from {old} to {new[0]}***@example.com" in message["text"], message
+        assert new not in message["text"], message
         assert mail_to(new, subject_contains="A change to your", timeout=3) is None
     finally:
         admin.delete_user(user["id"])

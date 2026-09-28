@@ -5528,11 +5528,15 @@ def _actor_text(name) -> str:
     return "the server's operator, on the host" if name == cc.HOST_OPERATOR else (name or "an administrator")
 
 
-def _notify_account_change(db, user, *, ntype, title, change, by, email=None) -> None:
+def _notify_account_change(db, user, *, ntype, title, change, by, email=None, email_change=None) -> None:
     """Tell a user that an administrator changed their account: in the app, and by email when email is
     configured and there is an address (``email``, else the account's own; an email change passes the
     OLD address). Says what changed, when, by whom, and what to do if it was not expected. After the
-    commit; best-effort, it never undoes the change."""
+    commit; best-effort, it never undoes the change.
+
+    ``email_change`` is the sentence the email carries when it must say less than the in-app notice:
+    an email change is told to the old address, whose mailbox may now be someone else's, so the new
+    address is masked there."""
     when = _change_time_text()
     try:
         # No time in the text: the notice's own time is shown beside it, in the reader's zone. A second,
@@ -5546,13 +5550,26 @@ def _notify_account_change(db, user, *, ntype, title, change, by, email=None) ->
     try:
         _fire_action_email(db, "account_changed_by_admin",
                            email=email if email is not None else user.email, username=user.username,
-                           action_context={"change": change, "by": by, "when": when})
+                           action_context={"change": email_change if email_change is not None else change,
+                                           "by": by, "when": when})
     except Exception as e:  # noqa: BLE001
         print(f"⚠ account-change email skipped: {type(e).__name__}")
 
 
-def _credential_change_notice(kind, result, by_host=False):
-    """(title, sentence) for a credential change that was made, from what applying it returned."""
+def _mask_email(address) -> str:
+    """An address with all but the first letter of its local part hidden: n***@example.com."""
+    address = (address or "").strip()
+    if not address:
+        return "(none)"
+    local, at, domain = address.partition("@")
+    if not at:
+        return "***"
+    return f"{local[:1]}***@{domain}"
+
+
+def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=False):
+    """(title, sentence) for a credential change that was made, from what applying it returned. With
+    ``mask_new_email``, an email change names the new address masked (the email to the old address)."""
     from app.core import credential_changes as cc
     who = "The server's operator" if by_host else "An administrator"
     result = result or {}
@@ -5571,8 +5588,9 @@ def _credential_change_notice(kind, result, by_host=False):
                 "a new one, with your own password, at your next sign-in.")
     if kind == cc.EMAIL:
         old, new = result.get("old_email"), result.get("new_email")
+        shown = _mask_email(new) if mask_new_email else (new or "(none)")
         return ("Your email address was changed",
-                f"{who} changed your account's email address from {old or '(none)'} to {new or '(none)'}.")
+                f"{who} changed your account's email address from {old or '(none)'} to {shown}.")
     if kind == cc.SSH_KEY:
         key = result.get("ssh_key")
         name = getattr(key, "name", "") if key is not None else ""
@@ -5592,8 +5610,14 @@ def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=
     if approved_by:
         by += f", approved by {_actor_text(approved_by)}"
     old_email = (result or {}).get("old_email") if kind == cc.EMAIL else None
+    email_change = None
+    if kind == cc.EMAIL:
+        # The old mailbox may now belong to someone else (a former employer, a recycled address), who
+        # should not learn where the person went. The in-app notice keeps the address in full.
+        email_change = _credential_change_notice(kind, result, by_host=(by_name == cc.HOST_OPERATOR),
+                                                 mask_new_email=True)[1]
     _notify_account_change(db, target, ntype=ntype, title=title, change=change, by=by,
-                           email=(old_email or "") if kind == cc.EMAIL else None)
+                           email=(old_email or "") if kind == cc.EMAIL else None, email_change=email_change)
 
 
 def _notify_account_status_changes(db, user, *, by_name, locked=None, active=None, role=None,
