@@ -297,3 +297,33 @@ def test_a_request_for_an_unknown_id_is_not_found(admin):
 def test_a_user_cannot_see_or_decide_requests(temp_user_client):
     assert temp_user_client.get("/admin/credential-requests").status_code == 403
     assert temp_user_client.post(f"/admin/credential-requests/{uuid.uuid4()}/approve").status_code == 403
+
+
+def test_two_administrators_approving_at_once_apply_the_change_once(admin, temp_user, other_admin):
+    # Approving a held reset link mints the link, which commits part-way through the approval. Two
+    # approvals at the same moment must still make the change once: one is approved, the other is told
+    # the request was already decided.
+    import threading
+    requester, requester_client = other_admin
+    assert requester_client.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
+    with second_admin(admin) as (_third, third_client):
+        assert requester_client.post(f"/users/{temp_user['id']}/reset-link").status_code == 202
+        req = _request_for(requester_client, temp_user["id"])
+        start, answers = threading.Barrier(2), {}
+
+        def approve(name, client):
+            start.wait()
+            answers[name] = client.post(f"/admin/credential-requests/{req['id']}/approve")
+
+        threads = [threading.Thread(target=approve, args=(n, c)) for n, c in (("admin", admin), ("third", third_client))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        codes = sorted(r.status_code for r in answers.values())
+        assert codes == [200, 409], {n: (r.status_code, r.text[:200]) for n, r in answers.items()}
+        refused = next(r for r in answers.values() if r.status_code == 409)
+        assert "already" in refused.text
+    approvals = admin.get("/audit/log", params={"action": "credential_change_approved", "limit": 500}).json()
+    assert len([a for a in approvals if (a.get("details") or {}).get("change_id") == req["id"]]) == 1
+    assert psql(f"SELECT status FROM credential_changes WHERE id='{req['id']}'") == "approved"

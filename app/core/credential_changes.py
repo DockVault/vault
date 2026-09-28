@@ -210,6 +210,38 @@ def approve(change: CredentialChange, *, approver_id, approver_name, now: Option
     change.applied_at = now
 
 
+def claim_approval(db, change: CredentialChange, *, approver_id, approver_name,
+                   now: Optional[datetime] = None) -> bool:
+    """Mark a held request approved in ONE guarded statement, before anything is applied, in the
+    caller's transaction. Returns False, changing nothing, when the request is no longer held and open
+    in the database: another administrator (or the expiry sweep) decided it first.
+
+    Why a guarded statement and not the row lock alone: applying a reset link commits part-way (the
+    token is minted and committed on its own), which releases the lock the approval took. A second
+    approval waiting on that lock would then read the row, find it still held, and apply the change a
+    second time. Claimed here first, the row is already approved by the time anything commits, and only
+    one approval can ever match ``status = 'held'``."""
+    from sqlalchemy import null, or_, update
+    now = now or utcnow()
+    tbl = CredentialChange.__table__
+    claimed = db.execute(
+        update(tbl)
+        .where(tbl.c.id == change.id, tbl.c.status == HELD,
+               or_(tbl.c.expires_at.is_(None), tbl.c.expires_at > now))
+        .values(status=APPROVED, decided_by_id=approver_id, decided_by_name=approver_name,
+                decided_at=now, applied_at=now, payload=null())
+    ).rowcount
+    if claimed != 1:
+        return False
+    # The statement went straight to the table: bring the caller's copy into step without marking it
+    # changed.
+    from sqlalchemy.orm.attributes import set_committed_value
+    for key, value in (("status", APPROVED), ("decided_by_id", approver_id), ("decided_by_name", approver_name),
+                       ("decided_at", now), ("applied_at", now), ("payload", None)):
+        set_committed_value(change, key, value)
+    return True
+
+
 def deny(change: CredentialChange, *, decider_id, decider_name, now: Optional[datetime] = None) -> str:
     """Turn a held request down. The administrator who asked withdraws it; anyone else denies it.
     Returns the status set."""

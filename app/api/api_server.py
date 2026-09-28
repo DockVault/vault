@@ -10221,10 +10221,21 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
     from app.core import credential_changes as cc
     approver_id = approver.id if approver is not None else None
     approver_name = approver.username if approver is not None else cc.HOST_OPERATOR
-    kind, requested_by = change.kind, change.requested_by_name
-    result = _apply_credential_change(db, kind, target, change.payload, actor_id=change.requested_by_id,
-                                      actor_name=requested_by, request=request)
-    cc.approve(change, approver_id=approver_id, approver_name=approver_name)
+    kind, requested_by, requested_by_id = change.kind, change.requested_by_name, change.requested_by_id
+    payload = dict(change.payload or {})
+    # Claimed approved first, in one guarded statement: applying a reset link commits part-way, and a
+    # second approval waiting for this request must then find it decided, not apply it again.
+    if not cc.claim_approval(db, change, approver_id=approver_id, approver_name=approver_name):
+        db.rollback()
+        raise HTTPException(status_code=409, detail="That request was already decided, so nothing was changed.")
+    try:
+        result = _apply_credential_change(db, kind, target, payload, actor_id=requested_by_id,
+                                          actor_name=requested_by, request=request)
+    except Exception:
+        # Refused while applying (the address is in use, email is not set up): the request stays held.
+        # Rolled back here, because the host tool's session commits whatever is left when it ends.
+        db.rollback()
+        raise
     db.add(AuditLogger(db).build_row(
         action="credential_change_approved", status="success", user=approver,
         username=None if approver is not None else cc.HOST_OPERATOR,

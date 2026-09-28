@@ -272,6 +272,57 @@ def test_only_an_administrators_lock_ends_a_session():
     assert A.admin_locked(User(is_locked=False, locked_until=None)) is False
 
 
+def test_an_automatic_lock_does_not_stop_a_temporary_credential(Session, limits, monkeypatch):
+    # A temporary credential is its own sign-in, handed out by the account's owner. Wrong passwords for
+    # the account's password pause new password sign-ins only; an administrator's lock stops it too.
+    from app.core import temp_scope
+    from app.core.models import ActiveSession, TemporaryCredential
+    engine = Session.kw["bind"]
+    for model in (TemporaryCredential, ActiveSession):
+        model.__table__.create(engine)
+    monkeypatch.setattr(temp_scope, "attach_scope", lambda *a, **k: None)
+    uid = _add_user(Session)
+    for i in range(THRESHOLD * MULTIPLE):              # account-wide, and ATTACKER's own address
+        _fail(Session, uid, ATTACKER if i < THRESHOLD else f"203.0.113.{i}")
+    assert _lock(Session, uid, ATTACKER).scope == L.SCOPE_ACCOUNT
+    s = Session()
+    user = _user(s, uid)
+    user.is_locked, user.locked_until = True, _now() + timedelta(minutes=10)   # the older timed kind
+    s.commit()
+    s.close()
+
+    def credential(name):
+        s = Session()
+        s.add(TemporaryCredential(user_id=uid, temp_username=name, credential_hash=hash_password("one-time"),
+                                  expires_at=_now() + timedelta(hours=1),
+                                  deactivate_at=_now() + timedelta(hours=1)))
+        s.commit()
+        s.close()
+
+    def sign_in(name):
+        s = Session()
+        svc = A.AuthService(s)
+        svc._check_rate_limit = lambda *a, **k: None
+        svc._create_session = lambda *a, **k: "session-token"
+        try:
+            user, token = svc.authenticate_temporary_credential(name, "one-time", ATTACKER,
+                                                                allow_device_credential=False)
+            return user.id, token
+        finally:
+            s.close()
+
+    credential("temp_during_auto_lock")
+    assert sign_in("temp_during_auto_lock") == (uid, "session-token")
+
+    s = Session()
+    _user(s, uid).locked_until = None                    # now an administrator's lock
+    s.commit()
+    s.close()
+    credential("temp_during_admin_lock")
+    with pytest.raises(A.InvalidCredentialsError):
+        sign_in("temp_during_admin_lock")
+
+
 # --------------------------------------------------------------------------- ending a lock
 
 def test_an_expired_lock_is_released_with_its_scope_by_the_timer(Session, limits):

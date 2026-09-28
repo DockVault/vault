@@ -256,3 +256,78 @@ def test_the_periodic_cleanup_prunes_the_records():
     body = src[start:min(ends)]
     assert body.count(".prune_done(db)") == 1
     assert body.index("_expire_held_credential_changes(db)") < body.index(".prune_done(db)")
+
+
+def test_an_approved_change_opens_a_new_window_from_its_approval(db):
+    # A held change took effect when it was approved, so the 14 days run from then: a change asked for
+    # after the first one's window closed still waits, because the approved one opened another.
+    alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    first = _made(db, carol, alice, now=now - timedelta(days=13))
+    held = cc.hold(db, kind=cc.EMAIL, target_id=carol.id, requester_id=alice.id,
+                   requester_name=alice.username, summary="s", payload={"email": "x@example.com"},
+                   now=now - timedelta(days=2))
+    cc.approve(held, approver_id=bob.id, approver_name=bob.username, now=now - timedelta(days=1))
+    db.commit()
+    later = now + timedelta(days=5)          # 18 days after the first change, 6 after the approval
+    assert cc.window_ends(first) < later
+    assert cc.last_applied(db, carol.id, later).id == held.id
+    assert cc.decide(db, requester_id=bob.id, target_id=carol.id, now=later).id == held.id
+    assert cc.recent_by_account(db, [carol.id], later)[carol.id].id == held.id
+
+
+@pytest.fixture
+def two_sessions():
+    """Two sessions on one database: two administrators deciding at the same moment."""
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'race.db'}")
+        User.__table__.create(engine)
+        CredentialChange.__table__.create(engine)
+        factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        first, second = factory(), factory()
+        yield first, second
+        first.close()
+        second.close()
+        engine.dispose()
+
+
+def _held_in(session):
+    alice, bob, dave, carol = (_user(session, RoleEnum.ADMIN), _user(session, RoleEnum.ADMIN),
+                               _user(session, RoleEnum.ADMIN), _user(session))
+    held = cc.hold(session, kind=cc.RESET_LINK, target_id=carol.id, requester_id=alice.id,
+                   requester_name=alice.username, summary="s", payload={"delivery": "copy"})
+    session.commit()
+    return held.id, bob, dave
+
+
+def test_only_one_of_two_approvals_claims_a_request(two_sessions):
+    # Both read the request while it was held. The first claims it and commits (as minting a reset link
+    # does part-way through an approval); the second, holding its stale copy, claims nothing.
+    s1, s2 = two_sessions
+    change_id, bob, dave = _held_in(s1)
+    mine = s1.get(CredentialChange, change_id)
+    theirs = s2.get(CredentialChange, change_id)
+    assert mine.status == theirs.status == cc.HELD
+    assert cc.claim_approval(s1, mine, approver_id=bob.id, approver_name=bob.username) is True
+    assert (mine.status, mine.payload, mine.decided_by_name) == (cc.APPROVED, None, bob.username)
+    assert mine.applied_at is not None
+    s1.commit()
+    assert cc.claim_approval(s2, theirs, approver_id=dave.id, approver_name=dave.username) is False
+    s2.rollback()
+    row = s2.get(CredentialChange, change_id)
+    assert (row.status, row.decided_by_name) == (cc.APPROVED, bob.username)
+
+
+def test_an_expired_or_decided_request_cannot_be_claimed(db):
+    alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    old = cc.hold(db, kind=cc.PASSWORD, target_id=carol.id, requester_id=alice.id, requester_name=alice.username,
+                  summary="s", payload={"password_hash": "h"}, now=now - timedelta(days=8))
+    denied = cc.hold(db, kind=cc.PASSWORD, target_id=carol.id, requester_id=alice.id, requester_name=alice.username,
+                     summary="s", payload={"password_hash": "h"}, now=now)
+    cc.deny(denied, decider_id=bob.id, decider_name=bob.username, now=now)
+    db.commit()
+    assert cc.claim_approval(db, old, approver_id=bob.id, approver_name=bob.username, now=now) is False
+    assert cc.claim_approval(db, denied, approver_id=bob.id, approver_name=bob.username, now=now) is False
+    db.rollback()
+    assert (old.status, denied.status) == (cc.HELD, cc.DENIED)
