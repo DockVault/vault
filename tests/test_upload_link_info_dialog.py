@@ -156,3 +156,29 @@ def test_a_refused_retention_change_is_announced():
     assert out["page"] == [{"text": "Enter the number of days to keep uploads: a whole number, 1 or more.",
                             "role": "alert"}]
     assert out["server"] == [{"text": "The server says no.", "role": "alert"}]
+
+
+def test_the_retention_editor_says_only_what_applies_and_refuses_beside_the_field():
+    """A type with a longest retention says "At most N days." and nothing about keeping uploads, which it
+    does not offer; a type with none offers keeping and does not quote the server's ten-year cap. The
+    refusal sits right under the number, in the theme's own red."""
+    out = _run(f"""
+    const editor = (r) => {{
+        const els = all(infoModal(Object.assign(link(r), {{ max_total_bytes: 10 * {MB}, stored_bytes: 0 }})));
+        const byId = (id) => els.find(e => e.id === id);
+        const input = byId('rc-info-retention-days'), err = byId('rc-info-retention-error');
+        const group = els.find(e => e.className === 'form-group' && e.children.includes(input));
+        return {{ text: byId('rc-info-retention-editor').textContent,
+                 errAfterInput: group.children.indexOf(err) === group.children.indexOf(input) + 1,
+                 red: err.style.color, keep: !!byId('rc-info-retention-keep') }};
+    }};
+    out.capped = editor({{ retention_limit_days: 30, retention_may_keep: false }});
+    out.open = editor({{ retention_limit_days: 3650, retention_may_keep: true }});
+    """)
+    capped, open_ = out["capped"], out["open"]
+    assert "At most 30 days." in capped["text"] and "Keeping uploads" not in capped["text"]
+    assert capped["keep"] is False
+    assert "At most" not in open_["text"] and "3650" not in open_["text"]
+    assert "Keeping uploads removes the date" in open_["text"] and open_["keep"] is True
+    for e in (capped, open_):
+        assert e["errAfterInput"] is True and e["red"] == "var(--error)"

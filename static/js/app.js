@@ -20060,6 +20060,9 @@ function _rcRetentionText(r) {
 // again. DOM APIs only.
 function _rcRetentionEditor(r) {
     const limit = Number(r.retention_limit_days) > 0 ? Number(r.retention_limit_days) : null;
+    // Keeping uploads is offered only when the link's type sets no longest retention; then the only
+    // bound on the number is the server's own ten-year cap, which is not worth a line of help.
+    const mayKeep = !!r.retention_may_keep;
     const wrap = document.createElement('div'); wrap.className = 'rc-retention-editor mt-md'; wrap.id = 'rc-info-retention-editor'; wrap.hidden = true;
     const group = document.createElement('div'); group.className = 'form-group';
     const label = document.createElement('label'); label.htmlFor = 'rc-info-retention-days'; label.textContent = 'Delete uploads after (days)';
@@ -20067,12 +20070,20 @@ function _rcRetentionEditor(r) {
     input.min = '1'; input.step = '1'; input.inputMode = 'numeric'; input.style.maxWidth = '160px';
     if (limit) input.max = String(limit);
     if (Number(r.retention_days) > 0) input.value = String(r.retention_days);
-    const help = document.createElement('small'); help.className = 'form-help';
-    help.textContent = limit ? ('At most ' + limit + (limit === 1 ? ' day.' : ' days.')) : '';
-    group.appendChild(label); group.appendChild(input); group.appendChild(help);
+    // The refusal sits right under the field it is about. An alert, so a screen reader says it when it
+    // appears rather than leaving it to be found.
+    const err = document.createElement('p'); err.className = 'text-sm mt-sm'; err.id = 'rc-info-retention-error';
+    err.setAttribute('role', 'alert');
+    err.style.color = 'var(--error)'; err.hidden = true;
+    group.appendChild(label); group.appendChild(input); group.appendChild(err);
+    if (limit && !mayKeep) {
+        const help = document.createElement('small'); help.className = 'form-help';
+        help.textContent = 'At most ' + limit + (limit === 1 ? ' day.' : ' days.');
+        group.appendChild(help);
+    }
     wrap.appendChild(group);
     let keep = null;
-    if (r.retention_may_keep) {
+    if (mayKeep) {
         const kl = document.createElement('label'); kl.className = 'checkbox-label';
         keep = document.createElement('input'); keep.type = 'checkbox'; keep.id = 'rc-info-retention-keep';
         keep.checked = !(Number(r.retention_days) > 0);
@@ -20082,18 +20093,14 @@ function _rcRetentionEditor(r) {
         keep.addEventListener('change', sync); sync();
     }
     const note = document.createElement('p'); note.className = 'text-sm text-secondary mt-sm';
-    note.textContent = 'A new number of days applies to files that arrive from now on; files already here keep the date they were given. Keeping uploads removes the date from every file, including those.';
+    note.textContent = 'A new number of days applies to files that arrive from now on; files already here keep the date they were given.'
+        + (mayKeep ? ' Keeping uploads removes the date from every file, including those.' : '');
     wrap.appendChild(note);
     if (!fileExpiryEnforced()) {
         const off = document.createElement('p'); off.className = 'text-sm text-warning mt-sm';
         off.textContent = 'File expiry is switched off on this server, so no files are being deleted. Deadlines are still recorded, and files past theirs will be deleted if it is switched back on.';
         wrap.appendChild(off);
     }
-    const err = document.createElement('p'); err.className = 'text-sm mt-sm'; err.id = 'rc-info-retention-error';
-    // An alert, so a screen reader says the refusal when it appears rather than leaving it to be found.
-    err.setAttribute('role', 'alert');
-    err.style.color = 'var(--danger,#dc2626)'; err.hidden = true;
-    wrap.appendChild(err);
     const actions = document.createElement('div'); actions.className = 'flex gap-sm mt-sm';
     const save = _el('button', 'btn btn-primary btn-sm', 'Save'); save.type = 'button'; save.id = 'rc-info-retention-save';
     const cancel = _el('button', 'btn btn-secondary btn-sm', 'Cancel'); cancel.type = 'button';
