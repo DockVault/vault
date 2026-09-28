@@ -333,7 +333,9 @@ class Settings(BaseSettings):
     # that refuse new sign-ins from everywhere, as a multiple of rate_limit_login_attempts (the
     # per-address limit). 4 with the default 5 = 20 a day; the count loses one every 24 h / 20 = 72
     # minutes, and while it is full each further failure pauses sign-ins again (see
-    # app/core/sign_in_lockout.py). The answer to many addresses guessing at once.
+    # app/core/sign_in_lockout.py). The answer to many addresses guessing at once: each attempt is
+    # counted before its password is checked, so no more than this many are checked a day. Its cost,
+    # accepted: one failure every 72 minutes keeps new sign-ins to the account paused for everyone.
     account_lockout_backstop_multiplier: int = Field(default=4)
     # Trust X-Forwarded-For ONLY when the immediate peer is one of these networks (CIDR /
     # bare IP, comma-separated). Empty (the default) => trust NO proxy: XFF is ignored and the
