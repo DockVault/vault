@@ -23,7 +23,8 @@ JS = (ROOT / "static" / "js" / "activity.js").read_text(encoding="utf-8")
 
 def _fn(name: str) -> str:
     """One function of the page, verbatim: a one-line body, or up to its closing brace."""
-    start = JS.index(f"\n    function {name}(") + 1
+    head = f"\n    async function {name}(" if f"\n    async function {name}(" in JS else f"\n    function {name}("
+    start = JS.index(head) + 1
     line = JS[start:JS.index("\n", start)]
     if line.rstrip().endswith("}") and line.count("{") == line.count("}"):
         return line + "\n"
@@ -317,3 +318,25 @@ console.log(JSON.stringify(['24h', '7d', '30d'].map((k) => presetStart(k, now).t
 def test_the_chart_ceiling_is_a_round_number():
     out = _node(_fn("niceCeil") + "console.log(JSON.stringify([0, 1, 2, 3, 7, 10, 11, 312, 999, 1001].map(niceCeil)));")
     assert out == [1, 1, 2, 5, 10, 10, 20, 500, 1000, 2000]
+
+
+def test_a_vault_list_that_arrives_after_a_sign_out_is_dropped():
+    """The list is read with the session that asked. If that person signs out and someone else signs in
+    on the same tab before it arrives, it must not become the next person's list: a vault chip is named
+    from it."""
+    out = _node(_fn("vaultList") + """
+let answer;
+const apiRequest = () => new Promise((resolve) => { answer = resolve; });
+let S = { vaultList: null };
+(async () => {
+  const pending = vaultList();
+  S = { vaultList: null };                      // signed out, and the next person's page began
+  answer([{ id: 'v1', name: 'Payroll' }]);
+  const got = await pending;
+  const again = vaultList();
+  answer([{ id: 'v2', name: 'Mine' }]);
+  const own = (await again).map((v) => v.name);
+  console.log(JSON.stringify({ got, kept: S.vaultList && S.vaultList.map((v) => v.name), own }));
+})();
+""")
+    assert out == {"got": [], "kept": ["Mine"], "own": ["Mine"]}

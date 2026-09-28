@@ -3819,15 +3819,21 @@
         return false;
     }
 
+    // This viewer's vaults. A list that comes back after a sign-out belongs to the person who asked, not
+    // to whoever signed in since, so it is dropped.
     async function vaultList() {
         if (S.vaultList) return S.vaultList;
+        const asked = S;
+        let list = [];
         try {
             const all = await apiRequest('/vaults', { silent: true });
-            S.vaultList = (Array.isArray(all) ? all : []).filter((v) => !v.is_receiver);
             const mine = (typeof state !== 'undefined' && state.allVaults) || [];
-            S.vaultList = S.vaultList.map((v) => mine.find((m) => String(m.id) === String(v.id)) || v);
-        } catch (_) { S.vaultList = []; }
-        return S.vaultList;
+            list = (Array.isArray(all) ? all : []).filter((v) => !v.is_receiver)
+                .map((v) => mine.find((m) => String(m.id) === String(v.id)) || v);
+        } catch (_) { list = []; }
+        if (asked !== S) return [];
+        S.vaultList = list;
+        return list;
     }
 
     // Draw the panel's controls from the state (or, on a phone, the staged draft).
