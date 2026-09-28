@@ -458,6 +458,8 @@ def test_a_sign_in_after_the_lock_ran_out_releases_it_and_succeeds(Session, limi
     s.query(SignInLockout).update({"locked_until": _now() - timedelta(seconds=1)})
     s.commit()
     s.close()
+    # A pause ends only once its count has lost a failure (_pause_until), so the count has room again.
+    _age_account_count(Session, uid, INTERVAL)
     user, token = _sign_in(Session, uid, HOME)
     assert token == "session-token"
     released = _audit(Session, L.AUTO_UNLOCKED_ACTION)
@@ -692,3 +694,242 @@ def test_with_both_locks_in_force_both_answer_with_the_account_wide_one(clocked)
     seen = _both(clocked, steps)
     assert seen["real-person"] == seen["nobody-here"], seen
     assert seen["real-person"][-1][0] == "account"
+
+
+# --------------------------------------------------------------------------- counted before the check
+#
+# Each attempt takes one failure on both counts before its password is checked, under the account-wide
+# row's lock, and gives it back when the password was right. Counted after the check, every attempt in
+# flight while the count was below the backstop had its password checked: through SFTP's parallel
+# connections, about 2,000 guesses a day instead of the backstop's 20.
+
+def _counts(Session, uid):
+    s = Session()
+    try:
+        return {r.source: r.failed_attempts for r in s.query(SignInLockout).filter(SignInLockout.user_id == uid)}
+    finally:
+        s.close()
+
+
+def _slow_checks(monkeypatch, seconds=0.6):
+    """verify_password, slow enough that every attempt of a burst is in flight at once, recording each
+    hash it was asked to check. Always wrong: a guess."""
+    import threading
+    import time
+    checked, lock = [], threading.Lock()
+
+    def verify(password, password_hash):
+        with lock:
+            checked.append(password_hash)
+        time.sleep(seconds)
+        return False
+
+    monkeypatch.setattr(A, "verify_password", verify)
+    return checked
+
+
+def _burst(Session, name, addresses):
+    """Sign-in attempts by ``name``, one from each address, all at once, each on its own session and
+    thread as the web and SFTP servers run them. Returns how each ended: "wrong" (its password was
+    checked) or the refusal's scope (refused unchecked)."""
+    import threading
+    start, outcomes, lock = threading.Barrier(len(addresses)), [], threading.Lock()
+
+    def attempt(address):
+        s = Session()
+        svc = A.AuthService(s)
+        svc._check_rate_limit = lambda *a, **k: None
+        start.wait()
+        try:
+            svc.authenticate_user(name, "a-guess", address)
+            seen = "signed in"
+        except A.AccountLockedError as e:
+            seen = e.scope
+        except A.InvalidCredentialsError:
+            seen = "wrong"
+        finally:
+            s.close()
+        with lock:
+            outcomes.append(seen)
+
+    threads = [threading.Thread(target=attempt, args=(a,)) for a in addresses]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert len(outcomes) == len(addresses), "an attempt did not finish"
+    return sorted(outcomes)
+
+
+BURST = [f"203.0.113.{i}" for i in range(1, 17)]        # 16 addresses, one attempt each, all at once
+
+
+def test_a_burst_from_many_addresses_gets_no_more_checks_than_the_backstop(Session, limits, monkeypatch):
+    # The review's concurrency finding: every attempt already past the lock check when the count was
+    # below the backstop had its password checked, however many there were.
+    uid = _add_user(Session, username="real-person")
+    checked = _slow_checks(monkeypatch)
+    seen = _burst(Session, "real-person", BURST)
+    backstop = THRESHOLD * MULTIPLE
+    assert len(checked) == backstop, f"{len(checked)} passwords checked, the backstop is {backstop}"
+    assert seen == ["account"] * (len(BURST) - backstop) + ["wrong"] * backstop, seen
+    assert _counts(Session, uid)[L.ACCOUNT_WIDE] == backstop
+    assert _lock(Session, uid, HOME).scope == L.SCOPE_ACCOUNT, "the failures armed the pause"
+    s = Session()
+    assert _user(s, uid).failed_login_attempts == backstop, "only a checked password is a failure"
+    s.close()
+
+
+def test_a_burst_from_one_address_gets_no_more_checks_than_the_login_limit(Session, limits, monkeypatch):
+    uid = _add_user(Session, username="real-person")
+    checked = _slow_checks(monkeypatch)
+    seen = _burst(Session, "real-person", [ATTACKER] * 8)
+    assert len(checked) == THRESHOLD, checked
+    assert seen == ["address"] * (8 - THRESHOLD) + ["wrong"] * THRESHOLD, seen
+    assert _counts(Session, uid) == {ATTACKER: THRESHOLD, L.ACCOUNT_WIDE: THRESHOLD}
+
+
+def test_a_name_that_is_no_account_meets_the_same_budget_in_a_burst(Session, limits, monkeypatch):
+    # Being refused must not tell an account from a name that is none, at once as one by one.
+    import threading
+
+    class _HeldStore(_FakeStore):
+        """The fake cache, with the hold the real one takes on a name: a lock per key. A read takes a
+        little while, as a round trip to the cache does, so attempts at once interleave unless held."""
+
+        def __init__(self, clock):
+            super().__init__(clock)
+            self.locks, self.guard = {}, threading.Lock()
+
+        def get(self, key):
+            import time
+            time.sleep(0.005)
+            return super().get(key)
+
+        def hold(self, key):
+            with self.guard:
+                lock = self.locks.setdefault(key, threading.Lock())
+            lock.acquire()
+            return "token"
+
+        def release(self, key, token):
+            self.locks[key].release()
+
+    clock = _Clock()
+    store = _HeldStore(clock)
+    monkeypatch.setattr(L, "_phantom_store", lambda: store)
+    _add_user(Session, username="real-person")
+    _slow_checks(monkeypatch, seconds=0.4)
+    real = _burst(Session, "real-person", BURST)
+    nobody = _burst(Session, "nobody-here", BURST)
+    assert real == nobody, (real, nobody)
+    assert nobody.count("wrong") == THRESHOLD * MULTIPLE
+
+
+def test_a_right_password_gives_back_what_its_attempt_counted(Session, limits):
+    uid = _add_user(Session)
+    _fail(Session, uid, ATTACKER)
+    _fail(Session, uid, ATTACKER)
+    before = _counts(Session, uid)
+    _sign_in(Session, uid, HOME)
+    after = _counts(Session, uid)
+    assert after[L.ACCOUNT_WIDE] == before[L.ACCOUNT_WIDE] == 2, (before, after)
+    assert HOME not in after or after[HOME] == 0, after
+    # A right password for an account that may not sign in is not a guess either: given back too.
+    s = Session()
+    _user(s, uid).is_active = False
+    s.commit()
+    s.close()
+    with pytest.raises(A.InvalidCredentialsError):
+        _sign_in(Session, uid, CAFE)
+    after = _counts(Session, uid)
+    assert after[L.ACCOUNT_WIDE] == 2 and after.get(CAFE, 0) == 0, after
+
+
+def test_a_full_count_with_attempts_still_being_checked_refuses_unchecked(Session, limits, monkeypatch):
+    # Room is decided by the count, attempts in flight included, not only by a lock in force: until the
+    # attempts being checked fail (and arm the lock) or succeed (and give theirs back), nobody else's
+    # password is checked.
+    uid = _add_user(Session)
+    for i in range(THRESHOLD * MULTIPLE):
+        s = Session()
+        assert L.reserve(s, _user(s, uid), f"203.0.113.{i}") is None
+        s.commit()
+        s.close()
+    assert _lock(Session, uid, HOME) is None, "nothing armed yet: those attempts are still being checked"
+    checked = []
+    monkeypatch.setattr(A, "verify_password", lambda pw, h: checked.append(pw) or True)
+    with pytest.raises(A.AccountLockedError) as refused:
+        _sign_in(Session, uid, HOME)
+    assert refused.value.scope == "account" and refused.value.locked_until is not None
+    assert checked == [], "refused before its password was checked"
+    # One of them turns out right and gives its failure back: there is room again.
+    s = Session()
+    L.give_back(s, uid, "203.0.113.0")
+    s.commit()
+    s.close()
+    assert _sign_in(Session, uid, HOME)[1] == "session-token"
+
+
+def test_an_administrators_locked_account_is_counted_too(Session, limits, monkeypatch):
+    # It arms no lock of its own, but its attempts are still bounded: a right password there answers
+    # differently from a wrong one, so unlimited checks would be unlimited guessing.
+    uid = _add_user(Session, is_locked=True, locked_until=None)
+    checked = _slow_checks(monkeypatch, seconds=0)
+    seen = []
+    for i in range(THRESHOLD * MULTIPLE + 2):
+        try:
+            _sign_in(Session, uid, f"203.0.113.{i}", password="a-guess")
+        except A.AccountLockedError as e:
+            seen.append(e.scope)
+        except A.InvalidCredentialsError:
+            seen.append("wrong")
+    assert len(checked) == THRESHOLD * MULTIPLE
+    assert seen == ["wrong"] * (THRESHOLD * MULTIPLE) + ["account"] * 2, seen
+    assert _audit(Session, L.AUTO_LOCKED_ACTION) == [], "no automatic lock on top of an administrator's"
+
+
+def test_the_cache_hold_lets_one_attempt_at_a_time_and_fails_open(monkeypatch):
+    import threading
+    from app.core import database, redis_guard
+
+    class _Redis:
+        def __init__(self):
+            self.values, self.guard = {}, threading.Lock()
+
+        def set(self, key, value, nx=False, px=None, ex=None):
+            with self.guard:
+                if nx and key in self.values:
+                    return None
+                self.values[key] = value
+                return True
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    fake = _Redis()
+    monkeypatch.setattr(database, "redis_client", fake)
+    monkeypatch.setattr(redis_guard, "_guard_open_until", 0.0)
+    store = L._CacheStore()
+    monkeypatch.setattr(L._CacheStore, "WAIT_SECONDS", 0.05)
+    token = store.hold("k")
+    assert token and fake.values["k"] == token
+    assert store.hold("k") is None, "a second attempt waits, then goes ahead without the hold"
+    store.release("k", "not-the-token")
+    assert fake.values["k"] == token, "only the holder lets go"
+    store.release("k", token)
+    assert "k" not in fake.values
+    assert store.hold("k") is not None
+
+    class _Broken:
+        def set(self, *a, **k):
+            raise ConnectionError("down")
+
+    monkeypatch.setattr(database, "redis_client", _Broken())
+    try:
+        assert store.hold("k") is None, "the cache down: no hold, and the attempt goes ahead"
+    finally:
+        redis_guard.guard_record_success()      # leave the shared guard as it was found

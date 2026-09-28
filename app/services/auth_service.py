@@ -534,9 +534,10 @@ class AuthService:
 
         if not user:
             # A name that is no account is refused at the same point an account's automatic lock
-            # would refuse it (counted in the cache), so being refused never tells whether an
-            # account exists.
-            phantom = sign_in_lockout.phantom_lock(username, ip_address)
+            # would refuse it, and counted before the stand-in check as an account's attempt is
+            # (both in the cache, one attempt after another), so being refused never tells whether an
+            # account exists, however many attempts arrive at once.
+            phantom = sign_in_lockout.phantom_reserve(username, ip_address)
             if phantom is not None:
                 raise AccountLockedError(_LOCK_REASONS[phantom.scope], locked_until=phantom.locked_until,
                                          scope=phantom.scope)
@@ -544,7 +545,6 @@ class AuthService:
             # distinguishable by response time (username-enumeration oracle).
             verify_password(password, _DUMMY_PASSWORD_HASH)
             self._record_failed_login(username, ip_address)
-            sign_in_lockout.phantom_failure(username, ip_address)
             raise InvalidCredentialsError("Invalid username or password")
 
         # Automatic locks whose time has run out end here, recorded with this sign-in's address:
@@ -563,13 +563,30 @@ class AuthService:
             raise AccountLockedError(_LOCK_REASONS[lock.scope], locked_until=lock.locked_until,
                                      scope=lock.scope)
 
+        # The attempt is counted as a failure BEFORE its password is checked, and committed at once:
+        # the next attempt, from anywhere, sees it, and the account-wide count's row lock is let go
+        # before the slow check. An attempt that finds no room left is refused unchecked. So however
+        # many arrive at once, over the web and SFTP together, no more passwords are checked than the
+        # backstop allows in about 24 hours (app/core/sign_in_lockout.py). Counted after the check,
+        # every attempt in flight while the count was below the backstop had its password checked.
+        lock = sign_in_lockout.reserve(self.db, user, ip_address)
+        self.db.commit()
+        if lock is not None:
+            raise AccountLockedError(_LOCK_REASONS[lock.scope], locked_until=lock.locked_until,
+                                     scope=lock.scope)
+
         # Verify the password FIRST, before any account-state branch, so a caller who does
         # NOT present valid credentials cannot distinguish existing/active/locked/deactivated
         # accounts by response body or timing. Every non-success outcome returns the
         # SAME generic message to the caller; the specific reason stays in the audit log only.
         if not verify_password(password, user.password_hash):
-            self._record_failed_login(username, ip_address, user)
+            self._record_failed_login(username, ip_address, user, counted=True)
             raise InvalidCredentialsError("Invalid username or password")
+
+        # The password was right: the failure counted for it is given back at once, whatever the
+        # account's state decides below, since a right password is never a guess.
+        sign_in_lockout.give_back(self.db, user.id, ip_address)
+        self.db.commit()
 
         # Credentials are valid — now enforce account state. (The distinct exception type is
         # for audit / internal handling; the endpoint surfaces a generic message.)
@@ -2166,9 +2183,12 @@ class AuthService:
         self,
         identifier: str,
         ip_address: str,
-        user: Optional[User] = None
+        user: Optional[User] = None,
+        *,
+        counted: bool = False,
     ):
-        """Record a failed login attempt."""
+        """Record a failed login attempt. ``counted``: the attempt was already counted toward the locks
+        before its password was checked (sign_in_lockout.reserve), so only the locks are armed here."""
         # Note: Rate limiting is handled by the RateLimiter class in _check_rate_limit
         # which uses sorted sets for sliding window algorithm.
         # We don't need to manually increment Redis counters here.
@@ -2196,8 +2216,12 @@ class AuthService:
             # arms its lock at its limit and records account_auto_locked with the scope, in this
             # transaction (app/core/sign_in_lockout.py). Neither touches users.is_locked, which is
             # an administrator's alone, so sessions already signed in carry on. An account an
-            # administrator locked is out of use already, and gains no automatic lock on top.
+            # administrator locked is out of use already, and gains no automatic lock on top (its
+            # attempts are still counted before the check, so they are bounded all the same).
             if not admin_locked(user):
-                sign_in_lockout.record_failure(self.db, user, ip_address)
+                if counted:
+                    sign_in_lockout.arm_after_failure(self.db, user, ip_address)
+                else:
+                    sign_in_lockout.record_failure(self.db, user, ip_address)
 
             self.db.commit()

@@ -59,6 +59,7 @@ _REGISTRY = {
     },
     "core/sign_in_lockout.py": {                 # a name that is no account, counted like an account:
         "get": ("D", 1), "set": ("D", 1),        # _CacheStore, behind the read-through guard, fails open
+        "hold": ("D", 1), "release": ("D", 2),   # one attempt at a time per name: guarded, fails open
     },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated

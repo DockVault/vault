@@ -19,6 +19,21 @@ Counting, on every wrong password for an account:
     5-minute login window instead, guessers using four or more addresses could go on for ever without
     arming it: some 5,500 guesses a day.)
 
+Each attempt is counted BEFORE its password is checked (reserve): it takes one failure on both counts,
+under the account-wide row's lock, and gives it back if the password was right (give_back). An attempt
+that finds a count already at its limit, attempts still being checked included, is refused without its
+password being checked. So however many attempts arrive at once, from however many addresses, through
+the web and SFTP together, no more than the backstop number of passwords are checked for an account in
+about 24 hours, nor more than the login limit from one address before its lock. (Counted after the
+check, every attempt in flight while the count was below the backstop had its password checked: SFTP's
+parallel connections alone came to about 2,000 guesses a day.) The locks themselves are armed after a
+wrong password (arm_after_failure), so a right one never records a lock it did not cause.
+
+The cost of the budget, accepted: one failed sign-in about every 24 h / backstop (72 minutes by
+default) is enough to keep new sign-ins to an account paused for everyone, its owner included. Sessions
+already signed in, devices and temporary credentials keep working throughout, and an administrator's
+unlock clears the pause.
+
 What a lock does, and does not do:
   * it refuses new sign-ins (a web password, an SFTP password, an SFTP key) BEFORE the password is
     checked, so while it lasts nobody can go on guessing from where it applies;
@@ -30,9 +45,10 @@ What a lock does, and does not do:
     with its scope (the address, or account-wide). An administrator's unlock clears it at once.
 
 Names that are no account are counted the same way in the cache (the "phantom" functions), with the
-same counts and the same lock timing, so being refused, and for how long, tells nobody whether an
-account by that name exists. That mimicry fails open: while the cache is down, an unknown name is
-simply never refused by it.
+same counts and the same lock timing, before the stand-in password check and one attempt after another
+(phantom_reserve), so being refused, and for how long, tells nobody whether an account by that name
+exists, however many attempts arrive at once. That mimicry fails open: while the cache is down, an
+unknown name is simply never refused by it.
 
 Nothing here commits: the caller's transaction carries each count, lock and audit row.
 """
@@ -134,19 +150,25 @@ def decayed(count, since, limit, now):
     return count - lost, since + timedelta(seconds=lost * interval)
 
 
+def _account_row(db, user_id, now) -> SignInLockout:
+    """The account-wide count's row, made at nought if there is none, taken FOR UPDATE: every attempt on
+    one account, from any address, queues on it, so they are counted one after another."""
+    tbl = SignInLockout.__table__
+    db.execute(_insert(db)(tbl).values(id=uuid.uuid4(), user_id=user_id, source=ACCOUNT_WIDE, failed_attempts=0,
+                                       window_start=now, last_failure_at=now)
+               .on_conflict_do_nothing(index_elements=[tbl.c.user_id, tbl.c.source]))
+    return (db.query(SignInLockout)
+            .filter(SignInLockout.user_id == user_id, SignInLockout.source == ACCOUNT_WIDE)
+            .with_for_update().populate_existing().one())
+
+
 def _count_account_wide(db, user_id, limit, now) -> SignInLockout:
     """Add one failure to the account-wide count, after what it lost since the last one (decayed), and
     return its row. The count never goes past ``limit``, so once a lock it armed has ended it falls
     below the limit again one interval later. The row is taken FOR UPDATE, so failures from many
     addresses at once are counted one after another. window_start is the moment the count last lost a
     failure, or started."""
-    tbl = SignInLockout.__table__
-    db.execute(_insert(db)(tbl).values(id=uuid.uuid4(), user_id=user_id, source=ACCOUNT_WIDE, failed_attempts=0,
-                                       window_start=now, last_failure_at=now)
-               .on_conflict_do_nothing(index_elements=[tbl.c.user_id, tbl.c.source]))
-    row = (db.query(SignInLockout)
-           .filter(SignInLockout.user_id == user_id, SignInLockout.source == ACCOUNT_WIDE)
-           .with_for_update().populate_existing().one())
+    row = _account_row(db, user_id, now)
     count, since = decayed(row.failed_attempts, row.window_start, limit, now)
     row.failed_attempts = min(int(limit), count + 1)
     row.window_start = since
@@ -166,20 +188,19 @@ def _audit_row(db, action, user, ip_address, details):
         resource_type="user", resource_id=str(user.id), ip_address=ip_address, details=details)
 
 
-def record_failure(db, user, address, *, now=None) -> list:
-    """Count one wrong password for ``user`` from ``address``, against the address and the account.
-    A count that reaches its limit arms that lock and records account_auto_locked, in the caller's
-    transaction. Returns the locks this failure armed."""
-    threshold, backstop, _window, minutes = limits()
-    now = now or utcnow()
-    until = now + timedelta(minutes=minutes) if minutes > 0 else None
-    armed = []
-    source = source_of(address)
-    # Both counts first, the audit rows after: the rows are added to the caller's transaction and
-    # written by its commit, with nothing flushed ahead of it.
-    row = _count(db, user.id, source, now)
-    account = _count_account_wide(db, user.id, backstop, now)
+def _pause_until(until, since, backstop):
+    """When an account-wide pause armed now ends: the lockout duration, or until the count has lost a
+    failure if that is later. A pause that ended while the count was still full would let one more guess
+    through every lockout duration (96 a day with the defaults) instead of one every 24 h / backstop.
+    None: no end (a lockout duration of 0)."""
+    return None if until is None else max(until, since + account_interval(backstop))
 
+
+def _arm(db, user, address, source, row, account, *, threshold, backstop, until, now) -> list:
+    """Arm the locks whose counts have reached their limit and are not already in force, recording
+    account_auto_locked for each. ``row`` is the address's count (None: none), ``account`` the
+    account-wide row with its count already decayed. Returns the locks armed."""
+    armed = []
     if row is not None and row.failed_attempts >= threshold and not _in_force(row.locked_at, row.locked_until, now):
         tbl = SignInLockout.__table__
         db.execute(update(tbl).where(tbl.c.id == row.id).values(locked_at=now, locked_until=until))
@@ -189,16 +210,107 @@ def record_failure(db, user, address, *, now=None) -> list:
         armed.append(Lock(SCOPE_ADDRESS, until, source))
 
     if account.failed_attempts >= backstop and not _in_force(account.locked_at, account.locked_until, now):
-        # The pause lasts the lockout duration, or until the count has lost a failure if that is later:
-        # a pause that ended while the count was still full would let one more guess through every
-        # lockout duration (96 a day with the defaults) instead of one every 24 h / backstop.
-        account_until = None if until is None else max(until, account.window_start + account_interval(backstop))
+        account_until = _pause_until(until, account.window_start, backstop)
         account.locked_at, account.locked_until = now, account_until
         db.add(_audit_row(db, AUTO_LOCKED_ACTION, user, address, {
             "scope": SCOPE_ACCOUNT, "failed_attempts": account.failed_attempts,
             "locked_until": account_until.isoformat() if account_until else None}))
         armed.append(Lock(SCOPE_ACCOUNT, account_until, ACCOUNT_WIDE))
     return armed
+
+
+def record_failure(db, user, address, *, now=None) -> list:
+    """Count one wrong password for ``user`` from ``address``, against the address and the account.
+    A count that reaches its limit arms that lock and records account_auto_locked, in the caller's
+    transaction. Returns the locks this failure armed.
+
+    For a failure nothing reserved. A sign-in counts its attempt before the check (reserve) and, when
+    the password was wrong, arms with arm_after_failure instead."""
+    threshold, backstop, _window, minutes = limits()
+    now = now or utcnow()
+    until = now + timedelta(minutes=minutes) if minutes > 0 else None
+    source = source_of(address)
+    # Both counts first, the audit rows after: the rows are added to the caller's transaction and
+    # written by its commit, with nothing flushed ahead of it. The account-wide row is taken first, as
+    # reserve takes it, so the two never wait on each other in opposite orders.
+    account = _count_account_wide(db, user.id, backstop, now)
+    row = _count(db, user.id, source, now)
+    return _arm(db, user, address, source, row, account, threshold=threshold, backstop=backstop,
+                until=until, now=now)
+
+
+def _address_row(db, user_id, source):
+    return (db.query(SignInLockout)
+            .filter(SignInLockout.user_id == user_id, SignInLockout.source == source)
+            .populate_existing().first())
+
+
+def reserve(db, user, address, *, now=None) -> Optional[Lock]:
+    """Count one failure for a sign-in attempt BEFORE its password is checked, on the address's count and
+    the account-wide one, in the caller's transaction. The caller commits at once, so the next attempt
+    sees it and the account-wide row's lock is let go before the (slow) password check; then it gives
+    the failure back if the password was right (give_back), or arms the locks if it was wrong
+    (arm_after_failure).
+
+    Returns the lock refusing the attempt, counting nothing, when there is no room: a lock in force, or a
+    count already at its limit with attempts still being checked (refused as the lock the next failure
+    would arm). None when the attempt may have its password checked. Taken under the account-wide row's
+    lock, so of any number of attempts at once no more than the room left get through."""
+    threshold, backstop, _window, minutes = limits()
+    now = now or utcnow()
+    until = now + timedelta(minutes=minutes) if minutes > 0 else None
+    source = source_of(address)
+    account = _account_row(db, user.id, now)
+    if _in_force(account.locked_at, account.locked_until, now):
+        return Lock(SCOPE_ACCOUNT, account.locked_until, ACCOUNT_WIDE)
+    count, since = decayed(account.failed_attempts, account.window_start, backstop, now)
+    if count >= backstop:
+        return Lock(SCOPE_ACCOUNT, _pause_until(until, since, backstop), ACCOUNT_WIDE)
+    row = _address_row(db, user.id, source)
+    if row is not None and _in_force(row.locked_at, row.locked_until, now):
+        return Lock(SCOPE_ADDRESS, row.locked_until, source)
+    if row is not None and row.locked_at is None and row.failed_attempts >= threshold:
+        return Lock(SCOPE_ADDRESS, until, source)
+    account.failed_attempts, account.window_start, account.last_failure_at = count + 1, since, now
+    db.flush()
+    _count(db, user.id, source, now)
+    return None
+
+
+def arm_after_failure(db, user, address, *, now=None) -> list:
+    """The password of an attempt reserve() counted was wrong: its failure is counted already. Arm the
+    locks its counts have reached, recording account_auto_locked, in the caller's transaction. Returns
+    the locks armed."""
+    threshold, backstop, _window, minutes = limits()
+    now = now or utcnow()
+    until = now + timedelta(minutes=minutes) if minutes > 0 else None
+    source = source_of(address)
+    account = _account_row(db, user.id, now)
+    count, since = decayed(account.failed_attempts, account.window_start, backstop, now)
+    account.failed_attempts, account.window_start, account.last_failure_at = count, since, now
+    db.flush()
+    return _arm(db, user, address, source, _address_row(db, user.id, source), account,
+                threshold=threshold, backstop=backstop, until=until, now=now)
+
+
+def give_back(db, user_id, address, *, now=None) -> None:
+    """The password of an attempt reserve() counted was right: give back the failure it counted, on the
+    account-wide count and the address's, in the caller's transaction. A lock that other attempts'
+    failures armed meanwhile stays, and so does the address count such a lock holds."""
+    _threshold, backstop, _window, _minutes = limits()
+    now = now or utcnow()
+    account = (db.query(SignInLockout)
+               .filter(SignInLockout.user_id == user_id, SignInLockout.source == ACCOUNT_WIDE)
+               .with_for_update().populate_existing().first())
+    if account is not None:
+        count, since = decayed(account.failed_attempts, account.window_start, backstop, now)
+        account.failed_attempts, account.window_start = max(0, count - 1), since
+        db.flush()
+    tbl = SignInLockout.__table__
+    db.execute(update(tbl)
+               .where(tbl.c.user_id == user_id, tbl.c.source == source_of(address),
+                      tbl.c.locked_at.is_(None), tbl.c.failed_attempts > 0)
+               .values(failed_attempts=tbl.c.failed_attempts - 1))
 
 
 def lock_in_force(db, user_id, address, *, now=None) -> Optional[Lock]:
@@ -368,6 +480,47 @@ class _CacheStore:
         redis_guard.best_effort("sign_in_lockout.phantom_set",
                                 lambda: redis_client.set(key, json.dumps(value), ex=max(1, int(ttl_seconds))))
 
+    # How long one attempt may hold a name while it is counted (a holder that dies lets go by then), and
+    # how long another attempt waits for it.
+    HOLD_MS = 2000
+    WAIT_SECONDS = 2.0
+
+    def hold(self, key):
+        """Take ``key`` for one attempt, waiting up to WAIT_SECONDS while another attempt holds it: what
+        the account-wide row's lock is to an account. Returns the token to let it go with, or None when
+        it was not taken (the cache cannot be reached, or the wait ran out), and the attempt is counted
+        without it: the mimicry fails open."""
+        import secrets
+        import time
+        from app.core import redis_guard
+        from app.core.database import redis_client
+        token = secrets.token_hex(8)
+        deadline = time.monotonic() + self.WAIT_SECONDS
+        while True:
+            taken = redis_guard.best_effort(
+                "sign_in_lockout.phantom_hold",
+                lambda: redis_client.set(key, token, nx=True, px=self.HOLD_MS), default=_UNAVAILABLE)
+            if taken is _UNAVAILABLE:
+                return None
+            if taken:
+                return token
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
+
+    def release(self, key, token) -> None:
+        """Let go of a hold taken with ``token``, and only that one. (Read, then deleted: a hold is kept
+        for milliseconds and lapses after HOLD_MS, so another attempt's hold is never in between.)"""
+        from app.core import redis_guard
+        from app.core.database import redis_client
+
+        def _release():
+            held = redis_client.get(key)
+            if held is not None and (held.decode() if isinstance(held, bytes) else held) == token:
+                redis_client.delete(key)
+
+        redis_guard.best_effort("sign_in_lockout.phantom_release", _release)
+
 
 def _phantom_store():
     return _CacheStore()
@@ -467,3 +620,31 @@ def phantom_lock(identifier, address, *, now=None) -> Optional[Lock]:
     except Exception:  # noqa: BLE001 - fail open: never refused by the mimicry while the cache is down
         return None
     return None
+
+
+def phantom_reserve(identifier, address, *, now=None) -> Optional[Lock]:
+    """What reserve() is for an account, for a name that is no account: refused as phantom_lock refuses
+    it, or else counted as phantom_failure counts a failure, BEFORE the stand-in password check. Both
+    happen under one hold on the name in the cache (the account-wide row's lock, for an account), so
+    attempts arriving at once are counted one after another and meet the refusal at the same count as
+    an account's would. Returns the refusing lock, or None. Best-effort: never raises, and fails open."""
+    store = _phantom_store()
+    key = token = None
+    try:
+        from app.core.name_keys import name_key
+        hold = getattr(store, "hold", None)
+        if hold is not None:
+            key = f"{PHANTOM_PREFIX}:hold|{name_key(identifier)}"
+            token = hold(key)
+        lock = phantom_lock(identifier, address, now=now)
+        if lock is None:
+            phantom_failure(identifier, address, now=now)
+        return lock
+    except Exception:  # noqa: BLE001 - the mimicry is best-effort
+        return None
+    finally:
+        if token is not None:
+            try:
+                store.release(key, token)
+            except Exception:  # noqa: BLE001
+                pass

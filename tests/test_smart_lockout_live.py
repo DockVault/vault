@@ -7,6 +7,8 @@ second and third source addresses are requests sent from inside the stack's own 
   * failures from one address pause new sign-ins from that address only; the owner signs in from
     another, and a sign-in from the paused address is refused before its password is checked;
   * failures from several addresses reaching the account-wide limit pause sign-ins from everywhere;
+  * a burst of wrong passwords from several addresses at once, over the web and SFTP together, has
+    no more of them checked than the account-wide limit: each attempt is counted before its check;
   * an automatic lock never ends a session, a live-monitor socket, a device's sync or an open SFTP
     session; an administrator's lock still ends them all;
   * SFTP password and key sign-ins follow the same locks, and SFTP failures count toward them;
@@ -253,3 +255,101 @@ def test_a_name_that_is_no_account_is_refused_at_the_same_point(admin, temp_user
         seen.append(refused.status_code)
         assert seen == [401] * THRESHOLD + [403], (name, seen)
         assert "from your network address" in refused.json()["detail"]
+
+
+# A burst of wrong passwords from inside a container of the stack: waits for the gate key in the cache,
+# then fires N sign-ins at once and prints their statuses as JSON.
+_BURST_SCRIPT = '''
+import json, os, sys, threading, time, urllib.error, urllib.request
+import redis
+url, name, password, n, gate = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+r = redis.Redis(host=os.environ.get("REDIS_HOST", "vault-redis"), port=int(os.environ.get("REDIS_PORT", "6379")),
+                password=os.environ.get("REDIS_PASSWORD") or None)
+print("ready", flush=True)
+deadline = time.time() + 60
+while not r.get(gate):
+    if time.time() > deadline:
+        sys.exit(3)
+    time.sleep(0.002)
+out, lock = [], threading.Lock()
+def attempt():
+    req = urllib.request.Request(url + "/auth/login", data=json.dumps({"username": name, "password": password}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        status = urllib.request.urlopen(req, timeout=60).status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    except Exception as e:
+        status = type(e).__name__
+    with lock:
+        out.append(status)
+threads = [threading.Thread(target=attempt) for _ in range(n)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(90)
+print(json.dumps(out), flush=True)
+'''
+
+
+def test_a_burst_of_guesses_from_several_addresses_gets_no_more_checks_than_the_backstop(admin, temp_user,
+                                                                                         small_limits):
+    """Wrong passwords fired at once from three addresses, over the web and SFTP together: the web
+    container itself and the SFTP container (web sign-ins from inside each), and the host (SFTP
+    connections). Each address may make the login limit's worth (3), 9 in all, and all 9 are in flight
+    together. Counted after the password check, as before, every attempt already past the lock check was
+    checked, so more than the backstop (6) were; counted before it, exactly the backstop are, and the rest
+    are refused unchecked. users.failed_login_attempts counts the wrong passwords that were checked."""
+    import subprocess
+    from _account_change_helpers import API, REDIS
+    uid, name = temp_user["id"], temp_user["_username"]
+    per_address, backstop = THRESHOLD, THRESHOLD * MULTIPLE
+    time.sleep(6)                          # the SFTP server's settings cache takes up the small limits
+    reset_sign_in_throttle()
+    gate = f"test_burst_gate:{uuid.uuid4().hex}"
+
+    shooters = []
+    for container, url in ((API, "http://127.0.0.1:8000"), (SFTP_CONTAINER, "http://vault-api:8000")):
+        p = subprocess.Popen(["docker", "exec", "-i", container, "python", "-c", _BURST_SCRIPT, url, name, WRONG,
+                              str(per_address), gate], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert p.stdout.readline().strip() == "ready", p.stderr.read()[-600:]
+        shooters.append(p)
+
+    transports = []
+    for _ in range(per_address):
+        t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        t.banner_timeout = 30
+        t.start_client(timeout=30)         # the handshake now, so only the password is left to send
+        transports.append(t)
+
+    import threading
+    sftp_refused = []
+
+    def sftp_attempt(t):
+        try:
+            t.auth_password(name, WRONG)
+        except (paramiko.SSHException, EOFError, OSError):
+            sftp_refused.append(True)
+        finally:
+            t.close()
+
+    threads = [threading.Thread(target=sftp_attempt, args=(t,)) for t in transports]
+    opened = subprocess.run(["docker", "exec", REDIS, "redis-cli", "SET", gate, "1", "EX", "120"],
+                            capture_output=True, text=True, timeout=30)
+    assert opened.returncode == 0, opened.stderr
+    for t in threads:
+        t.start()
+    web = []
+    for p in shooters:
+        out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, err[-600:]
+        web += json.loads(out.strip().splitlines()[-1])
+    for t in threads:
+        t.join(90)
+    reset_sign_in_throttle()
+
+    assert len(web) == 2 * per_address and len(sftp_refused) == per_address, (web, sftp_refused)
+    assert set(web) <= {401, 403}, web
+    checked = int(psql(f"SELECT failed_login_attempts FROM users WHERE id='{uid}'"))
+    assert checked == backstop, f"{checked} wrong passwords were checked; the backstop is {backstop}"
+    assert lock_rows(uid)["*"] == (backstop, True), lock_rows(uid)
