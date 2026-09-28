@@ -1146,7 +1146,6 @@ async def get_role_definitions(
                 "Access all files",
                 "View audit logs",
                 "Manage temporary credentials",
-                "Access live monitoring",
                 "Full dashboard access"
             ],
             icon="👑",
