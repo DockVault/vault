@@ -166,13 +166,34 @@ def test_a_held_change_made_on_a_phone_shows_as_waiting_and_can_be_withdrawn(pag
     assert psql(f"SELECT count(*) FROM password_reset_tokens WHERE user_id='{uid}'") == "0"
 
 
+def _independent(approver, requester_id):
+    """Make ``approver`` an administrator ``requester_id`` may be approved by: one the requester did not
+    make and that is not in the requester's own lineage, and one of long standing. An administrator
+    the shared admin creates here is none of those: its record names the shared admin as its maker, and
+    it was made a moment ago. So its record is rewritten in the database, as if the server's operator
+    had made it an administrator 15 days ago with the host tool: no maker among the administrators, no
+    lineage. It has made no change to the account it approves for."""
+    psql(f"UPDATE admin_grants SET granted_by_id = NULL, granted_by_name = 'operator@host', "
+         f"granted_at = (now() AT TIME ZONE 'utc') - interval '15 days', lineage = '[]' "
+         f"WHERE user_id = '{approver['id']}'")
+    assert psql(f"SELECT granted_by_id IS NULL, lineage::text, "
+                f"granted_at < (now() AT TIME ZONE 'utc') - interval '14 days' "
+                f"FROM admin_grants WHERE user_id = '{approver['id']}'") == "t|[]|t"
+    assert psql(f"SELECT count(*) FROM admin_grants WHERE user_id = '{requester_id}' "
+                f"AND lineage::text LIKE '%{approver['id']}%'") == "0", "the approver made the requester"
+
+
 def test_an_open_users_page_shows_a_request_the_moment_it_is_made(page: Page, admin, page_admin, temp_user):
     """Another administrator's held change reaches an open Users page with its notice, with no reload:
     the request appears with Approve. Before, the notice moved only the bell, and the block showed the
     request after a reload. The socket's nudge is also handed to the page's own frame handler here, as
     the socket does (the frame carries only the notice's type, target and owner), so the test does not
-    depend on the socket having connected in time."""
+    depend on the socket having connected in time.
+
+    The shared admin asks and page_admin, which it created, must be an administrator allowed to approve:
+    see _independent, which back-dates page_admin's record in the database."""
     uid = temp_user["id"]
+    _independent(page_admin, admin.get("/users/me").json()["id"])
     _login(page, page_admin, "v2", DESKTOP)
     _open_users(page)
     page.wait_for_timeout(500)                                                 # the block has been read
