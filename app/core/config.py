@@ -376,6 +376,13 @@ class Settings(BaseSettings):
     # polling plus a browsing burst never trips the shared default bucket.
     rate_limit_api_poll: int = Field(default=600)
     rate_limit_api_poll_window: int = Field(default=60)
+    # WebSocket connects per client address (an IPv6 address counted as its /64) per window, which
+    # the HTTP rate limiter never sees. The page opens one socket per tab and reconnects no faster
+    # than every 5 seconds, so this is far above a browser's use and still bounds a flood of sockets
+    # opened by anyone before they say who they are. 0 turns it off. Fails open on a Redis error.
+    # See app/core/websocket_guard.py.
+    rate_limit_ws_connect: int = Field(default=120)
+    rate_limit_ws_connect_window: int = Field(default=60)
 
     # How many file transfers the deployment carries at once, and what happens to the rest.
     #

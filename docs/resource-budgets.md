@@ -313,6 +313,25 @@ A signed-in multipart upload is still received whole before the handler runs. It
 to `/tmp`, which the shipped compose files mount as a tmpfs, so until the handler has read them they
 are held in memory. The resumable path (what the browser uses) is the one for large files.
 
+## WebSocket messages
+
+The page's live socket (`/ws/monitor`) is opened by anyone and learns who is calling from its first
+message, so its messages are bounded too (`app/core/websocket_guard.py`):
+
+- the server takes a message of at most 16 KiB and offers no per-message compression (uvicorn's
+  defaults were 16 MiB and on, so about 16 KB on the wire could become a 16 MiB message, parsed
+  before the caller was known);
+- the application closes the socket with 1009 on any message over 4 KiB, before parsing it (the page
+  sends one message, its sign-in, well under 1 KiB);
+- one address may open `RATE_LIMIT_WS_CONNECT` sockets (120 by default) per
+  `RATE_LIMIT_WS_CONNECT_WINDOW` seconds (60), an IPv6 address counted as its /64; the HTTP rate
+  limiter never sees a socket. A refused connect is closed before it opens, and the page polls until
+  it reconnects.
+
+Measured on this change: a 15 MiB first message is closed with 1009 in 0.1 s on its header, the API's
+memory rises by 0.4 MiB and `/health` keeps answering within 0.07 s. Before it, one 16 MiB message
+held the event loop for about a second and raised the process's memory by about 400 MiB.
+
 ## On the 500 MB target
 
 **Reached, and no longer dependent on file size — on either protocol.** A 500 MB deployment fits

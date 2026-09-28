@@ -243,6 +243,12 @@ async def _request_validation_error_handler(request: StarletteRequest, exc: Requ
 from app.core.body_limit import BodyLimitMiddleware  # noqa: E402
 app.add_middleware(BodyLimitMiddleware)
 
+# A WebSocket's messages and connects are bounded too (see app/core/websocket_guard.py): every
+# message the application reads is at most a few KiB, checked before it is parsed, and one address
+# may open only so many sockets a minute. The HTTP rate limiter and the body limit never see one.
+from app.core.websocket_guard import WebSocketGuardMiddleware  # noqa: E402
+app.add_middleware(WebSocketGuardMiddleware)
+
 # Add CORS middleware. Bearer-token auth (no cookies anywhere) already makes credentialed
 # cross-origin theft impossible, but don't bake a dev origin into a production image: read the
 # allow-list from CORS_ALLOW_ORIGINS (comma-separated) and fall back to the localhost dev origin
@@ -24594,6 +24600,7 @@ def _should_warn_plaintext_transport(use_https, environment, trusted_proxies):
 
 if __name__ == "__main__":
     import uvicorn
+    from app.core import websocket_guard
 
     # Configure SSL if enabled
     ssl_config = {}
@@ -24631,5 +24638,9 @@ if __name__ == "__main__":
         # peer before the app sees it, so a loopback peer's header would be believed even with no
         # trusted proxy configured.
         proxy_headers=False,
+        # A WebSocket message is at most a few KiB, with per-message compression off: uvicorn's
+        # defaults (16 MiB, compression on) let ~16 KB on the wire become a 16 MiB message parsed
+        # before the caller is known. See app/core/websocket_guard.py.
+        **websocket_guard.server_options(),
         **ssl_config
     )
