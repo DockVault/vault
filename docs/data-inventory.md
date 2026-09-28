@@ -21,16 +21,16 @@ retention period suits your organisation, are yours to decide.
 | Holders of a temporary credential | Someone an account holder gave a temporary credential to. They act under that account; the audit log records the credential's name. |
 | Recipients of a public link (a file, folder or note) | No account. Each visit is audited with their address and browser's user agent. |
 | Senders to an upload link | No account. Their address is kept with the upload for about a day, and each upload is audited with their address and user agent. |
-| Anyone who types a name at the sign-in page | A failed sign-in is audited with the name exactly as typed, whether or not it is an account (a password typed into the username box included), with the address and, on the web, the user agent. |
+| Anyone who types a name at the sign-in page | A failed sign-in is audited with the name exactly as typed, whether or not it is an account (a password typed into the username box included), with the address and, on the web, the user agent. The sign-in throttles count it under a keyed stand-in, not the name. |
 | People invited by email | Their username, email address and role, from the invitation. |
-| Administrators acting on others | Their username appears in the records of the people they changed. |
+| Administrators acting on others | Their username appears in the records of the people they changed, and in the record of each administrator they made. |
 
 ## Where it is kept
 
 | Store | Location | Kept until |
 |---|---|---|
 | [Database](#database) | PostgreSQL, volume `vault_pg_data` | Per table, below. |
-| [Cache](#cache-redis) | Redis. The shipped compose files keep its data in memory only (`/data` is a tmpfs). | Each key expires on its own, from minutes to a day. A restart of the Redis container empties it. |
+| [Cache](#cache-redis) | Redis. The shipped compose files keep its data in memory only (`/data` is a tmpfs). | Each key expires on its own, from minutes to a day (30 days for a lock with no end on a name that is no account). A restart of the Redis container empties it. |
 | [Files](#files) | Volume `vault_storage` | The file is deleted or expires. |
 | [Logs](#logs) | The container output, and a size-capped file in volume `vault_logs` | Rotation (the file) or your Docker logging settings (the output). |
 | [Email](#email) | Your SMTP server and the recipients' mailboxes | Outside DockVault. It keeps no copy of what it sends. |
@@ -54,7 +54,7 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `second_factor_enrollments`, `second_factor_recovery_codes` | Method, the authenticator seed (encrypted), times; recovery-code hashes. | Second factor. | Until reset or removed. | Resetting the second factor; deleted with the account. |
 | `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The periodic cleanup (every 5 minutes); deleted with the account. |
 | `pending_logins` | The account, client address, attempts. | A sign-in waiting for its second factor. | 30 days after it completed or expired. | The periodic cleanup; deleted with the account. |
-| `sign_in_lockouts` **New in 0.33.0** | The account, the source address (or `*` for the account-wide count), failure count, window start, last failure, lock start and end. | Automatic locks: wrong passwords from one address lock new sign-ins from that address, and past a higher count, from everywhere. | A count with no lock: a day after its last failure (the account-wide count: when its window has passed). A lock: until it ends (`ACCOUNT_LOCKOUT_MINUTES`, 15 by default), or until an administrator clears it when that setting is 0. | The periodic cleanup; an administrator's unlock (deletes every row for the account); deleted with the account. |
+| `sign_in_lockouts` **New in 0.33.0** | The account, the source address (an IPv6 address as its /64, or `*` for the account-wide count), failure count, window start, last failure, lock start and end. | Automatic locks: wrong passwords from one address lock new sign-ins from that address, and past a higher count from all addresses together over about 24 hours, from everywhere. | An address count with no lock: a day after its last failure. The account-wide count: at most a day after its last failure, by when it has lost every one (it loses one every 24 hours divided by the backstop, every 72 minutes by default). A lock: until it ends (`ACCOUNT_LOCKOUT_MINUTES`, 15 by default; the account-wide pause lasts until its count has lost a failure, if that is later), or until an administrator clears it when that setting is 0. | The periodic cleanup; an administrator's unlock (deletes every row for the account); deleted with the account. |
 | `temporary_credentials`, `temp_credential_vault_access` | The generated username, a hash of the credential, the owner's note about it (free text), its scope and passcode hash, times, creator. | Delegated, time-limited access. | Until the owner deletes it: an expired credential stays listed. | The owner deleting it; deleted with the account. |
 | `devices`, `device_grants` | Device label, secret hashes, last seen, created, expiry; which vaults it syncs. | Desktop sync. | Until revoked and deleted. | The person deleting the device; deleted with the account. |
 | `password_reset_tokens` | The account, token hash, times, the administrator who created it. | Password reset. | An unused token is replaced when a new one is issued; a used one is kept. | Deleted with the account. |
@@ -95,9 +95,10 @@ Visits to a link and uploads through one are also in the audit log.
 |---|---|---|---|---|
 | `audit_logs` | See [The audit log](#the-audit-log). | Accountability and security. | **For ever by default** (`AUDIT_LOG_RETENTION_DAYS=0`). | A positive `AUDIT_LOG_RETENTION_DAYS` deletes older rows. **Not** deleted with the account. |
 | `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. | Opening the alerts view deletes old resolved alerts, at most once an hour. **Not** deleted with the account. |
-| `rate_limit_records` | An address, a username, or a name and address together; counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The periodic cleanup. |
-| `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; and while a request waits, what it would set (a password hash, an address or a key). | A second change to someone's sign-in within 14 days waits for another administrator. | The pending value: until the request is decided or expires (at most 7 days). The row: until the changed account is deleted. | Deleted with the changed account. An administrator's username stays on the rows of the accounts they changed. |
-| `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username. | Telling people what happened. | Until the person deletes it. | The person; deleted with the account. |
+| `rate_limit_records` | An address; for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The periodic cleanup. |
+| `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key); and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The periodic cleanup (every 5 minutes); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
+| `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | An administrator may not approve a change asked for by someone who made them one, directly or through administrators they made, or asked for before they became one. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
+| `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username; and to every other administrator, that an account became an administrator and who made it one. | Telling people what happened. | Until the person deletes it. | The person; deleted with the account. |
 | `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
@@ -140,7 +141,7 @@ database access can change the table.
 
 Names typed at failed sign-ins appear on the Activity page (filtered as "no account") and in its
 exports. The summary charts' "most active people" leaves them out, and the page's username search
-suggests only accounts.
+suggests only accounts: it does not read the log for its suggestions, whatever it is asked.
 
 ## Cache (Redis)
 
@@ -151,10 +152,10 @@ In memory only with the shipped compose files. Every key below expires on its ow
 | `session:*`, `denylist:session:*` | A session token's hash with its session and account id; ended sessions. | 30 minutes; a token's remaining life. |
 | `temp_cred:<name>` | A temporary credential's ids and times. | The credential's lifetime. |
 | `otp:<purpose>:<account>` | A pending code's hash and the new email address it was sent to. | The code's lifetime. |
-| `rate_limit:login_user:<name>\|<address>`, `rate_limit:login_ip:<address>` | Failed sign-ins per name and address, and per address. The name is as typed. | The login window (`RATE_LIMIT_LOGIN_WINDOW_SECONDS`, 5 minutes by default). |
-| `rate_limit:login_phantom:<address>\|<name>`, `rate_limit:login_phantom:*\|<name>` **New in 0.33.0** | Failed sign-ins for a name that is no account, counted like an account's so a refusal does not reveal whether it exists. The name is as typed. | `ACCOUNT_LOCKOUT_MINUTES` (15 by default; 24 hours when it is 0). |
-| `security:failed_login:<name>:<address>` | Failed sign-ins, for alerts. | `SECURITY_FAILED_LOGIN_WINDOW` (10 minutes by default). |
-| `rate_limit:sftp_pk:<address>:<name>`, `rate_limit:device_sync:*`, `rate_limit:vault:*`, `rate_limit:api:*`, `security:file_deletion:*` | Throttles keyed by address, name, account or device. | Their windows: seconds to minutes. |
+| `rate_limit:login_user:<name key>\|<address>`, `rate_limit:login_ip:<address>` | Failed sign-ins per name and address, and per address. **Changed in 0.33.0:** the name is a keyed stand-in, 128 bits of an HMAC of it under the deployment's secret (`LOG_TOKEN_PEPPER`, else one derived from `JWT_SECRET_KEY`), which cannot be reversed or confirmed without that secret; it was the name as typed. | The login window (`RATE_LIMIT_LOGIN_WINDOW_SECONDS`, 5 minutes by default). |
+| `rate_limit:login_phantom:<address>\|<name key>`, `rate_limit:login_phantom:*\|<name key>` **New in 0.33.0** | Failed sign-ins for a name that is no account, counted and paused exactly like an account's so a refusal does not reveal whether it exists. The name is a keyed stand-in, as above. | Like the database's rows for an account: the address count, a day after its last failure or its lock's end; the account-wide count, about a day, or until its pause ends if later. A lock with no end (`ACCOUNT_LOCKOUT_MINUTES` of 0): 30 days. |
+| `security:failed_login:<name key>:<address>` | Failed sign-ins, for alerts. **Changed in 0.33.0:** the name is a keyed stand-in, as above; it was the name as typed. | `SECURITY_FAILED_LOGIN_WINDOW` (10 minutes by default). |
+| `rate_limit:sftp_pk:<address>:<name>`, `rate_limit:device_sync:*`, `rate_limit:vault:*`, `rate_limit:api:*`, `security:file_deletion:*` | Throttles keyed by address, the name as typed (an SFTP key sign-in), account or device. | Their windows: seconds to minutes. |
 | `operation:*` | A transfer in progress: account id and username, the file name, size, progress. | An hour. |
 | Upload markers | A same-name upload in progress: the member's id and the name, encrypted. | 5 minutes by default. |
 | `device_reuse_alert:<device>` | That an alert was raised for a device. | An hour. |
@@ -196,10 +197,11 @@ the recipients' mailboxes.
 
 | Email | Sent to | Holds |
 |---|---|---|
-| Password reset | The account's address | A reset link. |
+| Password reset | The account's address. **New in 0.33.0:** for 14 days after an administrator changed it, a reset the person asks for goes to the address before (nothing is sent if there was none) | A reset link; when it goes to the address before, a line saying why. |
 | Email change verification | The new address | A confirmation code. |
 | Account invitation | The invitee | The invitation link and their username. |
-| Account changed by an administrator **New in 0.33.0** | The person; for an email change, the **old** address | What changed (both addresses for an email change; an SSH key's name and fingerprint), when, and the administrator's username. It cannot be switched off. |
+| Account changed by an administrator **New in 0.33.0** | The person; for an email change, the **old** address | What changed (for an email change, the old address and the new one masked, as n***@example.com; an SSH key's name and fingerprint), when, and the administrator's username. It cannot be switched off. |
+| New administrator **New in 0.33.0** | Every other active administrator | Which account became an administrator, how (created, promoted, or an invitation accepted), by whom, and when. It cannot be switched off. |
 | Welcome, new sign-in alert, something shared with you, added to a vault, temporary credential issued | The person concerned | Off unless an administrator turns each on. The username and the template's text. |
 | Email Studio sends | People or addresses an administrator chooses | The template the administrator wrote. |
 
@@ -231,19 +233,24 @@ and the unlock state.
    delete them) or is the last administrator. The deletion removes the account and everything the
    tables above mark "deleted with the account": sign-in data, keys, sessions, devices, temporary
    credentials, notes, notifications, preferences, saved searches, memberships, their shares and
-   links, upload links, and credential-change records about them.
+   links, upload links, credential-change records about them, and the record of who made them an
+   administrator.
 2. **What stays** after the account is deleted:
    - their rows in `audit_logs` (username, addresses, user agents, details), and the row recording
      the deletion;
    - `security_alerts` naming them (resolved ones age out after `SECURITY_ALERT_RETENTION_DAYS`);
    - their username on other accounts' `credential_changes` rows, as the requesting or deciding
-     administrator, and in other people's notifications and received notes;
+     administrator, until those rows are deleted 14 days after the change or decision; and in other
+     people's notifications and received notes;
+   - their username on the `admin_grants` record of each administrator they made, while that account
+     stays an administrator;
    - other administrators' saved searches, and earlier exports' recorded filters, that name them;
    - an `account_invitations` row that named them;
    - files they uploaded to other people's vaults (their id is cleared; the file belongs to the
      vault);
    - backups, exports and logs made before the deletion, and email already sent.
-   Cache entries expire on their own within a day.
+   Cache entries expire on their own within a day (a lock with no end on a name that is no account:
+   30 days); those about names typed at sign-in hold only a keyed stand-in.
 3. **Removing what stays**, if you decide it must go (audit records are often kept to establish or
    defend legal claims; that is your decision): set `AUDIT_LOG_RETENTION_DAYS`, or delete rows in the
    database. For example, in the database container:
@@ -272,6 +279,8 @@ There is no built-in per-person erasure yet.
 | `ENFORCE_FILE_EXPIRY` | `true` | Whether vault and upload-link expiry deletes files. |
 | Per vault and per upload link | Off | How long files are kept. |
 | Fixed | 30 days | Finished sessions and pending sign-ins. |
+| Fixed | 14 days | Credential-change records, after the change is made or the request ends. |
+| Fixed | About a day | Failed sign-in counts with no lock, after their last failure (database and cache). |
 | Fixed | About a day | Resumable-upload sessions and an upload-link sender's address. |
 | Fixed | About 15 MB | The log-access file. |
 
@@ -280,11 +289,17 @@ There is no built-in per-person erasure yet.
 - `audit_logs`: the user agent, method, route and channel are now filled on web, public-link,
   upload-link and device-sync rows, including those of people with no account (link recipients and
   upload-link senders); and a temporary credential's name, kept after it is deleted.
-- `sign_in_lockouts`: failed sign-ins per account and source address.
-- Redis `rate_limit:login_phantom:` keys: names typed at sign-in that are no account.
-- `credential_changes`: administrators' requests to change someone's sign-in, with their summary.
+- `sign_in_lockouts`: failed sign-ins per account and source address (an IPv6 address as its /64), and
+  per account from all addresses together over about 24 hours.
+- Redis `rate_limit:login_phantom:` keys: a keyed stand-in for each name typed at sign-in that is no
+  account.
+- `credential_changes`: administrators' requests to change someone's sign-in, with their summary, and
+  the address before and after an email change, each kept for 14 days after the change or decision.
+- `admin_grants`: who made each administrator one, and when.
 - Notifications and an email ("Account changed by an administrator") for every administrator's change
-  to a person's account, the email going to the old address for an email change.
+  to a person's account, the email going to the old address for an email change and naming the new
+  one masked; and a notification and an email ("New administrator") to every other administrator
+  when an account becomes one.
 - `activity_saved_searches`: administrators' saved Activity filters.
 - `users.second_factor_reset_at`.
 - `user_preferences`: "Hide note text" and the Activity page's choices.
@@ -292,3 +307,6 @@ There is no built-in per-person erasure yet.
   each signed-in account's latest address from the existing sessions.
 - Removed: the Live Monitor, whose feed of activity went to every administrator's open page. The
   Activity page's live signal carries only an event's id and category.
+- Changed: the cache keys and the fallback table that count failed sign-ins by name hold a keyed
+  stand-in, not the name as typed; the Activity page's username search suggests accounts only and
+  never reads the audit log.
