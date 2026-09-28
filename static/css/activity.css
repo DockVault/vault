@@ -572,7 +572,10 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     .activity-table .act-c-ch { display: none; }
     .act-body.has-detail { display: block; min-height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 16px); }
     .act-body.has-detail .activity-table .act-c-ip { display: table-cell; }
-    .act-detail { position: absolute; top: 0; right: 0; bottom: 0; width: min(440px, 60%); height: auto; z-index: 25; }
+    /* Stretched from the list's top to its bottom, so the sticky panel inside has the list's whole height
+       to stay on screen in. The desktop pane's align-self: start would shrink the drawer to the panel's
+       own height, and the panel would then scroll away with the list. */
+    .act-detail { position: absolute; top: 0; right: 0; bottom: 0; width: min(440px, 60%); height: auto; z-index: 25; align-self: stretch; }
     .act-detail-inner {
         position: sticky; top: calc(var(--navbar-height) + var(--act-toolbar-h, 44px));
         height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 16px);

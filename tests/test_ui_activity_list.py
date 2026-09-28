@@ -281,3 +281,37 @@ def test_the_list_stays_put_as_the_detail_opens(page: Page, activity_admin):
     after = page.locator("#act-list").bounding_box()
     assert after["y"] == before["y"], (before, after)
     assert page.locator("#act-detail").bounding_box()["y"] == after["y"]
+
+
+_PANEL_ON_SCREEN = """() => {
+    const inner = document.querySelector('#act-detail .act-detail-inner');
+    const bar = document.getElementById('act-toolbar').getBoundingClientRect();
+    const r = inner.getBoundingClientRect();
+    return {top: r.top, bottom: r.bottom, barBottom: bar.bottom, height: innerHeight,
+            drawer: getComputedStyle(document.getElementById('act-detail')).position};
+}"""
+
+
+@pytest.mark.parametrize("skin,width,height", [("v2", 1024, 768), ("v1", 1280, 800)])
+def test_the_tablet_drawer_stays_on_screen_as_the_list_scrolls(page: Page, activity_admin, skin, width, height):
+    """Below a 980 px section the detail is a drawer over the list. Its panel stays under the toolbar and
+    inside the window however far the list scrolls, so Newer and Older move through a pane in view."""
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin, width=width, height=height)
+    open_activity(page)
+    _size(page, "100")
+    expect(page.locator("#activity-summary")).to_have_text(re.compile(r"^1–"), timeout=10000)
+    rows(page).nth(1).click()
+    expect(page.locator("#act-detail .act-detail-inner")).to_be_visible()
+    assert page.evaluate(_PANEL_ON_SCREEN)["drawer"] == "absolute", "not the tablet drawer at this width"
+    room = page.evaluate("() => document.getElementById('act-list').getBoundingClientRect().bottom"
+                         " + scrollY - innerHeight")
+    assert room > 900, f"the list must be longer than the window by 900 px for this test ({room})"
+    for dy in (600, min(1500, int(room) - 10)):
+        page.evaluate(f"() => window.scrollTo(0, {dy})")
+        page.wait_for_timeout(250)
+        at = page.evaluate(_PANEL_ON_SCREEN)
+        assert at["top"] >= at["barBottom"] - 1 and at["bottom"] <= at["height"] + 1, (dy, at)
+    page.keyboard.press("j")
+    expect(page.locator("#act-detail .act-d-pos")).to_have_text(re.compile(r"^3 of"))
+    expect(page.locator("#act-detail .act-d-older")).to_be_in_viewport()
