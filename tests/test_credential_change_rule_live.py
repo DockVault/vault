@@ -14,9 +14,13 @@ denied, is withdrawn, or expires after 7 days. With nobody else to approve it, i
 and a pointer to the host tool. Changing your own credentials is not affected. The account keeps
 working while a request waits.
 
-The session's administrator made every other administrator on a fresh stack, so none of them may
-approve its changes, and its own second change is refused outright. So in these tests the module's
-second administrator asks, and the session's administrator approves.
+Who may approve: an administrator independent of the change. Not the one who asked; not one who made
+or approved a change to that account within 14 days of the request; not one in the asker's lineage, nor
+with the asker in theirs; and one who had been an administrator for 14 days when it was asked for. An
+administrator a test creates is none of that (the session's administrator made it, a moment ago), so the
+module's second administrator is made independent and of long standing in the database
+(make_independent). In most tests it makes the first change and asks for the second, and the session's
+administrator, who changed nothing, approves.
 
 test_credential_change_rule.py covers the rule itself offline.
 """
@@ -28,8 +32,8 @@ import uuid
 import pytest
 
 from conftest import ApiClient, BASE_URL, unique
-from _account_change_helpers import (in_api_container, mail_sink, notifications, psql, second_admin,
-                                     signed_in)
+from _account_change_helpers import (in_api_container, mail_sink, make_independent, notifications, psql,
+                                     second_admin, signed_in)
 from _sf_helpers import enroll_totp
 
 pytestmark = pytest.mark.integration
@@ -82,8 +86,16 @@ def mail(admin):
 
 @pytest.fixture(scope="module")
 def other_admin(admin):
-    """One more administrator for the module (creating one per test doubled the module's time)."""
-    with second_admin(admin) as pair:
+    """One more administrator for the module (creating one per test doubled the module's time), made
+    independent of the session's administrator and of long standing (make_independent)."""
+    with second_admin(admin, independent=True) as pair:
+        yield pair
+
+
+@pytest.fixture(scope="module")
+def third_admin(admin):
+    """A third one, likewise: for a request whose approver may be neither of the other two."""
+    with second_admin(admin, independent=True) as pair:
         yield pair
 
 
@@ -101,13 +113,13 @@ def _request_for(client, user_id):
 
 @pytest.mark.parametrize("second", sorted(MAKERS))
 def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_user, other_admin, mail, second):
-    assert MAKERS["patch_password"](admin, temp_user).status_code == 200    # the first change is made
+    other, other_client = other_admin
+    assert MAKERS["patch_password"](other_client, temp_user).status_code == 200    # the first change is made
     if second == "second_factor":
         # Enrolled with the new password: the first change set it.
         enroll_totp({**temp_user, "_password": NEW_PASSWORD},
                     signed_in({**temp_user, "_password": NEW_PASSWORD}))
     before = _state(admin, temp_user)
-    other, other_client = other_admin
 
     r = MAKERS[second](other_client, temp_user)
     assert r.status_code == 202, r.text
@@ -125,18 +137,22 @@ def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_u
 
 
 @pytest.mark.parametrize("first", sorted(MAKERS))
-def test_every_kind_opens_the_window(admin, temp_user, other_admin, mail, first):
+def test_every_kind_opens_the_window(admin, temp_user, other_admin, third_admin, mail, first):
     if first == "second_factor":
         enroll_totp(temp_user, signed_in(temp_user))
-    r = MAKERS[first](admin, temp_user)
+    r = MAKERS[first](other_admin[1], temp_user)
     assert r.status_code == 200, r.text
     # A second change, by a different administrator this time, waits.
-    r = MAKERS["ssh_key"](other_admin[1], temp_user)
+    r = MAKERS["ssh_key"](third_admin[1], temp_user)
     assert r.status_code == 202, r.text
-    assert r.json()["request"]["requested_by"] == other_admin[0]["_username"]
-    # The administrator who made the asker one did not become one through them, so may approve it.
+    assert r.json()["request"]["requested_by"] == third_admin[0]["_username"]
+    # The session's administrator changed nothing and is independent of the asker, so may approve it;
+    # the one who made the first change may not.
     theirs = _request_for(admin, temp_user["id"])
     assert (theirs["is_mine"], theirs["can_approve"], theirs["cannot_approve"]) == (False, True, None)
+    first_changer = _request_for(other_admin[1], temp_user["id"])
+    assert first_changer["can_approve"] is False
+    assert "you changed this account's sign-in details" in first_changer["cannot_approve"]
 
 
 def test_an_address_and_a_password_saved_together_are_two_changes(admin, temp_user, other_admin):
@@ -160,11 +176,11 @@ def test_resaving_the_same_address_is_not_a_change(admin, temp_user):
 
 
 def test_another_administrator_approves_and_the_change_is_made(admin, temp_user, other_admin):
-    # The second administrator asks; the one who made it an administrator did not become one through
-    # it, so may approve.
+    # The second administrator makes the first change and asks for the second; the session's
+    # administrator, who changed nothing and is independent of it, may approve.
     other, other_client = other_admin
     me = admin.get("/users/me").json()["username"]
-    assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
+    assert other_client.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
     user_client = signed_in(temp_user)
     assert other_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 202
     req = _request_for(admin, temp_user["id"])
@@ -193,7 +209,8 @@ def test_another_administrator_approves_and_the_change_is_made(admin, temp_user,
 
 
 def test_approving_a_held_reset_link_gives_the_link_to_the_approver(admin, temp_user, other_admin):
-    assert admin.patch(f"/users/{temp_user['id']}", json={"email": f"{unique('x')}@example.com"}).status_code == 200
+    assert other_admin[1].patch(f"/users/{temp_user['id']}",
+                                json={"email": f"{unique('x')}@example.com"}).status_code == 200
     assert other_admin[1].post(f"/users/{temp_user['id']}/reset-link").status_code == 202
     req = _request_for(admin, temp_user["id"])
     r = admin.post(f"/admin/credential-requests/{req['id']}/approve")
@@ -205,7 +222,8 @@ def test_approving_a_held_reset_link_gives_the_link_to_the_approver(admin, temp_
 def test_a_denied_or_withdrawn_request_changes_nothing(admin, temp_user, other_admin):
     other, other_client = other_admin
     me = admin.get("/users/me").json()["username"]
-    assert admin.post(f"/users/{temp_user['id']}/ssh-keys", json={"name": "a", "public_key": _ssh_key()}).status_code == 200
+    assert other_client.post(f"/users/{temp_user['id']}/ssh-keys",
+                             json={"name": "a", "public_key": _ssh_key()}).status_code == 200
     before = _state(admin, temp_user)
 
     assert other_client.post(f"/users/{temp_user['id']}/ssh-keys",
@@ -232,7 +250,7 @@ def test_a_denied_or_withdrawn_request_changes_nothing(admin, temp_user, other_a
 
 
 def test_a_request_nobody_decides_expires_after_seven_days(admin, temp_user, other_admin):
-    assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    assert other_admin[1].patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
     assert other_admin[1].post(f"/users/{temp_user['id']}/reset-link").status_code == 202
     req = _request_for(admin, temp_user["id"])
     psql(f"UPDATE credential_changes SET expires_at = (now() AT TIME ZONE 'utc') - interval '1 minute' "
@@ -256,10 +274,10 @@ def test_a_request_nobody_decides_expires_after_seven_days(admin, temp_user, oth
     assert notifications(user_client, "credential_change_expired")
 
 
-def test_with_no_other_administrator_the_second_change_is_refused(admin, temp_user, other_admin):
+def test_with_no_other_administrator_the_second_change_is_refused(admin, temp_user, other_admin, third_admin):
     """Every other administrator is locked for the length of the test, so the session's admin is the
-    only one who could approve. Their locks are lifted afterwards, and the module's second
-    administrator, whose sessions the lock ended, signs in again."""
+    only one who could approve. Their locks are lifted afterwards, and the module's other
+    administrators, whose sessions the lock ended, sign in again."""
     me = admin.get("/users/me").json()["id"]
     others = [u for u in admin.get("/users").json()
               if u["role"] == "admin" and u["is_active"] and not u["is_locked"] and u["id"] != me]
@@ -270,20 +288,23 @@ def test_with_no_other_administrator_the_second_change_is_refused(admin, temp_us
             locked.append(u["id"])
         assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
         # An administrator account the session's admin makes now is not another administrator: it
-        # could only approve its maker's change, which the rule refuses.
-        with second_admin(admin):
+        # could only approve its maker's change, which the rule refuses, and the refusal says so.
+        with second_admin(admin) as (made, _client):
             r = admin.post(f"/users/{temp_user['id']}/second-factor/reset")
         assert r.status_code == 409, r.text
         detail = r.json()["detail"]
         assert "no other administrator may approve it" in detail and "dockvault.py accounts" in detail
+        assert f"you made {made['_username']} an administrator" in detail, detail
         assert psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id='{temp_user['id']}' "
                     "AND status='held'") == "0"
         rows = admin.get("/audit/log", params={"action": "credential_change_refused", "limit": 500}).json()
-        assert [a for a in rows if a["resource_id"] == temp_user["id"]]
+        mine = [a for a in rows if a["resource_id"] == temp_user["id"]]
+        assert mine and mine[0]["details"]["approver_refusals"] == ["made"], mine
     finally:
         for uid in locked:
             admin.patch(f"/users/{uid}", json={"is_locked": False})
-        other_admin[1].login(other_admin[0]["_username"], other_admin[0]["_password"])
+        for account, client in (other_admin, third_admin):
+            client.login(account["_username"], account["_password"])
 
 
 def test_changing_your_own_credentials_is_not_affected(admin):
@@ -325,7 +346,7 @@ def test_two_administrators_approving_at_once_apply_the_change_once(admin, temp_
     import threading
     requester, requester_client = other_admin
     assert requester_client.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
-    with second_admin(admin) as (_third, third_client):
+    with second_admin(admin, independent=True) as (_third, third_client):
         assert requester_client.post(f"/users/{temp_user['id']}/reset-link").status_code == 202
         req = _request_for(requester_client, temp_user["id"])
         start, answers = threading.Barrier(2), {}
@@ -354,7 +375,7 @@ def test_an_administrator_the_requester_made_cannot_approve(admin, temp_user, ot
     # administrator is told of each new one; an administrator the asker did not make may approve.
     asker, asker_client = other_admin
     me = admin.get("/users/me").json()["username"]
-    assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    assert asker_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
     held = asker_client.post(f"/users/{temp_user['id']}/reset-link")
     assert held.status_code == 202, held.text
     req_id = held.json()["request"]["id"]
@@ -380,20 +401,87 @@ def test_an_administrator_the_requester_made_cannot_approve(admin, temp_user, ot
     assert psql(f"SELECT decided_by_name FROM credential_changes WHERE id='{req_id}'") == me
 
 
-def test_with_only_administrators_it_made_the_first_administrator_is_refused_outright(admin, temp_user,
-                                                                                     other_admin):
-    # On this stack the session's administrator made every other one, so none of them counts as
-    # someone who could approve its second change: refused, with the pointer to the host tool.
-    assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 200
-    r = admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD})
-    if r.status_code == 202:
-        pytest.skip("this stack has an administrator the session's administrator did not make")
-    assert r.status_code == 409 and "dockvault.py accounts" in r.json()["detail"], r.text
+def test_the_administrator_who_made_the_first_change_cannot_approve_through_an_account_it_made(
+        admin, temp_user, other_admin):
+    # The review's mirror: the session's administrator makes the first change and an administrator
+    # account, asks for the second as that account, and approves it as itself. Refused, saying why;
+    # the module's independent administrator, who changed nothing, may approve.
+    other, other_client = other_admin
+    assert admin.post(f"/users/{temp_user['id']}/reset-link").status_code == 200       # the first change
+    with second_admin(admin) as (puppet, puppet_client):
+        held = puppet_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD})
+        assert held.status_code == 202, held.text
+        req_id = held.json()["held_changes"][0]["request"]["id"]
+        r = admin.post(f"/admin/credential-requests/{req_id}/approve")
+        assert r.status_code == 403, r.text
+        assert f"You made {puppet['_username']} an administrator" in r.json()["detail"], r.text
+        row = _request_for(admin, temp_user["id"])
+        assert row["can_approve"] is False and "you made" in row["cannot_approve"], row
+        assert psql(f"SELECT status FROM credential_changes WHERE id='{req_id}'") == "held"
+        ok = other_client.post(f"/admin/credential-requests/{req_id}/approve")
+        assert ok.status_code == 200, ok.text
+    refusals = admin.get("/audit/log", params={"action": "credential_change_approval_refused",
+                                               "limit": 500}).json()
+    mine = [a for a in refusals if (a.get("details") or {}).get("change_id") == req_id]
+    assert [a["details"]["reason"] for a in mine] == ["maker"], mine
+
+
+def test_who_made_or_approved_a_change_to_the_account_cannot_approve_the_next(admin, temp_user, other_admin,
+                                                                             third_admin):
+    # Rule 2 on its own: the module's independent administrator makes the first change, the session's
+    # administrator asks for the second; the first may not approve it, a third may. Having approved it,
+    # the third may not approve a further change either.
+    other, other_client = other_admin
+    third, third_client = third_admin
+    assert other_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    held = admin.post(f"/users/{temp_user['id']}/reset-link")
+    assert held.status_code == 202, held.text
+    req_id = held.json()["request"]["id"]
+    r = other_client.post(f"/admin/credential-requests/{req_id}/approve")
+    assert r.status_code == 403, r.text
+    assert "You changed this account's sign-in details" in r.json()["detail"], r.text
+    assert "you changed this account" in _request_for(other_client, temp_user["id"])["cannot_approve"]
+    assert third_client.post(f"/admin/credential-requests/{req_id}/approve").status_code == 200
+
+    # A third change: the session's administrator asked for the second and the third administrator
+    # approved it, so neither may approve this one. With no other administrator on the stack who may,
+    # it is refused and the refusal names them; with one, it waits and the third is refused.
+    held = other_client.post(f"/users/{temp_user['id']}/ssh-keys", json={"name": "k", "public_key": _ssh_key()})
+    if held.status_code == 409:
+        detail = held.json()["detail"]
+        assert third["_username"] in detail and "sign-in details in the last 14 days" in detail, detail
+        return
+    assert held.status_code == 202, held.text
+    req_id = held.json()["request"]["id"]
+    r = third_client.post(f"/admin/credential-requests/{req_id}/approve")
+    assert r.status_code == 403 and "or approved a change to them" in r.json()["detail"], r.text
+    r = admin.post(f"/admin/credential-requests/{req_id}/approve")
+    assert r.status_code == 403 and "or approved a change to them" in r.json()["detail"], r.text
+    assert admin.post(f"/admin/credential-requests/{req_id}/deny").status_code == 200
+
+
+def test_an_approver_must_have_been_an_administrator_for_fourteen_days(admin, temp_user, other_admin):
+    # Rule 4: an administrator independent in every other way, but made one 13 days before the request,
+    # may not approve it; 15 days before, it may.
+    other, other_client = other_admin
+    assert other_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    with second_admin(admin, independent=True) as (recent, recent_client):
+        make_independent(recent["id"], days=13)
+        held = other_client.post(f"/users/{temp_user['id']}/reset-link")
+        assert held.status_code == 202, held.text
+        req_id = held.json()["request"]["id"]
+        r = recent_client.post(f"/admin/credential-requests/{req_id}/approve")
+        assert r.status_code == 403 and "for less than 14 days" in r.json()["detail"], r.text
+        row = _request_for(recent_client, temp_user["id"])
+        assert row["can_approve"] is False and "less than 14 days" in row["cannot_approve"], row
+        make_independent(recent["id"], days=15)
+        assert recent_client.post(f"/admin/credential-requests/{req_id}/approve").status_code == 200
+
 
 def test_an_administrator_made_after_the_request_cannot_approve_it(admin, temp_user, other_admin):
     # Made by someone other than the one who asked, but after the request: still refused.
     other, other_client = other_admin
-    assert admin.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
+    assert other_client.patch(f"/users/{temp_user['id']}", json={"password": NEW_PASSWORD}).status_code == 200
     held = other_client.post(f"/users/{temp_user['id']}/reset-link")
     assert held.status_code == 202, held.text
     req_id = held.json()["request"]["id"]

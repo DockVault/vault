@@ -321,3 +321,44 @@ def test_accepting_an_administrators_invitation_records_who_invited(admin, invit
         assert row == f"{me['username']}|{me['id']}"
     finally:
         _cleanup_user(admin, uname)
+
+
+@pytest.mark.parametrize("fate", ["demoted", "deleted"])
+def test_an_administrators_invitation_keeps_its_inviters_lineage(admin, invites_on, fate):
+    # An administrator the session's administrator made invites a new administrator, and is demoted (which
+    # deletes their record) or deleted before the invitation is accepted. The new administrator used to
+    # descend from the inviter alone, or from nobody, so the session's administrator dropped out of its
+    # lineage and could have approved through it. The invitation keeps the lineage from when it was made.
+    me = admin.get("/users/me").json()
+    inviter = admin.create_user(role="admin")
+    inviter_client = ApiClient()
+    inviter_client.login(inviter["_username"], inviter["_password"])
+    uname = unique("invlin")
+    inv = _mint(inviter_client, username=uname, role="admin")
+    try:
+        kept = _psql(f"SELECT inviter_lineage::text FROM account_invitations "
+                     f"WHERE token_prefix={_q(inv['token_prefix'])}")
+        assert inviter["id"] in kept and me["id"] in kept, kept
+        if fate == "demoted":
+            assert admin.patch(f"/users/{inviter['id']}", json={"role": "user"}).status_code == 200
+            assert _psql(f"SELECT count(*) FROM admin_grants WHERE user_id={_q(inviter['id'])}") == "0"
+        else:
+            admin.delete_user(inviter["id"])
+        r = _anon().post(f"/invites/{inv['token']}/accept", json={"password": STRONG_PW})
+        assert r.status_code == 200, r.text
+        lineage = _psql("SELECT g.lineage::text FROM admin_grants g "
+                        f"JOIN users u ON u.id = g.user_id WHERE u.username={_q(uname)}")
+        assert inviter["id"] in lineage and me["id"] in lineage, lineage
+    finally:
+        _cleanup_user(admin, uname)
+        if fate == "demoted":
+            admin.delete_user(inviter["id"])
+
+
+def test_a_user_invitation_keeps_no_lineage(admin, invites_on):
+    inv = _mint(admin, username=unique("invplain"), role="user")
+    try:
+        assert _psql(f"SELECT inviter_lineage IS NULL FROM account_invitations "
+                     f"WHERE token_prefix={_q(inv['token_prefix'])}") == "t"
+    finally:
+        admin.delete(f"/invites/{inv['id']}")

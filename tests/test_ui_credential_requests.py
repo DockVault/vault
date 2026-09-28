@@ -21,7 +21,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
-from _account_change_helpers import psql
+from _account_change_helpers import make_independent, psql
 
 pytestmark = pytest.mark.ui
 
@@ -69,10 +69,12 @@ def test_another_administrators_request_is_approved_from_the_block(page: Page, a
     uid = temp_user["id"]
     new_email = f"{unique('approved')}@example.com"
     # Asked by another administrator: not the shared admin, who made page_admin an administrator and
-    # so could not have its request approved by it.
+    # so could not have its request approved by it. page_admin is made one that may approve it
+    # (_independent): the shared admin made both, a moment ago.
     asker_account = admin.create_user(role="admin")
     asker = ApiClient(BASE_URL)
     asker.login(asker_account["_username"], asker_account["_password"])
+    _independent(page_admin, asker_account["id"])
     try:
         assert asker.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
         held = asker.patch(f"/users/{uid}", json={"email": new_email})             # the second: held
@@ -104,6 +106,9 @@ def test_another_administrators_request_is_approved_from_the_block(page: Page, a
 def test_a_held_change_made_on_a_phone_shows_as_waiting_and_can_be_withdrawn(page: Page, admin, page_admin,
                                                                            temp_user, skin):
     uid, name = temp_user["id"], temp_user["_username"]
+    # The shared admin made page_admin a moment ago, so could not approve its request, and the second
+    # change would be refused rather than held: page_admin is made independent of it (make_independent).
+    make_independent(page_admin["id"])
     asker = ApiClient(BASE_URL)
     asker.login(page_admin["_username"], page_admin["_password"])
     first = asker.patch(f"/users/{uid}", json={"email": f"{unique('first')}@example.com"})
@@ -170,15 +175,10 @@ def _independent(approver, requester_id):
     """Make ``approver`` an administrator ``requester_id`` may be approved by: one the requester did not
     make and that is not in the requester's own lineage, and one of long standing. An administrator
     the shared admin creates here is none of those: its record names the shared admin as its maker, and
-    it was made a moment ago. So its record is rewritten in the database, as if the server's operator
-    had made it an administrator 15 days ago with the host tool: no maker among the administrators, no
-    lineage. It has made no change to the account it approves for."""
-    psql(f"UPDATE admin_grants SET granted_by_id = NULL, granted_by_name = 'operator@host', "
-         f"granted_at = (now() AT TIME ZONE 'utc') - interval '15 days', lineage = '[]' "
-         f"WHERE user_id = '{approver['id']}'")
-    assert psql(f"SELECT granted_by_id IS NULL, lineage::text, "
-                f"granted_at < (now() AT TIME ZONE 'utc') - interval '14 days' "
-                f"FROM admin_grants WHERE user_id = '{approver['id']}'") == "t|[]|t"
+    it was made a moment ago. So its record is rewritten in the database (make_independent), as if the
+    server's operator had made it an administrator 15 days ago with the host tool: no maker among the
+    administrators, no lineage. It has made no change to the account it approves for."""
+    make_independent(approver["id"])
     assert psql(f"SELECT count(*) FROM admin_grants WHERE user_id = '{requester_id}' "
                 f"AND lineage::text LIKE '%{approver['id']}%'") == "0", "the approver made the requester"
 
@@ -249,6 +249,8 @@ def test_an_administrator_the_asker_made_is_told_why_there_is_no_approve(page: P
     asker = ApiClient(BASE_URL)
     asker.login(asker_account["_username"], asker_account["_password"])
     puppet = asker.create_user(role="admin")
+    # So that the shared admin may approve the asker's request, and it waits rather than being refused.
+    make_independent(asker_account["id"])
     try:
         assert asker.post(f"/users/{uid}/reset-link").status_code == 200           # the first change
         held = asker.patch(f"/users/{uid}", json={"email": f"{unique('madeby')}@example.com"})

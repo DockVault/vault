@@ -87,8 +87,10 @@ def test_a_second_factor_reset_from_the_host(admin, temp_user):
 
 def test_the_host_approves_a_held_change(admin, temp_user):
     uid, name = temp_user["id"], temp_user["_username"]
-    with second_admin(admin) as (_other, other_client):
-        assert admin.patch(f"/users/{uid}", json={"email": f"{name}-a@example.com"}).status_code == 200
+    with second_admin(admin, independent=True) as (_other, other_client):
+        # Both changes by the second administrator: the session's administrator could approve the second,
+        # so it waits (with nobody who could, it would be refused outright).
+        assert other_client.patch(f"/users/{uid}", json={"email": f"{name}-a@example.com"}).status_code == 200
         held = other_client.patch(f"/users/{uid}", json={"email": f"{name}-b@example.com"})
         assert held.status_code == 202, held.text
         request_id = held.json()["held_changes"][0]["request"]["id"]

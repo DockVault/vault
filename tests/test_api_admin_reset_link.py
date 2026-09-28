@@ -61,10 +61,10 @@ def test_minting_again_invalidates_the_previous_link(admin):
     # administrator; approving it mints the new link and hands it to the approver.
     u = admin.create_user(role="user", email=None)
     try:
-        t1 = _token_from_link(admin.post(f"/users/{u['id']}/reset-link").json()["reset_link"])
-        with second_admin(admin) as (_other, other_client):
-            # Asked by the second administrator and approved by the first: an administrator may not
-            # approve a request from one they made, but the reverse is fine.
+        with second_admin(admin, independent=True) as (_other, other_client):
+            # Both links asked for by the second administrator, the second approved by the first, who
+            # made no change to the account and is independent of the one who asked.
+            t1 = _token_from_link(other_client.post(f"/users/{u['id']}/reset-link").json()["reset_link"])
             held = other_client.post(f"/users/{u['id']}/reset-link")
             assert held.status_code == 202, held.text
             approved = admin.post(f"/admin/credential-requests/{held.json()['request']['id']}/approve")

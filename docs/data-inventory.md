@@ -59,7 +59,7 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `devices`, `device_grants` | Device label, secret hashes, last seen, created, expiry; which vaults it syncs. | Desktop sync. | Until revoked and deleted. | The person deleting the device; deleted with the account. |
 | `password_reset_tokens` | The account, token hash, times, the administrator who created it. | Password reset. | An unused token is replaced when a new one is issued; a used one is kept. | Deleted with the account. |
 | `otp_codes`, `email_change_codes` | The account, the new email address a code was sent to, code hash, attempts, times. | Confirming an email change. | An unused code is replaced when a new one is issued; a used one is kept. | Deleted with the account. |
-| `account_invitations` | The invitee's username, email address and role, token hash, times, who created it, the account it became. | Inviting someone to create an account. | Kept after it is accepted, revoked or expired. The app never deletes it. | The database only (see [Erasing a person](#erasing-a-person)). |
+| `account_invitations` | The invitee's username, email address and role, token hash, times, who created it, the account it became; **new in 0.33.0**, for an administrator's invitation, the ids of the inviter and of the administrators the inviter descends from, as they stood when it was made. | Inviting someone to create an account; the ids keep the two-administrator rule's lineage if the inviter is demoted or deleted before it is accepted. | Kept after it is accepted, revoked or expired. The app never deletes it. | The database only (see [Erasing a person](#erasing-a-person)). |
 
 ### Access and collaboration
 
@@ -97,7 +97,7 @@ Visits to a link and uploads through one are also in the audit log.
 | `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. | Opening the alerts view deletes old resolved alerts, at most once an hour. **Not** deleted with the account. |
 | `rate_limit_records` | An address; for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The periodic cleanup. |
 | `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key); and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The periodic cleanup (every 5 minutes); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
-| `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | An administrator may not approve a change asked for by someone who made them one, directly or through administrators they made, or asked for before they became one. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
+| `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | Who may approve a held change: neither the administrator who asked nor the approver may have made the other one, directly or through administrators they made, and the approver must have been one for 14 days before the request. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
 | `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username; and to every other administrator, that an account became an administrator and who made it one. | Telling people what happened. | Until the person deletes it. | The person; deleted with the account. |
 | `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
@@ -242,8 +242,9 @@ and the unlock state.
    - their username on other accounts' `credential_changes` rows, as the requesting or deciding
      administrator, until those rows are deleted 14 days after the change or decision; and in other
      people's notifications and received notes;
-   - their username on the `admin_grants` record of each administrator they made, while that account
-     stays an administrator;
+   - their username on the `admin_grants` record of each administrator they made, and their id in the
+     lineage of each administrator made through them and of administrators' invitations, while those
+     records are kept;
    - other administrators' saved searches, and earlier exports' recorded filters, that name them;
    - an `account_invitations` row that named them;
    - files they uploaded to other people's vaults (their id is cleared; the file belongs to the
@@ -295,7 +296,8 @@ There is no built-in per-person erasure yet.
   account.
 - `credential_changes`: administrators' requests to change someone's sign-in, with their summary, and
   the address before and after an email change, each kept for 14 days after the change or decision.
-- `admin_grants`: who made each administrator one, and when.
+- `admin_grants`: who made each administrator one, and when; and on an administrator's invitation
+  (`account_invitations.inviter_lineage`), the administrators the inviter descends from.
 - Notifications and an email ("Account changed by an administrator") for every administrator's change
   to a person's account, the email going to the old address for an email change and naming the new
   one masked; and a notification and an email ("New administrator") to every other administrator

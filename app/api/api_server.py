@@ -4765,10 +4765,17 @@ async def create_invite(
     # the policy DEFAULT (24) only for the pathological empty-blob case, never the shipped 72.
     expires_at = now + timedelta(hours=int(pol.get("invite_ttl_hours") or 24))
     plaintext, prefix = invitations.mint_invite()
+    # An administrator's invitation keeps the inviter's lineage now, for the two-administrator rule: the
+    # account that accepts it descends from the same administrators even if the inviter is demoted or
+    # deleted before then (app/core/admin_grants.py).
+    inviter_lineage = None
+    if role == RoleEnum.ADMIN.value:
+        from app.core import admin_grants
+        inviter_lineage = admin_grants.lineage_through(db, current_user.id)
     inv = AccountInvitation(
         username=username, email=email, role=role,
         token_prefix=prefix, token_hash=invitations.hash_invite_token(plaintext, pepper),
-        expires_at=expires_at, created_by=current_user.id)
+        expires_at=expires_at, created_by=current_user.id, inviter_lineage=inviter_lineage)
     db.add(inv)
     try:
         db.commit()
@@ -5082,11 +5089,13 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     # (h) Grant the role's default permissions inside this same transaction (commit=False).
     grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
     # An administrator's invitation makes an administrator: recorded as made by whoever invited (who
-    # held the link, and could have accepted it themselves), for the two-administrator rule.
+    # held the link, and could have accepted it themselves), for the two-administrator rule, with the
+    # lineage the invitation kept when it was made, so an inviter demoted or deleted since does not
+    # shorten it.
     inviter = db.get(User, inv.created_by) if (role == RoleEnum.ADMIN and inv.created_by) else None
     if role == RoleEnum.ADMIN:
         _record_admin_grant(db, user, by=inviter, by_name=inviter.username if inviter is not None
-                            else "an administrator since deleted")
+                            else "an administrator since deleted", inherited=inv.inviter_lineage)
 
     # (i) One commit for the whole accept.
     try:
@@ -5497,16 +5506,18 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
         target_id, target_name = target.id, target.username
         detail = (f"{_earlier_changer(refused.last_change, requester_id)} already changed {target_name}'s "
                   f"sign-in details on {_cc_date(refused.last_change.applied_at)}. A second change within 14 "
-                  "days needs another administrator's approval, and no other administrator may approve it. "
-                  "The person who runs the server can make this change on the host with: "
-                  "python dockvault.py accounts")
+                  "days needs another administrator's approval, and no other administrator may approve it: "
+                  f"{_no_approver_text(refused.refusals, target_name)}. The person who runs the server can "
+                  "make this change on the host with: python dockvault.py accounts")
+        why = sorted({reason for _name, reason in refused.refusals})
         db.rollback()   # the whole request is refused, so nothing it changed may be kept
         try:
             AuditLogger(db).log_action(
                 action="credential_change_refused", status="failure", user=actor,
                 resource_type="user", resource_id=str(target_id),
                 details={"kind": kind, "target_username": target_name,
-                         "reason": "no other administrator can approve a second change"})
+                         "reason": "no other administrator can approve a second change",
+                         "approver_refusals": why})
         except Exception:  # noqa: BLE001 - the refusal stands without its row
             db.rollback()
         raise HTTPException(status_code=409, detail=detail)
@@ -5546,23 +5557,78 @@ def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fing
     return None
 
 
+_OTHERS_CAN = ("Another administrator, or the person who runs the server (python dockvault.py accounts), "
+               "can.")
+
+
 def _approval_refusal_text(reason, requester, *, short=False) -> str:
-    """What an administrator is told when they may not approve a held request (see
-    credential_changes.approval_refusal). ``short`` is the line the Users page shows beside it."""
+    """What an administrator is told when they may not approve a held request, naming the rule that
+    applied (credential_changes.refusal_reason). ``short`` is the line the Users page shows beside it;
+    the long one is the refusal of the approval (403)."""
     from app.core import credential_changes as cc
     if reason == cc.MADE_BY_REQUESTER:
         if short:
             return f"You cannot approve this: {requester} made you an administrator."
         return (f"{requester} made you an administrator, directly or through an administrator they made, "
-                "so you cannot approve their request. Another administrator, or the person who runs the "
-                "server (python dockvault.py accounts), can.")
+                f"so you cannot approve their request. {_OTHERS_CAN}")
+    if reason == cc.MADE_REQUESTER:
+        if short:
+            return f"You cannot approve this: you made {requester} an administrator."
+        return (f"You made {requester} an administrator, directly or through an administrator you made, "
+                f"so you cannot approve their request. {_OTHERS_CAN}")
+    if reason == cc.CHANGED_ACCOUNT:
+        if short:
+            return "You cannot approve this: you changed this account's sign-in details in the last 14 days."
+        return ("You changed this account's sign-in details, or approved a change to them, within 14 days "
+                f"of this request, so you cannot approve another change to it. {_OTHERS_CAN}")
     if reason == cc.BECAME_ADMIN_AFTER:
         if short:
             return "You cannot approve this: you became an administrator after it was asked for."
         return ("You became an administrator after this request was made, so you cannot approve it. An "
                 "administrator who was one before it, or the person who runs the server (python "
                 "dockvault.py accounts), can.")
+    if reason == cc.NEW_ADMIN:
+        if short:
+            return "You cannot approve this: you had been an administrator for less than 14 days."
+        return ("You had been an administrator for less than 14 days when this request was made, so you "
+                "cannot approve it. An administrator of longer standing, or the person who runs the "
+                "server (python dockvault.py accounts), can.")
     return "A change you asked for needs another administrator's approval. You can withdraw it."
+
+
+def _names_text(names) -> str:
+    """alice; alice and bob; alice, bob and carol; the first five and how many more."""
+    names = list(names)
+    if len(names) > 5:
+        names = names[:5] + [f"{len(names) - 5} more"]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _no_approver_text(refusals, target_name) -> str:
+    """Why nobody may approve a second change (credential_changes.NoApprover), one clause per rule that
+    applied, naming the administrators it applied to."""
+    from app.core import credential_changes as cc
+    if not refusals:
+        return "there is no other administrator who can sign in"
+    by_reason = {}
+    for name, reason in refusals:
+        by_reason.setdefault(reason, []).append(name)
+    def admins(names):
+        return "an administrator" if len(names) == 1 else "administrators"
+
+    clauses = []
+    made = by_reason.get(cc.MADE_BY_REQUESTER)
+    if made:
+        clauses.append(f"you made {_names_text(made)} {admins(made)}")
+    if by_reason.get(cc.MADE_REQUESTER):
+        clauses.append(f"{_names_text(by_reason[cc.MADE_REQUESTER])} made you an administrator")
+    if by_reason.get(cc.CHANGED_ACCOUNT):
+        clauses.append(f"{_names_text(by_reason[cc.CHANGED_ACCOUNT])} changed {target_name}'s sign-in "
+                       "details in the last 14 days")
+    recent = by_reason.get(cc.NEW_ADMIN, []) + by_reason.get(cc.BECAME_ADMIN_AFTER, [])
+    if recent:
+        clauses.append(f"{_names_text(recent)} became {admins(recent)} less than 14 days ago")
+    return "; ".join(clauses)
 
 
 def _credential_request_dict(change, target_username, viewer_id=None, db=None) -> dict:
@@ -5744,14 +5810,16 @@ def _notify_account_status_changes(db, user, *, by_name, locked=None, active=Non
                                change=f"An administrator changed your role from {role[0]} to {role[1]}.", by=by)
 
 
-def _record_admin_grant(db, user, *, by, by_name=None) -> None:
+def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     """``user`` has just become an administrator, made so by ``by`` (a User, or None for the host
     operator): record who and when, in the caller's transaction, for the two-administrator rule
-    (app/core/admin_grants.py). Call it only on the change INTO the role."""
+    (app/core/admin_grants.py). ``inherited`` is an invitation's kept lineage. Call it only on the
+    change INTO the role."""
     from app.core import admin_grants
     from app.core import credential_changes as cc
     admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
-                        granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR))
+                        granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR),
+                        inherited=inherited)
 
 
 def _announce_admin_granted(db, user, *, by_name, how) -> None:
@@ -5771,8 +5839,9 @@ def _announce_admin_granted(db, user, *, by_name, how) -> None:
         # No time in the text: the notice's own time is shown beside it, in the reader's zone, and a
         # second one in UTC read as a different time. The email has no other, so it keeps its own.
         _notify_users([str(a.id) for a in others], "administrator_added", title="A new administrator",
-                      body=(f"{what} An administrator can change other people's accounts. If you did not "
-                            "expect this, check the Users page at once."),
+                      body=(f"{what} An administrator can change other people's accounts, and after 14 "
+                            "days can approve other administrators' changes to people's sign-in details. "
+                            "If you did not expect this, check the Users page at once."),
                       target="#users")
         _fire_action_email_bulk(db, "administrator_added", [(a.email, a.username) for a in others],
                                 {"change": what, "by": by, "when": when})
@@ -10391,7 +10460,7 @@ async def list_credential_requests(
     db: Session = Depends(get_db),
 ):
     """The credential changes waiting for a second administrator's approval, oldest first. Each says
-    whether the viewer may approve it: anyone but the administrator who asked."""
+    whether the viewer may approve it, and when not, which rule applied (credential_changes.refusal_reason)."""
     from app.core import credential_changes as cc
     rows = cc.open_requests(db)
     names = dict(db.query(User.id, User.username).filter(
@@ -10409,9 +10478,11 @@ async def approve_credential_request(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """Approve a held credential change: it is made as it was asked for. The administrator who asked
-    cannot approve it, nor an administrator they made one, nor one made an administrator after the
-    request (app/core/admin_grants.py)."""
+    """Approve a held credential change: it is made as it was asked for. Only an administrator
+    independent of it may: not the one who asked, not one who made a change to that account within 14
+    days of the request, not one in the asker's lineage nor with the asker in theirs, and one who had
+    been an administrator for 14 days when it was asked for (app/core/credential_changes.py). The
+    refusal (403) says which of those applied."""
     from app.core import credential_changes as cc
     change, target = _open_credential_request(db, change_id)
     refusal = cc.approval_refusal(db, change, current_user.id)
@@ -23572,6 +23643,9 @@ END $$;""",
             # An administrator's second-factor reset asks the user to set the factor up again at the
             # next sign-in. Nullable, so a rollback to a release that does not know it is unaffected.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS second_factor_reset_at TIMESTAMP",
+            # An administrator's invitation keeps its inviter's lineage from the moment it is made, for
+            # the two-administrator rule (app/core/admin_grants.py). Nullable, for the same reason.
+            "ALTER TABLE account_invitations ADD COLUMN IF NOT EXISTS inviter_lineage JSON",
             # DB-backed login throttle (RateLimitRecord, used when Redis is down):
             # first collapse any duplicate (identifier, action) rows, then add the
             # UNIQUE constraint the ON CONFLICT upsert relies on. create_all adds it

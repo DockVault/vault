@@ -49,15 +49,34 @@ def in_api_container(source: str, *, check=True) -> subprocess.CompletedProcess:
 
 
 @contextmanager
-def second_admin(admin):
-    """Another administrator account, signed in. Deleted afterwards."""
+def second_admin(admin, *, independent=False):
+    """Another administrator account, signed in. Deleted afterwards. ``independent``: made one that may
+    approve the session's administrator's changes, and have its own approved by it (make_independent)."""
     account = admin.create_user(role="admin")
+    if independent:
+        make_independent(account["id"])
     client = ApiClient(BASE_URL)
     client.login(account["_username"], account["_password"])
     try:
         yield account, client
     finally:
         admin.delete_user(account["id"])
+
+
+def make_independent(admin_id, *, days=15):
+    """Make an administrator a test created independent of every other one, and of long standing, as
+    far as approving a held change goes (app/core/credential_changes.py).
+
+    An administrator a test creates is neither: its record names its creator as its maker (so neither
+    may approve the other's changes), and it was made a moment ago (an approver must have been one for
+    14 days before the request). So its record is rewritten in the database, as if the server's
+    operator had made it an administrator ``days`` ago with the host tool: no maker among the
+    administrators, no lineage."""
+    psql(f"UPDATE admin_grants SET granted_by_id = NULL, granted_by_name = 'operator@host', "
+         f"granted_at = (now() AT TIME ZONE 'utc') - interval '{int(days)} days', lineage = '[]' "
+         f"WHERE user_id = '{admin_id}'")
+    assert psql(f"SELECT granted_by_id IS NULL, lineage::text FROM admin_grants "
+                f"WHERE user_id = '{admin_id}'") == "t|[]", "no record to rewrite"
 
 
 def notifications(client, ntype=None):

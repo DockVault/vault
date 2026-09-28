@@ -7,6 +7,7 @@ records here. Every other administrator is told, in the app and by email, when a
 administrator. test_credential_change_rule.py covers the rule; test_credential_change_rule_live.py
 drives the routes on a running stack."""
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -195,3 +196,120 @@ def test_the_refusal_of_a_second_change_says_no_other_administrator_may_approve(
     detail = refused.value.detail
     assert "no other administrator may approve it" in detail and "dockvault.py accounts" in detail, detail
     assert "active" not in detail, detail
+    assert "you made puppet an administrator" in detail, "it says which rule applied, to whom"
+
+
+def test_the_refusal_of_a_second_change_names_each_rule_that_applied(db):
+    alice, carol = _user(db, "alice"), _user(db, "carol", role=RoleEnum.USER)
+    now = cc.utcnow()
+    fresh = _user(db, "fresh")
+    admin_grants.record(db, fresh.id, granted_by_id=None, granted_by_name=cc.HOST_OPERATOR,
+                        now=now - timedelta(days=3))
+    maker = _user(db, "maker")
+    admin_grants.record(db, alice.id, granted_by_id=maker.id, granted_by_name="maker",
+                        now=now - timedelta(days=40))
+    changer = _user(db, "changer")
+    cc.record_made(db, kind=cc.PASSWORD, target_id=carol.id, requester_id=changer.id, requester_name="changer")
+    db.commit()
+    from fastapi import HTTPException
+    from app.core.models import AuditLog
+    AuditLog.__table__.create(db.get_bind())
+    with pytest.raises(HTTPException) as refused:
+        api._credential_change(db, alice, carol, cc.RESET_LINK, summary="s", payload={"delivery": "copy"})
+    detail = refused.value.detail
+    assert refused.value.status_code == 409, detail
+    for words in ("maker made you an administrator", "changer changed carol's sign-in details in the last 14 days",
+                  "fresh became an administrator less than 14 days ago"):
+        assert words in detail, (words, detail)
+    (row,) = db.query(AuditLog).filter(AuditLog.action == "credential_change_refused").all()
+    assert row.details["approver_refusals"] == sorted([cc.MADE_REQUESTER, cc.CHANGED_ACCOUNT, cc.NEW_ADMIN])
+
+
+def test_the_refusal_names_several_administrators_in_plain_words():
+    text = api._no_approver_text([("a", cc.MADE_BY_REQUESTER), ("b", cc.MADE_BY_REQUESTER), ("c", cc.NEW_ADMIN),
+                                  ("d", cc.BECAME_ADMIN_AFTER)], "carol")
+    assert text == "you made a and b administrators; c and d became administrators less than 14 days ago"
+    many = [(f"x{i}", cc.CHANGED_ACCOUNT) for i in range(7)]
+    said = api._no_approver_text(many, "carol")
+    assert said == "x0, x1, x2, x3, x4 and 2 more changed carol's sign-in details in the last 14 days"
+    assert api._no_approver_text([], "carol") == "there is no other administrator who can sign in"
+
+
+@pytest.mark.parametrize("reason,short,long", [
+    (cc.MADE_BY_REQUESTER, "alice made you an administrator", "alice made you an administrator"),
+    (cc.MADE_REQUESTER, "you made alice an administrator", "You made alice an administrator"),
+    (cc.CHANGED_ACCOUNT, "you changed this account's sign-in details in the last 14 days",
+     "within 14 days of this request"),
+    (cc.BECAME_ADMIN_AFTER, "after it was asked for", "after this request was made"),
+    (cc.NEW_ADMIN, "for less than 14 days", "for less than 14 days when this request was made"),
+])
+def test_each_refusal_of_an_approval_says_its_rule_in_plain_words(reason, short, long):
+    assert short in api._approval_refusal_text(reason, "alice", short=True)
+    text = api._approval_refusal_text(reason, "alice")
+    assert long in text and "dockvault.py accounts" in text, text
+
+
+def test_the_list_says_when_the_viewer_changed_the_account_or_is_new(db):
+    alice, carol = _user(db, "alice"), _user(db, "carol", role=RoleEnum.USER)
+    changer, fresh = _user(db, "changer"), _user(db, "fresh")
+    admin_grants.record(db, fresh.id, granted_by_id=None, granted_by_name=cc.HOST_OPERATOR,
+                        now=cc.utcnow() - timedelta(days=1))
+    cc.record_made(db, kind=cc.PASSWORD, target_id=carol.id, requester_id=changer.id, requester_name="changer")
+    change = cc.hold(db, kind=cc.RESET_LINK, target_id=carol.id, requester_id=alice.id, requester_name="alice",
+                     summary="s", payload={"delivery": "copy"})
+    db.commit()
+    as_changer = api._credential_request_dict(change, "carol", changer.id, db=db)
+    assert as_changer["can_approve"] is False and "changed this account" in as_changer["cannot_approve"]
+    as_fresh = api._credential_request_dict(change, "carol", fresh.id, db=db)
+    assert as_fresh["can_approve"] is False and "less than 14 days" in as_fresh["cannot_approve"]
+
+
+def test_the_approve_route_refuses_the_mirror_and_records_why(db, monkeypatch):
+    # Alice made the first change and the account that asks for the second; she may not approve it.
+    from fastapi import HTTPException
+    from _async_run import run_coroutine
+    from app.core.models import AuditLog
+    AuditLog.__table__.create(db.get_bind())
+    monkeypatch.setattr(api, "_enforce_step_up", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_approve_credential_change", lambda *a, **k: pytest.fail("approved"))
+    alice, carol = _user(db, "alice"), _user(db, "carol", role=RoleEnum.USER)
+    puppet = _user(db, "puppet")
+    admin_grants.record(db, puppet.id, granted_by_id=alice.id, granted_by_name="alice")
+    cc.record_made(db, kind=cc.PASSWORD, target_id=carol.id, requester_id=alice.id, requester_name="alice")
+    change = cc.hold(db, kind=cc.RESET_LINK, target_id=carol.id, requester_id=puppet.id,
+                     requester_name="puppet", summary="s", payload={"delivery": "copy"})
+    db.commit()
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(api.approve_credential_request(
+            change_id=change.id, request=SimpleNamespace(headers={}, client=None), current_user=alice, db=db))
+    assert refused.value.status_code == 403
+    assert "You made puppet an administrator" in refused.value.detail, refused.value.detail
+    (row,) = db.query(AuditLog).filter(AuditLog.action == "credential_change_approval_refused").all()
+    assert row.details["reason"] == cc.MADE_REQUESTER
+
+
+def test_an_invitation_keeps_its_inviters_lineage_through_a_demotion_or_a_deletion(db):
+    # The review's third and fourth bypasses: the inviter's record went with a demotion, or the
+    # inviter with a deletion, before the invitation was accepted, and the new administrator lost the
+    # administrators the inviter descended from. The invitation keeps that lineage from when it was made.
+    alice, p = _user(db, "alice"), _user(db, "p")
+    admin_grants.record(db, p.id, granted_by_id=alice.id, granted_by_name="alice")
+    db.commit()
+    kept = admin_grants.lineage_through(db, p.id)
+    assert kept == [str(p.id), str(alice.id)]
+    assert admin_grants.lineage_through(db, None) == [], "the host operator's invitation has none"
+
+    admin_grants.forget(db, p.id)                                   # p demoted
+    demoted = _user(db, "via-demoted")
+    admin_grants.record(db, demoted.id, granted_by_id=p.id, granted_by_name="p", inherited=kept)
+    assert admin_grants.of(db, [demoted.id])[demoted.id].lineage == [str(p.id), str(alice.id)]
+
+    deleted = _user(db, "via-deleted")                              # p deleted: no maker left to read
+    admin_grants.record(db, deleted.id, granted_by_id=None, granted_by_name="an administrator since deleted",
+                        inherited=kept)
+    grant = admin_grants.of(db, [deleted.id])[deleted.id]
+    assert grant.lineage == [str(p.id), str(alice.id)]
+    assert admin_grants.made_by(grant, alice.id)
+    # And the kept lineage never names the account itself, nor repeats anyone.
+    admin_grants.record(db, alice.id, granted_by_id=p.id, granted_by_name="p", inherited=kept + [str(p.id)])
+    assert admin_grants.of(db, [alice.id])[alice.id].lineage == [str(p.id)]

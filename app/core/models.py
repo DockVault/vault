@@ -1402,6 +1402,12 @@ class AccountInvitation(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     created_by = Column(UUID(as_uuid=True),
                         ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    # An administrator's invitation: the lineage the account that accepts it gets, kept from the moment
+    # it was made (the inviter's id, then the administrators the inviter descends from), so demoting or
+    # deleting the inviter before it is accepted cannot shorten it (app/core/admin_grants.py). NULL for
+    # any other invitation, and for one made before this column existed. Added to existing deployments
+    # by the lightweight migrations; a release that does not know it ignores it.
+    inviter_lineage = Column(JSON, nullable=True)
 
     __table_args__ = (
         Index('idx_account_invitation_prefix', 'token_prefix'),

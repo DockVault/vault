@@ -13,10 +13,25 @@ approve, and it expires after 7 days. With no other administrator who could appr
 change is refused, and the person who runs the server can make it on the host (``dockvault.py
 accounts``), where it is recorded as the host operator's.
 
-A different administrator means one the requester did not make: not made an administrator by the
-requester (directly, or through an administrator the requester made), and not made one after the
-request was asked for (app/core/admin_grants.py). Otherwise one administrator could create a second
-administrator account and approve their own second change with it.
+A different administrator means one independent of the change (refusal_reason, with the records in
+app/core/admin_grants.py). The approver:
+  1. is not the administrator who asked;
+  2. made no credential change to that account (asked for one that was made, or approved one) in the
+     14 days before the request, or since. Otherwise the administrator who made the first change could
+     approve the second through someone else's request: make an administrator account, ask as it, and
+     approve as themselves;
+  3. is not in the lineage of the one who asked, and the one who asked is not in theirs: neither made
+     the other an administrator, directly or through administrators they made;
+  4. had been an administrator for at least 14 days when the request was made. An administrator from
+     before these records existed, and the first one the server set up, count as long-standing. This
+     closes what the lineage alone cannot: two accounts one administrator made for the purpose (neither
+     in the other's lineage), and an administrator whose maker was demoted or deleted.
+
+The residual, accepted: someone who creates several administrator accounts and waits 14 days can then
+approve their own changes through them. Every step of that is visible: every administrator is told when
+an administrator is created or promoted, and the user is told of every change to their sign-in
+details, held or made. A stricter rule (no maker in common) would leave a deployment whose first
+administrator made all the others with no approver but the host tool.
 
 Why: taking over an account takes two credential changes (move its email, then reset its password;
 reset its password, then its second factor). One administrator acting alone, or one whose session was
@@ -31,12 +46,14 @@ change (and the approval that applies a held one) live in app/api/api_server.py 
 :func:`decide` first.
 """
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from app.core.models import CredentialChange, RoleEnum, User
 
 WINDOW = timedelta(days=14)
 HOLD = timedelta(days=7)
+# How long an approver must have been an administrator before the request was made.
+TENURE = timedelta(days=14)
 
 # The name the records, the audit log and the notifications use for whoever runs the server, acting
 # through `dockvault.py accounts`. A username may not contain '@', so no account can carry it.
@@ -75,11 +92,13 @@ APPLIED = (MADE, APPROVED)
 
 class NoApprover(Exception):
     """A second change in the window, and no administrator other than the one asking could approve
-    it. Carries the change that opened the window."""
+    it. Carries the change that opened the window, and why each other administrator who can sign in
+    may not approve: ``refusals`` is [(username, reason)], empty when there is no such administrator."""
 
-    def __init__(self, last_change: CredentialChange):
+    def __init__(self, last_change: CredentialChange, refusals=None):
         super().__init__("no other administrator can approve")
         self.last_change = last_change
+        self.refusals = list(refusals or [])
 
 
 def utcnow() -> datetime:
@@ -150,29 +169,86 @@ def can_approve(admin) -> bool:
             and not admin_locked(admin))
 
 
-# Why an administrator may not approve a held request (approval_refusal), each with what the refusal
-# says.
+# Why an administrator may not approve a held request (refusal_reason), in the order they are checked.
+# Each is said in plain words on the Users page, in the refusal of an approval (403), and in the refusal
+# of a second change nobody may approve (409): see app/api/api_server.py.
 ASKED = "asked"                  # the administrator who asked
-MADE_BY_REQUESTER = "made"       # made an administrator by the one who asked
-BECAME_ADMIN_AFTER = "after"     # made an administrator after the request was asked for
+MADE_BY_REQUESTER = "made"       # the one who asked made them an administrator (rule 3)
+MADE_REQUESTER = "maker"         # they made the one who asked an administrator (rule 3, the other way)
+CHANGED_ACCOUNT = "changed"      # they made or approved a change to that account (rule 2)
+BECAME_ADMIN_AFTER = "after"     # they became an administrator after the request was made (rule 4)
+NEW_ADMIN = "new"                # they had been one for less than TENURE when it was made (rule 4)
 
 
-def approvers(db, requester_id, change: Optional[CredentialChange] = None) -> List[User]:
-    """The administrators who could approve a change asked for by ``requester_id``: active, able to sign
-    in, not the one asking, and not made an administrator by the one asking. With ``change``, also not
-    made an administrator after it was asked for."""
-    from app.core import admin_grants
-    admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
-    grants = admin_grants.of(db, [a.id for a in admins])
-    out = []
-    for a in admins:
-        grant = grants.get(a.id)
-        if a.id == requester_id or not can_approve(a) or admin_grants.made_by(grant, requester_id):
-            continue
-        if change is not None and admin_grants.granted_after(grant, change.requested_at):
-            continue
-        out.append(a)
+def changers(db, target_id, since: datetime) -> Set:
+    """The administrators who made a credential change to ``target_id`` applied after ``since``: who
+    asked for it, and, for a held change that was approved, who approved it. Either one made it happen."""
+    rows = (db.query(CredentialChange.requested_by_id, CredentialChange.decided_by_id, CredentialChange.status)
+            .filter(CredentialChange.target_user_id == target_id,
+                    CredentialChange.status.in_(APPLIED),
+                    CredentialChange.applied_at.isnot(None),
+                    CredentialChange.applied_at > since)
+            .all())
+    out = set()
+    for requested_by, decided_by, status in rows:
+        if requested_by is not None:
+            out.add(requested_by)
+        if status == APPROVED and decided_by is not None:
+            out.add(decided_by)
     return out
+
+
+def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant, changed: Set,
+                   requested_at: datetime) -> Optional[str]:
+    """Why ``approver_id`` may not approve a change ``requester_id`` asked for at ``requested_at``, or
+    None when they may (the module docstring has the four rules). ``approver_grant`` and
+    ``requester_grant`` are their admin_grants records (None: none); ``changed`` is changers() for the
+    account since 14 days before the request."""
+    from app.core import admin_grants
+    if approver_id == requester_id:
+        return ASKED
+    if admin_grants.made_by(approver_grant, requester_id):
+        return MADE_BY_REQUESTER
+    if admin_grants.made_by(requester_grant, approver_id):
+        return MADE_REQUESTER
+    if approver_id in changed:
+        return CHANGED_ACCOUNT
+    if admin_grants.granted_after(approver_grant, requested_at):
+        return BECAME_ADMIN_AFTER
+    if admin_grants.granted_after(approver_grant, requested_at - TENURE):
+        return NEW_ADMIN
+    return None
+
+
+def refusals(db, requester_id, *, target_id=None, requested_at: Optional[datetime] = None,
+             now: Optional[datetime] = None) -> Dict:
+    """{administrator: why they may not approve, or None when they may} for every administrator other
+    than ``requester_id`` who could sign in, for a change to ``target_id`` asked for at ``requested_at``
+    (default now). Without ``target_id`` the changes already made to an account are not looked at."""
+    from app.core import admin_grants
+    now = now or utcnow()
+    requested_at = requested_at or now
+    admins = [a for a in db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
+              if a.id != requester_id and can_approve(a)]
+    grants = admin_grants.of(db, [a.id for a in admins] + [requester_id])
+    changed = changers(db, target_id, min(requested_at, now) - WINDOW) if target_id is not None else set()
+    return {a: refusal_reason(a.id, requester_id=requester_id, approver_grant=grants.get(a.id),
+                              requester_grant=grants.get(requester_id), changed=changed,
+                              requested_at=requested_at)
+            for a in admins}
+
+
+def approvers(db, requester_id, change: Optional[CredentialChange] = None, *, target_id=None,
+              now: Optional[datetime] = None) -> List[User]:
+    """The administrators who could approve a change asked for by ``requester_id``: able to sign in,
+    and independent of it (the module docstring's four rules). With ``change``, the change held; with
+    ``target_id``, a change to that account asked for now."""
+    if change is not None:
+        found = refusals(db, requester_id, target_id=change.target_user_id,
+                         requested_at=change.requested_at, now=now)
+    else:
+        found = refusals(db, requester_id, target_id=target_id, now=now)
+    return [a for a, reason in found.items() if reason is None]
 
 
 def _lock_account(db, target_id) -> None:
@@ -186,9 +262,9 @@ def decide(db, *, requester_id, target_id, now: Optional[datetime] = None) -> Op
     be made now.
 
     Returns None when it may: no change was applied to the account within the window. Returns the
-    change that opened the window when this one must be held instead. Raises :class:`NoApprover` when
-    it would have to be held but nobody could approve it. The host operator is the way round the rule,
-    so a change it asks for is never held.
+    change that opened the window when this one must be held instead. Raises :class:`NoApprover`, with
+    why each other administrator may not approve, when it would have to be held but nobody could
+    approve it. The host operator is the way round the rule, so a change it asks for is never held.
 
     Call it before applying anything, in the transaction that will apply or hold the change."""
     now = now or utcnow()
@@ -198,8 +274,9 @@ def decide(db, *, requester_id, target_id, now: Optional[datetime] = None) -> Op
     last = last_applied(db, target_id, now)
     if last is None:
         return None
-    if not approvers(db, requester_id):
-        raise NoApprover(last)
+    found = refusals(db, requester_id, target_id=target_id, requested_at=now, now=now)
+    if not any(reason is None for reason in found.values()):
+        raise NoApprover(last, sorted((a.username, reason) for a, reason in found.items()))
     return last
 
 
@@ -242,20 +319,22 @@ def may_approve(change: CredentialChange, approver_id) -> bool:
     return approver_id is None or approver_id != change.requested_by_id
 
 
-def approval_refusal(db, change: CredentialChange, approver_id) -> Optional[str]:
-    """Why ``approver_id`` may not approve ``change`` (ASKED, MADE_BY_REQUESTER or BECAME_ADMIN_AFTER),
+def approval_refusal(db, change: CredentialChange, approver_id, now: Optional[datetime] = None) -> Optional[str]:
+    """Why ``approver_id`` may not approve ``change`` (one of the reasons above, see refusal_reason),
     or None when they may. None is the host operator, who may approve any request."""
     from app.core import admin_grants
     if approver_id is None:
         return None
     if approver_id == change.requested_by_id:
         return ASKED
-    grant = admin_grants.of(db, [approver_id]).get(approver_id)
-    if admin_grants.made_by(grant, change.requested_by_id):
-        return MADE_BY_REQUESTER
-    if admin_grants.granted_after(grant, change.requested_at):
-        return BECAME_ADMIN_AFTER
-    return None
+    now = now or utcnow()
+    requested_at = change.requested_at or now
+    grants = admin_grants.of(db, [approver_id, change.requested_by_id])
+    return refusal_reason(approver_id, requester_id=change.requested_by_id,
+                          approver_grant=grants.get(approver_id),
+                          requester_grant=grants.get(change.requested_by_id),
+                          changed=changers(db, change.target_user_id, min(requested_at, now) - WINDOW),
+                          requested_at=requested_at)
 
 
 def _decide(change, status, decider_id, decider_name, now):

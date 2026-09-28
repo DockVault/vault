@@ -61,6 +61,7 @@ def test_the_first_change_in_the_window_may_be_made(db):
 @pytest.mark.parametrize("kind", [cc.PASSWORD, cc.RESET_LINK, cc.SECOND_FACTOR, cc.EMAIL, cc.SSH_KEY])
 def test_a_second_change_of_any_kind_is_held_by_anyone(db, kind):
     alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    dave = _user(db, RoleEnum.ADMIN)       # who may approve bob's: alice made the first change
     first = _made(db, carol, alice, kind=kind)
     db.commit()
     # The same administrator, and a different one: both are the second change to this account.
@@ -263,6 +264,7 @@ def test_an_approved_change_opens_a_new_window_from_its_approval(db):
     # A held change took effect when it was approved, so the 14 days run from then: a change asked for
     # after the first one's window closed still waits, because the approved one opened another.
     alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    _user(db, RoleEnum.ADMIN)              # who may approve bob's: alice asked, bob approved
     now = cc.utcnow()
     first = _made(db, carol, alice, now=now - timedelta(days=13))
     held = cc.hold(db, kind=cc.EMAIL, target_id=carol.id, requester_id=alice.id,
@@ -376,9 +378,115 @@ def test_an_administrator_made_after_the_request_cannot_approve_it(db):
     _grant(db, late, bob, now=now)                      # made by someone else, but after the request
     assert cc.approval_refusal(db, change, late.id) == cc.BECAME_ADMIN_AFTER
     early = _user(db, RoleEnum.ADMIN)
-    _grant(db, early, bob, now=now - timedelta(hours=2))
+    _grant(db, early, bob, now=now - timedelta(days=15))
     assert cc.approval_refusal(db, change, early.id) is None
     assert {a.id for a in cc.approvers(db, alice.id, change)} == {bob.id, early.id}
+
+
+def test_an_approver_must_have_been_an_administrator_for_fourteen_days_before_the_request(db):
+    # Rule 4. Closes an administrator made for the purpose by someone the lineage does not lead to.
+    alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    change = _held_by(db, alice, carol, now=now)
+    for days, reason in ((13, cc.NEW_ADMIN), (15, None)):
+        x = _user(db, RoleEnum.ADMIN)
+        _grant(db, x, bob, now=now - timedelta(days=days))
+        assert cc.approval_refusal(db, change, x.id) == reason, days
+    # Measured to the request, not to the approval: made 13 days before it, 20 days before now.
+    older = _held_by(db, alice, carol, now=now - timedelta(days=7))
+    y = _user(db, RoleEnum.ADMIN)
+    _grant(db, y, bob, now=now - timedelta(days=20))
+    assert cc.approval_refusal(db, older, y.id) == cc.NEW_ADMIN
+    # An administrator from before the records existed, and the first one, have no record: long-standing.
+    assert cc.approval_refusal(db, change, bob.id) is None
+
+
+def test_the_administrator_who_made_the_first_change_cannot_approve_the_second(db):
+    # Rule 2, the mirror: alice makes the first change and an administrator account, asks for the
+    # second as that account and approves it as herself. Also an administrator she did not make.
+    alice, carol = _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    _made(db, carol, alice, now=now - timedelta(days=1))
+    db.commit()
+    puppet, independent = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN)
+    _grant(db, puppet, alice, now=now - timedelta(days=30))
+    _grant(db, independent, None, now=now - timedelta(days=30))
+    for asker in (puppet, independent):
+        change = _held_by(db, asker, carol, now=now)
+        expected = cc.MADE_REQUESTER if asker is puppet else cc.CHANGED_ACCOUNT
+        assert cc.approval_refusal(db, change, alice.id) == expected, asker.username
+    # Who approved an earlier held change made it too; so is one made 14 days before the request.
+    dave, erin = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN)
+    held = _held_by(db, independent, carol, now=now - timedelta(days=3))
+    cc.approve(held, approver_id=dave.id, approver_name=dave.username, now=now - timedelta(days=2))
+    db.commit()
+    change = _held_by(db, independent, carol, now=now)
+    assert cc.approval_refusal(db, change, dave.id) == cc.CHANGED_ACCOUNT
+    assert cc.approval_refusal(db, change, erin.id) is None
+    assert cc.approval_refusal(db, change, alice.id) == cc.CHANGED_ACCOUNT
+    old = _user(db)
+    _made(db, old, alice, now=now - timedelta(days=15))
+    db.commit()
+    assert cc.approval_refusal(db, _held_by(db, independent, old, now=now), alice.id) is None
+
+
+def test_the_mirror_is_refused_outright_when_nobody_else_may_approve(db):
+    # The review's first bypass: alice, the only real administrator, makes the first change and an
+    # administrator account; the second change asked for as that account had alice as its approver.
+    alice, carol = _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    puppet = _user(db, RoleEnum.ADMIN, username="puppet")
+    _grant(db, puppet, alice, now=now - timedelta(days=30))
+    _made(db, carol, alice, now=now - timedelta(hours=1))
+    db.commit()
+    with pytest.raises(cc.NoApprover) as refused:
+        cc.decide(db, requester_id=puppet.id, target_id=carol.id, now=now)
+    assert refused.value.refusals == [(alice.username, cc.MADE_REQUESTER)]
+
+
+def test_neither_may_be_in_the_others_lineage(db):
+    # Rule 3, both ways: an administrator the asker made, and the administrator who made the asker.
+    root, carol = _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    mid, leaf = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN)
+    _grant(db, mid, root, now=now - timedelta(days=40))
+    _grant(db, leaf, mid, now=now - timedelta(days=30))
+    by_leaf = _held_by(db, leaf, carol, now=now)
+    assert cc.approval_refusal(db, by_leaf, mid.id) == cc.MADE_REQUESTER
+    assert cc.approval_refusal(db, by_leaf, root.id) == cc.MADE_REQUESTER
+    by_root = _held_by(db, root, carol, now=now)
+    assert cc.approval_refusal(db, by_root, leaf.id) == cc.MADE_BY_REQUESTER
+
+
+def test_siblings_made_for_the_purpose_cannot_approve_each_other_for_fourteen_days(db):
+    # The review's second bypass: alice makes P1 and P2; P2 asks and P1 approves. Neither is in the
+    # other's lineage, so rule 4 is what refuses it. After 14 days it is the accepted residual: every
+    # administrator was told of each new one, and the user of every change.
+    alice, carol = _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    p1, p2 = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN)
+    _grant(db, p1, alice, now=now - timedelta(days=1))
+    _grant(db, p2, alice, now=now - timedelta(days=1))
+    assert cc.approval_refusal(db, _held_by(db, p2, carol, now=now), p1.id) == cc.NEW_ADMIN
+    later = now + timedelta(days=15)
+    assert cc.approval_refusal(db, _held_by(db, p2, carol, now=later), p1.id, now=later) is None
+
+
+def test_a_second_change_nobody_may_approve_carries_why_each_may_not(db):
+    alice, carol = _user(db, RoleEnum.ADMIN, username="alice"), _user(db)
+    now = cc.utcnow()
+    made = _user(db, RoleEnum.ADMIN, username="made")
+    _grant(db, made, alice, now=now - timedelta(days=30))
+    fresh = _user(db, RoleEnum.ADMIN, username="fresh")
+    _grant(db, fresh, None, now=now - timedelta(days=2))
+    changer = _user(db, RoleEnum.ADMIN, username="changer")
+    _user(db, RoleEnum.ADMIN, username="locked", is_locked=True, locked_until=None)
+    _made(db, carol, changer, now=now - timedelta(days=1))
+    db.commit()
+    with pytest.raises(cc.NoApprover) as refused:
+        cc.decide(db, requester_id=alice.id, target_id=carol.id, now=now)
+    assert refused.value.refusals == [("changer", cc.CHANGED_ACCOUNT), ("fresh", cc.NEW_ADMIN),
+                                      ("made", cc.MADE_BY_REQUESTER)], "an administrator's lock is left out"
 
 
 def test_one_administrator_with_accounts_they_made_is_refused_a_second_change(db):
@@ -397,10 +505,10 @@ def test_a_demotion_forgets_who_made_the_administrator(db):
     from app.core import admin_grants
     alice, bob, carol, x = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db), _user(db, RoleEnum.ADMIN)
     now = cc.utcnow()
-    _grant(db, x, alice, now=now - timedelta(days=3))
+    _grant(db, x, alice, now=now - timedelta(days=30))
     admin_grants.forget(db, x.id)
     db.commit()
-    _grant(db, x, bob, now=now - timedelta(days=2))     # made one again, by bob this time
+    _grant(db, x, bob, now=now - timedelta(days=20))    # made one again, by bob this time
     change = _held_by(db, alice, carol, now=now)
     assert cc.approval_refusal(db, change, x.id) is None
     assert admin_grants.of(db, [x.id])[x.id].lineage == [str(bob.id)]

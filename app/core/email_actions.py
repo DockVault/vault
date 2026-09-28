@@ -162,8 +162,9 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p>Hi {{user.username}},</p>"
             "<p>{{action.change}}</p>"
             "<p>When: {{action.when}}</p>"
-            "<p>An administrator can change other people's accounts. If you did not expect this, check "
-            "the Users page at once.</p>"
+            "<p>An administrator can change other people's accounts, and after 14 days can approve other "
+            "administrators' changes to people's sign-in details. If you did not expect this, check the "
+            "Users page at once.</p>"
             "<hr>"
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
