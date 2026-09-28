@@ -2796,7 +2796,7 @@
         shown.forEach((c, i) => {
             const pressed = chosen.has(c.key);
             const row = rankRow({
-                key: 'cat-' + c.key, label: c.label, count: c.count, failed: c.failed, max, barWidth: 56,
+                key: 'cat-' + c.key, label: c.label, count: c.count, failed: c.failed, max, barWidth: 36,
                 pressed, cls: (pressed ? 'is-sel' : (anyChosen ? 'is-dim' : '')) + (i === pinned.length - 1 && rankedShown.length ? ' is-pin-last' : ''),
                 aria: `${c.label}, ${plural(c.count, 'event', 'events')}, ${nf(c.failed)} failed or refused`,
                 title: `${c.label}: ${plural(c.count, 'event', 'events')}, ${nf(c.failed)} failed or refused. Click to filter.`,

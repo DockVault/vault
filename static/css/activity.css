@@ -101,11 +101,12 @@
 
 /* Now is at least 136 px and grows, out of the space the charts would share, to fit its widest row: with
    a two-digit count "Temp. credentials" needs about 146 px in Console and 142 px in Classic. Growing
-   takes only free space, so the minimums still sum to 972 px and the band stays one row from a 980 px
-   section. */
+   takes only free space, so the minimums (956 px) still fit a 980 px section and the band stays one row
+   there. Events is mostly empty space between its columns, so By category takes a larger share: its
+   labels ("Sign-in and sessions", "Temporary credentials") fit whole in both skins. */
 .act-band {
     display: grid; position: relative; margin: 0 0 12px;
-    grid-template-columns: minmax(136px, max-content) minmax(276px, 2fr) minmax(208px, 1.3fr) minmax(160px, 1fr) minmax(192px, 1.4fr);
+    grid-template-columns: minmax(136px, max-content) minmax(236px, 1.6fr) minmax(232px, 1.5fr) minmax(160px, 1fr) minmax(192px, 1.4fr);
     grid-template-areas: "now time cat signin active";
     background: var(--surface-0); border: 1px solid var(--act-line); border-radius: var(--radius-md);
 }
@@ -216,14 +217,19 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 .act-tip-when { color: var(--text-tertiary); }
 .act-tip-go { margin-top: 6px; pointer-events: auto; }
 
-/* Ranked rows: By category and Most active */
-.act-rank { display: flex; flex-direction: column; }
+/* Ranked rows: By category and Most active. The rows share their panel's columns (subgrid), so the bars
+   line up and the count column is as wide as the widest count and no wider: the label gets the rest. */
+.act-rank {
+    display: grid; grid-template-columns: minmax(0, 1fr) var(--act-rank-bar, 36px) max-content;
+    grid-auto-rows: max-content; align-content: start; column-gap: 6px;
+}
+.act-active .act-rank { --act-rank-bar: 40px; }
+.act-rank > * { grid-column: 1 / -1; }
 .act-rank-row {
-    position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 56px 40px; align-items: center; gap: 6px;
+    position: relative; display: grid; grid-template-columns: subgrid; align-items: center;
     width: 100%; height: var(--act-row-h); padding: 0 0 0 6px; background: none; border: 0; text-align: left; cursor: pointer;
     font-size: 12px; color: var(--text-secondary);
 }
-.act-active .act-rank-row { grid-template-columns: minmax(0, 1fr) 40px 40px; }
 .act-rank-row:hover .act-rank-label { color: var(--text-primary); }
 .act-rank-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .act-rank-count { text-align: right; color: var(--text-primary); font-variant-numeric: tabular-nums; }
@@ -234,7 +240,7 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 .act-rank-row.is-dim, .act-signin-row.is-dim { opacity: .55; }
 .act-rank-row.is-pin-last { border-bottom: 1px solid var(--act-line); }
 .act-rank-row.is-noaccount .act-rank-label, .act-rank-row.is-legacy .act-rank-label { color: var(--text-tertiary); }
-.act-rank-more { align-self: flex-start; height: var(--act-row-h); margin-left: 6px; }
+.act-rank-more { justify-self: start; height: var(--act-row-h); margin-left: 6px; }
 .act-hbar { display: block; }
 
 /* Sign-ins */
@@ -567,8 +573,10 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 /* ---- tablet: 600 to 979 px of section --------------------------------------------------------- */
 
 @container act (width < 980px) {
+    /* Sign-ins needs the least room on the second row; By category and Most active share the rest, so
+       their labels ("Temporary credentials", "Names with no account") fit whole. */
     .act-band {
-        grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1fr) minmax(150px, .72fr) minmax(0, 1fr);
         grid-template-areas: "time time now" "cat signin active";
     }
     .act-panel + .act-panel { border-left: 0; }

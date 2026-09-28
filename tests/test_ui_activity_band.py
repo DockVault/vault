@@ -271,3 +271,39 @@ def test_the_now_panel_fits_four_digit_counts_without_widening_the_band(page: Pa
         return {overflow: band.scrollWidth - band.clientWidth, rows: new Set(tops.map(Math.round)).size};
     }""")
     assert one_row == {"overflow": 0, "rows": 1}, one_row
+
+
+
+def _cut(page: Page, selectors):
+    return page.evaluate("""(sel) => Array.from(document.querySelectorAll(sel))
+        .filter((e) => e.offsetParent && e.scrollWidth > e.clientWidth + 0.5).map((e) => e.textContent.trim())""",
+                         selectors)
+
+
+@pytest.mark.parametrize("skin", ["v2", "v1"])
+@pytest.mark.parametrize("width,height", [(1440, 900), (1280, 800), (1024, 768)])
+def test_the_band_labels_fit_at_desktop_and_tablet_widths(page: Page, activity_admin, skin, width, height):
+    """Every panel title, Most active's beside its People and Addresses choice (which wraps under the
+    title where the two do not fit on one line), is read whole in both skins. On a 1440 px desktop and a
+    1024 px tablet so are By category's labels and "Names with no account", with three-digit counts:
+    the band is made to hold the longest category labels there are."""
+    def longest(route):
+        response = route.fetch()
+        body = response.json()
+        body["categories"] = [{"key": k, "label": label, "count": 900 - i, "failed": 40} for i, (k, label) in enumerate((
+            ("temp_credentials", "Temporary credentials"), ("sign_in", "Sign-in and sessions"),
+            ("security", "Security and denials"), ("zero_knowledge", "Zero-knowledge keys"),
+            ("vaults", "Vaults and access"), ("files", "Files and folders"), ("administration", "Administration")))]
+        body["top_users"] = [{"username": "ana", "count": 120, "failed": 3}]
+        body["no_account"] = {"total": 999, "failed": 990}
+        route.fulfill(response=response, json=body)
+
+    page.route(re.compile(r".*/activity/summary(\?.*)?$"), longest)
+    page.add_init_script(f"try {{ localStorage.setItem('ui', '{skin}'); }} catch (e) {{}}")
+    login(page, activity_admin, width=width, height=height)
+    open_activity(page)
+    expect(page.locator("#act-p-cat .act-rank-row").first).to_contain_text("Temporary credentials")
+    expect(page.locator("#act-p-active .act-rank-row.is-noaccount")).to_be_visible()
+    assert _cut(page, ".act-ptitle-text, .act-toggle") == []
+    if width != 1280:
+        assert _cut(page, "#act-p-cat .act-rank-label, #act-p-active .act-rank-row.is-noaccount .act-rank-label") == []
