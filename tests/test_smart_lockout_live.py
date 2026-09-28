@@ -8,7 +8,9 @@ second and third source addresses are requests sent from inside the stack's own 
     another, and a sign-in from the paused address is refused before its password is checked;
   * failures from several addresses reaching the account-wide limit pause sign-ins from everywhere;
   * a burst of wrong passwords from several addresses at once, over the web and SFTP together, has
-    no more of them checked than the account-wide limit: each attempt is counted before its check;
+    no more of them checked than the account-wide limit: attempts on one account take turns, each
+    seeing what the one before counted;
+  * twelve SFTP sign-ins at once with the right password all succeed, each waiting its turn;
   * an automatic lock never ends a session, a live-monitor socket, a device's sync or an open SFTP
     session; an administrator's lock still ends them all;
   * SFTP password and key sign-ins follow the same locks, and SFTP failures count toward them;
@@ -297,8 +299,8 @@ def test_a_burst_of_guesses_from_several_addresses_gets_no_more_checks_than_the_
     """Wrong passwords fired at once from three addresses, over the web and SFTP together: the web
     container itself and the SFTP container (web sign-ins from inside each), and the host (SFTP
     connections). Each address may make the login limit's worth (3), 9 in all, and all 9 are in flight
-    together. Counted after the password check, as before, every attempt already past the lock check was
-    checked, so more than the backstop (6) were; counted before it, exactly the backstop are, and the rest
+    together. Counted after the password check without turns, every attempt already past the lock check
+    was checked, so more than the backstop (6) were; taking turns, exactly the backstop are, and the rest
     are refused unchecked. users.failed_login_attempts counts the wrong passwords that were checked."""
     import subprocess
     from _account_change_helpers import API, REDIS
@@ -353,3 +355,148 @@ def test_a_burst_of_guesses_from_several_addresses_gets_no_more_checks_than_the_
     checked = int(psql(f"SELECT failed_login_attempts FROM users WHERE id='{uid}'"))
     assert checked == backstop, f"{checked} wrong passwords were checked; the backstop is {backstop}"
     assert lock_rows(uid)["*"] == (backstop, True), lock_rows(uid)
+
+
+_SFTP_AT_ONCE_SCRIPT = '''
+import json, os, sys, threading, time
+import paramiko, redis
+host, port, name, password, n, gate = (sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]),
+                                       sys.argv[6])
+r = redis.Redis(host=os.environ.get("REDIS_HOST", "vault-redis"), port=int(os.environ.get("REDIS_PORT", "6379")),
+                password=os.environ.get("REDIS_PASSWORD") or None)
+transports = []
+for _ in range(n):
+    t = paramiko.Transport((host, port))
+    t.banner_timeout = 30
+    t.start_client(timeout=30)
+    transports.append(t)
+print("ready", flush=True)
+deadline = time.time() + 60
+while not r.get(gate):
+    if time.time() > deadline:
+        sys.exit(3)
+    time.sleep(0.002)
+out, lock = [], threading.Lock()
+def attempt(t):
+    began = time.monotonic()
+    try:
+        t.auth_password(name, password)
+        ok = t.is_authenticated()
+    except Exception:
+        ok = False
+    with lock:
+        out.append([ok, round(time.monotonic() - began, 3)])
+    t.close()
+threads = [threading.Thread(target=attempt, args=(t,)) for t in transports]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(90)
+print(json.dumps(out), flush=True)
+'''
+
+
+def test_twelve_sftp_sign_ins_at_once_with_the_right_password_all_succeed(admin, temp_user,
+                                                                         record_testsuite_property):
+    """What the desktop app and SFTP clients do: several connections at once, one account, one password.
+    Attempts on one account take turns, so they wait for each other instead of being refused: all twelve
+    sign in. Six come from this host and six from inside the web container, because one address may hold
+    at most SFTP_MAX_CONNECTIONS_PER_IP (10 by default) connections that have not signed in yet. How long
+    the last one took is recorded in the report (longest_sign_in_seconds), beside the quickest.
+
+    The sign-in throttle (RATE_LIMIT_LOGIN_ATTEMPTS a name may try from one address in its window,
+    right or wrong) is set high on a test stack; with the shipped 5 it refuses the sixth before any
+    turn is taken. The SFTP server's settings cache is waited out first, so small limits an earlier
+    test set are gone."""
+    import subprocess
+    import threading
+    from _account_change_helpers import API, REDIS
+    uid, name, pw = temp_user["id"], temp_user["_username"], temp_user["_password"]
+    time.sleep(6)
+    reset_sign_in_throttle()
+    gate = f"test_sftp_gate:{uuid.uuid4().hex}"
+    inside = subprocess.Popen(["docker", "exec", "-i", API, "python", "-c", _SFTP_AT_ONCE_SCRIPT, "vault-sftp",
+                               "2222", name, pw, "6", gate],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert inside.stdout.readline().strip() == "ready", inside.stderr.read()[-600:]
+    transports = []
+    for _ in range(6):
+        t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        t.banner_timeout = 30
+        t.start_client(timeout=30)
+        transports.append(t)
+    here, lock = [], threading.Lock()
+
+    def attempt(t):
+        began = time.monotonic()
+        try:
+            t.auth_password(name, pw)
+            ok = t.is_authenticated()
+        except (paramiko.SSHException, EOFError, OSError):
+            ok = False
+        with lock:
+            here.append([ok, round(time.monotonic() - began, 3)])
+        t.close()
+
+    threads = [threading.Thread(target=attempt, args=(t,)) for t in transports]
+    opened = subprocess.run(["docker", "exec", REDIS, "redis-cli", "SET", gate, "1", "EX", "120"],
+                            capture_output=True, text=True, timeout=30)
+    assert opened.returncode == 0, opened.stderr
+    for t in threads:
+        t.start()
+    out, err = inside.communicate(timeout=120)
+    assert inside.returncode == 0, err[-600:]
+    for t in threads:
+        t.join(90)
+    everyone = here + json.loads(out.strip().splitlines()[-1])
+    took = sorted(seconds for _ok, seconds in everyone)
+    record_testsuite_property("sftp_sign_ins_at_once", len(everyone))
+    record_testsuite_property("longest_sign_in_seconds", took[-1])
+    record_testsuite_property("quickest_sign_in_seconds", took[0])
+    assert len(everyone) == 12 and all(ok for ok, _s in everyone), everyone
+    assert lock_rows(uid) == {}, "a right password counts nothing"
+
+
+def test_attempts_on_one_account_take_turns_in_the_database(admin, temp_user):
+    """The turn on PostgreSQL: a lock held by one attempt's transaction, which another attempt on the
+    same account waits for, and one on another account does not. A wait past its bound is refused as
+    busy, and the connection's own lock timeout is back as it was after the turn is taken."""
+    from _account_change_helpers import in_api_container
+    me = admin.get("/users/me").json()["id"]
+    script = f"""
+import json, time
+from sqlalchemy import text
+from app.core.database import SessionLocal
+from app.core import sign_in_lockout as L
+a, b = SessionLocal(), SessionLocal()
+out = {{}}
+L.take_turn(a, {temp_user['id']!r})
+out["timeout_after"] = a.execute(text("SHOW lock_timeout")).scalar()
+began = time.monotonic()
+L.take_turn(b, {me!r})
+out["other_account_waited"] = round(time.monotonic() - began, 2)
+b.commit()
+L.TURN_WAIT_SECONDS = 1
+began = time.monotonic()
+try:
+    L.take_turn(b, {temp_user['id']!r})
+    out["busy"] = False
+except L.Busy as e:
+    out["busy"], out["waited"], out["retry_after"] = True, round(time.monotonic() - began, 2), e.retry_after
+out["timeout_on_the_next"] = b.execute(text("SHOW lock_timeout")).scalar()
+b.commit()
+a.commit()
+began = time.monotonic()
+L.take_turn(b, {temp_user['id']!r})
+out["after_the_first_ended"] = round(time.monotonic() - began, 2)
+b.commit()
+a.close()
+b.close()
+print(json.dumps(out))
+"""
+    got = json.loads(in_api_container(script).stdout.strip().splitlines()[-1])
+    assert got["timeout_after"] == "5s", got
+    assert got["other_account_waited"] < 0.5, got
+    assert got["busy"] is True and 0.9 <= got["waited"] < 3 and got["retry_after"] == 5, got
+    assert got["timeout_on_the_next"] == "5s", got
+    assert got["after_the_first_ended"] < 0.5, got

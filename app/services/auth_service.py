@@ -533,20 +533,46 @@ class AuthService:
             user = self.db.query(User).filter(User.username == username).first()
 
         if not user:
-            # A name that is no account is refused at the same point an account's automatic lock
-            # would refuse it, and counted before the stand-in check as an account's attempt is
-            # (both in the cache, one attempt after another), so being refused never tells whether an
-            # account exists, however many attempts arrive at once.
-            phantom = sign_in_lockout.phantom_reserve(username, ip_address)
+            # A name that is no account is taken as an account's attempt is: one attempt at a time,
+            # under a hold on the name in the cache (an account's turn), refused at the same point an
+            # account's automatic lock would refuse it, and counted after its stand-in check. So being
+            # refused, when, and how long a burst of attempts takes, never tell whether an account
+            # exists. The stand-in check equalizes each attempt's timing with the real path.
+            try:
+                phantom = sign_in_lockout.phantom_attempt(
+                    username, ip_address, lambda: verify_password(password, _DUMMY_PASSWORD_HASH))
+            except sign_in_lockout.Busy as busy:
+                raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
             if phantom is not None:
                 raise AccountLockedError(_LOCK_REASONS[phantom.scope], locked_until=phantom.locked_until,
                                          scope=phantom.scope)
-            # Equalize timing with the real path so a non-existent username isn't
-            # distinguishable by response time (username-enumeration oracle).
-            verify_password(password, _DUMMY_PASSWORD_HASH)
             self._record_failed_login(username, ip_address)
             raise InvalidCredentialsError("Invalid username or password")
 
+        # Attempts on one account take turns (app/core/sign_in_lockout.py): this one waits for the
+        # account's turn and keeps it through the lock check, the password check and the counting, until
+        # its transaction ends. So each attempt sees what the one before it counted, and however many
+        # arrive at once, over the web and SFTP together, no more passwords are checked than the
+        # backstop allows in about 24 hours; the others wait instead of being refused, so parallel
+        # sign-ins with the right password all succeed. Nothing is counted until a password is wrong,
+        # and an attempt that dies part-way leaves nothing behind.
+        try:
+            sign_in_lockout.take_turn(self.db, user.id)
+        except sign_in_lockout.Busy as busy:
+            raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
+        try:
+            return self._authenticate_in_turn(user, username, password, ip_address)
+        except Exception:
+            # Whatever ended the attempt early ends its turn too, and keeps nothing it had not
+            # committed: a failure is committed with its count, a refusal with its releases.
+            self.db.rollback()
+            raise
+
+    def _authenticate_in_turn(self, user: User, username: str, password: str,
+                              ip_address: str) -> Tuple[User, str]:
+        """authenticate_user for an account, in the account's turn (take_turn), which the transaction's
+        end lets go: a refusal commits the releases it made and raises, a wrong password commits its
+        count, a right one commits its session."""
         # Automatic locks whose time has run out end here, recorded with this sign-in's address:
         # the account row's timed lock from before they moved (an administrator's, with no end,
         # stays), and the address's or the account-wide lock. The releases commit with whatever this
@@ -557,21 +583,14 @@ class AuthService:
 
         # An automatic lock refuses the sign-in BEFORE the password is checked: while it lasts,
         # nobody at that address (or, account-wide, anywhere) can go on guessing. A name that is no
-        # account is refused the same way above, so this answer does not reveal the account.
+        # account is refused the same way above, so this answer does not reveal the account. An
+        # account an administrator locked arms no lock of its own, but a count its failures brought to
+        # the limit refuses the same way, so its guesses stay bounded too.
         lock = sign_in_lockout.lock_in_force(self.db, user.id, ip_address)
+        if lock is None and admin_locked(user):
+            lock = sign_in_lockout.count_at_limit(self.db, user.id, ip_address)
         if lock is not None:
-            raise AccountLockedError(_LOCK_REASONS[lock.scope], locked_until=lock.locked_until,
-                                     scope=lock.scope)
-
-        # The attempt is counted as a failure BEFORE its password is checked, and committed at once:
-        # the next attempt, from anywhere, sees it, and the account-wide count's row lock is let go
-        # before the slow check. An attempt that finds no room left is refused unchecked. So however
-        # many arrive at once, over the web and SFTP together, no more passwords are checked than the
-        # backstop allows in about 24 hours (app/core/sign_in_lockout.py). Counted after the check,
-        # every attempt in flight while the count was below the backstop had its password checked.
-        lock = sign_in_lockout.reserve(self.db, user, ip_address)
-        self.db.commit()
-        if lock is not None:
+            self.db.commit()
             raise AccountLockedError(_LOCK_REASONS[lock.scope], locked_until=lock.locked_until,
                                      scope=lock.scope)
 
@@ -580,22 +599,27 @@ class AuthService:
         # accounts by response body or timing. Every non-success outcome returns the
         # SAME generic message to the caller; the specific reason stays in the audit log only.
         if not verify_password(password, user.password_hash):
-            self._record_failed_login(username, ip_address, user, counted=True)
+            # Counted, and the lock it arms armed, in one commit: the next attempt's turn finds it.
+            self._record_failed_login(username, ip_address, user)
             raise InvalidCredentialsError("Invalid username or password")
 
-        # The password was right: the failure counted for it is given back at once, whatever the
-        # account's state decides below, since a right password is never a guess.
-        sign_in_lockout.give_back(self.db, user.id, ip_address)
-        self.db.commit()
-
         # Credentials are valid — now enforce account state. (The distinct exception type is
-        # for audit / internal handling; the endpoint surfaces a generic message.)
+        # for audit / internal handling; the endpoint surfaces a generic message.) A right password is
+        # never a guess, so nothing was counted for it.
         if account_locked(user):
+            self.db.commit()
             raise AccountLockedError("Account is locked", locked_until=user.locked_until,
                                      scope="administrator" if user.locked_until is None else "timed")
         if not user.is_active:
+            self.db.commit()
             raise InvalidCredentialsError("Account is not active")
-        
+
+        # Reset failed login attempts: the total, and this address's count toward its lock. Set before
+        # the sessions below are written, so they commit with the first of them, in this turn.
+        user.failed_login_attempts = 0
+        sign_in_lockout.clear_after_success(self.db, user.id, ip_address)
+        user.last_login = datetime.now(timezone.utc)
+
         # Check for existing active sessions (only 1 allowed)
         self._terminate_existing_sessions(user.id)
 
@@ -606,15 +630,10 @@ class AuthService:
         # renews it.
         session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
         session_token = self._create_session(user, None, ip_address, expires_at=session_expires_at)
-        
-        # Reset failed login attempts: the total, and this address's count toward its lock.
-        user.failed_login_attempts = 0
-        sign_in_lockout.clear_after_success(self.db, user.id, ip_address)
-        user.last_login = datetime.now(timezone.utc)
         self.db.commit()
 
         return user, session_token
-    
+
     def authenticate_temporary_credential(
         self,
         temp_username: str,
@@ -2184,11 +2203,10 @@ class AuthService:
         identifier: str,
         ip_address: str,
         user: Optional[User] = None,
-        *,
-        counted: bool = False,
     ):
-        """Record a failed login attempt. ``counted``: the attempt was already counted toward the locks
-        before its password was checked (sign_in_lockout.reserve), so only the locks are armed here."""
+        """Record a failed login attempt, and for an account count it toward the automatic locks
+        (app/core/sign_in_lockout.py), arming any its counts reach, in one commit. A sign-in calls it in
+        the account's turn, so the next attempt finds it."""
         # Note: Rate limiting is handled by the RateLimiter class in _check_rate_limit
         # which uses sorted sets for sliding window algorithm.
         # We don't need to manually increment Redis counters here.
@@ -2216,12 +2234,9 @@ class AuthService:
             # arms its lock at its limit and records account_auto_locked with the scope, in this
             # transaction (app/core/sign_in_lockout.py). Neither touches users.is_locked, which is
             # an administrator's alone, so sessions already signed in carry on. An account an
-            # administrator locked is out of use already, and gains no automatic lock on top (its
-            # attempts are still counted before the check, so they are bounded all the same).
-            if not admin_locked(user):
-                if counted:
-                    sign_in_lockout.arm_after_failure(self.db, user, ip_address)
-                else:
-                    sign_in_lockout.record_failure(self.db, user, ip_address)
+            # administrator locked is out of use already, and gains no automatic lock on top; its
+            # failures are still counted, and a count at its limit refuses its next password unchecked
+            # (sign_in_lockout.count_at_limit), so they are bounded all the same.
+            sign_in_lockout.record_failure(self.db, user, ip_address, arm=not admin_locked(user))
 
             self.db.commit()

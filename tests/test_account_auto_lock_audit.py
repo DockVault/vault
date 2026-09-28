@@ -194,7 +194,10 @@ def test_an_administrators_lock_is_never_turned_into_a_timed_one_or_recorded_as_
     count, locked, until = _state(db_factory, uid)
     assert (count, locked, until) == (MAX_ATTEMPTS * 2, True, None)
     assert _rows(db_factory, A.AUTO_LOCKED_ACTION) == []
-    assert _address_lock(db_factory, uid) is None, "an account an administrator locked is not counted"
+    # Its failures are counted, so a sign-in finding the count at its limit is refused unchecked
+    # (test_sign_in_lockout.py), but no automatic lock is armed on top of the administrator's.
+    row = _address_lock(db_factory, uid)
+    assert row.failed_attempts == MAX_ATTEMPTS and row.locked_at is None, "counted, never armed"
 
 
 def test_a_lock_armed_after_an_expired_one_is_recorded(db_factory, limits):

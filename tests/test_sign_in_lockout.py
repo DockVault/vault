@@ -51,7 +51,9 @@ def limits(monkeypatch):
 @pytest.fixture
 def Session():
     with tempfile.TemporaryDirectory() as tmp:
-        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'lockout.db'}")
+        # Attempts on one account take turns (sign_in_lockout.take_turn), here the database's write lock:
+        # a long enough wait for it that a burst of slow checks queues rather than gives up.
+        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'lockout.db'}", connect_args={"timeout": 120})
         for model in (User, AuditLog, SignInLockout):
             model.__table__.create(engine)
         yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -696,12 +698,14 @@ def test_with_both_locks_in_force_both_answer_with_the_account_wide_one(clocked)
     assert seen["real-person"][-1][0] == "account"
 
 
-# --------------------------------------------------------------------------- counted before the check
+# --------------------------------------------------------------------------- one attempt at a time
 #
-# Each attempt takes one failure on both counts before its password is checked, under the account-wide
-# row's lock, and gives it back when the password was right. Counted after the check, every attempt in
-# flight while the count was below the backstop had its password checked: through SFTP's parallel
-# connections, about 2,000 guesses a day instead of the backstop's 20.
+# Attempts on one account take turns: each keeps the account's turn through the lock check, the password
+# check and the counting, so each sees what the one before it counted. Counted after the check without
+# turns, every attempt in flight while the count was below the backstop had its password checked: through
+# SFTP's parallel connections, about 2,000 guesses a day instead of the backstop's 20. Counted before the
+# check and given back after, right passwords beyond the room left were refused, and an attempt that died
+# in between left a failure counted that no lock recorded.
 
 def _counts(Session, uid):
     s = Session()
@@ -711,37 +715,58 @@ def _counts(Session, uid):
         s.close()
 
 
-def _slow_checks(monkeypatch, seconds=0.6):
+class _Checks(list):
+    """The hashes checked, and ``running``: how many checks ran at once, now and at the most."""
+    running = None
+
+
+def _slow_checks(monkeypatch, seconds=0.6, right=False):
     """verify_password, slow enough that every attempt of a burst is in flight at once, recording each
-    hash it was asked to check. Always wrong: a guess."""
+    hash it was asked to check, and how many checks ran at the same moment. A guess unless ``right``, when
+    it answers as the real check does."""
     import threading
     import time
-    checked, lock = [], threading.Lock()
+    real = A.verify_password
+    checked, lock = _Checks(), threading.Lock()
+    running = {"now": 0, "most": 0}
 
     def verify(password, password_hash):
         with lock:
             checked.append(password_hash)
-        time.sleep(seconds)
-        return False
+            running["now"] += 1
+            running["most"] = max(running["most"], running["now"])
+        try:
+            time.sleep(seconds)
+            return real(password, password_hash) if right else False
+        finally:
+            with lock:
+                running["now"] -= 1
 
     monkeypatch.setattr(A, "verify_password", verify)
+    checked.running = running
     return checked
 
 
-def _burst(Session, name, addresses):
+def _burst(Session, name, addresses, password="a-guess"):
     """Sign-in attempts by ``name``, one from each address, all at once, each on its own session and
-    thread as the web and SFTP servers run them. Returns how each ended: "wrong" (its password was
-    checked) or the refusal's scope (refused unchecked)."""
+    thread as the web and SFTP servers run them. Returns how each ended, sorted: "signed in", "wrong" (its
+    password was checked and was wrong), or the refusal's scope (refused unchecked), and how long the last
+    one took."""
     import threading
+    import time
     start, outcomes, lock = threading.Barrier(len(addresses)), [], threading.Lock()
+    took = []
 
     def attempt(address):
         s = Session()
         svc = A.AuthService(s)
         svc._check_rate_limit = lambda *a, **k: None
+        svc._terminate_existing_sessions = lambda *a, **k: None
+        svc._create_session = lambda *a, **k: "session-token"
         start.wait()
+        began = time.monotonic()
         try:
-            svc.authenticate_user(name, "a-guess", address)
+            svc.authenticate_user(name, password, address)
             seen = "signed in"
         except A.AccountLockedError as e:
             seen = e.scope
@@ -751,13 +776,15 @@ def _burst(Session, name, addresses):
             s.close()
         with lock:
             outcomes.append(seen)
+            took.append(time.monotonic() - began)
 
     threads = [threading.Thread(target=attempt, args=(a,)) for a in addresses]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(60)
+        t.join(120)
     assert len(outcomes) == len(addresses), "an attempt did not finish"
+    _burst.longest = max(took)
     return sorted(outcomes)
 
 
@@ -790,8 +817,10 @@ def test_a_burst_from_one_address_gets_no_more_checks_than_the_login_limit(Sessi
 
 
 def test_a_name_that_is_no_account_meets_the_same_budget_in_a_burst(Session, limits, monkeypatch):
-    # Being refused must not tell an account from a name that is none, at once as one by one.
+    # Being refused must not tell an account from a name that is none, at once as one by one; nor may how
+    # long a burst takes: both are checked one at a time, under the account's turn and the name's hold.
     import threading
+    import time
 
     class _HeldStore(_FakeStore):
         """The fake cache, with the hold the real one takes on a name: a lock per key. A read takes a
@@ -802,7 +831,6 @@ def test_a_name_that_is_no_account_meets_the_same_budget_in_a_burst(Session, lim
             self.locks, self.guard = {}, threading.Lock()
 
         def get(self, key):
-            import time
             time.sleep(0.005)
             return super().get(key)
 
@@ -819,56 +847,186 @@ def test_a_name_that_is_no_account_meets_the_same_budget_in_a_burst(Session, lim
     store = _HeldStore(clock)
     monkeypatch.setattr(L, "_phantom_store", lambda: store)
     _add_user(Session, username="real-person")
-    _slow_checks(monkeypatch, seconds=0.4)
+    checked = _slow_checks(monkeypatch, seconds=0.4)
     real = _burst(Session, "real-person", BURST)
+    real_took = _burst.longest
     nobody = _burst(Session, "nobody-here", BURST)
+    nobody_took = _burst.longest
     assert real == nobody, (real, nobody)
     assert nobody.count("wrong") == THRESHOLD * MULTIPLE
+    backstop_checks = THRESHOLD * MULTIPLE * 0.4
+    assert real_took >= backstop_checks and nobody_took >= backstop_checks, (real_took, nobody_took)
+    assert checked.running["most"] == 1, "neither ran two checks at once"
 
 
-def test_a_right_password_gives_back_what_its_attempt_counted(Session, limits):
+def test_attempts_on_one_account_are_checked_one_at_a_time(Session, limits, monkeypatch):
+    # Each keeps the account's turn through its check: two checks never run at once, however many
+    # attempts arrive together.
+    _add_user(Session, username="real-person")
+    _add_user(Session, username="someone-else")
+    checked = _slow_checks(monkeypatch, seconds=0.3, right=True)
+    assert _burst(Session, "real-person", [HOME] * 4, password=PASSWORD) == ["signed in"] * 4
+    assert checked.running["most"] == 1, checked.running
+
+
+def test_a_count_at_its_limit_always_has_its_lock(Session, limits, monkeypatch):
+    # The count and the lock it arms are committed together, in the failure's turn: whenever a count is
+    # at its limit its lock is in force, so an SFTP key sign-in (which checks no password) is refused
+    # exactly when a password would be.
+    uid = _add_user(Session, username="real-person")
+    _slow_checks(monkeypatch, seconds=0.2)
+    _burst(Session, "real-person", [ATTACKER] * 5 + [HOME, CAFE] + [f"203.0.113.{i}" for i in range(1, 6)])
+    s = Session()
+    rows = s.query(SignInLockout).filter(SignInLockout.user_id == uid).all()
+    s.close()
+    full = [r for r in rows if r.failed_attempts >= (THRESHOLD * MULTIPLE if r.source == L.ACCOUNT_WIDE
+                                                     else THRESHOLD)]
+    assert full and all(r.locked_at is not None for r in full), [(r.source, r.failed_attempts, r.locked_at)
+                                                                 for r in rows]
+    assert _lock(Session, uid, ATTACKER) is not None and _lock(Session, uid, HOME).scope == L.SCOPE_ACCOUNT
+
+
+def test_right_passwords_arriving_at_once_from_one_address_all_sign_in(Session, limits, monkeypatch):
+    # The review's first finding here: with a limit of 3, six right passwords at once from one address (an SFTP
+    # client opening several connections) gave 3 signed in and 3 refused as locked. They wait their turn.
+    uid = _add_user(Session, username="owner")
+    _slow_checks(monkeypatch, seconds=0.3, right=True)
+    seen = _burst(Session, "owner", [HOME] * (THRESHOLD + 3), password=PASSWORD)
+    assert seen == ["signed in"] * (THRESHOLD + 3), seen
+    assert _counts(Session, uid) == {}, "a right password is never counted"
+
+
+def test_right_passwords_arriving_at_once_past_the_backstop_all_sign_in(Session, limits, monkeypatch):
+    uid = _add_user(Session, username="owner")
+    _slow_checks(monkeypatch, seconds=0.3, right=True)
+    addresses = [f"198.51.100.{i}" for i in range(1, THRESHOLD * MULTIPLE + 3)]
+    assert _burst(Session, "owner", addresses, password=PASSWORD) == ["signed in"] * len(addresses)
+    assert _counts(Session, uid) == {}
+
+
+def test_twelve_connections_at_once_with_the_right_password_all_sign_in(Session, limits, monkeypatch):
+    # What the desktop app and SFTP clients do: several connections at once, one account, one password.
+    # Each waits for the ones before it; the last waits about eleven checks.
+    _add_user(Session, username="owner")
+    _slow_checks(monkeypatch, seconds=0.2, right=True)
+    assert _burst(Session, "owner", [HOME] * 12, password=PASSWORD) == ["signed in"] * 12
+    assert _burst.longest >= 11 * 0.2, "one at a time: the last one waited for the eleven before it"
+
+
+def test_an_attempt_that_dies_during_its_check_leaves_nothing_counted(Session, limits, monkeypatch):
+    # The review's third finding here: counted before the check, an attempt that died in between (a process
+    # killed, a commit that failed) left its failure counted, and a login limit's worth of them left a
+    # full count no lock recorded, refusing the address with an end that kept moving. Now nothing is
+    # counted before a password is known to be wrong, and a death ends the attempt's transaction.
+    uid = _add_user(Session, username="owner")
+    real = A.verify_password
+
+    def dies(*_a, **_k):
+        raise RuntimeError("the process died")
+
+    monkeypatch.setattr(A, "verify_password", dies)
+    for _ in range(THRESHOLD + 1):
+        with pytest.raises(RuntimeError):
+            _sign_in(Session, uid, HOME)
+    assert _counts(Session, uid) == {} and _lock(Session, uid, HOME) is None
+    monkeypatch.setattr(A, "verify_password", real)
+    assert _sign_in(Session, uid, HOME)[1] == "session-token"
+
+
+def test_an_attempt_that_dies_after_a_right_password_leaves_nothing_counted(Session, limits, monkeypatch):
+    # The review's fourth finding here: a right password whose attempt died before its failure was given back
+    # stayed counted.
+    uid = _add_user(Session, username="owner")
+    s = Session()
+    svc = A.AuthService(s)
+    svc._check_rate_limit = lambda *a, **k: None
+    svc._terminate_existing_sessions = lambda *a, **k: None
+
+    def dies(*_a, **_k):
+        raise RuntimeError("the process died")
+
+    svc._create_session = dies
+    try:
+        for _ in range(THRESHOLD + 1):
+            with pytest.raises(RuntimeError):
+                svc.authenticate_user("owner", PASSWORD, HOME)
+    finally:
+        s.close()
+    assert _counts(Session, uid) == {} and _lock(Session, uid, HOME) is None
+    assert _sign_in(Session, uid, HOME)[1] == "session-token"
+
+
+def test_a_wrong_password_whose_count_fails_to_commit_leaves_nothing_counted(Session, limits, monkeypatch):
+    # Rolled back where it failed: the web's sign-in route goes on to commit its own audit row in the
+    # same session, which would otherwise write the half-made count.
+    uid = _add_user(Session, username="owner")
+    real = L.record_failure
+
+    def fails(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("the commit failed")
+
+    monkeypatch.setattr(L, "record_failure", fails)
+    s = Session()
+    svc = A.AuthService(s)
+    svc._check_rate_limit = lambda *a, **k: None
+    try:
+        for _ in range(THRESHOLD + 1):
+            with pytest.raises(RuntimeError):
+                svc.authenticate_user("owner", "a-guess", HOME)
+            s.commit()
+    finally:
+        s.close()
+    assert _counts(Session, uid) == {}
+    s = Session()
+    assert _user(s, uid).failed_login_attempts == 0, "the total rolls back with its count"
+    s.close()
+
+
+def test_a_right_password_counts_nothing(Session, limits):
     uid = _add_user(Session)
     _fail(Session, uid, ATTACKER)
     _fail(Session, uid, ATTACKER)
     before = _counts(Session, uid)
     _sign_in(Session, uid, HOME)
     after = _counts(Session, uid)
-    assert after[L.ACCOUNT_WIDE] == before[L.ACCOUNT_WIDE] == 2, (before, after)
-    assert HOME not in after or after[HOME] == 0, after
-    # A right password for an account that may not sign in is not a guess either: given back too.
+    assert after == before == {ATTACKER: 2, L.ACCOUNT_WIDE: 2}, (before, after)
+    # A right password for an account that may not sign in is not a guess either.
     s = Session()
     _user(s, uid).is_active = False
     s.commit()
     s.close()
     with pytest.raises(A.InvalidCredentialsError):
         _sign_in(Session, uid, CAFE)
-    after = _counts(Session, uid)
-    assert after[L.ACCOUNT_WIDE] == 2 and after.get(CAFE, 0) == 0, after
+    assert _counts(Session, uid) == before
 
 
-def test_a_full_count_with_attempts_still_being_checked_refuses_unchecked(Session, limits, monkeypatch):
-    # Room is decided by the count, attempts in flight included, not only by a lock in force: until the
-    # attempts being checked fail (and arm the lock) or succeed (and give theirs back), nobody else's
-    # password is checked.
-    uid = _add_user(Session)
-    for i in range(THRESHOLD * MULTIPLE):
-        s = Session()
-        assert L.reserve(s, _user(s, uid), f"203.0.113.{i}") is None
-        s.commit()
-        s.close()
-    assert _lock(Session, uid, HOME) is None, "nothing armed yet: those attempts are still being checked"
+@pytest.mark.parametrize("name", ["owner", "nobody-here"])
+def test_a_turn_not_come_in_time_is_refused_as_busy_and_counts_nothing(Session, limits, monkeypatch, name):
+    # The same refusal for an account whose turn did not come and a name whose hold did not.
+    uid = _add_user(Session, username="owner")
     checked = []
-    monkeypatch.setattr(A, "verify_password", lambda pw, h: checked.append(pw) or True)
-    with pytest.raises(A.AccountLockedError) as refused:
-        _sign_in(Session, uid, HOME)
-    assert refused.value.scope == "account" and refused.value.locked_until is not None
-    assert checked == [], "refused before its password was checked"
-    # One of them turns out right and gives its failure back: there is room again.
+    monkeypatch.setattr(A, "verify_password", lambda pw, h: checked.append(pw) or False)
+
+    def busy(*_a, **_k):
+        raise L.Busy()
+
+    class _Busy(_FakeStore):
+        hold = staticmethod(busy)
+
+    store = _Busy(_Clock())
+    monkeypatch.setattr(L, "take_turn", busy)
+    monkeypatch.setattr(L, "_phantom_store", lambda: store)
     s = Session()
-    L.give_back(s, uid, "203.0.113.0")
-    s.commit()
-    s.close()
-    assert _sign_in(Session, uid, HOME)[1] == "session-token"
+    svc = A.AuthService(s)
+    svc._check_rate_limit = lambda *a, **k: None
+    try:
+        with pytest.raises(A.RateLimitExceededError) as refused:
+            svc.authenticate_user(name, "a-guess", HOME)
+    finally:
+        s.close()
+    assert refused.value.retry_after == L.BUSY_RETRY_SECONDS and "at once" in str(refused.value)
+    assert checked == [] and _counts(Session, uid) == {} and store.values == {}
 
 
 def test_an_administrators_locked_account_is_counted_too(Session, limits, monkeypatch):
@@ -917,7 +1075,8 @@ def test_the_cache_hold_lets_one_attempt_at_a_time_and_fails_open(monkeypatch):
     monkeypatch.setattr(L._CacheStore, "WAIT_SECONDS", 0.05)
     token = store.hold("k")
     assert token and fake.values["k"] == token
-    assert store.hold("k") is None, "a second attempt waits, then goes ahead without the hold"
+    with pytest.raises(L.Busy):
+        store.hold("k")                                   # a second attempt waits, then is refused as busy
     store.release("k", "not-the-token")
     assert fake.values["k"] == token, "only the holder lets go"
     store.release("k", token)
