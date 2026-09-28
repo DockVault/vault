@@ -23264,10 +23264,10 @@ def _run_lightweight_migrations():
             # The name of the temporary credential that wrote a row, kept after the credential is
             # deleted. Nullable: older rows have none and an older release ignores the column.
             "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS temp_credential_name VARCHAR(255)",
-            # The Activity page's username typeahead: a prefix search over every name the log has seen,
-            # in byte order ("C") so a prefix is one contiguous range of the index. Building it on a
-            # large audit log makes the first start of this release slower.
-            'CREATE INDEX IF NOT EXISTS idx_audit_username_prefix ON audit_logs ((lower(username) COLLATE "C"))',
+            # The Activity page's username-typeahead index is NOT in this list: a plain CREATE INDEX
+            # here blocked every audit write, and the web app, for as long as it took to build over
+            # the whole audit log. It is built after startup, concurrently, by
+            # app/core/optional_indexes.py, and is no schema step: the schema is complete without it.
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
@@ -24148,6 +24148,13 @@ async def lifespan(app: FastAPI):
             # advertising it and then serving an empty list (mirrors run_combined.mark_sink_active).
             os.environ.pop("VAULT_LOG_SINK_ACTIVE", None)
             os.environ.pop("VAULT_LOG_SINK_COMPONENTS", None)
+
+    # Indexes that only make something faster, last and off the startup path: they are built
+    # concurrently on a thread of their own while the app serves, so a large audit log never delays
+    # the first answer of a new release. See app/core/optional_indexes.py.
+    from app.core import optional_indexes
+    from app.core.database import _require_engine
+    optional_indexes.start_background_build(_require_engine)
 
     yield
     
