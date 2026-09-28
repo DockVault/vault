@@ -758,7 +758,7 @@
             out.push([`Channel: ${labels.join(', ')}`, labels.join(', '), 'channel', { ch: [] }]);
         }
         if (f.noAccount) {
-            out.push(['Person: names with no account', 'Names typed at failed sign-ins, and deleted accounts', 'person', { noAccount: false }]);
+            out.push(['Person: names with no account', "Names typed at failed sign-ins, deleted accounts, and the server's operator (operator@host)", 'person', { noAccount: false }]);
         } else if (f.user) {
             const t = f.userMatch === 'exact' ? `Person: ${f.user}` : `Person contains: ${f.user}`;
             out.push([t, t, 'person', { user: '', userMatch: 'contains' }]);
@@ -2929,7 +2929,7 @@
                 pressed: x.pressed, cls: (x.pressed ? 'is-sel' : (anyPressed ? 'is-dim' : '')) + (x.kind === 'none' ? ' is-noaccount' : ''),
                 aria: `${x.label}, ${plural(x.count, 'event', 'events')}, ${nf(x.failed)} failed or refused`,
                 title: x.kind === 'none'
-                    ? 'Names typed at failed sign-ins, and deleted accounts. They are counted together, not listed, because people sometimes type a password into the username box.'
+                    ? "Names typed at failed sign-ins, deleted accounts, and the server's operator (operator@host, for a change made from the host). They are counted together, not listed, because people sometimes type a password into the username box."
                     : `${x.label}: ${plural(x.count, 'event', 'events')}, ${nf(x.failed)} failed or refused. Click to filter.`,
                 onClick: () => {
                     if (x.kind === 'none') setState({ f: { noAccount: !S.f.noAccount, user: '', userMatch: 'contains' } });

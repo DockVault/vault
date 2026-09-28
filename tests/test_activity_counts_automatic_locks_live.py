@@ -90,3 +90,19 @@ def test_the_band_counts_both_kinds_of_automatic_lock(admin, temp_user, small_li
     assert sorted(e["details"]["scope"] for e in locks["events"]) == ["account", "address"]
     assert all(e["category"] == "sign_in" and e["username"] == name for e in locks["events"])
 
+
+def test_the_host_operators_changes_are_among_names_with_no_account(admin, temp_user):
+    """The server's operator acts from the host under a name no account may take (operator@host). The
+    Activity page shows that name on the row and counts it with the names that have no account, as the
+    page's help for that group says."""
+    import json
+    import subprocess
+    from _account_change_helpers import API
+    uid, name = temp_user["id"], temp_user["_username"]
+    r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.host_operator",
+                        "reset-second-factor", "--username", name, "--confirm-username", name],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    assert r.returncode == 0 and json.loads(r.stdout.strip().splitlines()[-1])["ok"], r.stdout[-400:]
+    rows = [e for e in _events(admin, "operator@host", no_account="true")["events"]
+            if e["resource_id"] == uid]
+    assert rows and all(e["username"] == "operator@host" and not e["automatic"] for e in rows)

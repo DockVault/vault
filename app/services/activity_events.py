@@ -126,7 +126,8 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
         q = q.filter(AuditLog.username.ilike(f"%{like_escape(username[:MAX_TEXT])}%", escape="\\"))
 
     if no_account:
-        # A name no account had: typed at a failed sign-in, or an account deleted since.
+        # A name no account had: typed at a failed sign-in, an account deleted since, or the server's
+        # operator acting from the host (credential_changes.HOST_OPERATOR, which no account may take).
         q = q.filter(AuditLog.user_id.is_(None), AuditLog.username.isnot(None))
 
     if actions:
