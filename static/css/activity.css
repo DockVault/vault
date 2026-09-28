@@ -376,6 +376,10 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 .activity-table td.act-c-time { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .activity-table td.act-c-ip { font-family: var(--font-mono); font-size: 12px; }
 .act-row { cursor: pointer; }
+/* Every row is one height, a status badge included: 32 px in Console, 38 px in Classic. */
+.activity-table tbody tr.act-row { height: 32px; }
+:root:not([data-ui="v2"]) .activity-table tbody tr.act-row { height: 38px; }
+.activity-table td .badge { padding-top: 0; padding-bottom: 0; line-height: 16px; }
 .activity-table tbody tr.act-row:hover { background: var(--hover-overlay); }
 .activity-table tbody tr.act-row.is-selected { background: var(--act-row-sel); }
 .act-row:focus-visible, .act-card:focus-visible { outline: 2px solid var(--brand-secondary); outline-offset: -2px; }
