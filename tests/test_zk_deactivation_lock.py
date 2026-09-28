@@ -37,7 +37,9 @@ import app.api.api_server as S  # noqa: E402
 import app.api.user_management_api as UM  # noqa: E402
 from app.api.ecc_router import _rekey_owed  # noqa: E402
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO  # noqa: E402
-from app.core.models import CredentialChange, RoleEnum, User, Vault, VaultMemberKey, vault_members  # noqa: E402
+from app.core.models import (  # noqa: E402
+    AccountInvitation, CredentialChange, RoleEnum, User, Vault, VaultMemberKey, vault_members,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -45,13 +47,15 @@ pytestmark = pytest.mark.unit
 @pytest.fixture
 def db():
     """(sessionmaker, locks): a file-backed SQLite database with the tables deactivation touches,
-    and the list of row locks the code asks for, in order, as ("vaults" | "users", sql, params)."""
+    and the list of row locks the code asks for, in order, as ("vaults" | "users" |
+    "account_invitations", sql, params)."""
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'offboard.db'}",
                                   connect_args={"check_same_thread": False})
         # credential_changes: deactivating an administrator withdraws the requests they have open.
+        # account_invitations: and revokes the invitations they made to be an administrator.
         for table in (User.__table__, Vault.__table__, vault_members, VaultMemberKey.__table__,
-                      CredentialChange.__table__):
+                      CredentialChange.__table__, AccountInvitation.__table__):
             table.create(engine)
         # The application's own session flags (app/core/database.py).
         Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -64,7 +68,8 @@ def db():
             compiled = state.statement.compile(dialect=postgresql.dialect())
             sql = str(compiled)
             if "FOR UPDATE" in sql:
-                table = "vaults" if "FROM vaults" in sql else "users" if "FROM users" in sql else sql
+                table = next((t for t in ("vaults", "users", "account_invitations")
+                              if f"FROM {t}" in sql), sql)
                 locks.append((table, sql, compiled.params))
 
         yield Session, locks
@@ -255,6 +260,12 @@ def test_each_route_locks_the_vaults_before_the_administrator_rows(db, monkeypat
     assert tables.index("vaults") < tables.index("users"), (
         f"{route} locked the administrator rows before the vaults: {tables}")
     assert _locked_ids(locks[tables.index("vaults")]) == set(w["shared"])
+    # The leaver's invitations to be an administrator are locked after the administrator rows:
+    # accepting one reads its maker's row under a share lock and then claims the invitation, so the
+    # other order could deadlock with an acceptance.
+    assert "account_invitations" in tables, f"{route} did not revoke the leaver's invitations: {tables}"
+    assert tables.index("users") < tables.index("account_invitations"), (
+        f"{route} locked the invitations before the administrator rows: {tables}")
     # And the deactivation itself went through.
     s = Session()
     try:
