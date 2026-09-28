@@ -13,15 +13,18 @@ Three classes, and an explicit entry for every route that needs more than the JS
   endpoints -- and the routes whose credential is checked only after the body has been read: device
   sync (a device secret) and second-factor enrollment (a session or a pending sign-in). Every one of
   them takes a handful of short fields.
-- JSON_LIMIT (1 MiB): every other route.
+- JSON_LIMIT (1 MiB): every other route, for a caller who is signed in (below). Every one of these
+  routes needs a session, so a caller who has none meets PUBLIC_LIMIT there too: nothing larger than
+  64 KiB is read on any route before its caller is known, not even to be refused with a 401.
 - ROUTE_RULES: the file routes and the few JSON routes whose legitimate body is larger, each with its
   own limit and the reason for it.
 
-A route whose rule has needs_session=True has its body read before it authenticates the caller, so a
-limit there above PUBLIC_LIMIT is given only to a session that is signed in right now: the token is
-signed and unexpired, and the session, the account and any temporary credential behind it pass the
-checks get_current_user makes (app/core/live_session.py, whose answer is kept a few seconds so an
-upload burst pays for one lookup). Everyone else meets PUBLIC_LIMIT on that route:
+A route whose rule has needs_session=True (the JSON class and every explicit rule but the chunk
+routes) has its body read before it authenticates the caller, so a limit there above PUBLIC_LIMIT is
+given only to a session that is signed in right now: the token is signed and unexpired, and the
+session, the account and any temporary credential behind it pass the checks get_current_user makes
+(app/core/live_session.py, whose answer is kept a few seconds so an upload burst pays for one
+lookup). Everyone else meets PUBLIC_LIMIT on that route:
 
 - a body that declares no more than PUBLIC_LIMIT goes in without anyone being asked, since anyone may
   send that much;
@@ -75,7 +78,7 @@ class BodyRule:
 
 
 PUBLIC = BodyRule("public", PUBLIC_LIMIT)
-JSON = BodyRule("json", JSON_LIMIT)
+JSON = BodyRule("json", JSON_LIMIT, needs_session=True)
 
 _POST, _PUT, _PATCH = ("POST",), ("PUT",), ("PATCH",)
 

@@ -140,14 +140,66 @@ def test_a_chunked_body_over_the_limit_is_refused_as_soon_as_it_passes_it():
     assert reads == bl.PUBLIC_LIMIT // (16 * KiB) + 1, f"read {reads} pieces of a refused body"
 
 
-def test_the_other_json_routes_are_refused_past_one_mib_and_not_before():
+def test_the_other_json_routes_take_one_mib_from_a_live_session_and_64_kib_from_anyone_else():
     over = _App()
-    status, _, reads, _ = _drive(over, "POST", "/vaults", _pieces(2 * MiB), chunked=True)
+    status, _, reads, _ = _drive(over, "POST", "/vaults", _pieces(2 * MiB), chunked=True, auth=LIVE)
     assert (status, over.calls) == (413, 0)
     assert reads == bl.JSON_LIMIT // (16 * KiB) + 1
     under = _App()
-    status, _, _, _ = _drive(under, "POST", "/vaults", _pieces(bl.JSON_LIMIT), chunked=True)
+    status, _, _, _ = _drive(under, "POST", "/vaults", _pieces(bl.JSON_LIMIT), chunked=True, auth=LIVE)
     assert status == 200 and under.body == b"x" * bl.JSON_LIMIT
+    anonymous = _App()
+    status, text, reads, _ = _drive(anonymous, "POST", "/groups", _pieces(bl.JSON_LIMIT), chunked=True)
+    assert (status, anonymous.calls) == (413, 0), "a caller with no session had 1 MiB parsed before its 401"
+    assert "64 KiB" in json.loads(text)["detail"]
+    assert reads == bl.PUBLIC_LIMIT // (16 * KiB) + 1
+    status, _, reads, _ = _drive(_App(), "POST", "/groups", [b"x"], declared=bl.JSON_LIMIT)
+    assert (status, reads) == (413, 0)
+    ended = _App()
+    status, _, reads, _ = _drive(ended, "PUT", "/users/me/preferences", _pieces(128 * KiB), chunked=True,
+                                 auth=ENDED)
+    assert (status, reads, ended.calls) == (401, 0, 0)
+
+
+def test_the_real_application_refuses_an_anonymous_megabyte_on_a_route_that_needs_a_session():
+    """The measured case: an anonymous 1 MiB JSON body to /groups was parsed (41 ms against 3 ms for a
+    tiny one) before the route answered 401. Now it is refused at 64 KiB and never parsed."""
+    import tracemalloc
+    S = _app()
+    body = ("[" + ",".join(["{}"] * (MiB // 3 - 1)) + "]").encode()
+    chunks = [body[i:i + 16 * KiB] for i in range(0, len(body), 16 * KiB)]
+
+    async def run():
+        pieces = list(chunks)
+        read, out = {"n": 0}, []
+
+        async def receive():
+            if pieces:
+                read["n"] += 1
+                return {"type": "http.request", "body": pieces.pop(0), "more_body": bool(pieces)}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            out.append(message)
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "path": "/groups", "raw_path": b"/groups", "query_string": b"", "root_path": "",
+                 "scheme": "http", "server": ("localhost", 80), "client": ("198.51.100.79", 1234),
+                 "headers": [(b"host", b"localhost"), (b"content-type", b"application/json"),
+                             (b"transfer-encoding", b"chunked")]}
+        await S.app(scope, receive, send)
+        return next(m["status"] for m in out if m["type"] == "http.response.start"), read["n"]
+
+    run_coroutine(run())   # the first call builds the application's middleware
+    tracemalloc.start()
+    try:
+        status, pieces_read = run_coroutine(run())
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert status == 413
+    assert pieces_read == bl.PUBLIC_LIMIT // (16 * KiB) + 1, pieces_read
+    assert peak < 1 * MiB, f"refusing it allocated {peak / KiB:.0f} KiB"
 
 
 @pytest.mark.parametrize("declared", [True, False], ids=["declared", "chunked"])
@@ -455,14 +507,17 @@ def test_every_route_that_streams_or_takes_a_form_has_an_explicit_rule():
     assert not missing, f"stream or form routes without a streaming rule: {missing}"
 
 
-def test_a_limit_above_the_json_one_needs_a_session_unless_the_route_checks_first():
+def test_a_limit_above_the_anonymous_one_needs_a_session_unless_the_route_checks_first():
     """The two chunk routes read their body themselves, after the caller or the link has been
-    checked. Every other limit above the JSON one is for a signed-in caller only, because the
-    framework reads those bodies before the route checks anyone."""
-    for methods, template, rule, _why in bl.ROUTE_RULES:
-        bigger = rule.limit is None or rule.limit > bl.JSON_LIMIT
+    checked. Every other limit above 64 KiB, the JSON class's included, is for a signed-in caller
+    only, because the framework reads those bodies before the route checks anyone."""
+    rules = [(template, rule) for _m, template, rule, _why in bl.ROUTE_RULES]
+    rules.append(("every other route", bl.JSON))
+    for template, rule in rules:
+        bigger = rule.limit is None or rule.limit > bl.PUBLIC_LIMIT
         if bigger and not rule.needs_session:
             assert rule.stream and template.endswith("/chunks/{chunk_index}"), template
+    assert bl.JSON.needs_session and bl.rule_for("POST", "/groups") is bl.JSON
 
 
 def test_the_limits_cover_what_the_handlers_accept():

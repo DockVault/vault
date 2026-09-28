@@ -298,7 +298,7 @@ is answered `413` without the rest being read (`app/core/body_limit.py`):
 | Routes | Limit |
 |---|---|
 | Sign-in, second factor, signup, invitation and reset acceptance, forgot-password, the public note, file and upload link endpoints, device sync | 64 KiB |
-| Every other route, unless listed below | 1 MiB |
+| Every other route, unless listed below | 1 MiB, signed in only |
 | A resumable chunk, signed in or through an upload link | 64 MiB (the chunk size cap) |
 | A note, an email template | 8 MiB, signed in only |
 | Sealing zero-knowledge names | 4 MiB, signed in only |
@@ -308,13 +308,14 @@ is answered `413` without the rest being read (`app/core/body_limit.py`):
 "Signed in only" means the larger limit needs a session that is signed in right now: the token is
 signed and unexpired, and the session, the account and any temporary credential behind it pass the
 checks the route's own authentication makes (`app/core/live_session.py`). Anyone else meets the
-64 KiB limit on that route: a caller with no token is held to it, and a token whose session has ended
+64 KiB limit on every route: a caller with no token is held to it, and a token whose session has ended
 (signed out or revoked, a deactivated account or one an administrator locked, a temporary credential
 switched off, finished or past its time) is answered `401` before any of its body is read. A body
 that declares no more than 64 KiB goes in without the check. Measured on this change: a 20 MB chunked
 body to `/auth/login` is refused in 0.2 s and the API's memory rises by under 2 MiB, where it used to
 be read whole; 48 MiB of chunked multipart with a token for a session that does not exist is answered
-`401` with nothing read (it used to be spooled whole to `/tmp` first).
+`401` with nothing read (it used to be spooled whole to `/tmp` first); 1 MiB of JSON to `/groups`
+with no token is refused at 64 KiB, where it used to be parsed before the `401`.
 
 The check costs one lookup per session every 5 seconds, and only for a body over 64 KiB: measured in
 the container, about 5 ms when the database is asked (a Redis read and two small queries, off the

@@ -189,6 +189,18 @@ def test_a_large_body_to_a_route_that_needs_a_session_is_refused_without_one(adm
     assert status == 400 and "too long" in json.loads(text)["detail"], (status, text)
 
 
+def test_a_caller_with_no_session_meets_64_kib_on_every_route(admin):
+    """Before, a caller with no session had up to 1 MiB of JSON parsed on any route that is not
+    public, and only then was told 401. Now 64 KiB is the most anyone who is not signed in can send."""
+    body = ("[" + ",".join(["{}"] * (MiB // 3 - 1)) + "]").encode()   # 1 MiB of objects: the costliest
+    for path in ("/groups", "/vaults"):
+        status, text, seconds = _post(path, body)
+        print(f"POST {path} with no session: {status} in {seconds:.2f} s")
+        assert status == 413 and "64 KiB" in json.loads(text)["detail"], (path, status, text)
+    status, text, _ = _post("/vaults", body, headers={"Authorization": f"Bearer {admin.token}"})
+    assert status == 422, (status, text[:200])   # signed in, the same body reaches the route
+
+
 # ------------------------------------------------------------------------------ only a live session
 
 # A validly signed token for a real administrator whose session was never created: what a token for a
