@@ -74,11 +74,28 @@ def _scope(method, path, headers=()):
     return {"type": "http", "method": method, "path": path, "headers": list(headers)}
 
 
+LARGEST_FILE = 8 * MiB    # the largest file the stand-in deployment accepts
+
+
+def _largest_file(value=LARGEST_FILE):
+    """A stand-in for body_limit.largest_file_bytes that records every question."""
+    asked = []
+
+    async def largest_file():
+        asked.append(value)
+        return value
+
+    largest_file.asked = asked
+    return largest_file
+
+
 def _drive(app, method, path, pieces, *, declared=None, chunked=False, auth=None,
-           classify=bl.rule_for, caller=None):
+           classify=bl.rule_for, caller=None, largest_file=None):
     """Send `pieces` as the request body; return (status, response body, receive calls, app). The
-    response's headers are left on app.response_headers, the questions asked on app.asked."""
+    response's headers are left on app.response_headers, the questions asked on app.asked (who is
+    calling) and app.asked_largest (the largest file)."""
     caller = caller or _caller()
+    largest_file = largest_file or _largest_file()
     headers = []
     if declared is not None:
         headers.append((b"content-length", str(declared).encode()))
@@ -100,12 +117,13 @@ def _drive(app, method, path, pieces, *, declared=None, chunked=False, auth=None
     async def send(message):
         sent.append(message)
 
-    mw = bl.BodyLimitMiddleware(app, classify=classify, caller=caller)
+    mw = bl.BodyLimitMiddleware(app, classify=classify, caller=caller, largest_file=largest_file)
     run_coroutine(mw(_scope(method, path, headers), receive, send))
     start = next(m for m in sent if m["type"] == "http.response.start")
     body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
     app.response_headers = dict(start["headers"])
     app.asked = caller.asked
+    app.asked_largest = largest_file.asked
     return start["status"], body, state["reads"], app
 
 
@@ -331,15 +349,142 @@ def test_a_chunk_route_takes_its_limit_from_anyone_because_it_checks_the_caller_
         assert status == 200 and app.body == b"x" * (3 * MiB), path
 
 
-def test_a_multipart_upload_has_no_cap_here_for_a_live_session_and_the_anonymous_one_without():
-    pieces = _pieces(3 * MiB, size=256 * KiB)
+# A multipart upload's whole form is spooled to /tmp (a tmpfs: memory) before the route checks the
+# caller's right to upload, so a signed-in session is held to the largest file the deployment accepts,
+# plus the form's framing. It had no limit here at all: any session could fill the tmpfs.
+MULTIPART_LIMIT = LARGEST_FILE + bl._MULTIPART_HEADROOM
+
+
+def test_a_multipart_upload_from_a_live_session_is_streamed_through_up_to_the_largest_file():
+    pieces = _pieces(MULTIPART_LIMIT, size=256 * KiB)
     app = _App()
     status, _, _, _ = _drive(app, "POST", "/vaults/v/files", pieces, chunked=True, auth=LIVE)
     assert status == 200 and len(app.messages) == len(pieces), "a signed-in upload was held or capped"
+    assert app.asked_largest == [LARGEST_FILE]
+
+
+def test_a_declared_multipart_upload_over_the_largest_file_is_refused_before_anything_is_read():
+    app = _App()
+    status, body, reads, _ = _drive(app, "POST", "/vaults/v/files", [b"x"], declared=MULTIPART_LIMIT + 1,
+                                    auth=LIVE)
+    assert (status, reads, app.calls) == (413, 0, 0)
+    detail = json.loads(body)["detail"]
+    assert detail == ("Request body too large. The limit for this request is 9 MiB. Send a larger file, or "
+                      "several files together, with the resumable uploader (POST /vaults/{vault_id}/uploads)."), detail
+
+
+def test_a_chunked_multipart_upload_over_the_largest_file_is_refused_as_soon_as_it_passes_it():
+    app = _App()
+    pieces = _pieces(64 * MiB, size=1 * MiB)                 # no declared length
+    status, body, reads, _ = _drive(app, "POST", "/vaults/v/files", pieces, chunked=True, auth=LIVE)
+    assert status == 413 and "resumable uploader" in json.loads(body)["detail"]
+    assert reads == MULTIPART_LIMIT // MiB + 1, f"read {reads} pieces of a refused body"
+    assert app.body == b"x" * MULTIPART_LIMIT, "handed on as it came, up to the limit"
+
+
+def test_the_multipart_limit_follows_the_largest_file_the_deployment_accepts_now():
+    for largest in (0, 3 * MiB, 20 * MiB):
+        app = _App()
+        limit = largest + bl._MULTIPART_HEADROOM
+        status, _, _, _ = _drive(app, "POST", "/vaults/v/files", [b"x"], declared=limit + 1, auth=LIVE,
+                                 largest_file=_largest_file(largest))
+        assert status == 413, largest
+        status, _, _, _ = _drive(_App(), "POST", "/vaults/v/files", _pieces(limit, 256 * KiB), chunked=True,
+                                 auth=LIVE, largest_file=_largest_file(largest))
+        assert status == 200, largest
+
+
+def test_an_anonymous_multipart_upload_is_held_to_64_kib_and_the_largest_file_is_not_asked():
+    pieces = _pieces(3 * MiB, size=256 * KiB)
     anon = _App()
     status, _, reads, _ = _drive(anon, "POST", "/vaults/v/files", pieces, chunked=True)
     assert (status, anon.calls) == (413, 0), "an anonymous multipart body was spooled past 64 KiB"
     assert reads == 1, "an anonymous multipart body was read past its first piece"
+    assert anon.asked_largest == []
+    small = _App()
+    _drive(small, "POST", "/vaults/v/files", [b"x" * KiB], declared=KiB, auth=LIVE)
+    assert small.asked_largest == [], "a body anyone may send asks nothing"
+
+
+def test_the_largest_file_is_the_ceiling_lowered_by_the_administrators_setting(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from app.core.config import settings
+    from app.core.models import SystemSetting
+    set_bare_api_env()
+    import app.api.api_server as S
+    monkeypatch.setattr(settings, "max_file_size_mb", 100)
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'settings.db'}")
+        SystemSetting.__table__.create(engine)
+        db = sessionmaker(bind=engine)()
+        try:
+            assert bl.largest_file_from(db) == 100 * MiB, "no setting: the ceiling"
+            row = SystemSetting(key="global", value={"max_file_size": 5})
+            db.add(row)
+            db.commit()
+            for stored, expected in ((5, 5 * MiB), (500, 100 * MiB), (0, 100 * MiB), ("junk", 100 * MiB)):
+                row.value = {"max_file_size": stored}
+                db.commit()
+                assert bl.largest_file_from(db) == expected, stored
+                # The same limit the upload route holds each file to.
+                assert S._upload_policy(db)[1] == expected, stored
+        finally:
+            db.close()
+            engine.dispose()
+
+
+def test_the_largest_file_is_kept_a_few_seconds_and_the_ceiling_stands_in_when_unreadable(monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "max_file_size_mb", 100)
+    monkeypatch.setattr(bl, "_largest", {"value": None, "until": 0.0})
+    asked = []
+
+    def ask():
+        asked.append(1)
+        return 7 * MiB
+
+    assert run_coroutine(bl.largest_file_bytes(ask)) == 7 * MiB
+    assert run_coroutine(bl.largest_file_bytes(ask)) == 7 * MiB and asked == [1], "asked again at once"
+    bl._largest["until"] = 0.0                                  # its time ran out
+    assert run_coroutine(bl.largest_file_bytes(ask)) == 7 * MiB and asked == [1, 1]
+
+    monkeypatch.setattr(bl, "_largest", {"value": None, "until": 0.0})
+
+    def broken():
+        raise ConnectionError("database down")
+
+    assert run_coroutine(bl.largest_file_bytes(broken)) == 100 * MiB, "the deployment's ceiling"
+    assert bl._largest["value"] is None, "a failed read is not kept"
+
+
+def test_the_largest_file_is_the_default_and_is_looked_up_when_used(monkeypatch):
+    asked = []
+
+    async def largest_file_bytes():
+        asked.append(1)
+        return 2 * MiB
+
+    async def caller_state(authorization):
+        return ls.LIVE
+
+    monkeypatch.setattr(bl, "largest_file_bytes", largest_file_bytes)
+    monkeypatch.setattr(ls, "caller_state", caller_state)
+    sent = []
+    queue = [{"type": "http.request", "body": b"x", "more_body": False}]
+
+    async def receive():
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    headers = [(b"content-length", str(4 * MiB).encode()), (b"authorization", LIVE)]
+    app = _App()
+    run_coroutine(bl.BodyLimitMiddleware(app)(_scope("POST", "/vaults/v/files", headers), receive, send))
+    assert asked == [1] and sent[0]["status"] == 413 and app.calls == 0
 
 
 def test_the_live_session_check_is_the_default_and_is_looked_up_when_used(monkeypatch):
@@ -538,3 +683,31 @@ def test_the_middleware_is_installed_innermost_and_the_old_declared_only_cap_is_
     assert S.app.user_middleware[-1].cls is bl.BodyLimitMiddleware, (
         "the body limit must be the innermost middleware, so every outer layer wraps its 413")
     assert not hasattr(S, "_MAX_REQUEST_BODY_BYTES")
+
+
+def test_saving_the_maximum_file_size_forgets_the_largest_file_kept(monkeypatch):
+    """A lower or higher maximum takes effect on the next upload, not five seconds later."""
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from app.core.models import AuditLog, SystemSetting, User
+    set_bare_api_env()
+    import app.api.api_server as S
+    monkeypatch.setattr(S, "_enforce_step_up", lambda *a, **k: None)
+    admin = SimpleNamespace(id=None, username="admin", role=S.RoleEnum.ADMIN)
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'settings.db'}")
+        for model in (SystemSetting, User, AuditLog):
+            model.__table__.create(engine)
+        db = sessionmaker(bind=engine)()
+        try:
+            for payload, forgotten in (({"session_timeout": 30}, False), ({"max_file_size": 3}, True)):
+                monkeypatch.setattr(bl, "_largest", {"value": 9 * MiB, "until": float("inf")})
+                run_coroutine(S.update_settings(payload=payload, request=SimpleNamespace(headers={}, client=None),
+                                                current_user=admin, db=db))
+                assert (bl._largest["value"] is None) is forgotten, payload
+        finally:
+            db.close()
+            engine.dispose()

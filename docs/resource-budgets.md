@@ -303,7 +303,7 @@ is answered `413` without the rest being read (`app/core/body_limit.py`):
 | A note, an email template | 8 MiB, signed in only |
 | Sealing zero-knowledge names | 4 MiB, signed in only |
 | A logo or favicon; an email image | 3 MiB; 6 MiB, signed in only |
-| A multipart file upload | none here (each file is held to the maximum file size and the quotas), signed in only |
+| A multipart file upload | the largest file the deployment accepts (`MAX_FILE_SIZE_MB`, lowered by the administrators' maximum file size) plus 1 MiB for the form, signed in only |
 
 "Signed in only" means the larger limit needs a session that is signed in right now: the token is
 signed and unexpired, and the session, the account and any temporary credential behind it pass the
@@ -323,7 +323,14 @@ event loop) and about 50 µs when the answer is kept.
 
 A signed-in multipart upload is still received whole before the handler runs. Its parts are spooled
 to `/tmp`, which the shipped compose files mount as a tmpfs, so until the handler has read them they
-are held in memory. The resumable path (what the browser uses) is the one for large files.
+are held in memory, before the route has checked that the caller may upload to that vault at all.
+So its body is held to the largest file the deployment accepts right now plus 1 MiB for the form:
+the file-size ceiling, lowered by the administrators' setting (read once every 5 seconds, and again
+as soon as the setting is saved). It used to have no limit here, so any signed-in session could
+fill the tmpfs. A batch larger than one file, and any large file, goes through the resumable path
+(what the browser uses), whose chunks are checked before they are read. With the default ceiling of
+10 GB, a signed-in caller can still have one such request spool 10 GB into `/tmp`; lower
+`MAX_FILE_SIZE_MB`, or the maximum file size in Settings, to bound it further.
 
 ## WebSocket messages
 

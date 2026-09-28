@@ -327,6 +327,52 @@ def test_a_chunked_upload_from_a_session_that_never_existed_is_refused_and_costs
     assert seconds < 30, f"refusing it took {seconds:.1f} s"
 
 
+@pytest.fixture
+def largest_file_2_mb(admin):
+    """The administrators' maximum file size set to 2 MB for the test, and put back afterwards. The
+    body limit of a signed-in multipart upload is then 2 MiB plus 1 MiB for the form."""
+    before = admin.get("/settings").json().get("max_file_size") or 0
+    r = admin.put("/settings", json={"max_file_size": 2})
+    assert r.status_code == 200, r.text
+    try:
+        yield 3 * MiB
+    finally:
+        admin.put("/settings", json={"max_file_size": before})
+
+
+def test_a_signed_in_multipart_upload_is_held_to_the_largest_file(admin, temp_user_client, temp_vault,
+                                                                  largest_file_2_mb):
+    """Any signed-in session could send a multipart upload of any size: the whole form is spooled to /tmp
+    (memory, in the shipped compose files) before the route checks the caller may upload to that vault.
+    Now it is held to the largest file the deployment accepts plus 1 MiB, declared or chunked, whoever
+    sends it."""
+    limit, vid = largest_file_2_mb, temp_vault["id"]
+    for who, token in (("administrator", admin.token), ("user", temp_user_client.token)):
+        status, text, _headers, seconds = _declare_only(f"/vaults/{vid}/files", limit + 1, token)
+        assert status == 413, (who, status, text)
+        detail = json.loads(text)["detail"]
+        assert "The limit for this request is 3 MiB" in detail and "resumable uploader" in detail, detail
+        assert seconds < 5, f"refusing it took {seconds:.1f} s"
+
+    memory = _Memory()
+    try:
+        status, text, seconds = _post(f"/vaults/{vid}/files", _multipart(32 * MiB), chunked=True,
+                                      headers={"Authorization": f"Bearer {temp_user_client.token}",
+                                               "Content-Type": "multipart/form-data; boundary=b"})
+    finally:
+        rise = memory.rise()
+    print(f"{status} after {seconds:.2f} s; memory +{rise / MiB:.1f} MiB")
+    assert status == 413, text
+    assert "The limit for this request is 3 MiB" in json.loads(text)["detail"], text
+    assert rise < 16 * MiB, f"the API's memory rose {rise / MiB:.1f} MiB for a refused upload"
+
+    # A file the deployment accepts still uploads, at once: saving the setting took effect immediately.
+    content = os.urandom(MiB + MiB // 2)
+    name = unique("f") + ".bin"
+    r = admin.post(f"/vaults/{vid}/files", files=[("files", (name, content, "application/octet-stream"))])
+    assert r.status_code == 200, r.text
+
+
 def test_a_large_email_template_still_saves(admin):
     body_html = "<p>" + "Welcome to the vault. " * 12_000 + "</p>"      # about 260 KB
     r = admin.post("/email/templates", json={"name": unique("big"), "subject": "Hello",

@@ -4246,6 +4246,10 @@ async def update_settings(
     from app.core import rate_limit_settings as _rl_settings_write
     if any(key in (payload or {}) for key in _rl_settings_write.OVERRIDE_KEYS):
         _rl_settings_write.invalidate_cache()
+    # And the largest file the multipart upload's body limit allows (app/core/body_limit.py).
+    if "max_file_size" in (payload or {}):
+        from app.core import body_limit as _body_limit
+        _body_limit.forget_largest_file()
     try:
         AuditLogger(db).log_action(
             action="settings_updated",

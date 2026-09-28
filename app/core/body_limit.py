@@ -17,7 +17,11 @@ Three classes, and an explicit entry for every route that needs more than the JS
   routes needs a session, so a caller who has none meets PUBLIC_LIMIT there too: nothing larger than
   64 KiB is read on any route before its caller is known, not even to be refused with a 401.
 - ROUTE_RULES: the file routes and the few JSON routes whose legitimate body is larger, each with its
-  own limit and the reason for it.
+  own limit and the reason for it. The direct multipart upload (POST /vaults/{vault_id}/files) is
+  held to the largest file the deployment accepts right now, plus the form's framing (largest_file):
+  the framework spools its whole form to /tmp, a tmpfs in the shipped compose files and so memory,
+  before the route checks anything about the caller's rights. A batch larger than one file, and any
+  large file, goes through the resumable uploader, whose chunks are checked before they are read.
 
 A route whose rule has needs_session=True (the JSON class and every explicit rule but the chunk
 routes) has its body read before it authenticates the caller, so a limit there above PUBLIC_LIMIT is
@@ -44,6 +48,7 @@ it is first asked) so it is unit-testable offline.
 """
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, Sequence, Tuple
 
@@ -75,6 +80,10 @@ class BodyRule:
     limit: Optional[int]
     stream: bool = False          # the route reads the body as a stream: count it, never hold it
     needs_session: bool = False   # above PUBLIC_LIMIT only for a live session; anyone else gets PUBLIC
+    # The limit is the largest file the deployment accepts right now plus _MULTIPART_HEADROOM, asked
+    # when a live session sends a body over PUBLIC_LIMIT (largest_file_bytes); ``limit`` is unused then.
+    largest_file: bool = False
+    hint: Optional[str] = None    # added to the refusal: where a body this large should go instead
 
 
 PUBLIC = BodyRule("public", PUBLIC_LIMIT)
@@ -112,9 +121,12 @@ ROUTE_RULES: Sequence[Tuple[Tuple[str, ...], str, BodyRule, str]] = (
      BodyRule("link_upload_chunk", CHUNK_LIMIT, stream=True),
      "one chunk of an upload-link upload, written to disk as it arrives after the link is checked"),
     (_POST, "/vaults/{vault_id}/files",
-     BodyRule("multipart_upload", None, stream=True, needs_session=True),
-     "a multipart upload of one or more files: each file is held to the maximum file size and the "
-     "vault and deployment quotas by the handler, and a batch may legitimately exceed any one file"),
+     BodyRule("multipart_upload", None, stream=True, needs_session=True, largest_file=True,
+              hint="Send a larger file, or several files together, with the resumable uploader "
+                   "(POST /vaults/{vault_id}/uploads)."),
+     "a multipart upload, spooled whole to /tmp (memory) before the handler runs: at most the largest "
+     "file the deployment accepts, plus the form's framing; each file is then held to that size and "
+     "the quotas by the handler"),
     (_POST, "/settings/brand/asset/{slot}",
      BodyRule("brand_asset", 2 * MiB + _MULTIPART_HEADROOM, stream=True, needs_session=True),
      "a logo or favicon, at most 2 MB"),
@@ -172,12 +184,68 @@ def _human(n: int) -> str:
     return f"{n} bytes"
 
 
-def too_large_detail(limit: int) -> str:
-    return f"Request body too large. The limit for this request is {_human(limit)}."
+def too_large_detail(limit: int, hint: Optional[str] = None) -> str:
+    detail = f"Request body too large. The limit for this request is {_human(limit)}."
+    return f"{detail} {hint}" if hint else detail
 
 
-def too_large_body(limit: int) -> bytes:
-    return json.dumps({"detail": too_large_detail(limit)}).encode()
+def too_large_body(limit: int, hint: Optional[str] = None) -> bytes:
+    return json.dumps({"detail": too_large_detail(limit, hint)}).encode()
+
+
+# --------------------------------------------------------------------------- the largest file
+
+# How long the answer of largest_file_bytes is kept, so an upload burst pays for one read. Saving the
+# administrators' maximum file size forgets it at once (forget_largest_file).
+LARGEST_FILE_CACHE_SECONDS = 5.0
+_largest = {"value": None, "until": 0.0}
+
+
+def forget_largest_file() -> None:
+    """Drop the kept answer of largest_file_bytes: the setting it reads was just saved."""
+    _largest.update(value=None, until=0.0)
+
+
+def _ceiling_bytes() -> int:
+    """The deployment's ceiling on one file (MAX_FILE_SIZE_MB), in bytes."""
+    from app.core.config import settings
+    return max(0, int(settings.max_file_size_mb or 0)) * MiB
+
+
+def largest_file_from(db) -> int:
+    """The largest file the deployment accepts, read from ``db``: the ceiling, lowered (never raised)
+    by the administrators' maximum file size setting. The per-file limit the upload route holds each
+    file to (api_server._upload_policy), from the same setting."""
+    from app.core.models import SystemSetting
+    from app.core.upload_policy import effective_max_file_bytes
+    row = db.query(SystemSetting.value).filter(SystemSetting.key == "global").first()
+    blob = row[0] if row is not None and isinstance(row[0], dict) else {}
+    return effective_max_file_bytes(_ceiling_bytes(), blob.get("max_file_size"))
+
+
+def _ask_database() -> int:
+    from app.core.database import SessionLocal
+    db = SessionLocal()
+    try:
+        return largest_file_from(db)
+    finally:
+        db.close()
+
+
+async def largest_file_bytes(ask=None) -> int:
+    """The largest file the deployment accepts right now, in bytes (largest_file_from), asked in a worker
+    thread and kept LARGEST_FILE_CACHE_SECONDS. The ceiling alone when the setting could not be read,
+    and that is not kept. `ask() -> int` defaults to the database."""
+    now = time.monotonic()
+    if _largest["value"] is not None and now < _largest["until"]:
+        return _largest["value"]
+    from starlette.concurrency import run_in_threadpool
+    try:
+        value = int(await run_in_threadpool(ask or _ask_database))
+    except Exception:  # noqa: BLE001 -- the setting could not be read: the deployment's ceiling
+        return _ceiling_bytes()
+    _largest.update(value=value, until=now + LARGEST_FILE_CACHE_SECONDS)
+    return value
 
 
 # A token that is no live session is told what get_current_user would tell it; the web app signs the
@@ -194,8 +262,8 @@ class BodyTooLarge(HTTPException):
     """Raised out of receive() when a streamed body passes its limit. An HTTPException, so the
     framework's body readers and the handlers' ``except HTTPException: raise`` pass it on untouched."""
 
-    def __init__(self, limit: int):
-        super().__init__(status_code=413, detail=too_large_detail(limit))
+    def __init__(self, limit: int, hint: Optional[str] = None):
+        super().__init__(status_code=413, detail=too_large_detail(limit, hint))
         self.limit = limit
 
 
@@ -210,13 +278,16 @@ class BodyLimitMiddleware:
     """Pure ASGI: bound every HTTP request body by its route's rule (see the module docstring).
 
     `caller(authorization)` answers live_session's NO_CREDENTIAL, LIVE, ENDED or UNKNOWN; left out, it
-    is live_session.caller_state, looked up when used."""
+    is live_session.caller_state, looked up when used. `largest_file()` answers the largest file the
+    deployment accepts, in bytes; left out, it is largest_file_bytes, looked up when used."""
 
     def __init__(self, app, classify: Callable[[str, str], BodyRule] = rule_for,
-                 caller: Optional[Callable[[Optional[bytes]], Awaitable[str]]] = None):
+                 caller: Optional[Callable[[Optional[bytes]], Awaitable[str]]] = None,
+                 largest_file: Optional[Callable[[], Awaitable[int]]] = None):
         self.app = app
         self.classify = classify
         self.caller = caller
+        self.largest_file = largest_file
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -259,15 +330,17 @@ class BodyLimitMiddleware:
                 if state != live_session.LIVE:
                     rule = PUBLIC   # no credential: what anyone may send, held until it is whole
         limit = rule.limit
+        if rule.largest_file:
+            limit = await (self.largest_file or largest_file_bytes)() + _MULTIPART_HEADROOM
         if limit is None:
             await self.app(scope, receive, send)
             return
         if length is not None and length > limit:
             # Refused on the declaration: nothing is read, and the server discards the rest.
-            await _answer(send, 413, too_large_body(limit))
+            await _answer(send, 413, too_large_body(limit, rule.hint))
             return
         if rule.stream:
-            await self._counted(scope, receive, send, limit)
+            await self._counted(scope, receive, send, limit, rule.hint)
         else:
             await self._buffered(scope, receive, send, limit)
 
@@ -302,7 +375,7 @@ class BodyLimitMiddleware:
 
         await self.app(scope, replay, send)
 
-    async def _counted(self, scope, receive, send, limit):
+    async def _counted(self, scope, receive, send, limit, hint=None):
         """Pass the body through as it arrives, counting it. Past the limit, receive() raises and
         whatever the application answers is replaced by the 413 (unless it had already started a
         response before the limit was reached, which it then finishes as it can)."""
@@ -310,14 +383,14 @@ class BodyLimitMiddleware:
 
         async def counted_receive():
             if state["tripped"]:
-                raise BodyTooLarge(limit)
+                raise BodyTooLarge(limit, hint)
             message = await receive()
             if message.get("type") == "http.request":
                 state["received"] += len(message.get("body") or b"")
                 if state["received"] > limit:
                     state["tripped"] = True
                     state["started_at_trip"] = state["started"]
-                    raise BodyTooLarge(limit)
+                    raise BodyTooLarge(limit, hint)
             return message
 
         async def guarded_send(message):
@@ -333,4 +406,4 @@ class BodyLimitMiddleware:
             if not state["tripped"]:
                 raise
         if state["tripped"] and not state["started_at_trip"]:
-            await _answer(send, 413, too_large_body(limit))
+            await _answer(send, 413, too_large_body(limit, hint))
