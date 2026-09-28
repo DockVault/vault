@@ -15,6 +15,8 @@ The page is driven as a THROWAWAY administrator: the skin is applied after sign-
 stored preference, so a skin chosen against the shared account could be replaced. Each test asserts
 the skin that applied. test_credential_change_rule_live.py covers the rule through the API.
 """
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -107,9 +109,19 @@ def test_a_held_change_made_on_a_phone_shows_as_waiting_and_can_be_withdrawn(pag
     copy = page.locator(f'.copy-reset-link-btn[data-user-id="{uid}"]')
     copy.scroll_into_view_if_needed()
     copy.click()                                                               # the second change
+    # Asked as what it is, before anything is sent: the first change was this administrator's own.
+    expect(page.locator("#confirm-modal-title")).to_have_text("Ask for approval?", timeout=10000)
+    expect(page.locator("#confirm-modal-confirm-btn")).to_have_text("Send for approval")
+    expect(page.locator("#confirm-modal-message")).to_contain_text(
+        f"You already changed {name}’s sign-in details on")
+    expect(page.locator("#confirm-modal-message")).to_contain_text("only when another administrator approves it")
     _confirm(page)
 
-    expect(page.locator(".toast", has_text="waiting for approval").first).to_be_visible(timeout=10000)
+    toast = page.locator(".toast", has_text="waiting for approval").first
+    expect(toast).to_be_visible(timeout=10000)
+    expect(toast).to_contain_text(f"You already changed {name}")
+    said = toast.inner_text()
+    assert "by an administrator" not in said and not re.search(r"\d{4}-\d{2}-\d{2}", said), said
     row = page.locator("#credential-requests-block .credential-request-row", has_text=name)
     expect(row).to_have_count(1, timeout=10000)
     expect(row).to_contain_text("Create a password reset link")

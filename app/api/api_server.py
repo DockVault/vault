@@ -5323,8 +5323,25 @@ class _CredentialOutcome:
         self.last = last
 
 
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+           "October", "November", "December")
+
+
 def _cc_date(value) -> str:
-    return value.strftime("%Y-%m-%d") if value else ""
+    """A date in words ("5 October 2026"), for a sentence a person reads. Not the ISO form: it read as a
+    code, and broke across lines on a phone ("2026-10-" / "05")."""
+    return f"{value.day} {_MONTHS[value.month - 1]} {value.year}" if value else ""
+
+
+def _earlier_changer(last, requester_id) -> str:
+    """Who made the change that opened the 14-day window, as the start of a sentence: "You" when it was
+    the administrator asking now, the server's operator, or the administrator by name."""
+    from app.core import credential_changes as cc
+    if requester_id is not None and last.requested_by_id == requester_id:
+        return "You"
+    if last.requested_by_name == cc.HOST_OPERATOR:
+        return "The server's operator"
+    return last.requested_by_name or "An administrator"
 
 
 def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name, request=None,
@@ -5418,9 +5435,9 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
         last = cc.decide(db, requester_id=requester_id, target_id=target.id, now=now)
     except cc.NoApprover as refused:
         target_id, target_name = target.id, target.username
-        detail = (f"{target_name}'s sign-in details were already changed by an administrator on "
-                  f"{_cc_date(refused.last_change.applied_at)}. A second change within 14 days needs "
-                  "another administrator's approval, and there is no other active administrator. "
+        detail = (f"{_earlier_changer(refused.last_change, requester_id)} already changed {target_name}'s "
+                  f"sign-in details on {_cc_date(refused.last_change.applied_at)}. A second change within 14 "
+                  "days needs another administrator's approval, and there is no other active administrator. "
                   "The person who runs the server can make this change on the host with: "
                   "python dockvault.py accounts")
         db.rollback()   # the whole request is refused, so nothing it changed may be kept
@@ -5469,17 +5486,19 @@ def _credential_request_dict(change, target_username, viewer_id=None) -> dict:
 
 
 def _held_body(outcome, target, viewer_id) -> dict:
-    """The response to a request whose change was held: what is waiting, and why, in words."""
+    """The response to a request whose change was held: what is waiting, and why, in words. `previous`
+    is the change that opened the window, for the page to say it in the viewer's own date format."""
     from app.core import credential_changes as cc
-    change = outcome.change
+    change, last = outcome.change, outcome.last
     return {
         "held": True,
         "request": _credential_request_dict(change, target.username, viewer_id),
-        "message": (f"{target.username}'s sign-in details were already changed by an administrator on "
-                    f"{_cc_date(outcome.last.applied_at)}, and a second change within 14 days needs "
-                    f"another administrator's approval. Your request to {cc.phrase(change.kind)} is "
-                    f"waiting for approval, and expires on {_cc_date(change.expires_at)} if nobody "
-                    "decides."),
+        "previous": {"by": last.requested_by_name,
+                     "at": last.applied_at.isoformat() + "Z" if last.applied_at else None},
+        "message": (f"{_earlier_changer(last, viewer_id)} already changed {target.username}'s sign-in details "
+                    f"on {_cc_date(last.applied_at)}, and a second change within 14 days needs another "
+                    f"administrator's approval. Your request to {cc.phrase(change.kind)} is waiting for "
+                    f"approval, and expires on {_cc_date(change.expires_at)} if nobody decides."),
     }
 
 

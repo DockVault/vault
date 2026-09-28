@@ -535,7 +535,7 @@ function showInfo(message) {
 
 let confirmModalResolver = null;
 
-function showConfirm(message, title = 'Confirm Action', requireInput = null) {
+function showConfirm(message, title = 'Confirm Action', requireInput = null, confirmLabel = null) {
     return new Promise((resolve) => {
         const modal = document.getElementById('confirm-modal');
         const titleEl = document.getElementById('confirm-modal-title');
@@ -553,6 +553,7 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null) {
         // Set content
         titleEl.textContent = title;
         messageEl.textContent = message;
+        confirmBtn.textContent = confirmLabel || 'Confirm';
         
         // Show/hide input
         if (requireInput) {
@@ -5091,9 +5092,55 @@ async function revokeInvite(id) {
 // second factor, email address, SSH key) within 14 days; a second one waits here until a different
 // administrator approves it. Built with DOM APIs: no data goes through innerHTML.
 
-// Say plainly that a change was held and why, then show it in the waiting list.
+// A date as a person reads it, in their own locale: "28 Sep" (the year too when it is not this one).
+function formatDayMonth(value) {
+    const d = parseServerTime(value);
+    if (!d) return '';
+    const opts = { day: 'numeric', month: 'short' };
+    if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+    return d.toLocaleDateString(undefined, opts);
+}
+
+// Who made a change, as the start of a sentence: "You", the server's operator, or the administrator.
+function _changedBy(name) {
+    if (currentUser && name === currentUser.username) return 'You';
+    return name === 'operator@host' ? 'The server’s operator' : (name || 'An administrator');
+}
+
+// The last change to this account's sign-in details, when it means the next one will be held for
+// another administrator: made within 14 days, to someone other than the viewer.
+function pendingApproval(u) {
+    const c = u && u.credential_change;
+    if (!c || (currentUser && u.id === currentUser.id)) return null;
+    const ends = parseServerTime(c.window_ends);
+    return ends && ends > new Date() ? c : null;
+}
+
+// Confirm a change to someone's sign-in details. When it will be held, say so BEFORE it is sent, in
+// place of a confirmation that reads as if it will happen: `outcome` finishes "... only when another
+// administrator approves it" ("This link is created"); `after` is said last.
+function confirmCredentialChange(u, outcome, message, title, after) {
+    const c = pendingApproval(u);
+    if (!c) return showConfirm(message, title);
+    const who = _changedBy(c.by);
+    return showConfirm(who + ' already changed ' + u.username + '’s sign-in details on ' + formatDayMonth(c.at)
+        + '. ' + outcome + ' only when another administrator approves it.' + (after ? ' ' + after : ''),
+        'Ask for approval?', null, 'Send for approval');
+}
+
+// Say plainly that a change was held and why, then show it in the waiting list. Worded here, in the
+// viewer's locale, from what the server returned; its own message is the fallback.
+function _heldText(h) {
+    const req = h && h.request, prev = h && h.previous;
+    if (!req || !prev) return (h && h.message) || '';
+    const target = req.target_username || 'this account';
+    return 'Waiting for approval. ' + _changedBy(prev.by) + ' already changed ' + target + '’s sign-in details on '
+        + formatDayMonth(prev.at) + ', so another administrator must approve this change. It expires on '
+        + formatDayMonth(req.expires_at) + ' if nobody decides.';
+}
+
 function showHeldChange(r) {
-    const messages = (r && r.held_changes) ? r.held_changes.map(h => h.message) : [r && r.message];
+    const messages = (r && r.held_changes) ? r.held_changes.map(_heldText) : [_heldText(r)];
     showToast(messages.filter(Boolean).join(' ') || 'The change is waiting for another administrator.', 'warning', 15000);
     loadCredentialRequests();
 }
@@ -5191,7 +5238,8 @@ async function decideCredentialRequest(req, action, btn) {
 async function resetUserSecondFactor(userId, btn) {
     const u = (usersView.users || []).find(x => x.id === userId);
     const name = u ? u.username : 'this user';
-    if (!await showConfirm(name + ' will be signed out everywhere and asked to set up a new second factor, with their own password, at their next sign-in.',
+    if (!await confirmCredentialChange(u, 'The second factor is reset',
+        name + ' will be signed out everywhere and asked to set up a new second factor, with their own password, at their next sign-in.',
         'Reset the second factor?')) return;
     if (btn) btn.disabled = true;
     try {
@@ -5559,6 +5607,8 @@ async function addSshKey(userId, root = document) {
         showError('Enter a label and an OpenSSH public key.');
         return;
     }
+    const u = (usersView.users || []).find(x => x.id === userId);
+    if (pendingApproval(u) && !await confirmCredentialChange(u, 'The key is added')) return;
     try {
         const r = await apiRequest(`/users/${userId}/ssh-keys`, { method: 'POST', body: JSON.stringify({ name, public_key: publicKey }) });
         if (nameEl) nameEl.value = '';
@@ -5874,7 +5924,9 @@ function attachUserListeners() {
         btn.addEventListener('click', async () => {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
-            if (!await showConfirm('Email a password-reset link to ' + username + '?', 'Send reset link')) return;
+            const u = (usersView.users || []).find(x => x.id === userId);
+            if (!await confirmCredentialChange(u, 'The link is emailed',
+                'Email a password-reset link to ' + username + '?', 'Send reset link')) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
@@ -5892,7 +5944,10 @@ function attachUserListeners() {
         btn.addEventListener('click', async () => {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
-            if (!await showConfirm('Create a one-time password-reset link for ' + username + '? Anyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.', 'Create reset link')) return;
+            const u = (usersView.users || []).find(x => x.id === userId);
+            if (!await confirmCredentialChange(u, 'This link is created',
+                'Create a one-time password-reset link for ' + username + '? Anyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.',
+                'Create reset link')) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/reset-link', { method: 'POST' });
@@ -21405,6 +21460,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const email = document.getElementById('edit-user-email').value;
             const role = document.getElementById('edit-user-role').value;
             const isActive = document.getElementById('edit-user-active').checked;
+            const u = (usersView.users || []).find(x => x.id === userId);
+            if (u && (email.trim() || null) !== (u.email || null) && pendingApproval(u)
+                && !await confirmCredentialChange(u, 'The new address is saved', null, null, 'Your other changes are saved now.')) return;
 
             // Storage quota: 'inherit' clears the override (null), 'unlimited' exempts the
             // account, a number sets an exact budget. A blank custom box is treated as
