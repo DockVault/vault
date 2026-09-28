@@ -5385,13 +5385,15 @@ function _showResetLinkModal(link, username, ttlMinutes) {
     overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index:10000; padding:16px;';
     overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true'); overlay.setAttribute('aria-label', 'Password reset link');
 
+    // The theme's own surface and text colours, in both skins and every theme: `--surface` and `--text`
+    // do not exist, so the card was always white and, in a dark theme, its title white on white.
     const card = _el('div');
-    card.style.cssText = 'background:var(--surface, #fff); color:var(--text, #111); border-radius:12px; max-width:560px; width:100%; padding:20px; box-shadow:0 10px 40px rgba(0,0,0,0.3);';
+    card.style.cssText = 'background:var(--surface-0); color:var(--text-primary); border:1px solid var(--surface-3); border-radius:12px; max-width:560px; width:100%; padding:20px; box-shadow:var(--shadow-lg);';
     card.addEventListener('click', e => e.stopPropagation());
 
     card.appendChild(_el('h3', null, 'Password reset link for ' + username));
     const warn = _el('p', 'text-sm');
-    warn.style.cssText = 'margin:8px 0; color:var(--text-secondary, #64748b);';
+    warn.style.cssText = 'margin:8px 0; color:var(--text-secondary);';
     warn.textContent = 'Copy this link and give it to ' + username + ' over a trusted channel. It is shown only once, '
         + (ttlMinutes ? ('expires in about ' + ttlMinutes + ' minutes, ') : '') + 'can be used only once, and signs the account out everywhere when used.';
     card.appendChild(warn);

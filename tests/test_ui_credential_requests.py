@@ -179,3 +179,33 @@ def test_an_open_users_page_shows_a_request_the_moment_it_is_made(page: Page, ad
     expect(row).to_be_visible(timeout=10000)
     expect(row.get_by_role("button", name="Approve")).to_be_visible()
     admin.post(f"/admin/credential-requests/{request_id}/deny")               # leave nothing waiting
+
+
+_READABLE = """() => {
+    const lum = (c) => {
+        const [r, g, b] = c.match(/[\d.]+/g).slice(0, 3).map(Number).map((v) => {
+            v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        });
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const ratio = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((m, n) => n - m); return (x + 0.05) / (y + 0.05); };
+    const overlay = document.querySelector('.reset-link-overlay');
+    const card = overlay.firstElementChild;
+    const bg = getComputedStyle(card).backgroundColor;
+    return { bg, title: ratio(getComputedStyle(card.querySelector('h3')).color, bg),
+             text: ratio(getComputedStyle(card.querySelector('p')).color, bg) };
+}"""
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_the_reset_link_dialog_is_readable_in_every_skin_and_theme(page: Page, page_admin, skin, theme):
+    """The dialog that shows a reset link once (made at once, or when a held one is approved) took
+    colours from tokens the theme does not have, so its card was always white: in Classic's dark theme
+    its title was white on white. It now takes the theme's own surface and text colours."""
+    _login(page, page_admin, skin, DESKTOP)
+    page.evaluate("""(theme) => { document.documentElement.setAttribute('data-theme', theme);
+        _showResetLinkModal('https://vault.example/reset#one-time', 'carol', 30); }""", theme)
+    got = page.evaluate(_READABLE)
+    assert got["title"] >= 4.5 and got["text"] >= 4.5, got
+    page.locator(".reset-link-overlay").get_by_role("button", name="Close").click()
