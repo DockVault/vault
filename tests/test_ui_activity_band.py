@@ -134,6 +134,9 @@ def _skin(page: Page, skin, theme, accent):
         html.setAttribute('data-theme', theme);
         html.setAttribute('data-accent', accent);
     }""", [skin, theme, accent])
+    # A skin's stylesheet that started disabled is read only now: measure once it is in.
+    page.wait_for_function("id => { const s = document.getElementById(id).sheet; return !!(s && s.cssRules.length); }",
+                           arg=f"skin-{skin}", timeout=10000)
 
 
 def test_a_selection_in_the_charts_is_ink_whatever_the_accent(page: Page, anon, activity_admin):
