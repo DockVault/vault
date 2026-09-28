@@ -263,3 +263,28 @@ def test_password_reset_ttl_config_validates(admin, restore_reset):
         assert admin.get("/settings").json().get("password_reset_ttl_minutes") == 10
     finally:
         admin.put("/settings", json={"password_reset_ttl_minutes": 5})
+
+
+@_mailpit
+def test_after_an_administrator_moves_the_email_a_reset_link_goes_to_the_old_address(
+        admin, restore_reset, mailpit_profile):
+    # The review's takeover: an administrator moves someone's email to an address they control, then
+    # asks for a reset link on the public form. For 14 days the link goes to the address before.
+    admin.put("/settings", json={"password_reset_enabled": True})
+    _mp_clear()
+    old, new = f"own-{unique('u')}@example.com", f"moved-{unique('u')}@example.com"
+    u = admin.create_user(email=old)
+    try:
+        assert admin.patch(f"/users/{u['id']}", json={"email": new}).status_code == 200
+        for identifier in (u["_username"], new):
+            assert _anon().post("/auth/forgot-password", json={"identifier": identifier}).status_code == 202
+        token = _mp_token_for(old)
+        assert token, "the link did not reach the address the account had before"
+        assert _mp_token_for(new, timeout=3) is None, "the link went to the address the administrator set"
+        texts = []
+        for m in requests.get(f"{MAILPIT_URL}/api/v1/messages", timeout=10).json().get("messages", []):
+            if old in [a.get("Address", "").lower() for a in m.get("To", [])]:
+                texts.append(requests.get(f"{MAILPIT_URL}/api/v1/message/{m['ID']}", timeout=10).json()["Text"])
+        assert any("For 14 days after such a change" in t for t in texts), texts
+    finally:
+        _purge(u["id"]); admin.delete_user(u["id"])

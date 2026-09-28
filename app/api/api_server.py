@@ -5228,12 +5228,15 @@ def _mint_reset_link(db: Session, user, base_url: str, *, created_by_id) -> Opti
     return f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
 
 
-def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> bool:
+def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id, to: Optional[str] = None,
+                         note_html: str = "") -> bool:
     """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
     password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
-    Never raises — the caller (public or admin) must not fail on mail trouble. Requires an email."""
+    Never raises — the caller (public or admin) must not fail on mail trouble. Requires an email.
+    ``to`` sends it to that address instead of the account's own, with ``note_html`` appended to say
+    why (see _self_service_reset_destination)."""
     from app.core.email_actions import send_action_email
-    email = (getattr(user, "email", "") or "").strip()
+    email = ((to if to is not None else getattr(user, "email", "")) or "").strip()
     if not email:
         return False
     try:
@@ -5247,22 +5250,58 @@ def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id) -> 
     try:
         return bool(send_action_email(db, "password_reset",
                                       recipient={"email": email, "username": user.username},
-                                      action_context={"link": link, "expires": f"in {ttl} minutes"}))
+                                      action_context={"link": link, "expires": f"in {ttl} minutes"},
+                                      footer_html=note_html))
     except Exception:
         return False
+
+
+def _self_service_reset_destination(db: Session, user):
+    """Where a self-service reset link for ``user`` may go: (address, note_html), or None to send
+    nothing.
+
+    Normally the account's own address, with no note. But for 14 days after an ADMINISTRATOR changed the
+    account's email address, the link goes to the address the account had BEFORE that change, and says
+    why. Otherwise an administrator could move someone's email to an address they control and finish the
+    takeover through the public forgot-password form, with only one credential change on record: the
+    email change is the one the two-administrator rule allows, and the reset link would be a second one
+    that nobody approved. The person's own mailbox receives the link instead; the new address is the one
+    that has to wait. When the account had no address before, nothing is sent until the 14 days pass.
+    If the person changed the address again themselves since (which asks for their password), their own
+    choice stands and the link goes there."""
+    from app.core import credential_changes as cc
+    moves = cc.email_changes_in_window(db, user.id)
+    if not moves:
+        return (user.email or "").strip(), ""
+    latest = (moves[-1].payload or {})
+    if "new_email" in latest and (latest.get("new_email") or "").lower() != (user.email or "").strip().lower():
+        return (user.email or "").strip(), ""
+    previous = ((moves[0].payload or {}).get("previous_email") or "").strip()
+    if not previous:
+        return None
+    when = _cc_date(moves[0].applied_at)
+    note = ("<p><small>An administrator changed this account's email address on "
+            f"{when}. For 14 days after such a change, a password reset link is sent to the "
+            "address the account had before, not to the new one, so this link came to you here. If you did "
+            "not expect the change, contact your administrators.</small></p>")
+    return previous, note
 
 
 def _mint_and_send_reset_async(user_id, base_url: str) -> None:
     """Fire-and-forget the self-service reset mint+send on a daemon thread in its OWN session, so a
     resolved identifier doesn't respond measurably slower than an unknown one (a timing enumeration
-    oracle). The 202 has already been returned by the time this runs."""
+    oracle). The 202 has already been returned by the time this runs. Where the link goes is decided
+    here, off the request path too (_self_service_reset_destination)."""
     def _run():
         try:
             from app.core.database import get_db_context
             with get_db_context() as s:
                 u = s.query(User).filter(User.id == user_id).first()
                 if u is not None:
-                    _mint_and_send_reset(s, u, base_url, created_by_id=None)
+                    destination = _self_service_reset_destination(s, u)
+                    if destination is not None:
+                        _mint_and_send_reset(s, u, base_url, created_by_id=None, to=destination[0],
+                                             note_html=destination[1])
         except Exception:  # noqa: BLE001
             pass
     try:
@@ -5476,6 +5515,10 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
                                 requester_name=requester_name, summary=summary, now=now)
         result = _apply_credential_change(db, kind, target, payload, actor_id=requester_id,
                                           actor_name=requester_name, request=request)
+        if kind == cc.EMAIL:
+            # The address before and after, for the 14 days a self-service reset link goes to the old
+            # one (_self_service_reset_destination).
+            change.payload = cc.applied_email_payload(result)
         return _CredentialOutcome(change, False, result)
     change = cc.hold(db, kind=kind, target_id=target.id, requester_id=requester_id,
                      requester_name=requester_name, summary=summary, payload=payload, now=now)
@@ -10324,6 +10367,10 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
         # Rolled back here, because the host tool's session commits whatever is left when it ends.
         db.rollback()
         raise
+    if kind == cc.EMAIL:
+        # The address before and after, for the 14 days a self-service reset link goes to the old one
+        # (_self_service_reset_destination). Nothing else a decided request held is kept.
+        change.payload = cc.applied_email_payload(result)
     db.add(AuditLogger(db).build_row(
         action="credential_change_approved", status="success", user=approver,
         username=None if approver is not None else cc.HOST_OPERATOR,

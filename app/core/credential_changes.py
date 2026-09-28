@@ -114,6 +114,28 @@ def last_applied(db, target_id, now: Optional[datetime] = None) -> Optional[Cred
             .first())
 
 
+def email_changes_in_window(db, target_id, now: Optional[datetime] = None) -> List[CredentialChange]:
+    """The email address changes an administrator (or the host operator) applied to this account within
+    the window, oldest first. Their ``payload`` keeps the address before and after (see
+    applied_email_payload), which a self-service reset link reads: within the window it goes to the
+    address the account had before (app/api/api_server.py, _self_service_reset_destination)."""
+    now = now or utcnow()
+    return (db.query(CredentialChange)
+            .filter(CredentialChange.target_user_id == target_id,
+                    CredentialChange.kind == EMAIL,
+                    CredentialChange.status.in_(APPLIED),
+                    CredentialChange.applied_at > now - WINDOW)
+            .order_by(CredentialChange.applied_at.asc())
+            .all())
+
+
+def applied_email_payload(result: dict) -> dict:
+    """What an applied email change keeps, from what applying it returned: the address before and the
+    address after. Kept for the window only; the periodic prune deletes the row after it."""
+    result = result or {}
+    return {"previous_email": result.get("old_email"), "new_email": result.get("new_email")}
+
+
 def window_ends(change: CredentialChange) -> Optional[datetime]:
     """When a further change to that account stops needing approval."""
     return change.applied_at + WINDOW if change.applied_at else None
