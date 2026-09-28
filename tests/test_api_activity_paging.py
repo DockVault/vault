@@ -183,20 +183,21 @@ def test_a_temporary_credential_is_found_by_its_name_even_after_it_is_deleted(ad
     assert _events(admin, temp_credential=unique("nobody"))["total"] == 0
 
 
-def test_the_typeahead_offers_accounts_and_names_only_the_log_has_seen(admin, temp_user):
+def test_the_typeahead_offers_accounts_and_never_a_name_typed_at_a_sign_in(admin):
+    """A name typed at a failed sign-in can be a password typed into the username box: the typeahead
+    suggests accounts only, whatever it is asked, while the Person filter still finds the typed name."""
     stem = unique("ta").lower()
     typed = f"{stem}-Typed"
     ApiClient().post("/auth/login", json={"username": typed, "password": "not-the-password-1"})
     user = admin.create_user(username=f"{stem}-account")
     try:
-        got = None
-        for _ in range(25):
-            got = admin.get("/activity/usernames", params={"q": stem}).json()["usernames"]
-            if len(got) >= 2:
-                break
-            time.sleep(0.2)
-        assert got == [{"username": f"{stem}-account", "account": True, "active": True},
-                       {"username": typed, "account": False}]            # in name order, as typed
+        _wait_for(admin, 1, user=typed, user_match="exact")          # the typed name is in the log
+        account = [{"username": f"{stem}-account", "account": True, "active": True}]
+        got = admin.get("/activity/usernames", params={"q": stem}).json()["usernames"]
+        assert got == account
+        assert admin.get("/activity/usernames", params={"q": typed}).json()["usernames"] == []
+        for asked in ({"accounts_only": "false"}, {"accounts_only": "true"}):   # a switch that is gone
+            assert admin.get("/activity/usernames", params={"q": stem, **asked}).json()["usernames"] == account
         upper = admin.get("/activity/usernames", params={"q": stem.upper()}).json()["usernames"]
         assert upper == got                                                # any case finds them
         assert admin.get("/activity/usernames", params={"q": stem, "limit": 1}).json()["usernames"] == got[:1]
@@ -209,24 +210,6 @@ def test_the_typeahead_offers_accounts_and_names_only_the_log_has_seen(admin, te
 def test_only_an_administrator_gets_the_typeahead(temp_user_client):
     assert temp_user_client.get("/activity/usernames", params={"q": "a"}).status_code == 403
     assert temp_user_client.get("/activity/temp-credentials", params={"q": "temp_"}).status_code == 403
-
-
-def test_the_typeahead_can_offer_accounts_only(admin):
-    stem = unique("tb").lower()
-    ApiClient().post("/auth/login", json={"username": f"{stem}-typed", "password": "not-the-password-1"})
-    user = admin.create_user(username=f"{stem}-account")
-    try:
-        got = None
-        for _ in range(25):
-            got = admin.get("/activity/usernames", params={"q": stem}).json()["usernames"]
-            if len(got) >= 2:
-                break
-            time.sleep(0.2)
-        assert len(got) == 2
-        only = admin.get("/activity/usernames", params={"q": stem, "accounts_only": "true"}).json()["usernames"]
-        assert only == [{"username": f"{stem}-account", "account": True, "active": True}]
-    finally:
-        admin.delete_user(user["id"])
 
 
 def test_the_credential_typeahead_names_state_and_expiry_but_never_the_note(admin):

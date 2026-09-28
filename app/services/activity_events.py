@@ -364,33 +364,9 @@ def row_view(r) -> dict:
 
 
 # --- Username typeahead ---------------------------------------------------------------------------
-
-# The top of the prefix range: in byte order (the index's "C" collation), every UTF-8 string that
-# starts with the prefix sorts before the prefix followed by the highest code point.
-_TOP = "\U0010ffff"
-
-# Each distinct name in the log that starts with the prefix, found one at a time: each step asks the
-# index for the next name after the last one, so a name written a million times costs one probe, not a
-# million rows. idx_audit_username_prefix is on exactly this expression.
-_LOG_NAMES_SQL = """
-WITH RECURSIVE seen(n) AS (
-    (SELECT lower(username) COLLATE "C" FROM audit_logs
-      WHERE lower(username) COLLATE "C" >= :lo AND lower(username) COLLATE "C" < :hi
-      ORDER BY 1 LIMIT 1)
-  UNION ALL
-    SELECT (SELECT lower(a.username) COLLATE "C" FROM audit_logs a
-             WHERE lower(a.username) COLLATE "C" > seen.n AND lower(a.username) COLLATE "C" < :hi
-             ORDER BY 1 LIMIT 1)
-      FROM seen WHERE seen.n IS NOT NULL
-)
-SELECT n FROM seen WHERE n IS NOT NULL LIMIT :limit
-"""
-
-# One stored spelling of a name found above (the log keeps the case it was typed in).
-_LOG_SPELLING_SQL = """
-SELECT username FROM audit_logs WHERE lower(username) COLLATE "C" = :n LIMIT 1
-"""
-
+# Suggestions come from the accounts table only. The log also holds every name typed at a failed
+# sign-in, which can be a password typed into the username box, and a typeahead over it would list them
+# to anyone walking the prefixes. Those names stay findable through the Person filter, never suggested.
 
 def typeahead_prefix(text: Optional[str]) -> Optional[str]:
     """The prefix a typeahead searches for: trimmed and lower-cased, None when empty or too long."""
@@ -400,33 +376,21 @@ def typeahead_prefix(text: Optional[str]) -> Optional[str]:
     return text
 
 
-def username_suggestions(db, text: Optional[str], limit: int = 10, accounts_only: bool = False) -> List[dict]:
-    """Usernames that start with `text`, from the accounts and, unless `accounts_only`, from every name
-    the audit log has seen (attempted sign-ins and deleted accounts included), in name order, at most
-    `limit` (MAX_SUGGESTIONS). Each says whether it is an account now, and an account whether it is
-    active. Bounded work: the accounts table is small and searched on its username; the log is walked
-    name by name through its index."""
-    from sqlalchemy import func, text as sql
+def username_suggestions(db, text: Optional[str], limit: int = 10) -> List[dict]:
+    """Accounts whose username starts with `text`, in name order, at most `limit` (MAX_SUGGESTIONS), each
+    saying whether it is active. Never a name from the log alone: a name typed at a failed sign-in or a
+    deleted account's (see above)."""
+    from sqlalchemy import func
     from app.core.models import User
     prefix = typeahead_prefix(text)
     limit = max(1, min(int(limit or 10), MAX_SUGGESTIONS))
     if prefix is None:
         return []
     like = like_escape(prefix) + "%"
-    accounts = [(u, a) for u, a in db.query(User.username, User.is_active)
-                .filter(func.lower(User.username).like(like, escape="\\"))
-                .order_by(func.lower(User.username).collate("C")).limit(limit).all() if u]
-    out = {u.lower(): {"username": u, "account": True, "active": bool(a)} for u, a in accounts}
-    if accounts_only:
-        return [out[k] for k in sorted(out)][:limit]
-    found = [n for (n,) in db.execute(sql(_LOG_NAMES_SQL),
-                                      {"lo": prefix, "hi": prefix + _TOP, "limit": limit}).all()]
-    for n in found:
-        if n in out:
-            continue
-        spelled = db.execute(sql(_LOG_SPELLING_SQL), {"n": n}).scalar()
-        out[n] = {"username": spelled or n, "account": False}
-    return [out[k] for k in sorted(out)][:limit]
+    accounts = db.query(User.username, User.is_active).filter(
+        func.lower(User.username).like(like, escape="\\")).order_by(
+        func.lower(User.username).collate("C")).limit(limit).all()
+    return [{"username": u, "account": True, "active": bool(a)} for u, a in accounts if u]
 
 
 def temp_credential_suggestions(db, text: Optional[str], limit: int = 8) -> List[dict]:

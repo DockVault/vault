@@ -121,16 +121,6 @@ def test_a_typeahead_prefix_is_trimmed_and_lower_cased(text, expected):
     assert ev.typeahead_prefix(text) == expected
 
 
-def test_the_typeahead_range_covers_every_name_with_the_prefix_and_no_other():
-    # In byte order, which is the order of the index the typeahead walks.
-    prefix = "al"
-    hi = (prefix + ev._TOP).encode()
-    inside = ["al", "alice", "al.ice", "aléx", "al\U0001f600", "al￿"]
-    outside = ["ak", "am", "a", "b", "alz"[:1]]
-    assert all(prefix.encode() <= n.encode() < hi for n in inside)
-    assert not any(prefix.encode() <= n.encode() < hi for n in outside)
-
-
 def test_a_row_view_carries_the_credentials_name():
     row = SimpleNamespace(
         id=uuid.uuid4(), timestamp=datetime(2026, 9, 27, 8, 0, 0), username="alex",

@@ -2602,16 +2602,15 @@ def activity_event(event_id: str,
 def activity_usernames(
     q: str = Query("", max_length=64),
     limit: int = Query(10, ge=1, le=20),
-    accounts_only: bool = False,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """Usernames that start with `q`, for the Events filter's typeahead (admin only): the accounts, and
-    unless `accounts_only`, every other name the audit log has seen, such as a name typed at a failed
-    sign-in or a deleted account. Each says whether it is an account now, and an account whether it is
-    active. At most 20, and cheap on a large log (see activity_events.username_suggestions)."""
+    """Accounts whose username starts with `q`, for the Events filter's typeahead (admin only), each
+    saying whether it is active; at most 20. Never a name the audit log holds without an account, such
+    as one typed at a failed sign-in: it can be a password typed into the username box (see
+    activity_events.username_suggestions)."""
     from app.services import activity_events as ev
-    return {"usernames": ev.username_suggestions(db, q, limit, accounts_only=accounts_only)}
+    return {"usernames": ev.username_suggestions(db, q, limit)}
 
 
 # --- Saved searches (the Activity page) ------------------------------------------------------------

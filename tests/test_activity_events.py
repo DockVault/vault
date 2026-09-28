@@ -241,3 +241,40 @@ def test_rows_gone_since_the_count_leave_no_closing_note():
     fetch, _ = _batches([_view(i) for i in range(3)], size=10)      # counted 5, two were deleted since
     lines = [json.loads(line) for line in ev.export_lines(fetch, "ndjson", total=5, cap=100)]
     assert len(lines) == 3 and all("truncated" not in line for line in lines)
+
+
+class _SuggestionDb:
+    """Holds one account, "ana-account", and would answer any read of the audit log with a typed name."""
+
+    def __init__(self):
+        self.log_reads = 0
+
+    def query(self, *_cols):
+        rows = [("ana-account", True)]
+
+        class _Q:
+            def filter(self, *_a):
+                return self
+
+            def order_by(self, *_a):
+                return self
+
+            def limit(self, _n):
+                return self
+
+            def all(self):
+                return rows
+        return _Q()
+
+    def execute(self, *_a, **_k):
+        self.log_reads += 1
+        return SimpleNamespace(all=lambda: [("ana-Hunter2!Pass",)], scalar=lambda: "ana-Hunter2!Pass")
+
+
+def test_the_username_typeahead_suggests_accounts_and_never_reads_the_log():
+    """A name typed at a failed sign-in can hold a password: it is never suggested, and the log is not
+    even read for suggestions."""
+    db = _SuggestionDb()
+    assert ev.username_suggestions(db, "ana", 10) == [{"username": "ana-account", "account": True, "active": True}]
+    assert db.log_reads == 0
+    assert ev.username_suggestions(db, "", 10) == []

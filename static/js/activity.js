@@ -3692,7 +3692,7 @@
         typeahead(pInput, {
             min: 2,
             source: async (q) => {
-                const d = await get(`/activity/usernames?q=${encodeURIComponent(q)}&limit=8&accounts_only=true`);
+                const d = await get(`/activity/usernames?q=${encodeURIComponent(q)}&limit=8`);
                 return (d.usernames || []).filter((u) => u.account).slice(0, 8)
                     .map((u) => ({ value: u.username, label: u.username, sub: u.active === false ? 'Deactivated account' : 'Account' }));
             },
