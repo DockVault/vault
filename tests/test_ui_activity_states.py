@@ -167,3 +167,16 @@ def test_classic_filter_checkboxes_take_the_skins_accent(page: Page, activity_ad
         return { strong, accent: getComputedStyle(b).accentColor };
     }""")
     assert got["accent"] == got["strong"], got
+
+
+def test_charts_under_a_filter_that_matches_nothing_say_so(page: Page, activity_admin):
+    """Under a search that matches nothing, Most active says no one matches (not "No one yet."), for
+    people and for addresses, and the empty Events chart shows no scale ("1") above nothing."""
+    login(page, activity_admin)
+    open_activity(page)
+    page.fill("#act-search", unique("matches-nothing"))
+    active = page.locator("#act-p-active .act-plot")
+    expect(active).to_have_text("No one matches.", timeout=10000)
+    expect(page.locator("#act-p-time .act-grid-label")).to_have_count(0)
+    page.click("#act-p-active .act-toggle-btn[data-fkey=mode-addresses]")
+    expect(page.locator("#act-p-active .act-plot")).to_have_text("No addresses match.")

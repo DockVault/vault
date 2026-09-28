@@ -2557,14 +2557,15 @@
         const top = narrow ? 2 : 12;
         const base = H - axisH;
         const area = Math.max(1, base - top);
-        const ceil = niceCeil(Math.max(0, ...buckets.map((x) => x.total || 0)));
+        const peak = Math.max(0, ...buckets.map((x) => x.total || 0));
+        const ceil = niceCeil(peak);
         const n = buckets.length;
         const pitch = W / n;
         const cw = Math.max(1, Math.min(pitch * 0.7, 14));
         const sel = selectedBuckets();
         const chart = el('div', 'act-chart' + (sel.size ? ' has-sel' : ''));
         const s = svg('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': chartAriaLabel() }, 'act-chart-svg');
-        if (!narrow) {
+        if (!narrow && peak > 0) {                                  // an empty chart has no scale to show
             s.appendChild(svg('line', { x1: 0, x2: W, y1: top + 0.5, y2: top + 0.5 }, 'act-grid'));
             const lab = svg('text', { x: 0, y: top - 3 }, 'act-axis act-grid-label');
             lab.textContent = nf(ceil);
@@ -2944,7 +2945,13 @@
         }
         const pinned = items.filter((x) => x.pressed);
         const shown = pinned.concat(items.filter((x) => !x.pressed)).slice(0, slots());
-        if (!shown.length) { plot.appendChild(el('span', 'act-plot-note', mode === 'people' ? 'No one yet.' : 'No addresses yet.')); return; }
+        if (!shown.length) {
+            // Under filters the panel is empty because nothing matches them, not because no one has come yet.
+            const filtered = panelFiltered('active');
+            const note = mode === 'people' ? (filtered ? 'No one matches.' : 'No one yet.') : (filtered ? 'No addresses match.' : 'No addresses yet.');
+            plot.appendChild(el('span', 'act-plot-note', note));
+            return;
+        }
         const max = Math.max(1, ...shown.map((x) => x.count));
         const anyPressed = pinned.length > 0;
         shown.forEach((x) => {
