@@ -5768,9 +5768,11 @@ def _announce_admin_granted(db, user, *, by_name, how) -> None:
         when = _change_time_text()
         others = [a for a in db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
                   if a.id != user.id]
+        # No time in the text: the notice's own time is shown beside it, in the reader's zone, and a
+        # second one in UTC read as a different time. The email has no other, so it keeps its own.
         _notify_users([str(a.id) for a in others], "administrator_added", title="A new administrator",
-                      body=(f"{what} When: {when}. An administrator can change other people's accounts. If "
-                            "you did not expect this, check the Users page at once."),
+                      body=(f"{what} An administrator can change other people's accounts. If you did not "
+                            "expect this, check the Users page at once."),
                       target="#users")
         _fire_action_email_bulk(db, "administrator_added", [(a.email, a.username) for a in others],
                                 {"change": what, "by": by, "when": when})

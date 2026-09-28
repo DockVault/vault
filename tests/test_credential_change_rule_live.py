@@ -373,6 +373,7 @@ def test_an_administrator_the_requester_made_cannot_approve(admin, temp_user, ot
         told = [n["body"] for n in notifications(admin, "administrator_added")
                 if f"created the administrator account {puppet['_username']}." in n["body"]]
         assert told and told[0].startswith(f"{asker['_username']} created"), told
+        assert "When:" not in told[0] and "UTC" not in told[0], told    # the notice's own time is the one shown
         assert psql(f"SELECT granted_by_name FROM admin_grants WHERE user_id='{puppet['id']}'") == asker["_username"]
     ok = admin.post(f"/admin/credential-requests/{req_id}/approve")
     assert ok.status_code == 200, ok.text

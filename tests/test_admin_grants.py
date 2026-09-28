@@ -100,11 +100,14 @@ def test_every_other_administrator_is_told_of_a_new_one_in_the_app_and_by_email(
     ((ids, ntype, title, body, target),) = told
     assert ids == sorted([str(alice.id), str(bob.id), str(dora.id)]), "active administrators but the new one"
     assert (ntype, title, target) == ("administrator_added", "A new administrator", "#users")
-    assert "alice created the administrator account newadmin" in body and "UTC" in body
+    assert "alice created the administrator account newadmin" in body
+    # One time, the notice's own, shown beside it in the reader's zone: none in the text. The email,
+    # with no other time, says when.
+    assert "UTC" not in body and "When:" not in body, body
     ((key, recipients, ctx),) = mailed
     assert key == "administrator_added"
     assert sorted(r for r in recipients if r[0]) == [("alice@example.com", "alice"), ("bob@example.com", "bob")]
-    assert "newadmin" in ctx["change"] and ctx["by"] == "alice"
+    assert "newadmin" in ctx["change"] and ctx["by"] == "alice" and "UTC" in ctx["when"]
 
 
 @pytest.mark.parametrize("how,words", [("promoted", "alice made newadmin an administrator"),
