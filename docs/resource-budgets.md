@@ -305,9 +305,20 @@ is answered `413` without the rest being read (`app/core/body_limit.py`):
 | A logo or favicon; an email image | 3 MiB; 6 MiB, signed in only |
 | A multipart file upload | none here (each file is held to the maximum file size and the quotas), signed in only |
 
-"Signed in only" means the larger limit needs a session token the server signed; any other caller
-meets the 1 MiB limit on that route. Measured on this change: a 20 MB chunked body to `/auth/login`
-is refused in 0.2 s and the API's memory rises by under 2 MiB, where it used to be read whole.
+"Signed in only" means the larger limit needs a session that is signed in right now: the token is
+signed and unexpired, and the session, the account and any temporary credential behind it pass the
+checks the route's own authentication makes (`app/core/live_session.py`). Anyone else meets the
+64 KiB limit on that route: a caller with no token is held to it, and a token whose session has ended
+(signed out or revoked, a deactivated account or one an administrator locked, a temporary credential
+switched off, finished or past its time) is answered `401` before any of its body is read. A body
+that declares no more than 64 KiB goes in without the check. Measured on this change: a 20 MB chunked
+body to `/auth/login` is refused in 0.2 s and the API's memory rises by under 2 MiB, where it used to
+be read whole; 48 MiB of chunked multipart with a token for a session that does not exist is answered
+`401` with nothing read (it used to be spooled whole to `/tmp` first).
+
+The check costs one lookup per session every 5 seconds, and only for a body over 64 KiB: measured in
+the container, about 5 ms when the database is asked (a Redis read and two small queries, off the
+event loop) and about 50 µs when the answer is kept.
 
 A signed-in multipart upload is still received whole before the handler runs. Its parts are spooled
 to `/tmp`, which the shipped compose files mount as a tmpfs, so until the handler has read them they

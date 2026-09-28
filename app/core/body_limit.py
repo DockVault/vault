@@ -17,22 +17,36 @@ Three classes, and an explicit entry for every route that needs more than the JS
 - ROUTE_RULES: the file routes and the few JSON routes whose legitimate body is larger, each with its
   own limit and the reason for it.
 
-A route listed with needs_session=True parses its body before it authenticates the caller, so its
-larger limit is given only to a request carrying a bearer token this server signed for a session
-(signature and expiry checked, which needs no database). Anyone else meets JSON_LIMIT there: nothing
-larger than 1 MiB is parsed for a caller who has not signed in. A stream rule marks a route that reads
-the body itself as it arrives (a chunk written straight to disk, a multipart form spooled part by
-part): its bytes are counted, never held here.
+A route whose rule has needs_session=True has its body read before it authenticates the caller, so a
+limit there above PUBLIC_LIMIT is given only to a session that is signed in right now: the token is
+signed and unexpired, and the session, the account and any temporary credential behind it pass the
+checks get_current_user makes (app/core/live_session.py, whose answer is kept a few seconds so an
+upload burst pays for one lookup). Everyone else meets PUBLIC_LIMIT on that route:
 
-Kept free of the application's imports (the token check is imported only when first needed) so it is
-unit-testable offline.
+- a body that declares no more than PUBLIC_LIMIT goes in without anyone being asked, since anyone may
+  send that much;
+- a request with no bearer token is held to PUBLIC_LIMIT;
+- a bearer token that is not a live session (a revoked or logged-out session, a deactivated or locked
+  account, a temporary credential that is off, finished or past its time, a token this server did not
+  sign) is answered 401 without its body being read, as the route would answer it;
+- a session that could not be checked (the database did not answer) is answered 503.
+
+The two chunk routes are the exception: they read the body themselves, after the caller or the link
+has been checked, so their limit applies to whoever reaches them. A stream rule marks a route that
+reads the body as it arrives (a chunk written straight to disk, a multipart form spooled part by part):
+its bytes are counted, never held here.
+
+Kept free of the application's imports at module level (live_session imports the database only when
+it is first asked) so it is unit-testable offline.
 """
 import json
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Optional, Sequence, Tuple
 
 from starlette.exceptions import HTTPException
+
+from app.core import live_session
 
 KiB = 1024
 MiB = 1024 * KiB
@@ -57,7 +71,7 @@ class BodyRule:
     name: str
     limit: Optional[int]
     stream: bool = False          # the route reads the body as a stream: count it, never hold it
-    needs_session: bool = False   # the limit is for a signed-in caller only; anyone else gets JSON
+    needs_session: bool = False   # above PUBLIC_LIMIT only for a live session; anyone else gets PUBLIC
 
 
 PUBLIC = BodyRule("public", PUBLIC_LIMIT)
@@ -147,28 +161,6 @@ def rule_for(method: str, path: str) -> BodyRule:
     return JSON
 
 
-def bearer_has_session(authorization: Optional[bytes]) -> bool:
-    """True if the Authorization header carries a session token this server signed and that has not
-    expired. A signature and expiry check only (no database): enough to know the caller signed in,
-    which is all a larger body limit needs. The same rule as the session resolver: a token without a
-    session_token is no session, which is what keeps a second-factor pending token out."""
-    if not authorization:
-        return False
-    try:
-        scheme, _, token = authorization.decode("latin-1").strip().partition(" ")
-    except Exception:  # noqa: BLE001 -- an undecodable header is no session
-        return False
-    token = token.strip()
-    if scheme.lower() != "bearer" or not token:
-        return False
-    try:
-        from app.core.security import verify_access_token
-        payload = verify_access_token(token)
-    except Exception:  # noqa: BLE001 -- a broken token is no session, never a 500
-        return False
-    return bool(isinstance(payload, dict) and payload.get("sub") and payload.get("session_token"))
-
-
 def _human(n: int) -> str:
     if n % MiB == 0:
         return f"{n // MiB} MiB"
@@ -185,6 +177,16 @@ def too_large_body(limit: int) -> bytes:
     return json.dumps({"detail": too_large_detail(limit)}).encode()
 
 
+# A token that is no live session is told what get_current_user would tell it; the web app signs the
+# person out on a 401 (a detail that mentions no password).
+SESSION_ENDED_BODY = json.dumps({"detail": "Your session has ended. Please sign in again."}).encode()
+SESSION_ENDED_HEADERS = [(b"www-authenticate", b"Bearer"),
+                         (b"clear-site-data", b'"cache", "cookies", "storage"')]
+SESSION_UNCHECKED_BODY = json.dumps(
+    {"detail": "Your sign-in could not be checked just now. Try again in a moment."}).encode()
+SESSION_UNCHECKED_HEADERS = [(b"retry-after", b"5")]
+
+
 class BodyTooLarge(HTTPException):
     """Raised out of receive() when a streamed body passes its limit. An HTTPException, so the
     framework's body readers and the handlers' ``except HTTPException: raise`` pass it on untouched."""
@@ -194,21 +196,24 @@ class BodyTooLarge(HTTPException):
         self.limit = limit
 
 
-async def _answer(send, status: int, body: bytes) -> None:
+async def _answer(send, status: int, body: bytes, headers=()) -> None:
     await send({"type": "http.response.start", "status": status,
                 "headers": [(b"content-type", b"application/json"),
-                            (b"content-length", str(len(body)).encode())]})
+                            (b"content-length", str(len(body)).encode())] + list(headers)})
     await send({"type": "http.response.body", "body": body})
 
 
 class BodyLimitMiddleware:
-    """Pure ASGI: bound every HTTP request body by its route's rule (see the module docstring)."""
+    """Pure ASGI: bound every HTTP request body by its route's rule (see the module docstring).
+
+    `caller(authorization)` answers live_session's NO_CREDENTIAL, LIVE, ENDED or UNKNOWN; left out, it
+    is live_session.caller_state, looked up when used."""
 
     def __init__(self, app, classify: Callable[[str, str], BodyRule] = rule_for,
-                 has_session: Callable[[Optional[bytes]], bool] = bearer_has_session):
+                 caller: Optional[Callable[[Optional[bytes]], Awaitable[str]]] = None):
         self.app = app
         self.classify = classify
-        self.has_session = has_session
+        self.caller = caller
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -237,8 +242,19 @@ class BodyLimitMiddleware:
             return
 
         rule = self.classify(scope.get("method", ""), scope.get("path", ""))
-        if rule.needs_session and not self.has_session(authorization):
-            rule = JSON
+        if rule.needs_session and (rule.limit is None or rule.limit > PUBLIC_LIMIT):
+            if length is not None and length <= PUBLIC_LIMIT:
+                rule = PUBLIC   # anyone may send this much: no need to ask who is calling
+            else:
+                state = await (self.caller or live_session.caller_state)(authorization)
+                if state == live_session.ENDED:
+                    await _answer(send, 401, SESSION_ENDED_BODY, SESSION_ENDED_HEADERS)
+                    return
+                if state == live_session.UNKNOWN:
+                    await _answer(send, 503, SESSION_UNCHECKED_BODY, SESSION_UNCHECKED_HEADERS)
+                    return
+                if state != live_session.LIVE:
+                    rule = PUBLIC   # no credential: what anyone may send, held until it is whole
         limit = rule.limit
         if limit is None:
             await self.app(scope, receive, send)

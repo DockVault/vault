@@ -4,7 +4,9 @@ The framework reads a JSON body whole and parses it on the event loop before any
 before the caller is known; a limit that only read a declared Content-Length let a chunked body in
 unbounded. These drive app.core.body_limit.BodyLimitMiddleware directly with ASGI messages -- no
 server, no socket -- and sweep the application's routes so every route that reads a body before it
-knows the caller, and every route that streams one, is covered by an explicit rule.
+knows the caller, and every route that streams one, is covered by an explicit rule. Whether a caller
+is a live session is app.core.live_session's answer (tests/test_live_session.py); here a stand-in
+gives each answer in turn.
 """
 import inspect
 import json
@@ -14,10 +16,25 @@ import pytest
 from _async_run import run_coroutine
 from _bare_api_env import set_bare_api_env
 from app.core import body_limit as bl
+from app.core import live_session as ls
 
 pytestmark = pytest.mark.unit
 
 KiB, MiB = bl.KiB, bl.MiB
+LIVE, ENDED, UNKNOWN = b"Bearer live", b"Bearer ended", b"Bearer unknown"
+
+
+def _caller():
+    """A stand-in for live_session.caller_state that records every question: LIVE, ENDED and UNKNOWN
+    above answer as named, no header is no credential."""
+    asked = []
+
+    async def caller(authorization):
+        asked.append(authorization)
+        return {None: ls.NO_CREDENTIAL, LIVE: ls.LIVE, UNKNOWN: ls.UNKNOWN}.get(authorization, ls.ENDED)
+
+    caller.asked = asked
+    return caller
 
 
 # --------------------------------------------------------------------------- an ASGI harness
@@ -58,8 +75,10 @@ def _scope(method, path, headers=()):
 
 
 def _drive(app, method, path, pieces, *, declared=None, chunked=False, auth=None,
-           classify=bl.rule_for, has_session=lambda _h: False):
-    """Send `pieces` as the request body; return (status, response body, receive calls, app)."""
+           classify=bl.rule_for, caller=None):
+    """Send `pieces` as the request body; return (status, response body, receive calls, app). The
+    response's headers are left on app.response_headers, the questions asked on app.asked."""
+    caller = caller or _caller()
     headers = []
     if declared is not None:
         headers.append((b"content-length", str(declared).encode()))
@@ -81,10 +100,12 @@ def _drive(app, method, path, pieces, *, declared=None, chunked=False, auth=None
     async def send(message):
         sent.append(message)
 
-    mw = bl.BodyLimitMiddleware(app, classify=classify, has_session=has_session)
+    mw = bl.BodyLimitMiddleware(app, classify=classify, caller=caller)
     run_coroutine(mw(_scope(method, path, headers), receive, send))
     start = next(m for m in sent if m["type"] == "http.response.start")
     body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    app.response_headers = dict(start["headers"])
+    app.asked = caller.asked
     return start["status"], body, state["reads"], app
 
 
@@ -189,29 +210,107 @@ def test_a_response_already_started_before_the_limit_is_left_to_finish():
 
 # --------------------------------------------------------------------------- sessions and no body
 
-def test_a_larger_limit_that_needs_a_session_is_given_only_with_one():
+def test_a_larger_limit_that_needs_a_session_is_given_only_to_a_live_one():
     body = _pieces(2 * MiB)
-    without = _App()
-    status, _, _, _ = _drive(without, "POST", "/notes", body, chunked=True)
-    assert (status, without.calls) == (413, 0), "a caller with no session got the note limit"
-    status, _, _, _ = _drive(_App(), "POST", "/notes", body, chunked=True, auth=b"Bearer forged",
-                             has_session=lambda h: False)
-    assert status == 413
-    with_session = _App()
-    status, _, _, _ = _drive(with_session, "POST", "/notes", body, chunked=True, auth=b"Bearer ok",
-                             has_session=lambda h: h == b"Bearer ok")
-    assert status == 200 and with_session.body == b"x" * (2 * MiB)
+    live = _App()
+    status, _, _, _ = _drive(live, "POST", "/notes", body, chunked=True, auth=LIVE)
+    assert status == 200 and live.body == b"x" * (2 * MiB)
+    anonymous = _App()
+    status, text, reads, _ = _drive(anonymous, "POST", "/notes", body, chunked=True)
+    assert (status, anonymous.calls) == (413, 0), "a caller with no session got the note limit"
+    assert "64 KiB" in json.loads(text)["detail"]
+    assert reads == bl.PUBLIC_LIMIT // (16 * KiB) + 1, "read past the anonymous limit"
 
 
-def test_a_multipart_upload_has_no_cap_here_for_a_session_and_the_json_one_without():
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "chunked"])
+def test_a_token_that_is_no_live_session_is_answered_401_before_its_body_is_read(declared):
+    """A revoked, logged-out, locked, deactivated or expired session: the route would answer 401 once
+    it had read the body, so this answers it without reading any. The web app signs out on it."""
+    app = _App()
+    status, text, reads, _ = _drive(app, "POST", "/vaults/v/files", _pieces(3 * MiB, 256 * KiB),
+                                    declared=3 * MiB if declared else None, chunked=not declared, auth=ENDED)
+    assert (status, reads, app.calls) == (401, 0, 0)
+    detail = json.loads(text)["detail"]
+    assert "sign in" in detail and "password" not in detail.lower(), detail   # app.js: 401 -> sign out
+    assert app.response_headers[b"www-authenticate"] == b"Bearer"
+    assert app.response_headers[b"clear-site-data"] == b'"cache", "cookies", "storage"'
+
+
+def test_a_session_that_could_not_be_checked_is_answered_503_before_its_body_is_read():
+    app = _App()
+    status, _, reads, _ = _drive(app, "POST", "/notes", _pieces(2 * MiB), chunked=True, auth=UNKNOWN)
+    assert (status, reads, app.calls) == (503, 0, 0)
+    assert app.response_headers[b"retry-after"] == b"5"
+
+
+def test_a_body_anyone_may_send_is_let_in_without_asking_who_is_calling():
+    """A declared body within the anonymous limit fits every caller's limit, so no one is asked and a
+    small request costs nothing; the route's own authentication still answers it."""
+    for auth in (None, ENDED, UNKNOWN, LIVE):
+        app = _App()
+        status, _, _, _ = _drive(app, "POST", "/notes", [b"x" * bl.PUBLIC_LIMIT], declared=bl.PUBLIC_LIMIT,
+                                 auth=auth)
+        assert (status, app.asked) == (200, []), auth
+
+
+def test_the_caller_is_asked_once_and_only_where_a_larger_limit_is_at_stake():
+    big = _pieces(128 * KiB)
+    for method, path in (("POST", "/notes"), ("POST", "/vaults/v/files"), ("POST", "/email/templates")):
+        app = _App()
+        _drive(app, method, path, big, declared=128 * KiB, auth=LIVE)
+        assert app.asked == [LIVE], path
+        app = _App()
+        _drive(app, method, path, big, chunked=True, auth=LIVE)
+        assert app.asked == [LIVE], path
+    for method, path in (("POST", "/auth/login"), ("PUT", "/vaults/v/uploads/s/chunks/0"),
+                         ("PUT", "/receivers/t/upload-session/s/chunks/0"), ("POST", "/device/sync-credential")):
+        app = _App()
+        _drive(app, method, path, big, chunked=True, auth=ENDED)
+        assert app.asked == [], f"{path} asked who was calling"
+
+
+def test_a_chunk_route_takes_its_limit_from_anyone_because_it_checks_the_caller_first():
+    """The upload-link chunk is sent by someone with no account, and both chunk handlers check the
+    caller or the link before they read a byte, so neither needs a session here."""
+    pieces = _pieces(3 * MiB, size=256 * KiB)
+    for path in ("/receivers/t/upload-session/s/chunks/0", "/vaults/v/uploads/s/chunks/0"):
+        app = _App()
+        status, _, _, _ = _drive(app, "PUT", path, pieces, chunked=True)
+        assert status == 200 and app.body == b"x" * (3 * MiB), path
+
+
+def test_a_multipart_upload_has_no_cap_here_for_a_live_session_and_the_anonymous_one_without():
     pieces = _pieces(3 * MiB, size=256 * KiB)
     app = _App()
-    status, _, _, _ = _drive(app, "POST", "/vaults/v/files", pieces, chunked=True, auth=b"Bearer ok",
-                             has_session=lambda h: True)
+    status, _, _, _ = _drive(app, "POST", "/vaults/v/files", pieces, chunked=True, auth=LIVE)
     assert status == 200 and len(app.messages) == len(pieces), "a signed-in upload was held or capped"
     anon = _App()
-    status, _, _, _ = _drive(anon, "POST", "/vaults/v/files", pieces, chunked=True)
-    assert (status, anon.calls) == (413, 0), "an anonymous multipart body was spooled past 1 MiB"
+    status, _, reads, _ = _drive(anon, "POST", "/vaults/v/files", pieces, chunked=True)
+    assert (status, anon.calls) == (413, 0), "an anonymous multipart body was spooled past 64 KiB"
+    assert reads == 1, "an anonymous multipart body was read past its first piece"
+
+
+def test_the_live_session_check_is_the_default_and_is_looked_up_when_used(monkeypatch):
+    asked = []
+
+    async def caller_state(authorization):
+        asked.append(authorization)
+        return ls.LIVE
+
+    monkeypatch.setattr(ls, "caller_state", caller_state)
+    app = _App()
+    sent = []
+    queue = [{"type": "http.request", "body": b"x" * (128 * KiB), "more_body": False}]
+
+    async def receive():
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    headers = [(b"content-length", str(128 * KiB).encode()), (b"authorization", LIVE)]
+    run_coroutine(bl.BodyLimitMiddleware(app)(_scope("POST", "/notes", headers), receive, send))
+    assert asked == [LIVE] and app.calls == 1
 
 
 def test_a_request_without_a_body_goes_straight_through_unread():
@@ -237,25 +336,6 @@ def test_websockets_and_lifespan_pass_through():
     for kind in ("websocket", "lifespan"):
         run_coroutine(mw({"type": kind, "path": "/ws/monitor", "headers": []}, None, None))
     assert seen == ["websocket", "lifespan"]
-
-
-def test_the_session_check_accepts_only_a_signed_unexpired_session_token():
-    _app()   # installs the runtime settings the token helpers read
-    from datetime import timedelta
-    from app.core.security import create_access_token
-    ok = create_access_token({"sub": "u1", "session_token": "s"})
-    assert bl.bearer_has_session(b"Bearer " + ok.encode())
-    assert bl.bearer_has_session(b"bearer  " + ok.encode() + b" ")
-    pending = create_access_token({"sub": "u1", "stage": "second_factor", "pre_auth": "p"})
-    assert not bl.bearer_has_session(b"Bearer " + pending.encode()), "a second-factor token is no session"
-    no_session = create_access_token({"sub": "u1"})
-    assert not bl.bearer_has_session(b"Bearer " + no_session.encode())
-    expired = create_access_token({"sub": "u1", "session_token": "s"}, expires_delta=timedelta(minutes=-5))
-    assert not bl.bearer_has_session(b"Bearer " + expired.encode())
-    head, payload, sig = ok.split(".")
-    assert not bl.bearer_has_session(f"Bearer {head}.{payload}.{sig[::-1]}".encode())
-    for bad in (None, b"", b"Bearer", b"Basic " + ok.encode(), b"\xff\xfe"):
-        assert not bl.bearer_has_session(bad)
 
 
 # --------------------------------------------------------------------------- the classifier

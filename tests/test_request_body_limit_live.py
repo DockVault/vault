@@ -13,12 +13,14 @@ import os
 import subprocess
 import threading
 import time
+import uuid
 from urllib.parse import urlsplit
 
 import pytest
 
 from conftest import ApiClient, BASE_URL, _random_ip, unique
 from _device_boundary_helpers import grant, mint_sync_cred, register_device
+from test_api_receiver_upload_finalize import _mk_receiver, _upload, receivers_enabled  # noqa: F401
 
 MiB = 1024 * 1024
 _OCTET = {"Content-Type": "application/octet-stream"}
@@ -178,13 +180,172 @@ def test_parallel_chunked_bodies_to_sign_in_leave_the_api_up():
 
 
 def test_a_large_body_to_a_route_that_needs_a_session_is_refused_without_one(admin):
-    """A note may be large, but only for a signed-in caller: anyone else meets the JSON limit before
-    the body is parsed. With a session the same body reaches the handler, which answers itself."""
+    """A note may be large, but only for a signed-in caller: anyone else meets the anonymous limit
+    before the body is parsed. With a session the same body reaches the handler, which answers itself."""
     body = json.dumps({"title": "t", "body": "x" * (2 * MiB)}).encode()
     status, text, _ = _post("/notes", body)
-    assert status == 413, text
+    assert status == 413 and "64 KiB" in json.loads(text)["detail"], text
     status, text, _ = _post("/notes", body, headers={"Authorization": f"Bearer {admin.token}"})
     assert status == 400 and "too long" in json.loads(text)["detail"], (status, text)
+
+
+# ------------------------------------------------------------------------------ only a live session
+
+# A validly signed token for a real administrator whose session was never created: what a token for a
+# deleted session, or one forged with a leaked signing key, looks like to the server.
+_MINT_ORPHAN = r'''
+import secrets
+from app.core.database import SessionLocal
+from app.core.models import RoleEnum, User
+from app.core.security import create_access_token
+db = SessionLocal()
+try:
+    user = db.query(User).filter(User.role == RoleEnum.ADMIN).first()
+    print("TOKEN:" + create_access_token(data={"sub": str(user.id), "username": user.username,
+                                               "session_token": secrets.token_hex(32), "is_temporary": False}))
+finally:
+    db.close()
+'''
+
+
+def _orphan_token():
+    container = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    proc = subprocess.run(["docker", "exec", "-i", container, "python", "-"], input=_MINT_ORPHAN,
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    if proc.returncode != 0 and "No such container" in (proc.stderr or ""):
+        pytest.skip(f"no {container} container to mint the token in")
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("TOKEN:")), None)
+    assert line, f"no token minted:\n{proc.stdout}\n{proc.stderr}"
+    return line[len("TOKEN:"):].strip()
+
+
+def _ended_token(admin, how):
+    """A token whose session has ended in the way named."""
+    if how == "never existed":
+        return _orphan_token()
+    if how == "temporary credential switched off":
+        tc = admin.post("/auth/temp-credentials", json={"note": unique("bl-tc")}).json()
+        client = ApiClient()
+        client.login(tc["temp_username"], tc["credential"])
+        assert client.get("/users/me").status_code == 200
+        assert admin.post(f"/temp-creds/{tc['temp_username']}/deactivate").status_code == 200
+        return client.token
+    user = admin.create_user(role="user")
+    client = ApiClient()
+    client.login(user["_username"], user["_password"])
+    assert client.get("/users/me").status_code == 200
+    if how == "signed out":
+        assert client.post("/api/logout").status_code == 200
+    elif how == "account deactivated":
+        assert admin.patch(f"/users/{user['id']}", json={"is_active": False}).status_code == 200
+    elif how == "account locked by an administrator":
+        assert admin.patch(f"/users/{user['id']}", json={"is_locked": True}).status_code == 200
+    return client.token
+
+
+def _declare_only(path, size, token, content_type="multipart/form-data; boundary=b"):
+    """Send the headers of a `size`-byte body and none of it, and read the answer: a body refused on
+    its declaration is answered before a byte of it is sent. Returns (status, text, headers, seconds)."""
+    conn = _conn()
+    try:
+        conn.connect()
+        started = time.monotonic()
+        conn.putrequest("POST", path)
+        for name, value in (("Content-Type", content_type), ("Content-Length", str(size)),
+                            ("Authorization", f"Bearer {token}"), ("X-Forwarded-For", _random_ip())):
+            conn.putheader(name, value)
+        conn.endheaders()
+        response = conn.getresponse()
+        text = response.read(4096).decode("utf-8", "replace")
+        return response.status, text, {k.lower(): v for k, v in response.getheaders()}, time.monotonic() - started
+    finally:
+        conn.close()
+
+
+def _multipart(total):
+    """A multipart upload of one `total`-byte file, in 1 MiB pieces."""
+    yield b'--b\r\nContent-Disposition: form-data; name="files"; filename="a.bin"\r\n' \
+          b"Content-Type: application/octet-stream\r\n\r\n"
+    piece = b"A" * MiB
+    for _ in range(total // MiB):
+        yield piece
+    yield b"\r\n--b--\r\n"
+
+
+@pytest.mark.parametrize("how", ["signed out", "account deactivated", "account locked by an administrator",
+                                 "temporary credential switched off", "never existed"])
+def test_a_session_that_has_ended_cannot_send_a_large_body(admin, how):
+    """Before, a token's signature and expiry were enough for the larger limits, so every one of these
+    could have 48 MiB of multipart spooled to /tmp (memory, in the shipped compose files) or 8 MiB of
+    JSON parsed before the route refused it. Now each is answered 401 before any of it is read."""
+    token = _ended_token(admin, how)
+    status, text, headers, seconds = _declare_only(f"/vaults/{uuid.uuid4()}/files", 48 * MiB, token)
+    assert status == 401, (status, text)
+    assert "sign in" in json.loads(text)["detail"] and headers.get("www-authenticate") == "Bearer"
+    assert seconds < 5, f"refusing it took {seconds:.1f} s"
+    status, text, _ = _post("/notes", json.dumps({"title": "t", "body": "x" * (2 * MiB)}).encode(),
+                            headers={"Authorization": f"Bearer {token}"})
+    assert status == 401, (status, text)
+
+
+def test_a_chunked_upload_from_a_session_that_never_existed_is_refused_and_costs_no_memory():
+    """The measured case: 48 MiB of chunked multipart with a signed token for no session was read
+    whole, spooled to /tmp, before the route answered 401."""
+    token = _orphan_token()
+    memory = _Memory()
+    try:
+        status, text, seconds = _post(f"/vaults/{uuid.uuid4()}/files", _multipart(48 * MiB), chunked=True,
+                                      headers={"Authorization": f"Bearer {token}",
+                                               "Content-Type": "multipart/form-data; boundary=b"})
+    finally:
+        rise = memory.rise()
+    print(f"{status} after {seconds:.2f} s; memory +{rise / MiB:.1f} MiB")
+    assert status == 401, text
+    assert rise < 8 * MiB, f"the API's memory rose {rise / MiB:.1f} MiB for a refused upload"
+    assert seconds < 30, f"refusing it took {seconds:.1f} s"
+
+
+def test_a_large_email_template_still_saves(admin):
+    body_html = "<p>" + "Welcome to the vault. " * 12_000 + "</p>"      # about 260 KB
+    r = admin.post("/email/templates", json={"name": unique("big"), "subject": "Hello",
+                                             "body_html": body_html})
+    assert r.status_code == 201, r.text[:300]
+    try:
+        assert len(r.json()["body_html"]) > 200_000
+    finally:
+        admin.delete(f"/email/templates/{r.json()['id']}")
+
+
+def test_a_logo_above_the_anonymous_limit_still_uploads(admin):
+    padded = b"\x89PNG\r\n\x1a\n" + b"\0" * (300 * 1024)   # the type is read from the signature alone
+    r = admin.post("/settings/brand/asset/logo", files={"file": ("logo.png", padded, "image/png")})
+    try:
+        assert r.status_code == 200, r.text[:300]
+    finally:
+        admin.delete("/settings/brand/asset/logo")
+
+
+def test_an_upload_link_upload_above_the_anonymous_limit_still_works(admin, receivers_enabled):
+    """An upload link is used by someone with no account; its chunk route checks the link before it
+    reads the body, so the chunk limit is theirs too."""
+    receiver = _mk_receiver(admin)
+    content = os.urandom(3 * MiB)
+    r = _upload(admin.clone_anonymous(), receiver["token"], unique("drop") + ".bin", content)
+    assert r.status_code == 200, r.text
+    assert r.json()["size"] == len(content)
+
+
+def test_a_temporary_credential_still_uploads_above_the_anonymous_limit(admin, temp_vault):
+    tc = admin.post("/auth/temp-credentials", json={"note": unique("bl-up")}).json()
+    client = ApiClient()
+    client.login(tc["temp_username"], tc["credential"])
+    try:
+        name = unique("tc") + ".bin"
+        r = client.post(f"/vaults/{temp_vault['id']}/files",
+                        files=[("files", (name, os.urandom(MiB), "application/octet-stream"))])
+        assert r.status_code == 200, r.text[:300]
+    finally:
+        admin.post(f"/temp-creds/{tc['temp_username']}/deactivate")
 
 
 def test_a_note_of_the_largest_size_an_admin_can_allow_still_saves(admin):
