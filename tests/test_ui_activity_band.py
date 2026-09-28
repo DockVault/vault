@@ -305,5 +305,30 @@ def test_the_band_labels_fit_at_desktop_and_tablet_widths(page: Page, activity_a
     expect(page.locator("#act-p-cat .act-rank-row").first).to_contain_text("Temporary credentials")
     expect(page.locator("#act-p-active .act-rank-row.is-noaccount")).to_be_visible()
     assert _cut(page, ".act-ptitle-text, .act-toggle") == []
+    # Now is read again (on returning to the tab, and every 15 s), which redraws the Events title row:
+    # it must fit again, not come back with the longer key words.
+    page.evaluate("() => { window.__head = document.querySelector('#act-p-time .act-ptitle');"
+                  " document.dispatchEvent(new Event('visibilitychange')); }")
+    page.wait_for_function("() => !window.__head.isConnected", timeout=5000)
+    assert _cut(page, ".act-ptitle-text, .act-toggle") == []
     if width != 1280:
         assert _cut(page, "#act-p-cat .act-rank-label, #act-p-active .act-rank-row.is-noaccount .act-rank-label") == []
+
+
+def test_the_band_stays_one_row_in_classic_at_1280_px(page: Page, activity_admin):
+    """Classic at 1280 x 800 gives the page a 928 px section: the band's five panels still fit one row,
+    so the list starts near the top of the window instead of below a band twice as tall."""
+    page.add_init_script("try { localStorage.setItem('ui', 'v1'); } catch (e) {}")
+    login(page, activity_admin, width=1280, height=800)
+    open_activity(page)
+    at = page.evaluate("""() => {
+        const band = document.querySelector('.act-band');
+        const tops = ['now', 'time', 'cat', 'signin', 'active']
+            .map((k) => Math.round(document.querySelector('#act-p-' + k).getBoundingClientRect().top));
+        return {rows: new Set(tops).size, overflow: band.scrollWidth - band.clientWidth,
+                height: band.getBoundingClientRect().height,
+                section: document.getElementById('activity-section').clientWidth};
+    }""")
+    # One row, Most active's choice wrapped under its title: about 168 px, against 299 for two rows.
+    assert at["rows"] == 1 and at["overflow"] == 0 and at["height"] < 190, at
+    assert rows(page).first.bounding_box()["y"] < 450

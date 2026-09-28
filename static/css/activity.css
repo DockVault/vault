@@ -101,12 +101,14 @@
 
 /* Now is at least 136 px and grows, out of the space the charts would share, to fit its widest row: with
    a two-digit count "Temp. credentials" needs about 146 px in Console and 142 px in Classic. Growing
-   takes only free space, so the minimums (956 px) still fit a 980 px section and the band stays one row
-   there. Events is mostly empty space between its columns, so By category takes a larger share: its
-   labels ("Sign-in and sessions", "Temporary credentials") fit whole in both skins. */
+   takes only free space. The minimums sum to 920 px, so the band stays one row down to a 922 px section:
+   Classic's 1280 px window (a 928 px section) keeps the list's first row near the top rather than below
+   a two-row band. Events is mostly empty space between its columns, so By category takes a larger
+   share: at a 1440 px window its labels ("Sign-in and sessions", "Temporary credentials") fit whole in
+   both skins. */
 .act-band {
     display: grid; position: relative; margin: 0 0 12px;
-    grid-template-columns: minmax(136px, max-content) minmax(236px, 1.6fr) minmax(232px, 1.5fr) minmax(160px, 1fr) minmax(192px, 1.4fr);
+    grid-template-columns: minmax(136px, max-content) minmax(236px, 1.6fr) minmax(208px, 1.5fr) minmax(160px, 1fr) minmax(180px, 1.4fr);
     grid-template-areas: "now time cat signin active";
     background: var(--surface-0); border: 1px solid var(--act-line); border-radius: var(--radius-md);
 }
@@ -255,10 +257,13 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 .act-signin-row:disabled { cursor: default; }
 .act-signin-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
 
-/* Most active */
+/* Most active. Where the panel is too narrow for its title and People · Addresses on one line (the
+   narrowest one-row band), the choice wraps under the title rather than cutting it short. */
+.act-active .act-ptitle { flex-wrap: wrap; height: auto; min-height: 16px; row-gap: 2px; line-height: 16px; }
+.act-active .act-ptitle-text { flex: none; }
 .act-toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; letter-spacing: 0; text-transform: none; }
 .act-toggle-sep { color: var(--text-disabled); }
-.act-toggle-btn { padding: 0; background: none; border: 0; cursor: pointer; font-size: 11px; color: var(--text-tertiary); }
+.act-toggle-btn { padding: 0; background: none; border: 0; cursor: pointer; font-size: 11px; line-height: 16px; color: var(--text-tertiary); }
 .act-toggle-btn[aria-checked="true"] { color: var(--text-primary); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
 
 /* ---- toolbar ----------------------------------------------------------------------------------- */
@@ -572,9 +577,10 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 
 /* ---- tablet: 600 to 979 px of section --------------------------------------------------------- */
 
-@container act (width < 980px) {
-    /* Sign-ins needs the least room on the second row; By category and Most active share the rest, so
-       their labels ("Temporary credentials", "Names with no account") fit whole. */
+@container act (width < 922px) {
+    /* Too narrow for the band's one row: two rows. Sign-ins needs the least room on the second;
+       By category and Most active share the rest, so their labels ("Temporary credentials", "Names with
+       no account") fit whole. */
     .act-band {
         grid-template-columns: minmax(0, 1fr) minmax(150px, .72fr) minmax(0, 1fr);
         grid-template-areas: "time time now" "cat signin active";
@@ -582,6 +588,8 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     .act-panel + .act-panel { border-left: 0; }
     .act-now, .act-signin, .act-active { border-left: 1px solid var(--act-line); }
     .act-cat, .act-signin, .act-active { border-top: 1px solid var(--act-line); }
+}
+@container act (width < 980px) {
     .activity-table .act-c-ch { display: none; }
     .act-body.has-detail { display: block; min-height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 16px); }
     .act-body.has-detail .activity-table .act-c-ip { display: table-cell; }

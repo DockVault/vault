@@ -2459,6 +2459,7 @@
         const old = panel && panel.querySelector('.act-ptitle');
         if (!old) return;
         old.replaceWith(timeHead());
+        fitTimeKeys(panel);
     }
 
     function timeHead() {
@@ -2472,7 +2473,7 @@
         all.addEventListener('click', () => { if (S.f.status.length) setState({ f: { status: [] } }); });
         const failedOnly = S.f.status.length === 1 && S.f.status[0] === 'failed';
         const bad = button('act-key-btn', null, { 'aria-pressed': failedOnly ? 'true' : 'false', 'data-fkey': 'key-bad', title: 'Show only events that failed or were refused' });
-        bad.append(el('span', 'act-key act-key-bad'), keyText(nf(b.failed), narrow ? ' failed' : ' failed or refused'));
+        bad.append(el('span', 'act-key act-key-bad'), keyText(nf(b.failed), ' failed', narrow ? null : ' or refused'));
         bad.addEventListener('click', () => setState({ f: { status: failedOnly ? [] : ['failed'] } }));
         keys.append(all, bad);
         head.appendChild(keys);
@@ -2484,10 +2485,25 @@
         return head;
     }
 
-    function keyText(num, words) {
+    // `more` is said only while it fits: the title row drops it before the title would be cut short.
+    function keyText(num, words, more) {
         const t = el('span', 'act-key-text');
         t.append(el('span', 'act-num', num), document.createTextNode(words));
+        if (more) t.appendChild(el('span', 'act-key-more', more));
         return t;
+    }
+
+    // At the narrowest one-row band "38 failed or refused" beside "EVENTS" and the total would cut the
+    // title short: say "38 failed" there (the key's title says the rest).
+    function fitTimeKeys(panel) {
+        const more = panel.querySelector('.act-key-more');
+        if (!more) return;
+        more.hidden = false;
+        const title = panel.querySelector('.act-ptitle-text');
+        const head = panel.querySelector('.act-ptitle');
+        if ((title && title.scrollWidth > title.clientWidth + 0.5) || (head && head.scrollWidth > head.clientWidth + 0.5)) {
+            more.hidden = true;
+        }
     }
 
     let chartUi = null;       // the drawn chart's geometry and state, for hover and drag
@@ -2497,6 +2513,8 @@
         const key = focusKeyIn(panel);
         panel.replaceChildren();
         panel.appendChild(timeHead());
+        fitTimeKeys(panel);
+        requestAnimationFrame(() => fitTimeKeys(panel));         // once the band around it is laid out
         const plot = el('div', 'act-plot act-time-plot');
         panel.appendChild(plot);
         if (!plotState(plot)) drawTimeChart(plot);
@@ -2510,6 +2528,7 @@
         if (plotObserver) plotObserver.disconnect();
         plotWidth = plot.clientWidth;
         plotObserver = new ResizeObserver(() => {
+            fitTimeKeys($('act-p-time'));
             const w = plot.clientWidth;
             if (w && Math.abs(w - plotWidth) > 1 && S.band && !S.bandError) {
                 plotWidth = w;
