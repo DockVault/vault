@@ -52,9 +52,19 @@ def _load_cvss4():
 
 cvss4 = _load_cvss4()
 
-# Generous next to a file that holds a few dozen short records, and small enough that a runaway or
-# hostile file cannot make the parser the problem.
-MAX_BYTES = 256 * 1024
+# The validator's cap stays below what every reader in a supported release (0.17.0 and later)
+# accepts, so a file the release gate passes is one that every reader will read. Those limits:
+# - the running app's update check (app/services/update_check.py): 512 KiB, in every supported
+#   release;
+# - dockvault.py: main's lifecycle copy at 512 KiB since 0.30.0 (before it, there was no main copy
+#   to read), and a release's own copy, fetched by its tag, read whole in every release;
+# - the documentation site, which reads main's copy at request time: 512 KiB.
+# A reader handed a larger file falls back silently and loses every advisory with it, so the cap
+# keeps a 64 KiB margin below the smallest of them, and the test's warning line (three quarters of
+# this cap) comes well before the cap itself. 256 KiB until 0.33.0, whose advisories took the file
+# to about 223 KB. That is still small enough that a runaway or hostile file cannot make the parser
+# the problem.
+MAX_BYTES = 448 * 1024
 # 2 adds a required per-version `support` block (lifecycle: end-of-life, security posture, and
 # optional extended-support end dates). A schema_version-1 file has no such block and would leave
 # every version's lifecycle undeclared, so the bump is not backward-compatible on purpose.
