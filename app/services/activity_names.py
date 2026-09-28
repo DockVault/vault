@@ -13,7 +13,8 @@ import uuid
 from typing import Dict, List, Optional
 
 NOT_SHOWN = "Not shown: you are not a member of this vault"
-DELETED_VAULT = "Deleted vault"
+# Beside an event's label ("Vault created · (vault since deleted)"): the vault was deleted after it.
+DELETED_VAULT = "(vault since deleted)"
 DELETED_ITEM = "Deleted"
 ZK_HIDDEN = "Zero-knowledge: name hidden"
 PASSWORD_HIDDEN = "Name hidden: the vault has a password"

@@ -914,7 +914,9 @@
         evWrap.appendChild(el('span', 'act-ev-label', ev.label));
         const names = namesText(ev);
         if (names) {
-            const n = el('span', 'act-ev-names', ` · ${names}`);
+            // A no-break space: an ordinary one at the start of this flex item would collapse, and the
+            // row read "Vault deleted· Project".
+            const n = el('span', 'act-ev-names', `\u00a0· ${names}`);
             n.title = names;
             evWrap.appendChild(n);
         }

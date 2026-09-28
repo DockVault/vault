@@ -9,6 +9,7 @@ from playwright.sync_api import Page, expect
 
 from _activity_ui import (activity_admin, failed_sign_in, filter_by_person, login, open_activity, ready,  # noqa: F401
                           rows, sign_in, sign_out, summary, total_of)
+from conftest import ApiClient, unique
 
 pytestmark = pytest.mark.ui
 
@@ -341,6 +342,34 @@ def test_the_detail_and_the_filter_panel_end_inside_the_window(page: Page, activ
     for sel in ("#act-filter-panel", "#act-fp-done"):
         b = page.locator(sel).bounding_box()
         assert b["y"] + b["height"] <= 900, (sel, b)
+
+
+_GAP_BEFORE_NAMES = """(row) => {
+    const label = row.querySelector('.act-ev-label'), names = row.querySelector('.act-ev-names');
+    const text = names.firstChild, dot = text.textContent.indexOf('·');
+    const range = document.createRange();
+    range.setStart(text, dot);
+    range.setEnd(text, dot + 1);
+    return range.getBoundingClientRect().left - label.getBoundingClientRect().right;
+}"""
+
+
+def test_a_deleted_vault_is_named_as_since_deleted_after_a_space(page: Page, activity_admin):
+    """A row about a vault that no longer exists reads "Vault created · (vault since deleted)": the
+    separator keeps its space after the label, and the name says the vault went later, which "Deleted
+    vault" beside "Vault created" did not."""
+    me = ApiClient()
+    me.login(activity_admin["_username"], activity_admin["_password"])
+    vault = me.create_vault(name=unique("gone"))
+    assert me.delete_vault(vault["id"]).status_code == 200
+    login(page, activity_admin)
+    open_activity(page)
+    filter_by_person(page, activity_admin["_username"])
+    created = rows(page).filter(has_text="Vault created")
+    expect(created).to_have_count(1, timeout=10000)
+    expect(created.locator(".act-ev-names")).to_have_text("\u00a0· (vault since deleted)")
+    for row in (created, rows(page).filter(has_text="Vault deleted")):
+        assert row.locator(".act-ev").evaluate(_GAP_BEFORE_NAMES) >= 2
 
 
 def test_recorded_details_shows_that_it_opens(page: Page, activity_admin):
