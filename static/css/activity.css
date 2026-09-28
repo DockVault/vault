@@ -339,7 +339,7 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 /* ---- the list ---------------------------------------------------------------------------------- */
 
 .act-body { position: relative; }
-.act-body.has-detail { display: grid; grid-template-columns: minmax(0, 1fr) var(--act-pane-w); gap: 16px; align-items: start; }
+.act-body.has-detail { display: grid; grid-template-columns: minmax(0, 1fr) var(--act-pane-w); column-gap: 16px; align-items: start; }
 .act-body.has-detail .act-pill-row { grid-column: 1; }
 .act-pill-row {
     position: sticky; top: calc(var(--navbar-height) + var(--act-toolbar-h, 44px)); z-index: 15;
@@ -449,8 +449,8 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 /* ---- the detail -------------------------------------------------------------------------------- */
 
 .act-detail {
-    position: sticky; top: calc(var(--navbar-height) + var(--act-toolbar-h, 44px));
-    height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 16px);
+    position: sticky; top: calc(var(--navbar-height) + var(--act-toolbar-h, 44px) + 8px);
+    height: calc(100dvh - var(--navbar-height) - var(--act-toolbar-h, 44px) - 24px);
     min-width: 0; align-self: start;
 }
 .act-detail-inner {
