@@ -499,57 +499,164 @@ def test_blocks_by_user_says_where_and_until_when(Session, limits):
 
 # --------------------------------------------------------------------------- names that are no account
 
-class _FakeLimiter:
-    """The cache's sliding window, in memory: counts per key, and a peek that never counts."""
-
+class _Clock:
     def __init__(self):
-        self.counts = {}
-
-    def check_rate_limit(self, key, limit, window, prefix="rate_limit", fail_open=False):
-        self.counts[key] = self.counts.get(key, 0) + 1
-        return self.counts[key] <= limit, max(0, limit - self.counts[key]), 0
-
-    def peek_rate_limit(self, key, limit, window, prefix="rate_limit"):
-        return self.counts.get(key, 0) >= limit, 60
+        self.t = _now()
 
 
-def test_a_name_that_is_no_account_is_refused_at_the_same_point(Session, limits, monkeypatch):
-    from app.core import rate_limiter as rl
-    monkeypatch.setattr(rl, "rate_limiter", _FakeLimiter())
-    uid = _add_user(Session, username="real-person")
+class _FakeStore:
+    """The cache, in memory, with each value's lifetime kept on the test's clock."""
 
-    def attempt(name):
+    def __init__(self, clock):
+        self.clock, self.values = clock, {}
+
+    def get(self, key):
+        value = self.values.get(key)
+        if value is None or value[1] <= self.clock.t:
+            self.values.pop(key, None)
+            return None
+        return dict(value[0])
+
+    def set(self, key, value, ttl_seconds):
+        self.values[key] = (dict(value), self.clock.t + timedelta(seconds=ttl_seconds))
+
+
+@pytest.fixture
+def clocked(Session, limits, monkeypatch):
+    """A clock the lockout reads, the cache the mimicry uses, and one attempt at a time by a name from
+    an address: what the caller sees ("wrong", or the refusal's scope and minutes left)."""
+    clock = _Clock()
+    monkeypatch.setattr(L, "utcnow", lambda: clock.t)
+    store = _FakeStore(clock)
+    monkeypatch.setattr(L, "_phantom_store", lambda: store)
+    _add_user(Session, username="real-person")
+
+    def attempt(name, address=ATTACKER):
         s = Session()
         svc = A.AuthService(s)
         svc._check_rate_limit = lambda *a, **k: None
         try:
-            svc.authenticate_user(name, "a-guess", ATTACKER)
+            svc.authenticate_user(name, "a-guess", address)
         except A.AccountLockedError as e:
-            return ("refused", e.scope)
+            left = None if e.locked_until is None else round((e.locked_until - clock.t).total_seconds())
+            return (e.scope, left)
         except A.InvalidCredentialsError:
-            return ("wrong",)
+            return "wrong"
         finally:
             s.close()
+        return "signed in"
 
+    def prune():
+        s = Session()
+        L.release_expired(s)
+        L.prune_stale(s)
+        s.commit()
+        s.close()
+
+    clock.attempt, clock.prune, clock.store = attempt, prune, store
+    return clock
+
+
+def _both(clock, steps):
+    """Run the same attempts, with the same pauses, as the account and as a name that is no account.
+    ``steps`` is a list of (address, minutes to wait afterwards)."""
+    seen = {}
+    start = clock.t
     for name in ("real-person", "nobody-here"):
-        seen = [attempt(name) for _ in range(THRESHOLD + 1)]
-        assert seen == [("wrong",)] * THRESHOLD + [("refused", "address")], (name, seen)
-    assert _lock(Session, uid, ATTACKER) is not None
+        clock.t = start
+        out = []
+        for address, wait in steps:
+            out.append(clock.attempt(name, address))
+            clock.t += timedelta(minutes=wait)
+            clock.prune()                      # the periodic cleanup, which only an account has
+        seen[name] = out
+    return seen
+
+
+def test_slow_guessing_is_refused_at_the_same_point(clocked):
+    # The review's first scratch test: guesses further apart than the lock's length, then one a minute
+    # later. An address's count does not run out by itself, for an account or for a name.
+    steps = [(ATTACKER, MINUTES + 5)] * (THRESHOLD - 1) + [(ATTACKER, 1), (ATTACKER, 1)]
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"][THRESHOLD][0] == "address"
+
+
+def test_a_burst_spread_over_minutes_is_refused_for_as_long(clocked):
+    # The review's second: the lock runs from the failure that armed it, for both, so the minutes left
+    # (and so Retry-After) are the same.
+    seen = _both(clocked, [(ATTACKER, 2)] * (THRESHOLD + 2))
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"][THRESHOLD] == ("address", (MINUTES - 2) * 60)
+
+
+def test_guessing_from_many_addresses_pauses_both_the_same_way(clocked):
+    steps = [(f"203.0.113.{i}", 5) for i in range(THRESHOLD * MULTIPLE + 2)]
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"][THRESHOLD * MULTIPLE][0] == "account"
+
+
+def test_after_a_pause_ends_the_next_failure_pauses_both_again(clocked):
+    steps = ([(f"203.0.113.{i}", 1) for i in range(THRESHOLD * MULTIPLE)]
+             + [(HOME, INTERVAL.total_seconds() / 60 + 1), ("203.0.113.90", 1), (CAFE, 1)])
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"][-1][0] == "account"
+
+
+def test_an_address_count_left_for_a_day_is_gone_for_both(clocked):
+    steps = [(ATTACKER, 1)] * (THRESHOLD - 1) + [(ATTACKER, 24 * 60 + 10), (ATTACKER, 1), (ATTACKER, 1)]
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert "address" not in [x[0] for x in seen["real-person"] if isinstance(x, tuple)]
 
 
 def test_the_name_mimicry_fails_open_when_the_cache_is_down(monkeypatch, limits):
-    from app.core import rate_limiter as rl
-
     class _Down:
-        def check_rate_limit(self, *a, **k):
-            raise rl.RateLimiterUnavailable("down")
+        def get(self, key):
+            return L._UNAVAILABLE
 
-        def peek_rate_limit(self, *a, **k):
-            raise rl.RateLimiterUnavailable("down")
+        def set(self, *a, **k):
+            raise RuntimeError("down")
 
-    monkeypatch.setattr(rl, "rate_limiter", _Down())
+    monkeypatch.setattr(L, "_phantom_store", lambda: _Down())
     L.phantom_failure("nobody", ATTACKER)       # never raises
     assert L.phantom_lock("nobody", ATTACKER) is None
+
+
+def test_the_cache_store_reads_back_what_it_wrote_and_fails_open(monkeypatch):
+    from app.core import database, redis_guard
+
+    class _Redis:
+        def __init__(self):
+            self.values = {}
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, ex=None):
+            self.values[key] = value
+
+    fake = _Redis()
+    monkeypatch.setattr(database, "redis_client", fake)
+    monkeypatch.setattr(redis_guard, "_guard_open_until", 0.0)
+    store = L._CacheStore()
+    assert store.get("k") is None
+    store.set("k", {"n": 2}, 60)
+    assert store.get("k") == {"n": 2}
+    fake.values["k"] = "not json"
+    assert store.get("k") is None
+
+    class _Broken:
+        def get(self, key):
+            raise ConnectionError("down")
+
+    monkeypatch.setattr(database, "redis_client", _Broken())
+    try:
+        assert store.get("k") is L._UNAVAILABLE
+    finally:
+        redis_guard.guard_record_success()      # leave the shared guard as it was found
 
 
 def test_an_account_wide_count_is_pruned_only_once_all_of_it_is_gone(Session, limits):
@@ -568,3 +675,20 @@ def test_an_account_wide_count_is_pruned_only_once_all_of_it_is_gone(Session, li
     s.commit()
     assert [r.source for r in s.query(SignInLockout).all()] == [HOME]
     s.close()
+
+
+def test_after_an_address_lock_runs_out_its_count_starts_again_for_both(clocked):
+    steps = ([(ATTACKER, 1)] * THRESHOLD + [(ATTACKER, MINUTES + 1)]
+             + [(ATTACKER, 1)] * THRESHOLD)
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"][THRESHOLD + 1:THRESHOLD * 2 + 1] == ["wrong"] * THRESHOLD
+
+
+def test_with_both_locks_in_force_both_answer_with_the_account_wide_one(clocked):
+    steps = ([(ATTACKER, 1)] * THRESHOLD
+             + [(f"203.0.113.{i}", 1) for i in range(THRESHOLD * MULTIPLE - THRESHOLD)]
+             + [(ATTACKER, 1)])
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"][-1][0] == "account"

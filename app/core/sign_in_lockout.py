@@ -29,9 +29,10 @@ What a lock does, and does not do:
     release. Arming and releasing are audited as account_auto_locked and account_auto_unlocked, each
     with its scope (the address, or account-wide). An administrator's unlock clears it at once.
 
-Names that are no account are counted the same way in the cache (the "phantom" functions), so being
-refused tells nobody whether an account by that name exists. That mimicry fails open: while the cache
-is down, an unknown name is simply never refused by it.
+Names that are no account are counted the same way in the cache (the "phantom" functions), with the
+same counts and the same lock timing, so being refused, and for how long, tells nobody whether an
+account by that name exists. That mimicry fails open: while the cache is down, an unknown name is
+simply never refused by it.
 
 Nothing here commits: the caller's transaction carries each count, lock and audit row.
 """
@@ -311,45 +312,155 @@ def blocks_by_user(db, user_ids: Iterable, *, now=None) -> Dict:
 
 
 # --- Names that are no account ------------------------------------------------------------------
+#
+# A name that is no account is counted in the cache exactly as record_failure counts an account in
+# sign_in_lockouts, and refused exactly as lock_in_force refuses it, so nothing an attempt can observe
+# (being refused, the scope, when the refusal ends) tells whether an account by that name exists:
+#   * per address: one more per failure, never expiring while it is used; at the limit a lock from
+#     that failure for the lockout duration; the count ends with its lock, or a day after its last
+#     failure (the periodic prune of an untouched address count);
+#   * account-wide: the same decaying count, capped at the backstop, and the same pause, which lasts
+#     the lockout duration or until the count has lost a failure;
+#   * a lock whose time ran out is released at the next attempt (address: the count goes with it;
+#     account-wide: the count stays), as release_expired does for an account.
+# Each state is one small JSON value in the cache, kept as long as the database row would be. The
+# mimicry fails open: while the cache cannot be read or written, a name that is no account is never
+# refused by it.
+
+PHANTOM_PREFIX = "login_phantom"
+# How long a phantom lock with no end (a lockout duration of 0) is kept. An account's lasts until an
+# administrator clears it, which nobody can do for a name that is no account.
+PHANTOM_NO_END = timedelta(days=30)
+
+_UNAVAILABLE = object()
+
+
+def _to_ts(dt) -> float:
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _from_ts(ts):
+    return datetime.fromtimestamp(float(ts), timezone.utc).replace(tzinfo=None) if ts is not None else None
+
+
+class _CacheStore:
+    """The mimicry's state in Redis, behind the guard: get() returns the stored dict, None when there
+    is none, or _UNAVAILABLE when the cache cannot be read."""
+
+    def get(self, key):
+        import json
+        from app.core import redis_guard
+        from app.core.database import redis_client
+        raw = redis_guard.best_effort("sign_in_lockout.phantom_get", lambda: redis_client.get(key),
+                                      default=_UNAVAILABLE)
+        if raw is _UNAVAILABLE or raw is None:
+            return raw
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def set(self, key, value: dict, ttl_seconds: int) -> None:
+        import json
+        from app.core import redis_guard
+        from app.core.database import redis_client
+        redis_guard.best_effort("sign_in_lockout.phantom_set",
+                                lambda: redis_client.set(key, json.dumps(value), ex=max(1, int(ttl_seconds))))
+
+
+def _phantom_store():
+    return _CacheStore()
+
 
 def _phantom_keys(identifier, address):
-    return (f"login_phantom:{source_of(address)}|{identifier}", f"login_phantom:{ACCOUNT_WIDE}|{identifier}")
+    return (f"{PHANTOM_PREFIX}:{source_of(address)}|{identifier}",
+            f"{PHANTOM_PREFIX}:{ACCOUNT_WIDE}|{identifier}")
 
 
-def phantom_failure(identifier, address) -> None:
+def _phantom_in_force(state, now) -> bool:
+    if not state or not state.get("locked"):
+        return False
+    until = _from_ts(state.get("until"))
+    return until is None or until > now
+
+
+def _phantom_ended(state, now) -> bool:
+    """A lock that ran out, which release_expired would clear at this attempt."""
+    return bool(state) and bool(state.get("locked")) and not _phantom_in_force(state, now)
+
+
+def phantom_failure(identifier, address, *, now=None) -> None:
     """Count a wrong sign-in for a name that is no account, the way record_failure counts one for an
-    account, so that such a name is refused at the same point. Best-effort: never raises."""
+    account (see the section comment above). Best-effort: never raises."""
     try:
-        from app.core.rate_limiter import rate_limiter
         threshold, backstop, _window, minutes = limits()
-        lock_seconds = minutes * 60 if minutes > 0 else 86400
+        now = now or utcnow()
+        until = now + timedelta(minutes=minutes) if minutes > 0 else None
+        store = _phantom_store()
         by_address, account_wide = _phantom_keys(identifier, address)
-        # Both kept over the lock's length rather than the login window, so a name's refusal lasts
-        # about as long as an account's lock would after a burst of failures.
-        rate_limiter.check_rate_limit(by_address, threshold, lock_seconds, fail_open=True)
-        rate_limiter.check_rate_limit(account_wide, backstop, lock_seconds, fail_open=True)
+
+        state = store.get(by_address)
+        if state is _UNAVAILABLE:
+            return
+        if _phantom_ended(state, now):
+            state = None                          # the count ended with its lock
+        if _phantom_in_force(state, now):
+            new = dict(state)                     # refused before counting, as an account is
+        else:
+            new = {"n": int((state or {}).get("n", 0)) + 1}
+            if new["n"] >= threshold:
+                new.update(locked=True, until=_to_ts(until) if until else None)
+        if new.get("locked") and new.get("until") is None:
+            ttl = PHANTOM_NO_END
+        elif new.get("locked"):
+            ttl = (_from_ts(new["until"]) - now) + STALE_ADDRESS_COUNT
+        else:
+            ttl = STALE_ADDRESS_COUNT
+        store.set(by_address, new, ttl.total_seconds())
+
+        state = store.get(account_wide)
+        if state is _UNAVAILABLE:
+            return
+        state = dict(state or {})
+        if _phantom_ended(state, now):
+            state.update(locked=False, until=None)  # the pause ends; the count stays
+        if _phantom_in_force(state, now):
+            new = state
+            since = _from_ts(state.get("since")) or now
+        else:
+            count, since = decayed(int(state.get("n", 0)), _from_ts(state.get("since")), backstop, now)
+            new = {"n": min(int(backstop), count + 1), "since": _to_ts(since)}
+            if new["n"] >= backstop:
+                account_until = None if until is None else max(until, since + account_interval(backstop))
+                new.update(locked=True, until=_to_ts(account_until) if account_until else None)
+        if new.get("locked") and new.get("until") is None:
+            ttl = PHANTOM_NO_END
+        else:
+            ends = since + ACCOUNT_PERIOD
+            if new.get("locked"):
+                ends = max(ends, _from_ts(new["until"]))
+            ttl = ends - now
+        store.set(account_wide, new, max(ttl.total_seconds(), 1))
     except Exception:  # noqa: BLE001 - the mimicry is best-effort
         pass
 
 
 def phantom_lock(identifier, address, *, now=None) -> Optional[Lock]:
-    """The lock a name that is no account is refused with, when its failures from this address (or
-    from everywhere) have reached the limit an account's would. None when not, or when the cache
-    cannot be read."""
+    """The lock a name that is no account is refused with: the account-wide one if in force, else the
+    address's, as lock_in_force answers for an account. None when neither is, or when the cache cannot
+    be read."""
     try:
-        from app.core.rate_limiter import rate_limiter
-        threshold, backstop, _window, minutes = limits()
-        lock_seconds = minutes * 60 if minutes > 0 else 86400
-        by_address, account_wide = _phantom_keys(identifier, address)
         now = now or utcnow()
-        over, retry = rate_limiter.peek_rate_limit(account_wide, backstop, lock_seconds)
-        if over:
-            return Lock(SCOPE_ACCOUNT, now + timedelta(seconds=max(retry, 1)) if minutes > 0 else None,
-                        ACCOUNT_WIDE)
-        over, retry = rate_limiter.peek_rate_limit(by_address, threshold, lock_seconds)
-        if over:
-            return Lock(SCOPE_ADDRESS, now + timedelta(seconds=max(retry, 1)) if minutes > 0 else None,
-                        source_of(address))
+        store = _phantom_store()
+        by_address, account_wide = _phantom_keys(identifier, address)
+        for key, scope, source in ((account_wide, SCOPE_ACCOUNT, ACCOUNT_WIDE),
+                                   (by_address, SCOPE_ADDRESS, source_of(address))):
+            state = store.get(key)
+            if state is _UNAVAILABLE:
+                return None
+            if _phantom_in_force(state, now):
+                return Lock(scope, _from_ts(state.get("until")), source)
     except Exception:  # noqa: BLE001 - fail open: never refused by the mimicry while the cache is down
         return None
     return None

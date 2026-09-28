@@ -57,6 +57,9 @@ _REGISTRY = {
     "core/audit_signal.py": {
         "_publish": ("D", 1),                    # the Activity signal: a background thread, guarded
     },
+    "core/sign_in_lockout.py": {                 # a name that is no account, counted like an account:
+        "get": ("D", 1), "set": ("D", 1),        # _CacheStore, behind the read-through guard, fails open
+    },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated
     },                                           # short-timeout client (the constructor uses redis.Redis)
