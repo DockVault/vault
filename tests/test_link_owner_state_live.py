@@ -258,11 +258,13 @@ def _sign_in(username, password):
 
 def _arm_the_automatic_lock(owner):
     """Lock the owner the way strangers can: with wrong passwords, from anywhere. The account-wide
-    count is primed far past any threshold after a first failure has created it, so one more wrong
-    password arms the account-wide lock whatever the deployment's setting."""
+    count is primed to one short of the deployment's account-wide limit after a first failure has made
+    it, so one more wrong password arms the account-wide lock whatever the setting (login_limits)."""
+    from _account_change_helpers import login_limits
     uid, name = owner.account["id"], owner.account["_username"]
     assert _sign_in(name, "definitely-not-the-password").status_code == 401
-    _psql(f"UPDATE sign_in_lockouts SET failed_attempts = 1000000 WHERE user_id = '{uid}' AND source = '*'")
+    _limit, backstop = login_limits()
+    _psql(f"UPDATE sign_in_lockouts SET failed_attempts = {backstop - 1} WHERE user_id = '{uid}' AND source = '*'")
     assert _sign_in(name, "definitely-not-the-password").status_code == 401
     locked = _psql(f"SELECT locked_at IS NOT NULL FROM sign_in_lockouts WHERE user_id = '{uid}' AND source = '*'")
     assert locked == "t", "a wrong password past the threshold is expected to lock the account"

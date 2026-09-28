@@ -181,6 +181,20 @@ def sign_in_from_inside(username, password, *, container=None, url="http://127.0
     return tuple(json.loads(r.stdout.strip().splitlines()[-1]))
 
 
+def login_limits():
+    """(the login limit from one address, the account-wide limit), as the web container reads them now.
+
+    A test that primes a count to arm a lock with one more wrong password primes it to one short of
+    the limit: each attempt is counted before its password is checked, and one that finds the count
+    already at the limit is refused unchecked, so the failure that arms the lock is the one that brings
+    the count to the limit."""
+    out = in_api_container("from app.core import sign_in_lockout\n"
+                           "limit, backstop, _w, _m = sign_in_lockout.limits()\n"
+                           "print(limit, backstop)\n").stdout.strip().splitlines()[-1]
+    limit, backstop = (int(x) for x in out.split())
+    return limit, backstop
+
+
 def lock_rows(user_id):
     """{source: (failed_attempts, locked)} for the account's rows in sign_in_lockouts."""
     out = psql(f"SELECT source, failed_attempts, locked_at IS NOT NULL FROM sign_in_lockouts "

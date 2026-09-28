@@ -19,15 +19,13 @@ import threading
 import pytest
 
 from conftest import ApiClient, BASE_URL
-from _account_change_helpers import host_address, in_api_container, lock_rows, psql, reset_sign_in_throttle
+from _account_change_helpers import (host_address, in_api_container, lock_rows, login_limits, psql,
+                                     reset_sign_in_throttle)
 
 pytestmark = pytest.mark.integration
 
 LOCKED = "account_auto_locked"
 UNLOCKED = "account_auto_unlocked"
-# Far past any sane max_login_attempts, so a single further failure arms the lock whatever the
-# deployment's threshold is.
-PRIMED = 1_000_000
 
 
 def _login(client, username, password):
@@ -68,12 +66,15 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     client = ApiClient(BASE_URL)
     assert _login(client, name, "definitely-the-wrong-password").status_code == 401
     here = host_address(admin, name)
-    psql(f"UPDATE sign_in_lockouts SET failed_attempts={PRIMED} WHERE user_id='{uid}' AND source='{here}'")
+    # One short of the deployment's login limit, so the next wrong password brings the count to the limit
+    # and arms the lock, whatever the limit is (login_limits).
+    limit, _backstop = login_limits()
+    psql(f"UPDATE sign_in_lockouts SET failed_attempts={limit - 1} WHERE user_id='{uid}' AND source='{here}'")
 
     r = _login(client, name, "definitely-the-wrong-password")
     assert r.status_code == 401, r.text
     assert "lock" not in r.text.lower(), "the failure that arms the lock still sees only the generic answer"
-    assert lock_rows(uid)[here] == (PRIMED + 1, True)
+    assert lock_rows(uid)[here] == (limit, True)
     until = psql(f"SELECT coalesce(locked_until::text, '') FROM sign_in_lockouts "
                  f"WHERE user_id='{uid}' AND source='{here}'")
     assert psql(f"SELECT is_locked FROM users WHERE id='{uid}'") == "f", "the account row is never locked"
@@ -83,7 +84,7 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     row = rows[0]
     assert row["username"] == name and row["resource_id"] == uid and row["status"] == "success"
     assert row["details"]["scope"] == "address" and row["details"]["address"] == here
-    assert row["details"]["failed_attempts"] == PRIMED + 1
+    assert row["details"]["failed_attempts"] == limit
     failure = _latest(admin, "login_failure", name)
     assert row["ip_address"] and row["ip_address"] == failure["ip_address"], (row, failure)
     event = _event(admin, LOCKED, name)
@@ -98,7 +99,7 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
         assert refused.status_code == 403, refused.text
         if until:
             assert int(refused.headers.get("Retry-After", "0")) > 0
-    assert lock_rows(uid)[here] == (PRIMED + 1, True)
+    assert lock_rows(uid)[here] == (limit, True)
     assert len(_rows(admin, LOCKED, uid)) == 1
 
     if not until:
@@ -117,7 +118,7 @@ def test_the_failure_that_arms_the_lock_and_the_sign_in_that_clears_it_are_recor
     assert len(released) == 1, released
     details = released[0]["details"]
     assert (details["cleared_by"], details["scope"], details["address"]) == ("sign_in", "address", here)
-    assert details["failed_attempts"] == PRIMED + 1
+    assert details["failed_attempts"] == limit
     success = _latest(admin, "login_success", name)
     assert released[0]["ip_address"] == success["ip_address"], (released[0], success)
     event = _event(admin, UNLOCKED, name)
