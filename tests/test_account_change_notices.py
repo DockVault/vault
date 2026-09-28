@@ -146,7 +146,9 @@ def test_a_held_change_is_told_with_its_date_in_words(sent, monkeypatch):
     """The user, the asker and the approvers are told when a held change expires: "by 5 October 2026",
     never "by 2026-10-05", which read as a code and broke across two lines on a phone."""
     from datetime import datetime
-    monkeypatch.setattr(cc, "approvers", lambda db, requester_id: [SimpleNamespace(id="a-2")])
+    # The notice passes the change too, so an administrator made after it is left out. A stand-in that
+    # did not take it raised an error the best-effort notice swallowed, and one notice of three went.
+    monkeypatch.setattr(cc, "approvers", lambda db, requester_id, change=None: [SimpleNamespace(id="a-2")])
     change = SimpleNamespace(kind=cc.RESET_LINK, requested_by_id="a-1", requested_by_name="alice",
                              expires_at=datetime(2026, 10, 5, 9, 0))
     api._announce_held_change(None, change, USER)
