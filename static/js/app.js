@@ -1860,6 +1860,10 @@ function _buildStepUpBody(action, methods) {
 
 // Logout
 function logout() {
+    // The Activity page first, while the session still holds its token: a page size or range chosen in
+    // the last second, which the page saves to the account a second after the last change, is saved now.
+    // It also forgets everything it held, so none of it carries over to the next person on this tab.
+    if (typeof window.resetActivity === 'function') { try { window.resetActivity(); } catch (_) {} }
     authToken = null;
     currentUser = null;
     userPermissions = [];
@@ -1878,10 +1882,9 @@ function logout() {
     // Close this session's socket; the next sign-in opens one with its own token.
     closeAppSocket();
 
-    // The Activity page keeps its filters in the URL hash and in the page itself: neither may carry over
-    // to the next person who signs in on this tab.
+    // The Activity page keeps its filters in the URL hash too: they may not carry over to the next person
+    // who signs in on this tab.
     if (location.hash) { try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {} }
-    if (typeof window.resetActivity === 'function') { try { window.resetActivity(); } catch (_) {} }
 
     // Wipe the notification bell so a prior user's notifications never show to the next user on this
     // same tab, and stop the unread-count poll.
