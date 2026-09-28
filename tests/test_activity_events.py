@@ -319,3 +319,18 @@ def test_every_row_the_host_tool_writes_is_known_as_the_operators():
     src = (Path(__file__).resolve().parents[1] / "app" / "core" / "host_operator.py").read_text(encoding="utf-8")
     written = set(re.findall(r'action="([a-z_]+)", status="success", username=cc\.HOST_OPERATOR', src))
     assert written and written <= ev.HOST_OPERATOR_ACTIONS, written
+
+
+@pytest.mark.parametrize("action, label", [
+    ("credential_change_held", "Sign-in change held for approval"),
+    ("credential_change_approved", "Held change approved"),
+    ("credential_change_denied", "Held change denied"),
+    ("credential_change_expired", "Held change expired"),
+    ("credential_change_withdrawn", "Held change withdrawn"),
+    ("credential_change_refused", "Sign-in change refused (no approver)"),
+])
+def test_the_held_change_events_are_short_enough_for_a_phone_row(action, label):
+    """A phone row is about 36 characters of label wide: "Sign-in change held for a second admini..."
+    was cut there. Each held-change event now says what happened in those."""
+    assert audit_catalog.label_for(action) == label
+    assert len(label) <= 36
