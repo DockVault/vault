@@ -5266,17 +5266,28 @@ async function resetUserSecondFactor(userId, btn) {
     }
 }
 
+// What the last change to someone's sign-in details was, as done: "Password reset link created".
+const _CHANGE_MADE = {
+    password: 'New password set', reset_link: 'Password reset link created', second_factor: 'Second factor reset',
+    email: 'Email address changed', ssh_key: 'SSH key added',
+};
+
+// "Password reset link created by admin on 28 Sep. Until 12 Oct, another change ..." in the viewer's
+// own date format; "by you" when it was the viewer.
+function credentialChangeNoteText(c) {
+    const who = (currentUser && c.by === currentUser.username) ? 'you'
+        : (c.by === 'operator@host' ? 'the server’s operator' : c.by);
+    return (_CHANGE_MADE[c.kind] || c.label) + ' by ' + who + ' on ' + formatDayMonth(c.at) + '. Until '
+        + formatDayMonth(c.window_ends) + ', another change to this account’s sign-in details needs a second administrator’s approval.';
+}
+
 // The note inside each user's details: the last change an administrator made to their sign-in
 // details within 14 days, and until when a further change needs another administrator.
 function fillCredentialChangeNotes() {
     document.querySelectorAll('.credential-change-note').forEach(note => {
         const u = (usersView.users || []).find(x => x.id === note.getAttribute('data-user-id'));
         const lines = [];
-        if (u && u.credential_change) {
-            const c = u.credential_change;
-            lines.push(c.label + ' by ' + c.by + ' on ' + formatServerTime(c.at) + '. Until '
-                + formatServerTime(c.window_ends) + ', another change to this account’s sign-in details needs a second administrator’s approval.');
-        }
+        if (u && u.credential_change) lines.push(credentialChangeNoteText(u.credential_change));
         if (u && u.second_factor_reset_pending) {
             lines.push('Second factor reset: they set up a new one at their next sign-in.');
         }

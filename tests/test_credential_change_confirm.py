@@ -144,6 +144,34 @@ def test_a_request_row_says_only_what_its_heading_does_not(kind, facts, line):
         assert not summary.lower().startswith(cc.request_label(kind).lower()[:12])
 
 
+def test_the_note_on_an_account_says_what_was_done_by_whom_and_when():
+    """The note in an account's details read "Password reset link by admin on 28/09/2026, 08:47:01":
+    now "Password reset link created by admin on 28 Sep", "by you" when it was the viewer, with the
+    dates in the viewer's own format and no time of day."""
+    js = APP_JS.read_text(encoding="utf-8")
+    start = js.index("\nconst _CHANGE_MADE = {") + 1
+    const = js[start:js.index("\n};\n", start) + 4]
+    node = shutil.which("node")
+    assert node, "Node is required: the shipped page code must not be skipped"
+    harness = ("let currentUser = { id: 'me', username: 'alice' };\n" + const
+               + "".join(_function(js, n) for n in ("parseServerTime", "formatDayMonth", "credentialChangeNoteText"))
+               + """
+const at = new Date(Date.now() - 4 * 86400000).toISOString(), ends = new Date(Date.now() + 10 * 86400000).toISOString();
+const local = (v) => new Date(v).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+process.stdout.write(JSON.stringify({ day: local(at), end: local(ends),
+    other: credentialChangeNoteText({ kind: 'reset_link', label: 'Password reset link', by: 'bob', at, window_ends: ends }),
+    mine: credentialChangeNoteText({ kind: 'email', label: 'Email address change', by: 'alice', at, window_ends: ends }),
+    host: credentialChangeNoteText({ kind: 'second_factor', label: 'Second factor reset', by: 'operator@host', at, window_ends: ends }) }));
+""")
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    assert out["other"] == (f"Password reset link created by bob on {out['day']}. Until {out['end']}, another change "
+                            "to this account’s sign-in details needs a second administrator’s approval.")
+    assert out["mine"].startswith(f"Email address changed by you on {out['day']}.")
+    assert out["host"].startswith("Second factor reset by the server’s operator on ")
+
+
 def test_an_address_change_that_will_be_held_says_the_rest_is_saved_now():
     out = _run("""
 const soon = new Date(Date.now() + 10 * 86400000).toISOString(), at = new Date().toISOString();
