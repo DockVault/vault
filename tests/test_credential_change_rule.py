@@ -201,3 +201,58 @@ def test_the_host_operator_name_cannot_be_a_username():
     with pytest.raises(ValueError):
         _validate_new_username(cc.HOST_OPERATOR)
 
+
+
+def test_records_nothing_reads_any_more_are_pruned_after_fourteen_days(db):
+    # A change applied, or a request decided, more than 14 days ago is read by nothing, and its summary
+    # names an address or a key that may never have been applied. The audit log keeps the history.
+    alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
+    now = cc.utcnow()
+    old, recent = now - timedelta(days=14, seconds=1), now - timedelta(days=13, hours=23)
+
+    def held(at, summary):
+        return cc.hold(db, kind=cc.EMAIL, target_id=carol.id, requester_id=alice.id,
+                       requester_name=alice.username, summary=summary, payload={"email": "x@example.com"},
+                       now=at - timedelta(days=1))
+
+    keep, gone = [], []
+    gone.append(_made(db, carol, alice, now=old))
+    keep.append(_made(db, carol, alice, now=recent))
+    approved_old, approved_recent = held(old, "approved old"), held(recent, "approved recent")
+    cc.approve(approved_old, approver_id=bob.id, approver_name=bob.username, now=old)
+    cc.approve(approved_recent, approver_id=bob.id, approver_name=bob.username, now=recent)
+    gone.append(approved_old)
+    keep.append(approved_recent)
+    for decide_by in (bob, alice):     # denied by another, withdrawn by the one who asked
+        o, r = held(old, "decided old"), held(recent, "decided recent")
+        cc.deny(o, decider_id=decide_by.id, decider_name=decide_by.username, now=old)
+        cc.deny(r, decider_id=decide_by.id, decider_name=decide_by.username, now=recent)
+        gone.append(o)
+        keep.append(r)
+    expired_old = held(old - timedelta(days=6), "expired old")
+    cc.expire_due(db, old)
+    gone.append(expired_old)
+    still_open = cc.hold(db, kind=cc.SSH_KEY, target_id=carol.id, requester_id=alice.id,
+                         requester_name=alice.username, summary="open", payload={"fingerprint": "f"},
+                         now=now - timedelta(days=1))
+    keep.append(still_open)
+    db.commit()
+    keep_ids, gone_ids = [c.id for c in keep], [c.id for c in gone]
+    assert expired_old.status == cc.EXPIRED
+
+    assert cc.prune_done(db, now) == len(gone_ids)
+    db.commit()
+    left = {row[0] for row in db.query(CredentialChange.id).all()}
+    assert left == set(keep_ids)
+    assert cc.prune_done(db, now) == 0
+
+
+def test_the_periodic_cleanup_prunes_the_records():
+    # The cleanup loop cannot run offline (it sleeps five minutes first); pin that it calls the prune,
+    # once, inside the loop that expires held requests.
+    src = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    start = src.index("async def cleanup_expired_sessions(")
+    ends = [i for i in (src.find("\ndef ", start + 1), src.find("\nasync def ", start + 1)) if i > 0]
+    body = src[start:min(ends)]
+    assert body.count(".prune_done(db)") == 1
+    assert body.index("_expire_held_credential_changes(db)") < body.index(".prune_done(db)")

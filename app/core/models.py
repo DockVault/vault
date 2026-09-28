@@ -2738,7 +2738,9 @@ class CredentialChange(Base):
     history of a deleted account.
 
     ``payload`` holds what approving a held request applies (a password hash, an address, a key). It
-    is cleared once the request is decided or expires, so nothing waits here longer than needed."""
+    is cleared once the request is decided or expires, so nothing waits here longer than needed. A row
+    applied, denied, withdrawn or expired more than 14 days ago is deleted by the periodic cleanup
+    (credential_changes.prune_done)."""
     __tablename__ = 'credential_changes'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

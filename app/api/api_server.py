@@ -22820,6 +22820,19 @@ async def cleanup_expired_sessions():
                     db.rollback()
                     print(f"⚠ sign-in lock release failed: {type(lockout_err).__name__}")
 
+                # Records of changes applied, or requests decided, more than 14 days ago are read by
+                # nothing and name addresses and keys that may never have been applied: they go (the
+                # audit log keeps the history).
+                try:
+                    from app.core import credential_changes as _cc_prune
+                    pruned_changes = _cc_prune.prune_done(db)
+                    if pruned_changes:
+                        db.commit()
+                        print(f"🧹 Pruned {pruned_changes} finished credential change record(s)")
+                except Exception as prune_err:
+                    db.rollback()
+                    print(f"⚠ credential change pruning failed: {type(prune_err).__name__}")
+
                 # Delete finished session and pending-login rows once they are past retention.
                 # Each holds the address a sign-in came from, and nothing else ever removed them
                 # (see app/core/session_retention.py).

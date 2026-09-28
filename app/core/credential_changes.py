@@ -232,6 +232,24 @@ def expire_due(db, now: Optional[datetime] = None) -> List[CredentialChange]:
     return due
 
 
+def prune_done(db, now: Optional[datetime] = None) -> int:
+    """Delete, in the caller's transaction, the records nothing reads any more: a change applied more
+    than 14 days ago (it no longer holds the window open), and a request denied, withdrawn or expired
+    more than 14 days ago. Held requests still open are kept. Their summary names an email address or
+    a key that may never have been applied, so they are not kept for as long as the account lives; the
+    audit log keeps the history. Run by the periodic cleanup. Returns how many were deleted."""
+    now = now or utcnow()
+    cutoff = now - WINDOW
+    applied = (db.query(CredentialChange)
+               .filter(CredentialChange.status.in_(APPLIED), CredentialChange.applied_at < cutoff)
+               .delete(synchronize_session=False))
+    decided = (db.query(CredentialChange)
+               .filter(CredentialChange.status.in_((DENIED, WITHDRAWN, EXPIRED)),
+                       CredentialChange.decided_at < cutoff)
+               .delete(synchronize_session=False))
+    return applied + decided
+
+
 def open_requests(db, now: Optional[datetime] = None, target_ids: Optional[Iterable] = None) -> List[CredentialChange]:
     """Held requests nobody has decided yet, oldest first."""
     now = now or utcnow()
