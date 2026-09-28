@@ -180,9 +180,11 @@ files except to serve them, and cannot read zero-knowledge ones.
 - **Container output** (`docker logs`): the web access log (client address and port, method, path
   with any link, invitation or reset token in it redacted, status) and the application's own lines
   (startup, counts from the cleanups, warnings). Those lines name accounts by id and carry no file
-  names or passwords, with one exception: some error lines carry a database error's text, which can
-  include the values of the row it failed on (a username, an address). How long Docker keeps this is
-  set by the host's Docker logging
+  names or passwords. A database error's text leaves out the statement's values (**new in 0.33.0**),
+  and an unexpected error, or a failed audit, notification or security-event write, is logged by its
+  class and where it was raised. The database driver's own text can still name a value that broke a
+  uniqueness rule (a username, an address), and some older error lines print it. How long Docker
+  keeps this is set by the host's Docker logging
   configuration; the shipped compose files set no limit, so set `max-size` and `max-file` for the
   logging driver if you need one.
 - **The log-access file** (volume `vault_logs`, `LOG_PULL_SINK_PATH`): the same web lines, and the

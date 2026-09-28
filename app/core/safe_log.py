@@ -87,3 +87,22 @@ def safe_event(code: str, exc: BaseException | None = None, **fields) -> None:
     # EMPTY: every operational event, including session termination and upload rejection, sat
     # unread in memory. A log an operator cannot see is not a log.
     print(" ".join(parts), flush=True)
+
+
+def exception_outline(exc: BaseException) -> str:
+    """Where an exception was raised, for a log: for it and each exception it was raised from or during,
+    the class and the frames (file, line, function), and never the message or a local value.
+
+    A message is not ours to vouch for: a database error's carries the statement's values, which can be
+    a name typed at sign-in or an address, and a traceback's last line repeats it. The class and the
+    place are what an operator can act on; the error id beside them finds the request."""
+    import traceback
+
+    blocks, seen, current = [], set(), exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        frames = "".join(f'  File "{f.filename}", line {f.lineno}, in {f.name}\n'
+                         for f in traceback.extract_tb(current.__traceback__))
+        blocks.append(f"{frames}{type(current).__module__}.{type(current).__qualname__}")
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    return "\n(the exception above led to the one below)\n".join(reversed(blocks))

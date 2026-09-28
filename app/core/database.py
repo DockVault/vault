@@ -55,6 +55,10 @@ def initialize_consumers() -> None:
                 pool_size=10,
                 max_overflow=20,
                 echo=settings.log_level == "DEBUG",
+                # A database error's text, and the DEBUG echo, leave out the statement's bound values:
+                # they are names typed at sign-in, addresses, file names, and an error is printed to
+                # the container log. Nothing reads the values back out of an error.
+                hide_parameters=True,
                 connect_args={"connect_timeout": 5, "options": f"-c lock_timeout={_LOCK_TIMEOUT_MS}"},
             )
             factory = sessionmaker(

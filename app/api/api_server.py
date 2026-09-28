@@ -424,8 +424,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception as exc:
             # Global exception handler - prevents 500 errors from leaking information
             error_id = str(uuid.uuid4())
-            print(f"[ERROR] Unhandled exception (ID: {error_id}): {exc}")
-            print(traceback.format_exc())
+            # The class and where it was raised, never the message: a database error's message
+            # carries the statement's values (a name typed at sign-in, an address), and so does a
+            # traceback's last line (app/core/safe_log.py).
+            from app.core.safe_log import exception_outline
+            print(f"[ERROR] Unhandled exception (ID: {error_id}): {type(exc).__name__}")
+            print(exception_outline(exc))
 
             # Fall through to the header-setting code below so 500s carry the same hardening
             # headers (nosniff / XFO / no-store / Referrer-Policy / Permissions-Policy) as any
@@ -2133,7 +2137,9 @@ def _record_failed_login_bg(username, ip_address, reason) -> None:
         with get_db_context() as bg_db:
             get_security_monitor(bg_db).record_failed_login(username, ip_address, reason)
     except Exception as e:  # noqa: BLE001 — best-effort threat telemetry; never fails the response
-        print(f"Warning: Failed to record security event: {e}")
+        # The class only: the write carries the name typed at sign-in, which a database error's
+        # message would repeat into the log.
+        print(f"Warning: Failed to record security event: {type(e).__name__}")
 
 
 def _vault_activity_fields(vault=None, current_user=None) -> dict:
