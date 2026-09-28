@@ -312,12 +312,12 @@ def test_the_four_guarded_lines_are_where_they_were_on_comment_free_code():
 def test_the_comment_stripper_removes_every_kind_of_comment_and_nothing_else():
     src = ("const a = 'https://x/y'; // trailing\n"
            "/* block\n   spanning */ const b = `t ${ fn('/*not*/') } u`;\n"
-           "const re = /\/\/[^/]*\/\*/g; // a regex holding both comment openers\n"
+           "const re = /\\/\\/[^/]*\\/\\*/g; // a regex holding both comment openers\n"
            "// whole line\n"
            "const c = \"//\";\n")
     out = strip_comments(src)
     # Strings, templates and regular expressions are untouched -- a `//` inside them is not a comment.
-    assert "'https://x/y'" in out and "`t ${ fn('/*not*/') } u`" in out and "/\/\/[^/]*\/\*/g" in out
+    assert "'https://x/y'" in out and "`t ${ fn('/*not*/') } u`" in out and "/\\/\\/[^/]*\\/\\*/g" in out
     assert '"//"' in out
     # Every comment is gone, and the line count is the file's.
     assert "trailing" not in out and "block" not in out and "spanning" not in out and "whole line" not in out

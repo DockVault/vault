@@ -189,7 +189,7 @@ def test_an_open_users_page_shows_a_request_the_moment_it_is_made(page: Page, ad
     admin.post(f"/admin/credential-requests/{request_id}/deny")               # leave nothing waiting
 
 
-_READABLE = """() => {
+_READABLE = r"""() => {
     const lum = (c) => {
         const [r, g, b] = c.match(/[\d.]+/g).slice(0, 3).map(Number).map((v) => {
             v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
