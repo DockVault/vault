@@ -79,7 +79,8 @@ def test_another_administrators_request_is_approved_from_the_block(page: Page, a
     expect(row).to_be_visible(timeout=10000)
     expect(row).to_contain_text("Change the email address")
     expect(row).to_contain_text(temp_user["_username"])
-    expect(row).to_contain_text(new_email)
+    # Under the heading, only what it does not say.
+    expect(row.locator(".credential-request-summary")).to_have_text(f"New address: {new_email}")
     expect(row.get_by_role("button", name="Deny")).to_be_visible()
     expect(row.get_by_role("button", name="Withdraw")).to_have_count(0)
 

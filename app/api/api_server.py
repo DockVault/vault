@@ -5466,6 +5466,22 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     return _CredentialOutcome(change, True, last=last)
 
 
+def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fingerprint=None):
+    """The line a request's row shows under its heading ("Change the email address for carol"): only
+    what the heading does not already say, or None when it says it all. It used to repeat the heading
+    ("Change the email address to ...")."""
+    from app.core import credential_changes as cc
+    if kind == cc.EMAIL:
+        return f"New address: {new_email}" if new_email else "The address is removed"
+    if kind == cc.RESET_LINK:
+        return "Sent to their email address" if delivery == "email" else "A link to copy"
+    if kind == cc.SSH_KEY:
+        return f"Key \"{key_name}\" ({fingerprint})"
+    if kind == cc.PASSWORD:
+        return "A password the administrator chose"
+    return None
+
+
 def _credential_request_dict(change, target_username, viewer_id=None) -> dict:
     from app.core import credential_changes as cc
     return {
@@ -5731,7 +5747,8 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     # A reset link for someone else is a credential change: the second one within 14 days waits for
     # another administrator (app/core/credential_changes.py).
     outcome = _credential_change(db, current_user, user, "reset_link",
-                                 summary="Email a password reset link", payload={"delivery": "email"},
+                                 summary=_request_summary("reset_link", delivery="email"),
+                                 payload={"delivery": "email"},
                                  request=request)
     if outcome.held:
         db.commit()
@@ -5775,7 +5792,8 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
     # A reset link for someone else is a credential change: the second one within 14 days waits for
     # another administrator (app/core/credential_changes.py).
     outcome = _credential_change(db, current_user, user, "reset_link",
-                                 summary="Create a password reset link to copy", payload={"delivery": "copy"},
+                                 summary=_request_summary("reset_link", delivery="copy"),
+                                 payload={"delivery": "copy"},
                                  request=request)
     if outcome.held:
         db.commit()
@@ -9801,7 +9819,7 @@ async def update_user(
         if new_email != user.email:
             outcome = _credential_change(
                 db, current_user, user, "email",
-                summary=f"Change the email address to {new_email}" if new_email else "Remove the email address",
+                summary=_request_summary("email", new_email=new_email),
                 payload={"email": new_email}, request=request)
             if outcome.held:
                 held.append(outcome)
@@ -9829,7 +9847,7 @@ async def update_user(
         # A credential change like the address above. Applying it also ends the account's sessions:
         # a stolen token must not survive the response to a suspected compromise.
         outcome = _credential_change(
-            db, current_user, user, "password", summary="Set a password the administrator chose",
+            db, current_user, user, "password", summary=_request_summary("password"),
             payload={"password_hash": hash_password(user_update.password)}, request=request)
         if outcome.held:
             held.append(outcome)
@@ -10024,7 +10042,7 @@ async def add_ssh_key(
     # waits for another administrator (app/core/credential_changes.py). Your own key is not affected.
     outcome = _credential_change(
         db, current_user, target, "ssh_key",
-        summary=f"Add the SSH key \"{body.name.strip()}\" ({fingerprint})",
+        summary=_request_summary("ssh_key", key_name=body.name.strip(), fingerprint=fingerprint),
         payload={"name": body.name.strip(), "key_type": key_type, "public_key": normalized,
                  "fingerprint": fingerprint},
         request=request)
@@ -10113,7 +10131,7 @@ async def admin_reset_second_factor(
     # recovery codes removed, sessions ended, set-up asked for at the next sign-in) is
     # _apply_credential_change's.
     outcome = _credential_change(db, current_user, target, "second_factor",
-                                 summary="Reset the second factor", payload={}, request=request)
+                                 summary=_request_summary("second_factor"), payload={}, request=request)
     if outcome.held:
         db.commit()
         _announce_held_change(db, outcome.change, target)

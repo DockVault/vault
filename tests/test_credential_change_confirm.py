@@ -125,6 +125,25 @@ def test_the_servers_own_words_name_who_made_the_first_change_and_write_dates_ou
     assert mine["previous"] == {"by": "alice", "at": "2026-09-28T05:47:00Z"}
 
 
+@pytest.mark.parametrize("kind, facts, line", [
+    ("email", {"new_email": "carol@new.example"}, "New address: carol@new.example"),
+    ("email", {"new_email": None}, "The address is removed"),
+    ("reset_link", {"delivery": "copy"}, "A link to copy"),
+    ("reset_link", {"delivery": "email"}, "Sent to their email address"),
+    ("ssh_key", {"key_name": "laptop", "fingerprint": "SHA256:abc"}, 'Key "laptop" (SHA256:abc)'),
+    ("second_factor", {}, None),
+])
+def test_a_request_row_says_only_what_its_heading_does_not(kind, facts, line):
+    """A waiting request reads "Change the email address for carol" and, under it, only what differs:
+    "New address: ...", not "Change the email address to ..." again; a second-factor reset has nothing
+    to add."""
+    from app.core import credential_changes as cc
+    summary = api._request_summary(kind, **facts)
+    assert summary == line
+    if summary:
+        assert not summary.lower().startswith(cc.request_label(kind).lower()[:12])
+
+
 def test_an_address_change_that_will_be_held_says_the_rest_is_saved_now():
     out = _run("""
 const soon = new Date(Date.now() + 10 * 86400000).toISOString(), at = new Date().toISOString();
