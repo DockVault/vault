@@ -118,7 +118,7 @@ def test_demoting_the_asker_does_not_let_their_maker_approve(db, approve):
     db.commit()
     for who in (alice, bob):
         refused = _refused(run, change.id, who)
-        assert refused.status_code == 403 and "no longer an active administrator" in refused.detail, refused.detail
+        assert refused.status_code == 403 and "is not an active administrator" in refused.detail, refused.detail
     assert applied == []
     assert db.get(CredentialChange, change.id).status == cc.HELD
     reasons = [r.details["reason"] for r in db.query(AuditLog)
@@ -407,7 +407,9 @@ def test_exactly_fourteen_days_as_an_administrator_is_long_enough(db):
 
 @pytest.mark.parametrize("reason,short,long", [
     (cc.OWN_ACCOUNT, "it is a change to your own account", "This is a change to your own account"),
-    (cc.REQUESTER_GONE, "alice is no longer an administrator", "alice, who asked for this change, is no longer"),
+    # "not", never "no longer": the one who asked may never have been one (a user who manages users).
+    (cc.REQUESTER_GONE, "alice is not an active administrator",
+     "alice, who asked for this change, is not an active administrator, so nobody can approve it."),
 ])
 def test_the_new_refusals_say_their_rule_in_plain_words(reason, short, long):
     assert short in api._approval_refusal_text(reason, "alice", short=True)

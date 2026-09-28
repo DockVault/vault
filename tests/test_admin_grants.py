@@ -201,6 +201,31 @@ def test_the_refusal_of_a_second_change_says_no_other_administrator_may_approve(
     assert "you made puppet an administrator" in detail, "it says which rule applied, to whom"
 
 
+def test_a_second_change_by_a_user_who_manages_users_is_refused_and_points_to_an_administrator(db):
+    """Their second change within 14 days used to be held, and every administrator was then refused its
+    approval ("is no longer an administrator"), so it waited seven days to expire. It is refused when
+    asked for, pointing to an administrator, and recorded; nothing is held."""
+    from fastapi import HTTPException
+    from app.core.models import AuditLog
+    AuditLog.__table__.create(db.get_bind())
+    _alice, _bob = _user(db, "alice"), _user(db, "bob")
+    dana, carol = _user(db, "dana", role=RoleEnum.USER), _user(db, "carol", role=RoleEnum.USER)
+    cc.record_made(db, kind=cc.RESET_LINK, target_id=carol.id, requester_id=dana.id, requester_name="dana")
+    db.commit()
+    with pytest.raises(HTTPException) as refused:
+        api._credential_change(db, dana, carol, cc.RESET_LINK, summary="s", payload={"delivery": "copy"})
+    detail = refused.value.detail
+    assert refused.value.status_code == 409, detail
+    assert detail.startswith("You already changed carol's sign-in details on "), detail
+    assert "must be made by an administrator and approved by another, so ask an administrator" in detail, detail
+    assert "dockvault.py accounts" in detail, detail
+    assert db.query(CredentialChange).filter(CredentialChange.status == cc.HELD).count() == 0
+    (row,) = db.query(AuditLog).filter(AuditLog.action == "credential_change_refused").all()
+    assert row.user_id == dana.id and row.resource_id == str(carol.id)
+    assert row.details == {"kind": cc.RESET_LINK, "target_username": "carol",
+                           "reason": "only an administrator may ask for a second change"}
+
+
 def test_the_refusal_of_a_second_change_names_each_rule_that_applied(db):
     alice, carol = _user(db, "alice"), _user(db, "carol", role=RoleEnum.USER)
     now = cc.utcnow()

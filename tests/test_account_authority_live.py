@@ -140,3 +140,25 @@ def test_an_administrator_still_makes_a_reset_link_for_another_administrator(adm
     ada, _carol = accounts
     r = admin.post(f"/users/{ada['id']}/reset-link")
     assert r.status_code == 200 and "?reset=" in r.json()["reset_link"], r.text
+
+
+def test_a_second_change_by_a_user_who_manages_users_is_refused_not_held(admin, delegate):
+    # It used to be held, and then every administrator was refused its approval, so it waited seven days
+    # to expire. It is refused when asked for, pointing to an administrator, and nothing is held.
+    manager, as_manager = delegate
+    carol = admin.create_user(role="user")
+    try:
+        first = as_manager.post(f"/users/{carol['id']}/reset-link")
+        assert first.status_code == 200, first.text
+        second = as_manager.post(f"/users/{carol['id']}/reset-link")
+        assert second.status_code == 409, second.text
+        detail = second.json()["detail"]
+        assert "must be made by an administrator and approved by another, so ask an administrator" in detail
+        held = [r for r in admin.get("/admin/credential-requests").json()["requests"]
+                if r["target_user_id"] == carol["id"]]
+        assert held == [], held
+        row = psql("SELECT user_id::text || '|' || (details->>'reason') FROM audit_logs "
+                   f"WHERE action = 'credential_change_refused' AND resource_id = '{carol['id']}'")
+        assert row == f"{manager['id']}|only an administrator may ask for a second change", row
+    finally:
+        admin.delete_user(carol["id"])

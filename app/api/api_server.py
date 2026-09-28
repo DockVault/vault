@@ -5494,14 +5494,32 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     raise ValueError(f"unknown credential change: {kind}")
 
 
+def _refuse_credential_change(db, actor, target, kind, detail, *, reason, approver_refusals=None):
+    """Refuse a whole request whose credential change could never be made (_credential_change): roll
+    the session back, so nothing the request changed is kept, record the refusal, and raise 409 with
+    ``detail``."""
+    target_id, target_name = target.id, target.username   # read before the rollback expires them
+    db.rollback()
+    details = {"kind": kind, "target_username": target_name, "reason": reason}
+    if approver_refusals is not None:
+        details["approver_refusals"] = approver_refusals
+    try:
+        AuditLogger(db).log_action(action="credential_change_refused", status="failure", user=actor,
+                                   resource_type="user", resource_id=str(target_id), details=details)
+    except Exception:  # noqa: BLE001 - the refusal stands without its row
+        db.rollback()
+    raise HTTPException(status_code=409, detail=detail)
+
+
 def _credential_change(db, actor, target, kind, *, summary, payload, request=None) -> _CredentialOutcome:
     """The one place the two-person rule is applied to a credential change on ``target``.
 
-    ``actor`` is the administrator asking, or None for the host operator. Changing your own
-    credentials is not affected: it is applied and not recorded. Otherwise the change is applied now
-    and recorded (the first in the window), or held for another administrator (a second one), in the
-    caller's transaction; the caller commits. With nobody else to approve, the whole request is
-    refused with 409: this rolls the session back, records the refusal, and raises."""
+    ``actor`` is the administrator (or the user given the permission to manage users) asking, or None
+    for the host operator. Changing your own credentials is not affected: it is applied and not
+    recorded. Otherwise the change is applied now and recorded (the first in the window), or held for
+    another administrator (a second one), in the caller's transaction; the caller commits. When a second
+    change could never be approved (nobody else may, or the one asking is not an administrator), the
+    whole request is refused with 409: this rolls the session back, records the refusal, and raises."""
     from app.core import credential_changes as cc
     if actor is not None and actor.id == target.id:
         return _CredentialOutcome(None, False, _apply_credential_change(
@@ -5512,25 +5530,23 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     now = cc.utcnow()
     try:
         last = cc.decide(db, requester_id=requester_id, target_id=target.id, now=now)
+    except cc.NotAnAdministrator as refused:
+        detail = (f"{_earlier_changer(refused.last_change, requester_id)} already changed {target.username}'s "
+                  f"sign-in details on {_cc_date(refused.last_change.applied_at)}. A second change within 14 "
+                  "days must be made by an administrator and approved by another, so ask an administrator "
+                  "to make it. The person who runs the server can also make it on the host with: "
+                  "python dockvault.py accounts")
+        _refuse_credential_change(db, actor, target, kind, detail,
+                                  reason="only an administrator may ask for a second change")
     except cc.NoApprover as refused:
-        target_id, target_name = target.id, target.username
-        detail = (f"{_earlier_changer(refused.last_change, requester_id)} already changed {target_name}'s "
+        detail = (f"{_earlier_changer(refused.last_change, requester_id)} already changed {target.username}'s "
                   f"sign-in details on {_cc_date(refused.last_change.applied_at)}. A second change within 14 "
                   "days needs another administrator's approval, and no other administrator may approve it: "
-                  f"{_no_approver_text(refused.refusals, target_name)}. The person who runs the server can "
+                  f"{_no_approver_text(refused.refusals, target.username)}. The person who runs the server can "
                   "make this change on the host with: python dockvault.py accounts")
-        why = sorted({reason for _name, reason in refused.refusals})
-        db.rollback()   # the whole request is refused, so nothing it changed may be kept
-        try:
-            AuditLogger(db).log_action(
-                action="credential_change_refused", status="failure", user=actor,
-                resource_type="user", resource_id=str(target_id),
-                details={"kind": kind, "target_username": target_name,
-                         "reason": "no other administrator can approve a second change",
-                         "approver_refusals": why})
-        except Exception:  # noqa: BLE001 - the refusal stands without its row
-            db.rollback()
-        raise HTTPException(status_code=409, detail=detail)
+        _refuse_credential_change(db, actor, target, kind, detail,
+                                  reason="no other administrator can approve a second change",
+                                  approver_refusals=sorted({reason for _name, reason in refused.refusals}))
     if last is None:
         change = cc.record_made(db, kind=kind, target_id=target.id, requester_id=requester_id,
                                 requester_name=requester_name, summary=summary, now=now)
@@ -5581,10 +5597,12 @@ def _approval_refusal_text(reason, requester, *, short=False) -> str:
             return "You cannot approve this: it is a change to your own account."
         return f"This is a change to your own account, so you cannot approve it. {_OTHERS_CAN}"
     if reason == cc.REQUESTER_GONE:
+        # Not "no longer": the one who asked may never have been an administrator (a user given the
+        # permission to manage users, whose request was held before such a request was refused).
         if short:
-            return f"You cannot approve this: {requester} is no longer an administrator."
-        return (f"{requester}, who asked for this change, is no longer an active administrator, so nobody "
-                "can approve it.")
+            return f"You cannot approve this: {requester} is not an active administrator."
+        return (f"{requester}, who asked for this change, is not an active administrator, so nobody can "
+                "approve it.")
     if reason == cc.MADE_BY_REQUESTER:
         if short:
             return f"You cannot approve this: {requester} made you an administrator."

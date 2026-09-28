@@ -29,6 +29,11 @@ app/core/admin_grants.py). The approver:
      closes what the lineage alone cannot: two accounts one administrator made for the purpose (neither
      in the other's lineage), and an administrator whose maker was demoted or deleted.
 
+Only an administrator's second change is held. A user given the permission to manage users can make
+a first change to an ordinary user's account, but a second one within the window is refused when asked
+for (NotAnAdministrator): an approval needs the one who asked to be an administrator who can act, so
+nobody could ever approve it, and it would only have waited seven days to expire.
+
 And the administrator who asked must still be one who can act (can_approve) when it is approved. An
 administrator who is demoted, deactivated, locked by an administrator or deleted has every request
 they have open withdrawn at that moment (withdraw_open), and a request whose asker is no longer an
@@ -98,6 +103,18 @@ DENIED = "denied"        # held, then turned down by another administrator
 WITHDRAWN = "withdrawn"  # held, then taken back by the administrator who asked
 EXPIRED = "expired"      # held, and nobody decided within HOLD
 APPLIED = (MADE, APPROVED)
+
+
+class NotAnAdministrator(Exception):
+    """A second change in the window, asked for by someone who is not an administrator who can act: a
+    user given the permission to manage users. Only an administrator's request is held for another's
+    approval, and an approval checks that the one who asked is still an administrator who can act, so a
+    request of theirs could never be approved: it is refused when asked for instead. Carries the change
+    that opened the window."""
+
+    def __init__(self, last_change: CredentialChange):
+        super().__init__("only an administrator may ask for a second change")
+        self.last_change = last_change
 
 
 class NoApprover(Exception):
@@ -338,7 +355,9 @@ def decide(db, *, requester_id, target_id, now: Optional[datetime] = None) -> Op
     be made now.
 
     Returns None when it may: no change was applied to the account within the window. Returns the
-    change that opened the window when this one must be held instead. Raises :class:`NoApprover`, with
+    change that opened the window when this one must be held instead. Raises :class:`NotAnAdministrator`
+    when it would have to be held but the one asking is not an administrator who can act (a user given
+    the permission to manage users), whose request nobody could approve; and :class:`NoApprover`, with
     why each other administrator may not approve, when it would have to be held but nobody could
     approve it. The host operator is the way round the rule, so a change it asks for is never held.
 
@@ -350,6 +369,8 @@ def decide(db, *, requester_id, target_id, now: Optional[datetime] = None) -> Op
     last = last_applied(db, target_id, now)
     if last is None:
         return None
+    if not can_approve(db.get(User, requester_id)):
+        raise NotAnAdministrator(last)
     found = refusals(db, requester_id, target_id=target_id, requested_at=now, now=now)
     if not any(reason is None for reason in found.values()):
         raise NoApprover(last, sorted((a.username, reason) for a, reason in found.items()))

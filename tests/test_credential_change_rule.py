@@ -111,6 +111,21 @@ def test_with_nobody_else_to_approve_the_second_change_is_refused(db):
     assert refused.value.last_change.id == first.id
 
 
+def test_a_second_change_asked_for_by_someone_who_is_not_an_administrator_is_refused_not_held(db):
+    # A user given the permission to manage users may make the first change to an ordinary user's
+    # account. A second one used to be held, and could never be approved: an approval needs the one who
+    # asked to be an administrator who can act. It is refused when asked for instead, while bob could
+    # still approve the same second change asked for by an administrator.
+    alice, _bob, dana, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db), _user(db)
+    assert cc.decide(db, requester_id=dana.id, target_id=carol.id) is None, "the first change is made"
+    first = _made(db, carol, dana)
+    db.commit()
+    with pytest.raises(cc.NotAnAdministrator) as refused:
+        cc.decide(db, requester_id=dana.id, target_id=carol.id)
+    assert refused.value.last_change.id == first.id
+    assert cc.decide(db, requester_id=alice.id, target_id=carol.id).id == first.id, "an administrator's is held"
+
+
 def test_a_lock_that_runs_out_does_not_stop_an_administrator_approving(db):
     alice, carol = _user(db, RoleEnum.ADMIN), _user(db)
     timed = _user(db, RoleEnum.ADMIN, is_locked=True, locked_until=cc.utcnow() + timedelta(minutes=10))
