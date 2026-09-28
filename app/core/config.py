@@ -329,9 +329,11 @@ class Settings(BaseSettings):
     # sessions already signed in keep working. An ADMIN lock (set via the API) stays permanent.
     # 0 keeps an automatic lock until an administrator clears it.
     account_lockout_minutes: int = Field(default=15)
-    # The account-wide lock: failed sign-ins to one account from ALL addresses within the login window
+    # The account-wide lock: failed sign-ins to one account from ALL addresses together per 24 hours
     # that refuse new sign-ins from everywhere, as a multiple of rate_limit_login_attempts (the
-    # per-address limit). 4 with the default 5 = 20. The answer to many addresses guessing at once.
+    # per-address limit). 4 with the default 5 = 20 a day; the count loses one every 24 h / 20 = 72
+    # minutes, and while it is full each further failure pauses sign-ins again (see
+    # app/core/sign_in_lockout.py). The answer to many addresses guessing at once.
     account_lockout_backstop_multiplier: int = Field(default=4)
     # Trust X-Forwarded-For ONLY when the immediate peer is one of these networks (CIDR /
     # bare IP, comma-separated). Empty (the default) => trust NO proxy: XFF is ignored and the

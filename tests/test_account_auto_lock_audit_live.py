@@ -140,7 +140,9 @@ def test_the_timer_clears_an_expired_lock_and_records_it(admin, temp_user):
         "    db.commit()\n"
         "    print(n)\n").stdout.strip().splitlines()[-1]
     assert int(cleared) >= 1
-    assert lock_rows(uid) == {}
+    # The lock is gone; the account-wide count stays, to lose its failures over the day
+    # (app/core/sign_in_lockout.py).
+    assert lock_rows(uid) == {"*": (7, False)}
 
     rows = _rows(admin, UNLOCKED, uid)
     assert len(rows) == 1, rows

@@ -2,13 +2,22 @@
 and past a higher count across every address, from anywhere.
 
 Counting, on every wrong password for an account:
-  * one against the account from its source address. When that count reaches the login limit
-    (max_login_attempts), new sign-ins to the account FROM THAT ADDRESS are refused for the lockout
-    duration. The count ends at a successful sign-in from the address, or when the lock it armed runs
-    out;
-  * one against the account as a whole. When that count reaches the limit times the backstop multiple
-    (lockout_backstop_multiplier) within the login window, new sign-ins to the account from EVERY
-    address are refused for the lockout duration: the answer to many addresses guessing at once.
+  * one against the account from its source address (an IPv6 address counts as its /64, one site's
+    network, since whoever holds one can use billions of addresses in it). When that count reaches the
+    login limit (max_login_attempts), new sign-ins to the account FROM THAT ADDRESS are refused for the
+    lockout duration. The count ends at a successful sign-in from the address, or when the lock it
+    armed runs out;
+  * one against the account as a whole, from every address together. That count holds about the last
+    24 hours: it loses one failure every 24 h / backstop, where the backstop is the limit times the
+    backstop multiple (lockout_backstop_multiplier; 5 x 4 = 20 by default, so one every 72 minutes).
+    When it reaches the backstop, new sign-ins to the account from EVERY address are refused for the
+    lockout duration, or until the count has lost a failure if that is later: the answer to many
+    addresses guessing at once. The count does not end with that lock, so while it is still full each
+    further failure refuses them again. An account therefore gets at most the backstop number of failed
+    sign-ins from all addresses together per 24 hours before new sign-ins pause for everyone, and one
+    more per 24 h / backstop after that. (Counted within the
+    5-minute login window instead, guessers using four or more addresses could go on for ever without
+    arming it: some 5,500 guesses a day.)
 
 What a lock does, and does not do:
   * it refuses new sign-ins (a web password, an SFTP password, an SFTP key) BEFORE the password is
@@ -26,11 +35,12 @@ is down, an unknown name is simply never refused by it.
 
 Nothing here commits: the caller's transaction carries each count, lock and audit row.
 """
+import ipaddress
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, NamedTuple, Optional
 
-from sqlalchemy import and_, case, update
+from sqlalchemy import update
 
 from app.core.models import SignInLockout, User
 
@@ -45,6 +55,10 @@ AUTO_UNLOCKED_ACTION = "account_auto_unlocked"
 # dropped by the periodic prune: a few mistakes last week should not count against someone today.
 STALE_ADDRESS_COUNT = timedelta(days=1)
 
+# The account-wide count holds the failures of about this long: it loses one every ACCOUNT_PERIOD /
+# backstop (see the module docstring).
+ACCOUNT_PERIOD = timedelta(hours=24)
+
 
 class Lock(NamedTuple):
     scope: str                          # SCOPE_ADDRESS or SCOPE_ACCOUNT
@@ -58,8 +72,21 @@ def utcnow() -> datetime:
 
 
 def source_of(address) -> str:
-    """The address a count is kept under (the column is bounded)."""
-    return (str(address) if address else "unknown")[:64]
+    """The source a count is kept under: the client address, with an IPv6 address grouped to its /64
+    (an IPv4 address written as IPv6 counts as the IPv4 one). Anything that is not an address is kept as
+    given, bounded to the column."""
+    if not address:
+        return "unknown"
+    text = str(address).strip()
+    try:
+        ip = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return text[:64]
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
 
 
 def limits():
@@ -78,22 +105,53 @@ def _insert(db):
     return insert
 
 
-def _count(db, user_id, source, now, window_seconds=None):
-    """Add one failure to (user_id, source) in one statement and return the row as it now stands.
-    With a window, a count that holds no lock and whose window has passed starts again at 1."""
+def _count(db, user_id, source, now):
+    """Add one failure to an address's count in one statement and return the row as it now stands."""
     tbl = SignInLockout.__table__
     stmt = _insert(db)(tbl).values(id=uuid.uuid4(), user_id=user_id, source=source, failed_attempts=1,
                                    window_start=now, last_failure_at=now)
-    if window_seconds:
-        stale = and_(tbl.c.window_start < now - timedelta(seconds=window_seconds), tbl.c.locked_at.is_(None))
-        set_ = {"failed_attempts": case((stale, 1), else_=tbl.c.failed_attempts + 1),
-                "window_start": case((stale, now), else_=tbl.c.window_start),
-                "last_failure_at": now}
-    else:
-        set_ = {"failed_attempts": tbl.c.failed_attempts + 1, "last_failure_at": now}
+    set_ = {"failed_attempts": tbl.c.failed_attempts + 1, "last_failure_at": now}
     stmt = stmt.on_conflict_do_update(index_elements=[tbl.c.user_id, tbl.c.source], set_=set_).returning(
         tbl.c.id, tbl.c.failed_attempts, tbl.c.locked_at, tbl.c.locked_until)
     return db.execute(stmt).first()
+
+
+def account_interval(limit) -> timedelta:
+    """How often the account-wide count loses one failure: ACCOUNT_PERIOD / the backstop."""
+    return ACCOUNT_PERIOD / max(1, int(limit))
+
+
+def decayed(count, since, limit, now):
+    """(count, since) after the account-wide count has lost one failure every account_interval(limit)
+    since ``since``: the moment it last lost one, or started. A count that is all gone starts again
+    now."""
+    interval = account_interval(limit).total_seconds()
+    elapsed = (now - since).total_seconds() if since is not None else 0.0
+    lost = int(elapsed // interval) if elapsed > 0 else 0
+    if lost >= (count or 0):
+        return 0, now
+    return count - lost, since + timedelta(seconds=lost * interval)
+
+
+def _count_account_wide(db, user_id, limit, now) -> SignInLockout:
+    """Add one failure to the account-wide count, after what it lost since the last one (decayed), and
+    return its row. The count never goes past ``limit``, so once a lock it armed has ended it falls
+    below the limit again one interval later. The row is taken FOR UPDATE, so failures from many
+    addresses at once are counted one after another. window_start is the moment the count last lost a
+    failure, or started."""
+    tbl = SignInLockout.__table__
+    db.execute(_insert(db)(tbl).values(id=uuid.uuid4(), user_id=user_id, source=ACCOUNT_WIDE, failed_attempts=0,
+                                       window_start=now, last_failure_at=now)
+               .on_conflict_do_nothing(index_elements=[tbl.c.user_id, tbl.c.source]))
+    row = (db.query(SignInLockout)
+           .filter(SignInLockout.user_id == user_id, SignInLockout.source == ACCOUNT_WIDE)
+           .with_for_update().populate_existing().one())
+    count, since = decayed(row.failed_attempts, row.window_start, limit, now)
+    row.failed_attempts = min(int(limit), count + 1)
+    row.window_start = since
+    row.last_failure_at = now
+    db.flush()
+    return row
 
 
 def _in_force(locked_at, locked_until, now) -> bool:
@@ -111,23 +169,34 @@ def record_failure(db, user, address, *, now=None) -> list:
     """Count one wrong password for ``user`` from ``address``, against the address and the account.
     A count that reaches its limit arms that lock and records account_auto_locked, in the caller's
     transaction. Returns the locks this failure armed."""
-    threshold, backstop, window, minutes = limits()
+    threshold, backstop, _window, minutes = limits()
     now = now or utcnow()
     until = now + timedelta(minutes=minutes) if minutes > 0 else None
     armed = []
-    for source, limit, count_window, scope in ((source_of(address), threshold, None, SCOPE_ADDRESS),
-                                               (ACCOUNT_WIDE, backstop, window, SCOPE_ACCOUNT)):
-        row = _count(db, user.id, source, now, count_window)
-        if row is None or row.failed_attempts < limit or _in_force(row.locked_at, row.locked_until, now):
-            continue
+    source = source_of(address)
+    # Both counts first, the audit rows after: the rows are added to the caller's transaction and
+    # written by its commit, with nothing flushed ahead of it.
+    row = _count(db, user.id, source, now)
+    account = _count_account_wide(db, user.id, backstop, now)
+
+    if row is not None and row.failed_attempts >= threshold and not _in_force(row.locked_at, row.locked_until, now):
         tbl = SignInLockout.__table__
         db.execute(update(tbl).where(tbl.c.id == row.id).values(locked_at=now, locked_until=until))
-        details = {"scope": scope, "failed_attempts": row.failed_attempts,
-                   "locked_until": until.isoformat() if until else None}
-        if scope == SCOPE_ADDRESS:
-            details["address"] = source
-        db.add(_audit_row(db, AUTO_LOCKED_ACTION, user, address, details))
-        armed.append(Lock(scope, until, source))
+        db.add(_audit_row(db, AUTO_LOCKED_ACTION, user, address, {
+            "scope": SCOPE_ADDRESS, "failed_attempts": row.failed_attempts,
+            "locked_until": until.isoformat() if until else None, "address": source}))
+        armed.append(Lock(SCOPE_ADDRESS, until, source))
+
+    if account.failed_attempts >= backstop and not _in_force(account.locked_at, account.locked_until, now):
+        # The pause lasts the lockout duration, or until the count has lost a failure if that is later:
+        # a pause that ended while the count was still full would let one more guess through every
+        # lockout duration (96 a day with the defaults) instead of one every 24 h / backstop.
+        account_until = None if until is None else max(until, account.window_start + account_interval(backstop))
+        account.locked_at, account.locked_until = now, account_until
+        db.add(_audit_row(db, AUTO_LOCKED_ACTION, user, address, {
+            "scope": SCOPE_ACCOUNT, "failed_attempts": account.failed_attempts,
+            "locked_until": account_until.isoformat() if account_until else None}))
+        armed.append(Lock(SCOPE_ACCOUNT, account_until, ACCOUNT_WIDE))
     return armed
 
 
@@ -159,8 +228,9 @@ def release_expired(db, *, user_id=None, ip_address=None, now=None) -> int:
     """Clear the automatic locks whose time has run out, recording each as account_auto_unlocked with
     its scope, in the caller's transaction. The periodic release passes no ``user_id``; a sign-in
     passes the account and its address, which the row carries. Rows are claimed FOR UPDATE SKIP
-    LOCKED, so the two never both record one release. A lock with no end is never touched. Returns
-    how many were cleared."""
+    LOCKED, so the two never both record one release. A lock with no end is never touched. An
+    address's count ends with its lock; the account-wide count stays, so that until it has lost a
+    failure (decayed) the next failure refuses new sign-ins again. Returns how many were cleared."""
     now = now or utcnow()
     q = db.query(SignInLockout).filter(SignInLockout.locked_at.isnot(None),
                                        SignInLockout.locked_until.isnot(None),
@@ -180,18 +250,22 @@ def release_expired(db, *, user_id=None, ip_address=None, now=None) -> int:
             if r.source != ACCOUNT_WIDE:
                 details["address"] = r.source
             db.add(_audit_row(db, AUTO_UNLOCKED_ACTION, user, ip_address, details))
-        db.delete(r)
+        if r.source == ACCOUNT_WIDE:
+            r.locked_at = None
+            r.locked_until = None
+        else:
+            db.delete(r)
     return len(expired)
 
 
 def prune_stale(db, *, now=None) -> int:
-    """Drop counts that hold no lock and have nothing left to count: an account-wide count whose
-    window has passed, and an address count untouched for a day. Keeps the table small."""
+    """Drop counts that hold no lock and have nothing left to count: an account-wide count that has
+    lost every failure (it holds at most the backstop, and loses all of them within ACCOUNT_PERIOD of
+    window_start), and an address count untouched for a day. Keeps the table small."""
     now = now or utcnow()
-    _t, _b, window, _m = limits()
     tbl = SignInLockout
     removed = db.query(tbl).filter(tbl.locked_at.is_(None), tbl.source == ACCOUNT_WIDE,
-                                   tbl.window_start < now - timedelta(seconds=window)).delete(synchronize_session=False)
+                                   tbl.window_start < now - ACCOUNT_PERIOD).delete(synchronize_session=False)
     removed += db.query(tbl).filter(tbl.locked_at.is_(None), tbl.source != ACCOUNT_WIDE,
                                     tbl.last_failure_at < now - STALE_ADDRESS_COUNT).delete(synchronize_session=False)
     return removed

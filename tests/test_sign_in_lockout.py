@@ -2,7 +2,7 @@
 
 Wrong passwords count per account and source address, and across all addresses. At the login limit
 new sign-ins to the account from THAT address are refused for the lockout duration; at the limit times
-the backstop multiple within the login window they are refused from EVERY address. A refusal happens
+the backstop multiple, counted over about the last 24 hours, they are refused from EVERY address. A refusal happens
 before the password is checked, so guessing stops. A lock never ends a session: only an
 administrator's lock (users.is_locked with no end) does. Locks end by themselves and are audited
 with their scope. Names that are no account are refused the same way, from the cache.
@@ -147,20 +147,127 @@ def test_failures_from_many_addresses_lock_the_whole_account(Session, limits):
     assert rows[0].details["failed_attempts"] == THRESHOLD * MULTIPLE
 
 
-def test_the_account_wide_count_is_within_the_login_window(Session, limits):
+def _account_row(Session, uid):
+    s = Session()
+    try:
+        row = s.query(SignInLockout).filter(SignInLockout.user_id == uid,
+                                            SignInLockout.source == L.ACCOUNT_WIDE).one()
+        return row.failed_attempts, row.window_start, row.locked_at
+    finally:
+        s.close()
+
+
+def _age_account_count(Session, uid, by):
+    s = Session()
+    row = s.query(SignInLockout).filter(SignInLockout.user_id == uid, SignInLockout.source == L.ACCOUNT_WIDE).one()
+    row.window_start = row.window_start - by
+    s.commit()
+    s.close()
+
+
+INTERVAL = L.ACCOUNT_PERIOD / (THRESHOLD * MULTIPLE)     # the account-wide count loses one this often
+
+
+def test_the_account_wide_count_outlasts_the_login_window(Session, limits):
+    # The count used to start again once the 5-minute login window passed, so guessers using a few
+    # addresses at a time never armed it. It now holds about a day.
     uid = _add_user(Session)
     for i in range(THRESHOLD * MULTIPLE - 1):
         _fail(Session, uid, f"203.0.113.{i}")
+    _age_account_count(Session, uid, timedelta(seconds=WINDOW + 1))
+    _fail(Session, uid, "203.0.113.200")
+    assert _lock(Session, uid, HOME).scope == L.SCOPE_ACCOUNT
+
+
+def test_the_account_wide_count_loses_one_failure_per_interval_and_is_gone_after_a_day(Session, limits):
+    uid = _add_user(Session)
+    for i in range(THRESHOLD * MULTIPLE - 1):
+        _fail(Session, uid, f"203.0.113.{i}")
+    _age_account_count(Session, uid, 2 * INTERVAL + timedelta(seconds=1))
+    _fail(Session, uid, "203.0.113.200")                 # two lost, one added
+    assert _lock(Session, uid, HOME) is None
+    assert _account_row(Session, uid)[0] == THRESHOLD * MULTIPLE - 2
+    _age_account_count(Session, uid, L.ACCOUNT_PERIOD)
+    _fail(Session, uid, "203.0.113.201")
+    assert _account_row(Session, uid)[0] == 1, "a day later every earlier failure is gone"
+
+
+def test_while_the_account_wide_count_is_full_each_further_failure_pauses_sign_ins_again(Session, limits):
+    uid = _add_user(Session)
+    for i in range(THRESHOLD * MULTIPLE):
+        _fail(Session, uid, f"203.0.113.{i}")
     s = Session()
-    s.query(SignInLockout).filter(SignInLockout.source == L.ACCOUNT_WIDE).update(
-        {"window_start": _now() - timedelta(seconds=WINDOW + 1)})
+    s.query(SignInLockout).update({"locked_until": _now() - timedelta(seconds=1)})
+    s.commit()
+    assert L.release_expired(s) == 1
     s.commit()
     s.close()
-    _fail(Session, uid, "203.0.113.200")   # the old window is over: this one starts a new count
-    assert _lock(Session, uid, HOME) is None
-    s = Session()
-    assert s.query(SignInLockout).filter(SignInLockout.source == L.ACCOUNT_WIDE).one().failed_attempts == 1
-    s.close()
+    count, _start, locked_at = _account_row(Session, uid)
+    assert (count, locked_at) == (THRESHOLD * MULTIPLE, None), "the lock ends; the count does not"
+    # (Ended early here: it lasts until the count has room again, see the next test.)
+    assert _lock(Session, uid, HOME) is None, "the owner can sign in again"
+    _fail(Session, uid, "203.0.113.100")
+    assert _lock(Session, uid, HOME).scope == L.SCOPE_ACCOUNT, "one more failure pauses them again"
+    assert _account_row(Session, uid)[0] == THRESHOLD * MULTIPLE, "the count never passes the backstop"
+
+
+def test_the_account_wide_pause_lasts_until_the_count_has_room_again(Session, limits):
+    uid = _add_user(Session)
+    for i in range(THRESHOLD * MULTIPLE):
+        _fail(Session, uid, f"203.0.113.{i}")
+    _count, start, _locked = _account_row(Session, uid)
+    lock = _lock(Session, uid, HOME)
+    assert lock.locked_until == start + INTERVAL, "not the 15 minutes: the count is still full then"
+    limits["lockout_duration"] = 10 * 24 * 60            # a longer lockout duration still wins
+    uid2 = _add_user(Session)
+    for i in range(THRESHOLD * MULTIPLE):
+        _fail(Session, uid2, f"203.0.113.{i}")
+    assert _lock(Session, uid2, HOME).locked_until > _now() + timedelta(days=9)
+
+
+def test_guessers_from_many_addresses_get_at_most_the_backstop_a_day_before_the_pause(Session, limits,
+                                                                                    monkeypatch):
+    # The review's arithmetic: fresh addresses, never enough from one to lock it, a guess every five
+    # minutes for a day. Counted in the login window, every one of the 288 guesses was answered. Now the
+    # backstop's worth are, then a pause, then about one per interval as the count loses a failure.
+    clock = {"t": _now()}
+    monkeypatch.setattr(L, "utcnow", lambda: clock["t"])
+    uid = _add_user(Session)
+    answered = refused = 0
+    for i in range(24 * 12):
+        s = Session()
+        svc = A.AuthService(s)
+        svc._check_rate_limit = lambda *a, **k: None
+        try:
+            svc.authenticate_user(_user(s, uid).username, "a-guess", f"2001:db8:{i}::1")
+        except A.AccountLockedError:
+            refused += 1
+        except A.InvalidCredentialsError:
+            answered += 1
+        finally:
+            s.close()
+        clock["t"] += timedelta(minutes=5)
+    backstop = THRESHOLD * MULTIPLE
+    assert answered <= backstop + int(L.ACCOUNT_PERIOD / INTERVAL), (answered, refused)
+    assert answered >= backstop and refused > 0
+
+
+def test_an_ipv6_address_counts_as_its_slash_64():
+    assert L.source_of("2001:db8:1:2:aaaa::1") == L.source_of("2001:db8:1:2:ffff:ffff:ffff:ffff") == "2001:db8:1:2::/64"
+    assert L.source_of("2001:db8:1:3::1") != L.source_of("2001:db8:1:2::1")
+    assert L.source_of("::ffff:198.51.100.7") == "198.51.100.7", "an IPv4 address written as IPv6"
+    assert L.source_of("198.51.100.7") == "198.51.100.7"
+    assert L.source_of("fe80::1%eth0") == "fe80::/64"
+    assert L.source_of(None) == "unknown" and L.source_of("not-an-address") == "not-an-address"
+
+
+def test_guessing_from_across_one_ipv6_network_locks_that_network(Session, limits):
+    uid = _add_user(Session)
+    for i in range(THRESHOLD):
+        _fail(Session, uid, f"2001:db8:5:6::{i + 1:x}")       # a fresh address each time, one /64
+    lock = _lock(Session, uid, "2001:db8:5:6::ffff")
+    assert (lock.scope, lock.source) == (L.SCOPE_ADDRESS, "2001:db8:5:6::/64")
+    assert _lock(Session, uid, "2001:db8:5:7::1") is None, "the next network is not affected"
 
 
 def test_an_address_count_is_not_time_limited(Session, limits):
@@ -443,3 +550,21 @@ def test_the_name_mimicry_fails_open_when_the_cache_is_down(monkeypatch, limits)
     monkeypatch.setattr(rl, "rate_limiter", _Down())
     L.phantom_failure("nobody", ATTACKER)       # never raises
     assert L.phantom_lock("nobody", ATTACKER) is None
+
+
+def test_an_account_wide_count_is_pruned_only_once_all_of_it_is_gone(Session, limits):
+    # It holds at most the backstop and loses all of it within a day of window_start, and not before.
+    uid = _add_user(Session)
+    _fail(Session, uid, HOME)
+    _age_account_count(Session, uid, L.ACCOUNT_PERIOD - timedelta(minutes=5))
+    s = Session()
+    assert L.prune_stale(s) == 0
+    s.commit()
+    s.close()
+    _age_account_count(Session, uid, timedelta(minutes=5, seconds=1))
+    s = Session()
+    s.query(SignInLockout).filter(SignInLockout.source == HOME).update({"last_failure_at": _now()})
+    assert L.prune_stale(s) == 1
+    s.commit()
+    assert [r.source for r in s.query(SignInLockout).all()] == [HOME]
+    s.close()

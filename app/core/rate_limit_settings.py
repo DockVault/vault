@@ -95,9 +95,9 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
         "rate_limit_login_window_seconds", "rate_limit_login_window_seconds", 10, _WINDOW_MAX,
         "seconds", "login",
         "Login window",
-        "The rolling time window over which sign-in attempts are throttled, and over which failed "
-        "sign-ins from all addresses are counted for the account-wide lock.",
-        "Applies to the sign-in throttle, the account-wide lock and the SFTP key-offer throttle.",
+        "The rolling time window over which sign-in attempts are throttled.",
+        "Applies to the sign-in throttle and the SFTP key-offer throttle. (The account-wide lock "
+        "counts over 24 hours.)",
     ),
     RateLimitSpec(
         "lockout_duration", "account_lockout_minutes", 1, 1440, "minutes", "login",
@@ -113,9 +113,11 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
         "lockout_backstop_multiplier", "account_lockout_backstop_multiplier", 2, 100, "times", "login",
         "Account-wide lock (times the per-address limit)",
         "How many times the per-address limit of failed sign-ins, counted across every address "
-        "within the login window, refuses new sign-ins to the account from everywhere.",
-        "Triggers when many addresses guess one account's password at once; lasts the lockout "
-        "duration. Sessions already signed in keep working.",
+        "over 24 hours, refuses new sign-ins to the account from everywhere: the most failed "
+        "sign-ins an account gets per day from all addresses together before they pause.",
+        "Triggers when many addresses guess one account's password at once. The count loses one "
+        "failure every 24 hours divided by this total, and the pause lasts the lockout duration or "
+        "until the count has lost one; sessions already signed in keep working.",
     ),
     # --- Vault unlock ---------------------------------------------------------------------------
     RateLimitSpec(
