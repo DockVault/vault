@@ -2271,7 +2271,7 @@
             b.addEventListener('click', () => openOnline(k === 'temp' ? 'temp' : null, b));
             plot.appendChild(b);
         });
-        const tr = el('div', 'act-now-row is-static');
+        const tr = el('div', 'act-now-row is-static act-now-transfers');
         tr.title = 'Uploads and downloads in progress through the web on this server, of the most allowed at once. SFTP transfers are not counted yet.';
         const limit = n && n.transfer_limit;
         tr.append(el('span', 'act-now-label', 'Web transfers'),
@@ -2829,8 +2829,13 @@
         if (plotState(plot)) return;
         const si = S.band.sign_ins || { succeeded: 0, failed: 0, locked: 0 };
         const attempts = (si.succeeded || 0) + (si.failed || 0);
-        // Filtered, the title needs the room; the line under the meter still gives the attempts.
-        if (!head.classList.contains('is-filtered')) head.appendChild(el('span', 'act-ptitle-note', plural(attempts, 'attempt', 'attempts')));
+        // Filtered, the title needs the room; the line under the meter still gives the attempts. Too
+        // narrow for the word (four-digit counts, Classic's padding), the number stands alone.
+        if (!head.classList.contains('is-filtered')) {
+            const note = el('span', 'act-ptitle-note', plural(attempts, 'attempt', 'attempts'));
+            head.appendChild(note);
+            if (note.clientWidth && note.scrollWidth > note.clientWidth) { note.title = note.textContent; note.textContent = nf(attempts); }
+        }
         const meter = svg('svg', { width: '100%', height: 6, viewBox: '0 0 100 6', preserveAspectRatio: 'none', role: 'img',
             'aria-label': attempts ? `${nf(si.failed)} of ${nf(attempts)} sign-in attempts failed` : 'No sign-in attempts' }, 'act-meter');
         meter.appendChild(svg('rect', { x: 0, y: 0, width: 100, height: 6 }, attempts ? 'act-bar' : 'act-track'));

@@ -122,7 +122,7 @@
 .act-ptitle-mark { display: inline-block; margin-left: 5px; vertical-align: -1px; }
 .act-ptitle-mark .icon { width: 10px; height: 10px; }
 .act-now .act-ptitle-text { display: inline-flex; align-items: center; }
-.act-ptitle-note { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-secondary); }
+.act-ptitle-note { margin-left: auto; min-width: 0; flex-shrink: 1000; overflow: hidden; text-overflow: ellipsis; font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-secondary); }
 .act-plot { position: relative; height: var(--act-plot-h); margin-top: 8px; min-width: 0; }
 .act-band.is-busy .act-panel:not(.act-now) .act-plot { opacity: .55; }
 .act-plot-note { display: block; font-size: 12px; color: var(--text-tertiary); }
@@ -136,7 +136,7 @@
 .act-now-dot.is-live { background: var(--success); }
 .act-now-rows { display: flex; flex-direction: column; }
 .act-now-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    display: flex; align-items: center; justify-content: space-between; gap: 4px;
     width: 100%; height: var(--act-row-h); padding: 0; background: none; border: 0; text-align: left; cursor: pointer;
     font-size: 12px; white-space: nowrap;
 }
@@ -146,6 +146,11 @@
 button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-decoration: underline; text-underline-offset: 2px; }
 .act-now-value { flex: none; color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
 .act-now-wait .act-now-label { color: var(--text-secondary); }
+/* "Web transfers" and its "2 / 8" do not fit the panel's width on one line: the value goes under it. */
+.act-now-row.act-now-transfers { flex-wrap: wrap; height: auto; }
+.act-now-transfers > span { line-height: var(--act-row-h); }
+.act-now-transfers .act-now-label { flex: none; }
+.act-now-transfers .act-now-value { margin-left: auto; }
 .act-warn-icon { width: 11px; height: 11px; color: var(--warning); flex: none; }
 
 .act-pop {
@@ -368,6 +373,7 @@ button.act-now-row:hover .act-now-label { color: var(--text-secondary); text-dec
 :root:not([data-ui="v2"]) .act-search input { height: 36px; min-height: 36px; padding-top: .3rem; padding-bottom: .3rem; }
 :root:not([data-ui="v2"]) .activity-table td { padding: .55rem .85rem; }
 .activity-table .act-c-time { width: 112px; }
+:root:not([data-ui="v2"]) .activity-table .act-c-time { width: 120px; }
 .activity-table .act-c-who { width: 150px; }
 .activity-table .act-c-ch { width: 104px; }
 .activity-table .act-c-ip { width: 140px; }
