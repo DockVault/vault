@@ -225,7 +225,8 @@ the recipients' mailboxes.
   usernames, roles, and who granted each permission when), not audited either. **New in 0.33.1:** it
   can list the permissions an administrator revoked that a restart before 0.33.1 granted again (usernames,
   roles, the permission, and when it was revoked and granted again, read from the audit log), not
-  audited either.
+  audited either, and unlock an account (its automatic locks and an administrator's lock), audited as
+  the host operator.
 
 ## The browser
 

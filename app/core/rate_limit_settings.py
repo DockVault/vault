@@ -107,7 +107,9 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
         "keep working throughout.",
         "Starts when failed sign-ins lock an account. (An admin-set lock is permanent and "
         "unaffected.)",
-        deployment_min=0,  # a deployment account_lockout_minutes of 0 means "locks are permanent"
+        # A deployment account_lockout_minutes of 0 (.env only) means "automatic locks have no end",
+        # except an administrator's, which ends after 15 minutes (sign_in_lockout._lock_end).
+        deployment_min=0,
     ),
     RateLimitSpec(
         "lockout_backstop_multiplier", "account_lockout_backstop_multiplier", 2, 100, "times", "login",

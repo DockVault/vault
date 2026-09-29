@@ -2835,7 +2835,8 @@ class SignInLockout(Base):
     # When the lock was armed; NULL while the failures are only being counted.
     locked_at = Column(DateTime, nullable=True)
     # When it ends (naive UTC). NULL with locked_at set: no end, for a deployment whose lockout
-    # duration is 0; an administrator clears it.
+    # duration is 0; an administrator clears it. An administrator's own lock is always given an end
+    # (app/core/sign_in_lockout.py, end_administrators_open_locks).
     locked_until = Column(DateTime, nullable=True)
 
     __table_args__ = (

@@ -6,6 +6,7 @@ network::
     python -m app.core.host_operator lookup --username alice
     python -m app.core.host_operator reset-password --username alice --confirm-username alice
     python -m app.core.host_operator reset-second-factor --username alice --confirm-username alice
+    python -m app.core.host_operator unlock --username alice --confirm-username alice
     python -m app.core.host_operator list
     python -m app.core.host_operator approve --request-id <id> --confirm-username alice
     python -m app.core.host_operator user-managers
@@ -13,7 +14,8 @@ network::
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
-none who can sign in, the server's operator acts here. Each change is recorded, audited and notified
+none who can sign in, the server's operator acts here. ``unlock`` clears an account's locks (those
+failed sign-ins armed, and an administrator's), for when no administrator can sign in to do it. Each change is recorded, audited and notified
 exactly as an administrator's would be, under the name ``operator@host``.
 
 Safety:
@@ -34,7 +36,7 @@ import string
 import sys
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
-           "regranted-defaults")
+           "regranted-defaults", "unlock")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -326,6 +328,26 @@ def _run(args, api) -> int:
             return _answer({"ok": True, "account": user.username, "secret": outcome.result["reset_link"],
                             "secret_kind": "reset_link",
                             "expires_in_minutes": outcome.result["expires_in_minutes"]})
+
+        if args.action == "unlock":
+            from datetime import datetime, timezone
+            from app.core import sign_in_lockout
+            was_locked = bool(user.is_locked)
+            user.is_locked = False
+            user.locked_until = None
+            user.failed_login_attempts = 0
+            user.updated_at = datetime.now(timezone.utc)
+            cleared = sign_in_lockout.clear_for_user(db, user.id)
+            db.commit()
+            AuditLogger(db).log_action(
+                action="USER_LOCK_CHANGED", status="success", username=cc.HOST_OPERATOR,
+                resource_type="user", resource_id=str(user.id),
+                details={"target_username": user.username, "locked": False, "was_locked": was_locked,
+                         "sign_in_locks_cleared": cleared, "by": "host operator"})
+            api._notify_account_status_changes(db, user, by_name=cc.HOST_OPERATOR,
+                                               locked=(was_locked, False), sign_in_locks_cleared=cleared)
+            return _answer({"ok": True, "account": user.username, "was_locked": was_locked,
+                            "sign_in_locks_cleared": cleared})
 
         if args.action == "reset-second-factor":
             outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,

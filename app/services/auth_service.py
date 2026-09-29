@@ -579,6 +579,11 @@ class AuthService:
         # sign-in commits next.
         if user.is_locked and not account_locked(user):
             release_expired_locks(self.db, user=user, ip_address=ip_address)
+        # An administrator's automatic lock always ends, even one armed with no end (a lockout
+        # duration of 0 before 0.33.1, or before the account was made an administrator).
+        administrator = sign_in_lockout.is_administrator(user)
+        if administrator:
+            sign_in_lockout.end_administrators_open_locks(self.db, user_id=user.id)
         sign_in_lockout.release_expired(self.db, user_id=user.id, ip_address=ip_address)
 
         # An automatic lock refuses the sign-in BEFORE the password is checked: while it lasts,
@@ -588,7 +593,7 @@ class AuthService:
         # the limit refuses the same way, so its guesses stay bounded too.
         lock = sign_in_lockout.lock_in_force(self.db, user.id, ip_address)
         if lock is None and admin_locked(user):
-            lock = sign_in_lockout.count_at_limit(self.db, user.id, ip_address)
+            lock = sign_in_lockout.count_at_limit(self.db, user.id, ip_address, administrator=administrator)
         if lock is not None:
             self.db.commit()
             raise AccountLockedError(_LOCK_REASONS[lock.scope], locked_until=lock.locked_until,

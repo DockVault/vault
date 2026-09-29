@@ -23441,10 +23441,13 @@ async def cleanup_expired_sessions():
                 # counts with nothing left to count are dropped.
                 try:
                     from app.core import sign_in_lockout
+                    # An administrator's lock that has no end is given one first (see
+                    # end_administrators_open_locks), so the release below can clear it; the end it is
+                    # given is kept even when nothing is released yet.
+                    sign_in_lockout.end_administrators_open_locks(db)
                     released = sign_in_lockout.release_expired(db)
-                    pruned_counts = sign_in_lockout.prune_stale(db)
-                    if released or pruned_counts:
-                        db.commit()
+                    sign_in_lockout.prune_stale(db)
+                    db.commit()
                     if released:
                         print(f"🔓 Released {released} automatic sign-in lock(s) past their duration")
                 except Exception as lockout_err:

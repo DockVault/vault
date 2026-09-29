@@ -334,7 +334,9 @@ class Settings(BaseSettings):
     # How long (minutes) new sign-ins stay refused after too many failed ones: from one address, or
     # from every address once the account-wide limit below is reached. The lock ends by itself;
     # sessions already signed in keep working. An ADMIN lock (set via the API) stays permanent.
-    # 0 keeps an automatic lock until an administrator clears it.
+    # 0 keeps an automatic lock until an administrator clears it, except an administrator's own, which
+    # then ends after 15 minutes (app/core/sign_in_lockout.py, ADMINISTRATOR_LOCK_MINUTES); the host
+    # tool can clear any lock (python dockvault.py accounts --action unlock).
     account_lockout_minutes: int = Field(default=15)
     # The account-wide lock: failed sign-ins to one account from ALL addresses together per 24 hours
     # that refuse new sign-ins from everywhere, as a multiple of rate_limit_login_attempts (the

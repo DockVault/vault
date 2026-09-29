@@ -211,9 +211,11 @@ def test_each_other_route_asks_before_it_writes(path, marker, check, write):
 
 
 def test_no_other_route_changes_a_role_activity_lock_or_deletes_a_user():
-    """Every place that writes one of these is one of the routes above. The automatic lock that
-    failed sign-ins arm lives in its own table and never writes users.is_locked. A role is written only
-    by _set_role, which only those routes call (test_role_change_permissions.py holds that)."""
+    """Every place that writes one of these is one of the routes above, or the host operator's unlock,
+    which only ever clears a lock and so cannot leave the deployment without an administrator who can
+    act. The automatic lock that failed sign-ins arm lives in its own table and never writes
+    users.is_locked. A role is written only by _set_role, which only those routes call
+    (test_role_change_permissions.py holds that)."""
     writers = []
     for path in sorted((ROOT / "app").rglob("*.py")):
         if "__pycache__" in str(path):
@@ -229,6 +231,7 @@ def test_no_other_route_changes_a_role_activity_lock_or_deletes_a_user():
         "app/api/user_management_api.py: user.is_active = update_data.is_active",
         "app/api/user_management_api.py: user.is_active = not user.is_active",
         "app/api/user_management_api.py: user.is_locked = new_locked",
+        "app/core/host_operator.py: user.is_locked = False",
     ]), writers
 
 
