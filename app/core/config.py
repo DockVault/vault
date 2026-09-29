@@ -322,6 +322,12 @@ class Settings(BaseSettings):
     # who has decided to run the older release on that data anyway; never written by setup. See
     # app/core/data_requirements.py.
     allow_start_on_newer_data: bool = Field(default=False)
+    # Whether a request that changes a zero-knowledge vault's keys -- creating one, sharing it, rotating
+    # its key, setting its name-index key -- must carry a key proof (app/services/zk_key_proof.py). On,
+    # such a request without one is refused; off, it is accepted as before and recorded in the audit
+    # log, while a request that does carry a proof is still checked in full. Environment only: the
+    # settings page refuses it, so only the host operator can turn it off.
+    zk_key_proof_enforce: bool = Field(default=True)
     
     # Rate Limiting
     rate_limit_login_attempts: int = Field(default=5)

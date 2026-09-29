@@ -372,7 +372,8 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written),
+    invite_token_pepper (str), enforce_file_expiry and zk_key_proof_enforce (raw strings; only a false
+    value is written),
     max_single_request_upload_mb (int or None; written only when set)."""
     lines = []
 
@@ -490,6 +491,10 @@ def build_env_lines(cfg):
     # a fresh volume set instead of silently switching back on.
     if str(cfg.get("enforce_file_expiry") or "").strip().lower() in ("false", "0", "no", "off"):
         bare("ENFORCE_FILE_EXPIRY", "false")
+    # The key proof on zero-knowledge key changes likewise: on by default and never mentioned, written
+    # only when the operator has postponed it, so a fresh volume set does not switch it back on.
+    if str(cfg.get("zk_key_proof_enforce") or "").strip().lower() in ("false", "0", "no", "off"):
+        bare("ZK_KEY_PROOF_ENFORCE", "false")
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -1284,6 +1289,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # Keep a postponed file-expiry enforcement across a fresh volume set, like the choices above
         # (raw, so an explicit "false" survives; the default is on).
         "enforce_file_expiry": (current_env.get("ENFORCE_FILE_EXPIRY") or "").strip() or None,
+        # And a postponed key proof on zero-knowledge key changes, for the same reason.
+        "zk_key_proof_enforce": (current_env.get("ZK_KEY_PROOF_ENFORCE") or "").strip() or None,
     }
     return cfg
 

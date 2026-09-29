@@ -3798,6 +3798,14 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
                 status_code=400,
                 detail=f"{managed_key} is managed by the deployment environment",
             )
+    # Switches only the host operator may set, in the environment. Nothing reads them from here; the
+    # refusal (whatever the key's case) keeps a settings save from appearing to change one.
+    for env_only_key in ("zk_key_proof_enforce",):
+        if any(isinstance(key, str) and key.lower() == env_only_key for key in payload):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{env_only_key} is managed by the deployment environment",
+            )
 
     # Custom rate-limit overrides (general-API buckets + the login / vault / SFTP throttles) share one
     # uniform bounds check from the registry: an int in [min, max], or the sentinel 0 meaning "clear the
@@ -24851,6 +24859,10 @@ async def lifespan(app: FastAPI):
     # without touching anything.
     expiry_cleared = file_expiry.prepare_at_startup()
     expiry_task = asyncio.create_task(file_expiry.run_forever(cleared=expiry_cleared))
+
+    # Say so when requests that change zero-knowledge keys are accepted without a key proof.
+    from app.services import zk_key_proof
+    zk_key_proof.report_at_startup()
 
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.

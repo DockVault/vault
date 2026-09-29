@@ -54,6 +54,22 @@ MODES = {"direct": 1, "hierarchical": 2}
 
 CHALLENGE_TTL_SECONDS = 300
 
+
+def enforcement_enabled() -> bool:
+    """True unless the operator has set ZK_KEY_PROOF_ENFORCE=false."""
+    from app.core.config import settings
+    return bool(getattr(settings, "zk_key_proof_enforce", True))
+
+
+def report_at_startup(log=print) -> None:
+    """Say at start when requests without a key proof are accepted. Never raises."""
+    try:
+        if not enforcement_enabled():
+            log("⚠ Zero-knowledge key changes are accepted without a key proof "
+                "(ZK_KEY_PROOF_ENFORCE=false); each such request is recorded in the audit log")
+    except Exception:  # noqa: BLE001 -- a report must never stop the server starting
+        pass
+
 # The sealed proof key: version-2 envelope family, purpose byte 0x07. The server checks only this
 # header and the length bounds; it cannot open the seal and does not try.
 SEALED_KEY_HEADER = b"DVZ2" + bytes([0x02, 0x07, 0x00, 0x00])
