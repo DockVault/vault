@@ -356,6 +356,12 @@ def _not_offered(_args):
         "'list')\n"))
 
 
+def _no_host_operator(_args):
+    """What a release that has no host operator at all answers (every release before 0.33.0)."""
+    return argparse.Namespace(returncode=1, stdout="", stderr=(
+        "/usr/local/bin/python: No module named app.core.host_operator\n"))
+
+
 _HOLD = {"key": "legal-holds", "requires_at_least": "0.34.0", "reason": "keeps records under a hold",
          "undo": "release the holds"}
 
@@ -418,9 +424,11 @@ def test_going_back_with_nothing_in_the_way_goes_ahead(tmp_path, monkeypatch):
     assert deployment.image().endswith(":v0.33.0")
 
 
-def test_a_running_version_without_the_action_is_not_a_problem(tmp_path, monkeypatch, capsys):
-    """Every release before the one that adds the action wrote nothing an older one cannot read."""
-    deployment = _Deployment(tmp_path, monkeypatch, ask=_not_offered)
+@pytest.mark.parametrize("answer", [_not_offered, _no_host_operator])
+def test_a_running_version_without_the_action_is_not_a_problem(tmp_path, monkeypatch, capsys, answer):
+    """Every release before the one that adds the action wrote nothing an older one cannot read --
+    those with a host operator that lacks the action, and those with no host operator at all."""
+    deployment = _Deployment(tmp_path, monkeypatch, ask=answer)
 
     deployment.update("v0.33.0")
 
@@ -459,6 +467,20 @@ def test_a_deployment_that_cannot_be_asked_about_a_version_without_the_check_is_
             ) in out
     assert "refuses to start" not in out
     assert deployment.image().endswith(":v0.33.0")
+
+
+def test_an_import_failure_inside_the_host_operator_is_not_read_as_not_offered(
+        tmp_path, monkeypatch, capsys):
+    """Only a missing host operator module means the release predates the action; a module that is
+    there but fails to load says nothing about what is in the way."""
+    deployment = _Deployment(tmp_path, monkeypatch, ask=lambda _a: argparse.Namespace(
+        returncode=1, stdout="", stderr=(
+            "Traceback (most recent call last):\n  File \"/app/app/core/host_operator.py\", line 3\n"
+            "ModuleNotFoundError: No module named 'app.core.host_operator_helpers'\n")))
+
+    deployment.update("v0.33.1")
+
+    assert "Could not ask the running deployment" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("answer", [

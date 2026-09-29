@@ -1575,6 +1575,11 @@ def checks_newer_data(version):
     return bool(parsed) and parsed >= parse_semver(FIRST_NEWER_DATA_CHECK)
 
 
+# What `python -m app.core.host_operator ...` prints in an image that has no host operator module
+# (every release before 0.33.0), as its own line.
+_NO_HOST_OPERATOR = re.compile(r"No module named '?app\.core\.host_operator'?\s*$", re.MULTILINE)
+
+
 def parse_downgrade_blockers(answer):
     """The blockers in a `downgrade-blockers` answer, or None when the answer does not say.
 
@@ -5084,9 +5089,10 @@ class DockVault:
         which answers, as its last line, {"ok": true, "blockers": [{"key": ..., "requires_at_least":
         "X.Y.Z", "reason": ..., "undo": ...}, ...]} -- an empty list when nothing is in the way.
         offered is True with that answer; False when the container's host operator has no such
-        action (argparse calls it an invalid choice), which is every release before the one that
-        added it and is not a problem: such a release wrote nothing an older one cannot read; None
-        when it could not be asked at all.
+        action (argparse calls it an invalid choice), or the container has no host operator at all
+        (Python finds no such module), which is every release before the one that added the action
+        and is not a problem: such a release wrote nothing an older one cannot read; None when it
+        could not be asked at all.
         """
         version = str(target).lstrip("vV")
         for service in ("vault", "vault-api"):
@@ -5098,7 +5104,8 @@ class DockVault:
             blockers = parse_downgrade_blockers(parse_operator_answer(getattr(r, "stdout", "")))
             if blockers is not None:
                 return True, blockers
-            if "invalid choice" in (getattr(r, "stderr", "") or ""):
+            stderr = getattr(r, "stderr", "") or ""
+            if "invalid choice" in stderr or _NO_HOST_OPERATOR.search(stderr):
                 return False, []
         return None, []
 
