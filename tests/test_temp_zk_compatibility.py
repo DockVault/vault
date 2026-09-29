@@ -15,7 +15,6 @@ import subprocess
 import uuid
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 import pytest
 
 from app.core.zk_temp_access import TEMP_ZK_KEY_ACCESS_DENIED
@@ -31,6 +30,7 @@ from conftest import (
     zk_encrypt_name,
     zk_name_blind_index,
 )
+from conftest import client_username, identity_private_key, post_zk
 
 
 pytestmark = pytest.mark.crypto_compatibility
@@ -60,8 +60,10 @@ def _opaque_envelope(label: str) -> str:
 
 
 def _registration_payload(client, envelope: str) -> dict:
-    """Build a valid P-384 registration request, including proof of possession."""
-    private_key = ec.generate_private_key(ec.SECP384R1())
+    """Build a valid P-384 registration request, including proof of possession.
+
+    The key is the account's derived identity key, so a later key proof for the account can be made."""
+    private_key = identity_private_key(client_username(client))
     public_key = (
         private_key.public_key()
         .public_bytes(
@@ -2811,7 +2813,7 @@ def test_a_credential_cannot_manufacture_its_own_envelope_eligibility(
                 # inserts the creator's own VaultMemberKey at the current epoch. Omit it and the
                 # account still holds no live key for any zero-knowledge vault, so the closing 403
                 # would hold with the bound under test reverted and this test would prove nothing.
-                created = temp.post("/vaults", json={
+                created = post_zk(temp, "/vaults", json={
                     "name": unique("zk_self_escalation"),
                     "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
                     "description": "created by the temporary credential",

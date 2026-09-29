@@ -23,6 +23,12 @@ from pathlib import Path
 import pytest
 import requests
 
+# The key-proof client for the routes that change a zero-knowledge vault's keys. Re-exported here so a
+# test takes every helper from one place.
+from zk_proof_harness import (  # noqa: F401
+    client_username, identity_private_key, post_zk, put_zk, team_public_key,
+)
+
 
 def _random_ip() -> str:
     """A unique-ish source IP so each client lands in its own login
@@ -137,13 +143,18 @@ def ensure_ecc_keypair(client) -> None:
     wraps a fresh vault DEK to their public key at creation time. Registers a real
     P-384 public key with an OPAQUE encrypted-private-key blob (the server stores
     the blob but can't read it, so this doesn't weaken the zero-knowledge model),
-    with a valid proof-of-possession (the server now requires one)."""
+    with a valid proof-of-possession (the server now requires one).
+
+    The key is the account's DERIVED identity key (tests/zk_proof_harness.py), not a random one, so a
+    later request that must prove the account holds its key can recompute it. An account that already
+    has a key keeps it; the harness refuses to prove for one whose key it did not derive."""
     import json as _json
     if client.get("/ecc/keys/public").json().get("has_keypair"):
         return
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import serialization
-    priv = ec.generate_private_key(ec.SECP384R1())
+    username = client_username(client)
+    priv = identity_private_key(username) if username else ec.generate_private_key(ec.SECP384R1())
     pub_pem = priv.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -310,7 +321,7 @@ def create_zk_vault(client, name=None, wrapped_dek=None, ephemeral_public_key=No
         body["name"] = name or unique("zk")
         body["enc_name"] = ZK_ENC_NAME_STUB
         body["name_key_version"] = 1
-    r = client.post("/vaults", json=body)
+    r = post_zk(client, "/vaults", json=body)
     r.raise_for_status()
     return r.json()
 

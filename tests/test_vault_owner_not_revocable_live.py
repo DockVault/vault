@@ -14,6 +14,7 @@ import pytest
 from conftest import (
     ApiClient, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, create_zk_vault, ensure_ecc_keypair,
 )
+from conftest import post_zk
 
 pytestmark = pytest.mark.integration
 
@@ -93,7 +94,7 @@ def test_a_keyless_manager_and_an_admin_cannot_remove_the_owner(admin, temp_user
 
     assert _revocations(admin, vid) == [], "a refused removal was recorded as a revocation"
     # The owner can still do what only a key holder may: rotate.
-    r = temp_user_client.post(f"/ecc/vaults/{vid}/rekey", json={
+    r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json={
         "from_version": 1, "to_version": 2, "member_keys": [
             {"user_id": str(owner), "wrapped_dek": ZK_WRAPPED_DEK_STUB,
              "ephemeral_public_key": ZK_EPHEMERAL_STUB}]})
@@ -122,7 +123,7 @@ def test_removing_someone_who_is_not_a_member_leaves_their_key_alone(admin, temp
     vid = owned_vault
     holder, holder_client = person()
     ensure_ecc_keypair(holder_client)
-    temp_user_client.post(f"/ecc/vaults/{vid}/members", json={
+    post_zk(temp_user_client, f"/ecc/vaults/{vid}/members", json={
         "user_id": holder["id"], "wrapped_dek": ZK_WRAPPED_DEK_STUB,
         "ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
     assert _keys(holder_client, vid)["has_access"] is True

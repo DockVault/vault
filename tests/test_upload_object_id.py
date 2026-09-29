@@ -20,6 +20,7 @@ import uuid
 import pytest
 
 from conftest import unique, ensure_ecc_keypair, ZK_ENC_NAME_STUB, require_zk_first_chunk
+from conftest import post_zk
 
 
 def _init(admin, vault_id, **extra):
@@ -49,7 +50,7 @@ def zk_vault(admin):
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        r = admin.post("/vaults", json={
+        r = post_zk(admin, "/vaults", json={
             "name": unique("objidzk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": base64.b64encode(b"dek-" + uuid.uuid4().bytes).decode(),
             "ephemeral_public_key": base64.b64encode(b"eph-" + uuid.uuid4().bytes).decode(),
@@ -96,7 +97,7 @@ def _zk_init(admin, vault_id, file_id, name_bi, blob_id=_UNSET, epoch=1, resume=
 
 @pytest.fixture
 def std_vault(admin):
-    r = admin.post("/vaults", json={"name": unique("objid")})
+    r = post_zk(admin, "/vaults", json={"name": unique("objid")})
     r.raise_for_status()
     vid = r.json()["id"]
     yield vid
@@ -239,7 +240,7 @@ def test_an_encrypted_upload_is_protected_too(admin):
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        v = admin.post("/vaults", json={
+        v = post_zk(admin, "/vaults", json={
             "name": unique("objidzk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": base64.b64encode(b"dek-" + uuid.uuid4().bytes).decode(),
             "ephemeral_public_key": base64.b64encode(b"eph-" + uuid.uuid4().bytes).decode(),

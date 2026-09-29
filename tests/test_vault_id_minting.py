@@ -25,6 +25,7 @@ import uuid
 import pytest
 
 from conftest import unique, ensure_ecc_keypair, ZK_ENC_NAME_STUB
+from conftest import post_zk, team_public_key
 
 
 def _stub(prefix="w"):
@@ -55,7 +56,7 @@ def test_the_vault_is_created_under_the_id_the_client_chose(admin):
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        r = admin.post("/vaults", json=_zk_payload(chosen))
+        r = post_zk(admin, "/vaults", json=_zk_payload(chosen))
         assert r.status_code in (200, 201), r.text
         assert r.json()["id"] == str(chosen), "the server did not honour the chosen id"
     finally:
@@ -79,10 +80,10 @@ def test_an_id_already_in_use_is_refused(admin):
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        first = admin.post("/vaults", json=_zk_payload(chosen))
+        first = post_zk(admin, "/vaults", json=_zk_payload(chosen))
         assert first.status_code in (200, 201), first.text
 
-        clash = admin.post("/vaults", json=_zk_payload(chosen))
+        clash = post_zk(admin, "/vaults", json=_zk_payload(chosen))
         # If the guard is gone this succeeds under a server-assigned id, so record it for
         # teardown before asserting -- a failing test should not also leak a vault.
         if clash.status_code in (200, 201):
@@ -106,7 +107,7 @@ def test_a_standard_vault_may_not_choose_its_id(admin):
     about that needs a caller's input, and narrowing the field to the branch that justifies it keeps
     a client-controlled value out of places it has no business being.
     """
-    r = admin.post("/vaults", json={"name": unique("stdid"), "id": str(uuid.uuid4())})
+    r = post_zk(admin, "/vaults", json={"name": unique("stdid"), "id": str(uuid.uuid4())})
     assert r.status_code == 400, (
         f"a Standard vault accepted a client-chosen id: {r.status_code} {r.text}"
     )
@@ -120,7 +121,7 @@ def test_a_malformed_id_is_rejected_before_anything_is_built(admin):
     try:
         ensure_ecc_keypair(admin)
         for bad in ("not-a-uuid", "../../etc/passwd", "x" * 500):
-            r = admin.post("/vaults", json=_zk_payload() | {"id": bad})
+            r = post_zk(admin, "/vaults", json=_zk_payload() | {"id": bad})
             assert r.status_code == 422, f"{bad!r} was not rejected: {r.status_code} {r.text}"
     finally:
         admin.put("/settings", json={"zero_knowledge_enabled": False})
@@ -132,7 +133,7 @@ def test_a_client_that_sends_no_id_is_unaffected(admin):
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        r = admin.post("/vaults", json=_zk_payload())
+        r = post_zk(admin, "/vaults", json=_zk_payload())
         assert r.status_code in (200, 201), r.text
         assigned = r.json()["id"]
         assert uuid.UUID(assigned)
@@ -161,12 +162,12 @@ def test_a_team_vault_may_also_choose_its_id(admin):
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
         ensure_ecc_keypair(admin)
-        r = admin.post("/vaults", json={
+        r = post_zk(admin, "/vaults", json={
             "name": unique("teamid"),
             "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "id": str(chosen),
             "key_wrapping_mode": "hierarchical",
-            "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+            "team_public_key": team_public_key(),
             "team_wrapped_dek": _stub("tdek"),
             "team_dek_ephemeral_public_key": _stub("teph"),
             "wrapped_team_privkey": _stub("tpriv"),

@@ -15,6 +15,7 @@ import pytest
 import os
 
 from conftest import unique, ensure_ecc_keypair, create_zk_vault, zk_chunked_upload
+from conftest import post_zk
 
 _API_CONTAINER = os.environ.get("VAULT_API_CONTAINER", "vault-api")
 
@@ -43,7 +44,7 @@ def _zk_enabled(admin):
 def test_zk_creation_is_gated(admin):
     # OFF by default -> rejected
     admin.put("/settings", json={"zero_knowledge_enabled": False})
-    r = admin.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge"})
+    r = post_zk(admin, "/vaults", json={"name": unique("zk"), "type": "zero_knowledge"})
     assert r.status_code == 400, r.text
     # opted in + a client-wrapped DEK -> allowed, and the vault reports its type
     with _zk_enabled(admin):

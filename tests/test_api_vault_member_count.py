@@ -23,6 +23,7 @@ import pytest
 
 from conftest import (ApiClient, ZK_ENC_NAME_STUB, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB,
                       ensure_ecc_keypair, unique)
+from conftest import post_zk
 
 _DB = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
@@ -206,7 +207,7 @@ def zk_enabled(admin):
 def test_deleting_an_unlabelled_zero_knowledge_vault_claims_no_name(admin, zk_enabled):
     """The browser sends a zero-knowledge vault's name sealed, with no label unless one is typed."""
     ensure_ecc_keypair(admin)
-    r = admin.post("/vaults", json={
+    r = post_zk(admin, "/vaults", json={
         "type": "zero_knowledge", "wrapped_dek": ZK_WRAPPED_DEK_STUB,
         "ephemeral_public_key": ZK_EPHEMERAL_STUB, "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
     })

@@ -15,7 +15,6 @@ import contextlib
 import os
 import subprocess
 import time
-import uuid
 
 import pytest
 
@@ -23,6 +22,7 @@ from conftest import (
     ApiClient, ZK_ENC_NAME_STUB, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB,
     create_zk_vault, ensure_ecc_keypair, unique,
 )
+from conftest import post_zk, put_zk, team_public_key
 
 pytestmark = pytest.mark.integration
 
@@ -55,7 +55,7 @@ def _rotation(from_version, *remaining, revoke=None):
 def _share(owner, vid, member, member_client, level="read"):
     """Share the way the web app does: the owner wraps the key for the member, then grants access."""
     ensure_ecc_keypair(member_client)
-    owner.post(f"/ecc/vaults/{vid}/members", json=_wrap(member["id"])).raise_for_status()
+    post_zk(owner, f"/ecc/vaults/{vid}/members", json=_wrap(member["id"])).raise_for_status()
     owner.post(f"/vaults/{vid}/permissions",
                json={"user_id": str(member["id"]), "level": level}).raise_for_status()
 
@@ -94,7 +94,7 @@ def second_member(admin):
 def test_an_admin_without_the_key_cannot_rotate_it_and_the_owner_can(admin, temp_user,
                                                                      temp_user_client, owned_vault):
     vid = owned_vault
-    r = admin.post(f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
+    r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
     assert r.status_code == 403, r.text
     assert r.json()["detail"] == NOT_A_HOLDER
     # Refused before anything was stored: still epoch 1, and the owner's key is the one they had.
@@ -102,7 +102,7 @@ def test_an_admin_without_the_key_cannot_rotate_it_and_the_owner_can(admin, temp
     assert keys["current_dek_version"] == 1 and keys["key_version"] == 1
     assert keys["wrapped_dek"] == ZK_WRAPPED_DEK_STUB and keys["has_access"] is True
 
-    r = temp_user_client.post(f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
+    r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
     assert r.status_code == 200, r.text
     assert _keys(temp_user_client, vid)["current_dek_version"] == 2
 
@@ -112,11 +112,11 @@ def _team_vault(admin, owner_client):
     wraps: its owner holds the team private key at team epoch 1."""
     ensure_ecc_keypair(owner_client)
     with _zk_enabled(admin):
-        r = owner_client.post("/vaults", json={
+        r = post_zk(owner_client, "/vaults", json={
             "name": unique("hier"), "type": "zero_knowledge",
             "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "key_wrapping_mode": "hierarchical",
-            "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+            "team_public_key": team_public_key(),
             "team_wrapped_dek": ZK_WRAPPED_DEK_STUB,
             "team_dek_ephemeral_public_key": ZK_EPHEMERAL_STUB,
             "wrapped_team_privkey": ZK_WRAPPED_DEK_STUB,
@@ -138,12 +138,12 @@ def test_an_admin_without_the_team_key_cannot_rotate_a_hierarchical_vault(admin,
     vid = _team_vault(admin, temp_user_client)
     routine = _ROUTINE_TEAM_ROTATION
     try:
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json=routine)
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=routine)
         assert r.status_code == 403, r.text
         assert r.json()["detail"] == NOT_A_HOLDER
         assert _keys(temp_user_client, vid)["current_dek_version"] == 1
 
-        r = temp_user_client.post(f"/ecc/vaults/{vid}/rekey", json=routine)
+        r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json=routine)
         assert r.status_code == 200, r.text
     finally:
         temp_user_client.delete_vault(vid)
@@ -166,10 +166,10 @@ def test_a_removal_without_a_rotation_is_owed_to_the_key_holder(admin, temp_user
     assert _keys(temp_user_client, vid)["rekey_owed"] is True
 
     # The admin who removed them still cannot do the rotation.
-    assert admin.post(f"/ecc/vaults/{vid}/rekey",
+    assert post_zk(admin, f"/ecc/vaults/{vid}/rekey",
                       json=_rotation(1, temp_user["id"])).status_code == 403
 
-    r = temp_user_client.post(f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
+    r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
     assert r.status_code == 200, r.text
     after = _keys(temp_user_client, vid)
     assert after["current_dek_version"] == 2 and after["rekey_owed"] is False
@@ -181,15 +181,15 @@ def test_a_member_cannot_be_rotated_out_by_themselves(admin, temp_user, temp_use
     they would learn the new key and then not be given it."""
     vid = owned_vault
     ensure_ecc_keypair(admin)
-    temp_user_client.post(f"/ecc/vaults/{vid}/members", json=_wrap(admin.user["id"])).raise_for_status()
+    post_zk(temp_user_client, f"/ecc/vaults/{vid}/members", json=_wrap(admin.user["id"])).raise_for_status()
     temp_user_client.post(f"/vaults/{vid}/permissions",
                           json={"user_id": str(admin.user["id"]), "level": "read"}).raise_for_status()
-    r = admin.post(f"/ecc/vaults/{vid}/rekey",
+    r = post_zk(admin, f"/ecc/vaults/{vid}/rekey",
                    json=_rotation(1, temp_user["id"], revoke=admin.user["id"]))
     assert r.status_code == 403, r.text
     assert "must remain a member" in r.json()["detail"]
     # Rotating with themselves among the recipients is allowed.
-    r = admin.post(f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"], admin.user["id"]))
+    r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"], admin.user["id"]))
     assert r.status_code == 200, r.text
 
 
@@ -198,10 +198,10 @@ def test_an_admin_without_the_key_cannot_mint_the_name_index_key(admin, temp_use
     vid = owned_vault
     body = {"wraps": [{"user_id": str(temp_user["id"]), "encrypted_index_key": ZK_WRAPPED_DEK_STUB,
                        "ephemeral_public_key": ZK_EPHEMERAL_STUB}]}
-    r = admin.put(f"/ecc/vaults/{vid}/index-key", json=body)
+    r = put_zk(admin, f"/ecc/vaults/{vid}/index-key", json=body)
     assert r.status_code == 403, r.text
     assert temp_user_client.get(f"/ecc/vaults/{vid}/index-key").json()["index_key"] is None
-    r = temp_user_client.put(f"/ecc/vaults/{vid}/index-key", json=body)
+    r = put_zk(temp_user_client, f"/ecc/vaults/{vid}/index-key", json=body)
     assert r.status_code == 200, r.text
 
 
@@ -242,7 +242,7 @@ def test_a_rotation_rechecks_the_key_after_it_gets_the_lock(temp_user, temp_user
     holder = _hold_vault_row(vid, before_commit=(
         f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
     try:
-        r, elapsed = _timed(lambda: temp_user_client.post(f"/ecc/vaults/{vid}/rekey",
+        r, elapsed = _timed(lambda: post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey",
                                                           json=_rotation(1, uid)))
     finally:
         holder.wait(timeout=_HOLD + 5)
@@ -283,7 +283,7 @@ def test_a_share_rechecks_the_key_after_it_gets_the_lock(temp_user, temp_user_cl
     holder = _hold_vault_row(vid, before_commit=(
         f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
     try:
-        r, elapsed = _timed(lambda: temp_user_client.post(f"/ecc/vaults/{vid}/members",
+        r, elapsed = _timed(lambda: post_zk(temp_user_client, f"/ecc/vaults/{vid}/members",
                                                           json=_wrap(member["id"])))
     finally:
         holder.wait(timeout=_HOLD + 5)
@@ -307,7 +307,7 @@ def test_minting_the_name_index_key_rechecks_the_key_after_it_gets_the_lock(temp
     holder = _hold_vault_row(vid, before_commit=(
         f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
     try:
-        r, elapsed = _timed(lambda: temp_user_client.put(f"/ecc/vaults/{vid}/index-key", json=body))
+        r, elapsed = _timed(lambda: put_zk(temp_user_client, f"/ecc/vaults/{vid}/index-key", json=body))
     finally:
         holder.wait(timeout=_HOLD + 5)
     assert holder.returncode == 0, "the lock-holding transaction failed"
@@ -331,7 +331,7 @@ def test_a_team_vault_rotation_rechecks_the_key_after_it_gets_the_lock(admin, te
         holder = _hold_vault_row(vid, before_commit=(
             f"UPDATE vault_member_keys SET is_active=false WHERE vault_id='{vid}' AND user_id='{uid}';"))
         try:
-            r, elapsed = _timed(lambda: temp_user_client.post(f"/ecc/vaults/{vid}/rekey",
+            r, elapsed = _timed(lambda: post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey",
                                                               json=_ROUTINE_TEAM_ROTATION))
         finally:
             holder.wait(timeout=_HOLD + 5)

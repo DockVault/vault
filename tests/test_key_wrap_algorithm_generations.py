@@ -48,6 +48,7 @@ from app.core.key_wrap_algorithms import (
     is_name_index,
     is_teampriv,
 )
+from conftest import post_zk, team_public_key
 
 _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 _APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
@@ -351,12 +352,12 @@ def _stub(prefix="w"):
 
 def _create_hier_vault(admin):
     ensure_ecc_keypair(admin)
-    r = admin.post("/vaults", json={
+    r = post_zk(admin, "/vaults", json={
         # Nameless (no sealed name): these tests exercise team/DEK-epoch retirement in isolation,
         # and a sealed name would pin epoch 1 so its stale wraps could never be retired.
         "type": "zero_knowledge",
         "key_wrapping_mode": "hierarchical",
-        "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+        "team_public_key": team_public_key(),
         "team_wrapped_dek": _stub("tdek"),
         "team_dek_ephemeral_public_key": _stub("teph"),
         "wrapped_team_privkey": _stub("tpriv"),
@@ -407,11 +408,11 @@ def test_a_stale_next_generation_wrap_is_pruned_like_any_other(admin):
     try:
         me = admin.get("/users/me").json()["id"]
         # Rotate the team keypair: epoch 1 rows become stale, epoch 2 rows are the live ones.
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [{"user_id": str(me), "wrapped_dek": _stub("tpriv"),
                              "ephemeral_public_key": _stub("tpeph")}],
-            "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+            "team_public_key": team_public_key(),
             "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
         })
         assert r.status_code == 200, r.text
@@ -457,7 +458,7 @@ def test_a_deactivated_next_generation_wrap_still_forces_a_team_rotation(admin, 
         # A second team member, whose row is the one deactivated below: only someone who holds the
         # current team key may rotate at all, so the owner must keep theirs to reach this check.
         ensure_ecc_keypair(temp_user_client)
-        admin.post(f"/ecc/vaults/{vid}/members", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": str(temp_user["id"]), "wrapped_team_privkey": _stub("tpriv"),
             "team_ephemeral_public_key": _stub("tpeph"),
         }).raise_for_status()
@@ -471,7 +472,7 @@ def test_a_deactivated_next_generation_wrap_still_forces_a_team_rotation(admin, 
         assert out == "UPDATE 1", out
 
         # A routine DEK-only rotation must now be refused.
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None, "member_keys": [],
             "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
         })
@@ -510,11 +511,11 @@ def test_the_prune_reports_rows_whose_label_it_cannot_place(admin):
 
         # Rotate first. Without this the row sits at version 1 with both floors at 1, so no branch
         # could delete it whatever its label, and "it survived" would prove nothing at all.
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [{"user_id": str(me), "wrapped_dek": _stub("tpriv"),
                              "ephemeral_public_key": _stub("tpeph")}],
-            "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+            "team_public_key": team_public_key(),
             "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
         })
         assert r.status_code == 200, r.text
