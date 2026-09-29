@@ -111,7 +111,8 @@ Visits to a link and uploads through one are also in the audit log.
 `ecc_key_update_challenges` hold settings, policies, templates, storage allocations and key material.
 Their only personal data is the id of the account that created, owns or was allocated an item, and
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
-account and group ids that may use a tag.
+account and group ids that may use a tag. `data_requirements` holds no personal data: each row
+says which version a change to the stored data needs, what the change was, and how to undo it.
 
 ### The audit log
 

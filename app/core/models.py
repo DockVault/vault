@@ -2834,3 +2834,27 @@ class SignInLockout(Base):
         UniqueConstraint('user_id', 'source', name='uq_sign_in_lockout_user_source'),
         Index('idx_sign_in_lockout_locked_until', 'locked_until'),
     )
+
+
+class DataRequirement(Base):
+    """A mark a release leaves on the data when it stores something an older release cannot read.
+
+    One row per kind of change (``key``), written by the release that makes it and removed by that
+    release once the change is undone: ``requires_at_least`` is the oldest version that can read the
+    data, ``reason`` says what changed and ``undo`` how to undo it with the newer release. Every
+    release that has this table reads it before touching the database and refuses to start when a row
+    names a version above its own (app/core/data_requirements.py). An older release reads these five
+    columns by name, so a later one may add columns but keeps them.
+
+    A NEW table, so create_all builds it on an existing deployment. A release older than the reader
+    ignores it, so a rollback to one of those is not protected.
+    """
+    __tablename__ = 'data_requirements'
+
+    key = Column(String(64), primary_key=True)
+    requires_at_least = Column(String(32), nullable=False)
+    reason = Column(Text, nullable=False)
+    undo = Column(Text, nullable=True)
+    since = Column(DateTime, nullable=False,
+                   server_default=text("(now() AT TIME ZONE 'utc')"),
+                   default=datetime.utcnow)

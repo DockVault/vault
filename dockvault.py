@@ -1553,6 +1553,28 @@ GHCR_IMAGE = "ghcr.io/dockvault/vault"
 # unset DOCKVAULT_IMAGE. Naming it here lets the from-source paths point .env back at a local build
 # after a release image has been pulled over it.
 LOCAL_IMAGE = "dockvault-vault:latest"
+# The setting that lets an image start on data a newer release changed in a way it cannot read (see
+# app/core/data_requirements.py). An operator sets it by hand, for as long as they need it; setup
+# never writes it, so no .env this tool authors carries it.
+NEWER_DATA_ESCAPE = "ALLOW_START_ON_NEWER_DATA"
+
+
+def newer_data_escape_set(env):
+    return str((env or {}).get(NEWER_DATA_ESCAPE) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_downgrade_blockers(answer):
+    """The blockers in a `downgrade-blockers` answer, or None when the answer does not say.
+
+    Each is a dict with at least a `reason`; `requires_at_least` and `undo` are shown when present.
+    An answer that is not ok, or whose list is missing or malformed, says nothing -- which is not
+    the same as saying there is nothing in the way."""
+    if not isinstance(answer, dict) or answer.get("ok") is not True:
+        return None
+    blockers = answer.get("blockers")
+    if not isinstance(blockers, list) or not all(isinstance(b, dict) for b in blockers):
+        return None
+    return blockers
 
 
 def release_image_ref(version):
@@ -4769,6 +4791,12 @@ class DockVault:
             (env.get("UPDATE_CHECK_ENABLED") or "false"),
             env.get("UPDATE_CHECK_INTERVAL_MINUTES") or "360"))
 
+        if newer_data_escape_set(env):
+            print(pal.paint(
+                "  %s is set in .env: this deployment starts even on data a newer version changed "
+                "in a way it cannot read. Remove it once you are back on that version or have "
+                "undone the change." % NEWER_DATA_ESCAPE, "yellow"))
+
         tag = getattr(args, "tag", None) if args else None
         from_source = bool(getattr(args, "source", False)) if args else False
         # This checkout's matrix describes every version's lifecycle up to what it ships; use it to
@@ -4921,6 +4949,37 @@ class DockVault:
             self._fail("the upgrade matrix says this change must not be taken directly: %s"
                        % clean_matrix_text(plan["blocked"].get("reason", "no reason recorded")))
 
+        # Going back: the running version knows which of its changes to the data an older one
+        # cannot read, so ask it. The older image refuses to start on such data by itself; this
+        # says so before the change is made, and names how to undo each first.
+        if down and version_source == "the running container":
+            offered, blockers = self._downgrade_blockers(tag)
+            if blockers:
+                print(pal.paint("\n  %s has changed this deployment's data in a way %s cannot read:"
+                                % (current, tag), "red"))
+                for blocker in blockers:
+                    needs = server_text(blocker.get("requires_at_least"))
+                    print(pal.paint("    - %s%s" % (server_text(blocker.get("reason"), "no reason given"),
+                                                    (" (needs %s or later)" % needs) if needs else ""),
+                                    "red"))
+                    if blocker.get("undo"):
+                        print("      undo it first, with %s running: %s"
+                              % (current, server_text(blocker.get("undo"))))
+                if not (args and getattr(args, "force_downgrade", False)):
+                    self._fail(
+                        "undo these with %s first, then run update again. %s would refuse to start "
+                        "on this data. (--force-downgrade goes back anyway; %s then starts only with "
+                        "%s=true in .env, on data it cannot fully read.)"
+                        % (current, tag, tag, NEWER_DATA_ESCAPE))
+                print(pal.paint(
+                    "  --force-downgrade given: going on. %s refuses to start on this data unless "
+                    "%s=true is set in .env." % (tag, NEWER_DATA_ESCAPE), "yellow"))
+            elif offered is None:
+                print(pal.paint(
+                    "  Could not ask the running deployment whether %s can read its data. If it "
+                    "cannot, %s refuses to start and says how to undo the change." % (tag, tag),
+                    "yellow"))
+
         dry_run = bool(getattr(args, "dry_run", False)) if args else False
         if dry_run:
             print(pal.paint("\n  --dry-run: nothing was changed.\n", "cyan"))
@@ -4982,6 +5041,35 @@ class DockVault:
         healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
         print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
                         "green" if healthy else "red"))
+
+    def _downgrade_blockers(self, target):
+        """What the running deployment says stops it going back to `target`: (offered, blockers).
+
+        Asked of the host operator in the running web container (the one-container layout names the
+        service `vault`, the split one `vault-api`):
+
+            python -m app.core.host_operator downgrade-blockers --target X.Y.Z
+
+        which answers, as its last line, {"ok": true, "blockers": [{"key": ..., "requires_at_least":
+        "X.Y.Z", "reason": ..., "undo": ...}, ...]} -- an empty list when nothing is in the way.
+        offered is True with that answer; False when the container's host operator has no such
+        action (argparse calls it an invalid choice), which is every release before the one that
+        added it and is not a problem: such a release wrote nothing an older one cannot read; None
+        when it could not be asked at all.
+        """
+        version = str(target).lstrip("vV")
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.host_operator",
+                                 "downgrade-blockers", "--target", version, timeout=180)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            blockers = parse_downgrade_blockers(parse_operator_answer(getattr(r, "stdout", "")))
+            if blockers is not None:
+                return True, blockers
+            if "invalid choice" in (getattr(r, "stderr", "") or ""):
+                return False, []
+        return None, []
 
     def _perform_leg(self, tag, from_source, index=1, total=1):
         """Move the deployment onto one version and prove it came up before going on.
@@ -5548,6 +5636,9 @@ def build_parser():
     up.add_argument("--yes", dest="yes", action="store_true", help="confirm the version change (required in --non-interactive)")
     up.add_argument("--dry-run", dest="dry_run", action="store_true", help="report what the change involves and stop, changing nothing")
     up.add_argument("--backup-verified", dest="backup_verified", action="store_true", help="you keep backups elsewhere; skip taking one (not checked)")
+    up.add_argument("--force-downgrade", dest="force_downgrade", action="store_true",
+                    help="go back even though the running version says the older one cannot read data it "
+                         "changed (the older one then starts only with %s=true)" % NEWER_DATA_ESCAPE)
     up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lp = parsers["logs"]
