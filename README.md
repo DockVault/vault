@@ -511,6 +511,10 @@ them, but a README-only reader can miss them (the off-host key backup is always 
 - **Terminate TLS** in front of the app (or run it with `API_USE_HTTPS=true` + certs). Never expose plaintext.
 - **Restrict network exposure:** publish only the web/API (and SFTP if used) ports; keep Postgres/Redis on the
   internal network. Set `REDIS_PASSWORD` and `ALLOWED_HOSTS` for defense-in-depth.
+- **Behind a reverse proxy, name it in `TRUSTED_PROXIES`** so the audit log and the sign-in limits see real
+  client addresses: a proxy container's address, or `gateway` for a proxy on the same host together with
+  `WEB_BIND=127.0.0.1` (the port published on loopback only). A range never trusts the Docker gateway, which
+  every connection relayed to a published port comes from.
 - **Use fresh `ENCRYPTION_KEY` / `JWT_SECRET_KEY` per deployment.** You can rotate `JWT_SECRET_KEY` (it just
   forces re-login) and passwords on a schedule, but **NEVER rotate `ENCRYPTION_KEY` on a vault that already
   holds data** — it makes every stored file permanently undecryptable.
