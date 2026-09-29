@@ -95,16 +95,17 @@ def test_the_host_approves_a_held_change(admin, temp_user):
         assert held.status_code == 202, held.text
         request_id = held.json()["held_changes"][0]["request"]["id"]
 
-    listed = tool("list")
-    assert request_id in [r["id"] for r in listed["requests"]]
+        # Decided while the administrator who asked still exists: deleting them withdraws the request.
+        listed = tool("list")
+        assert request_id in [r["id"] for r in listed["requests"]]
 
-    refused = tool("approve", "--request-id", request_id, "--confirm-username", "someone-else")
-    assert not refused["ok"] and "does not match" in refused["error"]
-    assert admin.get(f"/users/{uid}").json()["email"] == f"{name}-a@example.com"
+        refused = tool("approve", "--request-id", request_id, "--confirm-username", "someone-else")
+        assert not refused["ok"] and "does not match" in refused["error"]
+        assert admin.get(f"/users/{uid}").json()["email"] == f"{name}-a@example.com"
 
-    approved = tool("approve", "--request-id", request_id, "--confirm-username", name)
-    assert approved["ok"], approved
-    assert admin.get(f"/users/{uid}").json()["email"] == f"{name}-b@example.com"
+        approved = tool("approve", "--request-id", request_id, "--confirm-username", name)
+        assert approved["ok"], approved
+        assert admin.get(f"/users/{uid}").json()["email"] == f"{name}-b@example.com"
     assert psql(f"SELECT status, decided_by_name FROM credential_changes WHERE id='{request_id}'") == f"approved|{HOST}"
     assert _audit(admin, "credential_change_approved", uid)[0]["username"] == HOST
 
@@ -122,3 +123,4 @@ def test_nothing_changes_unless_the_username_is_typed_again(admin, temp_user):
 def test_an_unknown_account_is_refused(admin):
     answer = tool("lookup", "--username", "no-such-account-anywhere")
     assert not answer["ok"] and "no account" in answer["error"].lower()
+
