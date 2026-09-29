@@ -29,9 +29,11 @@ def test_numbered_pages_and_their_counts(page: Page, activity_admin):
     expect(page.locator("#activity-summary")).to_have_text(re.compile(r"^1–25 of [\d,]+$"), timeout=10000)
     n = total_of(summary(page))
     assert n > 50, "the log should hold more than two pages of events by now"
-    # With no time picked on the chart, the band counts what the list counts.
-    band = page.locator("#act-p-time .act-key-btn[data-fkey=key-all] .act-num").inner_text()
-    assert int(band.replace(",", "")) == n
+    # With no time picked on the chart, the band counts what the list counts. The band's counts can be a
+    # few seconds old (shared for up to the range's CACHE_SECONDS, 15 s for 7 days), so a row written just
+    # after they were counted is in the list's total first; the page then reads the band again.
+    expect(page.locator("#act-p-time .act-key-btn[data-fkey=key-all] .act-num")).to_have_text(
+        f"{n:,}", timeout=20000)
     last = math.ceil(n / 25)
     pager = page.locator("#act-pager")
     expect(pager.locator(".act-pager-info")).to_have_text(f"Showing 1–25 of {n:,}")
