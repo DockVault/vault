@@ -8,12 +8,15 @@ whose role is not above theirs (app/core/account_authority.py), and a refusal is
 This drives the rule, the two routes as a user who holds the permission (against an administrator and
 against an ordinary user, on a real database), and sweeps every route that changes someone else's
 account: each one either requires an interactive administrator outright or asks the rule. The sweep finds
-such a route by what its code does (a credential change, a write to an account's fields, its credential
-rows made or deleted, an account looked up by a path parameter), whatever its parameters are called, and
-every route it finds must be in one of the lists below.
+such a route by what its code does (a credential change, a write to an account's fields, directly or with
+setattr, an account row updated or deleted, its credential rows made or deleted, an account looked up by a
+path parameter), in the route and in the functions it calls, in its own module or in another of the app's,
+whatever its parameters are called, and every route it finds must be in one of the lists below.
 test_account_authority_live.py drives every such route on a running stack.
 """
 import ast
+import functools
+import importlib
 import inspect
 import re
 import tempfile
@@ -24,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from sqlalchemy.orm import sessionmaker
 
 from _async_run import run_coroutine
@@ -35,6 +38,7 @@ set_bare_api_env()
 from app.api import api_server as api  # noqa: E402
 from app.core import account_authority as aa  # noqa: E402
 from app.core.models import AuditLog, RoleEnum, User, UserEndpointPermission  # noqa: E402
+from app.core import temp_cred_slot  # noqa: E402  (called by a throwaway route below)
 
 pytestmark = pytest.mark.unit
 
@@ -260,6 +264,12 @@ NOT_THE_ACCOUNT = {
     ("DELETE", "/ecc/vaults/{vault_id}/members/{user_id}"): "a zero-knowledge vault's key, not the account",
     ("PUT", "/vaults/{vault_id}/password"): "a vault's password, not an account's",
     ("DELETE", "/invites/{invite_id}"): "an invitation not yet accepted: there is no account yet",
+    ("DELETE", "/share-tags/{tag_id}"): "a share tag, not an account",
+    ("DELETE", "/note-link-tags/{tag_id}"): "a note-link tag, not an account",
+    ("DELETE", "/receiver-tags/{tag_id}"): "a receiver tag, not an account",
+    ("POST", "/devices/{device_id}/grants"): "a device's access to a vault, not the account",
+    ("POST", "/ecc/vaults/{vault_id}/members"): "a zero-knowledge vault's key, not the account",
+    ("POST", "/ecc/vaults/{vault_id}/rekey"): "a zero-knowledge vault's keys, not an account",
 }
 
 # Routes that change the caller's own account and no one else's, with the reason.
@@ -272,6 +282,9 @@ OWN_ACCOUNT = {
     ("POST", "/users/me/second-factor/totp/confirm"): "the caller's own second factor",
     ("POST", "/users/me/second-factor/totp/enroll"): "the caller's own second factor",
     ("POST", "/auth/temp-credentials"): "a temporary credential for the caller's own account",
+    ("POST", "/api/logout"): "the caller's own session",
+    ("POST", "/auth/second-factor/step-up"): "the caller's own second factor, used for a step-up",
+    ("POST", "/auth/second-factor/verify"): "the second factor of the account signing in, after its password",
 }
 
 # Routes that remove a device or a temporary credential: the caller's own, and another account's only
@@ -284,6 +297,7 @@ OWN_UNLESS_ADMINISTRATOR = {
     ("POST", "/temp-creds/{temp_username}/delete"),
     ("POST", "/api/user-management/temp-credentials/{temp_cred_id}/deactivate"),
     ("DELETE", "/api/user-management/temp-credentials/{temp_cred_id}"),
+    ("POST", "/temp-creds/{temp_username}/terminate-sessions"),
 }
 
 # Public routes that act on the account a link was made for, or send a link to the account's own
@@ -308,6 +322,7 @@ _ACCOUNT_CHANGERS = {
 _ACCOUNT_FIELDS = {
     "password_hash", "email", "role", "is_locked", "locked_until", "failed_login_attempts",
     "second_factor_reset_at", "sftp_enabled", "sftp_password_auth", "storage_quota_bytes",
+    "is_active", "username",
 }
 _ACCOUNT_ROWS = {
     "UserSSHKey", "AccountInvitation", "PasswordResetToken", "SecondFactorEnrollment",
@@ -315,6 +330,7 @@ _ACCOUNT_ROWS = {
 }
 
 
+@functools.lru_cache(maxsize=None)
 def _source_tree(fn):
     return ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(fn))))
 
@@ -332,8 +348,83 @@ def _queried_models(node):
     return models
 
 
+def _reads_a_user(node):
+    """Whether an expression gives a User row: a query over User, ``db.get(User, ...)``, or ``User(...)``."""
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id == "User":
+            return True
+        if (getattr(node.func, "attr", None) == "get" and node.args
+                and isinstance(node.args[0], ast.Name) and node.args[0].id == "User"):
+            return True
+    return "User" in _queried_models(node)
+
+
+def _user_names(tree):
+    """The names a function binds to a User row: from a query over User, as a loop over one, or as a
+    parameter annotated ``User``."""
+    names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and _reads_a_user(n.value):
+            names |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+        elif isinstance(n, (ast.For, ast.comprehension)) and _reads_a_user(n.iter):
+            if isinstance(n.target, ast.Name):
+                names.add(n.target.id)
+        elif isinstance(n, ast.arg) and isinstance(n.annotation, ast.Name) and n.annotation.id == "User":
+            names.add(n.arg)
+    return names
+
+
+def _in_app_name(dotted):
+    return dotted == "app" or dotted.startswith("app.")
+
+
+def _in_app(obj):
+    module = obj if inspect.ismodule(obj) else inspect.getmodule(obj)
+    return module is not None and _in_app_name(module.__name__)
+
+
+def _local_imports(tree):
+    """What the function's own import statements bind, for imports from ``app``: most code in
+    api_server.py imports inside the function and then calls ``module.func()``."""
+    bound = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module and _in_app_name(n.module):
+            module = importlib.import_module(n.module)
+            for alias in n.names:
+                obj = getattr(module, alias.name, None)
+                if obj is None:
+                    try:
+                        obj = importlib.import_module(f"{n.module}.{alias.name}")
+                    except ImportError:
+                        continue
+                bound[alias.asname or alias.name] = obj
+        elif isinstance(n, ast.Import):
+            for alias in n.names:
+                if _in_app_name(alias.name):
+                    module = importlib.import_module(alias.name)
+                    if alias.asname:
+                        bound[alias.asname] = module
+                    else:
+                        bound[alias.name.split(".")[0]] = importlib.import_module(alias.name.split(".")[0])
+    return bound
+
+
+def _resolve(expr, scope):
+    """The object a called expression names (``func``, ``module.func``, ``app.core.module.func``), looked
+    up in ``scope`` (the function's own imports, then its module), or None."""
+    if isinstance(expr, ast.Name):
+        return scope(expr.id)
+    if isinstance(expr, ast.Attribute):
+        base = _resolve(expr.value, scope)
+        if base is not None and inspect.ismodule(base):
+            return getattr(base, expr.attr, None)
+    return None
+
+
 def _account_changes(fn, depth=2, seen=None):
-    """What in ``fn``, or in a function of its module it calls (to ``depth``), changes an account."""
+    """What in ``fn``, or in a function it calls (to ``depth``), changes an account. A function it calls
+    is followed when it is one of its own module's, or one of ``app``'s that it names through a module
+    (``credential_changes.apply(...)``) or imports, at the top of its file or inside itself."""
     seen = set() if seen is None else seen
     fn = inspect.unwrap(fn)
     if fn in seen:
@@ -343,10 +434,20 @@ def _account_changes(fn, depth=2, seen=None):
         tree = _source_tree(fn)
     except (OSError, TypeError):
         return set()
-    found, called, queried, deletes = set(), set(), set(), False
+    module = inspect.getmodule(fn)
+    local = _local_imports(tree)
+
+    def scope(name):
+        return local[name] if name in local else getattr(module, name, None)
+
+    users = _user_names(tree)
+    found, called, queried, deletes, helpers = set(), set(), set(), False, []
     for n in ast.walk(tree):
         if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+            targets = list(n.targets if isinstance(n, ast.Assign) else [n.target])
+            while any(isinstance(t, (ast.Tuple, ast.List)) for t in targets):   # a.x, b.y = ...
+                targets = [e for t in targets for e in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t])]
+            for t in targets:
                 if isinstance(t, ast.Attribute) and t.attr in _ACCOUNT_FIELDS:
                     found.add(f"sets .{t.attr}")
         elif isinstance(n, ast.Attribute) and n.attr in _ACCOUNT_CHANGERS:
@@ -358,19 +459,33 @@ def _account_changes(fn, depth=2, seen=None):
                 found.add(name)
             if isinstance(n.func, ast.Name) and name in _ACCOUNT_ROWS:
                 found.add(f"makes {name}")
+            if isinstance(n.func, ast.Name) and name == "setattr" and len(n.args) >= 2:
+                field = n.args[1]
+                if isinstance(field, ast.Constant):
+                    if field.value in _ACCOUNT_FIELDS:
+                        found.add(f"sets .{field.value}")
+                elif isinstance(n.args[0], ast.Name) and n.args[0].id in users:
+                    found.add("sets a field of a User named at run time")
             if isinstance(n.func, ast.Attribute):
                 queried |= _queried_models(n.func.value) & _ACCOUNT_ROWS
                 deletes = deletes or name == "delete"
                 if name in ("delete", "update"):
-                    found |= {f"{name}s {m}" for m in _queried_models(n.func.value) & _ACCOUNT_ROWS}
+                    found |= {f"{name}s {m}" for m in _queried_models(n.func.value) & (_ACCOUNT_ROWS | {"User"})}
+                if (name == "delete" and n.args and isinstance(n.args[0], ast.Name)
+                        and n.args[0].id in users):
+                    found.add("deletes User")
+            target = _resolve(n.func, scope)
+            if inspect.isfunction(target) and _in_app(target):
+                helpers.append(target)
     if deletes and queried:
         found |= {f"deletes {m}" for m in queried}    # read first, then db.delete(row)
     if depth:
-        module = inspect.getmodule(fn)
         for name in called:
             helper = getattr(module, name, None) if name else None
             if inspect.isfunction(helper):
                 found |= _account_changes(helper, depth - 1, seen)
+        for helper in helpers:
+            found |= _account_changes(helper, depth - 1, seen)
     return found
 
 
@@ -430,6 +545,129 @@ def _lock(who):
 
 def _read_only(db, account_ref):
     return db.query(User).filter(User.is_active.is_(True)).count()
+
+
+def _bulk_update(db, ref):
+    db.query(User).filter(User.id == ref).update({"is_admin_flag": True})
+
+
+def _bulk_delete(db, ref):
+    db.query(User).filter(User.id == ref).delete()
+
+
+def _delete_the_row(db, ref):
+    account = db.query(User).filter(User.id == ref).first()
+    db.delete(account)
+
+
+def _setattr_a_watched_field(db, ref, value):
+    account = db.query(User).filter(User.id == ref).first()
+    setattr(account, "password_hash", value)
+
+
+def _setattr_a_field_named_at_run_time(db, ref, field, value):
+    account = db.query(User).filter(User.id == ref).first()
+    setattr(account, field, value)
+
+
+def _setattr_in_a_loop(db, field, value):
+    for account in db.query(User).filter(User.is_active.is_(True)):
+        setattr(account, field, value)
+
+
+def _whoever():
+    return None
+
+
+def _setattr_on_a_parameter(field: str, value: str, account: User = Depends(_whoever)):
+    setattr(account, field, value)
+
+
+def _setattr_on_what_get_returned(db, ref, field, value):
+    account = db.get(User, ref)
+    setattr(account, field, value)
+
+
+def _setattr_on_a_new_account(field, value):
+    account = User()
+    setattr(account, field, value)
+
+
+def _setattr_elsewhere(tag, field, value):
+    setattr(tag, field, value)
+
+
+def _deactivate(db, who):
+    who.is_active = False
+
+
+def _rename(db, who):
+    who.username = "someone-else"
+
+
+def _lock_in_one_line(db, who):
+    who.is_locked, who.locked_until = True, None
+
+
+def _through_a_module_imported_inside(db, token):
+    from app.core import temp_cred_slot as slots
+    slots.release_for_session(db, None, None, token)
+
+
+def _through_a_module_imported_at_the_top(db, token):
+    temp_cred_slot.release_for_session(db, None, None, token)
+
+
+def _through_a_dotted_module(db, token):
+    import app.core.temp_cred_slot
+    app.core.temp_cred_slot.release_for_session(db, None, None, token)
+
+
+def _through_a_function_imported_inside(db, token):
+    from app.core.temp_cred_slot import release_for_session
+    release_for_session(db, None, None, token)
+
+
+def _throwaway_route(fn):
+    """``fn`` as the endpoint of a route whose path names no account, so only what it does can find it."""
+    from fastapi import APIRouter
+    router = APIRouter()
+    router.add_api_route("/throwaway/thing", fn, methods=["POST"])
+    (route,) = router.routes
+    return route
+
+
+@pytest.mark.parametrize("fn,what", [
+    (_bulk_update, "updates User"),
+    (_bulk_delete, "deletes User"),
+    (_delete_the_row, "deletes User"),
+    (_setattr_a_watched_field, "sets .password_hash"),
+    (_setattr_a_field_named_at_run_time, "sets a field of a User named at run time"),
+    (_setattr_in_a_loop, "sets a field of a User named at run time"),
+    (_setattr_on_a_parameter, "sets a field of a User named at run time"),
+    (_setattr_on_what_get_returned, "sets a field of a User named at run time"),
+    (_setattr_on_a_new_account, "sets a field of a User named at run time"),
+    (_deactivate, "sets .is_active"),
+    (_rename, "sets .username"),
+    (_lock_in_one_line, "sets .is_locked"),
+    (_through_a_module_imported_inside, "sets .is_active"),
+    (_through_a_module_imported_at_the_top, "sets .is_active"),
+    (_through_a_dotted_module, "sets .is_active"),
+    (_through_a_function_imported_inside, "sets .is_active"),
+])
+def test_a_throwaway_route_of_each_shape_is_found(fn, what):
+    route = _throwaway_route(fn)
+    assert what in _account_changes(route.endpoint)
+    assert _changes_or_names_an_account(route.path, route)
+
+
+def test_a_computed_setattr_on_something_that_is_not_an_account_is_not_one():
+    assert not _account_changes(_setattr_elsewhere)
+
+
+def test_only_code_of_the_app_is_followed_into_another_module():
+    assert _in_app(temp_cred_slot) and _in_app(temp_cred_slot.release_for_session)
+    assert not _in_app(inspect) and not _in_app(inspect.getsource) and not _in_app(pytest)
 
 
 def test_the_sweep_finds_an_account_change_whatever_the_parameter_is_called():
