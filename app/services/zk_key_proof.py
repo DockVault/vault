@@ -92,6 +92,68 @@ class MalformedProof(ValueError):
     challenge is consumed, so an honest client cannot destroy its own challenge with a bad request."""
 
 
+# ------------------------------------------------------------------------------------ refusals
+#
+# Every refusal on the key-proof paths is one JSON shape, {"detail": <sentence>, "reason": <slug>}, with
+# a plain-string detail and never a 401. Clients read `detail` with a substring test, and the web app
+# signs a person out on a 403 whose detail contains "inactive", "terminated" or "locked", and treats one
+# containing "password", "Password", "Unauthorized" or "401" as a sign-in problem -- in the current
+# bundle and in the older one the desktop app ships. None of these sentences may contain any of them
+# ("locked" also rules out "unlocked"). One sentence covers every failed proof: telling a caller which
+# part failed helps only an attacker.
+
+REFUSALS = {
+    "zk-key-proof-required": (
+        428,
+        "This change needs proof that you hold this vault's key, which this version of the app cannot "
+        "give. Reload the page (or update DockVault Desktop) and try again.",
+    ),
+    "zk-key-proof-setup-required": (
+        428,
+        "This vault's key check has not been set up yet. Open the vault once as a manager who holds its "
+        "key, then try again.",
+    ),
+    "zk-key-proof-malformed": (400, "This request's key proof or key material is malformed."),
+    "zk-key-proof-failed": (403, "The proof that you hold this vault's key did not check out. Try again."),
+    "zk-key-proof-interactive-only": (
+        403, "A temporary credential cannot set up or reset a vault's key check."),
+    "zk-key-proof-stale": (
+        409, "This vault's key changed while the change was being prepared. Try again."),
+    "zk-key-proof-exists": (409, "This vault's key check was just set up by someone else. Try again."),
+    "zk-key-proof-verifier-unusable": (
+        409, "This vault's key record is inconsistent. Its owner can reset the key."),
+}
+
+# What no refusal sentence may contain (see above).
+FORBIDDEN_IN_REFUSALS = ("inactive", "terminated", "locked", "password", "unauthorized", "401")
+
+
+class KeyProofRefusal(Exception):
+    """A refusal on a key-proof path, rendered by :func:`refusal_handler` as
+    ``{"detail": <sentence>, "reason": <slug>}`` with the slug's status.
+
+    `detail` defaults to the slug's sentence; only the malformed refusal takes a more specific one (the
+    shape problem, which a caller can act on and which says nothing about any key)."""
+
+    def __init__(self, reason: str, detail: Optional[str] = None):
+        status, sentence = REFUSALS[reason]
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status
+        self.detail = detail if detail else sentence
+
+
+def malformed(message: str) -> KeyProofRefusal:
+    """The 400 for a request whose header or material has the wrong shape."""
+    return KeyProofRefusal("zk-key-proof-malformed", message)
+
+
+async def refusal_handler(request, exc: KeyProofRefusal):
+    """The application-level handler for :class:`KeyProofRefusal`."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "reason": exc.reason})
+
+
 @dataclass(frozen=True)
 class ProofHeader:
     challenge_id: str          # lowercase canonical UUID

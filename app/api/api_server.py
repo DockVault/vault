@@ -228,6 +228,12 @@ async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPE
     return await fastapi_http_exception_handler(request, exc)
 
 
+# A refusal on a key-proof path renders as {"detail": <sentence>, "reason": <slug>}, never a 401 and never
+# with a word the web app acts on (see app/services/zk_key_proof.py).
+from app.services.zk_key_proof import KeyProofRefusal as _KeyProofRefusal, refusal_handler as _key_proof_refusal_handler  # noqa: E402
+app.add_exception_handler(_KeyProofRefusal, _key_proof_refusal_handler)
+
+
 @app.exception_handler(RequestValidationError)
 async def _request_validation_error_handler(request: StarletteRequest, exc: RequestValidationError):
     """A 422 names the field and says what is wrong with it, and never repeats the value: the default
