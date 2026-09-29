@@ -436,7 +436,7 @@ def test_every_stored_envelope_read_goes_through_the_versioned_reader() -> None:
     """
     app = APP_JS.read_text(encoding="utf-8")
     for signature in (
-        "async function zkEnsureUnlocked(",
+        "async function _zkUnlockOnce(",
         "async function zkChangePassphrase(",
         "async function zkExportRecoveryKey(",
         "async function zkRestoreFromRecoveryKey(",
@@ -452,7 +452,8 @@ def test_every_unlock_path_checks_key_consistency_before_caching_anything() -> N
     """Section 6's fail-closed claim is a property of the call sites, not of the comparator."""
     app = APP_JS.read_text(encoding="utf-8")
 
-    unlock = _fn_body(app, "async function zkEnsureUnlocked(")
+    # The unlock itself; zkEnsureUnlocked runs it once for every caller waiting at the same time.
+    unlock = _fn_body(app, "async function _zkUnlockOnce(")
     assert "privateKeyMatchesRegisteredPublicKey(" in unlock
     # Nothing may be cached before the check passes.
     assert unlock.index("privateKeyMatchesRegisteredPublicKey(") < unlock.index(
@@ -494,7 +495,7 @@ def test_validation_precedes_the_passphrase_prompt_on_every_path() -> None:
     """A corrupt or hostile envelope should fail before the user is asked to type anything."""
     app = APP_JS.read_text(encoding="utf-8")
     for signature, validator in (
-        ("async function zkEnsureUnlocked(", "parsePrivateEnvelope("),
+        ("async function _zkUnlockOnce(", "parsePrivateEnvelope("),
         ("async function zkChangePassphrase(", "parsePrivateEnvelope("),
         ("async function zkExportRecoveryKey(", "parsePrivateEnvelope("),
         ("async function zkRestoreFromRecoveryKey(", "parseRecoveryKitFile("),

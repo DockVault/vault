@@ -26,11 +26,13 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import (
-    ApiClient, BASE_URL, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, create_zk_vault, ensure_ecc_keypair,
+    ApiClient, BASE_URL, ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, create_zk_vault, ensure_ecc_keypair, post_zk,
 )
 from test_ui_e2e import _create_zk_vault_via_ui, _login, _u
 
 pytestmark = pytest.mark.ui
+
+SHARE_IN_THE_BROWSER = "async ([vaultId, userId]) => { await zkShareVaultToUser(vaultId, userId); return true; }"
 
 CAN_UNWRAP_CURRENT_KEY = """async (vaultId) => {
     const dek = await zkGetVaultDek(vaultId);
@@ -104,9 +106,8 @@ def test_a_manager_without_the_key_removes_and_the_owner_rotates(browser, admin)
         vid_m = _create_zk_vault_via_ui(page_m, cm, "passphrase-M-123")
 
         ensure_ecc_keypair(cx)
-        co.post(f"/ecc/vaults/{vid}/members", json={
-            "user_id": member["id"], "wrapped_dek": ZK_WRAPPED_DEK_STUB,
-            "ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
+        # The owner's key was made in this browser, so the share is made there too (it proves the key).
+        assert page_o.evaluate(SHARE_IN_THE_BROWSER, [vid, member["id"]]) is True
         co.post(f"/vaults/{vid}/permissions",
                 json={"user_id": member["id"], "level": "read"}).raise_for_status()
         co.post(f"/vaults/{vid}/permissions",
@@ -171,9 +172,7 @@ def test_the_notice_rotates_a_team_vault_whose_member_was_removed_without_a_rota
         assert co.get(f"/ecc/vaults/{vid}/keys").json()["mode"] == "hierarchical"
 
         ensure_ecc_keypair(cx)
-        co.post(f"/ecc/vaults/{vid}/members", json={
-            "user_id": member["id"], "wrapped_team_privkey": ZK_WRAPPED_DEK_STUB,
-            "team_ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
+        assert page.evaluate(SHARE_IN_THE_BROWSER, [vid, member["id"]]) is True
         co.post(f"/vaults/{vid}/permissions",
                 json={"user_id": member["id"], "level": "read"}).raise_for_status()
         # A global admin, who may manage the vault but holds none of its keys, removes the member.
@@ -206,10 +205,19 @@ def _watch_rotations(page: Page) -> list:
 
 
 def _stub_share(owner_client, vault_id: str, person: dict, level: str):
-    """Share the way the web app does (wrap the key, then grant access), with a stand-in wrap."""
-    owner_client.post(f"/ecc/vaults/{vault_id}/members", json={
+    """Share the way the web app does (wrap the key, then grant access), with a stand-in wrap and the
+    test helper's key proof (the owner's key here is the helper's own)."""
+    post_zk(owner_client, f"/ecc/vaults/{vault_id}/members", json={
         "user_id": person["id"], "wrapped_dek": ZK_WRAPPED_DEK_STUB,
         "ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
+    owner_client.post(f"/vaults/{vault_id}/permissions",
+                      json={"user_id": person["id"], "level": level}).raise_for_status()
+
+
+def _browser_share(page: Page, owner_client, vault_id: str, person: dict, level: str):
+    """Share from the owner's browser, where the owner's key was made (so it can prove it), then grant
+    access."""
+    assert page.evaluate(SHARE_IN_THE_BROWSER, [vault_id, person["id"]]) is True
     owner_client.post(f"/vaults/{vault_id}/permissions",
                       json={"user_id": person["id"], "level": level}).raise_for_status()
 
@@ -277,7 +285,7 @@ def test_a_removal_whose_key_check_fails_removes_nobody(browser, admin):
         vid = _create_zk_vault_via_ui(page, co, "passphrase-F-123")
         for person, client in ((member, cx), (other, cy)):
             ensure_ecc_keypair(client)
-            _stub_share(co, vid, person, "read")
+            _browser_share(page, co, vid, person, "read")
         _open_vault(page, vid)
         page.click('[data-vault-tab="permissions"]')
         revoke = page.locator(f'button[data-action="revoke-permission"][data-user-id="{member["id"]}"]')

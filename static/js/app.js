@@ -817,6 +817,7 @@ async function apiRequest(endpoint, options = {}) {
                 }
                 const err = new Error(errorDetail || 'Permission denied');
                 err.status = 403;  // a refusal, which callers may tell apart from a failure
+                err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
                 throw err;
             }
         }
@@ -824,16 +825,21 @@ async function apiRequest(endpoint, options = {}) {
         // Handle 404 Not Found - provide context
         if (response.status === 404) {
             const errorDetail = data?.detail || 'Resource not found';
-            
+            // Its status and reason, like every other refusal: a caller tells a route this server
+            // does not have (a plain 404, no reason) from a refusal of its own (see zkKeyProofChallenge).
+            const err = new Error(errorDetail);
+            err.status = 404;
+            err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
+
             // Check for specific scenarios
             if (endpoint.includes('/files') && errorDetail.includes('Folder')) {
                 // Folder was deleted
-                throw new Error('Folder not found - it may have been deleted');
+                err.message = 'Folder not found - it may have been deleted';
             }
-            
-            throw new Error(errorDetail);
+
+            throw err;
         }
-        
+
         // Handle 422 Validation Errors - parse field-specific errors
         if (response.status === 422 && data?.detail) {
             if (Array.isArray(data.detail)) {
@@ -872,6 +878,7 @@ async function apiRequest(endpoint, options = {}) {
             }
             const err = new Error(errorMsg);
             err.status = response.status;  // let callers branch on e.g. 409 conflict
+            err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
             throw err;
         }
         
@@ -3640,6 +3647,7 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         // OWN public key. The server only ever receives the opaque wrapped DEK — it
         // never sees the key (true zero-knowledge). Requires an ECC keypair.
         let zkPendingDek = null;
+        let zkPendingProofKey = null;   // the key this create installs as the vault's first verifier
         if (vaultType === 'zero_knowledge') {
             try {
                 // Both halves come from the same response: the public key to wrap to, and the
@@ -3706,12 +3714,21 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
                     payload.team_dek_ephemeral_public_key = dekWrap.ephemeralPublicKey;
                     payload.wrapped_team_privkey = privWrap.wrappedKey;
                     payload.team_privkey_ephemeral_public_key = privWrap.ephemeralPublicKey;
+                    // The team key is this vault's verifier: the create proves it holds its private half.
+                    zkPendingProofKey = { publicKeyPem: payload.team_public_key, privateKey: teamKp.privateKey };
                 } else {
                     const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
                         dek, myPub,
                         { vaultId: payload.id, recipientUserId: myUserId, dekEpoch: 1 });
                     payload.wrapped_dek = wrappedDEK;
                     payload.ephemeral_public_key = ephemeralPublicKey;
+                    // The first epoch's proof key, sealed under the DEK: the verifier later changes to
+                    // this vault's keys are proved against. Its key check lets every member confirm the
+                    // DEK they are given.
+                    const sealed = await lib.sealKeyProofKey(dek, payload.id, 1);
+                    payload.key_proof = { public_key: sealed.publicKeyPem, sealed_private_key: sealed.sealedKey,
+                                          dek_check: sealed.dekCheck };
+                    zkPendingProofKey = { publicKeyPem: sealed.publicKeyPem, privateKey: sealed.privateKey };
                 }
                 zkPendingDek = dek;
             } catch (err) {
@@ -3733,10 +3750,19 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
             }
         }
 
-        const created = await apiRequest('/vaults', {
-            method: 'POST',
-            body: JSON.stringify(payload)
-        });
+        // A zero-knowledge create proves the account's identity key and the key it installs (asking
+        // for the passphrase if the key is locked); a standard vault is an ordinary request.
+        const created = zkPendingDek
+            ? await zkKeyProofRequest(payload.id, 'create', {
+                method: 'POST', path: '/vaults', body: payload,
+                expect: { mode: payload.key_wrapping_mode === 'hierarchical' ? 'hierarchical' : 'direct',
+                          dekEpoch: 1, teamEpoch: 1 },
+                installs: zkPendingProofKey,
+            })
+            : await apiRequest('/vaults', {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
         // Cache the just-generated DEK (epoch 1) so the first upload needn't round-trip to
         // unwrap. zkState.vaultDeks is keyed {vaultId: {epoch: dek}} — store under epoch 1.
         if (zkPendingDek && payload.id && created && created.id !== payload.id) {
@@ -3749,7 +3775,13 @@ document.getElementById('create-vault-form').addEventListener('submit', async (e
         }
         if (zkPendingDek && created && created.id) {
             zkState.vaultDeks[created.id] = { 1: zkPendingDek };
-            if (payload.key_wrapping_mode === 'hierarchical') zkState.pinnedHier[created.id] = true;
+            if (payload.key_wrapping_mode === 'hierarchical') {
+                zkState.pinnedHier[created.id] = true;
+            } else if (zkPendingProofKey) {
+                // The first epoch's proof key, so the name-index key below proves with it directly.
+                zkState.keyProofKeys[created.id] = { 1: { pem: String(zkPendingProofKey.publicKeyPem).trim(),
+                                                          key: zkPendingProofKey.privateKey } };
+            }
             // Mint the vault's name-index key (rotation-independent same-name matching). Awaited so
             // the key is in place before the first upload, but non-fatal -- the vault falls back to
             // legacy indices if it fails.
@@ -11854,8 +11886,10 @@ function eccLib() {
 // first hierarchical /keys read). A server that later serves a DIRECT key for a pinned-hierarchical
 // vault is attempting a mode downgrade — zkGetVaultDek refuses rather than silently fail the
 // (already fail-closed) unwrap. In-session only; the crypto fails closed regardless of the pin.
-const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {}, vaultIndexKeys: {} };
-function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; zkState.vaultIndexKeys = {}; }
+// keyProofKeys: vaultId -> { [dek_epoch]: {pem, key} } -- a direct vault's opened per-epoch proof keys
+// (non-extractable, deriveBits only), with the public key each was checked against.
+const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {}, vaultIndexKeys: {}, keyProofKeys: {} };
+function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; zkState.vaultIndexKeys = {}; zkState.keyProofKeys = {}; }
 
 // --- ZK idle auto-lock -------------------------------------------------------------------------
 // Optional org policy (zk_idle_lock_minutes, from /zk-enabled): drop the in-memory ZK key after N
@@ -12068,8 +12102,20 @@ async function zkWrapPrivateKey(pem, passphrase) {
 
 // Unlock the user's ECC private key into memory (prompts for the passphrase once
 // per session). Returns the CryptoKey.
+//
+// One unlock for every caller: requests started while locked (a share to several people runs in
+// parallel, and each change to a vault's keys proves the identity key) wait for the same prompt
+// instead of fighting over the one dialog, and cancelling it rejects them all.
+let _zkUnlockInFlight = null;
 async function zkEnsureUnlocked() {
     if (zkState.privateKey) return zkState.privateKey;
+    if (!_zkUnlockInFlight) {
+        _zkUnlockInFlight = _zkUnlockOnce().finally(() => { _zkUnlockInFlight = null; });
+    }
+    return _zkUnlockInFlight;
+}
+
+async function _zkUnlockOnce() {
     const priv = await apiRequest('/ecc/keys/private', { silent: true });
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
@@ -12341,10 +12387,11 @@ async function zkRestoreFromRecoveryKey(kitText) {
     zkArmIdleLock();
 }
 
-// Return the server-authoritative public identity key needed to create a zero-knowledge vault.
-// An existing keypair is deliberately PUBLIC-ONLY here: vault creation mints a fresh DEK and
-// wraps it to this key, so fetching or unlocking the private identity envelope would add exposure
-// without granting any capability the operation needs. First registration remains interactive.
+// Return the server-authoritative public identity key needed to create a zero-knowledge vault, or
+// guide a user who has none to set one up first. The create then also proves the account's identity
+// key (zkKeyProofRequest), so it unlocks the private key too: a vault created without that proof
+// could be created "as" someone by whoever holds their session, under a key of that person's choosing.
+// First registration remains interactive.
 // Returns { pem, userId }. The account id comes back from the same response as the key, and
 // the caller needs it: a version-2 lock stamps the account it was made for, and the only other
 // source is local session state, which this app deliberately does not trust for this (see the
@@ -12640,18 +12687,22 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
 // create -- it is swallowed and the vault works.
 async function zkMintOwnIndexKey(vaultId) {
     try {
-        const identity = await zkEnsurePublicKeyForCreate();
+        // Minting proves the identity key and the vault's current key (the key is one every member
+        // then uses for every name). Both are in hand right after a create, so this asks for nothing.
+        const identity = await zkProofIdentity();
         const lib = eccLib();
         const pub = await lib.importPublicKeyPEM(identity.pem);
         const K = await lib.generateVaultDEK();            // a fresh 32-byte AES key
         const w = await lib.wrapNameIndexKeyV2(K, pub, { vaultId, recipientUserId: identity.userId });
-        await apiRequest(`/ecc/vaults/${vaultId}/index-key`, {
-            method: 'PUT', silent: true,
-            body: JSON.stringify({ wraps: [{
+        const current = await zkCurrentKeyMaterial(vaultId);
+        await zkKeyProofRequest(vaultId, 'index_key', {
+            method: 'PUT', path: `/ecc/vaults/${vaultId}/index-key`,
+            body: { wraps: [{
                 user_id: identity.userId,
                 encrypted_index_key: w.wrappedKey,
                 ephemeral_public_key: w.ephemeralPublicKey,
-            }] }),
+            }] },
+            expect: current.expect, current: current.material,
         });
         zkState.vaultIndexKeys[vaultId] = K;   // cache so a later write need not round-trip
         return K;
@@ -12704,6 +12755,205 @@ async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphe
         { vaultId, recipientUserId });
     if (teamEpoch != null) perVault[teamEpoch] = teamPriv;
     return teamPriv;
+}
+
+// ============================================================================
+// ZERO-KNOWLEDGE KEY PROOF
+// ============================================================================
+// Creating a zero-knowledge vault, sharing one, rotating its key and setting its name-index key each
+// carry a proof in the X-ZK-Key-Proof header: MACs over a one-time server challenge and over the exact
+// body sent, showing that this browser holds, right now, the account's identity key, the vault's
+// current key (a direct vault's per-epoch proof key, opened with that epoch's DEK, or a team vault's
+// team private key) and the private half of any key the request installs. An account that is signed
+// in but whose identity key is not here -- someone else using the session -- cannot make one.
+// zkKeyProofRequest is the one place such a request is sent.
+
+const ZK_KEY_PROOF_HEADER = 'X-ZK-Key-Proof';
+// The operations that prove the vault's current key; creating a vault, setting up an epoch's key
+// check and the owner's reset do not (there is no usable verifier to prove against).
+const ZK_KEY_PROOF_NEEDS_CURRENT = { rekey: true, share: true, index_key: true };
+
+function zkKeyProofError(message, reason, status) {
+    const err = new Error(message);
+    err.reason = reason;
+    if (status) err.status = status;
+    return err;
+}
+
+// Did this error come from a key proof, a refusal of one or proof material that will not open?
+function zkIsKeyProofRefusal(err) {
+    return !!(err && typeof err.reason === 'string' && err.reason.startsWith('zk-key-proof-'));
+}
+
+// The account's side of a proof: the unlocked identity key (this is where the passphrase is asked
+// for, once), and the registered public key and account id from the server's own answer.
+async function zkProofIdentity() {
+    const key = await zkEnsureUnlocked();
+    const pub = await apiRequest('/ecc/keys/public', { silent: true });
+    if (!pub || !pub.public_key || !pub.user_id) {
+        throw new Error('Your account identity is unavailable.');
+    }
+    return { key, pem: pub.public_key, userId: String(pub.user_id).toLowerCase() };
+}
+
+// What a proof of a vault's current key needs, from this account's own /keys answer: the state a
+// request is built for, and the key -- a direct vault's DEK at the current epoch (to open its proof
+// key with), or a team vault's team private key. May ask for the passphrase.
+async function zkCurrentKeyMaterial(vaultId) {
+    const keys = await apiRequest(`/ecc/vaults/${vaultId}/keys`, { silent: true });
+    if (!keys || !keys.has_access) throw new Error('You do not have a key for this zero-knowledge vault.');
+    if (keys.wrapped_team_privkey && keys.team_ephemeral_public_key) {
+        const teamKey = await zkGetTeamPrivKey(vaultId, keys.team_key_version, keys.wrapped_team_privkey,
+                                               keys.team_ephemeral_public_key, keys.recipient_user_id);
+        return { keys, material: { teamKey },
+                 expect: { mode: 'hierarchical', dekEpoch: keys.current_dek_version, teamEpoch: keys.team_key_version } };
+    }
+    const dek = await zkGetVaultDek(vaultId, keys.key_version);
+    return { keys, material: { dek }, expect: { mode: 'direct', dekEpoch: keys.key_version } };
+}
+
+// A direct epoch's proof key: opened with that epoch's DEK, and only if it is the key the server names
+// as the verifier (the point comparison in openKeyProofKey). Cached per vault and epoch with the public
+// key it was checked against. Proof material that does not open is not something a retry fixes.
+async function zkOpenProofKey(vaultId, dekEpoch, verifier, dek) {
+    const perVault = zkState.keyProofKeys[vaultId] || (zkState.keyProofKeys[vaultId] = {});
+    const pem = String(verifier.public_key || '').trim();
+    const cached = perVault[dekEpoch];
+    if (cached && cached.pem === pem) return cached.key;
+    let key;
+    try {
+        key = await eccLib().openKeyProofKey(verifier.sealed_private_key, verifier.public_key,
+                                             dek || await zkGetVaultDek(vaultId, dekEpoch), vaultId, dekEpoch);
+    } catch (e) {
+        throw zkKeyProofError("This vault's key check does not open with its key, so the key cannot be "
+            + 'changed this way. The vault can still be read.', 'zk-key-proof-material-unusable');
+    }
+    perVault[dekEpoch] = { pem, key };
+    return key;
+}
+
+// Ask for a challenge. An older server answers this route with its plain 404, which has no `reason`:
+// then there is nothing to prove to it, and the request goes as it is (such a server refuses none).
+// A server that knows proofs never answers here with 404 (a missing vault is a 403).
+async function zkKeyProofChallenge(vaultId, op, mode) {
+    const body = { op };
+    if (op === 'create') body.mode = mode || 'direct';
+    try {
+        return await apiRequest(`/ecc/vaults/${vaultId}/key-proof/challenge`, {
+            method: 'POST', silent: true, body: JSON.stringify(body),
+        });
+    } catch (e) {
+        if (e && e.status === 404 && !e.reason) return null;
+        throw e;
+    }
+}
+
+// Set up the key check of a direct vault's epoch that has none (made before key proofs, or while they
+// were not required). Any manager who holds the key may. Another manager may just have done it, which
+// is as good: the caller asks for a new challenge and proves against theirs.
+async function zkBootstrapKeyProof(vaultId, dekEpoch, dek) {
+    const lib = eccLib();
+    const sealed = await lib.sealKeyProofKey(dek || await zkGetVaultDek(vaultId, dekEpoch), vaultId, dekEpoch);
+    try {
+        await zkKeyProofRequest(vaultId, 'bootstrap', {
+            method: 'PUT', path: `/ecc/vaults/${vaultId}/key-proof`,
+            body: { dek_epoch: dekEpoch, public_key: sealed.publicKeyPem,
+                    sealed_private_key: sealed.sealedKey, dek_check: sealed.dekCheck },
+            expect: { mode: 'direct', dekEpoch },
+            installs: { publicKeyPem: sealed.publicKeyPem, privateKey: sealed.privateKey },
+        });
+    } catch (e) {
+        if (e && e.reason === 'zk-key-proof-exists') return;
+        throw e;
+    }
+    const perVault = zkState.keyProofKeys[vaultId] || (zkState.keyProofKeys[vaultId] = {});
+    perVault[dekEpoch] = { pem: String(sealed.publicKeyPem).trim(), key: sealed.privateKey };
+}
+
+// Send one request that changes a zero-knowledge vault's keys, with its key proof.
+//
+//   opts.method, opts.path  the request
+//   opts.body               the body OBJECT: serialized once here, and that exact string is proved and sent
+//   opts.expect             {mode, dekEpoch, teamEpoch} the body was built for. A challenge for another
+//                           state throws a stale error (status 409), which the caller's retry loop handles
+//   opts.current            for the operations that prove the current key: {dek} (direct: the DEK at
+//                           expect.dekEpoch, to open the epoch's proof key) or {teamKey} (team vault)
+//   opts.installs           {publicKeyPem, privateKey} for a request that installs a key
+//
+// The passphrase, if needed, is asked for before the challenge, so its five minutes cover computing
+// only. A refusal of the proof is retried once with a fresh challenge (it covers an expired one); an
+// epoch with no key check yet is set up first, once.
+async function zkKeyProofRequest(vaultId, op, opts) {
+    const bodyString = JSON.stringify(opts.body);
+    const identity = await zkProofIdentity();
+    const expect = opts.expect || {};
+    const current = opts.current || {};
+    let setUp = false;
+    let retried = false;
+    for (;;) {
+        const challenge = await zkKeyProofChallenge(vaultId, op, expect.mode);
+        if (!challenge) {
+            return apiRequest(opts.path, { method: opts.method, body: bodyString, silent: true });
+        }
+        if ((expect.mode && challenge.mode !== expect.mode)
+            || (expect.dekEpoch != null && challenge.dek_epoch !== expect.dekEpoch)
+            || (expect.teamEpoch != null && challenge.team_epoch !== expect.teamEpoch)) {
+            throw zkKeyProofError("This vault's key changed while the change was being prepared. Try again.",
+                                  'zk-key-proof-stale', 409);
+        }
+        let currentKey = null;
+        let currentPem = null;
+        if (ZK_KEY_PROOF_NEEDS_CURRENT[op]) {
+            const verifier = challenge.verifier;
+            if (challenge.mode === 'hierarchical') {
+                currentKey = current.teamKey || null;
+                currentPem = verifier ? verifier.public_key : null;
+            } else if (!verifier) {
+                if (setUp) {
+                    throw zkKeyProofError("This vault's key check could not be set up. Try again.",
+                                          'zk-key-proof-setup-required', 428);
+                }
+                await zkBootstrapKeyProof(vaultId, challenge.dek_epoch, current.dek);
+                setUp = true;
+                continue;
+            } else {
+                currentKey = await zkOpenProofKey(vaultId, challenge.dek_epoch, verifier, current.dek);
+                currentPem = verifier.public_key;
+            }
+        }
+        const header = await eccLib().computeKeyProof({
+            challenge, op, userId: identity.userId, vaultId: String(vaultId).toLowerCase(), mode: challenge.mode,
+            dekEpoch: challenge.dek_epoch, teamEpoch: challenge.team_epoch, identityPem: identity.pem,
+            currentPem, newPem: opts.installs ? opts.installs.publicKeyPem : null, bodyString,
+        }, {
+            identityKey: identity.key, currentKey,
+            newKey: opts.installs ? opts.installs.privateKey : null,
+        });
+        try {
+            return await apiRequest(opts.path, {
+                method: opts.method, body: bodyString, silent: true,
+                headers: { [ZK_KEY_PROOF_HEADER]: header },
+            });
+        } catch (err) {
+            if (err && err.reason === 'zk-key-proof-failed' && !retried) {
+                retried = true;
+                continue;
+            }
+            if (err && err.reason === 'zk-key-proof-setup-required' && !setUp && op !== 'bootstrap') {
+                await zkBootstrapKeyProof(vaultId, challenge.dek_epoch, current.dek);
+                setUp = true;
+                continue;
+            }
+            throw err;
+        }
+    }
+}
+
+// Is this account the owner of the vault open on screen? Only the owner may reset a vault's key.
+function zkIsCurrentVaultOwner(vaultId) {
+    const v = state.currentVault;
+    return !!(v && currentUser && String(v.id) === String(vaultId)
+              && String(v.owner_id) === String(currentUser.id));
 }
 
 // The vault's current DEK epoch — what new uploads must encrypt under and declare.
@@ -13557,9 +13807,14 @@ async function zkShareVaultToUser(vaultId, userId) {
             { vaultId, recipientUserId: keys.recipient_user_id });
         const { wrappedKey, ephemeralPublicKey } = await zkWrapTeamPrivateKey(
             teamPriv, recipientPub, { vaultId, recipientUserId: userId });
-        await apiRequest(`/ecc/vaults/${vaultId}/members`, {
-            method: 'POST',
-            body: JSON.stringify({ user_id: userId, wrapped_team_privkey: wrappedKey, team_ephemeral_public_key: ephemeralPublicKey }),
+        // The proof of the current key uses the cached, non-extractable team key, not this copy.
+        const teamKey = await zkGetTeamPrivKey(vaultId, keys.team_key_version, keys.wrapped_team_privkey,
+                                               keys.team_ephemeral_public_key, keys.recipient_user_id);
+        await zkKeyProofRequest(vaultId, 'share', {
+            method: 'POST', path: `/ecc/vaults/${vaultId}/members`,
+            body: { user_id: userId, wrapped_team_privkey: wrappedKey, team_ephemeral_public_key: ephemeralPublicKey },
+            expect: { mode: 'hierarchical', dekEpoch: keys.current_dek_version, teamEpoch: keys.team_key_version },
+            current: { teamKey },
         });
         return { pending: false };
     }
@@ -13580,14 +13835,16 @@ async function zkShareVaultToUser(vaultId, userId) {
     // vault's epoch is when the request lands, so a rotation arriving in between labels our
     // old-DEK blob as the new epoch AND overwrites the correct row the rotation just wrote --
     // leaving the recipient unable to read anything written after it, with no error anywhere.
-    await apiRequest(`/ecc/vaults/${vaultId}/members`, {
-        method: 'POST',
-        body: JSON.stringify({
+    await zkKeyProofRequest(vaultId, 'share', {
+        method: 'POST', path: `/ecc/vaults/${vaultId}/members`,
+        body: {
             user_id: userId,
             wrapped_dek: wrappedDEK,
             ephemeral_public_key: ephemeralPublicKey,
             dek_version: shareEpoch != null ? shareEpoch : undefined,
-        }),
+        },
+        expect: { mode: 'direct', dekEpoch: shareEpoch },
+        current: { dek },
     });
     return { pending: false };
 }
@@ -13689,73 +13946,118 @@ async function refreshZkRekeyNotice() {
 // the browser, re-wraps it for every REMAINING member, and atomically bumps the vault
 // epoch server-side — so the revoked member (who still holds the old DEK) can no longer
 // read NEW content. Existing files keep their old epoch and remain readable by remaining
-// members. The server never sees the DEK. Retries once on a concurrent-rekey 409.
+// members. The server never sees the DEK. Retries once on a concurrent-rekey 409. The request proves
+// the rotator holds the current key (see zkKeyProofRequest); when the vault's key check is damaged so
+// that nobody can, its owner is offered a reset instead.
 // revokedUserId null rotates without removing anyone: what a vault that owes a rotation needs,
 // since the member it was owed for is already gone. Only someone who holds the vault's key may
 // run this (they learn the new key); the server refuses anyone else.
 // NOTE (claims discipline): this does NOT retroactively protect content the removed member
 // could already read — the DEK was extractable in their browser. See the revoke UI copy.
-async function zkRekeyForRevoke(vaultId, revokedUserId) {
+async function zkRekeyForRevoke(vaultId, revokedUserId, options = {}) {
+    // An owner reset (options.ownerReset) is the owner's way out when the vault's key check will not
+    // open: the same rotation, proving the owner's identity key and the new key but not the current one.
+    const ownerReset = !!options.ownerReset;
     for (let attempt = 0; attempt < 3; attempt++) {
         // 1) Authoritative remaining-member set + current epoch.
         const info = await apiRequest(`/ecc/vaults/${vaultId}/member-keys`, { silent: true });
         const fromVersion = info.current_dek_version || 1;
-        if (info.mode === 'hierarchical') {
-            try {
-                await zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion);
-            } catch (e) {
-                if (e && e.status === 409 && attempt < 2) continue;
-                throw e;
-            }
-            delete zkState.vaultDeks[vaultId];
-            delete zkState.teamKeys[vaultId];
-            return;
-        }
-        const remaining = (info.members || []).filter(uid => String(uid) !== String(revokedUserId));
-
-        // 2) Mint a new DEK (never leaves the browser).
-        const newDek = await eccLib().generateVaultDEK();
-
-        // 3) Wrap the new DEK to each remaining member's public key.
-        const memberKeys = [];
-        for (const uid of remaining) {
-            const pk = await apiRequest(`/ecc/users/${uid}/public-key`, { silent: true });
-            if (!pk || !pk.has_keypair || !pk.public_key) {
-                throw new Error('A remaining member has no encryption key; cannot rotate. Resolve their key setup and retry.');
-            }
-            const recipientPub = await eccLib().importPublicKeyPEM(pk.public_key);
-            // Every remaining member is re-wrapped here, so a rotation is where a vault
-            // converts wholesale to v2, the owner's own wrap included. That is what keeps the
-            // legacy wrap written at creation from mattering much -- but only for vaults that
-            // ever rotate: this path runs on member revocation, so a vault that never removes
-            // anyone keeps its original wrap indefinitely. Harmless, since the reader takes
-            // both, but it is a mixed state rather than a passing one.
-            const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
-                newDek, recipientPub,
-                { vaultId, recipientUserId: uid, dekEpoch: fromVersion + 1 });
-            memberKeys.push({ user_id: uid, wrapped_dek: wrappedDEK, ephemeral_public_key: ephemeralPublicKey });
-        }
-
-        // 4) Commit atomically (revoke + rotate + re-wrap).
         try {
-            await apiRequest(`/ecc/vaults/${vaultId}/rekey`, {
-                method: 'POST',
-                body: JSON.stringify({
-                    from_version: fromVersion,
-                    to_version: fromVersion + 1,
-                    revoke_user_id: revokedUserId,
-                    member_keys: memberKeys,
-                }),
-            });
+            if (info.mode === 'hierarchical') {
+                await zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion, ownerReset);
+                delete zkState.vaultDeks[vaultId];
+                delete zkState.teamKeys[vaultId];
+                return;
+            }
+            await zkRotateDirectForRevoke(vaultId, revokedUserId, info, fromVersion, ownerReset);
+            // 5) Drop cached DEKs for this vault so subsequent reads/writes refetch the new epoch.
+            delete zkState.vaultDeks[vaultId];
+            return;
         } catch (e) {
             if (e && e.status === 409 && attempt < 2) continue;  // someone else rotated; refetch + retry
+            // The vault's key check will not open, or the team key the server holds is unusable: no
+            // proof of the current key can be made. Its owner can reset the key to fresh material.
+            const damaged = e && (e.reason === 'zk-key-proof-material-unusable'
+                                  || e.reason === 'zk-key-proof-verifier-unusable');
+            if (damaged && !ownerReset && zkIsCurrentVaultOwner(vaultId)) {
+                const reset = await showConfirm(
+                    "This vault's key check is damaged, so its key cannot be rotated the usual way. As the "
+                    + "vault's owner you can reset the key: a new key is made and given to every remaining "
+                    + 'member, and files already in the vault stay readable. Reset the key now?',
+                    "Reset this vault's key", null, 'Reset the key');
+                if (reset) return zkRekeyForRevoke(vaultId, revokedUserId, { ownerReset: true });
+            }
             throw e;
         }
-        // 5) Drop cached DEKs for this vault so subsequent reads/writes refetch the new epoch.
-        delete zkState.vaultDeks[vaultId];
-        return;
     }
     throw new Error('Key rotation kept colliding with concurrent changes — please retry.');
+}
+
+// A direct vault's rotation: mint a new DEK and its epoch's proof key in the browser, wrap the DEK for
+// every remaining member, tag the new epoch with the previous DEK (so members can tell a holder made
+// it), and prove the identity key, the current epoch's proof key and the new one. Opening the current
+// proof key needs the current DEK, which a rotation never needed before: that is what makes it
+// something only a holder of the key can do.
+async function zkRotateDirectForRevoke(vaultId, revokedUserId, info, fromVersion, ownerReset) {
+    const lib = eccLib();
+    const remaining = (info.members || []).filter(uid => String(uid) !== String(revokedUserId));
+    const toVersion = fromVersion + 1;
+    // The current DEK. An owner resetting damaged material may not be able to open it (a wrap made by
+    // someone else); the reset then goes without a lineage tag, which members see as a reset.
+    let currentDek = null;
+    try {
+        currentDek = await zkGetVaultDek(vaultId, fromVersion);
+    } catch (e) {
+        if (!ownerReset) throw e;
+    }
+
+    // 2) Mint a new DEK (never leaves the browser), and the new epoch's proof key sealed under it.
+    const newDek = await lib.generateVaultDEK();
+    const next = await lib.sealKeyProofKey(newDek, vaultId, toVersion);
+
+    // 3) Wrap the new DEK to each remaining member's public key.
+    const memberKeys = [];
+    for (const uid of remaining) {
+        const pk = await apiRequest(`/ecc/users/${uid}/public-key`, { silent: true });
+        if (!pk || !pk.has_keypair || !pk.public_key) {
+            throw new Error('A remaining member has no encryption key; cannot rotate. Resolve their key setup and retry.');
+        }
+        const recipientPub = await lib.importPublicKeyPEM(pk.public_key);
+        // Every remaining member is re-wrapped here, so a rotation is where a vault
+        // converts wholesale to v2, the owner's own wrap included. That is what keeps the
+        // legacy wrap written at creation from mattering much -- but only for vaults that
+        // ever rotate: this path runs on member revocation, so a vault that never removes
+        // anyone keeps its original wrap indefinitely. Harmless, since the reader takes
+        // both, but it is a mixed state rather than a passing one.
+        const { wrappedDEK, ephemeralPublicKey } = await zkWrapDekForRecipient(
+            newDek, recipientPub,
+            { vaultId, recipientUserId: uid, dekEpoch: fromVersion + 1 });
+        memberKeys.push({ user_id: uid, wrapped_dek: wrappedDEK, ephemeral_public_key: ephemeralPublicKey });
+    }
+
+    const body = {
+        from_version: fromVersion,
+        to_version: toVersion,
+        revoke_user_id: revokedUserId,
+        member_keys: memberKeys,
+        next_key_proof: { public_key: next.publicKeyPem, sealed_private_key: next.sealedKey, dek_check: next.dekCheck },
+    };
+    if (currentDek) {
+        body.lineage_tag = await lib.keyLineageTag(currentDek, {
+            vaultId, prevEpoch: fromVersion, mode: 'direct', nextTeamEpoch: 1,
+            nextVerifierPem: next.publicKeyPem, nextDekCheck: next.dekCheck,
+        });
+    }
+    if (ownerReset) body.owner_reset = true;
+
+    // 4) Commit atomically (revoke + rotate + re-wrap), with the proof.
+    await zkKeyProofRequest(vaultId, ownerReset ? 'owner_reset' : 'rekey', {
+        method: 'POST', path: `/ecc/vaults/${vaultId}/rekey`, body,
+        expect: { mode: 'direct', dekEpoch: fromVersion },
+        current: { dek: currentDek },
+        installs: { publicKeyPem: next.publicKeyPem, privateKey: next.privateKey },
+    });
+    zkState.keyProofKeys[vaultId] = { [toVersion]: { pem: String(next.publicKeyPem).trim(), key: next.privateKey } };
 }
 
 // Hierarchical revoke (forward secrecy): the removed member saw the TEAM PRIVATE key, so we must
@@ -13763,10 +14065,24 @@ async function zkRekeyForRevoke(vaultId, revokedUserId) {
 // browser; wrap the new DEK to the new team PUBLIC key; wrap the new team PRIVATE key to every
 // REMAINING member; the server swaps team_public_key, advances team_key_version, appends the new
 // DEK epoch, and deactivates the revoked member at every epoch — in one transaction, never seeing
-// a key. (member_keys carry the wrapped TEAM PRIVATE key in the generic wrapped_dek field.)
-async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) {
+// a key. (member_keys carry the wrapped TEAM PRIVATE key in the generic wrapped_dek field.) The
+// request proves the identity key, the current team key and the new one, and carries the lineage tag
+// made with the current DEK.
+async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion, ownerReset = false) {
     const ecc = eccLib();
     const remaining = (info.members || []).filter(uid => String(uid) !== String(revokedUserId));
+    const teamEpoch = info.team_key_version || 1;
+    // The current team key (to prove it) and the current DEK (for the lineage tag). An owner resetting
+    // damaged material may be unable to open them; the reset needs neither.
+    let currentDek = null;
+    let teamKey = null;
+    try {
+        const current = await zkCurrentKeyMaterial(vaultId);
+        teamKey = current.material.teamKey || null;
+        currentDek = await zkGetVaultDek(vaultId, fromVersion);
+    } catch (e) {
+        if (!ownerReset) throw e;
+    }
     const teamKp = await ecc.generateKeypair();         // new team keypair (browser-only)
     const newDek = await ecc.generateVaultDEK();         // new DEK (browser-only)
     const dekWrap = await zkWrapTeamDek(newDek, teamKp.publicKey,      // DEK -> new team pubkey
@@ -13783,17 +14099,27 @@ async function zkRotateTeamForRevoke(vaultId, revokedUserId, info, fromVersion) 
         memberKeys.push({ user_id: uid, wrapped_dek: wrappedKey, ephemeral_public_key: ephemeralPublicKey });
     }
     const teamPubPem = await ecc.exportPublicKeyPEM(teamKp.publicKey);
-    await apiRequest(`/ecc/vaults/${vaultId}/rekey`, {
-        method: 'POST',
-        body: JSON.stringify({
-            from_version: fromVersion,
-            to_version: fromVersion + 1,
-            revoke_user_id: revokedUserId,
-            member_keys: memberKeys,
-            team_public_key: teamPubPem,
-            team_dek_wrapped: dekWrap.wrappedDEK,
-            team_dek_ephemeral_public_key: dekWrap.ephemeralPublicKey,
-        }),
+    const body = {
+        from_version: fromVersion,
+        to_version: fromVersion + 1,
+        revoke_user_id: revokedUserId,
+        member_keys: memberKeys,
+        team_public_key: teamPubPem,
+        team_dek_wrapped: dekWrap.wrappedDEK,
+        team_dek_ephemeral_public_key: dekWrap.ephemeralPublicKey,
+    };
+    if (currentDek) {
+        body.lineage_tag = await ecc.keyLineageTag(currentDek, {
+            vaultId, prevEpoch: fromVersion, mode: 'hierarchical', nextTeamEpoch: teamEpoch + 1,
+            nextVerifierPem: teamPubPem, nextTeamWrap: dekWrap.wrappedDEK,
+        });
+    }
+    if (ownerReset) body.owner_reset = true;
+    await zkKeyProofRequest(vaultId, ownerReset ? 'owner_reset' : 'rekey', {
+        method: 'POST', path: `/ecc/vaults/${vaultId}/rekey`, body,
+        expect: { mode: 'hierarchical', dekEpoch: fromVersion, teamEpoch },
+        current: { teamKey },
+        installs: { publicKeyPem: teamPubPem, privateKey: teamKp.privateKey },
     });
 }
 
@@ -17709,9 +18035,21 @@ async function revokeVaultPermission(userId) {
             try {
                 await zkRekeyForRevoke(state.currentVault.id, userId);
             } catch (e) {
-                showError('Access was NOT revoked: the vault key could not be rotated. Please retry. ('
-                    + (e && e.message ? e.message : e) + ')');
-                return;
+                const why = e && e.message ? e.message : String(e);
+                // Removing someone is never held up by the key proof: when the rotation cannot be
+                // proved, offer to remove the access alone -- their keys are switched off at once, and
+                // the vault asks its key holders to rotate.
+                const alone = zkIsKeyProofRefusal(e) && await showConfirm(
+                    'The vault key could not be rotated (' + why + '). Remove this access now without '
+                    + "rotating? It is removed at once, and someone who holds this vault's key will be "
+                    + "asked to rotate it, so that this user can't open files added after that.",
+                    'Remove access without rotating', null, 'Remove access now without rotating');
+                if (!alone) {
+                    showError('Access was NOT revoked: the vault key could not be rotated. Please retry. ('
+                        + why + ')');
+                    return;
+                }
+                rotate = false;
             }
         }
 
