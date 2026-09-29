@@ -1,9 +1,9 @@
 """Refuse to start on data that a newer release has changed in a way this one cannot read.
 
-Some changes a release makes to stored data cannot be read by an older release: audit history moved
-into compressed archive blocks, records kept under a legal hold, a recording level that stores less
-than everything. Rolling the image back over such data would show an incomplete audit log, or let the
-older release delete what must be kept, without saying so.
+Some changes a later release may make to stored data cannot be read by an older release: for example,
+audit history moved into compressed archive blocks, records kept under a legal hold, or a recording
+level that stores less than everything. Rolling the image back over such data would show an
+incomplete audit log, or let the older release delete what must be kept, without saying so.
 
 The release that makes such a change writes a row in ``data_requirements`` naming the oldest version
 that can read the data, what changed, and how to undo it with the newer release; it removes the row
@@ -111,19 +111,36 @@ def _escape_advice() -> str:
             "setting as soon as you are back on the newer version or have undone the change.")
 
 
-def refusal_message(rows: list[Requirement], version: str) -> str:
-    lines = [f"DockVault {version or '(unknown version)'} will not start: a newer version changed "
-             "this database in a way this version cannot read."]
+def _describe(rows: list[Requirement], undo_lead: str) -> list[str]:
+    lines = []
     for row in rows:
         lines.append(f"- Needs DockVault {row.requires_at_least or '(unreadable version)'} or later "
                      f"({row.key}): {row.reason or 'no reason recorded'}")
         if row.undo:
-            lines.append(f"  To go back to this version, first undo it with the newer version: "
-                         f"{row.undo}")
+            lines.append(f"  {undo_lead}, first undo it with the newer version: {row.undo}")
         else:
             lines.append("  The newer version's release notes say how to undo it.")
+    return lines
+
+
+def refusal_message(rows: list[Requirement], version: str) -> str:
+    lines = [f"DockVault {version or '(unknown version)'} will not start: a newer version changed "
+             "this database in a way this version cannot read."]
+    lines += _describe(rows, "To go back to this version")
     lines.append("Or start the newer version again: it reads this data as it is.")
     lines.append(_escape_advice())
+    return "\n".join(lines)
+
+
+def escape_message(rows: list[Requirement], version: str) -> str:
+    """What a start let through by the escape says: that it is running on such data, what each row is
+    and how to undo it -- not how to start, since it is starting."""
+    lines = [f"{ESCAPE_VARIABLE} is set, so DockVault {version or '(unknown version)'} starts on data "
+             "a newer version changed in a way this version cannot read. It may show an incomplete "
+             "audit log, and it may delete or change records the newer version keeps."]
+    lines += _describe(rows, f"To run this version without {ESCAPE_VARIABLE}")
+    lines.append(f"Remove {ESCAPE_VARIABLE} from .env as soon as you are back on the newer version or "
+                 "have undone the change.")
     return "\n".join(lines)
 
 
@@ -142,11 +159,9 @@ def check(connection, version: str, *, allow: bool) -> list[Requirement]:
         return []
     if not rows:
         return []
-    message = refusal_message(rows, version)
     if not allow:
-        raise NewerDataRefusal(message)
-    _warn(f"{ESCAPE_VARIABLE} is set, so this version starts on data it cannot fully read.\n"
-          + message)
+        raise NewerDataRefusal(refusal_message(rows, version))
+    _warn(escape_message(rows, version))
     return rows
 
 

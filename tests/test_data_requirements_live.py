@@ -165,8 +165,11 @@ def test_the_escape_starts_the_web_process_with_a_warning(mark, probes):
     probe.wait_for_health()
 
     logs = probe.logs()
-    assert "WARNING: ALLOW_START_ON_NEWER_DATA is set" in logs
+    assert "WARNING: ALLOW_START_ON_NEWER_DATA is set, so DockVault" in logs
     assert f"WARNING: - Needs DockVault 999.0.0 or later ({_KEY})" in logs
+    # It is starting, with the setting already in place: not a refusal, not how to set it.
+    assert "will not start" not in logs
+    assert "To start this version anyway" not in logs
 
 
 def test_with_no_mark_the_web_process_starts_as_usual(probes):

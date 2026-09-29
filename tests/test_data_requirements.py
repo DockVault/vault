@@ -163,6 +163,25 @@ def test_the_escape_starts_it_with_a_warning_naming_each_requirement(marked, cap
     assert "WARNING: - Needs DockVault 0.34.0 or later (audit-archive): archived audit history" in err
 
 
+def test_the_escape_warning_says_it_is_starting_not_how_to_start(marked, capsys):
+    """The setting is already there and the process is starting: the log says so and what it risks,
+    and does not read as a refusal or tell the operator to set what is set."""
+    _mark(marked, "audit-archive", "0.34.0", reason="archived audit history", undo="unarchive it")
+
+    _check(marked, "0.33.1", allow=True)
+
+    err = capsys.readouterr().err
+    assert err.startswith("WARNING: ALLOW_START_ON_NEWER_DATA is set, so DockVault 0.33.1 starts on "
+                          "data a newer version changed in a way this version cannot read.")
+    assert "may delete or change records the newer version keeps" in err
+    assert ("WARNING:   To run this version without ALLOW_START_ON_NEWER_DATA, first undo it with the "
+            "newer version: unarchive it") in err
+    assert "WARNING: Remove ALLOW_START_ON_NEWER_DATA from .env as soon as" in err
+    assert "will not start" not in err
+    assert "To start this version anyway" not in err
+    assert "set ALLOW_START_ON_NEWER_DATA=true" not in err
+
+
 def test_the_escape_also_covers_a_table_it_cannot_read(engine, capsys):
     with engine.begin() as conn:
         conn.execute(sa.text("CREATE TABLE data_requirements (key VARCHAR(64) PRIMARY KEY)"))
@@ -210,7 +229,9 @@ def test_the_start_up_check_reads_the_setting(startup, monkeypatch, capsys):
 
     dr.check_at_startup("web")
 
-    assert "WARNING: ALLOW_START_ON_NEWER_DATA is set" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "WARNING: ALLOW_START_ON_NEWER_DATA is set" in err
+    assert "will not start" not in err
 
 
 def test_the_start_up_check_passes_on_a_clean_database(startup, capsys):
