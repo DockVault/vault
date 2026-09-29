@@ -16065,6 +16065,31 @@ def _enforce_zk_vault_cap(db) -> None:
         )
 
 
+def _check_create_vault_type(db: Session, current_user: User, requested: Optional[str]) -> str:
+    """May `current_user` create a vault of the requested type? Returns the type, or raises.
+
+    The account's permission to create vaults, the deployment's confidentiality policy, and a scoped
+    temporary credential's restriction to one vault type. Shared by POST /vaults and the key-proof
+    challenge for a zero-knowledge create, so the two cannot drift."""
+    PermissionService(db).require_permission(current_user, PermissionEnum.VAULT_CREATE)
+    vault_type = _resolve_vault_type_for_create(current_user, requested, db)
+    from app.core.temp_scope import require_create_vault_type
+    require_create_vault_type(current_user, vault_type)
+    return vault_type
+
+
+def _require_vault_id_unused(db: Session, vault_id) -> None:
+    """Refuse (409) a vault id that is in use or was ever in use.
+
+    "In use" includes "was in use". A retired vault id is the most valuable one to refuse: the server
+    never generates a zero-knowledge vault key, it stores a wrap the browser supplies, so an old key
+    holder could otherwise recreate the vault under its own id, re-supply that same wrap, and read
+    whatever survived the delete."""
+    if (db.query(Vault.id).filter(Vault.id == vault_id).first()
+            or db.query(RetiredObjectId.id).filter(RetiredObjectId.id == vault_id).first()):
+        raise HTTPException(status_code=409, detail="That vault id is already in use.")
+
+
 def _resolve_vault_type_for_create(current_user: User, requested: Optional[str], db: Session) -> str:
     """Creation-time confidentiality-policy chokepoint (design sequencing item 2 + §5).
 
@@ -16151,15 +16176,9 @@ async def create_vault(
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
 
-    # Check permission
-    permission_service.require_permission(current_user, PermissionEnum.VAULT_CREATE)
-
-    # Confidentiality-policy hook (defaults to 'standard'; rejects unbuilt tiers).
-    vault_type = _resolve_vault_type_for_create(current_user, vault_create.type, db)
-
-    # A scoped temp credential may be restricted to a specific vault type (standard vs ZK).
-    from app.core.temp_scope import require_create_vault_type
-    require_create_vault_type(current_user, vault_type)
+    # Permission, the confidentiality policy (defaults to 'standard'; rejects unbuilt tiers) and a scoped
+    # temporary credential's vault-type restriction -- shared with the key-proof challenge for a create.
+    vault_type = _check_create_vault_type(db, current_user, vault_create.type)
 
     # Per-user vault-count cap: a single account cannot create unbounded vaults.
     _enforce_vault_count(db, current_user)
@@ -16209,14 +16228,7 @@ async def create_vault(
         # Reject a taken id before anything is built. Note what actually guarantees uniqueness:
         # the primary key. This check turns that constraint violation into a clear answer, and
         # two simultaneous requests for one id still race past it -- hence the guard below.
-        # "In use" includes "was in use". A retired vault id is the most valuable one to refuse:
-        # the server never generates a zero-knowledge vault key, it stores a wrap the browser
-        # supplies, so an old key holder could otherwise recreate the vault under its own id,
-        # re-supply that same wrap, and read whatever survived the delete.
-        if (db.query(Vault.id).filter(Vault.id == vault_create.id).first()
-                or db.query(RetiredObjectId.id).filter(
-                    RetiredObjectId.id == vault_create.id).first()):
-            raise HTTPException(status_code=409, detail="That vault id is already in use.")
+        _require_vault_id_unused(db, vault_create.id)
 
     # Name / seal validation. A standard vault needs a real plaintext name. A zero-knowledge vault
     # seals its name (and optionally its description) in the BROWSER and sends only its non-secret

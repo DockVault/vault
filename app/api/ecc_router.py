@@ -16,11 +16,14 @@ import json
 import uuid
 from app.core.database import get_db
 from app.core.models import User, Vault, UserKeyPair, VaultMemberKey, VaultMemberIndexKey, ZKShareInvite, ECCRegistrationChallenge, ECCKeyUpdateChallenge, vault_members, RoleEnum
+from app.core.models import VaultKeyProof, ZkKeyProofChallenge
+from app.core.security import decrypt_secret_strict, encrypt_secret
 from app.services import ecc_pop, ecc_update_pop
+from app.services import zk_key_proof
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
 from app.core.rate_limiter import rate_limiter as _rate_limiter, retry_after_seconds
-from app.core.endpoint_permissions import require_endpoint_permission
+from app.core.endpoint_permissions import check_endpoint_permission, require_endpoint_permission
 from app.core.temp_scope import (
     require_vault_cap, enforce_vault, is_scoped, has_scoped_vault_cap, effective_vault_caps,
 )
@@ -207,6 +210,23 @@ def _can_manage_vault(db: Session, vault: Vault, user: User) -> bool:
     return bool(row and row.manage_permission)
 
 
+def _reaches_vault(db: Session, vault: Optional[Vault], user_id) -> bool:
+    """True if `user_id` has any relationship to `vault`: its owner, a direct member, or the holder of
+    any wrapped-key row for it, active or revoked.
+
+    The key routes answer a caller with none the same 403 whether or not the vault exists, so they do
+    not confirm a vault's existence -- or its key topology -- to a stranger. A revoked member still
+    reaches it: the revoke flow reads the answer "has_access false". can_access_vault is deliberately
+    not used: a zero-knowledge member is tracked by their key row, not necessarily a vault_members row."""
+    return vault is not None and (
+        _is_member(db, vault, user_id)
+        or db.query(VaultMemberKey.id).filter(
+            VaultMemberKey.vault_id == vault.id,
+            VaultMemberKey.user_id == user_id,
+        ).first() is not None
+    )
+
+
 def _age_seconds(ts) -> Optional[float]:
     """Seconds since a stored timestamp, tolerating both naive (model default
     datetime.utcnow) and aware (datetime.now(timezone.utc)) values that coexist in
@@ -290,6 +310,10 @@ _ECC_RATELIMIT = {
     # issuance, against a 256-bit MAC.
     "key_update_challenge": (10, 900),
     "key_update": (10, 900),
+    # Key-proof challenges, one per guarded key change. As generous as the mutations they precede: a
+    # bulk share asks for one per person, in parallel. Each attempt at a proof needs a fresh challenge,
+    # and every attempt is recorded, so this bounds guessing even when the limiter fails open.
+    "key_proof_challenge": (400, 60),
 }
 
 
@@ -991,16 +1015,8 @@ async def get_vault_index_key(
     # GET /vaults/{id}/keys, which carries the same _reaches_vault gate. That matters here because the
     # index key lets its holder CONFIRM a guessed filename against stored indices (see the docstring),
     # so leaking existence more freely than the DEK would hand a capability to principals who cannot
-    # read the vault at all. "Related" = owner, a direct vault_members row, OR any wrapped-DEK row
-    # (VaultMemberKey) for this vault — the exact reachability test the /keys handler already uses.
-    _reaches_vault = vault is not None and (
-        _is_member(db, vault, current_user.id)
-        or db.query(VaultMemberKey.id).filter(
-            VaultMemberKey.vault_id == vault_id,
-            VaultMemberKey.user_id == current_user.id,
-        ).first() is not None
-    )
-    if not _reaches_vault:
+    # read the vault at all. The same reachability test the /keys handler uses (_reaches_vault).
+    if not _reaches_vault(db, vault, current_user.id):
         raise HTTPException(status_code=403, detail="No access to this vault's keys")
     if not may_release_vault_key(db, current_user, vault):
         raise HTTPException(status_code=403, detail="No access to this vault's keys")
@@ -1156,14 +1172,7 @@ async def get_vault_keys(
     # the revoke flow relies on), while someone who was never a member is refused. can_access_vault is
     # deliberately NOT used: a zero-knowledge member is tracked by their VaultMemberKey, not a
     # vault_members row, so it would wrongly 403 legitimate ZK members.
-    _reaches_vault = vault is not None and (
-        _is_member(db, vault, current_user.id)
-        or db.query(VaultMemberKey.id).filter(
-            VaultMemberKey.vault_id == vault_id,
-            VaultMemberKey.user_id == current_user.id,
-        ).first() is not None
-    )
-    if not _reaches_vault:
+    if not _reaches_vault(db, vault, current_user.id):
         raise HTTPException(status_code=403, detail="No access to this vault's keys")
     if not may_release_vault_key(db, current_user, vault):
         raise HTTPException(
@@ -1246,6 +1255,199 @@ async def get_vault_keys(
         current_dek_version=current,
         rekey_owed=owed,
     )
+
+
+# =============================================================================
+# Key proof: the challenge
+# =============================================================================
+# A request that changes a zero-knowledge vault's keys carries a proof that its caller holds, right
+# now, their own identity key, the vault's current key material and the key the request installs
+# (app/services/zk_key_proof.py). Each proof answers one challenge from this route.
+
+_KEY_PROOF_MAX_LIVE_CHALLENGES = 32  # per account: a bulk share asks for one per person, in parallel
+
+
+class KeyProofChallengeRequest(BaseModel):
+    op: str = Field(..., max_length=32)
+    # Only for "create": the wrapping mode of the vault being created. Every other operation takes the
+    # mode from the vault itself, and a value sent with one is ignored.
+    mode: Optional[str] = Field(None, max_length=32)
+
+
+def _current_key_proof(db: Session, vault: Vault) -> Optional[VaultKeyProof]:
+    """The key-proof row of the vault's current DEK epoch, or None."""
+    return db.query(VaultKeyProof).filter(
+        VaultKeyProof.vault_id == vault.id,
+        VaultKeyProof.dek_epoch == (getattr(vault, 'dek_version', 1) or 1),
+    ).first()
+
+
+def _verifier_sha256(public_key_pem: Optional[str]) -> Optional[str]:
+    """Hex SHA-256 of a verifier's point, or None when there is none or it is not a P-384 key."""
+    if not public_key_pem:
+        return None
+    try:
+        return hashlib.sha256(zk_key_proof.public_point(public_key_pem)).hexdigest()
+    except zk_key_proof.MalformedProof:
+        return None
+
+
+def _challenge_verifier(vault: Vault, row: Optional[VaultKeyProof]) -> Optional[dict]:
+    """What a proof at the current epoch is checked against, for the challenge's answer.
+
+    Hierarchical: the vault's team public key, with the epoch row's provenance when there is one.
+    Direct: the epoch's row, whose sealed proof key is released here because only a manager who holds
+    the key is ever issued a challenge; None when the epoch has no row yet."""
+    if _is_hierarchical(vault):
+        return {
+            "public_key": getattr(vault, 'team_public_key', None),
+            "source": row.source if row else None,
+            "lineage_tag": row.lineage_tag if row else None,
+        }
+    if row is None:
+        return None
+    return {
+        "public_key": row.proof_public_key,
+        "source": row.source,
+        "sealed_private_key": row.sealed_private_key,
+        "dek_check": row.dek_check,
+        "lineage_tag": row.lineage_tag,
+    }
+
+
+def _unseal_challenge_key(sealed: str) -> str:
+    """The server's one-time key of a challenge row. Only a value this deployment sealed opens, so a row
+    whose key was written in the clear -- by anyone who can write the table -- cannot be answered."""
+    return decrypt_secret_strict(sealed)
+
+
+@router.post("/vaults/{vault_id}/key-proof/challenge")
+async def key_proof_challenge(
+    vault_id: str,
+    request: KeyProofChallengeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Issue a one-time challenge for a key-proof operation on this vault.
+
+    `op` is one of rekey, share, index_key, bootstrap, create, owner_reset. For create, `vault_id` is the
+    id the new vault will have and `mode` its wrapping mode. The answer carries the server's one-time
+    public key and nonce, the vault's state the proof will be checked against (mode, DEK and team epochs),
+    and the current verifier (null for create, for bootstrap, and for a direct epoch with no proof key yet).
+
+    Only a caller who could make the change gets a challenge: for create, the same checks POST /vaults
+    makes; otherwise someone who reaches the vault, may use its key, manages it and holds its current key.
+    A stranger gets the same 403 whether or not the vault exists. The state checks here are advisory: the
+    guarded request re-checks them under the vault row lock.
+
+    At most 32 challenges per account are live; issuing another deletes the oldest. Issuance is serialized
+    on the account's row, and deletes the account's expired challenges.
+    """
+    op = request.op
+    if op not in zk_key_proof.OPS:
+        raise zk_key_proof.malformed("op must be one of: " + ", ".join(zk_key_proof.OPS))
+    # Refuse BEFORE charging the budget: a temporary session is the owner's own row, so a charged refusal
+    # would let a leaked temporary credential spend the owner's budget (see the key-update routes).
+    if op in ("bootstrap", "owner_reset") and getattr(current_user, "_is_temp_session", False):
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-interactive-only")
+    _ecc_rate_limit(current_user, "key_proof_challenge")
+
+    try:
+        vid = uuid.UUID(str(vault_id))
+    except (ValueError, TypeError):
+        if op == "create":
+            raise zk_key_proof.malformed("the vault id is not a UUID")
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
+    keypair = db.query(UserKeyPair.id).filter(UserKeyPair.user_id == current_user.id).first()
+
+    if op == "create":
+        mode = request.mode or "direct"
+        if mode not in zk_key_proof.MODES:
+            raise zk_key_proof.malformed("mode must be direct or hierarchical")
+        # The checks POST /vaults makes, from the same helpers, so the two cannot drift.
+        from app.api.api_server import _check_create_vault_type, _require_vault_id_unused
+        check_endpoint_permission(db, current_user, "VAULT_CREATE")
+        _check_create_vault_type(db, current_user, "zero_knowledge")
+        _require_vault_id_unused(db, vid)
+        if keypair is None:
+            raise HTTPException(status_code=400,
+                                detail="Set up your encryption key before creating a zero-knowledge vault.")
+        state = {"mode": mode, "dek_epoch": 1, "team_epoch": 1}
+        verifier = None
+    else:
+        vault = db.query(Vault).filter(Vault.id == vid).first()
+        if not _reaches_vault(db, vault, current_user.id):
+            raise HTTPException(status_code=403, detail="No access to this vault's keys")
+        if not may_release_vault_key(db, current_user, vault):
+            raise HTTPException(status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED)
+        enforce_vault(current_user, str(vid))
+        check_endpoint_permission(db, current_user, "VAULT_PERMISSIONS", {"vault_id": str(vid)})
+        if is_scoped(current_user) and "vault.change_permissions" not in set(
+                effective_vault_caps(current_user, str(vid))):
+            raise HTTPException(status_code=403, detail="Temporary credential scope does not permit this action")
+        if not _can_manage_vault(db, vault, current_user):
+            raise HTTPException(status_code=403,
+                                detail="Only the vault owner or a manager can change this vault's keys")
+        if not _holds_current_key(db, vault, current_user.id):
+            raise HTTPException(status_code=403,
+                                detail="Only someone who holds this vault's key can change its keys")
+        if keypair is None:
+            raise HTTPException(status_code=400, detail="No encryption key is set up for this account.")
+        if op == "owner_reset" and str(vault.owner_id) != str(current_user.id):
+            raise HTTPException(status_code=403, detail="Only the vault's owner can reset its key")
+        hierarchical = _is_hierarchical(vault)
+        row = _current_key_proof(db, vault)
+        if op == "bootstrap":
+            if hierarchical:
+                raise zk_key_proof.malformed("a team vault's key check needs no setup")
+            if row is not None:
+                raise zk_key_proof.KeyProofRefusal("zk-key-proof-exists")
+        if (hierarchical and op not in zk_key_proof.OPS_WITHOUT_CURRENT_KEY
+                and _verifier_sha256(getattr(vault, 'team_public_key', None)) is None):
+            raise zk_key_proof.KeyProofRefusal("zk-key-proof-verifier-unusable")
+        verifier = None if op == "bootstrap" else _challenge_verifier(vault, row)
+        state = {
+            "mode": "hierarchical" if hierarchical else "direct",
+            "dek_epoch": getattr(vault, 'dek_version', 1) or 1,
+            "team_epoch": getattr(vault, 'team_key_version', 1) or 1,
+        }
+
+    # Serialize issuance on the account's row, so the cap holds under concurrent requests.
+    db.query(User).filter(User.id == current_user.id).with_for_update().first()
+    now = datetime.utcnow()
+    db.query(ZkKeyProofChallenge).filter(
+        ZkKeyProofChallenge.user_id == current_user.id,
+        ZkKeyProofChallenge.created_at < now - timedelta(seconds=zk_key_proof.CHALLENGE_TTL_SECONDS),
+    ).delete(synchronize_session=False)
+    live = db.query(ZkKeyProofChallenge.id).filter(
+        ZkKeyProofChallenge.user_id == current_user.id,
+    ).order_by(ZkKeyProofChallenge.created_at.asc(), ZkKeyProofChallenge.id.asc()).all()
+    excess = len(live) - (_KEY_PROOF_MAX_LIVE_CHALLENGES - 1)
+    if excess > 0:
+        db.query(ZkKeyProofChallenge).filter(
+            ZkKeyProofChallenge.id.in_([r.id for r in live[:excess]])
+        ).delete(synchronize_session=False)
+
+    server_private_pem, server_public_pem, nonce = zk_key_proof.generate_challenge()
+    ch = ZkKeyProofChallenge(
+        user_id=current_user.id, vault_id=vid, op=op,
+        server_private_key_sealed=encrypt_secret(server_private_pem),
+        nonce=nonce, mode=state["mode"], dek_epoch=state["dek_epoch"], team_epoch=state["team_epoch"],
+        verifier_sha256=_verifier_sha256((verifier or {}).get("public_key")),
+        created_at=now,
+    )
+    db.add(ch)
+    db.commit()
+    return {
+        "challenge_id": str(ch.id),
+        "server_ephemeral_public_key": server_public_pem,
+        "nonce": nonce,
+        "expires_in": zk_key_proof.CHALLENGE_TTL_SECONDS,
+        "mode": state["mode"],
+        "dek_epoch": state["dek_epoch"],
+        "team_epoch": state["team_epoch"],
+        "verifier": verifier,
+    }
 
 
 @router.get("/users/{user_id}/public-key")
