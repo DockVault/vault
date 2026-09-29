@@ -45,6 +45,11 @@ class MatrixSyncError(ValueError):
     """The two matrices cannot be combined into a valid one."""
 
 
+# The top-level keys combined entry by entry. Any other key is main's, and a branch that differs
+# there is reported, like an entry both declare.
+_MERGED = ("versions", "edges", "advisories", "waivers")
+
+
 def _validator():
     path = Path(__file__).resolve().parent / "upgrade_matrix.py"
     spec = importlib.util.spec_from_file_location("dockvault_upgrade_matrix_for_sync", path)
@@ -110,6 +115,8 @@ def sync(main: dict, branch: dict) -> tuple[dict, list[str]]:
         result[field] = _copy(main[field] if field in main else branch[field])
         if field not in main:
             notes.append(f"took '{field}' from the branch; main has none")
+        elif field in branch and field not in _MERGED and branch[field] != main[field]:
+            notes.append(f"kept main's '{field}'; the branch's differs")
 
     extra_versions = {v: _copy(e) for v, e in branch["versions"].items() if v not in main["versions"]}
     for version, entry in branch["versions"].items():
@@ -146,8 +153,13 @@ def sync(main: dict, branch: dict) -> tuple[dict, list[str]]:
             if not refs:
                 continue
             target = result["versions"][version]
+            support = entry.get("support")
+            if (not isinstance(support, dict) or "secure" not in support
+                    or not isinstance(target.get("support"), dict)):
+                raise MatrixSyncError(
+                    f"{version} has no support block to carry whether {slug} leaves it secure")
             target.setdefault("vulnerabilities", []).extend(_copy(refs))
-            target["support"]["secure"] = entry["support"]["secure"]
+            target["support"]["secure"] = support["secure"]
 
     if "waivers" in branch:
         waived = {w.get("version") for w in result.get("waivers", [])}

@@ -118,6 +118,42 @@ def test_where_both_declare_the_same_thing_mains_is_kept_and_reported():
     assert "kept main's edge 0.33.0 -> 0.33.1; the branch's differs" in notes
 
 
+def test_a_top_level_key_the_branch_changed_is_reported_and_mains_kept():
+    main = _main()
+    branch = _branch_release(main)
+    branch["about"] = "the wording the branch was cut with"
+
+    result, notes = _SYNC.sync(main, branch)
+
+    assert result["about"] == "fixture"
+    assert "kept main's 'about'; the branch's differs" in notes
+    # The keys combined entry by entry are reported entry by entry, not as a whole.
+    assert not [note for note in notes if note.startswith(("kept main's 'versions'",
+                                                           "kept main's 'edges'"))]
+
+
+def _older_line_advisory(branch: dict, version: str) -> None:
+    reference = {"advisory": "older-line-only", "title": "Older line only", "fixed_in": "0.33.2"}
+    branch["advisories"]["older-line-only"] = {
+        "title": "Older line only", "description": "d", "impact": "i", "remediation": "r",
+        "mitigation": None, "severity": None, "cvss": None, "id": None, "fixed_in": "0.33.2",
+        "published": "2026-12-20"}
+    branch["versions"][version]["vulnerabilities"] = [reference]
+
+
+@pytest.mark.parametrize("side, key", [
+    ("main", "support"), ("branch", "support"), ("branch", "secure")])
+def test_an_affected_version_without_a_support_block_is_refused_not_a_crash(side, key):
+    main = _main()
+    branch = _branch_release(main)
+    _older_line_advisory(branch, "0.33.1")
+    entry = (main if side == "main" else branch)["versions"]["0.33.1"]
+    del (entry if key == "support" else entry["support"])[key]
+
+    with pytest.raises(_SYNC.MatrixSyncError, match="0.33.1 has no support block"):
+        _SYNC.sync(main, branch)
+
+
 def test_a_fix_only_the_older_line_needs_brings_its_advisory_to_main():
     """The advisory, each affected version's reference to it, and those versions' secure flag."""
     main = _main()
