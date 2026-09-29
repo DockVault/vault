@@ -6,6 +6,7 @@ import datetime
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -287,13 +288,12 @@ def test_publication_is_serial_and_scan_auth_push_release_order_is_fail_closed()
         "Refresh release refs immediately before authentication"
     ) < publish.index("Revalidate immediately before authentication")
     assert publish.count("release_gate.py") == 2
-    # What reaches GHCR must be the staged index that was scanned, under both tags, and nothing
-    # else: the copy is verified against the staging digest rather than trusted.
+    # What reaches GHCR must be the staged index that was scanned, under every tag this run moves,
+    # and nothing else: the copy is verified against the staging digest rather than trusted.
     assert 'test "$resolved_version" = "$staged_digest"' in publish
-    assert 'test "$resolved_latest" = "$staged_digest"' in publish
+    assert 'test "$resolved_floating" = "$staged_digest"' in publish
     assert 'echo "digest=${resolved_version}" >> "$GITHUB_OUTPUT"' in publish
     assert "+refs/heads/main:refs/remotes/origin/main" in publish
-    assert "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}" in publish
     order = [
         publish.index("Validate publication inputs before build"),
         publish.index("Build every platform into the staging registry"),
@@ -332,6 +332,8 @@ def test_validation_fetches_main_and_exports_one_immutable_identity():
     assert "fetch-depth: 0" in validate
     assert "git fetch --no-tags --prune origin" in validate
     assert "+refs/heads/main:refs/remotes/origin/main" in validate
+    assert "+refs/heads/release/*:refs/remotes/origin/release/*" in validate
+    assert "+refs/tags/v*:refs/tags/v*" in validate
     assert "release_gate.py" in validate
     for name in ("version", "tag", "sha", "image"):
         assert f"{name}: ${{{{ steps.gate.outputs.{name} }}}}" in validate
@@ -823,3 +825,212 @@ def test_a_higher_tag_on_the_same_commit_is_not_a_release_built_on_it(tmp_path):
 
     with pytest.raises(_GATE.ReleaseGateError, match="is below v0.2.0"):
         history.gate("0.1.1")
+
+
+# --- publication of a release from either line ---------------------------------------------------
+
+
+def _step_text(job: str, name: str) -> str:
+    """One step of a job, from its name to the next step (exactly once)."""
+    assert job.count(f"- name: {name}\n") == 1, name
+    body = job.split(f"- name: {name}\n", 1)[1]
+    return body.split("\n      - ", 1)[0]
+
+
+@pytest.mark.parametrize("step", [
+    "Fetch current release refs",
+    "Refresh release refs immediately before authentication",
+])
+def test_every_gate_run_sees_the_maintenance_branches_and_every_release_tag(step):
+    """The gate places a tag on main or on release/X.Y and against every other release, so each of
+    its runs needs those refs as they are at that moment -- not main and this one tag only."""
+    text = _step_text(_job("publish"), step)
+
+    assert "--no-tags --prune origin" in text
+    assert '"+refs/heads/main:refs/remotes/origin/main"' in text
+    assert '"+refs/heads/release/*:refs/remotes/origin/release/*"' in text
+    assert '"+refs/tags/v*:refs/tags/v*"' in text
+    assert "EXPECTED_TAG" not in text
+
+
+def test_the_moving_tags_come_from_the_gate_just_before_authentication():
+    publish = _job("publish")
+    push = _step_text(publish, "Copy the scanned index to GHCR and resolve its digest")
+
+    # Only what the last gate run decided: a release tagged on top of this one while it was being
+    # tested owns `latest` and the line tag by then.
+    assert "FLOATING_TAGS: ${{ steps.auth_gate.outputs.floating_tags }}" in push
+    assert "outputs.floating_tags" not in publish.replace(
+        "steps.auth_gate.outputs.floating_tags", "")
+    # No moving tag is written by name: `latest` is one of the gate's answers, not a constant.
+    assert ":latest" not in push
+    assert 'tag_args=(--tag "${IMAGE}:${TAG}")' in push
+    assert 'tag_args+=(--tag "${IMAGE}:${floating}")' in push
+    assert 'docker buildx imagetools create "${tag_args[@]}" "${STAGING_IMAGE}:${TAG}"' in push
+    # Each moving tag is checked against what the registry holds before the copy, and against the
+    # staged digest after it.
+    assert "refusing to move it backwards" in push
+    assert push.index("refusing to move it backwards") < push.index("imagetools create")
+    assert '"org.opencontainers.image.version"' in push
+    assert "sort -V" in push
+    assert 'test "$resolved_floating" = "$staged_digest"' in push
+    assert push.index("imagetools create") < push.index('test "$resolved_floating"')
+    # A name the gate did not mean is refused rather than pushed.
+    assert r"^(latest|v[0-9]+\.[0-9]+)$" in push
+
+
+def test_github_is_told_which_release_is_latest_and_what_to_compare_against():
+    release = _step_text(_job("publish"), "Create GitHub Release")
+
+    assert "generate_release_notes: true" in release
+    assert "make_latest: ${{ steps.auth_gate.outputs.make_latest }}" in release
+    assert "previous_tag: ${{ steps.auth_gate.outputs.previous_tag }}" in release
+    assert "body: ${{ steps.auth_gate.outputs.notes_preamble }}" in release
+
+
+# The publish step's moving-tag checks are shell, and a pin on their text cannot tell a working
+# comparison from a disabled one, so the step itself runs here against a stand-in `docker` that
+# answers what a registry would.
+_DOCKER_STUB = r"""#!/usr/bin/env bash
+echo "docker $*" >> "$STUB_LOG"
+if [ "$3" = "inspect" ]; then
+  ref="$4"; fmt="$6"; name="${ref##*:}"; name="${name//./_}"
+  case "$fmt" in
+    *Labels*)
+      var="LABEL_${name}"
+      case "${!var:-}" in
+        NOTFOUND) echo "ERROR: ${ref}: not found" >&2; exit 1 ;;
+        BROKEN) echo "ERROR: unexpected status from GET request: 500" >&2; exit 1 ;;
+      esac
+      printf '%s' "${!var:-}" ;;
+    *Digest*)
+      var="DIGEST_${name}"
+      echo "\"${!var:-sha256:staged}\"" ;;
+  esac
+fi
+exit 0
+"""
+
+
+def _bash() -> str | None:
+    """A bash that runs POSIX scripts: Git's own on Windows (whatever `bash` resolves to there may
+    be the WSL launcher), the system one elsewhere."""
+    if sys.platform == "win32":
+        git = shutil.which("git")
+        if git is not None:
+            # git.exe is in Git\cmd or Git\mingw64\bin; bash.exe is in Git\bin.
+            for folder in list(Path(git).resolve().parents)[:3]:
+                candidate = folder / "bin" / "bash.exe"
+                if candidate.is_file():
+                    return str(candidate)
+        return None
+    return shutil.which("bash")
+
+
+def _run_push_step(tmp_path: Path, floating: str, **registry: str):
+    bash = _bash()
+    if bash is None:
+        if os.environ.get("CI"):
+            pytest.fail("no bash to run the publish step with; this check would silently not run")
+        pytest.skip("no bash on this machine")
+    import yaml
+
+    steps = yaml.safe_load(_WORKFLOW)["jobs"]["publish"]["steps"]
+    (script,) = [s["run"] for s in steps if s.get("id") == "push"]
+    (tmp_path / "push.sh").write_text(script, encoding="utf-8", newline="\n")
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    (stub_dir / "docker").write_text(_DOCKER_STUB, encoding="utf-8", newline="\n")
+    (stub_dir / "docker").chmod(0o755)
+    env = {
+        **os.environ,
+        "STUB_BIN": str(stub_dir),
+        "STUB_LOG": str(tmp_path / "docker.log"),
+        "IMAGE": "ghcr.io/dockvault/vault",
+        "TAG": "v0.34.0",
+        "VERSION": "0.34.0",
+        "STAGING_IMAGE": "localhost:5000/dockvault/vault",
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
+        "RUNNER_TEMP": str(tmp_path),
+        "FLOATING_TAGS": floating,
+        **registry,
+    }
+    (tmp_path / "docker.log").write_text("", encoding="utf-8")
+    run = subprocess.run(
+        [bash, "-c",
+         'PATH="$( (cygpath -u "$STUB_BIN") 2>/dev/null || printf %s "$STUB_BIN"):$PATH"; '
+         '. "$1"', "push-step", str(tmp_path / "push.sh")],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    calls = (tmp_path / "docker.log").read_text(encoding="utf-8").splitlines()
+    created = [c.split(" create ", 1)[1] for c in calls if " imagetools create " in c]
+    return run, created
+
+
+def test_a_release_moves_every_tag_the_gate_named_and_checks_each_one(tmp_path):
+    run, created = _run_push_step(tmp_path, "latest v0.34",
+                                  LABEL_latest="0.33.2", LABEL_v0_34="NOTFOUND")
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert created == [
+        "--tag ghcr.io/dockvault/vault:v0.34.0 --tag ghcr.io/dockvault/vault:latest "
+        "--tag ghcr.io/dockvault/vault:v0.34 localhost:5000/dockvault/vault:v0.34.0"]
+    assert (tmp_path / "output").read_text(encoding="utf-8") == "digest=sha256:staged\n"
+
+
+def test_a_release_the_gate_gave_no_moving_tag_moves_only_its_own(tmp_path):
+    run, created = _run_push_step(tmp_path, "")
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert created == [
+        "--tag ghcr.io/dockvault/vault:v0.34.0 localhost:5000/dockvault/vault:v0.34.0"]
+
+
+@pytest.mark.parametrize("current", ["0.34.0", "0.33.9", "0.9.99"])
+def test_a_moving_tag_may_stay_or_go_forward(tmp_path, current):
+    run, created = _run_push_step(tmp_path, "latest", LABEL_latest=current)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert len(created) == 1
+
+
+@pytest.mark.parametrize("current", ["0.34.1", "0.35.0", "1.0.0"])
+def test_a_moving_tag_is_never_moved_backwards(tmp_path, current):
+    """Version order, not text order: 0.9.x sorts after 0.10.x as text."""
+    run, created = _run_push_step(tmp_path, "latest", LABEL_latest=current)
+
+    assert run.returncode != 0
+    assert created == []
+    assert f"holds {current}, above 0.34.0; refusing to move it backwards" in run.stdout
+
+
+def test_a_moving_tag_below_the_release_in_version_order_but_not_in_text_order(tmp_path):
+    run, created = _run_push_step(tmp_path, "latest", LABEL_latest="0.10.0", VERSION="0.9.0")
+
+    assert run.returncode != 0
+    assert created == []
+
+
+def test_a_registry_that_cannot_say_what_a_tag_holds_stops_the_release(tmp_path):
+    run, created = _run_push_step(tmp_path, "latest", LABEL_latest="BROKEN")
+
+    assert run.returncode != 0
+    assert created == []
+    assert "cannot read what ghcr.io/dockvault/vault:latest holds now" in run.stdout
+
+
+def test_a_moving_tag_the_gate_did_not_mean_is_refused(tmp_path):
+    run, created = _run_push_step(tmp_path, "latest;touch")
+
+    assert run.returncode != 0
+    assert created == []
+    assert "unexpected moving tag" in run.stdout
+
+
+def test_a_moving_tag_that_names_another_image_after_the_copy_fails_the_release(tmp_path):
+    run, created = _run_push_step(tmp_path, "v0.34", LABEL_v0_34="0.34.0",
+                                  DIGEST_v0_34="sha256:elsewhere")
+
+    assert run.returncode != 0
+    assert len(created) == 1
+    assert "resolves to sha256:elsewhere, not sha256:staged" in run.stdout
+    assert not (tmp_path / "output").exists()

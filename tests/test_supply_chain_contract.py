@@ -390,7 +390,7 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert "git fetch --force --no-tags --prune origin" in publish
     assert "id: auth_gate" in publish
     assert 'test "$resolved_version" = "$staged_digest"' in publish
-    assert 'test "$resolved_latest" = "$staged_digest"' in publish
+    assert 'test "$resolved_floating" = "$staged_digest"' in publish
     assert 'echo "digest=${resolved_version}" >> "$GITHUB_OUTPUT"' in publish
     # provenance + one SBOM per platform, every one bound to the published index digest
     assert publish.count("subject-digest: ${{ steps.push.outputs.digest }}") == 3
