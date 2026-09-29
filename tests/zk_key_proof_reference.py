@@ -223,7 +223,10 @@ def lineage_tag(prev_dek: bytes, *, vault_id: str, prev_epoch: int, mode: str, n
         check, wrap_hash = next_dek_check, _ZERO32
     else:
         check = _ZERO32
-        wrap_hash = hashlib.sha256(base64.b64decode(next_team_wrap_b64, validate=True)).digest()
+        wrap = base64.b64decode(next_team_wrap_b64 or "", validate=True)
+        if not wrap:
+            raise ValueError("a team vault rotation's tag covers the next epoch's team DEK wrap")
+        wrap_hash = hashlib.sha256(wrap).digest()
     if check is None or len(check) != 32:
         raise ValueError("a direct rotation's tag covers the next epoch's 32-byte key check")
     msg = hashlib.sha256(_Z.join([

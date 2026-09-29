@@ -2152,7 +2152,7 @@ class ECCCryptoLibrary {
      *
      * fields: {vaultId, prevEpoch, mode ('direct' | 'hierarchical'), nextTeamEpoch,
      *          nextVerifierPem (P_{p+1}, or the team public key at p + 1),
-     *          nextDekCheck (base64, direct only), nextTeamWrap (base64 team DEK wrap, hierarchical only)}
+     *          nextDekCheck (base64, direct only), nextTeamWrap (base64 team DEK wrap, hierarchical only; required)}
      * @returns {Promise<string>} base64 of 32 bytes
      */
     async keyLineageTag(prevDek, fields) {
@@ -2172,7 +2172,10 @@ class ECCCryptoLibrary {
             check = new Uint8Array(this._base64ToArrayBuffer(String(f.nextDekCheck || '')));
             if (check.length !== 32) this._fail(BAD, 'keyLineageTag.dekCheck');
         } else {
-            wrapHash = await this._sha256(new Uint8Array(this._base64ToArrayBuffer(String(f.nextTeamWrap || ''))));
+            // The wrap is what the tag binds in this mode: a tag over no wrap could not show a substituted one.
+            const wrap = new Uint8Array(this._base64ToArrayBuffer(String(f.nextTeamWrap || '')));
+            if (wrap.length === 0) this._fail(BAD, 'keyLineageTag.teamWrap');
+            wrapHash = await this._sha256(wrap);
         }
         let verifierPoint;
         try {

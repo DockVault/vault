@@ -696,6 +696,34 @@ def test_a_direct_lineage_tag_needs_a_32_byte_key_check():
                    "empty": "INVALID_INPUT"}
 
 
+def test_a_team_vault_lineage_tag_needs_the_team_wrap():
+    """A tag over no team DEK wrap would bind none, so it could not show a substituted wrap: the browser
+    refuses to compute it, and a verification that cannot compute the tag is false."""
+    out = _node("""
+  const l = V.lineage.find(x => x.mode === 'hierarchical');
+  const prev = await aes(l.prev_dek_hex);
+  const f = { vaultId: l.vault_id, prevEpoch: l.prev_epoch, mode: 'hierarchical', nextTeamEpoch: l.next_team_epoch,
+    nextVerifierPem: l.next_verifier_pem, nextTeamWrap: l.next_team_wrap_b64 };
+  const res = { right: await code(() => lib.keyLineageTag(prev, f)), verify: {} };
+  for (const [name, value] of Object.entries({ missing: undefined, none: null, empty: '' })) {
+    res[name] = await code(() => lib.keyLineageTag(prev, { ...f, nextTeamWrap: value }));
+    res.verify[name] = await lib.verifyKeyLineageTag(prev, { ...f, nextTeamWrap: value }, l.lineage_tag_b64);
+  }
+  realLog(JSON.stringify(res));
+""")
+    assert out == {"right": "NONE", "missing": "INVALID_INPUT", "none": "INVALID_INPUT", "empty": "INVALID_INPUT",
+                   "verify": {"missing": False, "none": False, "empty": False}}
+
+
+@pytest.mark.parametrize("wrap", [None, ""])
+def test_the_reference_refuses_a_team_vault_lineage_tag_without_the_wrap(wrap):
+    ln = next(x for x in _vector()["lineage"] if x["mode"] == "hierarchical")
+    with pytest.raises(ValueError):
+        ref.lineage_tag(bytes.fromhex(ln["prev_dek_hex"]), vault_id=ln["vault_id"], prev_epoch=ln["prev_epoch"],
+                        mode="hierarchical", next_team_epoch=ln["next_team_epoch"],
+                        next_verifier_pem=ln["next_verifier_pem"], next_dek_check=None, next_team_wrap_b64=wrap)
+
+
 def test_the_team_key_match_compares_points():
     i = _vector()["inputs"]
     new_der = ref.private_from_scalar(i["new_scalar_hex"]).private_bytes(
