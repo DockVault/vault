@@ -23740,18 +23740,17 @@ def _seed_default_receiver_tags(bootstrap_status=None):
 
 
 def _backfill_default_permissions():
-    """Grant role-default endpoint permissions to existing non-admin users
-    (idempotent). Picks up newly-added defaults such as temp-credential
-    self-service for the 'user' role without needing the user to be recreated."""
+    """Give existing accounts that are not administrators the role defaults added since they were last
+    given them, once each (endpoint_permissions.grant_newer_role_defaults). Until 0.33.1 this granted
+    every default again at every start, so a default an administrator had revoked came back at the next
+    restart; now a revoked default stays revoked."""
     try:
         from app.core.database import get_db_context
-        from app.core.endpoint_permissions import grant_default_permissions_for_role
-        from app.core.models import RoleEnum, User
+        from app.core.endpoint_permissions import grant_newer_role_defaults
         with get_db_context() as db:
-            users = db.query(User).filter(User.role != RoleEnum.ADMIN).all()
-            for u in users:
-                grant_default_permissions_for_role(str(u.id), u.role.value, db)
-            print(f"[OK] Backfilled default permissions for {len(users)} non-admin user(s)")
+            done = grant_newer_role_defaults(db)
+            print(f"[OK] Role defaults up to date: {done['grants']} new default(s) granted to "
+                  f"{done['accounts']} account(s)")
     except Exception as e:
         print(f"⚠ Permission backfill skipped: {e}")
 
@@ -24043,6 +24042,9 @@ END $$;""",
             # An administrator's second-factor reset asks the user to set the factor up again at the
             # next sign-in. Nullable, so a rollback to a release that does not know it is unaffected.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS second_factor_reset_at TIMESTAMP",
+            # The revision of the role defaults an account has been given, so a start grants each default
+            # once instead of granting again one an administrator revoked. Nullable, for the same reason.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_defaults_revision INTEGER",
             # An administrator's invitation keeps its inviter's lineage from the moment it is made, for
             # the two-administrator rule (app/core/admin_grants.py). Nullable, for the same reason.
             "ALTER TABLE account_invitations ADD COLUMN IF NOT EXISTS inviter_lineage JSON",

@@ -49,7 +49,7 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
-| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. | The account. | Life of the account. | Deleting the account. |
+| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. **New in 0.33.1:** `permission_defaults_revision`, the revision of the role's default permissions the account has been given. | The account. | Life of the account. | Deleting the account. |
 | `user_ssh_keys` | Key name, public key, fingerprint, created, last used. | SFTP sign-in by key. | Until removed. | The person or an administrator removing it; deleted with the account. |
 | `second_factor_enrollments`, `second_factor_recovery_codes` | Method, the authenticator seed (encrypted), times; recovery-code hashes. | Second factor. | Until reset or removed. | Resetting the second factor; deleted with the account. |
 | `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The periodic cleanup (every 5 minutes); deleted with the account. |
@@ -222,7 +222,10 @@ the recipients' mailboxes.
   email and last sign-in are printed on the host's terminal, and the lookup is not audited, since the
   operator can read the database anyway) and change it (audited as the host operator). **New in
   0.33.0:** it can list the accounts that may view or manage users without being administrators (their
-  usernames, roles, and who granted each permission when), not audited either.
+  usernames, roles, and who granted each permission when), not audited either. **New in 0.33.1:** it
+  can list the permissions an administrator revoked that a restart before 0.33.1 granted again (usernames,
+  roles, the permission, and when it was revoked and granted again, read from the audit log), not
+  audited either.
 
 ## The browser
 
@@ -318,3 +321,9 @@ There is no built-in per-person erasure yet.
 - Changed: the cache keys and the fallback table that count failed sign-ins by name hold a keyed
   stand-in, not the name as typed; the Activity page's username search suggests accounts only and
   never reads the audit log.
+
+## What 0.33.1 added
+
+- `users.permission_defaults_revision`.
+- `audit_logs`: `permission_default_granted`, when a start gives an account a permission its role gained
+  by default in a newer release.

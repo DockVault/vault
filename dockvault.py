@@ -2582,6 +2582,7 @@ ACCOUNT_ACTIONS = (
     ("approve", "Approve a change waiting for a second administrator"),
     ("list", "List the changes waiting for approval"),
     ("user-managers", "List who may manage users without being an administrator"),
+    ("regranted-defaults", "List revoked permissions that a restart granted again (before 0.33.1)"),
 )
 
 
@@ -5337,6 +5338,27 @@ class DockVault:
                             "it: granting it while the account still holds it does nothing.\n", "yellow"))
             return
 
+        if action == "regranted-defaults":
+            answer = self._run_account_tool("regranted-defaults")
+            if not answer.get("ok"):
+                self._fail(server_text(answer.get("error")) or "the list could not be read")
+            rows = answer.get("permissions") or []
+            if not rows:
+                print(pal.paint("  No revoked permission was found granted again by a restart.\n", "green"))
+                return
+            print(pal.paint("\n  Permissions an administrator revoked that a restart granted again", "cyan"))
+            for r in rows:
+                print("  %s  (%s%s)  %-16s revoked %s, granted again %s" % (
+                    server_text(r.get("username")), server_text(r.get("role")),
+                    "" if r.get("active") else ", deactivated", server_text(r.get("group")),
+                    server_text(r.get("revoked_at"))[:16].replace("T", " "),
+                    server_text(r.get("granted_again_at"))[:16].replace("T", " ")))
+            print(pal.paint("  Before 0.33.1 every start granted each role default again. Where one is still not "
+                            "wanted, revoke it again with the account's Permissions button on the Users page "
+                            "(DELETE /permissions/users/{id}/revoke/<group>); from 0.33.1 it stays revoked.\n",
+                            "yellow"))
+            return
+
         if action == "approve":
             request_id = (getattr(args, "request_id", None) if args else None) or (
                 ask("Request id (see: List)", pal) if interactive else None)
@@ -5556,7 +5578,8 @@ def build_parser():
 
     ac = parsers["accounts"]
     ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
-                    help="reset-password | reset-second-factor | approve | list | user-managers")
+                    help="reset-password | reset-second-factor | approve | list | user-managers | "
+                         "regranted-defaults")
     ac.add_argument("--username", dest="username", help="the account to act on")
     ac.add_argument("--confirm-username", dest="confirm_username",
                     help="the account's username typed again; nothing changes unless it matches")

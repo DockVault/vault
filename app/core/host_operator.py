@@ -9,6 +9,7 @@ network::
     python -m app.core.host_operator list
     python -m app.core.host_operator approve --request-id <id> --confirm-username alice
     python -m app.core.host_operator user-managers
+    python -m app.core.host_operator regranted-defaults
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
@@ -32,7 +33,8 @@ import secrets
 import string
 import sys
 
-ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers")
+ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
+           "regranted-defaults")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -127,6 +129,70 @@ def user_managers(db):
     return list(accounts.values())
 
 
+def _groups_of(details, *keys):
+    """The permission groups an audit row's details name under the first of ``keys`` present (a list),
+    else under ``endpoint_group``. Rows from the earliest releases carry only ``endpoint_group``."""
+    details = details if isinstance(details, dict) else {}
+    for key in keys:
+        if isinstance(details.get(key), list):
+            return [g for g in details[key] if isinstance(g, str)]
+    group = details.get("endpoint_group")
+    return [group] if isinstance(group, str) else []
+
+
+def _naive(when):
+    return when.replace(tzinfo=None) if when is not None and when.tzinfo is not None else when
+
+
+def regranted_defaults(db):
+    """Each permission an administrator revoked that a restart granted again, as releases before 0.33.1
+    did with every role default at every start: the account holds the group again, with no granter
+    recorded, granted after its latest revocation (``REVOKE_PERMISSION`` in the audit log), and nothing
+    else explains the grant since then (an administrator granting it, ``GRANT_PERMISSION``; a change of
+    role, ``permissions_reset_for_role``; or a start giving a new default, ``permission_default_granted``).
+    Read-only: an administrator revokes the permission again if it is still not wanted. A revocation the
+    audit log no longer holds (a retention limit pruned it) cannot be found."""
+    from app.core.models import AuditLog, User, UserEndpointPermission
+
+    revoked, explained = {}, {}
+    for action, resource_id, when, details in db.query(
+            AuditLog.action, AuditLog.resource_id, AuditLog.timestamp, AuditLog.details).filter(
+            AuditLog.status == "success",
+            AuditLog.action.in_(("REVOKE_PERMISSION", "GRANT_PERMISSION", "permission_granted",
+                                 "permissions_reset_for_role", "permission_default_granted"))).all():
+        if not resource_id or when is None:
+            continue
+        if action == "REVOKE_PERMISSION":
+            into, groups = revoked, _groups_of(details, "revoked_groups")
+        elif action == "permissions_reset_for_role":
+            into, groups = explained, _groups_of(details, "added")
+        else:
+            into, groups = explained, _groups_of(details, "granted_groups")
+        for group in groups:
+            key = (resource_id, group)
+            into[key] = max(into.get(key, _naive(when)), _naive(when))
+    if not revoked:
+        return []
+    rows = (db.query(User.id, User.username, User.role, User.is_active, UserEndpointPermission.endpoint_group,
+                     UserEndpointPermission.granted_at)
+            .join(UserEndpointPermission, UserEndpointPermission.user_id == User.id)
+            .filter(UserEndpointPermission.granted_by.is_(None))
+            .order_by(User.username, UserEndpointPermission.endpoint_group).all())
+    found = []
+    for user_id, username, role, active, group, granted_at in rows:
+        key = (str(user_id), group)
+        revoked_at, granted_at = revoked.get(key), _naive(granted_at)
+        if revoked_at is None or granted_at is None or granted_at <= revoked_at:
+            continue
+        if explained.get(key) is not None and explained[key] > revoked_at:
+            continue
+        found.append({"username": username, "role": role.value if role is not None else None,
+                      "active": bool(active), "group": group,
+                      "revoked_at": revoked_at.isoformat() + "Z",
+                      "granted_again_at": granted_at.isoformat() + "Z"})
+    return found
+
+
 def _find(db, username):
     from app.core.models import User
     return db.query(User).filter(User.username == username).first()
@@ -189,6 +255,9 @@ def _run(args, api) -> int:
 
         if args.action == "user-managers":
             return _answer({"ok": True, "accounts": user_managers(db)})
+
+        if args.action == "regranted-defaults":
+            return _answer({"ok": True, "permissions": regranted_defaults(db)})
 
         if args.action == "approve":
             if not args.request_id:

@@ -191,6 +191,14 @@ class User(Base):
     # password, whatever the deployment's second-factor policy; enrolling clears it. Nullable and
     # added by the boot DDL, so an earlier release reads the table without it.
     second_factor_reset_at = Column(DateTime, nullable=True)
+    # The revision of the role defaults this account has been given (app/core/api_catalog.py,
+    # FunctionalityGroup.default_since). At each start an account that is not an administrator is given
+    # the defaults of its role that are newer than this, once, and it is then set to the current
+    # revision; creating the account and changing its role set it too. So a default an administrator
+    # revoked stays revoked. NULL is what every earlier release left: the defaults of revision 1, which
+    # those releases granted again at every start. Nullable and added by the boot DDL, so an earlier
+    # release reads the table without it.
+    permission_defaults_revision = Column(Integer, nullable=True)
 
     # SFTP access controls (per account). sftp_enabled gates ALL direct SFTP login
     # for this user; sftp_password_auth allows password-based SFTP (key auth via

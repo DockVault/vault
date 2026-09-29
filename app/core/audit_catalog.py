@@ -94,6 +94,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     # A change of role resets the account's permissions to the new role's defaults: the row lists what
     # was removed and added (app/api/api_server.py, _set_role).
     AuditAction("permissions_reset_for_role", "accounts", "Permissions reset for a new role", "notice"),
+    # A start gives an account a permission its role gained by default in a newer release, once.
+    AuditAction("permission_default_granted", "accounts", "New role default permission granted", "notice",
+                automatic=True),
     AuditAction("role_changed", "accounts", "User role changed", "notice"),
     AuditAction("self_account_update", "accounts", "Own account details changed", "notice"),
     AuditAction("ssh_key_add", "accounts", "SSH key added", "notice"),
