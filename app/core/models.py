@@ -681,6 +681,13 @@ class ActiveSession(Base):
     # unlike the best-effort Redis logout denylist. A new login does NOT set this, so concurrent
     # sessions keep working (no single-session side effect).
     revoked = Column(Boolean, nullable=False, default=False, server_default='false')
+    # Where the session was signed in: 'web' or 'sftp'. A web sign-in with a password marks the account's
+    # earlier web sessions inactive; it leaves SFTP sessions alone, and an SFTP sign-in (password or key)
+    # leaves every other session alone, since SFTP checks is_active on every operation and a client
+    # opens several connections at once. Revoking, locking and deactivating still end every session.
+    # NULL: written by an earlier release, and treated as a web session. Nullable and added by the boot
+    # DDL, so an earlier release reads the table without it.
+    channel = Column(String(8), nullable=True)
     
     # Relationships
     user = relationship('User', back_populates='active_sessions')

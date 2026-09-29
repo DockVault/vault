@@ -7376,7 +7376,8 @@ async def second_factor_login_verify(
     db.commit()
     auth_service = AuthService(db)
     session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at)
+    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at,
+                                                 channel=auth_service.WEB)
     _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
     access_token = create_access_token(
         data={"sub": str(user.id), "username": user.username, "session_token": session_token,
@@ -9885,7 +9886,8 @@ async def acknowledge_recovery_codes(
         db.commit()
         auth_service = AuthService(db)
         session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at)
+        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
+                                                     channel=auth_service.WEB)
         _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
         access_token = create_access_token(
             data={"sub": str(current_user.id), "username": current_user.username,
@@ -24040,6 +24042,9 @@ END $$;""",
             # revocation (web logout/lock survives a Redis outage). Both additive + idempotent.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP",
             "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE",
+            # Where a session was signed in ('web' or 'sftp'), so a sign-in on one ends only its own
+            # channel's earlier sessions. Nullable: a release that does not know it ignores it.
+            "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS channel VARCHAR(8)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN NOT NULL DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_password_auth BOOLEAN NOT NULL DEFAULT TRUE",
             # An administrator's second-factor reset asks the user to set the factor up again at the

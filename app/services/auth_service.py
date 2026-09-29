@@ -397,9 +397,18 @@ def _window_reset(win_start, window: int, now: datetime) -> float:
     return _epoch(win_start if win_start is not None else now) + window
 
 
+# Where a session was signed in (ActiveSession.channel).
+WEB_CHANNEL = "web"
+SFTP_CHANNEL = "sftp"
+
+
 class AuthService:
     """Service for authentication operations."""
     
+    # Where a session was signed in (ActiveSession.channel).
+    WEB = WEB_CHANNEL
+    SFTP = SFTP_CHANNEL
+
     def __init__(self, db: Session):
         self.db = db
     
@@ -488,7 +497,8 @@ class AuthService:
         password: str,
         ip_address: str,
         *,
-        login_identifier: str = "username"
+        login_identifier: str = "username",
+        channel: str = "web",
     ) -> Tuple[User, str]:
         """
         Authenticate a user with an identifier and password.
@@ -501,6 +511,8 @@ class AuthService:
             login_identifier: Org policy for how to resolve the identifier — "username" (default,
                 exact username), "email" (case-insensitive email), or "either" (username first,
                 then email). Defaulted so the SFTP caller and existing tests are unaffected.
+            channel: Where the sign-in happens, WEB (the default) or SFTP. A web sign-in marks the
+                account's earlier web sessions inactive; an SFTP sign-in ends no other session.
 
         Returns:
             Tuple of (User object, session_token)
@@ -563,7 +575,7 @@ class AuthService:
         except sign_in_lockout.Busy as busy:
             raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
         try:
-            signed_in = self._authenticate_in_turn(user, username, password, ip_address)
+            signed_in = self._authenticate_in_turn(user, username, password, ip_address, channel=channel)
         except Exception:
             # Whatever ended the attempt early ends its turn too, and keeps nothing it had not
             # committed: a failure is committed with its count, a refusal with its releases.
@@ -574,7 +586,7 @@ class AuthService:
         return signed_in
 
     def _authenticate_in_turn(self, user: User, username: str, password: str,
-                              ip_address: str) -> Tuple[User, str]:
+                              ip_address: str, channel: str = "web") -> Tuple[User, str]:
         """authenticate_user for an account, in the account's turn (take_turn), which the transaction's
         end lets go: a refusal commits the releases it made and raises, a wrong password commits its
         count, a right one commits its session."""
@@ -630,8 +642,12 @@ class AuthService:
         sign_in_lockout.clear_after_success(self.db, user.id, ip_address)
         user.last_login = datetime.now(timezone.utc)
 
-        # Check for existing active sessions (only 1 allowed)
-        self._terminate_existing_sessions(user.id)
+        # One web session at a time: a web sign-in marks the account's earlier web sessions inactive. An
+        # SFTP sign-in ends nothing, as a key sign-in never did: SFTP checks is_active on every
+        # operation, so ending another session there cut off a client's parallel connections, and a
+        # web sign-in cut off the account's SFTP transfers in flight.
+        if channel == self.WEB:
+            self._terminate_existing_sessions(user.id)
 
         # Create new session with an absolute server-side lifetime. Regular logins used to store
         # expires_at = NULL, which cleanup_expired_sessions never sweeps, so abandoned rows
@@ -639,7 +655,8 @@ class AuthService:
         # (30 days), so the row always outlives any token it backs yet still ages out once nothing
         # renews it.
         session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-        session_token = self._create_session(user, None, ip_address, expires_at=session_expires_at)
+        session_token = self._create_session(user, None, ip_address, expires_at=session_expires_at,
+                                             channel=channel)
         self.db.commit()
 
         return user, session_token
@@ -831,7 +848,8 @@ class AuthService:
             user,
             temp_cred.id,
             ip_address,
-            expires_at=temp_cred.expires_at
+            expires_at=temp_cred.expires_at,
+            channel=self.SFTP if allow_device_credential else self.WEB,
         )
         
         self.db.commit()
@@ -1768,20 +1786,21 @@ class AuthService:
         """Create an SFTP session for a user authenticated via SSH public key.
 
         No password is involved (paramiko has already verified the client holds the
-        private key before this is called). Unlike password login, this does NOT
+        private key before this is called). Like an SFTP password sign-in, this does NOT
         terminate the user's other sessions, so a service account may hold concurrent
         SFTP connections. Revoked like any session (lock/deactivate publishes a
         force-close; the SFTP layer re-checks is_active/is_locked every op)."""
-        return self._create_session(user, None, ip_address)
+        return self._create_session(user, None, ip_address, channel=self.SFTP)
 
     def _create_session(
         self,
         user: User,
         temp_credential_id: Optional[uuid.UUID],
         ip_address: str,
-        expires_at: Optional[datetime] = None
+        expires_at: Optional[datetime] = None,
+        channel: Optional[str] = None,
     ) -> str:
-        """Create a new active session."""
+        """Create a new active session, signed in on ``channel`` (WEB or SFTP)."""
         session_token = generate_session_token()
 
         # Store the token's SHA-256 hash at rest, not the token itself: a database read then yields
@@ -1792,7 +1811,8 @@ class AuthService:
             user_id=user.id,
             temp_credential_id=temp_credential_id,
             ip_address=ip_address,
-            expires_at=expires_at
+            expires_at=expires_at,
+            channel=channel,
         )
         
         self.db.add(session)
@@ -1829,12 +1849,15 @@ class AuthService:
         self.db.commit()
     
     def _terminate_existing_sessions(self, user_id: uuid.UUID):
-        """Terminate all existing sessions for a user (except temp credentials)."""
+        """Mark the account's other web sessions inactive (never a temporary credential's, never an
+        SFTP session): a web sign-in with a password keeps one web session at a time. A session written
+        by an earlier release (no channel) counts as a web one."""
         existing_sessions = self.db.query(ActiveSession).filter(
             and_(
                 ActiveSession.user_id == user_id,
                 ActiveSession.is_active == True,
-                ActiveSession.temp_credential_id.is_(None)
+                ActiveSession.temp_credential_id.is_(None),
+                or_(ActiveSession.channel.is_(None), ActiveSession.channel == self.WEB),
             )
         ).all()
         
