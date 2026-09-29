@@ -133,7 +133,10 @@ Each row of `audit_logs` holds:
   agent. Before 0.33.0 no row carried a user agent;
 - details, which depend on the action: for example the account a change was made to, an email
   address before and after a change, who a share went to, or the filters of an export. Vault, file
-  and folder names are never stored: they are removed from the details as each row is written;
+  and folder names are never stored: they are removed from the details as each row is written.
+  **New in 0.33.2:** a change to a zero-knowledge vault's keys records how it was proved (`proof`),
+  and a refused key proof records the operation and which part failed. The proof itself (its
+  header, MACs, challenge nonce) and the request body are never stored;
 - an error message for a failure.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is

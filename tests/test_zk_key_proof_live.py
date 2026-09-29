@@ -701,3 +701,30 @@ def test_retiring_old_epochs_prunes_their_proof_rows_and_never_the_current_one(a
         assert epochs() == "3"
     finally:
         oc.delete_vault(vid)
+
+
+
+# -------------------------------------------------------------------------------------------- audit
+
+def test_no_audit_row_holds_any_part_of_a_proof(admin, people):
+    owner, oc = people("kpau")
+    target, _ = people("kpaut")
+    vid = _direct_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/members"
+    try:
+        refused = harness.prepare_zk(oc, path, _share_body(target["id"]), roles={"identity": _foreign()})
+        _refused(harness.send_prepared(oc, path, refused))
+        accepted = harness.prepare_zk(oc, path, _share_body(target["id"]))
+        assert harness.send_prepared(oc, path, accepted).status_code == 200
+        rows = _psql(f"SELECT coalesce(details::text, '') FROM audit_logs WHERE resource_id = '{vid}'")
+        assert rows, "expected this vault's audit rows"
+        for prepared in (refused, accepted):
+            _, cid, *macs = prepared["header"].split(".")
+            for secret in [cid, prepared["challenge"]["nonce"], *[m for m in macs if m != "-"]]:
+                assert secret not in rows, "an audit row holds part of a key proof"
+        assert _psql("SELECT details->>'reason' FROM audit_logs WHERE action = 'zk_key_proof_failed' "
+                     f"AND resource_id = '{vid}'") == "identity"
+        assert _psql("SELECT details->>'proof' FROM audit_logs WHERE action = 'zk_member_key_granted' "
+                     f"AND resource_id = '{vid}' ORDER BY timestamp DESC LIMIT 1") == "key"
+    finally:
+        oc.delete_vault(vid)

@@ -227,3 +227,49 @@ def test_only_a_manager_is_given_the_sealed_proof_key():
     _once(code, '    if may_manage:\n        view["sealed_private_key"]', "_key_proof_view")
     keys = _function(ECC, "get_vault_keys")
     _once(keys, "may_manage=_can_manage_vault(db, vault, current_user)", "get_vault_keys")
+
+
+
+# ------------------------------------------------------------------------------------------- audit
+
+AUDIT_WRITERS = ("_audit_key_proof_failed", "_audit_key_proof_absent", "_add_owner_reset_audit_row")
+# The detail keys key-proof rows may carry. None of them is personal data or proof material.
+ALLOWED_DETAIL_KEYS = {"op", "reason", "mode", "dek_epoch", "team_epoch", "proof"}
+
+
+def test_the_key_proof_actions_are_catalogued_with_their_severity():
+    from app.core.audit_catalog import ACTIONS
+    by_name = {a.name: a for a in ACTIONS}
+    for name, severity in (("zk_key_proof_failed", "warning"), ("zk_key_proof_absent", "warning"),
+                           ("zk_owner_key_reset", "warning"), ("zk_key_proof_bootstrapped", "notice")):
+        assert by_name[name].category == "zero_knowledge" and by_name[name].severity == severity, name
+
+
+def _detail_keys(fn_source: str):
+    """Every key a function puts into an audit row's details: dict literals and keyword updates."""
+    keys = set()
+    for node in ast.walk(ast.parse(fn_source.strip())):
+        if isinstance(node, ast.Dict):
+            keys |= {k.value for k in node.keys if isinstance(k, ast.Constant)}
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "update"):
+            keys |= {kw.arg for kw in node.keywords}
+    return keys
+
+
+def test_key_proof_audit_rows_carry_no_proof_material():
+    """A refused or accepted proof is recorded by what was asked and why it failed; never the header, a MAC,
+    the challenge's nonce, the server's key or the request body."""
+    for name in AUDIT_WRITERS:
+        fn = _function(ECC, name)
+        assert _detail_keys(fn) <= ALLOWED_DETAIL_KEYS, (name, _detail_keys(fn))
+        code = fn[fn.index('"""', fn.index('"""') + 3) + 3:]
+        for word in ("header", "mac", "nonce", "server_private", "raw_body", "body"):
+            assert not re.search(r"\b" + word + r"\b", code), (name, word)
+    bootstrap = _function(ECC, "bootstrap_key_proof")
+    row = bootstrap[bootstrap.index('action="zk_key_proof_bootstrapped"'):]
+    row = "f(" + row[:row.index("))") + 1]   # the call's arguments, as a call that parses
+    assert _detail_keys(row) <= ALLOWED_DETAIL_KEYS and "op" in _detail_keys(row), _detail_keys(row)
+    # The rows the four changes already wrote gain only how they were proved.
+    for name in ("rekey_vault", "grant_member_key", "put_vault_index_key"):
+        fn = _function(ECC, name)
+        assert '"proof":' in fn, name
