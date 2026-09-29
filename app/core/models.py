@@ -1422,7 +1422,13 @@ class PasswordResetToken(Base):
     a short indexed prefix for lookup, and only a peppered HMAC-SHA256 stored at rest. Minting a new
     token invalidates any prior unconsumed one for the user (one active link at a time). A WHOLE NEW
     TABLE — created by create_all(), so it needs no lightweight-migration entry. ``created_by`` records
-    the admin who triggered it (NULL for a self-service 'forgot password' request)."""
+    who triggered it (an administrator, or a user given the permission to manage users; NULL for a
+    self-service 'forgot password' request and for the server's operator on the host).
+    ``made_by_other`` (added by the lightweight migrations, so nullable) is True when another account
+    made the link for this one: its maker's authority is judged again when it is used. It is kept apart
+    from ``created_by`` because deleting the maker sets that to NULL, and such a link must not then pass
+    for one the person asked for themselves. NULL on a row from before the column: read from
+    ``created_by``."""
     __tablename__ = 'password_reset_tokens'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1436,6 +1442,7 @@ class PasswordResetToken(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     created_by = Column(UUID(as_uuid=True),
                         ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    made_by_other = Column(Boolean, nullable=True)
 
     __table_args__ = (
         Index('idx_pwreset_prefix', 'token_prefix'),

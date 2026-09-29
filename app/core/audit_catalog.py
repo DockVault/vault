@@ -86,6 +86,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("email_change_requested", "accounts", "Email change requested", "info"),
     AuditAction("password_reset_completed", "accounts", "Password changed with a reset link", "notice"),
     AuditAction("password_reset_link_minted", "accounts", "Password reset link created", "notice"),
+    # An open link a user who manages users made for an account that has just been made an
+    # administrator: revoked with the promotion (app/api/api_server.py).
+    AuditAction("password_reset_link_revoked", "accounts", "Password reset link revoked", "notice"),
     AuditAction("password_reset_link_sent", "accounts", "Password reset link emailed", "notice"),
     AuditAction("password_reset_requested", "accounts", "Password reset requested", "info"),
     AuditAction("role_changed", "accounts", "User role changed", "notice"),
@@ -245,6 +248,11 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("device_secret_reuse_suspend", "security", "Old device key reused, device suspended", "warning"),
     AuditAction("endpoint_permission_denied", "security", "Action refused for lack of permission", "warning"),
     AuditAction("id_scope_denied", "security", "File or folder outside the granted scope refused", "warning"),
+    # A reset link someone made for another account, used when its maker could no longer make it (demoted,
+    # deactivated, locked, deleted, the permission taken away, or the account made an administrator):
+    # refused like an unknown link, and revoked (app/core/account_authority.py, link_refusal).
+    AuditAction("password_reset_link_refused", "security", "Reset link refused: its maker may no longer make it",
+                "warning"),
     AuditAction("security_alert_resolved", "security", "Security alert resolved", "notice"),
     AuditAction("vault_cap_denied", "security", "Vault action outside the credential's rights refused", "warning"),
     AuditAction("vault_scope_denied", "security", "Vault outside the granted scope refused", "warning"),

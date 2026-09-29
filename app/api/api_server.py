@@ -5251,13 +5251,16 @@ def _resolve_reset_user(db: Session, identifier: str):
     return u
 
 
-def _mint_reset_link(db: Session, user, base_url: str, *, created_by_id) -> Optional[str]:
+def _mint_reset_link(db: Session, user, base_url: str, *, created_by_id,
+                     made_by_other: bool = False) -> Optional[str]:
     """Mint a single-use reset token for `user` (invalidating any prior unconsumed one) and return the
     plaintext reset LINK exactly once. Does NOT email and does NOT require the user to have an email, so
     an admin can reset an email-less account by copying the link. The token row is identical to the
     emailed path — same hash-at-rest, same TTL, same single-use / atomic-consume at POST /reset (which
     also revokes the target's sessions). Returns None only when the reset pepper is unconfigured (no
-    token can be minted). The plaintext is returned to the caller and never logged."""
+    token can be minted). The plaintext is returned to the caller and never logged. ``made_by_other``:
+    another account (``created_by_id``) made it for this one, so its authority is judged again when the
+    link is used (_reset_link_refusal)."""
     from app.core.password_reset import mint_reset_token, hash_reset_token, pepper_ok
     from app.core.models import PasswordResetToken
     pepper = _reset_pepper()
@@ -5270,13 +5273,14 @@ def _mint_reset_link(db: Session, user, base_url: str, *, created_by_id) -> Opti
     plaintext, prefix = mint_reset_token()
     db.add(PasswordResetToken(
         user_id=user.id, token_prefix=prefix, token_hash=hash_reset_token(plaintext, pepper),
-        expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id))
+        expires_at=datetime.utcnow() + timedelta(minutes=ttl), created_by=created_by_id,
+        made_by_other=bool(made_by_other)))
     db.commit()
     return f"{(base_url or '').rstrip('/')}/?reset={plaintext}"
 
 
 def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id, to: Optional[str] = None,
-                         note_html: str = "") -> bool:
+                         note_html: str = "", made_by_other: bool = False) -> bool:
     """Mint a single-use reset token (invalidating any prior unconsumed one), email it through the
     password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
     Never raises — the caller (public or admin) must not fail on mail trouble. Requires an email.
@@ -5287,7 +5291,7 @@ def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id, to:
     if not email:
         return False
     try:
-        link = _mint_reset_link(db, user, base_url, created_by_id=created_by_id)
+        link = _mint_reset_link(db, user, base_url, created_by_id=created_by_id, made_by_other=made_by_other)
     except Exception:
         db.rollback()
         return False
@@ -5375,6 +5379,96 @@ def _resolve_valid_reset_token(db: Session, token: str):
     except Exception:
         return None
     return None
+
+
+def _reset_link_refusal(db: Session, r, target, *, lock: bool = False) -> Optional[str]:
+    """Why reset link ``r``, for ``target``'s account, may not be used now, or None when it may.
+
+    A link another account made (an administrator, or a user given the permission to manage users) is
+    judged again, as its maker and the account stand now, by the rule the routes that make one apply
+    (account_authority.link_refusal): otherwise a user who manages users could make a link for an
+    ordinary user, wait for an administrator to promote that user, and use it to take an administrator's
+    account; and a maker who was demoted, deactivated, locked or deleted, or lost the permission, would
+    keep the power the link carried. A link the person asked for themselves, or one the server's
+    operator made on the host, stands on its own.
+
+    With ``lock``, the maker's and the account's rows are read under a share lock, in id order (as the
+    last-administrator guard locks administrators): a promotion or demotion in progress finishes before
+    they are read, and one that starts later waits until the link has been used."""
+    from app.core import account_authority
+    from app.core.endpoint_permissions import endpoint_permission_denial
+    made_by_other = r.made_by_other
+    if made_by_other is None:        # a link from before the column: another account made it if one is named
+        made_by_other = r.created_by is not None and r.created_by != r.user_id
+    if not made_by_other:
+        return None
+    if lock:
+        ids = [i for i in (r.created_by, target.id) if i is not None]
+        rows = {u.id: u for u in (db.query(User).filter(User.id.in_(ids)).order_by(User.id)
+                                  .populate_existing().with_for_update(read=True).all())}
+        target = rows.get(target.id, target)
+        maker = rows.get(r.created_by) if r.created_by is not None else None
+    else:
+        maker = (db.query(User).filter(User.id == r.created_by).first()
+                 if r.created_by is not None else None)
+    may_manage = maker is not None and endpoint_permission_denial(db, maker, "USER_MANAGE") is None
+    return account_authority.link_refusal(maker, target, maker_may_manage_users=may_manage)
+
+
+def _refuse_reset_link(db: Session, r, target, reason: str, *, ip: Optional[str]) -> None:
+    """Revoke reset link ``r`` that may no longer be used (``reason``, from _reset_link_refusal) and record
+    why, then commit. The caller answers exactly as for an unknown or expired link, so the holder learns
+    nothing about why."""
+    from app.core.models import PasswordResetToken
+    link_id, maker_id = r.id, r.created_by
+    maker_name = (db.query(User.username).filter(User.id == maker_id).scalar()
+                  if maker_id is not None else None)
+    try:
+        db.query(PasswordResetToken).filter(PasswordResetToken.id == link_id).delete(synchronize_session=False)
+        db.add(AuditLogger(db).build_row(
+            action="password_reset_link_refused", status="failure", user=None, ip_address=ip,
+            resource_type="user", resource_id=str(target.id),
+            details={"reason": reason, "target_username": target.username,
+                     "made_by": maker_name, "made_by_id": str(maker_id) if maker_id else None,
+                     "link_id": str(link_id)}))
+        db.commit()
+    except Exception:  # noqa: BLE001 - the link is refused whether or not the revocation was saved
+        db.rollback()
+
+
+def _revoke_reset_links_outranked_by(db: Session, user, *, actor) -> int:
+    """``user`` is being made an administrator: revoke, in the caller's transaction, every open reset
+    link for them that someone who could not make one for an administrator made (a user given the
+    permission to manage users), with an audit row each, and return how many. Using one would be refused
+    anyway (_reset_link_refusal); revoking it here takes it out of anyone's hands at once."""
+    from types import SimpleNamespace
+    from app.core import credential_changes as cc
+    from app.core.models import PasswordResetToken
+    now = datetime.utcnow()
+    rows = (db.query(PasswordResetToken)
+            .filter(PasswordResetToken.user_id == user.id,
+                    PasswordResetToken.consumed_at.is_(None),
+                    PasswordResetToken.expires_at > now)
+            .order_by(PasswordResetToken.created_at)
+            .with_for_update().all())
+    as_administrator = SimpleNamespace(id=user.id, role=RoleEnum.ADMIN, username=user.username)
+    revoked = 0
+    for r in rows:
+        reason = _reset_link_refusal(db, r, as_administrator)
+        if reason is None:
+            continue
+        maker_name = (db.query(User.username).filter(User.id == r.created_by).scalar()
+                      if r.created_by is not None else None)
+        db.add(AuditLogger(db).build_row(
+            action="password_reset_link_revoked", status="success", user=actor,
+            username=None if actor is not None else cc.HOST_OPERATOR,
+            resource_type="user", resource_id=str(user.id),
+            details={"target_username": user.username, "made_by": maker_name,
+                     "made_by_id": str(r.created_by) if r.created_by else None, "link_id": str(r.id),
+                     "revoked_because": "made_an_administrator", "reason": reason}))
+        db.delete(r)
+        revoked += 1
+    return revoked
 
 
 @app.post("/auth/forgot-password")
@@ -5470,6 +5564,9 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     if kind == cc.RESET_LINK:
         from app.core.email_actions import public_base_url as _configured_base_url
         base_url = _public_base_url(request) if request is not None else _configured_base_url(None)
+        # Made by another account (an administrator, or a user who manages users, or an approved request's
+        # asker): judged again when it is used. Not one the server's operator makes (actor_id None).
+        made_by_other = actor_id is not None and actor_id != target.id
         if payload.get("delivery") == "email":
             if not (target.email or "").strip():
                 raise HTTPException(status_code=400,
@@ -5477,8 +5574,9 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
             if not _smtp_configured(db):
                 raise HTTPException(status_code=400, detail="Email is not configured. Add a sending "
                                     "profile in Settings -> Email first.")
-            return {"email_sent": bool(_mint_and_send_reset(db, target, base_url, created_by_id=actor_id))}
-        link = _mint_reset_link(db, target, base_url, created_by_id=actor_id)
+            return {"email_sent": bool(_mint_and_send_reset(db, target, base_url, created_by_id=actor_id,
+                                                            made_by_other=made_by_other))}
+        link = _mint_reset_link(db, target, base_url, created_by_id=actor_id, made_by_other=made_by_other)
         if not link:
             raise HTTPException(status_code=400, detail="Password reset is not configured on this "
                                 "deployment (LOG_TOKEN_PEPPER is unset).")
@@ -5880,13 +5978,17 @@ def _notify_account_status_changes(db, user, *, by_name, locked=None, active=Non
 def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     """``user`` has just become an administrator, made so by ``by`` (a User, or None for the host
     operator): record who and when, in the caller's transaction, for the two-administrator rule
-    (app/core/admin_grants.py). ``inherited`` is an invitation's kept lineage. Call it only on the
+    (app/core/admin_grants.py), and revoke the open reset links for them that someone who may not make
+    one for an administrator made. ``inherited`` is an invitation's kept lineage. Call it only on the
     change INTO the role."""
     from app.core import admin_grants
     from app.core import credential_changes as cc
     admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
                         granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR),
                         inherited=inherited)
+    # Open reset links for them that a user who manages users made would be refused when used; they are
+    # revoked now (_revoke_reset_links_outranked_by).
+    _revoke_reset_links_outranked_by(db, user, actor=by)
 
 
 def _announce_admin_granted(db, user, *, by_name, how) -> None:
@@ -6261,6 +6363,13 @@ async def get_reset(token: str, request: Request, db: Session = Depends(get_db))
     if r is None:
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     user = db.query(User).filter(User.id == r.user_id).first()
+    if user is not None:
+        # A link someone else made is judged again as its maker and the account stand now: refused
+        # exactly like an unknown one, revoked, and recorded (_reset_link_refusal).
+        reason = _reset_link_refusal(db, r, user)
+        if reason is not None:
+            _refuse_reset_link(db, r, user, reason, ip=ip)
+            raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     return {"username": (user.username if user else None)}
 
 
@@ -6293,10 +6402,18 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     r = _resolve_valid_reset_token(db, token)
     if r is None:
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
-    _validate_password_policy(db, body.new_password)     # 400 on a weak password BEFORE the token is burned
     user = db.query(User).filter(User.id == r.user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    # A link someone else made is judged again as its maker and the account stand now, under a share lock
+    # on both rows until the password is set: refused exactly like an unknown one, revoked, and recorded
+    # (_reset_link_refusal). A promotion made after the link was made is seen here. Judged before the
+    # password is, so a refused link answers as an unknown one whatever password comes with it.
+    reason = _reset_link_refusal(db, r, user, lock=True)
+    if reason is not None:
+        _refuse_reset_link(db, r, user, reason, ip=ip)
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    _validate_password_policy(db, body.new_password)     # 400 on a weak password BEFORE the token is burned
     # Atomic single-use claim: only the request that flips consumed_at proceeds.
     claimed = db.query(PasswordResetToken).filter(
         PasswordResetToken.id == r.id, PasswordResetToken.consumed_at.is_(None)).update(
@@ -24153,6 +24270,10 @@ END $$;""",
             # this adds it on a deployment that ran an earlier build of the device schema. Additive +
             # idempotent; defaults FALSE so every existing device stays un-suspended.
             "ALTER TABLE devices ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE",
+            # Whether another account made a password reset link, so its maker's authority is judged
+            # again when it is used (_reset_link_refusal). Nullable: a row from before it is read from
+            # created_by, and an older release ignores the column.
+            "ALTER TABLE password_reset_tokens ADD COLUMN IF NOT EXISTS made_by_other BOOLEAN",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

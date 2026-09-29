@@ -27,8 +27,8 @@ set_bare_api_env()
 from app.api import api_server as api  # noqa: E402
 from app.core import admin_grants, invitations  # noqa: E402
 from app.core import credential_changes as cc  # noqa: E402
-from app.core.models import (AccountInvitation, AdminGrant, AuditLog, CredentialChange, RoleEnum,  # noqa: E402
-                             SystemSetting, User)
+from app.core.models import (AccountInvitation, AdminGrant, AuditLog, CredentialChange,  # noqa: E402
+                             PasswordResetToken, RoleEnum, SystemSetting, User)
 
 pytestmark = pytest.mark.unit
 
@@ -39,7 +39,9 @@ PEPPER = "p" * 48
 def db():
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'invitations.db'}")
-        for model in (User, AdminGrant, CredentialChange, AuditLog, AccountInvitation, SystemSetting):
+        # PasswordResetToken: making an administrator revokes the open reset links a non-administrator made.
+        for model in (User, AdminGrant, CredentialChange, AuditLog, AccountInvitation, SystemSetting,
+                      PasswordResetToken):
             model.__table__.create(engine)
         session = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
         yield session

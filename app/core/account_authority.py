@@ -18,6 +18,11 @@ and deleting it. Every route that does one of those to someone else's account ei
 interactive administrator outright or asks :func:`refusal` first
 (tests/test_account_authority.py holds the list).
 
+A password reset link is used later, by whoever holds it, and the account it is for may have changed
+by then (made an administrator), or its maker may have (demoted, deactivated, locked, deleted, the
+permission taken away). So a link made for someone else's account is judged again when it is used
+(:func:`link_refusal`), by the same rule, as its maker and the account stand then.
+
 Nothing here touches the database.
 """
 from typing import Optional
@@ -29,6 +34,12 @@ ADMINISTRATOR = "administrator"   # the account is an administrator's, and the c
 HIGHER_ROLE = "higher_role"       # the account's role is above the caller's
 
 _RANK = {RoleEnum.EXTERNAL: 0, RoleEnum.USER: 1, RoleEnum.ADMIN: 2}
+
+# Why a link made for someone else's account no longer stands (link_refusal), besides the two above.
+MAKER_DELETED = "maker_deleted"            # the account that made it no longer exists
+MAKER_INACTIVE = "maker_inactive"          # it was deactivated
+MAKER_LOCKED = "maker_locked"              # an administrator locked it
+MAKER_WITHOUT_PERMISSION = "maker_without_permission"   # it may no longer manage users
 
 DETAILS = {
     ADMINISTRATOR: "Only an administrator can change an administrator's account.",
@@ -72,3 +83,27 @@ def refusal(caller, target) -> Optional[str]:
     if rank(getattr(target, "role", None)) > rank(getattr(caller, "role", None)):
         return HIGHER_ROLE
     return None
+
+
+def link_refusal(maker, target, *, maker_may_manage_users: bool) -> Optional[str]:
+    """Why a password reset link that ``maker`` made for ``target``'s account may not be used now, or
+    None when it may. ``maker`` is the account that made it as it stands now, or None when that account
+    was deleted; ``maker_may_manage_users`` whether it holds the permission to manage users now (an
+    administrator always does). Only for a link someone made for another person's account: one a person
+    asked for themselves, or the server's operator made on the host, is not judged here.
+
+    Authority is judged when the link is made, and again here when it is used: the maker must still be
+    able to make it (an account that exists, is active, is not locked by an administrator, and may manage
+    users) for the account as it is now (:func:`refusal`, so a user who manages users never for an
+    administrator, even one promoted after the link was made). A lock that wrong passwords armed pauses
+    only new sign-ins, and does not count."""
+    from app.services.auth_service import admin_locked
+    if maker is None:
+        return MAKER_DELETED
+    if getattr(maker, "is_active", None) is False:
+        return MAKER_INACTIVE
+    if admin_locked(maker):
+        return MAKER_LOCKED
+    if not maker_may_manage_users:
+        return MAKER_WITHOUT_PERMISSION
+    return refusal(maker, target)
