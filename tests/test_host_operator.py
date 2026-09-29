@@ -77,3 +77,49 @@ def test_the_host_tool_sends_its_signals_before_it_exits(monkeypatch):
     assert audit_signal.enqueue(row_id, "accounts") is True
     _wait_for_background_work(started_before, timeout=3.0)
     assert len(published) == 1 and row_id in published[0]
+
+
+def test_the_host_tool_lists_who_may_manage_users_without_being_an_administrator():
+    # Read-only. An account demoted before 0.33.0 kept the administrator's defaults, stored with no
+    # granter; a permission an administrator granted names them. Administrators themselves are not listed.
+    import tempfile
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.host_operator import user_managers
+    from app.core.models import RoleEnum, User, UserEndpointPermission
+
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'managers.db'}")
+        for model in (User, UserEndpointPermission):
+            model.__table__.create(engine)
+        db = sessionmaker(bind=engine)()
+        people = {}
+        for name, role in (("ada", RoleEnum.ADMIN), ("bob", RoleEnum.USER), ("dana", RoleEnum.USER),
+                           ("carol", RoleEnum.USER), ("xena", RoleEnum.EXTERNAL)):
+            people[name] = User(username=name, email=None, password_hash="x", role=role, is_active=True,
+                                is_locked=False)
+            db.add(people[name])
+        db.commit()
+        rows = [("ada", "USER_MANAGE", None), ("ada", "USER_VIEW", None),     # an administrator's own
+                ("bob", "USER_MANAGE", None), ("bob", "USER_VIEW", None),     # kept after a demotion
+                ("dana", "USER_MANAGE", "ada"), ("dana", "USER_VIEW", "ada"),  # granted on purpose
+                ("carol", "VAULT_VIEW", None),                                 # an ordinary default
+                ("xena", "USER_VIEW", "ada")]
+        for name, group, by in rows:
+            db.add(UserEndpointPermission(user_id=people[name].id, endpoint_group=group,
+                                          granted_by=people[by].id if by else None))
+        db.commit()
+        listed = {a["username"]: a for a in user_managers(db)}
+        db.close()
+        engine.dispose()
+
+    assert sorted(listed) == ["bob", "dana", "xena"]
+    assert [(p["group"], p["granted_by"]) for p in listed["bob"]["permissions"]] == [
+        ("USER_MANAGE", None), ("USER_VIEW", None)]
+    assert [(p["group"], p["granted_by"]) for p in listed["dana"]["permissions"]] == [
+        ("USER_MANAGE", "ada"), ("USER_VIEW", "ada")]
+    assert (listed["xena"]["role"], listed["xena"]["active"]) == ("external", True)
+    assert all(p["granted_at"].endswith("Z") for p in listed["bob"]["permissions"])

@@ -239,6 +239,13 @@ or when reset links are not configured, a temporary password) is shown once on y
 nowhere else. Each change is recorded and audited as the host operator's (`operator@host`), and the
 user is told.
 
+`python dockvault.py accounts --action user-managers` lists, and changes nothing, the accounts that may
+view or manage users without being administrators, with who granted each permission. A change of role
+resets an account's permissions to the new role's defaults, keeping those another administrator granted
+it; before 0.33.0 it did not, so an administrator demoted then kept the permission to manage users, and is
+listed with no granter recorded. Remove what you did not mean to give with the account's Permissions
+button on the Users page.
+
 ### Sealing credentials at rest (optional)
 
 `.env` holds every secret (including `ENCRYPTION_KEY`). You can seal it while the deployment is off:

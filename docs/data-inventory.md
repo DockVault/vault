@@ -220,7 +220,9 @@ the recipients' mailboxes.
   erased.
 - **`python dockvault.py accounts`** on the host: the server's operator can look an account up (its
   email and last sign-in are printed on the host's terminal, and the lookup is not audited, since the
-  operator can read the database anyway) and change it (audited as the host operator).
+  operator can read the database anyway) and change it (audited as the host operator). **New in
+  0.33.0:** it can list the accounts that may view or manage users without being administrators (their
+  usernames, roles, and who granted each permission when), not audited either.
 
 ## The browser
 

@@ -211,3 +211,30 @@ def test_a_refusal_from_the_server_cannot_act_on_the_terminal(app, monkeypatch, 
         app.accounts(_args("--action", "reset-password", "--username", "evil", "--non-interactive"))
     out = capsys.readouterr().out
     assert "No account evil" in out and _no_control(out), repr(out)
+
+
+def test_the_user_managers_listing_only_reads_and_says_how_each_permission_was_given(app, monkeypatch, capsys):
+    # Accounts that may view or manage users without being administrators: an administrator's defaults
+    # kept by an account demoted before 0.33.0 have no granter; a permission granted on purpose names who.
+    tool = _Tool({"user-managers": {"ok": True, "accounts": [
+        {"username": "bob", "role": "user", "active": True, "permissions": [
+            {"group": "USER_MANAGE", "granted_by": None, "granted_at": "2026-08-01T10:00:00Z"},
+            {"group": "USER_VIEW", "granted_by": None, "granted_at": "2026-08-01T10:00:00Z"}]},
+        {"username": HOSTILE, "role": "user", "active": False, "permissions": [
+            {"group": "USER_MANAGE", "granted_by": "alice", "granted_at": "2026-09-01T09:00:00Z"}]}]}})
+    monkeypatch.setattr(app, "_run_account_tool", tool)
+    app.accounts(_args("--action", "user-managers", "--non-interactive"))
+    assert tool.calls == [["user-managers"]], "one read, nothing else"
+    out = capsys.readouterr().out
+    bob = out[out.index("  bob  (user)"):out.index("evil")]
+    assert bob.count("no granter recorded: kept from when the account was an administrator") == 2, bob
+    evil = out[out.index("evil"):]
+    assert "granted by alice on 2026-09-01" in evil and "no granter" not in evil, evil
+    assert "deactivated" in evil and _no_control(out), repr(out)
+    assert app.shown == [], "nothing secret to show"
+
+
+def test_the_user_managers_listing_says_when_there_is_nobody(app, monkeypatch, capsys):
+    monkeypatch.setattr(app, "_run_account_tool", _Tool({"user-managers": {"ok": True, "accounts": []}}))
+    app.accounts(_args("--action", "user-managers", "--non-interactive"))
+    assert "Only administrators may view or manage users." in capsys.readouterr().out

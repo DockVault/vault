@@ -124,3 +124,28 @@ def test_an_unknown_account_is_refused(admin):
     answer = tool("lookup", "--username", "no-such-account-anywhere")
     assert not answer["ok"] and "no account" in answer["error"].lower()
 
+
+def test_the_host_lists_who_may_manage_users_without_being_an_administrator(admin):
+    # An administrator demoted before 0.33.0 kept the administrator's defaults, stored with no granter:
+    # the demotion is made here in the database, as such a release left it. A delegate names who granted.
+    former = admin.create_user(role="admin")
+    delegate = admin.create_user(role="user")
+    try:
+        psql(f"UPDATE users SET role = 'USER' WHERE id = '{former['id']}'")
+        r = admin.post(f"/permissions/users/{delegate['id']}/grant", json={"endpoint_group": "USER_MANAGE"})
+        assert r.status_code == 200, r.text
+        answer = tool("user-managers")
+        assert answer["ok"], answer
+        listed = {a["username"]: a for a in answer["accounts"]}
+        assert [(p["group"], p["granted_by"]) for p in listed[former["_username"]]["permissions"]] == [
+            ("USER_MANAGE", None), ("USER_VIEW", None)]
+        assert [(p["group"], p["granted_by"]) for p in listed[delegate["_username"]]["permissions"]] == [
+            ("USER_MANAGE", admin.user["username"]), ("USER_VIEW", admin.user["username"])]
+        assert all(a["role"] != "admin" for a in answer["accounts"])
+        # A demotion through the routes resets them: the account is no longer listed.
+        psql(f"UPDATE users SET role = 'ADMIN' WHERE id = '{former['id']}'")
+        assert admin.patch(f"/users/{former['id']}", json={"role": "user"}).status_code == 200
+        assert former["_username"] not in {a["username"] for a in tool("user-managers")["accounts"]}
+    finally:
+        admin.delete_user(former["id"])
+        admin.delete_user(delegate["id"])

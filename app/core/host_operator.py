@@ -8,6 +8,7 @@ network::
     python -m app.core.host_operator reset-second-factor --username alice --confirm-username alice
     python -m app.core.host_operator list
     python -m app.core.host_operator approve --request-id <id> --confirm-username alice
+    python -m app.core.host_operator user-managers
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
@@ -31,7 +32,10 @@ import secrets
 import string
 import sys
 
-ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve")
+ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers")
+
+# The permissions an administrator has by default and a user does not: to view and to manage users.
+USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
 
 
 class _Answer(Exception):
@@ -97,6 +101,32 @@ def _describe(db, user):
     }
 
 
+def user_managers(db):
+    """Every account that is not an administrator and holds the permission to view or to manage users,
+    with who granted each and when: ``granted_by`` None means no granter is recorded, which is how an
+    administrator's defaults are stored (an account created as an administrator and demoted before 0.33.0
+    kept them), or a grant whose granter's account was deleted since. Read-only."""
+    from app.core.models import RoleEnum, User, UserEndpointPermission
+    from sqlalchemy.orm import aliased
+    granter = aliased(User)
+    rows = (db.query(User.username, User.role, User.is_active, UserEndpointPermission.endpoint_group,
+                     UserEndpointPermission.granted_at, granter.username)
+            .join(UserEndpointPermission, UserEndpointPermission.user_id == User.id)
+            .outerjoin(granter, granter.id == UserEndpointPermission.granted_by)
+            .filter(User.role != RoleEnum.ADMIN,
+                    UserEndpointPermission.endpoint_group.in_(USER_MANAGEMENT_GROUPS))
+            .order_by(User.username, UserEndpointPermission.endpoint_group).all())
+    accounts = {}
+    for username, role, active, group, granted_at, granted_by in rows:
+        account = accounts.setdefault(username, {
+            "username": username, "role": role.value if role is not None else None,
+            "active": bool(active), "permissions": []})
+        account["permissions"].append({
+            "group": group, "granted_by": granted_by,
+            "granted_at": granted_at.replace(tzinfo=None).isoformat() + "Z" if granted_at else None})
+    return list(accounts.values())
+
+
 def _find(db, username):
     from app.core.models import User
     return db.query(User).filter(User.username == username).first()
@@ -156,6 +186,9 @@ def _run(args, api) -> int:
                 User.id.in_([r.target_user_id for r in rows])).all()) if rows else {}
             return _answer({"ok": True, "requests": [
                 api._credential_request_dict(r, names.get(r.target_user_id)) for r in rows]})
+
+        if args.action == "user-managers":
+            return _answer({"ok": True, "accounts": user_managers(db)})
 
         if args.action == "approve":
             if not args.request_id:
