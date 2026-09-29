@@ -154,6 +154,9 @@ def test_ids_are_lowercased_before_they_are_bound():
     {"nonce_b64": "not base64!"}, {"user_id": "not-a-uuid"}, {"vault_id": "0a1b2c3d4e5f40618273849"},
     {"dek_epoch": -1}, {"team_epoch": 2 ** 32}, {"dek_epoch": True},
     {"identity_public_key": "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"},
+    {"challenge_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301\n"},
+    {"user_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301\n"},
+    {"vault_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301\n"},
 ])
 def test_a_malformed_transcript_input_is_refused_as_malformed(override):
     v = _vector()
@@ -272,10 +275,15 @@ def _mac43():
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.-",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.-.-.-",
     "v1.not-a-challenge-id.{m}.-.-",
+    "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301\n.{m}.-.-",
+    "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}\n.-.-",
+    "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.{m}\n.-",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.-.-.-",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}=.-.-",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.+{m}.-",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.{short}.-",
+    "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}A.-.-",
+    "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.-.{m}AB",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{noncanon}.-.-",
     "v1.3f2504e0-4f89-11d3-9a0c-0305e82c3301.{m}.-.-" + "x" * 300,
 ])
@@ -713,6 +721,15 @@ def test_a_team_vault_lineage_tag_needs_the_team_wrap():
 """)
     assert out == {"right": "NONE", "missing": "INVALID_INPUT", "none": "INVALID_INPUT", "empty": "INVALID_INPUT",
                    "verify": {"missing": False, "none": False, "empty": False}}
+
+
+def test_the_reference_binds_only_a_whole_uuid():
+    """Ids are bound as exactly 36 characters: one with a trailing newline is refused, not bound as 37."""
+    vid = _vector()["inputs"]["vault_id"]
+    assert len(ref.uuid_bytes(vid.upper())) == 36
+    for value in (vid + "\n", vid + " ", "\n" + vid):
+        with pytest.raises(ValueError):
+            ref.uuid_bytes(value)
 
 
 @pytest.mark.parametrize("wrap", [None, ""])

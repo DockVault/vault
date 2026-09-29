@@ -68,13 +68,13 @@ _ZERO32 = bytes(32)
 
 # ---------------------------------------------------------------------------------- encodings
 
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def uuid_bytes(value) -> bytes:
     """A UUID as its 36-byte lowercase hyphenated ASCII form."""
     s = str(value).lower()
-    if not _UUID.match(s):
+    if not _UUID.fullmatch(s):
         raise ValueError("not a canonical UUID")
     return s.encode("ascii")
 

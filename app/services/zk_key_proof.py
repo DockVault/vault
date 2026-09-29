@@ -81,8 +81,9 @@ _MAC_BYTES = 32
 _MAX_HEADER_CHARS = 256
 _MAX_PEM_CHARS = 4096
 
-_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-_B64URL_MAC = re.compile(r"^[A-Za-z0-9_-]{43}$")
+# Applied with fullmatch: `$` alone would also accept a trailing newline, and an id is bound at a fixed width.
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_B64URL_MAC = re.compile(r"[A-Za-z0-9_-]{43}")
 _Z = b"\x00"
 _ZERO32 = bytes(32)
 
@@ -240,7 +241,7 @@ def validate_mac32(value, name: str) -> bytes:
 def _mac_field(text: str, required: bool) -> Optional[bytes]:
     if text == "-" and not required:
         return None
-    if not _B64URL_MAC.match(text):
+    if not _B64URL_MAC.fullmatch(text):
         raise MalformedProof("a MAC in the proof header is malformed")
     raw = base64.urlsafe_b64decode(text + "=")
     if base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") != text:
@@ -258,7 +259,7 @@ def parse_header(value) -> ProofHeader:
     parts = value.strip().split(".")
     if len(parts) != 5 or parts[0] != HEADER_VERSION:
         raise MalformedProof("the proof header is malformed")
-    if not _UUID.match(parts[1]):
+    if not _UUID.fullmatch(parts[1]):
         raise MalformedProof("the proof header's challenge id is malformed")
     return ProofHeader(
         challenge_id=parts[1].lower(),
@@ -272,7 +273,7 @@ def parse_header(value) -> ProofHeader:
 
 def _uuid_ascii(value, name: str) -> bytes:
     s = str(value)
-    if not _UUID.match(s):
+    if not _UUID.fullmatch(s):
         raise MalformedProof(f"{name} is not a UUID")
     return s.lower().encode("ascii")
 
