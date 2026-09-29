@@ -61,9 +61,9 @@ cvss4 = _load_cvss4()
 # - the documentation site, which reads main's copy at request time: 512 KiB.
 # A reader handed a larger file falls back silently and loses every advisory with it, so the cap
 # keeps a 64 KiB margin below the smallest of them, and the test's warning line (three quarters of
-# this cap) comes well before the cap itself. 256 KiB until 0.33.0, whose advisories took the file
-# to about 223 KB. That is still small enough that a runaway or hostile file cannot make the parser
-# the problem.
+# this cap) comes well before the cap itself. 256 KiB until 0.33.0, whose eight advisories took the
+# file to about 284 KB. That is still small enough that a runaway or hostile file cannot make the
+# parser the problem.
 MAX_BYTES = 448 * 1024
 # 2 adds a required per-version `support` block (lifecycle: end-of-life, security posture, and
 # optional extended-support end dates). A schema_version-1 file has no such block and would leave

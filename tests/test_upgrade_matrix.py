@@ -632,8 +632,8 @@ def test_the_committed_matrix_stays_well_inside_what_its_readers_will_read():
     # adds about 10 KB. The warning line is three quarters of the validator's cap, which still leaves
     # a margin before a release is refused.
     #
-    # The cap was raised once, from 256 to 448 KiB in 0.33.0, when that release's four advisories
-    # took the file to about 223 KB, past the old line. That raise was safe because it stays below
+    # The cap was raised once, from 256 to 448 KiB in 0.33.0, when that release's eight advisories
+    # took the file to about 284 KB, past the old cap. That raise was safe because it stays below
     # every reader: the smallest limit any supported reader has is 512 KiB, so a file the validator
     # passes is still one they all read, with 64 KiB to spare. There is no such room for another:
     # past 448 KiB the next step is the format change (references that carry only the advisory id,
@@ -642,8 +642,8 @@ def test_the_committed_matrix_stays_well_inside_what_its_readers_will_read():
     size = MATRIX_PATH.stat().st_size
     assert size < um.MAX_BYTES * 3 // 4, f"docs/upgrade-matrix.json is {size} bytes"
     # The cap itself stays below the smallest reader's limit, or the validator would pass a file a
-    # deployed reader drops; and the file 0.33.0 publishes (about 223 KB with its advisories, drafted
-    # and validated before the release) sits inside the warning line, with room for a few more.
+    # deployed reader drops; and the file 0.33.0 publishes (about 284 KB with its advisories) sits
+    # inside the warning line, with room for a few more.
     assert um.MAX_BYTES <= 512 * 1024 - 64 * 1024
     assert 240_000 < um.MAX_BYTES * 3 // 4
 
