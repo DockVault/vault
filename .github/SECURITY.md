@@ -7,15 +7,15 @@ project — and of everyone who self-hosts it — seriously.
 
 | Version | Security fixes |
 |---|---|
-| The latest release | Yes |
+| 0.33.x, the latest line | Yes |
 | The minor line before the latest, 0.33.x and later lines only | Yes, until six months after the next minor release ships |
-| Anything else, including 0.32.x once 0.33.0 ships | No. Upgrade to the latest release. |
+| 0.32.x and earlier | No. Upgrade to the latest release. |
 
-Until 0.33.0 ships, security fixes go to the latest release only, and 0.32.x receives none after
-that. Starting with 0.33, each minor release line (0.33.x, 0.34.x, ...) receives security fixes
-until six months after the next minor release ships, so for a while two lines are supported: the
-latest and the one before it. (The README's "minimum supported version" is a different thing: the
-oldest release `dockvault.py update` can upgrade from.)
+0.33.0 is the first release with a support period. Each minor release line from 0.33 on (0.33.x,
+0.34.x, ...) receives security fixes until six months after the next minor release ships, so for a
+while two lines are supported: the latest and the one before it. 0.32.x and earlier receive no
+more security fixes. (The README's "minimum supported version" is a different thing: the oldest
+release `dockvault.py update` can upgrade from.)
 
 Security fixes ship as patch releases. Every fixed vulnerability is published as an advisory,
 with a CVSS v4 score, in the upgrade matrix (`docs/upgrade-matrix.json`), which marks each
