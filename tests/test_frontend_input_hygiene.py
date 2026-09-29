@@ -18,6 +18,7 @@ from conftest import unique
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
 APP_JS = (STATIC / "js" / "app.js").read_text(encoding="utf-8", errors="ignore")
+ACTIVITY_JS = (STATIC / "js" / "activity.js").read_text(encoding="utf-8", errors="ignore")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -105,11 +106,18 @@ def test_hostile_origin_gets_no_cors_grant(admin):
 # Client-side output encoding (shipped app.js source)
 # --------------------------------------------------------------------------------------------------
 def test_audit_log_serialised_details_are_escaped():
-    # The audit-event modal renders the serialised details blob into a <pre> via textContent (never
-    # innerHTML/string interpolation), so an attacker-influenced value carried in a low-priv name
-    # cannot inject markup into an admin's session.
-    assert "pre.textContent = JSON.stringify(log.details" in APP_JS
-    assert "<pre class=\"text-xs mt-sm\">${JSON.stringify(log.details" not in APP_JS
+    # The Activity page's event detail renders the serialised details blob into a <pre> through el(),
+    # which sets textContent (never innerHTML or string interpolation), so an attacker-influenced value
+    # carried in a low-priv name cannot inject markup into an admin's session. The page builds all of
+    # its markup that way.
+    assert ACTIVITY_JS.count("if (hasDetails) det.appendChild(el('pre', 'act-d-json', json));") == 1
+    start = ACTIVITY_JS.index("function el(tag, cls, text) {")
+    helper = ACTIVITY_JS[start:ACTIVITY_JS.index("function icon(", start)]
+    assert "if (text != null) e.textContent = text;" in helper
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+        assert sink not in ACTIVITY_JS, sink
+    # The old Settings audit tab, which rendered the same blob, is gone from app.js.
+    assert "JSON.stringify(log.details" not in APP_JS
 
 
 def test_dashboard_feed_username_and_action_escaped():
