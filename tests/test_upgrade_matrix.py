@@ -15,8 +15,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -62,11 +64,126 @@ def _valid():
 
 # --- the committed file ------------------------------------------------------------------------
 
+# --- reading the repository ----------------------------------------------------------------------
+#
+# The same tests run on main and on a maintenance branch release/X.Y, whose matrix is main's plus its
+# own newest entry. These helpers are what lets one set of rules hold on both.
+
+_RELEASE_TAG = re.compile(r"v((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2})", re.ASCII)
+_ADDED_VERSION = re.compile(r"^\+((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2})\s*$", re.M)
+
+
+def _vkey(version: str) -> tuple[int, int, int]:
+    major, minor, patch = (int(part) for part in version.split("."))
+    return major, minor, patch
+
+
+def _git_out(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, timeout=60)
+
+
+def _released_versions(root: Path) -> list[str]:
+    """The released versions, from the vX.Y.Z tags in this checkout, in version order."""
+    tags = _git_out(root, "tag", "-l", "v*.*.*")
+    # A git that FAILED is not a checkout without tags, and folding them together reproduces the
+    # very mistake this check was written to fix -- one level down. `git tag -l` does not fail on a
+    # repository with no tags; it prints nothing and exits 0. A non-zero exit means something else
+    # is wrong, everywhere, so it fails everywhere.
+    assert tags.returncode == 0, (
+        "git tag -l failed, which is not the same as having no tags: %s"
+        % (tags.stderr or "").strip()[:200])
+    found = (_RELEASE_TAG.fullmatch(name) for name in tags.stdout.split())
+    return sorted({m.group(1) for m in found if m}, key=_vkey)
+
+
+def _versions_in_history(root: Path) -> set[str]:
+    """Every version the VERSION file has held in this commit's own history, this commit included.
+
+    A release candidate can be built on another that is not tagged yet: 0.34.0's candidate on top of
+    0.33.2's, when both ship the same day. The earlier one's entry is then declared but has no tag,
+    and it is not the VERSION of this commit either -- it is the VERSION of an ancestor.
+    """
+    log = _git_out(root, "log", "--format=", "-p", "--no-color", "--no-ext-diff", "--", "VERSION")
+    assert log.returncode == 0, "git log failed: %s" % (log.stderr or "").strip()[:200]
+    return set(_ADDED_VERSION.findall(log.stdout))
+
+
+def _is_shallow(root: Path) -> bool:
+    return _git_out(root, "rev-parse", "--is-shallow-repository").stdout.strip() == "true"
+
+
+def _released_ceiling(preparing: str, released: list[str]) -> str:
+    """The newest released version a fix may name: the highest of VERSION and the tags.
+
+    On main that is VERSION. On a maintenance branch VERSION is on an older line, while the matrix,
+    synced from main, names fixes released on newer lines.
+    """
+    return max([preparing, *released], key=_vkey)
+
+
+def _undeclared(released: list[str], declared, preparing: str) -> tuple[list[str], list[str]]:
+    """Released versions the matrix does not declare: (failures, warnings).
+
+    On main every one is a failure: main's matrix is the one the site and every reader use, and it
+    must not lag. On a maintenance branch -- VERSION on an older line than the newest release -- a
+    release of a newer line is only a warning: it is declared on main, and this branch takes main's
+    matrix at its next release. The release gate is strict everywhere.
+    """
+    newest_line = max(_vkey(v)[:2] for v in [preparing, *released])
+    on_maintenance_branch = _vkey(preparing)[:2] < newest_line
+    failures, warnings_ = [], []
+    for version in released:
+        if version in declared:
+            continue
+        if on_maintenance_branch and _vkey(version)[:2] > _vkey(preparing)[:2]:
+            warnings_.append(version)
+        else:
+            failures.append(version)
+    return failures, warnings_
+
+
+def _unreachable(data: dict, released: list[str]) -> list[str]:
+    """Released, declared versions with no takeable route in, each with the reason.
+
+    The gate's rule is an edge from the version-order predecessor. A maintenance release made after
+    the next minor makes itself that minor's predecessor, and no honest edge leads from it into a
+    release that predates its fix; the validator's backport rule then asks for an edge from some
+    release no later than it instead, and so does this.
+    """
+    versions = data["versions"]
+    ordered = sorted(versions, key=_vkey)
+    edges = data.get("edges", [])
+    problems = []
+    for version in released:
+        if version not in versions:
+            continue
+        index = ordered.index(version)
+        previous = ordered[index - 1] if index else None
+        if previous is not None and versions[previous]["released"] > versions[version]["released"]:
+            if not any(e["to"] == version and e["kind"] != "blocked"
+                       and versions[e["from"]]["released"] <= versions[version]["released"]
+                       for e in edges):
+                problems.append(f"{version}: no route in from a release made before it")
+            continue
+        try:
+            um.assert_release_declared(data, version)
+        except um.UpgradeMatrixError as exc:
+            problems.append(f"{version}: {exc}")
+    return problems
+
+
+def _phantoms(declared, released: list[str], pending: set[str]) -> list[str]:
+    """Declared versions that are neither released nor pending in this commit's history."""
+    return sorted((v for v in declared if v not in released and v not in pending), key=_vkey)
+
+
 def test_the_committed_matrix_is_valid():
-    # Against the real VERSION file: on main that is the newest released version, so a vulnerability
-    # naming an unreleased `fixed_in` would be caught here on an ordinary push, not only at release.
+    # Against the newest released version: on main that is the VERSION file, so a vulnerability
+    # naming an unreleased `fixed_in` is caught here on an ordinary push, not only at release. On a
+    # maintenance branch it is the newest tag, since the matrix there names newer lines' fixes too.
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    um.validate_matrix(um.load_matrix(MATRIX_PATH), released_ceiling=version)
+    ceiling = _released_ceiling(version, _released_versions(ROOT))
+    um.validate_matrix(um.load_matrix(MATRIX_PATH), released_ceiling=ceiling)
 
 
 def test_every_one_way_edge_in_the_committed_matrix_asks_for_a_backup():
@@ -88,16 +205,8 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
     A hand-copied list would drift the moment a release is cut, and would then agree with a matrix
     that had drifted the same way.
     """
-    tags = subprocess.run(
-        ["git", "tag", "-l", "v*.*.*"], cwd=ROOT, capture_output=True, text=True, timeout=60)
-    # A git that FAILED is not a checkout without tags, and folding them together reproduces the
-    # very mistake this check was written to fix -- one level down. `git tag -l` does not fail on a
-    # repository with no tags; it prints nothing and exits 0. A non-zero exit means something else
-    # is wrong, everywhere, so it fails everywhere.
-    assert tags.returncode == 0, (
-        "git tag -l failed, which is not the same as having no tags: %s"
-        % (tags.stderr or "").strip()[:200])
-    if not tags.stdout.strip():
+    released = _released_versions(ROOT)
+    if not released:
         # Skipping here is only acceptable on a developer's partial checkout. In CI it means the
         # check did not run in the job that gates publication -- which is exactly how this test
         # spent its first day doing nothing: the default checkout is shallow and tagless, so
@@ -108,19 +217,21 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
                 "fetch-tags; a silent skip here removes the only guard on the matrix matching the "
                 "releases that exist")
         pytest.skip("no release tags in this checkout")
-    released = sorted(
-        (line[1:] for line in tags.stdout.split() if line.startswith("v")),
-        key=lambda v: tuple(int(p) for p in v.split(".")))
+    preparing = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
     data = um.validate_matrix(um.load_matrix(MATRIX_PATH), released_ceiling=None)
-    missing = [v for v in released if v not in data["versions"]]
+    missing, elsewhere = _undeclared(released, data["versions"], preparing)
     assert not missing, (
         f"released but undeclared in docs/upgrade-matrix.json: {missing}. The release gate would "
         "have refused these; they predate it, so add them")
+    if elsewhere:
+        warnings.warn(
+            f"releases of newer lines not yet in this branch's matrix: {elsewhere}. main declares "
+            "them; take main's matrix before this branch's next release")
 
     # And each is reachable, which is the assertion the gate itself makes.
-    for version in released:
-        um.assert_release_declared(data, version)
+    unreachable = _unreachable(data, released)
+    assert not unreachable, f"released versions with no route in: {unreachable}"
 
     # The converse, which matters more than it looks. Adjacency completeness is satisfied by any
     # chain of entries, so a version that was never released could be invented to bridge a gap --
@@ -131,18 +242,24 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
     # exist, but the validator runs without a guaranteed view of the tag list, and a check that
     # silently passes when it cannot see tags would be worse than no check.
     #
-    # The version in VERSION is exempt: a release-prep commit bumps it and adds the matrix entry
-    # together, and the tag only appears afterwards. Without the exemption the two rules deadlock --
-    # the gate refuses to cut a version the matrix does not declare, and this refuses a declared
-    # version that is not yet tagged, so main would be red for the whole window between the two.
-    # It holds only if the bump and the entry land in the same commit, which is what release prep
-    # does and what the gate independently enforces at tag time by comparing tag to VERSION.
-    preparing = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    phantom = [v for v in data["versions"] if v not in released and v != preparing]
+    # A version being prepared is exempt: a release-prep commit bumps VERSION and adds the matrix
+    # entry together, and the tag only appears afterwards. Without the exemption the two rules
+    # deadlock -- the gate refuses to cut a version the matrix does not declare, and this refuses a
+    # declared version that is not yet tagged, so main would be red for the whole window between the
+    # two. "Being prepared" is this commit's VERSION or any VERSION in its history: two releases cut
+    # the same day are prepared as two candidates, the later built on the earlier, and each must pass
+    # CI before either is tagged. The release gate stays strict; it exempts only the tag it cuts.
+    pending = _versions_in_history(ROOT) | {preparing}
+    phantom = _phantoms(data["versions"], released, pending)
+    if phantom and _is_shallow(ROOT):
+        pytest.fail(
+            f"docs/upgrade-matrix.json declares {phantom}, which are not released tags, and this "
+            "checkout is shallow, so whether they are pending in this commit's history cannot be "
+            "told. The checkout needs its history (fetch-depth: 0)")
     assert not phantom, (
-        f"docs/upgrade-matrix.json declares {phantom}, which are not released tags and are not the "
-        f"version being prepared ({preparing}). A version that does not exist can satisfy the "
-        "adjacency rule while describing a release nobody can get")
+        f"docs/upgrade-matrix.json declares {phantom}, which are not released tags and not a "
+        f"version prepared in this commit's history ({preparing} now). A version that does not "
+        "exist can satisfy the adjacency rule while describing a release nobody can get")
 
 
 def test_the_committed_matrix_declares_every_released_edge_direct():
@@ -1111,3 +1228,124 @@ def test_the_release_workflow_does_not_redirect_the_gate_to_another_file():
     assert "--upgrade-matrix" not in workflow, (
         "release.yml now points the gate at a specific matrix path; make sure it is the same file "
         "the staging step copies, or the published asset is not the one that was validated")
+
+
+# --- the same tests on main and on a maintenance branch ------------------------------------------
+
+
+def _history_repo(tmp_path: Path, versions: list[str], *, tags: tuple[str, ...] = ()) -> Path:
+    """A repository whose VERSION held each of `versions` in turn, one commit each."""
+    root = tmp_path / "history"
+    root.mkdir()
+    for args in (("init", "-q", "-b", "main"), ("config", "user.name", "t"),
+                 ("config", "user.email", "t@example.invalid"), ("config", "commit.gpgsign", "false"),
+                 ("config", "core.autocrlf", "false")):
+        assert _git_out(root, *args).returncode == 0
+    for version in versions:
+        (root / "VERSION").write_bytes(f"{version}\n".encode())
+        assert _git_out(root, "add", "VERSION").returncode == 0
+        assert _git_out(root, "commit", "-q", "-m", version).returncode == 0
+        if version in tags:
+            assert _git_out(root, "tag", f"v{version}").returncode == 0
+    return root
+
+
+def test_a_version_pending_in_this_commits_history_is_not_a_phantom(tmp_path):
+    """The later of two same-day candidates declares the earlier one, not yet tagged."""
+    root = _history_repo(tmp_path, ["0.33.0", "0.33.1", "0.34.0"], tags=("0.33.0",))
+
+    assert _versions_in_history(root) == {"0.33.0", "0.33.1", "0.34.0"}
+    assert _released_versions(root) == ["0.33.0"]
+    assert _phantoms(["0.33.0", "0.33.1", "0.34.0"], _released_versions(root),
+                     _versions_in_history(root)) == []
+    # A version no commit in this history ever prepared is still a phantom.
+    assert _phantoms(["0.33.0", "0.33.1", "0.33.5", "0.34.0"], _released_versions(root),
+                     _versions_in_history(root)) == ["0.33.5"]
+
+
+def test_a_version_prepared_only_on_another_branch_is_a_phantom(tmp_path):
+    root = _history_repo(tmp_path, ["0.33.0"], tags=("0.33.0",))
+    assert _git_out(root, "checkout", "-q", "-b", "other").returncode == 0
+    (root / "VERSION").write_bytes(b"0.33.9\n")
+    assert _git_out(root, "commit", "-qam", "elsewhere").returncode == 0
+    assert _git_out(root, "checkout", "-q", "main").returncode == 0
+
+    assert "0.33.9" not in _versions_in_history(root)
+    assert _phantoms(["0.33.0", "0.33.9"], ["0.33.0"], _versions_in_history(root)) == ["0.33.9"]
+
+
+def test_tags_that_are_not_releases_are_not_read_as_releases(tmp_path):
+    root = _history_repo(tmp_path, ["0.33.0"], tags=("0.33.0",))
+    for name in ("v0.34.0-rc1", "v0.34", "v00.1.0", "other"):
+        assert _git_out(root, "tag", name).returncode == 0
+
+    assert _released_versions(root) == ["0.33.0"]
+
+
+def test_a_fix_on_a_newer_line_is_within_the_ceiling_on_a_maintenance_branch():
+    """On release/0.33, VERSION is 0.33.3 while main's synced matrix names a fix released in 0.34.1."""
+    assert _released_ceiling("0.33.3", ["0.33.2", "0.34.0", "0.34.1"]) == "0.34.1"
+    assert _released_ceiling("0.35.0", ["0.33.2", "0.34.1"]) == "0.35.0"
+    assert _released_ceiling("0.35.0", []) == "0.35.0"
+
+
+def test_an_undeclared_release_fails_on_main_and_a_newer_lines_warns_on_a_maintenance_branch():
+    declared = {"0.33.0", "0.33.1", "0.34.0"}
+
+    # main: VERSION is on the newest line, so anything undeclared fails.
+    assert _undeclared(["0.33.0", "0.33.1", "0.33.2", "0.34.0"], declared, "0.34.1") == (
+        ["0.33.2"], [])
+    # release/0.33: a newer line's release is main's to declare first, so it only warns...
+    assert _undeclared(["0.33.0", "0.33.1", "0.34.0", "0.34.1"], declared, "0.33.2") == (
+        [], ["0.34.1"])
+    # ...but a release of its own line, or an older one, still fails.
+    assert _undeclared(["0.32.9", "0.33.0", "0.33.1", "0.34.0"], declared, "0.33.2") == (
+        ["0.32.9"], [])
+    assert _undeclared(["0.33.0", "0.33.1", "0.33.2", "0.34.0"], declared, "0.33.3") == (
+        ["0.33.2"], [])
+
+
+def test_a_minor_after_a_later_maintenance_release_is_still_reachable():
+    """Once 0.2.1 ships on the 0.2 line after 0.3.0, 0.3.0's version-order predecessor is 0.2.1, and
+    no honest edge leads from it into 0.3.0. The route in from 0.2.0 still counts."""
+    data = _valid()
+    data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
+    data["versions"]["0.2.1"] = {"released": "2026-01-04", "notes": "patch", "support": _support()}
+    data["edges"] += [
+        {"from": "0.2.0", "to": "0.3.0", "kind": "direct", "reversible": True,
+         "requires_backup": False},
+        {"from": "0.2.0", "to": "0.2.1", "kind": "direct", "reversible": True,
+         "requires_backup": False},
+    ]
+    um.validate_matrix(data, released_ceiling=None)
+
+    assert _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"]) == []
+
+    # Without that route, it is not reachable, and says so -- an edge from the later patch into a
+    # release that predates its fix is not a route in either.
+    data["edges"] = [e for e in data["edges"] if (e["from"], e["to"]) != ("0.2.0", "0.3.0")]
+    assert [p.split(":")[0] for p in _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"])] == [
+        "0.3.0"]
+    data["edges"].append({"from": "0.2.1", "to": "0.3.0", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
+    assert [p.split(":")[0] for p in _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"])] == [
+        "0.3.0"]
+
+
+def test_an_ordinary_release_with_no_edge_in_is_unreachable():
+    data = _valid()
+    data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
+
+    assert [p.split(":")[0] for p in _unreachable(data, ["0.1.0", "0.2.0", "0.3.0"])] == ["0.3.0"]
+
+
+def test_the_suites_that_read_the_matrix_check_out_history():
+    """The pending-version exemption reads VERSION's history, so the jobs that run this file check
+    out with history, not only tags. A shallow checkout fails the check rather than skipping it."""
+    workflows = ROOT / ".github" / "workflows"
+    for name, marker in (("preflight.yml", "actions/checkout@"),
+                         ("fast-tests.yml", "actions/checkout@"),
+                         ("tests.yml", "  integration:")):
+        text = (workflows / name).read_text(encoding="utf-8")
+        checkout = text.split(marker, 1)[1].split("- name:", 1)[0]
+        assert "fetch-depth: 0" in checkout, name
