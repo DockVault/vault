@@ -279,12 +279,16 @@ def test_setup_never_writes_the_escape(monkeypatch, env):
 # --- the host tool, going back ---------------------------------------------------------------------
 
 def _matrix():
+    """0.33.0 has no reader; 0.33.1, the first release with one, and 0.34.0 do."""
     return {
         "schema_version": 3, "about": "test", "kinds": {"direct": "a", "blocked": "b"},
         "advisories": {},
-        "versions": {"0.1.0": {"released": "2026-01-01", "notes": "a"},
-                     "0.2.0": {"released": "2026-01-02", "notes": "b"}},
-        "edges": [{"from": "0.1.0", "to": "0.2.0", "kind": "direct", "reversible": True,
+        "versions": {"0.33.0": {"released": "2026-01-01", "notes": "a"},
+                     "0.33.1": {"released": "2026-01-02", "notes": "b"},
+                     "0.34.0": {"released": "2026-01-03", "notes": "c"}},
+        "edges": [{"from": "0.33.0", "to": "0.33.1", "kind": "direct", "reversible": True,
+                   "requires_backup": False},
+                  {"from": "0.33.1", "to": "0.34.0", "kind": "direct", "reversible": True,
                    "requires_backup": False}],
     }
 
@@ -293,7 +297,7 @@ class _Deployment:
     """A deployment at `running`, with the compose, backup and health calls stubbed and every
     `docker compose` call recorded. `ask` answers the host operator's downgrade-blockers action."""
 
-    def __init__(self, tmp_path, monkeypatch, *, running="0.2.0", ask=None, source="the running container",
+    def __init__(self, tmp_path, monkeypatch, *, running="0.34.0", ask=None, source="the running container",
                  env_extra=""):
         self.dv = dv = _dockvault()
         monkeypatch.setattr(dv, "tighten_secret_file", lambda _p: True)
@@ -352,7 +356,7 @@ def _not_offered(_args):
         "'list')\n"))
 
 
-_HOLD = {"key": "legal-holds", "requires_at_least": "0.2.0", "reason": "keeps records under a hold",
+_HOLD = {"key": "legal-holds", "requires_at_least": "0.34.0", "reason": "keeps records under a hold",
          "undo": "release the holds"}
 
 
@@ -361,14 +365,15 @@ def test_going_back_asks_the_running_version_and_refuses_while_something_is_in_t
     deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]))
 
     with pytest.raises(SystemExit):
-        deployment.update("v0.1.0")
+        deployment.update("v0.33.1")
 
     out = capsys.readouterr().out
     assert deployment.asked() == [("exec", "-T", "vault", "python", "-m", "app.core.host_operator",
-                                   "downgrade-blockers", "--target", "0.1.0")]
-    assert "0.2.0 has changed this deployment's data in a way v0.1.0 cannot read" in out
-    assert "keeps records under a hold (needs 0.2.0 or later)" in out
-    assert "undo it first, with 0.2.0 running: release the holds" in out
+                                   "downgrade-blockers", "--target", "0.33.1")]
+    assert "0.34.0 has changed this deployment's data in a way v0.33.1 cannot read" in out
+    assert "keeps records under a hold (needs 0.34.0 or later)" in out
+    assert "undo it first, with 0.34.0 running: release the holds" in out
+    assert "v0.33.1 would refuse to start on this data" in out
     assert "--force-downgrade" in out and "ALLOW_START_ON_NEWER_DATA=true" in out
     assert deployment.image() == deployment.dv.LOCAL_IMAGE, "the downgrade went ahead"
 
@@ -376,48 +381,90 @@ def test_going_back_asks_the_running_version_and_refuses_while_something_is_in_t
 def test_going_back_can_be_forced_and_says_what_the_older_image_will_do(tmp_path, monkeypatch, capsys):
     deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]))
 
-    deployment.update("v0.1.0", force_downgrade=True)
+    deployment.update("v0.33.1", force_downgrade=True)
 
-    assert "refuses to start on this data unless ALLOW_START_ON_NEWER_DATA=true" in capsys.readouterr().out
-    assert deployment.image().endswith(":v0.1.0")
+    assert ("v0.33.1 refuses to start on this data unless ALLOW_START_ON_NEWER_DATA=true"
+            in capsys.readouterr().out)
+    assert deployment.image().endswith(":v0.33.1")
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_going_back_to_a_version_without_the_check_is_refused_even_when_forced(
+        tmp_path, monkeypatch, capsys, forced):
+    """0.33.0 has no check: it starts on this data regardless, and may delete or change what the
+    running version keeps. Nothing but this tool stands in the way, so nothing forces it past."""
+    deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]))
+
+    with pytest.raises(SystemExit):
+        deployment.update("v0.33.0", force_downgrade=forced)
+
+    out = capsys.readouterr().out
+    assert "0.34.0 has changed this deployment's data in a way v0.33.0 cannot read" in out
+    assert "undo it first, with 0.34.0 running: release the holds" in out
+    assert ("v0.33.0 is older than 0.33.1, the first version that checks for this: it would start on "
+            "this data regardless, and may delete or change what 0.34.0 keeps") in out
+    assert "--force-downgrade does not go back to a version older than 0.33.1" in out
+    assert "refuse to start" not in out and "refuses to start" not in out
+    assert "ALLOW_START_ON_NEWER_DATA" not in out, "the setting does nothing on a version without the check"
+    assert deployment.image() == deployment.dv.LOCAL_IMAGE, "the downgrade went ahead"
 
 
 def test_going_back_with_nothing_in_the_way_goes_ahead(tmp_path, monkeypatch):
     deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([]))
 
-    deployment.update("v0.1.0")
+    deployment.update("v0.33.0")
 
     assert len(deployment.asked()) == 1
-    assert deployment.image().endswith(":v0.1.0")
+    assert deployment.image().endswith(":v0.33.0")
 
 
 def test_a_running_version_without_the_action_is_not_a_problem(tmp_path, monkeypatch, capsys):
     """Every release before the one that adds the action wrote nothing an older one cannot read."""
     deployment = _Deployment(tmp_path, monkeypatch, ask=_not_offered)
 
-    deployment.update("v0.1.0")
+    deployment.update("v0.33.0")
 
     out = capsys.readouterr().out
     assert len(deployment.asked()) == 1, "asked once, of the first service that answered"
     assert "Could not ask" not in out
-    assert deployment.image().endswith(":v0.1.0")
+    assert deployment.image().endswith(":v0.33.0")
+
+
+def _cannot_be_asked(_args):
+    return argparse.Namespace(returncode=1, stdout="", stderr="service \"vault\" is not running")
 
 
 def test_a_deployment_that_cannot_be_asked_is_said_so(tmp_path, monkeypatch, capsys):
-    deployment = _Deployment(tmp_path, monkeypatch, ask=lambda _a: argparse.Namespace(
-        returncode=1, stdout="", stderr="service \"vault\" is not running"))
+    deployment = _Deployment(tmp_path, monkeypatch, ask=_cannot_be_asked)
 
-    deployment.update("v0.1.0")
+    deployment.update("v0.33.1")
 
     out = capsys.readouterr().out
     assert [c[2] for c in deployment.asked()] == ["vault", "vault-api"]
-    assert "Could not ask the running deployment whether v0.1.0 can read its data" in out
-    assert deployment.image().endswith(":v0.1.0")
+    assert ("Could not ask the running deployment whether v0.33.1 can read its data. If it cannot, "
+            "v0.33.1 refuses to start and says how to undo the change.") in out
+    assert deployment.image().endswith(":v0.33.1")
+
+
+def test_a_deployment_that_cannot_be_asked_about_a_version_without_the_check_is_told_what_that_risks(
+        tmp_path, monkeypatch, capsys):
+    deployment = _Deployment(tmp_path, monkeypatch, ask=_cannot_be_asked)
+
+    deployment.update("v0.33.0")
+
+    out = capsys.readouterr().out
+    assert ("Could not ask the running deployment whether v0.33.0 can read its data. v0.33.0 is older "
+            "than 0.33.1, the first version that checks for this: if 0.34.0 changed the data in a way "
+            "v0.33.0 cannot read, v0.33.0 starts anyway and may delete or change what 0.34.0 keeps."
+            ) in out
+    assert "refuses to start" not in out
+    assert deployment.image().endswith(":v0.33.0")
 
 
 @pytest.mark.parametrize("answer", [
     {"ok": False, "error": "no"},
     {"ok": False, "blockers": []},
+    {"ok": "false", "blockers": []},
     {"ok": True},
     {"ok": True, "blockers": "none"},
     {"ok": True, "blockers": ["not an object"]},
@@ -427,18 +474,18 @@ def test_an_answer_that_does_not_say_is_not_read_as_nothing_in_the_way(tmp_path,
     deployment = _Deployment(tmp_path, monkeypatch, ask=lambda _a: argparse.Namespace(
         returncode=0, stderr="", stdout=json.dumps(answer) + "\n"))
 
-    deployment.update("v0.1.0")
+    deployment.update("v0.33.1")
 
     assert "Could not ask the running deployment" in capsys.readouterr().out
 
 
 def test_an_upgrade_does_not_ask(tmp_path, monkeypatch):
-    deployment = _Deployment(tmp_path, monkeypatch, running="0.1.0", ask=_answers([_HOLD]))
+    deployment = _Deployment(tmp_path, monkeypatch, running="0.33.1", ask=_answers([_HOLD]))
 
-    deployment.update("v0.2.0")
+    deployment.update("v0.34.0")
 
     assert deployment.asked() == []
-    assert deployment.image().endswith(":v0.2.0")
+    assert deployment.image().endswith(":v0.34.0")
 
 
 def test_a_guessed_running_version_is_not_asked(tmp_path, monkeypatch):
@@ -446,20 +493,30 @@ def test_a_guessed_running_version_is_not_asked(tmp_path, monkeypatch):
     deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]),
                              source="this checkout's VERSION file (nothing is running to ask)")
 
-    deployment.update("v0.1.0")
+    deployment.update("v0.33.1")
 
     assert deployment.asked() == []
 
 
+@pytest.mark.parametrize("version, checks", [
+    ("0.33.1", True), ("v0.33.1", True), ("0.33.2", True), ("0.34.0", True), ("1.0.0", True),
+    ("0.33.0", False), ("v0.32.6", False), ("0.9.9", False), ("latest", False), ("", False),
+])
+def test_the_tool_knows_which_versions_check(version, checks):
+    dv = _dockvault()
+    assert dv.FIRST_NEWER_DATA_CHECK == "0.33.1", "the first release whose image reads the mark"
+    assert dv.checks_newer_data(version) is checks
+
+
 def test_the_tool_says_when_the_escape_is_left_set(tmp_path, monkeypatch, capsys):
-    deployment = _Deployment(tmp_path, monkeypatch, running="0.1.0",
+    deployment = _Deployment(tmp_path, monkeypatch, running="0.33.1",
                              env_extra="ALLOW_START_ON_NEWER_DATA=true\n")
-    deployment.update("v0.2.0")
+    deployment.update("v0.34.0")
     assert "ALLOW_START_ON_NEWER_DATA is set in .env" in capsys.readouterr().out
 
 
 def test_the_tool_says_nothing_of_the_escape_when_it_is_not_set(tmp_path, monkeypatch, capsys):
-    deployment = _Deployment(tmp_path, monkeypatch, running="0.1.0",
+    deployment = _Deployment(tmp_path, monkeypatch, running="0.33.1",
                              env_extra="ALLOW_START_ON_NEWER_DATA=false\n")
-    deployment.update("v0.2.0")
+    deployment.update("v0.34.0")
     assert "ALLOW_START_ON_NEWER_DATA" not in capsys.readouterr().out

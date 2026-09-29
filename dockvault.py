@@ -1557,10 +1557,22 @@ LOCAL_IMAGE = "dockvault-vault:latest"
 # app/core/data_requirements.py). An operator sets it by hand, for as long as they need it; setup
 # never writes it, so no .env this tool authors carries it.
 NEWER_DATA_ESCAPE = "ALLOW_START_ON_NEWER_DATA"
+# The first release whose image checks for such data and refuses to start on it. An image older
+# than this has no check at all: it starts on data a newer release changed, whatever that data is,
+# and may delete or change what the newer release keeps.
+FIRST_NEWER_DATA_CHECK = "0.33.1"
 
 
 def newer_data_escape_set(env):
     return str((env or {}).get(NEWER_DATA_ESCAPE) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def checks_newer_data(version):
+    """True when `version`'s image refuses to start on data a newer release changed in a way it cannot
+    read. False for a release before FIRST_NEWER_DATA_CHECK, and for a version that cannot be read:
+    neither can be relied on to refuse."""
+    parsed = parse_semver(version)
+    return bool(parsed) and parsed >= parse_semver(FIRST_NEWER_DATA_CHECK)
 
 
 def parse_downgrade_blockers(answer):
@@ -4950,10 +4962,13 @@ class DockVault:
                        % clean_matrix_text(plan["blocked"].get("reason", "no reason recorded")))
 
         # Going back: the running version knows which of its changes to the data an older one
-        # cannot read, so ask it. The older image refuses to start on such data by itself; this
-        # says so before the change is made, and names how to undo each first.
+        # cannot read, so ask it. An older image from FIRST_NEWER_DATA_CHECK on refuses to start on
+        # such data by itself; this says so before the change is made, and names how to undo each
+        # first. An image older than that has no check and starts regardless, so going back to one
+        # over such data is refused here even when forced: this is the only check there is.
         if down and version_source == "the running container":
             offered, blockers = self._downgrade_blockers(tag)
+            target_checks = checks_newer_data(tag)
             if blockers:
                 print(pal.paint("\n  %s has changed this deployment's data in a way %s cannot read:"
                                 % (current, tag), "red"))
@@ -4965,6 +4980,14 @@ class DockVault:
                     if blocker.get("undo"):
                         print("      undo it first, with %s running: %s"
                               % (current, server_text(blocker.get("undo"))))
+                if not target_checks:
+                    self._fail(
+                        "undo these with %s first, then run update again. %s is older than %s, the "
+                        "first version that checks for this: it would start on this data regardless, "
+                        "and may delete or change what %s keeps. --force-downgrade does not go back to "
+                        "a version older than %s; to go back without undoing these, choose %s or later."
+                        % (current, tag, FIRST_NEWER_DATA_CHECK, current, FIRST_NEWER_DATA_CHECK,
+                           FIRST_NEWER_DATA_CHECK))
                 if not (args and getattr(args, "force_downgrade", False)):
                     self._fail(
                         "undo these with %s first, then run update again. %s would refuse to start "
@@ -4975,10 +4998,18 @@ class DockVault:
                     "  --force-downgrade given: going on. %s refuses to start on this data unless "
                     "%s=true is set in .env." % (tag, NEWER_DATA_ESCAPE), "yellow"))
             elif offered is None:
-                print(pal.paint(
-                    "  Could not ask the running deployment whether %s can read its data. If it "
-                    "cannot, %s refuses to start and says how to undo the change." % (tag, tag),
-                    "yellow"))
+                if target_checks:
+                    print(pal.paint(
+                        "  Could not ask the running deployment whether %s can read its data. If it "
+                        "cannot, %s refuses to start and says how to undo the change." % (tag, tag),
+                        "yellow"))
+                else:
+                    print(pal.paint(
+                        "  Could not ask the running deployment whether %s can read its data. %s is "
+                        "older than %s, the first version that checks for this: if %s changed the data "
+                        "in a way %s cannot read, %s starts anyway and may delete or change what %s "
+                        "keeps." % (tag, tag, FIRST_NEWER_DATA_CHECK, current, tag, tag, current),
+                        "yellow"))
 
         dry_run = bool(getattr(args, "dry_run", False)) if args else False
         if dry_run:
@@ -5638,7 +5669,9 @@ def build_parser():
     up.add_argument("--backup-verified", dest="backup_verified", action="store_true", help="you keep backups elsewhere; skip taking one (not checked)")
     up.add_argument("--force-downgrade", dest="force_downgrade", action="store_true",
                     help="go back even though the running version says the older one cannot read data it "
-                         "changed (the older one then starts only with %s=true)" % NEWER_DATA_ESCAPE)
+                         "changed (the older one then starts only with %s=true). Not accepted for a "
+                         "version older than %s, which has no such check and would start on that data "
+                         "regardless" % (NEWER_DATA_ESCAPE, FIRST_NEWER_DATA_CHECK))
     up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lp = parsers["logs"]
