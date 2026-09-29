@@ -1,6 +1,6 @@
 """A reset link someone made for another account is judged again when it is used, on a running stack.
 
-The verification proved it: a user given the permission to manage users made a reset link for an
+Before the fix, on a running stack, a user given the permission to manage users made a reset link for an
 ordinary user, an administrator then promoted that user, and the link still set the new administrator's
 password, so its maker signed in as an administrator. Now a promotion revokes such a link, and using a
 link another account made judges its maker again, as the maker and the account stand then; a refused
@@ -76,7 +76,7 @@ def _reasons(action, user_id):
 
 
 def test_a_delegates_link_made_before_a_promotion_does_not_work_after_it(admin, delegate, dave):
-    # The verified sequence, through the routes: link, promote, use.
+    # That sequence, through the routes: link, promote, use.
     manager, as_manager = delegate
     token = _link(as_manager, dave["id"])
     assert psql(f"SELECT made_by_other FROM password_reset_tokens WHERE user_id = '{dave['id']}'") == "t"

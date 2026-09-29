@@ -159,8 +159,8 @@ def _password_of(db, user):
 
 
 def test_a_delegates_link_made_before_a_promotion_is_refused_after_it(db):
-    # The sequence the verification proved on a running stack: a user who manages users makes a link for an
-    # ordinary user, an administrator then promotes that user, and the link is used. The promotion here is
+    # The sequence that took an administrator's account on a running stack: a user who manages users makes
+    # a link for an ordinary user, an administrator then promotes that user, and the link is used. The promotion here is
     # made behind the routes (the routes also revoke the link: see the promotion test below), so what
     # refuses it is the check at use.
     dana = _user(db, "dana", manages_users=True)
@@ -191,6 +191,30 @@ def test_the_lookup_that_shows_the_form_refuses_it_too(db):
     assert _open_links(db, carol) == 0
     assert [r.details["reason"] for r in _audit(db, "password_reset_link_refused")] == [aa.ADMINISTRATOR]
     assert _refused(lambda: _use(db, token)) == (404, UNKNOWN), "revoked at the lookup"
+
+
+def test_setting_the_password_reads_the_maker_and_the_account_under_a_share_lock(db, monkeypatch):
+    # POST judges the link with both accounts' rows read FOR SHARE until the password is set: a promotion
+    # or a demotion in progress finishes before they are read, and one that starts later waits until the
+    # link has been used. Without the lock, a promotion committed between the check and the new password
+    # would let a link its maker may no longer use set an administrator's password.
+    from sqlalchemy.orm import Query
+    locks = []
+    real = Query.with_for_update
+
+    def recording(self, *args, **kwargs):
+        locks.append(({d.get("entity") for d in self.column_descriptions}, args, kwargs))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "with_for_update", recording)
+    dana = _user(db, "dana", manages_users=True)
+    carol = _user(db, "carol")
+    token = _mint(db, carol, dana)
+    assert _look_up(db, token) == {"username": "carol"}
+    assert [lock for lock in locks if User in lock[0]] == [], "the lookup that shows the form changes nothing"
+    assert _use(db, token) == {"ok": True}
+    user_locks = [(args, kwargs) for entities, args, kwargs in locks if User in entities]
+    assert user_locks == [((), {"read": True})], locks
 
 
 def test_a_refused_link_answers_exactly_as_an_unknown_one_whatever_password_comes_with_it(db, monkeypatch):
