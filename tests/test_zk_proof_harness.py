@@ -227,8 +227,11 @@ def test_ensure_ecc_keypair_registers_the_derived_identity_key():
 
 # ------------------------------------------------------------------------------- the migration
 
+# The path is a string literal quoted with " or ', and an f-string may hold the other quote inside it
+# ({vault['id']}), so each quote style is matched up to its own closing quote.
 _GUARDED_PATH = re.compile(
-    r"""\.(post|put)\(\s*f?["'][^"']*/ecc/vaults/[^"']*/(rekey|members|index-key)["']""")
+    r"""\.(post|put)\(\s*f?(?:"[^"]*/ecc/vaults/[^"]*/(rekey|members|index-key)\""""
+    r"""|'[^']*/ecc/vaults/[^']*/(rekey|members|index-key)')""")
 
 
 def _call_text(src, start):
@@ -247,7 +250,7 @@ def _call_text(src, start):
 def _unproven_sites(src):
     sites = []
     for m in _GUARDED_PATH.finditer(src):
-        verb, route = m.group(1), m.group(2)
+        verb, route = m.group(1), m.group(2) or m.group(3)
         if (verb, route) in (("post", "rekey"), ("post", "members"), ("put", "index-key")):
             sites.append(m.start())
     for m in re.finditer(r"""\.post\(\s*["']/vaults["']""", src):
@@ -278,6 +281,9 @@ def test_the_unproven_request_detector_sees_one():
         'admin.post(\n    f"/ecc/vaults/{vid}/members",\n    json={})',
         'admin.put(f"/ecc/vaults/{vid}/index-key", json={})',
         'admin.post("/vaults", json={"name": "z", "type": "zero_knowledge"})',
+        # An f-string holding the other quote inside it.
+        'owner.post(\n    f"/ecc/vaults/{vault[\'id\']}/members",\n    json={})',
+        "admin.post(f'/ecc/vaults/{v[\"id\"]}/rekey', json={})",
     ]
     for sample in samples:
         assert len(_unproven_sites(sample)) == 1, sample

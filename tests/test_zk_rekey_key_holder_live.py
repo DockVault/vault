@@ -60,6 +60,16 @@ def _share(owner, vid, member, member_client, level="read"):
                json={"user_id": str(member["id"]), "level": level}).raise_for_status()
 
 
+def _refused_to_a_non_holder(r):
+    """Someone who does not hold the key is given no key-proof challenge -- refused by this same rule, or,
+    for an administrator with no relationship to the vault, without being told anything about it -- so
+    their request carries no proof and is refused before it reaches the vault."""
+    assert r.zk_challenge_status == 403, r.zk_challenge_refusal
+    detail = r.zk_challenge_refusal["detail"]
+    assert "holds this vault's key" in detail or detail == "No access to this vault's keys", detail
+    assert r.status_code == 428 and r.json()["reason"] == "zk-key-proof-required", r.text
+
+
 def _keys(client, vid):
     r = client.get(f"/ecc/vaults/{vid}/keys")
     assert r.status_code == 200, r.text
@@ -94,9 +104,7 @@ def second_member(admin):
 def test_an_admin_without_the_key_cannot_rotate_it_and_the_owner_can(admin, temp_user,
                                                                      temp_user_client, owned_vault):
     vid = owned_vault
-    r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
-    assert r.status_code == 403, r.text
-    assert r.json()["detail"] == NOT_A_HOLDER
+    _refused_to_a_non_holder(post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"])))
     # Refused before anything was stored: still epoch 1, and the owner's key is the one they had.
     keys = _keys(temp_user_client, vid)
     assert keys["current_dek_version"] == 1 and keys["key_version"] == 1
@@ -138,9 +146,7 @@ def test_an_admin_without_the_team_key_cannot_rotate_a_hierarchical_vault(admin,
     vid = _team_vault(admin, temp_user_client)
     routine = _ROUTINE_TEAM_ROTATION
     try:
-        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=routine)
-        assert r.status_code == 403, r.text
-        assert r.json()["detail"] == NOT_A_HOLDER
+        _refused_to_a_non_holder(post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=routine))
         assert _keys(temp_user_client, vid)["current_dek_version"] == 1
 
         r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json=routine)
@@ -166,8 +172,7 @@ def test_a_removal_without_a_rotation_is_owed_to_the_key_holder(admin, temp_user
     assert _keys(temp_user_client, vid)["rekey_owed"] is True
 
     # The admin who removed them still cannot do the rotation.
-    assert post_zk(admin, f"/ecc/vaults/{vid}/rekey",
-                      json=_rotation(1, temp_user["id"])).status_code == 403
+    _refused_to_a_non_holder(post_zk(admin, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"])))
 
     r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json=_rotation(1, temp_user["id"]))
     assert r.status_code == 200, r.text
@@ -198,8 +203,7 @@ def test_an_admin_without_the_key_cannot_mint_the_name_index_key(admin, temp_use
     vid = owned_vault
     body = {"wraps": [{"user_id": str(temp_user["id"]), "encrypted_index_key": ZK_WRAPPED_DEK_STUB,
                        "ephemeral_public_key": ZK_EPHEMERAL_STUB}]}
-    r = put_zk(admin, f"/ecc/vaults/{vid}/index-key", json=body)
-    assert r.status_code == 403, r.text
+    _refused_to_a_non_holder(put_zk(admin, f"/ecc/vaults/{vid}/index-key", json=body))
     assert temp_user_client.get(f"/ecc/vaults/{vid}/index-key").json()["index_key"] is None
     r = put_zk(temp_user_client, f"/ecc/vaults/{vid}/index-key", json=body)
     assert r.status_code == 200, r.text

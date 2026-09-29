@@ -374,6 +374,7 @@ def prepare_zk(client, path, json=None, *, method="POST", augment=True, roles=No
     else:
         raw = serialize(body)
     return {"raw": raw, "header": header, "challenge": answer, "challenge_status": challenge.status_code,
+            "challenge_refusal": None if answer is not None else _json_or_empty(challenge),
             "op": op, "vault_id": challenge_vault}
 
 
@@ -385,6 +386,7 @@ def send_prepared(client, path, prepared: dict, *, method="POST", headers=None, 
         extra[PROOF_HEADER] = proof
     response = _send(client, method, path, prepared["raw"], extra)
     response.zk_challenge_status = prepared["challenge_status"]
+    response.zk_challenge_refusal = prepared.get("challenge_refusal")
     return response
 
 

@@ -1176,8 +1176,8 @@ def test_change_permissions_key_release_tracks_live_manager_role(
             vault = create_zk_vault(admin, name=unique("zk_reader_role"))
             vault_ids.append(vault["id"])
             wrapped_for_reader = "cmVhZGVyLXdyYXBwZWQtZGVr"
-            shared = admin.post(
-                f"/ecc/vaults/{vault['id']}/members",
+            shared = post_zk(
+                admin, f"/ecc/vaults/{vault['id']}/members",
                 json={
                     "user_id": str(temp_user["id"]),
                     "wrapped_dek": wrapped_for_reader,
@@ -1844,8 +1844,8 @@ def test_global_admin_manager_cap_requires_live_direct_relationship_not_key_only
             vault = create_zk_vault(owner, name=unique("zk_global_admin_reader"))
             vault_ids.append(vault["id"])
             wrapped_for_admin = "YWRtaW4td3JhcHBlZC1kZWs="
-            shared = owner.post(
-                f"/ecc/vaults/{vault['id']}/members",
+            shared = post_zk(
+                owner, f"/ecc/vaults/{vault['id']}/members",
                 json={
                     "user_id": str(admin.user["id"]),
                     "wrapped_dek": wrapped_for_admin,
@@ -2347,8 +2347,8 @@ def test_direct_mode_old_epoch_cannot_substitute_for_inactive_current_epoch(
         try:
             vault = create_zk_vault(owner, name=unique("zk_direct_old_epoch"))
             vault_ids.append(vault["id"])
-            rotated = owner.post(
-                f"/ecc/vaults/{vault['id']}/rekey",
+            rotated = post_zk(
+                owner, f"/ecc/vaults/{vault['id']}/rekey",
                 json={
                     "from_version": 1,
                     "to_version": 2,
@@ -2615,8 +2615,8 @@ def test_direct_reader_see_files_qualifies_only_while_zk_vault_is_active(
             vault = create_zk_vault(admin, name=unique("zk_direct_reader_active"))
             vault_ids.append(vault["id"])
             wrapped_for_reader = "cmVhZGVyLXNlZS1maWxlcy13cmFw"
-            shared = admin.post(
-                f"/ecc/vaults/{vault['id']}/members",
+            shared = post_zk(
+                admin, f"/ecc/vaults/{vault['id']}/members",
                 json={
                     "user_id": str(temp_user["id"]),
                     "wrapped_dek": wrapped_for_reader,

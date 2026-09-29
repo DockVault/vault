@@ -49,12 +49,12 @@ def test_deleting_the_account_and_the_vault_cleans_up_through_the_database(admin
     vid = None
     try:
         ensure_ecc_keypair(admin)
-        vid = create_zk_vault(admin)["id"]
+        vid = create_zk_vault(admin)["id"]   # its first epoch's row is the create's own
         uid = user["id"]
         _psql(
             "INSERT INTO vault_key_proofs (id, vault_id, dek_epoch, format, proof_public_key, "
             "sealed_private_key, dek_check, source, created_by, created_at) VALUES "
-            f"('{uuid.uuid4()}', '{vid}', 1, 1, 'P', 'S', 'C', 'create', '{uid}', now())")
+            f"('{uuid.uuid4()}', '{vid}', 2, 1, 'P', 'S', 'C', 'rotate', '{uid}', now())")
         _psql(
             "INSERT INTO zk_key_proof_challenges (id, user_id, vault_id, op, server_private_key_sealed, "
             "nonce, mode, dek_epoch, team_epoch, created_at) VALUES "
@@ -65,7 +65,7 @@ def test_deleting_the_account_and_the_vault_cleans_up_through_the_database(admin
         dup = subprocess.run(
             ["docker", "exec", _DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc",
              "INSERT INTO vault_key_proofs (id, vault_id, dek_epoch, format, source, created_at) VALUES "
-             f"('{uuid.uuid4()}', '{vid}', 1, 1, 'bootstrap', now())"],
+             f"('{uuid.uuid4()}', '{vid}', 2, 1, 'bootstrap', now())"],
             capture_output=True, text=True, timeout=30)
         assert dup.returncode != 0 and "uq_vault_key_proof_epoch" in dup.stderr, dup.stderr
 
