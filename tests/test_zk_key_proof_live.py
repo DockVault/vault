@@ -649,3 +649,55 @@ def test_a_temporary_session_cannot_reset_a_key(admin, people):
         assert r.status_code == 403 and r.json()["reason"] == "zk-key-proof-interactive-only", r.text
     finally:
         oc.delete_vault(vid)
+
+
+# ------------------------------------------------------------------------------ read side, retire
+
+def test_key_holders_see_the_epochs_proof_material_and_only_managers_get_the_sealed_key(admin, people):
+    owner, oc = people("kprd")
+    member, mc = people("kprdm")
+    stranger, sc = people("kprds")
+    vid = _direct_vault(oc, admin)
+    team_vid = _team_vault(oc, admin)
+    try:
+        post_zk(oc, f"/ecc/vaults/{vid}/members", json=_share_body(member["id"])).raise_for_status()
+        oc.post(f"/vaults/{vid}/permissions", json={"user_id": member["id"], "level": "read"}).raise_for_status()
+        row = _psql(f"SELECT proof_public_key, sealed_private_key, dek_check FROM vault_key_proofs "
+                    f"WHERE vault_id = '{vid}' AND dek_epoch = 1").split("|")
+
+        mine = oc.get(f"/ecc/vaults/{vid}/keys").json()["key_proof"]
+        assert (mine["state"], mine["source"], mine["lineage_tag"]) == ("set", "create", None)
+        assert mine["public_key"].strip() == row[0].strip() and mine["dek_check"] == row[2]
+        assert mine["sealed_private_key"] == row[1] and mine["created_at"]
+        theirs = mc.get(f"/ecc/vaults/{vid}/keys").json()["key_proof"]
+        assert "sealed_private_key" not in theirs, "a plain member was given the sealed proof key"
+        assert (theirs["state"], theirs["public_key"], theirs["dek_check"]) == ("set", mine["public_key"], row[2])
+        assert sc.get(f"/ecc/vaults/{vid}/keys").status_code == 403
+
+        # An epoch with no row, and a team vault, whose verifier is its team key.
+        _psql(f"DELETE FROM vault_key_proofs WHERE vault_id = '{vid}'")
+        assert oc.get(f"/ecc/vaults/{vid}/keys").json()["key_proof"] == {"state": "missing"}
+        assert oc.get(f"/ecc/vaults/{team_vid}/keys").json()["key_proof"] == {
+            "state": "team", "source": "create", "lineage_tag": None}
+    finally:
+        oc.delete_vault(vid)
+        oc.delete_vault(team_vid)
+
+
+def test_retiring_old_epochs_prunes_their_proof_rows_and_never_the_current_one(admin, people):
+    owner, oc = people("kpret")
+    with _zk_enabled(admin):
+        vid = create_zk_vault(oc, seal_name=False)["id"]
+    try:
+        for frm in (1, 2):
+            assert post_zk(oc, f"/ecc/vaults/{vid}/rekey", json=_rotation(frm, owner["id"])).status_code == 200
+        epochs = lambda: _psql(f"SELECT string_agg(dek_epoch::text, ',' ORDER BY dek_epoch) "
+                               f"FROM vault_key_proofs WHERE vault_id = '{vid}'")
+        assert epochs() == "1,2,3"
+        # Something claims an epoch above the current one: the floor it sets must not take the current row.
+        _psql(f"UPDATE vaults SET enc_name = '{ZK_ENC_NAME_STUB}', name_key_version = 99 WHERE id = '{vid}'")
+        r = oc.post(f"/ecc/vaults/{vid}/retire-version")
+        assert r.status_code == 200 and r.json()["proof_rows_deleted"] == 2, r.text
+        assert epochs() == "3"
+    finally:
+        oc.delete_vault(vid)

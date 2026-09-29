@@ -135,6 +135,11 @@ class VaultKeysResponse(BaseModel):
     # Derived, so it clears automatically once a rekey advances the epoch. Only reported to a
     # caller who holds a key (the no-access response leaves it at the default).
     rekey_owed: bool = False
+    # The key-proof material of the returned epoch, for a caller who holds a key (see
+    # _key_proof_view): {"state": "set" | "missing" | "team", ...}. The sealed proof key is included
+    # only for a caller who may manage the vault, the only callers who run a key change; other
+    # members check their key against `dek_check`. None for a caller without a key.
+    key_proof: Optional[Dict[str, Any]] = None
 
 
 # =============================================================================
@@ -1220,6 +1225,9 @@ async def get_vault_keys(
         return VaultKeysResponse(vault_id=vault_id, mode=mode, has_access=False,
                                  current_dek_version=current)
 
+    def _key_proof(epoch):
+        return _key_proof_view(db, vault, epoch, may_manage=_can_manage_vault(db, vault, current_user))
+
     if _is_hierarchical(vault):
         # Two-axis: resolve the DEK wrap for epoch `want` from the team_key map, then the team
         # epoch T it was wrapped under, then the caller's TEAMPRIV row at T.
@@ -1247,6 +1255,7 @@ async def get_vault_keys(
             team_ephemeral_public_key=teampriv.ephemeral_public_key,
             team_key_version=team_epoch,
             rekey_owed=owed,
+            key_proof=_key_proof(want),
         )
 
     # DIRECT mode: the DEK is wrapped straight to the caller at the requested DEK epoch. (No
@@ -1270,7 +1279,35 @@ async def get_vault_keys(
         key_version=member_key.key_version,
         current_dek_version=current,
         rekey_owed=owed,
+        key_proof=_key_proof(member_key.key_version),
     )
+
+
+def _key_proof_view(db: Session, vault: Vault, epoch: int, *, may_manage: bool) -> dict:
+    """What a key holder sees of an epoch's key-proof material.
+
+    Direct, with a row: {"state": "set", source, created_at, public_key, dek_check, lineage_tag}, plus
+    `sealed_private_key` for a caller who may manage the vault. Direct, without one: {"state":
+    "missing"} (the epoch predates key proofs, or was made while they were not required). Hierarchical:
+    {"state": "team"}, with the row's source and lineage tag when it has one; its verifier is the team
+    public key."""
+    row = db.query(VaultKeyProof).filter(
+        VaultKeyProof.vault_id == vault.id, VaultKeyProof.dek_epoch == epoch).first()
+    if _is_hierarchical(vault):
+        view = {"state": "team"}
+        if row is not None:
+            view.update(source=row.source, lineage_tag=row.lineage_tag)
+        return view
+    if row is None or not row.proof_public_key:
+        return {"state": "missing"}
+    view = {
+        "state": "set", "source": row.source,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "public_key": row.proof_public_key, "dek_check": row.dek_check, "lineage_tag": row.lineage_tag,
+    }
+    if may_manage:
+        view["sealed_private_key"] = row.sealed_private_key
+    return view
 
 
 # =============================================================================
@@ -2747,6 +2784,13 @@ async def retire_dek_versions(
 
     unclassified_before = _unclassified_ids()
     unclassified = len(unclassified_before)
+    # Key-proof rows of retired epochs go too. The explicit min keeps the current epoch's row even if a
+    # file ever claimed an epoch above the current one: the floor comes from client-declared metadata.
+    # The rows authorize key changes; nothing reads data with them, so they never hold the floor up.
+    proof_floor = min(dek_floor, getattr(locked, 'dek_version', 1) or 1)
+    proof_rows_deleted = db.query(VaultKeyProof).filter(
+        VaultKeyProof.vault_id == locked.id, VaultKeyProof.dek_epoch < proof_floor,
+    ).delete(synchronize_session=False)
     if _is_hierarchical(locked):
         # TWO AXES. (1) Prune the team_key map of DEK epochs below the DEK floor. (2) Delete
         # TEAMPRIV rows below the TEAM floor = the lowest team epoch any SURVIVING team_key entry
@@ -2773,11 +2817,13 @@ async def retire_dek_versions(
                   details={"retired_dek_below": dek_floor, "retired_team_below": team_floor,
                            "rows_deleted": deleted, "mode": "hierarchical",
                            "unclassified_rows": unclassified,
-                           "unclassified_rows_deleted": unclassified_deleted})
+                           "unclassified_rows_deleted": unclassified_deleted,
+                           "proof_rows_deleted": proof_rows_deleted})
         return {"status": "ok", "vault_id": vault_id, "retired_dek_below": dek_floor,
                 "retired_team_below": team_floor, "rows_deleted": deleted,
                 "unclassified_rows": unclassified,
-                "unclassified_rows_deleted": unclassified_deleted}
+                "unclassified_rows_deleted": unclassified_deleted,
+                "proof_rows_deleted": proof_rows_deleted}
 
     # DIRECT mode: a single DEK axis (unchanged behavior). No algorithm filter here, so an
     # unrecognised label is removed along with everything else below the floor -- defensible,
@@ -2789,13 +2835,15 @@ async def retire_dek_versions(
     deleted = len(stale)
     for mk in stale:
         db.delete(mk)
-    if deleted:
+    if deleted or proof_rows_deleted:
         db.commit()
     unclassified_deleted = len(unclassified_before - _unclassified_ids())
     _audit_zk(db, current_user, "zk_versions_retired", resource_id=vault_id,
               details={"retired_below_version": dek_floor, "rows_deleted": deleted, "mode": "direct",
                        "unclassified_rows": unclassified,
-                       "unclassified_rows_deleted": unclassified_deleted})
+                       "unclassified_rows_deleted": unclassified_deleted,
+                       "proof_rows_deleted": proof_rows_deleted})
     return {"status": "ok", "vault_id": vault_id, "retired_below_version": dek_floor,
             "rows_deleted": deleted, "unclassified_rows": unclassified,
-            "unclassified_rows_deleted": unclassified_deleted}
+            "unclassified_rows_deleted": unclassified_deleted,
+            "proof_rows_deleted": proof_rows_deleted}

@@ -206,3 +206,24 @@ def test_the_step_up_boot_contract_still_holds():
     from app.core.second_factor_actions import OWNER_KEY_RESET
     S._assert_step_up_boot_contract()
     assert OWNER_KEY_RESET not in S.GUARDED_STEP_UP_ACTIONS
+
+
+def test_retire_prunes_proof_rows_only_below_the_current_epoch():
+    fn = _function(ECC, "retire_dek_versions")
+    floor = _once(fn, "proof_floor = min(dek_floor, getattr(locked, 'dek_version', 1) or 1)", "retire_dek_versions")
+    prune = _once(fn, "VaultKeyProof.vault_id == locked.id, VaultKeyProof.dek_epoch < proof_floor,",
+                  "retire_dek_versions")
+    lock = _once(fn, "with_for_update()", "retire_dek_versions")
+    assert lock < floor < prune
+    # Still gated on managing the vault, not on holding its key (pruning is housekeeping, not a key change).
+    assert "_can_manage_vault(db, vault, current_user)" in fn and "_holds_current_key" not in fn
+
+
+def test_only_a_manager_is_given_the_sealed_proof_key():
+    view = _function(ECC, "_key_proof_view")
+    code = view[view.index('"""', view.index('"""') + 3) + 3:]   # after the docstring
+    placed = [line.strip() for line in code.splitlines() if "sealed_private_key" in line]
+    assert placed == ['view["sealed_private_key"] = row.sealed_private_key'], placed
+    _once(code, '    if may_manage:\n        view["sealed_private_key"]', "_key_proof_view")
+    keys = _function(ECC, "get_vault_keys")
+    _once(keys, "may_manage=_can_manage_vault(db, vault, current_user)", "get_vault_keys")
