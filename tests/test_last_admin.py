@@ -180,7 +180,7 @@ def test_patch_refuses_self_changes_and_asks_before_writing():
         assert self_guard < body.index(message) < body.index("removes_last_admin(db, user)")
     assert "user_update.role != user.role" in body, "resaving your own unchanged role is allowed"
     _before(body, "removes_last_admin(db, user)", "changes = {}")
-    _before(body, "removes_last_admin(db, user)", "user.role = user_update.role")
+    _before(body, "removes_last_admin(db, user)", "_set_role(db, user, user_update.role")
 
 
 def test_put_refuses_self_changes_and_asks_before_writing():
@@ -189,7 +189,7 @@ def test_put_refuses_self_changes_and_asks_before_writing():
         assert body.index(message) < body.index("removes_last_admin(db, user)")
     # The address is written by the credential-change rule, which the route calls.
     _before(body, "removes_last_admin(db, user)", "outcome = _credential_change(")
-    _before(body, "removes_last_admin(db, user)", "user.role = update_data.role")
+    _before(body, "removes_last_admin(db, user)", "_set_role(db, user, update_data.role")
 
 
 @pytest.mark.parametrize("path,marker,check,write", [
@@ -200,7 +200,7 @@ def test_put_refuses_self_changes_and_asks_before_writing():
      "not user.is_locked and user.role == RoleEnum.ADMIN and removes_last_admin(db, user)",
      "user.is_locked = new_locked"),
     (USER_MGMT, '@router.patch("/users/{user_id}/role", response_model=ChangeRoleResponse)',
-     "removes_last_admin(db, target_user)", "target_user.role = request.new_role"),
+     "removes_last_admin(db, target_user)", "_set_role(db, target_user, request.new_role"),
     (API, '@app.post("/users/{user_id}/delete")',
      "user.role == RoleEnum.ADMIN and removes_last_admin(db, user)", "db.delete(user)"),
 ])
@@ -212,7 +212,8 @@ def test_each_other_route_asks_before_it_writes(path, marker, check, write):
 
 def test_no_other_route_changes_a_role_activity_lock_or_deletes_a_user():
     """Every place that writes one of these is one of the routes above. The automatic lock that
-    failed sign-ins arm lives in its own table and never writes users.is_locked."""
+    failed sign-ins arm lives in its own table and never writes users.is_locked. A role is written only
+    by _set_role, which only those routes call (test_role_change_permissions.py holds that)."""
     writers = []
     for path in sorted((ROOT / "app").rglob("*.py")):
         if "__pycache__" in str(path):
@@ -221,15 +222,13 @@ def test_no_other_route_changes_a_role_activity_lock_or_deletes_a_user():
             if re.search(r"\b(user|target_user)\.(role|is_active|is_locked) = |db\.delete\(user\)", ln):
                 writers.append(f"{path.relative_to(ROOT).as_posix()}: {ln.strip()}")
     assert sorted(writers) == sorted([
-        "app/api/api_server.py: user.role = user_update.role",
+        "app/api/api_server.py: user.role = new_role",
         "app/api/api_server.py: user.is_active = user_update.is_active",
         "app/api/api_server.py: user.is_locked = user_update.is_locked",
         "app/api/api_server.py: db.delete(user)",
-        "app/api/user_management_api.py: user.role = update_data.role",
         "app/api/user_management_api.py: user.is_active = update_data.is_active",
         "app/api/user_management_api.py: user.is_active = not user.is_active",
         "app/api/user_management_api.py: user.is_locked = new_locked",
-        "app/api/user_management_api.py: target_user.role = request.new_role",
     ]), writers
 
 

@@ -5952,11 +5952,12 @@ def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=
 
 
 def _notify_account_status_changes(db, user, *, by_name, locked=None, active=None, role=None,
-                                   sign_in_locks_cleared=0) -> None:
+                                   sign_in_locks_cleared=0, permissions_removed=()) -> None:
     """The notices for an administrator's lock, unlock, deactivation, reactivation or role change.
     Each argument is (old, new), or None when that did not change hands in the request.
     ``sign_in_locks_cleared`` is how many automatic locks an unlock cleared; clearing them is told as
-    an unlock too when the account itself was not locked."""
+    an unlock too when the account itself was not locked. ``permissions_removed``: the permissions a
+    role change took away (_set_role), named in the role change's notice."""
     by = _actor_text(by_name)
     if sign_in_locks_cleared and not (locked is not None and bool(locked[0]) != bool(locked[1])):
         _notify_account_change(db, user, ntype="account_changed", title="Your account was unlocked",
@@ -5979,8 +5980,43 @@ def _notify_account_status_changes(db, user, *, by_name, locked=None, active=Non
                                    change="An administrator deactivated your account. You cannot sign in "
                                           "until it is reactivated.", by=by)
     if role is not None and role[0] != role[1]:
+        change = f"An administrator changed your role from {role[0]} to {role[1]}."
+        if permissions_removed:
+            from app.core.api_catalog import GRANTABLE_API_CATALOG
+            names = ", ".join(GRANTABLE_API_CATALOG[g].display_name if g in GRANTABLE_API_CATALOG else g
+                              for g in permissions_removed)
+            change += (f" Your permissions were reset to those of the {role[1]} role, which removed: {names}. "
+                       "An administrator can grant a permission again.")
         _notify_account_change(db, user, ntype="account_changed", title="Your role was changed",
-                               change=f"An administrator changed your role from {role[0]} to {role[1]}.", by=by)
+                               change=change, by=by)
+
+
+def _set_role(db, user, new_role, *, actor) -> list:
+    """Make ``new_role`` ``user``'s role, in the caller's transaction, and reset the permissions stored
+    for the account to the new role's defaults (endpoint_permissions.reset_to_role_defaults), with an
+    audit row saying what was removed and added. Returns the removed permissions' group names, for the
+    notice of the role change (_notify_account_status_changes). Setting a role to the one the account
+    already has changes nothing.
+
+    Every change of role goes through here. An account created as an administrator holds the
+    administrator's defaults as stored rows, the permission to manage users among them; a role set any
+    other way would leave them to the account after a demotion, and with them password reset links for
+    other people's accounts. What the account was granted by another administrator stays, and an
+    administrator can grant anything else again."""
+    from app.core.endpoint_permissions import reset_to_role_defaults
+    old_role = getattr(user.role, "value", user.role)
+    user.role = new_role
+    if old_role == getattr(new_role, "value", new_role):
+        return []
+    change = reset_to_role_defaults(user.id, new_role, db)
+    if change["removed"] or change["added"]:
+        db.add(AuditLogger(db).build_row(
+            action="permissions_reset_for_role", status="success", user=actor,
+            resource_type="user", resource_id=str(user.id),
+            details={"target_username": user.username, "old_role": old_role,
+                     "new_role": getattr(new_role, "value", new_role), "removed": change["removed"],
+                     "added": change["added"], "kept": change["kept"]}))
+    return change["removed"]
 
 
 def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
@@ -10438,6 +10474,7 @@ async def update_user(
     # Admin-only fields
     admin_granted = False
     withdrawn = []
+    permissions_removed = []
     if is_admin:
         # An administrator demoted, deactivated or locked here has their open requests withdrawn, before
         # any of that is set: who was asked to approve them is read as it stands.
@@ -10459,7 +10496,8 @@ async def update_user(
             elif user_update.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
                 from app.core import admin_grants as _grants
                 _grants.forget(db, user.id)
-            user.role = user_update.role
+            # Its permissions are reset to the new role's defaults with it (_set_role).
+            permissions_removed = _set_role(db, user, user_update.role, actor=current_user)
         
         if user_update.is_active is not None:
             # Reactivating a user consumes a seat, so enforce the plan's user cap on the
@@ -10532,7 +10570,8 @@ async def update_user(
             return (c["old"], c["new"]) if isinstance(c, dict) else None
         _notify_account_status_changes(db, user, by_name=current_user.username, locked=_pair("is_locked"),
                                        active=_pair("is_active"), role=_pair("role"),
-                                       sign_in_locks_cleared=changes.get("sign_in_locks_cleared", 0))
+                                       sign_in_locks_cleared=changes.get("sign_in_locks_cleared", 0),
+                                       permissions_removed=permissions_removed)
     if admin_granted:
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
     _announce_withdrawn_requests(db, withdrawn)

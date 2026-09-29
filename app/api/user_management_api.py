@@ -607,6 +607,7 @@ async def update_user(
                 made.append(outcome)
 
     admin_granted = False
+    permissions_removed = []
     # An administrator demoted or deactivated here has their open requests withdrawn, before either is
     # set: who was asked to approve them is read as it stands.
     withdrawn = []
@@ -625,7 +626,9 @@ async def update_user(
         elif update_data.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
             from app.core import admin_grants
             admin_grants.forget(db, user.id)
-        user.role = update_data.role
+        # Its permissions are reset to the new role's defaults with it (_set_role).
+        from app.api.api_server import _set_role
+        permissions_removed = _set_role(db, user, update_data.role, actor=current_user)
     
     if update_data.is_active is not None:
         was_active = user.is_active
@@ -656,7 +659,8 @@ async def update_user(
             _notify_credential_change(db, "email", user, outcome.result, by_name=current_user.username)
         _notify_account_status_changes(
             db, user, by_name=current_user.username, active=(old_active, user.is_active),
-            role=(old_role, user.role.value if user.role is not None else None))
+            role=(old_role, user.role.value if user.role is not None else None),
+            permissions_removed=permissions_removed)
     if admin_granted:
         from app.api.api_server import _announce_admin_granted
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
@@ -1275,7 +1279,9 @@ async def change_user_role(
     elif old_role == RoleEnum.ADMIN.value:
         from app.core import admin_grants
         admin_grants.forget(db, target_user.id)
-    target_user.role = request.new_role
+    # Its permissions are reset to the new role's defaults with it (_set_role), in the same commit.
+    from app.api.api_server import _set_role
+    permissions_removed = _set_role(db, target_user, request.new_role, actor=current_user)
     target_user.updated_at = datetime.now(timezone.utc)
     
     # Recorded as the admin who made the change, with the account changed as the resource, like the
@@ -1291,7 +1297,8 @@ async def change_user_role(
         details={"username": target_user.username, "old_role": old_role, "new_role": new_role},
     )
     from app.api.api_server import _notify_account_status_changes
-    _notify_account_status_changes(db, target_user, by_name=current_user.username, role=(old_role, new_role))
+    _notify_account_status_changes(db, target_user, by_name=current_user.username, role=(old_role, new_role),
+                                   permissions_removed=permissions_removed)
     if admin_granted:
         from app.api.api_server import _announce_admin_granted
         _announce_admin_granted(db, target_user, by_name=current_user.username, how="promoted")

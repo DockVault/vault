@@ -91,6 +91,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("password_reset_link_revoked", "accounts", "Password reset link revoked", "notice"),
     AuditAction("password_reset_link_sent", "accounts", "Password reset link emailed", "notice"),
     AuditAction("password_reset_requested", "accounts", "Password reset requested", "info"),
+    # A change of role resets the account's permissions to the new role's defaults: the row lists what
+    # was removed and added (app/api/api_server.py, _set_role).
+    AuditAction("permissions_reset_for_role", "accounts", "Permissions reset for a new role", "notice"),
     AuditAction("role_changed", "accounts", "User role changed", "notice"),
     AuditAction("self_account_update", "accounts", "Own account details changed", "notice"),
     AuditAction("ssh_key_add", "accounts", "SSH key added", "notice"),

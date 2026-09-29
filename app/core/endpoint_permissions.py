@@ -182,7 +182,7 @@ def _insert_permission_groups(
     if not group_names:
         return
     now = datetime.now(timezone.utc)
-    statement = pg_insert(UserEndpointPermission).values([
+    values = [
         {
             "id": uuid_module.uuid4(),
             "user_id": user_id,
@@ -191,7 +191,15 @@ def _insert_permission_groups(
             "granted_by": granted_by,
         }
         for group_name in group_names
-    ]).on_conflict_do_nothing(constraint="uq_user_endpoint")
+    ]
+    if db.get_bind().dialect.name == "sqlite":
+        # The offline tests' database. The same statement: a row the account already holds stays as it is.
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        statement = sqlite_insert(UserEndpointPermission).values(values).on_conflict_do_nothing(
+            index_elements=["user_id", "endpoint_group"])
+    else:
+        statement = pg_insert(UserEndpointPermission).values(values).on_conflict_do_nothing(
+            constraint="uq_user_endpoint")
     db.execute(statement)
 
 
@@ -216,6 +224,59 @@ def grant_endpoint_permission(
     return groups
 
 
+def role_default_groups(role) -> List[str]:
+    """The groups ``role`` (a RoleEnum or its text) has by default, with their prerequisites, in
+    dependency-first order."""
+    role_str = str(getattr(role, "value", role)).lower().replace("roleenum.", "").replace("role.", "")
+    return _ordered_with_dependencies([
+        group_name
+        for group_name, group in GRANTABLE_API_CATALOG.items()
+        if role_str in [item.lower() for item in group.default_for_roles]
+    ])
+
+
+def reset_to_role_defaults(user_id, role, db: Session) -> dict:
+    """``user_id``'s role has just changed to ``role``: bring the permissions stored for the account to
+    that role's defaults, in the caller's transaction (nothing is committed), and say what changed:
+    ``{"removed": [...], "added": [...], "kept": [...]}``, group names, ``kept`` being the grants that
+    stayed although the role does not have them by default.
+
+    Each role's defaults are stored as rows when an account is created (POST /users, an invitation,
+    sign-up), with no granter; a permission an administrator grants records who granted it. An account
+    created as an administrator therefore holds the permissions to view and to manage users as rows, and
+    before this a change of role left them there: an administrator made a user kept the permission to
+    manage users, which nobody had granted to a user, and with it made password reset links for other
+    people's accounts.
+
+    What stays: the new role's defaults, and each permission another account granted this one (its
+    granter is recorded and is not the account itself), with what it depends on, because an
+    administrator may give that to anyone. What goes: every other row, that is the old role's defaults,
+    and a permission the account granted itself while it was an administrator, which changed nothing
+    then and must not outlast its own demotion. A grant whose granter's account was deleted since has
+    lost its granter (the column is set to NULL), cannot be told from a default, and goes too; an
+    administrator can grant it again. Rows naming a group outside the catalogue are left alone: nothing
+    requires them."""
+    target = uuid_module.UUID(str(user_id))
+    defaults = role_default_groups(role)
+    rows = db.query(UserEndpointPermission).filter(
+        UserEndpointPermission.user_id == target,
+        UserEndpointPermission.endpoint_group.in_(GRANTABLE_API_CATALOG),
+    ).all()
+    held = {row.endpoint_group for row in rows}
+    granted = {row.endpoint_group for row in rows
+               if row.granted_by is not None and row.granted_by != target}
+    keep = set(defaults) | granted | {dep for group in granted for dep in dependency_closure(group)}
+    removed = sorted(held - keep)
+    if removed:
+        db.query(UserEndpointPermission).filter(
+            UserEndpointPermission.user_id == target,
+            UserEndpointPermission.endpoint_group.in_(removed),
+        ).delete(synchronize_session=False)
+    added = [group for group in defaults if group not in held]
+    _insert_permission_groups(target, added, db, None)
+    return {"removed": removed, "added": sorted(added), "kept": sorted((keep & held) - set(defaults))}
+
+
 def grant_default_permissions_for_role(
     user_id: str,
     role: str,
@@ -227,13 +288,7 @@ def grant_default_permissions_for_role(
     `commit=False` lets a caller fold the grant into a surrounding transaction (e.g. invitation
     acceptance, which claims the invite and creates the user in one commit); the default keeps the
     self-committing behaviour every existing caller relies on."""
-    role_str = str(role).lower().replace("roleenum.", "").replace("role.", "")
-    defaults = [
-        group_name
-        for group_name, group in GRANTABLE_API_CATALOG.items()
-        if role_str in [item.lower() for item in group.default_for_roles]
-    ]
-    groups = _ordered_with_dependencies(defaults)
+    groups = role_default_groups(role)
     try:
         _insert_permission_groups(uuid_module.UUID(user_id), groups, db, None)
         if commit:
