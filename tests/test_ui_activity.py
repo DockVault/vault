@@ -105,6 +105,9 @@ def test_the_filter_panel_closes_on_a_click_elsewhere(page: Page, activity_admin
     page.click("#act-filter-btn")
     expect(page.locator("#act-filter-panel")).to_be_visible()
     expect(page.locator("#act-filter-btn")).to_have_attribute("aria-expanded", "true")
+    # The panel ignores clicks elsewhere for its first 60 ms, so the click that opened it cannot close
+    # it again; a person cannot click twice that fast, a test can.
+    page.wait_for_timeout(200)
     page.click("#activity-section h2")                                   # a click elsewhere closes it
     expect(page.locator("#act-filter-panel")).to_be_hidden()
     expect(page.locator("#act-filter-btn")).to_have_attribute("aria-expanded", "false")
