@@ -177,6 +177,23 @@ def _phantoms(declared, released: list[str], pending: set[str]) -> list[str]:
     return sorted((v for v in declared if v not in released and v not in pending), key=_vkey)
 
 
+def _require_no_phantoms(root: Path, declared, released: list[str], preparing: str) -> None:
+    """Fail when the matrix declares a version that is neither released nor prepared in this
+    commit's history. A shallow checkout cannot see that history, so it fails too -- as a failure,
+    not a skip, since a skip would leave the check silently off wherever CI checks out shallow."""
+    pending = _versions_in_history(root) | {preparing}
+    phantom = _phantoms(declared, released, pending)
+    if phantom and _is_shallow(root):
+        pytest.fail(
+            f"docs/upgrade-matrix.json declares {phantom}, which are not released tags, and this "
+            "checkout is shallow, so whether they are pending in this commit's history cannot be "
+            "told. The checkout needs its history (fetch-depth: 0)")
+    assert not phantom, (
+        f"docs/upgrade-matrix.json declares {phantom}, which are not released tags and not a "
+        f"version prepared in this commit's history ({preparing} now). A version that does not "
+        "exist can satisfy the adjacency rule while describing a release nobody can get")
+
+
 def test_the_committed_matrix_is_valid():
     # Against the newest released version: on main that is the VERSION file, so a vulnerability
     # naming an unreleased `fixed_in` is caught here on an ordinary push, not only at release. On a
@@ -249,17 +266,7 @@ def test_every_released_tag_has_an_entry_and_a_way_to_reach_it():
     # two. "Being prepared" is this commit's VERSION or any VERSION in its history: two releases cut
     # the same day are prepared as two candidates, the later built on the earlier, and each must pass
     # CI before either is tagged. The release gate stays strict; it exempts only the tag it cuts.
-    pending = _versions_in_history(ROOT) | {preparing}
-    phantom = _phantoms(data["versions"], released, pending)
-    if phantom and _is_shallow(ROOT):
-        pytest.fail(
-            f"docs/upgrade-matrix.json declares {phantom}, which are not released tags, and this "
-            "checkout is shallow, so whether they are pending in this commit's history cannot be "
-            "told. The checkout needs its history (fetch-depth: 0)")
-    assert not phantom, (
-        f"docs/upgrade-matrix.json declares {phantom}, which are not released tags and not a "
-        f"version prepared in this commit's history ({preparing} now). A version that does not "
-        "exist can satisfy the adjacency rule while describing a release nobody can get")
+    _require_no_phantoms(ROOT, data["versions"], released, preparing)
 
 
 def test_the_committed_matrix_declares_every_released_edge_direct():
@@ -1274,6 +1281,30 @@ def test_a_version_prepared_only_on_another_branch_is_a_phantom(tmp_path):
 
     assert "0.33.9" not in _versions_in_history(root)
     assert _phantoms(["0.33.0", "0.33.9"], ["0.33.0"], _versions_in_history(root)) == ["0.33.9"]
+
+
+def test_a_shallow_checkout_fails_the_check_rather_than_skipping_it(tmp_path):
+    """In a one-commit clone the earlier candidate's VERSION is out of sight, so a version pending
+    in history looks like a phantom. That must fail, loudly, not skip: a skip in CI is a check that
+    quietly stopped running."""
+    source = _history_repo(tmp_path, ["0.33.0", "0.33.1", "0.34.0"], tags=("0.33.0",))
+    clone = tmp_path / "shallow"
+    cloned = _git_out(tmp_path, "clone", "-q", "--depth", "1", source.resolve().as_uri(), str(clone))
+    assert cloned.returncode == 0, cloned.stderr
+    assert _is_shallow(clone) and not _is_shallow(source)
+    declared = ["0.33.0", "0.33.1", "0.34.0"]
+
+    # Caught as any outcome, so that a skip is seen as the wrong outcome here rather than skipping
+    # this test too.
+    with pytest.raises(BaseException, match="this checkout is shallow") as outcome:
+        _require_no_phantoms(clone, declared, ["0.33.0"], "0.34.0")
+    assert outcome.type is pytest.fail.Exception
+
+    # With its history, the same matrix is fine: 0.33.1 is pending in an ancestor.
+    _require_no_phantoms(source, declared, ["0.33.0"], "0.34.0")
+    # And a real phantom is an ordinary failure, shallow or not.
+    with pytest.raises(AssertionError, match=r"declares \['0\.33\.5'\]"):
+        _require_no_phantoms(source, [*declared, "0.33.5"], ["0.33.0"], "0.34.0")
 
 
 def test_tags_that_are_not_releases_are_not_read_as_releases(tmp_path):
