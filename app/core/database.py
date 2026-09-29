@@ -25,6 +25,11 @@ _consumer_lock = threading.Lock()
 # changes may legitimately wait on a lock; and the Postgres service also sets
 # idle_in_transaction_session_timeout in the deploy composes as a second backstop. No env flag.
 _LOCK_TIMEOUT_MS = 5000
+# Every app connection's session runs in UTC. The timestamp columns hold UTC with no zone attached,
+# and a zone-aware value bound into one (a write, or a comparison) is converted through the session's
+# time zone, which is otherwise the database's: on a database set to another zone such values were off
+# by its offset. Pinned here, they are UTC whatever the database is set to.
+_CONNECT_OPTIONS = f"-c lock_timeout={_LOCK_TIMEOUT_MS} -c timezone=UTC"
 _engine = None
 _session_factory = None
 _redis_client = None
@@ -59,7 +64,7 @@ def initialize_consumers() -> None:
                 # they are names typed at sign-in, addresses, file names, and an error is printed to
                 # the container log. Nothing reads the values back out of an error.
                 hide_parameters=True,
-                connect_args={"connect_timeout": 5, "options": f"-c lock_timeout={_LOCK_TIMEOUT_MS}"},
+                connect_args={"connect_timeout": 5, "options": _CONNECT_OPTIONS},
             )
             factory = sessionmaker(
                 autocommit=False,
