@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ import test_login_throttle as login_throttle
 import test_zk_vault as zk_vault
 
 import pytest
+import yaml
 
 from conftest import skip_for_older_deployment
 
@@ -20,6 +22,7 @@ from conftest import skip_for_older_deployment
 pytestmark = pytest.mark.unit
 
 _ROOT = Path(__file__).parents[1]
+_WORKFLOWS = _ROOT / ".github" / "workflows"
 _WORKFLOW = (_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
 _FAST_WORKFLOW = (_ROOT / ".github" / "workflows" / "fast-tests.yml").read_text(
     encoding="utf-8"
@@ -408,3 +411,83 @@ def test_degraded_alert_regression_cleans_only_its_row():
 
     assert "SecurityAlert.id.in_(created)" in target
     assert "filter(SecurityAlert.event_type==SecurityEventType.DETECTION_DEGRADED).delete" not in target
+
+
+# --- maintenance lines ---------------------------------------------------------------------------
+#
+# A line `release/X.Y` is a branch that publishes, so a merge into it gets the checks a merge into
+# main gets. Release candidates are `candidate/X.Y.Z` and are tested by a manual run only, as before:
+# a push-triggered run on a candidate would share its concurrency group with the dispatched one and
+# cancel it.
+
+
+def _github_filter(pattern: str) -> "re.Pattern[str]":
+    """A GitHub Actions branch filter as a regular expression.
+
+    The documented syntax: `*` matches within one path segment, `**` across them, `?` and `+` make
+    the preceding character (or class) optional or repeated, `[...]` is a character class, and
+    everything else is literal -- including `.`.
+    """
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+            continue
+        char = pattern[i]
+        if char == "*":
+            out.append("[^/]*")
+        elif char == "[":
+            end = pattern.index("]", i)
+            out.append(pattern[i:end + 1])
+            i = end + 1
+            continue
+        elif char in "?+":
+            out.append(char)
+        else:
+            out.append(re.escape(char))
+        i += 1
+    return re.compile("".join(out))
+
+
+def _branch_filter(workflow: str, event: str) -> list[str]:
+    data = yaml.safe_load((_WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    triggers = data.get("on", data.get(True))  # YAML 1.1 reads a bare `on` as true
+    branches = (triggers.get(event) or {}).get("branches")
+    assert isinstance(branches, list) and branches, f"{workflow} {event} has no branch filter"
+    return branches
+
+
+def _fires(branches: list[str], branch: str) -> bool:
+    return any(_github_filter(pattern).fullmatch(branch) for pattern in branches)
+
+
+@pytest.mark.parametrize("workflow, event", [
+    ("tests.yml", "push"),
+    ("fast-tests.yml", "push"),
+    ("codeql.yml", "push"),
+    ("codeql.yml", "pull_request"),
+    ("image-scan-pr.yml", "pull_request"),
+])
+def test_ci_gates_maintenance_lines_and_leaves_candidates_to_a_manual_run(workflow, event):
+    branches = _branch_filter(workflow, event)
+
+    assert _fires(branches, "main")
+    assert _fires(branches, "release/0.33")
+    assert _fires(branches, "release/1.0")
+    # Candidates, in the new naming and in the one release candidates used before it.
+    assert not _fires(branches, "candidate/0.34.0")
+    assert not _fires(branches, "release/0.33.0")
+    assert not _fires(branches, "release/0.33/extra")
+
+
+def test_the_filter_reading_matches_githubs_documented_examples():
+    """The reader above decides what the parametrized test proves, so it is checked against the
+    examples GitHub documents for its filter syntax."""
+    assert _github_filter("v[12].[0-9]+.[0-9]+").fullmatch("v2.10.3")
+    assert not _github_filter("v[12].[0-9]+.[0-9]+").fullmatch("v3.1.0")
+    assert _github_filter("feature/*").fullmatch("feature/my-branch")
+    assert not _github_filter("feature/*").fullmatch("feature/your/branch")
+    assert _github_filter("feature/**").fullmatch("feature/your/branch")
+    assert _github_filter("*").fullmatch("main")
+    assert not _github_filter("*").fullmatch("releases/v1")
