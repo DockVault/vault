@@ -71,6 +71,13 @@ def _point_sha256(pem: str) -> str:
                                            serialization.PublicFormat.UncompressedPoint)).hexdigest()
 
 
+def _epoch_row(vid, epoch=1):
+    """(source, proof public key, sealed key, key check, lineage tag) of a vault's proof row, psql-formatted."""
+    return _psql("SELECT source, coalesce(proof_public_key, '-'), coalesce(sealed_private_key, '-'), "
+                 "coalesce(dek_check, '-'), coalesce(lineage_tag, '-') FROM vault_key_proofs "
+                 f"WHERE vault_id = '{vid}' AND dek_epoch = {epoch}")
+
+
 def test_a_holder_gets_a_challenge_carrying_the_vaults_state(admin):
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
@@ -84,13 +91,20 @@ def test_a_holder_gets_a_challenge_carrying_the_vaults_state(admin):
         uuid.UUID(body["challenge_id"])
         assert len(base64.b64decode(body["nonce"])) == 32
         assert body["expires_in"] == 300
-        assert (body["mode"], body["dek_epoch"], body["team_epoch"], body["verifier"]) == ("direct", 1, 1, None)
+        assert (body["mode"], body["dek_epoch"], body["team_epoch"]) == ("direct", 1, 1)
         assert serialization.load_pem_public_key(body["server_ephemeral_public_key"].encode()).curve.name == "secp384r1"
+        # The vault was created with a proof, so its first epoch has its proof key from the start, and the
+        # challenge names it.
+        source, public_key, sealed_key, check, tag = _epoch_row(vid).split("|")
+        assert (source, tag) == ("create", "-")
+        assert body["verifier"] == {"public_key": body["verifier"]["public_key"], "source": "create",
+                                    "sealed_private_key": sealed_key, "dek_check": check, "lineage_tag": None}
+        assert body["verifier"]["public_key"].strip() == public_key.strip()
 
         row = _psql("SELECT op, mode, dek_epoch, team_epoch, coalesce(verifier_sha256, '-'), vault_id, "
                     f"server_private_key_sealed FROM zk_key_proof_challenges WHERE id = '{body['challenge_id']}'")
         op, mode, de, te, vsha, rvid, sealed = row.split("|")
-        assert (op, mode, de, te, vsha, rvid) == ("share", "direct", "1", "1", "-", vid)
+        assert (op, mode, de, te, vsha, rvid) == ("share", "direct", "1", "1", _point_sha256(public_key), vid)
         assert sealed.startswith("gAAAA") and "BEGIN" not in sealed, "the one-time key is stored sealed"
         # No row in the table holds a key in the clear.
         assert _psql("SELECT count(*) FROM zk_key_proof_challenges "
@@ -104,6 +118,12 @@ def test_a_direct_epochs_verifier_is_its_row_and_bootstrap_is_refused_once_it_ha
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
+        # As a vault made before proofs existed: its epoch has no proof key yet.
+        _psql(f"DELETE FROM vault_key_proofs WHERE vault_id = '{vid}'")
+        none_yet = _challenge(admin, vid, "share")
+        assert none_yet.status_code == 200 and none_yet.json()["verifier"] is None, none_yet.text
+        assert _psql("SELECT coalesce(verifier_sha256, '-') FROM zk_key_proof_challenges "
+                     f"WHERE id = '{none_yet.json()['challenge_id']}'") == "-"
         assert _challenge(admin, vid, "bootstrap").status_code == 200, "no row yet: bootstrap may run"
         proof_key = team_public_key()      # any remembered P-384 key will do as the verifier
         sealed = base64.b64encode(b"DVZ2\x02\x07\x00\x00" + os.urandom(60)).decode()
@@ -132,9 +152,9 @@ def test_a_team_vault_names_its_team_key_and_never_its_private_material(admin):
         v = _create_team_vault(admin)
     vid = v["id"]
     try:
-        # Its create challenge was issued for the mode the body creates, so that is the mode the proof binds.
-        assert _psql(f"SELECT mode FROM zk_key_proof_challenges WHERE vault_id = '{vid}' AND op = 'create'") \
-            == "hierarchical"
+        # Its create challenge was issued for the mode the body creates (a create in another mode than its
+        # challenge's is refused), and the create went through the proof: its first epoch has a row.
+        assert _epoch_row(vid) == "create|-|-|-|-"
         team_key = _psql(f"SELECT team_public_key FROM vaults WHERE id = '{vid}'")
         r = _challenge(admin, vid, "share")
         assert r.status_code == 200, r.text
@@ -143,7 +163,7 @@ def test_a_team_vault_names_its_team_key_and_never_its_private_material(admin):
         verifier = body["verifier"]
         assert set(verifier) == {"public_key", "source", "lineage_tag"}, "no sealed or private material"
         assert verifier["public_key"].strip() == team_key.strip()           # psql drops the final newline
-        assert (verifier["source"], verifier["lineage_tag"]) == (None, None)
+        assert (verifier["source"], verifier["lineage_tag"]) == ("create", None)
         boot = _challenge(admin, vid, "bootstrap")
         assert boot.status_code == 400 and boot.json()["reason"] == "zk-key-proof-malformed", boot.text
 

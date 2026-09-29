@@ -7,8 +7,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel, Field
-from typing import Optional, List
+from pydantic import BaseModel, Field, StrictBool
+from typing import Any, Dict, Optional, List
+from dataclasses import dataclass
 import hashlib
 import base64
 import os
@@ -1048,6 +1049,7 @@ async def put_vault_index_key(
     body: IndexKeyPut,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    http_request: Request = None,
 ):
     """Store the wrapped name-index key: mint it, or add a wrap for a NEW member.
 
@@ -1071,6 +1073,9 @@ async def put_vault_index_key(
     is -- the server holds only opaque wraps and cannot check the plaintext key. And, as for a DEK
     re-wrap, the caller must hold the vault's current key: management rights alone do not make
     someone a party to the vault's keys.
+
+    The request carries a key proof (see "Key proof: the guarded requests"): that the caller holds their
+    own identity key and the vault's current key right now, not merely an account that has a key row.
     """
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -1079,6 +1084,10 @@ async def put_vault_index_key(
     if not _can_manage_vault(db, vault, current_user):
         raise HTTPException(status_code=403,
                             detail="Only the vault owner or a manager can set the name-index key")
+    header = _key_proof_header(http_request)
+    raw_body = await _raw_body(http_request) if header else None
+    ch = (_consume_key_proof_challenge(db, current_user, vault_id=vault.id, op="index_key", header=header)
+          if header else None)
     # The key minted here is one members then use for every name they write, so its minter learns
     # it -- and with it can confirm guessed names against the stored indices. Minting (or handing out
     # a wrap) is for someone who holds the vault's key, checked under the vault row lock like a
@@ -1090,6 +1099,10 @@ async def put_vault_index_key(
     if not _holds_current_key(db, locked, current_user.id):
         raise HTTPException(status_code=403,
                             detail="Only someone who holds this vault's key can set its name-index key")
+    if ch is not None:
+        _pin_key_proof_state(db, ch, locked)
+        _verify_key_proof(db, current_user, ch, header, vault_id=locked.id, body=raw_body,
+                          current_pem=_current_key_verifier(db, locked), new_pem=None)
 
     # Validate every user_id up front so a malformed one is a clean 400, not a partial write.
     incoming = []
@@ -1140,7 +1153,10 @@ async def put_vault_index_key(
             detail="A name-index-key wrap for a member in this request was just created; re-read.")
     _audit_zk(db, current_user, "zk_index_key_wrapped", resource_id=vault.id,
               details={"wraps": len(incoming), "minted": not existing_uids,
-                       "members": [str(uid) for uid, _ in incoming]})
+                       "members": [str(uid) for uid, _ in incoming],
+                       "proof": "key" if ch is not None else "absent"})
+    if ch is None:
+        _audit_key_proof_absent(db, current_user, vault.id, "index_key", getattr(vault, 'key_wrapping_mode', None))
     return {"status": "ok", "wraps": len(incoming), "index_key_version": 1}
 
 
@@ -1450,6 +1466,220 @@ async def key_proof_challenge(
     }
 
 
+# =============================================================================
+# Key proof: the guarded requests
+# =============================================================================
+# Rotating a zero-knowledge vault's key, sharing it, setting its name-index key and creating one each
+# answer a challenge from the route above. Every one of them runs the same steps, in this order:
+#
+#   1. the header and the shape of every piece of key material in the body, refused with 400 before
+#      anything is consumed, so an honest client cannot destroy its own challenge;
+#   2. the challenge, claimed and deleted in its own commit BEFORE the vault row lock: a wrong answer
+#      costs a fresh, rate-limited challenge, and the handlers hold the lock to one final commit;
+#   3. under the lock: the key-holder check, the state pin (the vault is still in the state the
+#      challenge was issued for) and the MACs, before anything in the body is used beyond hashing it;
+#   4. the change and the proof row in one commit, then the audit row.
+#
+# A request without a header is refused (428) unless the host operator turned enforcement off; then it
+# runs as it did before proofs existed, is recorded as zk_key_proof_absent, and stores no proof material.
+
+
+@dataclass(frozen=True)
+class _IssuedChallenge:
+    """A consumed challenge row, captured before its deletion."""
+    id: str
+    op: str
+    nonce: str
+    server_private_pem: str
+    mode: str
+    dek_epoch: int
+    team_epoch: int
+    verifier_sha256: Optional[str]
+
+
+def _key_proof_header(http_request, *, always: bool = False) -> Optional["zk_key_proof.ProofHeader"]:
+    """The request's parsed key-proof header, or None for a request without one that may still go ahead.
+
+    Without a header: 428 while enforcement is on, and always for the operations that exist only with
+    proofs (`always`). A header that is present but malformed is a 400."""
+    raw = http_request.headers.get(zk_key_proof.HEADER_NAME) if http_request is not None else None
+    if raw is None:
+        if always or zk_key_proof.enforcement_enabled():
+            raise zk_key_proof.KeyProofRefusal("zk-key-proof-required")
+        return None
+    try:
+        return zk_key_proof.parse_header(raw)
+    except zk_key_proof.MalformedProof as exc:
+        raise zk_key_proof.malformed(str(exc))
+
+
+def _direct_proof_material(value, name: str) -> dict:
+    """A direct epoch's proof material {public_key, sealed_private_key, dek_check}, shape-checked. The
+    server cannot open the sealed key and does not try; members' clients check it against the DEK."""
+    if not isinstance(value, dict):
+        raise zk_key_proof.malformed(f"{name} is required")
+    try:
+        zk_key_proof.public_point(value.get("public_key"))
+        zk_key_proof.validate_sealed_key(value.get("sealed_private_key"))
+        zk_key_proof.validate_mac32(value.get("dek_check"), "dek_check")
+    except zk_key_proof.MalformedProof as exc:
+        raise zk_key_proof.malformed(f"{name}: {exc}")
+    return {"public_key": value["public_key"], "sealed_private_key": value["sealed_private_key"],
+            "dek_check": value["dek_check"]}
+
+
+def _lineage_tag_or_none(value, *, required: bool) -> Optional[str]:
+    """A rotation's lineage tag (base64 of 32 bytes), or None where one may be left out."""
+    if value is None and not required:
+        return None
+    try:
+        zk_key_proof.validate_mac32(value, "lineage_tag")
+    except zk_key_proof.MalformedProof as exc:
+        raise zk_key_proof.malformed(str(exc))
+    return value
+
+
+def _p384_or_malformed(pem, name: str) -> bytes:
+    """The point of a public key the request installs, or 400."""
+    try:
+        return zk_key_proof.public_point(pem)
+    except zk_key_proof.MalformedProof:
+        raise zk_key_proof.malformed(f"{name} is not a P-384 public key")
+
+
+def _audit_key_proof_failed(db: Session, user: User, vault_id, op: str, reason: str,
+                            ch: Optional[_IssuedChallenge] = None) -> None:
+    """Record a refused proof: which operation and why (`no_live_challenge`, `expired`, `identity`,
+    `current_key` or `new_key`). Never the header, a MAC, the nonce or the body."""
+    details = {"op": op, "reason": reason}
+    if ch is not None:
+        details.update(mode=ch.mode, dek_epoch=ch.dek_epoch, team_epoch=ch.team_epoch)
+    _audit_zk(db, user, "zk_key_proof_failed", resource_id=vault_id, details=details, status="failure")
+
+
+def _audit_key_proof_absent(db: Session, user: User, vault_id, op: str, mode: Optional[str]) -> None:
+    """Record a key change accepted without a proof, which only happens while enforcement is off."""
+    _audit_zk(db, user, "zk_key_proof_absent", resource_id=vault_id,
+              details={"op": op, "mode": mode or "direct"}, status="success")
+
+
+def _consume_key_proof_challenge(db: Session, user: User, *, vault_id, op: str,
+                                 header: "zk_key_proof.ProofHeader") -> _IssuedChallenge:
+    """Claim the challenge the header names -- issued to this account, for this vault and operation --
+    and delete it, in its own commit. Consumption never depends on the outcome, so every attempt at a
+    proof costs a fresh challenge. Missing, expired, or a key this deployment did not seal: 403."""
+    try:
+        vid = uuid.UUID(str(vault_id))
+    except (TypeError, ValueError):
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
+    row = db.query(ZkKeyProofChallenge).filter(
+        ZkKeyProofChallenge.id == uuid.UUID(header.challenge_id),
+        ZkKeyProofChallenge.user_id == user.id,
+        ZkKeyProofChallenge.vault_id == vid,
+        ZkKeyProofChallenge.op == op,
+    ).with_for_update().first()
+    if row is None:
+        db.rollback()
+        _audit_key_proof_failed(db, user, vid, op, "no_live_challenge")
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
+    created_at, sealed = row.created_at, row.server_private_key_sealed
+    captured = dict(id=str(row.id), op=row.op, nonce=row.nonce, mode=row.mode, dek_epoch=row.dek_epoch,
+                    team_epoch=row.team_epoch, verifier_sha256=row.verifier_sha256)
+    db.delete(row)
+    db.commit()
+    expired = created_at is None or (
+        datetime.utcnow() - created_at) > timedelta(seconds=zk_key_proof.CHALLENGE_TTL_SECONDS)
+    if expired:
+        _audit_key_proof_failed(db, user, vid, op, "expired")
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
+    try:
+        server_private_pem = _unseal_challenge_key(sealed)
+    except ValueError:
+        # Not a key this deployment sealed: someone wrote the row who is not this server.
+        _audit_key_proof_failed(db, user, vid, op, "no_live_challenge")
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
+    return _IssuedChallenge(server_private_pem=server_private_pem, **captured)
+
+
+def _live_verifier_pem(db: Session, locked: Vault) -> Optional[str]:
+    """The public key a proof of the vault's current key is checked against, as stored: the team public
+    key of a hierarchical vault, the current epoch's proof key of a direct one (None without a row)."""
+    if _is_hierarchical(locked):
+        return getattr(locked, 'team_public_key', None)
+    row = _current_key_proof(db, locked)
+    return row.proof_public_key if row is not None else None
+
+
+def _pin_key_proof_state(db: Session, ch: _IssuedChallenge, locked: Vault) -> None:
+    """The vault must still be in the state the challenge was issued for: its mode, both epochs and its
+    verifier. Anything else means the key changed meanwhile, and the caller prepares again (409)."""
+    live = (
+        "hierarchical" if _is_hierarchical(locked) else "direct",
+        getattr(locked, 'dek_version', 1) or 1,
+        getattr(locked, 'team_key_version', 1) or 1,
+        _verifier_sha256(_live_verifier_pem(db, locked)),
+    )
+    if live != (ch.mode, ch.dek_epoch, ch.team_epoch, ch.verifier_sha256):
+        db.rollback()
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-stale")
+
+
+def _current_key_verifier(db: Session, locked: Vault) -> str:
+    """The verifier a current-key proof is checked against. A direct epoch with no proof key yet needs a
+    bootstrap first (428); a team key that is not a usable P-384 key cannot verify anything (409)."""
+    if _is_hierarchical(locked):
+        pem = getattr(locked, 'team_public_key', None)
+        if _verifier_sha256(pem) is None:
+            db.rollback()
+            raise zk_key_proof.KeyProofRefusal("zk-key-proof-verifier-unusable")
+        return pem
+    row = _current_key_proof(db, locked)
+    if row is None:
+        db.rollback()
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-setup-required")
+    return row.proof_public_key
+
+
+def _verify_key_proof(db: Session, user: User, ch: _IssuedChallenge, header, *, vault_id, body: bytes,
+                      current_pem: Optional[str], new_pem: Optional[str]) -> None:
+    """Check every MAC the operation requires: identity always; the current key unless the operation is
+    one of the two that install the first verifier or replace damaged material; the new key whenever the
+    request installs one. A MAC the server does not require is ignored. On failure: roll back, record
+    the first role that failed, 403 (one sentence for every failure)."""
+    if ch.op in zk_key_proof.OPS_WITHOUT_CURRENT_KEY:
+        current_pem = None
+    identity_pem = db.query(UserKeyPair.public_key).filter(UserKeyPair.user_id == user.id).scalar()
+    try:
+        digest = zk_key_proof.transcript(
+            op=ch.op, challenge_id=ch.id, nonce_b64=ch.nonce, user_id=str(user.id), vault_id=str(vault_id),
+            mode=ch.mode, dek_epoch=ch.dek_epoch, team_epoch=ch.team_epoch,
+            identity_public_key=identity_pem, current_public_key=current_pem, new_public_key=new_pem,
+            body=body,
+        )
+    except zk_key_proof.MalformedProof:
+        digest = None
+    failed = None
+    if digest is None or not zk_key_proof.verify_role(
+            zk_key_proof.ROLE_IDENTITY, ch.server_private_pem, identity_pem, digest, header.identity_mac):
+        failed = "identity"
+    elif current_pem is not None and not zk_key_proof.verify_role(
+            zk_key_proof.ROLE_CURRENT_KEY, ch.server_private_pem, current_pem, digest, header.current_key_mac):
+        failed = "current_key"
+    elif new_pem is not None and not zk_key_proof.verify_role(
+            zk_key_proof.ROLE_NEW_KEY, ch.server_private_pem, new_pem, digest, header.new_key_mac):
+        failed = "new_key"
+    if failed:
+        db.rollback()
+        _audit_key_proof_failed(db, user, vault_id, ch.op, failed, ch)
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
+
+
+async def _raw_body(http_request) -> bytes:
+    """The request body exactly as received: what the proof's transcript binds. Starlette keeps the bytes
+    it read for the body model, so this is those same bytes."""
+    return await http_request.body()
+
+
 @router.get("/users/{user_id}/public-key")
 async def get_user_public_key(
     user_id: str,
@@ -1503,7 +1733,8 @@ async def grant_member_key(
     vault_id: str,
     request: GrantMemberKeyRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    http_request: Request = None,
 ):
     """Store a vault DEK that a MANAGER WRAPPED IN THE BROWSER for another user
     (zero-knowledge sharing). The server only persists opaque ciphertext + the
@@ -1513,7 +1744,11 @@ async def grant_member_key(
     (_can_manage_vault) — the SAME gate as the authz grant POST /vaults/{id}/permissions,
     so this DEK-minting path is not a weaker surface that any plain member could use to
     re-grant a revoked user a working key. The caller must ALSO hold an active key (so they
-    could actually unwrap+re-wrap the DEK). The recipient must have a registered keypair."""
+    could actually unwrap+re-wrap the DEK). The recipient must have a registered keypair.
+
+    The request carries a key proof (see "Key proof: the guarded requests"): the caller holds their own
+    identity key and the vault's current key right now. With one, a direct vault's share must name the
+    epoch its wrap was made at (`dek_version`)."""
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
@@ -1561,6 +1796,14 @@ async def grant_member_key(
                 detail="Only the vault owner or an admin can re-wrap a manager's key",
             )
 
+    header = _key_proof_header(http_request)
+    if header is not None and not _is_hierarchical(vault) and request.dek_version is None:
+        # A proven share binds one epoch: the wrap is only meaningful at the epoch it was made at.
+        raise zk_key_proof.malformed("dek_version is required with a key proof")
+    raw_body = await _raw_body(http_request) if header else None
+    ch = (_consume_key_proof_challenge(db, current_user, vault_id=vault.id, op="share", header=header)
+          if header else None)
+
     # Re-read the vault under a row lock before deciding the epoch, so a rotation cannot
     # commit between the read and the upsert. populate_existing() is load-bearing: this
     # session already holds the row from the entry read, and without it the identity map
@@ -1581,6 +1824,10 @@ async def grant_member_key(
     # lock, for the same reason as the rotation's check (see _holds_current_key).
     if not _holds_current_key(db, locked, current_user.id):
         raise HTTPException(status_code=403, detail="You don't hold this vault's current key")
+    if ch is not None:
+        _pin_key_proof_state(db, ch, locked)
+        _verify_key_proof(db, current_user, ch, header, vault_id=locked.id, body=raw_body,
+                          current_pem=_current_key_verifier(db, locked), new_pem=None)
 
     # HIERARCHICAL: store the recipient's wrap of the TEAM PRIVATE key at the current TEAM
     # epoch — O(1), the DEK is not touched. DIRECT: store the DEK wrapped to the recipient at
@@ -1655,7 +1902,10 @@ async def grant_member_key(
         db.rollback()
     _audit_zk(db, current_user, "zk_member_key_granted", resource_id=vault_id,
               details={"target_user_id": str(request.user_id), "key_version": epoch,
-                       "mode": getattr(vault, 'key_wrapping_mode', 'direct')})
+                       "mode": getattr(vault, 'key_wrapping_mode', 'direct'),
+                       "proof": "key" if ch is not None else "absent"})
+    if ch is None:
+        _audit_key_proof_absent(db, current_user, vault_id, "share", getattr(vault, 'key_wrapping_mode', None))
     return {"status": "ok", "vault_id": vault_id, "user_id": request.user_id,
             "key_version": epoch, "mode": getattr(vault, 'key_wrapping_mode', 'direct')}
 
@@ -1849,6 +2099,11 @@ class RekeyRequest(BaseModel):
     team_dek_wrapped: Optional[str] = Field(None, description="the new DEK wrapped to a team public key")
     team_dek_ephemeral_public_key: Optional[str] = None
     team_public_key: Optional[str] = Field(None, description="a NEW team public key (presence => team-keypair rotation)")
+    # With a key proof. DIRECT: the new epoch's proof material {public_key, sealed_private_key,
+    # dek_check}, the proof key sealed under the new DEK. Both modes: the lineage tag, a MAC by the
+    # previous epoch's DEK over what this rotation installs, so members can tell it came from a holder.
+    next_key_proof: Optional[Dict[str, Any]] = None
+    lineage_tag: Optional[str] = None
 
 
 @router.get("/vaults/{vault_id}/member-keys")
@@ -1927,6 +2182,7 @@ async def rekey_vault(
     request: RekeyRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    http_request: Request = None,
 ):
     """Atomically revoke a member (optional) and rotate the zero-knowledge vault DEK to a
     new epoch, re-wrapped for the remaining members. The browser mints DEK v_{n+1}, wraps
@@ -1944,6 +2200,11 @@ async def rekey_vault(
     a security-critical op must not be a weaker authz surface than a plain permission edit),
     AND the caller must hold the vault's current key and stay one of the members the new key is
     wrapped for. Whoever runs the rotation learns the new key (see _holds_current_key).
+
+    The request carries a key proof (see "Key proof: the guarded requests"): the caller holds their own
+    identity key, the vault's current key, and the private half of any public key the rotation installs
+    (a direct vault's new proof key, a hierarchical vault's new team key). The new epoch's proof row is
+    written in the same commit as the rotation.
     """
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
@@ -1951,6 +2212,22 @@ async def rekey_vault(
         raise HTTPException(status_code=404, detail="Vault not found")
     if not _can_manage_vault(db, vault, current_user):
         raise HTTPException(status_code=403, detail="Only the vault owner or a manager can rotate the vault key")
+
+    # The key proof: the header and the material's shape first (a malformed request consumes nothing),
+    # then the challenge, before the vault lock below.
+    header = _key_proof_header(http_request)
+    next_material = None
+    lineage_tag = None
+    if header is not None:
+        if _is_hierarchical(vault):
+            if request.team_public_key is not None:
+                _p384_or_malformed(request.team_public_key, "team_public_key")
+        else:
+            next_material = _direct_proof_material(request.next_key_proof, "next_key_proof")
+        lineage_tag = _lineage_tag_or_none(request.lineage_tag, required=True)
+    raw_body = await _raw_body(http_request) if header else None
+    ch = (_consume_key_proof_challenge(db, current_user, vault_id=vault.id, op="rekey", header=header)
+          if header else None)
 
     # Clean up any pre-existing orphan keys FIRST (it commits) so the 'remaining members'
     # computation is exact — must happen BEFORE we take the row lock below, since its commit
@@ -1974,6 +2251,14 @@ async def rekey_vault(
     # (which takes this same lock) has either committed and is visible here, or waits for us.
     if not _holds_current_key(db, locked, current_user.id):
         raise HTTPException(status_code=403, detail=_NOT_A_KEY_HOLDER)
+    if ch is not None:
+        _pin_key_proof_state(db, ch, locked)
+        _verify_key_proof(
+            db, current_user, ch, header, vault_id=locked.id, body=raw_body,
+            current_pem=_current_key_verifier(db, locked),
+            new_pem=(request.team_public_key if _is_hierarchical(locked)
+                     else next_material["public_key"]),
+        )
     current = getattr(locked, 'dek_version', 1) or 1
 
     # Optimistic-lock: the client must have rotated from the live epoch.
@@ -2057,7 +2342,20 @@ async def rekey_vault(
             VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS),
             VaultMemberKey.is_active == True,  # noqa: E712
         ).first() is not None
-        rotating_team_key = bool(request.team_public_key) and request.team_public_key != getattr(locked, 'team_public_key', None)
+        # Whether this rotation replaces the team keypair is decided by comparing POINTS, not PEM text: a
+        # re-encoded copy of the current key would otherwise count as new, advance the team epoch and
+        # leave the keypair -- and every member removed in this rotation would keep the team private key.
+        # A team key supplied at all must be a P-384 key and must not be the current one.
+        rotating_team_key = request.team_public_key is not None
+        if rotating_team_key:
+            new_point = _p384_or_malformed(request.team_public_key, "team_public_key")
+            try:
+                current_point = zk_key_proof.public_point(getattr(locked, 'team_public_key', None))
+            except zk_key_proof.MalformedProof:
+                current_point = None
+            if new_point == current_point:
+                raise zk_key_proof.malformed(
+                    "team_public_key is the vault's current team key; a team rotation needs a new one")
 
         # A team-keypair rotation is REQUIRED both when this request revokes a team member AND
         # when a prior bare revoke / reconciler sweep already deactivated a current-epoch TEAMPRIV
@@ -2113,11 +2411,18 @@ async def rekey_vault(
         if rotating_team_key:
             _deactivate_revoked()
         locked.dek_version = request.to_version
-        db.commit()
+        if ch is not None:
+            # The team key is the verifier; the row records who made the epoch and its lineage tag.
+            db.add(VaultKeyProof(vault_id=locked.id, dek_epoch=request.to_version, lineage_tag=lineage_tag,
+                                 source="rotate", created_by=current_user.id))
+        _commit_rotation(db)
         _audit_zk(db, current_user, "zk_vault_rekeyed", resource_id=vault_id, details={
             "revoked_user_id": str(request.revoke_user_id) if request.revoke_user_id else None,
             "from_version": request.from_version, "to_version": request.to_version,
-            "mode": "hierarchical", "team_key_version": getattr(locked, 'team_key_version', 1)})
+            "mode": "hierarchical", "team_key_version": getattr(locked, 'team_key_version', 1),
+            "proof": "key" if ch is not None else "absent"})
+        if ch is None:
+            _audit_key_proof_absent(db, current_user, vault_id, "rekey", "hierarchical")
         return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version,
                 "team_key_version": getattr(locked, 'team_key_version', 1)}
 
@@ -2153,11 +2458,34 @@ async def rekey_vault(
     _deactivate_revoked()
     # 3) Bump the vault epoch (still under the row lock).
     locked.dek_version = request.to_version
-    db.commit()
+    # 4) The new epoch's proof material, in the same commit: an epoch made by a proven rotation has its
+    # verifier from the start. A rotation without a proof stores none (its epoch is set up later).
+    if ch is not None:
+        db.add(VaultKeyProof(
+            vault_id=locked.id, dek_epoch=request.to_version,
+            proof_public_key=next_material["public_key"],
+            sealed_private_key=next_material["sealed_private_key"],
+            dek_check=next_material["dek_check"], lineage_tag=lineage_tag,
+            source="rotate", created_by=current_user.id,
+        ))
+    _commit_rotation(db)
     _audit_zk(db, current_user, "zk_vault_rekeyed", resource_id=vault_id, details={
         "revoked_user_id": str(request.revoke_user_id) if request.revoke_user_id else None,
-        "from_version": request.from_version, "to_version": request.to_version, "mode": "direct"})
+        "from_version": request.from_version, "to_version": request.to_version, "mode": "direct",
+        "proof": "key" if ch is not None else "absent"})
+    if ch is None:
+        _audit_key_proof_absent(db, current_user, vault_id, "rekey", "direct")
     return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version}
+
+
+def _commit_rotation(db: Session) -> None:
+    """The rotation's one commit. A proof row already at the new epoch (a database restored from before a
+    later rotation) is a state conflict: nothing is written and the caller prepares again."""
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-stale")
 
 
 def _lowest_epoch_in_use(db, vault_id, vault):

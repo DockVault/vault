@@ -193,6 +193,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("vault_settings_updated", "vaults", "Vault settings changed", "notice"),
     # Zero-knowledge keys
     AuditAction("zk_index_key_wrapped", "zero_knowledge", "Name-index key given to members", "notice"),
+    # A request to change a vault's keys whose proof that the caller holds the keys did not check out, and
+    # one accepted without such a proof (only while the host operator has turned enforcement off).
+    AuditAction("zk_key_proof_absent", "zero_knowledge", "Vault key changed without proof of the key", "warning"),
+    AuditAction("zk_key_proof_failed", "zero_knowledge", "Vault key change refused: key not proven", "warning"),
     AuditAction("zk_key_update_pop_failed", "zero_knowledge", "Encryption key change refused", "warning"),
     AuditAction("zk_keypair_registered", "zero_knowledge", "Encryption keys set up", "notice"),
     AuditAction("zk_member_key_granted", "zero_knowledge", "Vault key given to a member", "notice"),

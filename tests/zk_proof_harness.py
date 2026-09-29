@@ -292,8 +292,19 @@ def _complete(op, vault_id, challenge, body, current_pem):
     return body, None
 
 
-def _prove(client, op, vault_id, challenge, body, augment=True):
+# `roles` in _prove / prepare_zk / post_zk: prove a role with a key other than the harness's own, or not at
+# all. A missing entry means the harness's usual key; a key means that key; None means the role's MAC is left
+# out ("-"). The public keys the transcript names stay the ones the challenge and the body name, as a client
+# that does not hold a key would have to name them.
+_ROLE_NAMES = ("identity", "current", "new")
+
+
+def _prove(client, op, vault_id, challenge, body, augment=True, roles=None):
     """Complete the body, serialize it once and prove it. Returns (the exact string to send, header)."""
+    roles = dict(roles or {})
+    unknown = set(roles) - set(_ROLE_NAMES)
+    if unknown:
+        raise HarnessError(f"unknown roles {sorted(unknown)}; use {_ROLE_NAMES}")
     identity = identity_key_for(client)
     verifier = challenge.get("verifier") or {}
     current_pem = None if op in reference.OPS_WITHOUT_CURRENT_KEY else verifier.get("public_key")
@@ -319,11 +330,12 @@ def _prove(client, op, vault_id, challenge, body, augment=True):
         body=raw.encode("utf-8"),
     )
     server = challenge["server_ephemeral_public_key"]
-    current_key = private_key_for(current_pem)
-    new_key = private_key_for(new_pem)
+    current_key = roles["current"] if "current" in roles else private_key_for(current_pem)
+    new_key = roles["new"] if "new" in roles else private_key_for(new_pem)
+    identity = roles["identity"] if "identity" in roles else identity
     header = reference.proof_header(
         challenge["challenge_id"],
-        reference.role_mac("identity", identity, server, digest),
+        reference.role_mac("identity", identity, server, digest) if identity else bytes(32),
         reference.role_mac("current-key", current_key, server, digest) if current_key else None,
         reference.role_mac("new-key", new_key, server, digest) if new_key else None,
     )
@@ -338,7 +350,45 @@ def _send(client, method, path, raw: Optional[str], extra_headers: dict):
     return verb(path, data=raw.encode("utf-8"), headers=headers)
 
 
-def post_zk(client, path, json=None, *, method="POST", headers=None, augment=True):
+def prepare_zk(client, path, json=None, *, method="POST", augment=True, roles=None) -> dict:
+    """Everything post_zk would send, without sending it: {"raw": the body string, "header": the proof
+    header or None, "challenge": the challenge's answer or None, "challenge_status", "op", "vault_id"}.
+    For tests that replay a request, edit it, or send it later."""
+    body = json
+    guarded = guarded_operation(method, path, body)
+    if guarded is None:
+        return {"raw": None if body is None else serialize(body), "header": None, "challenge": None,
+                "challenge_status": None, "op": None, "vault_id": None}
+    op, vault_id = guarded
+    challenge_vault = vault_id or str(uuid.uuid4())
+    request = {"op": op}
+    if op == "create":
+        request["mode"] = body.get("key_wrapping_mode") or "direct"
+    challenge = client.post(CHALLENGE_PATH.format(vault_id=challenge_vault), json=request)
+    answer, header = None, None
+    if challenge.status_code == 200:
+        if op == "create" and augment and isinstance(body, dict) and "id" not in body:
+            body = {**body, "id": challenge_vault}
+        answer = _json_or_empty(challenge)
+        raw, header = _prove(client, op, challenge_vault, answer, body, augment=augment, roles=roles)
+    else:
+        raw = serialize(body)
+    return {"raw": raw, "header": header, "challenge": answer, "challenge_status": challenge.status_code,
+            "op": op, "vault_id": challenge_vault}
+
+
+def send_prepared(client, path, prepared: dict, *, method="POST", headers=None, header=...):
+    """Send what prepare_zk made. `header` replaces its proof header (None sends none)."""
+    extra = dict(headers or {})
+    proof = prepared["header"] if header is ... else header
+    if proof is not None:
+        extra[PROOF_HEADER] = proof
+    response = _send(client, method, path, prepared["raw"], extra)
+    response.zk_challenge_status = prepared["challenge_status"]
+    return response
+
+
+def post_zk(client, path, json=None, *, method="POST", headers=None, augment=True, roles=None):
     """Send one request to a route that may take a key proof, the way the web client does.
 
     Not a guarded request (for example a standard vault create): sent as is. Otherwise: ask for a
@@ -351,37 +401,16 @@ def post_zk(client, path, json=None, *, method="POST", headers=None, augment=Tru
     share's `dek_version`); `augment=False` sends the test's body exactly as given.
 
     The response carries `zk_challenge_status`: the challenge's status code, or None when no challenge
-    was asked for.
+    was asked for. `roles` proves a role with another key, or leaves it out (see _ROLE_NAMES).
+
+    The vault a create makes does not exist yet, so its challenge names the mode the body creates it in,
+    which the proof then binds; every other operation's mode is the vault's own. A create names its
+    vault: only a body with no `id` at all gets one, so a test that sends an empty or malformed id keeps it.
     """
-    body = json
-    headers = dict(headers or {})
-    guarded = guarded_operation(method, path, body)
-    if guarded is None:
-        response = _send(client, method, path, None if body is None else serialize(body), headers)
-        response.zk_challenge_status = None
-        return response
-    op, vault_id = guarded
-    challenge_vault = vault_id or str(uuid.uuid4())
-    # The vault a create makes does not exist yet, so its challenge names the mode the body creates it
-    # in, which the proof then binds. Every other operation's mode is the vault's own.
-    request = {"op": op}
-    if op == "create":
-        request["mode"] = body.get("key_wrapping_mode") or "direct"
-    challenge = client.post(CHALLENGE_PATH.format(vault_id=challenge_vault), json=request)
-    if challenge.status_code == 200:
-        # A create names its vault. Only a body with no `id` at all gets one: a test that sends an
-        # empty or malformed id is testing exactly that and keeps it.
-        if op == "create" and augment and isinstance(body, dict) and "id" not in body:
-            body = {**body, "id": challenge_vault}
-        raw, headers[PROOF_HEADER] = _prove(client, op, challenge_vault, _json_or_empty(challenge), body,
-                                            augment=augment)
-    else:
-        raw = serialize(body)
-    response = _send(client, method, path, raw, headers)
-    response.zk_challenge_status = challenge.status_code
-    return response
+    prepared = prepare_zk(client, path, json, method=method, augment=augment, roles=roles)
+    return send_prepared(client, path, prepared, method=method, headers=headers)
 
 
-def put_zk(client, path, json=None, *, headers=None, augment=True):
+def put_zk(client, path, json=None, *, headers=None, augment=True, roles=None):
     """`post_zk` for the guarded PUT routes (the name-index key, the proof bootstrap)."""
-    return post_zk(client, path, json, method="PUT", headers=headers, augment=augment)
+    return post_zk(client, path, json, method="PUT", headers=headers, augment=augment, roles=roles)

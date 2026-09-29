@@ -1273,6 +1273,10 @@ class VaultCreate(BaseModel):
     team_dek_ephemeral_public_key: Optional[str] = None
     wrapped_team_privkey: Optional[str] = None
     team_privkey_ephemeral_public_key: Optional[str] = None
+    # With a key proof, for a DIRECT zero-knowledge vault: the first epoch's proof material
+    # {public_key, sealed_private_key, dek_check}, the proof key sealed under the vault's DEK. A
+    # hierarchical vault's verifier is its team public key.
+    key_proof: Optional[Dict[str, Any]] = None
 
     @field_validator('name')
     @classmethod
@@ -16278,6 +16282,61 @@ async def create_vault(
         _enc_name = None                          # a standard vault never carries browser seals
         _enc_description = None
 
+    # Zero-knowledge: everything the key setup needs is checked BEFORE the vault is built, the key proof
+    # included, so a refused request creates nothing (there is nothing to delete again afterwards).
+    zk_hierarchical = (vault_create.key_wrapping_mode == 'hierarchical')
+    zk_proof_ch = None
+    zk_proof_material = None
+    if vault_type == 'zero_knowledge':
+        from app.api import ecc_router as _ecc
+        from app.core.models import UserKeyPair
+        from app.services import zk_key_proof
+        if not db.query(UserKeyPair.id).filter(UserKeyPair.user_id == current_user.id).first():
+            raise HTTPException(
+                status_code=400,
+                detail="Set up your encryption key before creating a zero-knowledge vault.",
+            )
+        if zk_hierarchical:
+            # Hierarchical: the DEK is wrapped to the TEAM public key, and the owner gets the TEAM
+            # PRIVATE key wrapped to their identity key. The team public key is the vault's verifier,
+            # so it must be a P-384 key.
+            if not (vault_create.team_public_key and vault_create.team_wrapped_dek
+                    and vault_create.team_dek_ephemeral_public_key
+                    and vault_create.wrapped_team_privkey
+                    and vault_create.team_privkey_ephemeral_public_key):
+                raise HTTPException(
+                    status_code=400,
+                    detail="A hierarchical zero-knowledge vault requires the team public key, the "
+                           "DEK wrapped to it, and the team private key wrapped to the owner.",
+                )
+            _ecc._p384_or_malformed(vault_create.team_public_key, "team_public_key")
+        elif not (vault_create.wrapped_dek and vault_create.ephemeral_public_key):
+            raise HTTPException(
+                status_code=400,
+                detail="A browser-wrapped vault key is required to create a zero-knowledge vault.",
+            )
+        header = _ecc._key_proof_header(request)
+        if header is not None:
+            # The proof binds the id the vault will have, so a proven create names it.
+            if vault_create.id is None:
+                raise zk_key_proof.malformed("id is required with a key proof")
+            if zk_hierarchical:
+                new_pem = vault_create.team_public_key
+            else:
+                zk_proof_material = _ecc._direct_proof_material(vault_create.key_proof, "key_proof")
+                new_pem = zk_proof_material["public_key"]
+            raw_body = await request.body()
+            zk_proof_ch = _ecc._consume_key_proof_challenge(
+                db, current_user, vault_id=vault_create.id, op="create", header=header)
+            # The challenge was issued for the mode this body creates; a body in another mode was not
+            # what the proof was prepared for.
+            if (zk_proof_ch.mode, zk_proof_ch.dek_epoch, zk_proof_ch.team_epoch) != (
+                    'hierarchical' if zk_hierarchical else 'direct', 1, 1):
+                raise zk_key_proof.KeyProofRefusal("zk-key-proof-stale")
+            # Identity (the caller's own key) and new key (the verifier this vault starts with).
+            _ecc._verify_key_proof(db, current_user, zk_proof_ch, header, vault_id=vault_create.id,
+                                   body=raw_body, current_pem=None, new_pem=new_pem)
+
     try:
         vault = vault_service.create_vault(
             vault_id=vault_create.id,
@@ -16314,35 +16373,15 @@ async def create_vault(
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
     # owner's own public key; the owner's wrapped copy is supplied here. The server
     # stores only the opaque wrapped DEK + ephemeral public key and NEVER sees the
-    # key — that is what makes it zero-knowledge. Reject (and roll back the vault) if
-    # the owner has no keypair or the client didn't supply a wrapped DEK, since that
-    # would leave a vault nobody can decrypt.
+    # key — that is what makes it zero-knowledge. Everything this needs was checked
+    # before the vault was built (above). The first epoch's proof row, from a proven
+    # request only, is written in the same commit as the owner's key row.
     if vault_type == 'zero_knowledge':
-        from app.core.models import UserKeyPair, VaultMemberKey
-        if not db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first():
-            db.delete(vault)
-            db.commit()
-            raise HTTPException(
-                status_code=400,
-                detail="Set up your encryption key before creating a zero-knowledge vault.",
-            )
-        hierarchical = (vault_create.key_wrapping_mode == 'hierarchical')
-        if hierarchical:
+        from app.core.models import VaultKeyProof, VaultMemberKey
+        if zk_hierarchical:
             # Hierarchical: the DEK is wrapped to the TEAM public key (team_key map @ epoch 1),
             # and the owner gets the TEAM PRIVATE key wrapped to their identity key (a TEAMPRIV
             # row @ team epoch 1). The server stores only public keys + opaque wraps.
-            missing = not (vault_create.team_public_key and vault_create.team_wrapped_dek
-                           and vault_create.team_dek_ephemeral_public_key
-                           and vault_create.wrapped_team_privkey
-                           and vault_create.team_privkey_ephemeral_public_key)
-            if missing:
-                db.delete(vault)
-                db.commit()
-                raise HTTPException(
-                    status_code=400,
-                    detail="A hierarchical zero-knowledge vault requires the team public key, the "
-                           "DEK wrapped to it, and the team private key wrapped to the owner.",
-                )
             import json as _json
             vault.key_wrapping_mode = 'hierarchical'
             vault.team_public_key = vault_create.team_public_key
@@ -16362,16 +16401,13 @@ async def create_vault(
                 granted_by=current_user.id,
                 granted_at=datetime.now(timezone.utc),
             ))
+            if zk_proof_ch is not None:
+                # The team public key is the verifier; the row records who made the first epoch.
+                db.add(VaultKeyProof(vault_id=vault.id, dek_epoch=1, source="create",
+                                     created_by=current_user.id))
             db.commit()
             db.refresh(vault)
         else:
-            if not (vault_create.wrapped_dek and vault_create.ephemeral_public_key):
-                db.delete(vault)
-                db.commit()
-                raise HTTPException(
-                    status_code=400,
-                    detail="A browser-wrapped vault key is required to create a zero-knowledge vault.",
-                )
             db.add(VaultMemberKey(
                 vault_id=vault.id,
                 user_id=current_user.id,
@@ -16382,9 +16418,20 @@ async def create_vault(
                 granted_by=current_user.id,
                 granted_at=datetime.now(timezone.utc),
             ))
+            if zk_proof_ch is not None:
+                db.add(VaultKeyProof(
+                    vault_id=vault.id, dek_epoch=1,
+                    proof_public_key=zk_proof_material["public_key"],
+                    sealed_private_key=zk_proof_material["sealed_private_key"],
+                    dek_check=zk_proof_material["dek_check"],
+                    source="create", created_by=current_user.id,
+                ))
             vault.key_wrapping_mode = 'direct'
             db.commit()
             db.refresh(vault)
+        if zk_proof_ch is None:
+            _ecc._audit_key_proof_absent(db, current_user, vault.id, "create",
+                                         'hierarchical' if zk_hierarchical else 'direct')
 
     audit_logger.log_vault_created(
         vault.id, vault.name, current_user, get_client_ip(request)
