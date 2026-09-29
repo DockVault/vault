@@ -316,7 +316,7 @@ def test_the_approve_route_refuses_the_mirror_and_records_why(db, monkeypatch):
 
 
 def test_an_invitation_keeps_its_inviters_lineage_through_a_demotion_or_a_deletion(db):
-    # The review's third and fourth bypasses: the inviter's record went with a demotion, or the
+    # Two bypasses: the inviter's record went with a demotion, or the
     # inviter with a deletion, before the invitation was accepted, and the new administrator lost the
     # administrators the inviter descended from. The invitation keeps that lineage from when it was made.
     alice, p = _user(db, "alice"), _user(db, "p")

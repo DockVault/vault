@@ -229,7 +229,7 @@ def test_the_account_wide_pause_lasts_until_the_count_has_room_again(Session, li
 
 def test_guessers_from_many_addresses_get_at_most_the_backstop_a_day_before_the_pause(Session, limits,
                                                                                     monkeypatch):
-    # The review's arithmetic: fresh addresses, never enough from one to lock it, a guess every five
+    # The arithmetic: fresh addresses, never enough from one to lock it, a guess every five
     # minutes for a day. Counted in the login window, every one of the 288 guesses was answered. Now the
     # backstop's worth are, then a pause, then about one per interval as the count loses a failure.
     clock = {"t": _now()}
@@ -578,7 +578,7 @@ def _both(clock, steps):
 
 
 def test_slow_guessing_is_refused_at_the_same_point(clocked):
-    # The review's first scratch test: guesses further apart than the lock's length, then one a minute
+    # Guesses further apart than the lock's length, then one a minute
     # later. An address's count does not run out by itself, for an account or for a name.
     steps = [(ATTACKER, MINUTES + 5)] * (THRESHOLD - 1) + [(ATTACKER, 1), (ATTACKER, 1)]
     seen = _both(clocked, steps)
@@ -587,7 +587,7 @@ def test_slow_guessing_is_refused_at_the_same_point(clocked):
 
 
 def test_a_burst_spread_over_minutes_is_refused_for_as_long(clocked):
-    # The review's second: the lock runs from the failure that armed it, for both, so the minutes left
+    # The lock runs from the failure that armed it, for both, so the minutes left
     # (and so Retry-After) are the same.
     seen = _both(clocked, [(ATTACKER, 2)] * (THRESHOLD + 2))
     assert seen["real-person"] == seen["nobody-here"], seen
@@ -812,7 +812,7 @@ BURST = [f"203.0.113.{i}" for i in range(1, 17)]        # 16 addresses, one atte
 
 
 def test_a_burst_from_many_addresses_gets_no_more_checks_than_the_backstop(Session, limits, monkeypatch):
-    # The review's concurrency finding: every attempt already past the lock check when the count was
+    # Concurrency: every attempt already past the lock check when the count was
     # below the backstop had its password checked, however many there were.
     uid = _add_user(Session, username="real-person")
     checked = _slow_checks(monkeypatch)
@@ -907,7 +907,7 @@ def test_a_count_at_its_limit_always_has_its_lock(Session, limits, monkeypatch):
 
 
 def test_right_passwords_arriving_at_once_from_one_address_all_sign_in(Session, limits, monkeypatch):
-    # The review's first finding here: with a limit of 3, six right passwords at once from one address (an SFTP
+    # With a limit of 3, six right passwords at once from one address (an SFTP
     # client opening several connections) gave 3 signed in and 3 refused as locked. They wait their turn.
     uid = _add_user(Session, username="owner")
     _slow_checks(monkeypatch, seconds=0.3, right=True)
@@ -934,7 +934,7 @@ def test_twelve_connections_at_once_with_the_right_password_all_sign_in(Session,
 
 
 def test_an_attempt_that_dies_during_its_check_leaves_nothing_counted(Session, limits, monkeypatch):
-    # The review's third finding here: counted before the check, an attempt that died in between (a process
+    # Counted before the check, an attempt that died in between (a process
     # killed, a commit that failed) left its failure counted, and a login limit's worth of them left a
     # full count no lock recorded, refusing the address with an end that kept moving. Now nothing is
     # counted before a password is known to be wrong, and a death ends the attempt's transaction.
@@ -954,7 +954,7 @@ def test_an_attempt_that_dies_during_its_check_leaves_nothing_counted(Session, l
 
 
 def test_an_attempt_that_dies_after_a_right_password_leaves_nothing_counted(Session, limits, monkeypatch):
-    # The review's fourth finding here: a right password whose attempt died before its failure was given back
+    # A right password whose attempt died before its failure was given back
     # stayed counted.
     uid = _add_user(Session, username="owner")
     s = Session()

@@ -369,7 +369,7 @@ def _held_by(db, requester, target, now=None):
 
 
 def test_an_administrator_the_requester_made_cannot_approve(db):
-    # The review's scenario: one administrator makes a second administrator account and approves their
+    # The scenario: one administrator makes a second administrator account and approves their
     # own held change with it. Made before the request or after, directly or through another one.
     alice, bob, carol = _user(db, RoleEnum.ADMIN), _user(db, RoleEnum.ADMIN), _user(db)
     now = cc.utcnow()
@@ -446,7 +446,7 @@ def test_the_administrator_who_made_the_first_change_cannot_approve_the_second(d
 
 
 def test_the_mirror_is_refused_outright_when_nobody_else_may_approve(db):
-    # The review's first bypass: alice, the only real administrator, makes the first change and an
+    # A bypass: alice, the only real administrator, makes the first change and an
     # administrator account; the second change asked for as that account had alice as its approver.
     alice, carol = _user(db, RoleEnum.ADMIN), _user(db)
     now = cc.utcnow()
@@ -474,7 +474,7 @@ def test_neither_may_be_in_the_others_lineage(db):
 
 
 def test_siblings_made_for_the_purpose_cannot_approve_each_other_for_fourteen_days(db):
-    # The review's second bypass: alice makes P1 and P2; P2 asks and P1 approves. Neither is in the
+    # Another bypass: alice makes P1 and P2; P2 asks and P1 approves. Neither is in the
     # other's lineage, so rule 4 is what refuses it. After 14 days it is the accepted residual: every
     # administrator was told of each new one, and the user of every change.
     alice, carol = _user(db, RoleEnum.ADMIN), _user(db)

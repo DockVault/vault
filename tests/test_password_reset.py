@@ -268,7 +268,7 @@ def test_password_reset_ttl_config_validates(admin, restore_reset):
 @_mailpit
 def test_after_an_administrator_moves_the_email_a_reset_link_goes_to_the_old_address(
         admin, restore_reset, mailpit_profile):
-    # The review's takeover: an administrator moves someone's email to an address they control, then
+    # The takeover: an administrator moves someone's email to an address they control, then
     # asks for a reset link on the public form. For 14 days the link goes to the address before.
     admin.put("/settings", json={"password_reset_enabled": True})
     _mp_clear()

@@ -397,7 +397,7 @@ def test_withdrawing_your_own_request_tells_who_was_asked_to_approve(db, told, m
 # --------------------------------------------------------------------------- never the person it is for
 
 def test_with_two_administrators_neither_approves_a_change_to_their_own_account(db):
-    # The review's two-administrator case: alice makes p, p changes bob once and asks for a second
+    # The two-administrator case: alice makes p, p changes bob once and asks for a second
     # change to bob. Only bob could have approved it, and a change to his own account is not his to
     # approve: it is refused outright, with the host tool the way round.
     alice, bob = _user(db, "alice"), _user(db, "bob")

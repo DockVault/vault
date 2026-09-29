@@ -370,7 +370,7 @@ def test_two_administrators_approving_at_once_apply_the_change_once(admin, temp_
 
 
 def test_an_administrator_the_requester_made_cannot_approve(admin, temp_user, other_admin):
-    # The review's scenario: the administrator whose change is held makes a new administrator account,
+    # The scenario: the administrator whose change is held makes a new administrator account,
     # signs in as it and approves. Refused, and so is an administrator that one made; every other
     # administrator is told of each new one; an administrator the asker did not make may approve.
     asker, asker_client = other_admin
@@ -403,7 +403,7 @@ def test_an_administrator_the_requester_made_cannot_approve(admin, temp_user, ot
 
 def test_the_administrator_who_made_the_first_change_cannot_approve_through_an_account_it_made(
         admin, temp_user, other_admin):
-    # The review's mirror: the session's administrator makes the first change and an administrator
+    # The mirror case: the session's administrator makes the first change and an administrator
     # account, asks for the second as that account, and approves it as itself. Refused, saying why;
     # the module's independent administrator, who changed nothing, may approve.
     other, other_client = other_admin

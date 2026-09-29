@@ -2,7 +2,7 @@
 (tests/test_upgrade_email_nullable.py and tests/test_upgrade_drill.py).
 
 Such a stack is made and removed by its test, on a host that runs other stacks, so three rules keep it
-to itself. Each is here because a stack broke it: a review run left three stacks running, and one of
+to itself. Each is here because a stack broke it: a test run left three stacks running, and one of
 them had mounted another stack's volumes, so two Postgres servers ran on one data directory.
 
 * docker runs with an explicit, minimal environment (compose_environment). Compose takes a variable
