@@ -46,3 +46,13 @@ def test_a_temporary_session_cannot_change_the_notes_or_activity_choices():
     assert S._PREF_NOT_FOR_TEMP_SESSIONS == {"hide_note_text", "activity_page_size", "activity_live",
                                              "activity_range"}
     assert S._PREF_NOT_FOR_TEMP_SESSIONS <= set(S._PREF_ALLOWED)
+
+
+def test_the_page_does_not_call_the_hide_setting_a_local_one():
+    # "Hide note text" is kept on the account (hide_note_text above), not in the browser.
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text(encoding="utf-8")
+    start = html.index("<!-- Notes Section.")
+    comment = html[start:html.index("-->", start)]
+    assert "local" not in comment
+    assert "saved on the account" in " ".join(comment.split())
