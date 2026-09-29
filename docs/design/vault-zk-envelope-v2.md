@@ -158,8 +158,14 @@ so the auditability benefit accrues to reviewers and tests, not to runtime error
 offset 0   4 bytes   magic     "DVZ2"
 offset 4   1 byte    version   0x02
 offset 5   1 byte    purpose   0x01 direct DEK | 0x02 team DEK | 0x03 team private | 0x04 content
+                               | 0x05 name-index key | 0x06 link token | 0x07 key-proof key
 offset 6   2 bytes   reserved  0x0000, MUST be zero
 ```
+
+Purposes `0x05` and `0x06` were added with the name-index key and the link-token copy, and `0x07`
+with the key proof that zero-knowledge key changes carry: a direct vault epoch's proof private key, sealed
+under that epoch's DEK. Its transcript binds the vault, the epoch and the SHA-256 of the proof key's
+public point; like the team private key its payload is a PKCS8 blob, bounded to 36..8192 bytes.
 
 The purpose is bound into the AAD — but as the value the READER EXPECTED, not as the byte that
 arrived. Every construction rebuilds the eight header bytes from its own purpose constant and
@@ -201,7 +207,7 @@ after committing is precisely the retry §6.3 forbids — it turns a tampering s
 oracle. `chunk_size` and framing are validated *after* the commit and are hard failures.
 
 The residual is a legacy payload whose random IV happens to begin `DVZ2`, then `0x02`, then a byte
-in `0x01..0x04`, then two zero bytes: about 2⁻⁶². That is the price of a magic-only discriminator
+in `0x01..0x07`, then two zero bytes: about 2⁻⁶¹. That is the price of a magic-only discriminator
 and it is accepted here rather than paid for with a fall-back path.
 
 ### 6.3 Downgrade

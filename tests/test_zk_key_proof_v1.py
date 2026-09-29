@@ -8,6 +8,9 @@ the vectors are frozen files rather than values recomputed at test time.
 """
 import base64
 import json
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -434,3 +437,263 @@ def test_the_strict_decrypt_opens_only_what_this_deployment_sealed(fernet_key):
         security.decrypt_secret_strict(other)
     # The lenient decrypt keeps its back-compat behaviour for stored credentials.
     assert security.decrypt_secret(pem) == pem
+
+
+# ----------------------------------------------------------------------------- the browser module
+
+CRYPTO_JS = ROOT / "static" / "js" / "ecc_crypto.js"
+
+
+def _node(script: str) -> dict:
+    """Run `script` against the shipped browser module under Node; it prints one JSON line."""
+
+    harness = f"""
+const {{ webcrypto }} = require('crypto');
+global.window = {{ crypto: webcrypto }};
+global.btoa = s => Buffer.from(s, 'binary').toString('base64');
+global.atob = s => Buffer.from(s, 'base64').toString('binary');
+const ECCCryptoLibrary = require({json.dumps(str(CRYPTO_JS))});
+const realLog = console.log;
+console.error = () => {{}};
+const V = {json.dumps(_vector())};
+const aes = hex => webcrypto.subtle.importKey('raw', Buffer.from(hex, 'hex'), {{ name: 'AES-GCM', length: 256 }},
+                                              true, ['encrypt', 'decrypt']);
+const code = async fn => {{ try {{ await fn(); return 'NONE'; }} catch (e) {{ return e.code || ('UNCODED:' + e); }} }};
+(async () => {{
+  const lib = new ECCCryptoLibrary();
+{script}
+}})().catch(e => {{ process.stderr.write('HARNESS ' + (e && e.stack)); process.exit(1); }});
+"""
+    # A file rather than `node -e`: the script carries the whole vector, which is longer than a Windows
+    # command line may be.
+    fd, path = tempfile.mkstemp(suffix=".js")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(harness)
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=300, cwd=str(ROOT))
+    finally:
+        os.unlink(path)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads([ln for ln in proc.stdout.splitlines() if ln.startswith("{")][-1])
+
+
+_KEYS_JS = """
+  const i = V.inputs;
+  const keys = {
+    identityKey: await lib.importPrivateKeyPEM(i.identity_private_key_pem, false),
+    currentKey: await lib.importPrivateKeyPEM(i.current_private_key_pem, false),
+    newKey: await lib.importPrivateKeyPEM(i.new_private_key_pem, false),
+  };
+  const challenge = { challenge_id: i.challenge_id, nonce: i.nonce_b64,
+                      server_ephemeral_public_key: i.server_public_key_pem };
+"""
+
+
+def test_the_browser_reproduces_every_frozen_transcript_and_header():
+    """The whole protocol rests on this. A Python-only check would agree by construction and leave a
+    browser-side divergence green, so the shipped module is what is executed."""
+    out = _node(_KEYS_JS + """
+  const res = {};
+  for (const c of V.transcripts) {
+    const p = { op: c.op, userId: i.user_id, vaultId: i.vault_id, mode: c.mode, dekEpoch: c.dek_epoch,
+      teamEpoch: c.team_epoch, identityPem: i.identity_public_key_pem,
+      currentPem: c.has_current_key ? i.current_public_key_pem : null,
+      newPem: c.has_new_key ? i.new_public_key_pem : null, bodyString: i.body_utf8 };
+    const t = await lib.keyProofTranscript({ ...p, challengeId: i.challenge_id, nonce: i.nonce_b64 });
+    const h = await lib.computeKeyProof({ ...p, challenge }, keys);
+    res[c.name] = { t: Buffer.from(t).toString('hex'), h };
+  }
+  realLog(JSON.stringify(res));
+""")
+    for case in _vector()["transcripts"]:
+        assert out[case["name"]]["t"] == case["transcript_sha256_hex"], case["name"]
+        assert out[case["name"]]["h"] == case["header"], case["name"]
+
+
+def test_an_operation_without_a_current_key_never_binds_or_proves_one():
+    """The operations that install the first verifier or replace damaged material prove no current key.
+    Handed one anyway, the browser must neither hash it into the transcript nor send its MAC."""
+    out = _node(_KEYS_JS + """
+  const c = V.transcripts.find(x => x.name === 'bootstrap-direct');
+  const p = { op: c.op, userId: i.user_id, vaultId: i.vault_id, mode: c.mode, dekEpoch: c.dek_epoch,
+    teamEpoch: c.team_epoch, identityPem: i.identity_public_key_pem, currentPem: i.current_public_key_pem,
+    newPem: i.new_public_key_pem, bodyString: i.body_utf8 };
+  realLog(JSON.stringify({ h: await lib.computeKeyProof({ ...p, challenge }, keys) }));
+""")
+    assert out["h"] == next(c for c in _vector()["transcripts"] if c["name"] == "bootstrap-direct")["header"]
+
+
+def test_the_browser_opens_the_frozen_sealed_key_as_a_derive_only_key():
+    out = _node("""
+  const s = V.seal;
+  const key = await lib.openKeyProofKey(s.sealed_b64, s.proof_public_key_pem, await aes(s.dek_hex),
+                                        s.vault_id, s.dek_epoch);
+  realLog(JSON.stringify({ extractable: key.extractable, usages: key.usages, type: key.type }));
+""")
+    assert out == {"extractable": False, "usages": ["deriveBits"], "type": "private"}
+
+
+def test_a_sealed_key_fails_closed_with_the_code_for_each_fault():
+    s = _vector()["seal"]
+    sealed = base64.b64decode(s["sealed_b64"])
+    pem, dek, vid, ep = s["proof_public_key_pem"], s["dek_hex"], s["vault_id"], s["dek_epoch"]
+
+    def b64(raw):
+        return base64.b64encode(raw).decode()
+
+    # Sealed for the right public key but holding another private key: it authenticates, and only the
+    # point comparison can catch it.
+    other_pkcs8 = ref.private_from_scalar("45").private_bytes(
+        serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    mismatched = ref.seal_key_proof_key(bytes.fromhex(dek), vid, ep, pem, other_pkcs8, bytes(12))
+    cases = {
+        "wrong_dek": (s["sealed_b64"], pem, "00" * 32, vid, ep),
+        "other_vault": (s["sealed_b64"], pem, dek, "66666666-7777-4888-9999-aaaaaaaaaaaa", ep),
+        "other_epoch": (s["sealed_b64"], pem, dek, vid, ep + 1),
+        "other_public_key": (s["sealed_b64"], ref.public_pem(ref.private_from_scalar("46")), dek, vid, ep),
+        "flipped_tag": (b64(sealed[:-1] + bytes([sealed[-1] ^ 1])), pem, dek, vid, ep),
+        "magic": (b64(b"DVZ1" + sealed[4:]), pem, dek, vid, ep),
+        "version": (b64(sealed[:4] + b"\x03" + sealed[5:]), pem, dek, vid, ep),
+        "purpose": (b64(sealed[:5] + b"\x03" + sealed[6:]), pem, dek, vid, ep),
+        "reserved": (b64(sealed[:7] + b"\x01" + sealed[8:]), pem, dek, vid, ep),
+        "too_short": (b64(sealed[:35]), pem, dek, vid, ep),
+        "too_long": (b64(sealed + bytes(8193 - len(sealed))), pem, dek, vid, ep),
+        "not_base64": ("%%%", pem, dek, vid, ep),
+        "bad_public_key": (s["sealed_b64"], "not a key", dek, vid, ep),
+        "mismatched_private_half": (b64(mismatched), pem, dek, vid, ep),
+    }
+    out = _node(f"""
+  const cases = {json.dumps(cases)};
+  const res = {{}};
+  for (const [name, [b64, pem, dek, vid, ep]] of Object.entries(cases)) {{
+    res[name] = await code(async () => lib.openKeyProofKey(b64, pem, await aes(dek), vid, ep));
+  }}
+  const s = V.seal;
+  const short = await webcrypto.subtle.importKey('raw', Buffer.alloc(16, 1), {{ name: 'AES-GCM', length: 128 }},
+                                                 true, ['encrypt']);
+  const hmacKey = await webcrypto.subtle.importKey('raw', Buffer.alloc(32, 1), {{ name: 'HMAC', hash: 'SHA-256' }},
+                                                   true, ['sign']);
+  res.aes128_dek = await code(() => lib.openKeyProofKey(s.sealed_b64, s.proof_public_key_pem, short, s.vault_id, s.dek_epoch));
+  res.hmac_dek = await code(() => lib.openKeyProofKey(s.sealed_b64, s.proof_public_key_pem, hmacKey, s.vault_id, s.dek_epoch));
+  res.seal_aes128 = await code(() => lib.sealKeyProofKey(short, s.vault_id, 1));
+  res.seal_hmac = await code(() => lib.sealKeyProofKey(hmacKey, s.vault_id, 1));
+  res.check_hmac = await code(() => lib.dekCheck(hmacKey, s.vault_id, 1));
+  realLog(JSON.stringify(res));
+""")
+    assert out == {
+        "wrong_dek": "WRAP_FAILED", "other_vault": "WRAP_FAILED", "other_epoch": "WRAP_FAILED",
+        "other_public_key": "WRAP_FAILED", "flipped_tag": "WRAP_FAILED",
+        "magic": "WRAP_INVALID", "version": "WRAP_INVALID", "purpose": "WRAP_INVALID", "reserved": "WRAP_INVALID",
+        "too_short": "WRAP_INVALID", "too_long": "WRAP_INVALID", "not_base64": "WRAP_INVALID",
+        "bad_public_key": "WRAP_INVALID", "mismatched_private_half": "KEY_MISMATCH",
+        "aes128_dek": "INVALID_INPUT", "hmac_dek": "INVALID_INPUT", "seal_aes128": "INVALID_INPUT",
+        "seal_hmac": "INVALID_INPUT", "check_hmac": "INVALID_INPUT",
+    }
+
+
+def test_a_browser_sealed_key_opens_in_the_reference_and_its_check_matches():
+    """The other direction: what the browser writes, an independent implementation reads."""
+    s = _vector()["seal"]
+    out = _node("""
+  const s = V.seal;
+  const dek = await aes(s.dek_hex);
+  const m = await lib.sealKeyProofKey(dek, s.vault_id, 5);
+  const again = await lib.openKeyProofKey(m.sealedKey, m.publicKeyPem, dek, s.vault_id, 5);
+  realLog(JSON.stringify({ pem: m.publicKeyPem, sealed: m.sealedKey, check: m.dekCheck,
+    priv: { extractable: m.privateKey.extractable, usages: m.privateKey.usages },
+    reopened: again.extractable === false }));
+""")
+    dek = bytes.fromhex(s["dek_hex"])
+    opened = ref.open_key_proof_key(base64.b64decode(out["sealed"]), dek, s["vault_id"], 5, out["pem"])
+    assert ref.point(ref.public_pem(opened)) == ref.point(out["pem"])
+    assert base64.b64decode(out["check"]) == ref.dek_check(dek, s["vault_id"], 5)
+    assert out["priv"] == {"extractable": False, "usages": ["deriveBits"]}
+    assert out["reopened"] is True
+    assert kp.validate_sealed_key(out["sealed"])[:8] == kp.SEALED_KEY_HEADER
+
+
+def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
+    out = _node("""
+  const res = { checks: [], lineage: {} };
+  for (const d of V.dek_check) res.checks.push(await lib.dekCheck(await aes(d.dek_hex), d.vault_id, d.dek_epoch));
+  for (const l of V.lineage) {
+    const prev = await aes(l.prev_dek_hex);
+    const f = { vaultId: l.vault_id, prevEpoch: l.prev_epoch, mode: l.mode, nextTeamEpoch: l.next_team_epoch,
+      nextVerifierPem: l.next_verifier_pem, nextDekCheck: l.next_dek_check_b64, nextTeamWrap: l.next_team_wrap_b64 };
+    res.lineage[l.mode] = {
+      tag: await lib.keyLineageTag(prev, f),
+      verifies: await lib.verifyKeyLineageTag(prev, f, l.lineage_tag_b64),
+      other_field: await lib.verifyKeyLineageTag(prev, { ...f, nextTeamEpoch: f.nextTeamEpoch + 1 }, l.lineage_tag_b64),
+      other_dek: await lib.verifyKeyLineageTag(await aes('00'.repeat(32)), f, l.lineage_tag_b64),
+      garbage: await lib.verifyKeyLineageTag(prev, { ...f, mode: 'flat' }, l.lineage_tag_b64),
+    };
+  }
+  realLog(JSON.stringify(res));
+""")
+    v = _vector()
+    assert out["checks"] == [d["dek_check_b64"] for d in v["dek_check"]]
+    for ln in v["lineage"]:
+        assert out["lineage"][ln["mode"]] == {"tag": ln["lineage_tag_b64"], "verifies": True, "other_field": False,
+                                              "other_dek": False, "garbage": False}, ln["mode"]
+
+
+def test_the_team_key_match_compares_points():
+    i = _vector()["inputs"]
+    new_der = ref.private_from_scalar(i["new_scalar_hex"]).private_bytes(
+        serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    crlf_pem = i["new_public_key_pem"].replace("\n", "\r\n")
+    out = _node(f"""
+  const der = Buffer.from({json.dumps(new_der.hex())}, 'hex');
+  realLog(JSON.stringify({{
+    same: await lib.teamPrivateKeyMatchesPublic(der, V.inputs.new_public_key_pem),
+    reencoded: await lib.teamPrivateKeyMatchesPublic(der, {json.dumps(crlf_pem)}),
+    other: await lib.teamPrivateKeyMatchesPublic(der, V.inputs.current_public_key_pem),
+    garbage: await lib.teamPrivateKeyMatchesPublic(Buffer.from('nope'), V.inputs.new_public_key_pem),
+  }}));
+""")
+    assert out == {"same": True, "reencoded": True, "other": False, "garbage": False}
+
+
+def test_the_browser_refuses_malformed_transcript_input():
+    out = _node(_KEYS_JS + """
+  const base = { op: 'share', challengeId: i.challenge_id, nonce: i.nonce_b64, userId: i.user_id,
+    vaultId: i.vault_id, mode: 'direct', dekEpoch: 1, teamEpoch: 1, identityPem: i.identity_public_key_pem,
+    currentPem: null, newPem: null, bodyString: '{}' };
+  const res = {};
+  for (const [name, over] of Object.entries({
+    op: { op: 'rotate' }, mode: { mode: 'flat' }, nonce: { nonce: Buffer.alloc(31).toString('base64') },
+    user: { userId: 'nope' }, vault: { vaultId: '0a1b2c3d4e5f' }, epoch: { dekEpoch: 0 },
+    body: { bodyString: { a: 1 } },
+  })) res[name] = await code(() => lib.keyProofTranscript({ ...base, ...over }));
+  res.no_identity = await code(() => lib.computeKeyProof({ ...base, challenge }, {}));
+  realLog(JSON.stringify(res));
+""")
+    assert set(out.values()) == {"INVALID_INPUT"}, out
+
+
+def test_the_browser_constants_and_registration():
+    """Every public key-proof method is behind the coded-error boundary (which refuses to load if a named
+    method is missing), the labels are the reference's, and the stored-material format is pinned."""
+    src = CRYPTO_JS.read_text(encoding="utf-8")
+    table = src[src.index("const _OPERATION_DEFAULT_CODE"):]
+    table = table[: table.index("});")]
+    for name in ("sealKeyProofKey", "openKeyProofKey", "dekCheck", "keyLineageTag", "verifyKeyLineageTag",
+                 "teamPrivateKeyMatchesPublic", "keyProofTranscript", "computeKeyProof"):
+        assert f"    {name}: CRYPTO_ERROR_CODES." in table, name
+    out = _node("""
+  realLog(JSON.stringify({
+    purpose: lib.V2_PURPOSE_KEY_PROOF_KEY, info: lib.V2_INFO_KEY_PROOF_KEY, check: lib.V2_INFO_DEK_CHECK,
+    lineage: lib.V2_INFO_KEY_LINEAGE, label: lib.KEY_PROOF_LABEL, salt: lib.KEY_PROOF_SALT,
+    version: lib.KEY_PROOF_HEADER_VERSION, ops: lib.KEY_PROOF_OPS, modes: lib.KEY_PROOF_MODES,
+    without: lib.KEY_PROOF_OPS_WITHOUT_CURRENT_KEY, format: lib.ZK_KEY_PROOF_WRITE_FORMAT, debug: lib.DEBUG,
+    min: lib.V2_KEY_PROOF_KEY_MIN_BYTES, max: lib.V2_KEY_PROOF_KEY_MAX_BYTES,
+    inspect: lib._inspectV2Header(Buffer.from([0x44, 0x56, 0x5a, 0x32, 2, 7, 0, 0])),
+  }));
+""")
+    assert out == {
+        "purpose": ref.V2_PURPOSE_KEY_PROOF_KEY, "info": ref.INFO_KEY_PROOF_KEY.decode(),
+        "check": ref.INFO_DEK_CHECK.decode(), "lineage": ref.INFO_KEY_LINEAGE.decode(),
+        "label": ref.PROOF_LABEL.decode(), "salt": ref.PROOF_SALT.decode(), "version": ref.HEADER_VERSION,
+        "ops": ref.OPS, "modes": ref.MODES, "without": list(ref.OPS_WITHOUT_CURRENT_KEY), "format": 1,
+        "debug": False, "min": ref.SEALED_MIN_BYTES, "max": ref.SEALED_MAX_BYTES, "inspect": "UNSUPPORTED",
+    }

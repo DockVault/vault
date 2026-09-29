@@ -178,6 +178,37 @@ class ECCCryptoLibrary {
         // replayed onto another link or owner, and its own purpose byte keeps it distinct.
         this.V2_PURPOSE_LINK_TOKEN = 0x06;
         this.V2_INFO_LINK_TOKEN = 'dockvault-zk-link-token-v2';
+        // The per-epoch PROOF KEY of a direct vault: a P-384 key whose private half is sealed under
+        // that epoch's DEK, so only the DEK's holders can open it, and whose public half the server
+        // keeps as the epoch's verifier. Like the team private key its payload is a PKCS8 blob, so it
+        // is bounded rather than fixed. The transcript binds the vault, the epoch and the hash of the
+        // public point, so a sealed key opens only together with the public key it was sealed for.
+        this.V2_PURPOSE_KEY_PROOF_KEY = 0x07;
+        this.V2_INFO_KEY_PROOF_KEY = 'dockvault-zk-key-proof-key-v2';
+        this.V2_KEY_PROOF_KEY_MIN_BYTES = 36;
+        this.V2_KEY_PROOF_KEY_MAX_BYTES = 8192;
+        // Not wire formats: the labels of two MACs keyed by a DEK. The KEY CHECK lets every member
+        // confirm the DEK they were given is the epoch's; the LINEAGE TAG, keyed by the previous
+        // epoch's DEK, shows a rotation was made by someone who held that DEK.
+        this.V2_INFO_DEK_CHECK = 'dockvault-zk-dek-check-v1';
+        this.V2_INFO_KEY_LINEAGE = 'dockvault-zk-key-lineage-v1';
+        // The key proof a key change carries: MACs over one server challenge, one per role, each an
+        // ECDH key confirmation in its own domain (distinct from registration and envelope
+        // replacement). See computeKeyProof.
+        this.KEY_PROOF_LABEL = 'dockvault-zk-key-proof-v1';
+        this.KEY_PROOF_SALT = 'dv-zk-key-proof-v1';
+        this.KEY_PROOF_HEADER_VERSION = 'v1';
+        this.KEY_PROOF_OPS = Object.freeze({
+            rekey: 1, share: 2, index_key: 3, bootstrap: 4, create: 5, owner_reset: 6,
+        });
+        this.KEY_PROOF_MODES = Object.freeze({ direct: 1, hierarchical: 2 });
+        // The operations whose proof names no current key: they install the first verifier
+        // (bootstrap, create) or replace damaged material (owner_reset).
+        this.KEY_PROOF_OPS_WITHOUT_CURRENT_KEY = Object.freeze(['bootstrap', 'create', 'owner_reset']);
+        // The format of the stored proof material this build writes. A change to any of it -- the
+        // sealed key, the key check, the lineage tag, the transcript -- gets a new value, and its
+        // reader ships before its writer. A test pins this.
+        this.ZK_KEY_PROOF_WRITE_FORMAT = 1;
         this.V2_CONTENT_HEADER_BYTES = 28;      // 8 shared + 4 chunk size + 16 attempt token
         this.V2_CONTENT_CHUNK_OVERHEAD = 28;    // 12-byte nonce + 16-byte tag, per chunk
         // The smallest possible file is the header plus one empty chunk. Anything shorter is
@@ -1326,11 +1357,11 @@ class ECCCryptoLibrary {
         // Reserved bytes are a breaking-change channel, not an extension channel: a non-zero
         // value means bytes this build cannot reason about, so it is malformed rather than new.
         if (reserved !== 0) return 'INVALID';
-        // Every purpose the grammar defines (0x01-0x06: the member-key and content wraps, the
-        // name-index key, the link token). This helper answers "is it a v2 envelope at all", so
-        // a purpose that exists must not read as malformed just because no caller of this helper
-        // inspects it today; the reader for each purpose checks the byte itself.
-        if (purpose < 0x01 || purpose > 0x06) return 'INVALID';
+        // Every purpose the grammar defines (0x01-0x07: the member-key and content wraps, the
+        // name-index key, the link token, the sealed proof key). This helper answers "is it a v2
+        // envelope at all", so a purpose that exists must not read as malformed just because no
+        // caller of this helper inspects it today; the reader for each purpose checks the byte itself.
+        if (purpose < 0x01 || purpose > 0x07) return 'INVALID';
         // Any version, including a future one, is "we recognise this and cannot read it".
         if (version < 0x02) return 'INVALID';
         return 'UNSUPPORTED';
@@ -1898,6 +1929,382 @@ class ECCCryptoLibrary {
         const transcript = await sha256(joined);
         return this._arrayBufferToBase64(
             await this._subtle().sign('HMAC', macKey, transcript));
+    }
+
+    // =========================================================================
+    // KEY PROOF — showing the server the caller holds the keys a key change needs
+    // =========================================================================
+    // Creating a zero-knowledge vault, sharing one, rotating its key and setting its name-index
+    // key carry a proof: one MAC per role over a server challenge and the exact request body. The
+    // server checks each against a public key it holds: the caller's identity key, the vault's
+    // verifier (the team public key, or a direct vault's per-epoch proof key) and the key the
+    // request installs. The server's side is app/services/zk_key_proof.py; the frozen vectors in
+    // tests/fixtures/crypto/zk-key-proof-v1/ are shared by both.
+
+    /** @private */
+    async _sha256(bytes) {
+        return new Uint8Array(await this._subtle().digest('SHA-256', bytes));
+    }
+
+    /** @private HKDF-SHA256 to 32 raw bytes. */
+    async _hkdf32(ikm, salt, info) {
+        const base = await this._subtle().importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+        return new Uint8Array(await this._subtle().deriveBits(
+            { name: 'HKDF', hash: 'SHA-256', salt, info }, base, 256));
+    }
+
+    /** @private */
+    async _hmacSha256(keyBytes, message) {
+        const key = await this._subtle().importKey(
+            'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        return new Uint8Array(await this._subtle().sign('HMAC', key, message));
+    }
+
+    /** @private Unpadded base64url. */
+    _b64url(bytes) {
+        return this._arrayBufferToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    /** @private Constant-shape comparison of two byte strings (both operands here are public). */
+    _bytesEqual(a, b) {
+        if (!a || !b || a.length !== b.length || a.length === 0) return false;
+        let diff = 0;
+        for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+        return diff === 0;
+    }
+
+    /**
+     * The 32 raw bytes of a DEK. Only an AES-GCM-256 key is a DEK: without the checks a 16-byte
+     * AES key or a 32-byte HMAC key would seed a perfectly valid derivation (see
+     * _deriveV2ContentKey, which makes the same two checks for the same reason).
+     * @private
+     */
+    async _dekRawBytes(dekCryptoKey, where) {
+        const alg = (dekCryptoKey && dekCryptoKey.algorithm) || {};
+        if (alg.name !== this.AES_ALGORITHM) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, where + '.dekAlgorithm');
+        }
+        const raw = await this._subtle().exportKey('raw', dekCryptoKey);
+        if (raw.byteLength !== 32) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, where + '.dekLength');
+        }
+        return new Uint8Array(raw);
+    }
+
+    /**
+     * The uncompressed public point of a PKCS8 private key, via JWK (WebCrypto cannot derive a
+     * public key from a private one directly). The extractable import lives only here.
+     * @private
+     */
+    async _rawPointFromPkcs8(pkcs8) {
+        const priv = await this._subtle().importKey(
+            'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']);
+        const jwk = await this._subtle().exportKey('jwk', priv);
+        delete jwk.d;
+        jwk.key_ops = [];
+        delete jwk.ext;
+        const pub = await this._subtle().importKey(
+            'jwk', jwk, { name: 'ECDH', namedCurve: this.CURVE }, true, []);
+        return new Uint8Array(await this._subtle().exportKey('raw', pub));
+    }
+
+    /**
+     * Header, HKDF info and AAD of a sealed proof key, from one place. The context binds the vault,
+     * the epoch and the SHA-256 of the proof key's public point, so a sealed key opens only for the
+     * public key it was sealed with: AES-GCM does not commit to its key, and this binding plus the
+     * point comparison in openKeyProofKey is what makes a successful open meaningful.
+     * @private
+     */
+    async _v2KeyProofKeyTranscript(vaultId, dekEpoch, pointBytes, code) {
+        const enc = new TextEncoder();
+        const z = new Uint8Array([0]);
+        const header = this._v2Header(this.V2_PURPOSE_KEY_PROOF_KEY);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, 'keyProofKey.vault', code), z,
+            this._v2Epoch(dekEpoch, 'keyProofKey.epoch', code), z,
+            await this._sha256(pointBytes),
+        ]);
+        return {
+            header,
+            info: this._concatBytes([enc.encode(this.V2_INFO_KEY_PROOF_KEY), z, context]),
+            aad: this._concatBytes([header, context]),
+        };
+    }
+
+    /**
+     * Mint a direct vault epoch's proof key and seal it under that epoch's DEK.
+     *
+     * Returns the public key (the verifier the server stores), the sealed private key, the epoch's
+     * key check, and the private key re-imported non-extractable with deriveBits only, for this
+     * session's proofs. The PKCS8 bytes are wiped once sealed.
+     *
+     * @returns {Promise<{publicKeyPem: string, sealedKey: string, dekCheck: string, privateKey: CryptoKey}>}
+     */
+    async sealKeyProofKey(dek, vaultId, dekEpoch) {
+        const raw = await this._dekRawBytes(dek, 'sealKeyProofKey');
+        const pair = await this._subtle().generateKey(
+            { name: 'ECDH', namedCurve: this.CURVE }, true, ['deriveBits']);
+        const point = new Uint8Array(await this._subtle().exportKey('raw', pair.publicKey));
+        const pkcs8 = new Uint8Array(await this._subtle().exportKey('pkcs8', pair.privateKey));
+        try {
+            const t = await this._v2KeyProofKeyTranscript(
+                vaultId, dekEpoch, point, CRYPTO_ERROR_CODES.INVALID_INPUT);
+            const key = await this._deriveV2WrappingKey(raw, t.info);
+            const nonce = this._randomBytes(12);
+            const ct = await this._subtle().encrypt(
+                { name: 'AES-GCM', iv: nonce, additionalData: t.aad, tagLength: 128 }, key, pkcs8);
+            const sealed = this._concatBytes([t.header, nonce, new Uint8Array(ct)]);
+            if (sealed.length > this.V2_KEY_PROOF_KEY_MAX_BYTES) {
+                this._fail(CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED, 'sealKeyProofKey.length');
+            }
+            const privateKey = await this._subtle().importKey(
+                'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, false, ['deriveBits']);
+            return {
+                publicKeyPem: await this.exportPublicKeyPEM(pair.publicKey),
+                sealedKey: this._arrayBufferToBase64(sealed),
+                dekCheck: await this.dekCheck(dek, vaultId, dekEpoch),
+                privateKey,
+            };
+        } finally {
+            pkcs8.fill(0);
+        }
+    }
+
+    /**
+     * Open a sealed proof key and confirm it is the key `publicKeyPem` names.
+     *
+     * WRAP_INVALID for a blob that is not this format, WRAP_FAILED when it does not authenticate
+     * under this DEK, vault and epoch, KEY_MISMATCH when it opens but holds another key. Returns a
+     * non-extractable key usable for deriveBits only.
+     *
+     * @returns {Promise<CryptoKey>}
+     */
+    async openKeyProofKey(sealedB64, publicKeyPem, dek, vaultId, dekEpoch) {
+        const W = 'openKeyProofKey';
+        let bytes;
+        try {
+            bytes = new Uint8Array(this._base64ToArrayBuffer(String(sealedB64)));
+        } catch (error) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, W + '.base64', error);
+        }
+        if (bytes.length < this.V2_KEY_PROOF_KEY_MIN_BYTES || bytes.length > this.V2_KEY_PROOF_KEY_MAX_BYTES) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, W + '.length');
+        }
+        const header = this._v2Header(this.V2_PURPOSE_KEY_PROOF_KEY);
+        for (let i = 0; i < 8; i++) {
+            if (bytes[i] !== header[i]) this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, W + '.header');
+        }
+        let point;
+        try {
+            point = await this._rawPointFromPublicPEM(publicKeyPem);
+        } catch (error) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, W + '.publicKey', error);
+        }
+        const t = await this._v2KeyProofKeyTranscript(vaultId, dekEpoch, point);
+        const raw = await this._dekRawBytes(dek, W);
+        const key = await this._deriveV2WrappingKey(raw, t.info);
+        let pkcs8;
+        try {
+            pkcs8 = new Uint8Array(await this._subtle().decrypt(
+                { name: 'AES-GCM', iv: bytes.slice(8, 20), additionalData: t.aad, tagLength: 128 },
+                key, bytes.slice(20)));
+        } catch (error) {
+            this._fail(CRYPTO_ERROR_CODES.WRAP_FAILED, W + '.auth', error);
+        }
+        try {
+            let recovered;
+            try {
+                recovered = await this._rawPointFromPkcs8(pkcs8);
+            } catch (error) {
+                this._fail(CRYPTO_ERROR_CODES.WRAP_INVALID, W + '.key', error);
+            }
+            if (!this._bytesEqual(recovered, point)) {
+                this._fail(CRYPTO_ERROR_CODES.KEY_MISMATCH, W + '.point');
+            }
+            return await this._subtle().importKey(
+                'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, false, ['deriveBits']);
+        } finally {
+            pkcs8.fill(0);
+        }
+    }
+
+    /**
+     * A direct epoch's KEY CHECK: a MAC keyed by the DEK over the vault and epoch, base64 of 32
+     * bytes. A member whose DEK does not reproduce the stored value holds another key.
+     * @returns {Promise<string>}
+     */
+    async dekCheck(dek, vaultId, dekEpoch) {
+        const raw = await this._dekRawBytes(dek, 'dekCheck');
+        const z = new Uint8Array([0]);
+        const label = new TextEncoder().encode(this.V2_INFO_DEK_CHECK);
+        const context = this._concatBytes([
+            this._v2Uuid(vaultId, 'dekCheck.vault', CRYPTO_ERROR_CODES.INVALID_INPUT), z,
+            this._v2Epoch(dekEpoch, 'dekCheck.epoch', CRYPTO_ERROR_CODES.INVALID_INPUT),
+        ]);
+        const message = this._concatBytes([label, z, context]);
+        const key = await this._hkdf32(raw, this.V2_HKDF_SALT, message);
+        return this._arrayBufferToBase64(await this._hmacSha256(key, message));
+    }
+
+    /**
+     * The LINEAGE TAG a rotation from epoch p to p + 1 carries: a MAC keyed by DEK_p over what the
+     * rotation installs, so only a holder of DEK_p could have made it.
+     *
+     * fields: {vaultId, prevEpoch, mode ('direct' | 'hierarchical'), nextTeamEpoch,
+     *          nextVerifierPem (P_{p+1}, or the team public key at p + 1),
+     *          nextDekCheck (base64, direct only), nextTeamWrap (base64 team DEK wrap, hierarchical only)}
+     * @returns {Promise<string>} base64 of 32 bytes
+     */
+    async keyLineageTag(prevDek, fields) {
+        const f = fields || {};
+        const BAD = CRYPTO_ERROR_CODES.INVALID_INPUT;
+        const raw = await this._dekRawBytes(prevDek, 'keyLineageTag');
+        const z = new Uint8Array([0]);
+        const label = new TextEncoder().encode(this.V2_INFO_KEY_LINEAGE);
+        const vid = this._v2Uuid(f.vaultId, 'keyLineageTag.vault', BAD);
+        const prev = this._v2Epoch(f.prevEpoch, 'keyLineageTag.prevEpoch', BAD);
+        const next = this._v2Epoch(Number(f.prevEpoch) + 1, 'keyLineageTag.nextEpoch', BAD);
+        const modeByte = this.KEY_PROOF_MODES[f.mode];
+        if (!modeByte) this._fail(BAD, 'keyLineageTag.mode');
+        let check = new Uint8Array(32);
+        let wrapHash = new Uint8Array(32);
+        if (f.mode === 'direct') {
+            check = new Uint8Array(this._base64ToArrayBuffer(String(f.nextDekCheck || '')));
+            if (check.length !== 32) this._fail(BAD, 'keyLineageTag.dekCheck');
+        } else {
+            wrapHash = await this._sha256(new Uint8Array(this._base64ToArrayBuffer(String(f.nextTeamWrap || ''))));
+        }
+        let verifierPoint;
+        try {
+            verifierPoint = await this._rawPointFromPublicPEM(f.nextVerifierPem);
+        } catch (error) {
+            this._fail(BAD, 'keyLineageTag.verifier', error);
+        }
+        const key = await this._hkdf32(raw, this.V2_HKDF_SALT,
+            this._concatBytes([label, z, vid, z, prev]));
+        const message = await this._sha256(this._concatBytes([
+            label, z, vid, z, prev, z, next, z, new Uint8Array([modeByte]), z,
+            this._v2Epoch(f.nextTeamEpoch, 'keyLineageTag.teamEpoch', BAD), z,
+            await this._sha256(verifierPoint), z, check, z, wrapHash,
+        ]));
+        return this._arrayBufferToBase64(await this._hmacSha256(key, message));
+    }
+
+    /**
+     * Does this lineage tag check against DEK_p? False when it does not, and false when it cannot be
+     * computed from these fields: a caller that cannot verify says "not verifiable" itself, before
+     * asking.
+     * @returns {Promise<boolean>}
+     */
+    async verifyKeyLineageTag(prevDek, fields, tagB64) {
+        let expected, given;
+        try {
+            expected = new Uint8Array(this._base64ToArrayBuffer(await this.keyLineageTag(prevDek, fields)));
+            given = new Uint8Array(this._base64ToArrayBuffer(String(tagB64 || '')));
+        } catch (error) {
+            return false;
+        }
+        return this._bytesEqual(expected, given);
+    }
+
+    /**
+     * Is this unwrapped team private key (its PKCS8 bytes) the key the vault's team public key names?
+     * Fails closed: an unusable key on either side is false.
+     * @returns {Promise<boolean>}
+     */
+    async teamPrivateKeyMatchesPublic(teamPrivatePkcs8, teamPublicKeyPem) {
+        try {
+            const derived = await this._rawPointFromPkcs8(new Uint8Array(teamPrivatePkcs8));
+            const stored = await this._rawPointFromPublicPEM(teamPublicKeyPem);
+            return this._bytesEqual(derived, stored);
+        } catch (error) {
+            return false;
+        }
+    }
+
+    /**
+     * The 32-byte transcript every role MACs (the server computes the same from its own view).
+     *
+     * params: {op, challengeId, nonce (base64), userId, vaultId, mode, dekEpoch, teamEpoch,
+     *          identityPem, currentPem, newPem, bodyString}
+     * Fixed widths make it injective: one byte for the operation and the mode, 36 lowercase ASCII
+     * bytes for each id, the 32 nonce bytes, 4-byte big-endian epochs and 32-byte digests. An absent
+     * key contributes 32 zero bytes; the operations that prove no current key never bind one.
+     * bodyString is hashed as UTF-8 and must be the exact string sent.
+     * @returns {Promise<Uint8Array>}
+     */
+    async keyProofTranscript(params) {
+        const p = params || {};
+        const BAD = CRYPTO_ERROR_CODES.INVALID_INPUT;
+        const enc = new TextEncoder();
+        const z = new Uint8Array([0]);
+        const opByte = this.KEY_PROOF_OPS[p.op];
+        const modeByte = this.KEY_PROOF_MODES[p.mode];
+        if (!opByte) this._fail(BAD, 'keyProofTranscript.op');
+        if (!modeByte) this._fail(BAD, 'keyProofTranscript.mode');
+        if (typeof p.bodyString !== 'string') this._fail(BAD, 'keyProofTranscript.body');
+        const nonce = new Uint8Array(this._base64ToArrayBuffer(String(p.nonce || '')));
+        if (nonce.length !== 32) this._fail(BAD, 'keyProofTranscript.nonce');
+        const pointHash = async pem => (pem ? this._sha256(await this._rawPointFromPublicPEM(pem))
+                                            : new Uint8Array(32));
+        const current = this.KEY_PROOF_OPS_WITHOUT_CURRENT_KEY.includes(p.op) ? null : p.currentPem;
+        return this._sha256(this._concatBytes([
+            enc.encode(this.KEY_PROOF_LABEL), z,
+            new Uint8Array([opByte]), z,
+            this._v2Uuid(p.challengeId, 'keyProofTranscript.challenge', BAD), z,
+            nonce, z,
+            this._v2Uuid(p.userId, 'keyProofTranscript.user', BAD), z,
+            this._v2Uuid(p.vaultId, 'keyProofTranscript.vault', BAD), z,
+            new Uint8Array([modeByte]), z,
+            this._v2Epoch(p.dekEpoch, 'keyProofTranscript.dekEpoch', BAD), z,
+            this._v2Epoch(p.teamEpoch, 'keyProofTranscript.teamEpoch', BAD), z,
+            await pointHash(p.identityPem), z,
+            await pointHash(current), z,
+            await pointHash(p.newPem), z,
+            await this._sha256(enc.encode(p.bodyString)),
+        ]));
+    }
+
+    /**
+     * The X-ZK-Key-Proof header value for one request:
+     * `v1.<challenge id>.<identity MAC>.<current-key MAC or ->.<new-key MAC or ->`, unpadded
+     * base64url.
+     *
+     * params: as keyProofTranscript, plus `challenge` ({challenge_id, nonce,
+     *         server_ephemeral_public_key}) in place of challengeId and nonce.
+     * keys:   {identityKey, currentKey, newKey}: ECDH private keys with deriveBits. The identity MAC
+     *         is always made; the other two only with both the key and its public PEM.
+     *
+     * Each MAC is HMAC-SHA256(HKDF-SHA256(ECDH(role key, server key), salt, role), transcript). The
+     * output is a MAC under a key in this protocol's own domain, so it says nothing about any wrap
+     * key even if the server chose its key to match a wrap's ephemeral.
+     * @returns {Promise<string>}
+     */
+    async computeKeyProof(params, keys) {
+        const p = params || {};
+        const k = keys || {};
+        const challenge = p.challenge || {};
+        const transcript = await this.keyProofTranscript({
+            ...p, challengeId: challenge.challenge_id, nonce: challenge.nonce,
+        });
+        const serverPub = await this.importPublicKeyPEM(challenge.server_ephemeral_public_key);
+        const enc = new TextEncoder();
+        const mac = async (role, key) => {
+            const shared = new Uint8Array(await this._subtle().deriveBits(
+                { name: 'ECDH', public: serverPub }, key, 384));
+            const macKey = await this._hkdf32(shared, enc.encode(this.KEY_PROOF_SALT), enc.encode(role));
+            return this._b64url(await this._hmacSha256(macKey, transcript));
+        };
+        if (!k.identityKey) this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'computeKeyProof.identity');
+        const withoutCurrent = this.KEY_PROOF_OPS_WITHOUT_CURRENT_KEY.includes(p.op);
+        const parts = [
+            this.KEY_PROOF_HEADER_VERSION,
+            String(challenge.challenge_id).toLowerCase(),
+            await mac('identity', k.identityKey),
+            (!withoutCurrent && k.currentKey && p.currentPem) ? await mac('current-key', k.currentKey) : '-',
+            (k.newKey && p.newPem) ? await mac('new-key', k.newKey) : '-',
+        ];
+        return parts.join('.');
     }
 
     // =========================================================================
@@ -3506,6 +3913,19 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     unwrapNameIndexKeyV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     calculateFingerprint: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     generateVaultDEK: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+
+    // Key proof. Opening a sealed proof key is a wrap-shaped operation: it raises WRAP_INVALID,
+    // WRAP_FAILED or KEY_MISMATCH itself, and anything else it hits is a wrap failure. The two
+    // checks that answer a question return false rather than throw; they are listed so the table
+    // stays a full statement of the public surface.
+    sealKeyProofKey: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    openKeyProofKey: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    dekCheck: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    keyLineageTag: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    verifyKeyLineageTag: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
+    teamPrivateKeyMatchesPublic: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
+    keyProofTranscript: CRYPTO_ERROR_CODES.INVALID_INPUT,
+    computeKeyProof: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
 });
 
 for (const [_name, _code] of Object.entries(_OPERATION_DEFAULT_CODE)) {
