@@ -197,6 +197,102 @@
       "id": null,
       "fixed_in": "0.32.6",
       "published": "2026-09-27"
+    },
+    "delegated-user-manager-could-take-an-administrator-account": {
+      "title": "A user given the permission to manage users could take an administrator's account",
+      "description": "An administrator can give someone who is not an administrator the permission to manage users. From 0.23.0 that permission reached POST /users/{id}/reset-link, which makes a password reset link and returns it to the caller, and neither it nor the route that emails one, POST /users/{id}/send-reset-link (from 0.16.0), checked whose account the link was for. Such a user could therefore make a reset link for an administrator, set the administrator's password with it and sign in as them; using the link also ended all of the administrator's sessions. Every other route that changes someone else's account (a second-factor reset, the email address, role, lock and active state, sessions, deletion, SSH keys and the account's details) already required an administrator. From 0.16.0 to 0.22.0 only the emailed link existed. It went to the administrator's own address, so it reached the user who asked for it only if ALLOWED_HOSTS was not set (dockvault.py setup sets it), where the link's host came from that user's request, and the administrator then opened the link. The permission was not held only by people an administrator gave it to: an account created as an administrator (POST /users, or an administrator's invitation) holds it as a stored permission, and demoting the account did not remove it, so every former administrator created as one kept the permission to manage users. In 0.16.0 to 0.32.6 that was another way for a removed administrator to become one again, besides an administrator invitation they had made (administrator-invitation-outlived-its-maker): make a reset link for a remaining administrator and use it (from 0.23.0 directly, before that only through the emailed link as above). The advisory demoted-administrator-kept-the-permission-to-manage-users covers what else a former administrator could do with it.",
+      "impact": "A user given the permission to manage users could become an administrator without anyone granting it, by taking over an existing administrator's account. As that administrator they could change the deployment's settings, grant any permission, change any account's role, and make reset links for any other user to sign in as them. If the administrator had a second factor enrolled, the second factor was still asked for at sign-in, so the user could not sign in as them. The administrator was still locked out: their password was changed and their sessions were ended. Second factors are optional by default. Each link is recorded in the audit log as password_reset_link_minted or password_reset_link_sent, with who made it and whose account it was for. A link made for an ordinary user also stayed usable after an administrator made that user an administrator, so it set an administrator's password too.",
+      "remediation": "Upgrade to 0.33.0. A caller who is not an administrator signed in as themselves (a temporary credential never counts as one) may change only an account whose role is not above their own, and never an administrator's. Both reset-link routes check this before a link is made. A refusal is a 403, recorded in the audit log as account_change_refused_role, and no reset token is created. PATCH /users/{id} and the SSH key routes apply the same check, although today only an administrator can reach another person's account through them. Every route that changes someone else's account either requires an administrator or applies this check. The check is made again when a link is used: a reset link made by someone other than its account's owner is judged, when its form is opened and when the new password is set, as its maker and the account stand at that moment. If the maker no longer exists, was deactivated or locked by an administrator, no longer holds the permission to manage users, or may not change the account as it now is (it has been made an administrator, or its role is now above the maker's), the link is refused exactly as an unknown or expired one, deleted, and recorded as password_reset_link_refused with the reason. Making an account an administrator also deletes the open links for it that a non-administrator made, recorded as password_reset_link_revoked. Changing an account's role now resets its permissions to the new role's defaults in the same change, keeping those another administrator granted it and recording what was removed (permissions_reset_for_role), so a demoted administrator no longer keeps the permission to manage users, and a link they made before the demotion is refused when used. Accounts demoted before the upgrade keep what they hold: python dockvault.py accounts --action user-managers lists every account that is not an administrator and may manage users.",
+      "mitigation": "Until you upgrade, review the permissions of every account that is not an administrator, including former administrators (an account created as an administrator and later demoted keeps the permission to manage users), and remove the Manage Users permission where it is not wanted: the account's Permissions button on the Users page, or DELETE /permissions/users/{id}/revoke/USER_MANAGE. For a former administrator, revoke View Users as well, which from 0.9.0 removes Manage Users with it. After upgrading, do the same for accounts demoted before the upgrade. Search the audit log for password_reset_link_minted and password_reset_link_sent rows made by someone who was not an administrator when they made them (a former administrator included) and whose target_user_id is an administrator's, or belongs to an account made an administrator while the link was still valid (a reset link lasts at most 60 minutes). If you find one, end that administrator's sessions, set their password yourself, and review what the account did after the link was made. A second factor on every administrator account prevents signing in as them, though not the lockout.",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "demoted-administrator-kept-the-permission-to-manage-users": {
+      "title": "A demoted administrator kept the permission to manage users",
+      "description": "An account created as an administrator (POST /users with the admin role, or from 0.13.0 an administrator's invitation) is given the administrator's default permissions as stored permissions, among them to view users and to manage users. Changing the account's role (PATCH /users/{id}, PUT /api/user-management/users/{id} or PATCH /api/user-management/users/{id}/role) left them in place, and nothing else removed them, so an administrator made a user or an external user kept both, although nobody had granted them to someone who is not an administrator. With the permission to manage users, POST /users/{id}/send-reset-link (from 0.16.0) emails a password reset link for another account and POST /users/{id}/reset-link (from 0.23.0) returns one to the caller. Before 0.33.0 neither checked whose account the link was for, so a former administrator could make a link for a remaining administrator's account and become an administrator again, or for any other account and sign in as that person. A reset link made while still an administrator also stayed usable after the demotion, as every link did before 0.33.0. The permission to view users showed the deployment's counts of users, locked and inactive accounts, active temporary credentials and sessions (GET /api/user-management/metrics) from 0.6.0. The first administrator, created at the first start from ADMIN_USERNAME, and accounts made administrators by a change of role never held these permissions as stored ones, so demoting them left nothing behind.",
+      "impact": "Demoting an administrator did not remove their power over other people's accounts. From 0.23.0 one request made a reset link for another account, and using it set that account's password, ended its sessions and let the former administrator sign in as its owner, with everything that account could open (not a zero-knowledge vault without its key, and a vault with its own password still asked for it). Used on a remaining administrator's account it gave them an administrator's account again, and locked that administrator out; a second factor enrolled on the account was still asked for at sign-in. From 0.16.0 to 0.22.0 only the emailed link existed: it went to the account's own address, and reached the former administrator only if ALLOWED_HOSTS was not set (dockvault.py setup sets it), where the link's host came from their request, and the owner then opened the link. Each link is recorded in the audit log as password_reset_link_minted or password_reset_link_sent, with who made it and whose account it was for. Every administrator can see such an account's permissions under its Permissions button on the Users page once it is no longer an administrator, but nothing pointed to them.",
+      "remediation": "Upgrade to 0.33.0. Changing an account's role now resets its permissions to the new role's defaults in the same change. A permission another administrator granted the account stays, with what it depends on; the old role's defaults, and a permission the account granted itself, are removed. The change is recorded in the audit log as permissions_reset_for_role, with what was removed and added, and the account's notice of the role change names the permissions removed. A reset link made by an account that no longer holds the permission to manage users is refused when used, exactly as an unknown link, and recorded as password_reset_link_refused. 0.33.0 also refuses a reset link for an administrator's account to anyone who is not one. Upgrading does not change accounts demoted before it, because a permission an administrator granted on purpose cannot always be told from a kept one: after upgrading, list the accounts that are not administrators and may view or manage users with python dockvault.py accounts --action user-managers (a kept permission shows no granter). Where it is not wanted, revoke View Users, which removes Manage Users with it. Where it is wanted, revoke it and then grant it, so that it records who granted it and outlasts a later change of role: granting it again while the account still holds it does nothing.",
+      "mitigation": "Until you upgrade, open the Permissions of every account that is not an administrator on the Users page, above all former administrators, and turn off View Users and Manage Users where you did not grant them. From 0.9.0, revoking View Users (DELETE /permissions/users/{id}/revoke/USER_VIEW) removes Manage Users with it; before 0.9.0, revoke each of them. Do the same each time you demote an administrator. To check the past, look in the audit log for password_reset_link_minted and password_reset_link_sent rows made by an account after it stopped being an administrator; if a link was used, end the affected account's sessions, set its password yourself, and review what it did after the link was made.",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "administrator-invitation-outlived-its-maker": {
+      "title": "A removed administrator could become an administrator again through an invitation they had made",
+      "description": "From 0.13.0 an administrator can invite someone to create an account with the administrator role (POST /invites takes a role, and the web app offers User, External and Admin). Accepting the invitation (POST /invites/{token}/accept, which needs only the link) creates the account with the invitation's role, and neither it nor the lookup that shows the form (GET /invites/{token}) checked who had made the invitation. Demoting, deactivating, locking or deleting the administrator who made it left their pending invitations open; deleting them kept the invitation and only cleared its maker. So an administrator who expected to lose that role could invite an address and username of their own, and after being removed accept the invitation and be an administrator again, under a new account. The invitation had to be accepted before it expired (24 hours by default; an administrator can set up to 30 days) and while invitations were enabled (on by default from 0.19.3; before that, an administrator had to turn them on).",
+      "impact": "An administrator who was removed could regain full administrator access to the deployment: its settings, every account, roles and permissions, the audit log, and password reset links for any account, and in releases before 0.32.6 access to other people's vaults. Removing an administrator did not end the access they could still claim. The pending invitation was listed under Pending invitations on the Users page (the list does not say who made it) until it was accepted, expired or revoked. Its creation is recorded in the audit log as account_invitation_created, by the administrator who made it, and its acceptance as account_invitation_accepted, with the role. Before 0.33.0 the other administrators were not told when an account became an administrator.",
+      "remediation": "Upgrade to 0.33.0. Demoting, deactivating, locking or deleting an administrator revokes the pending invitations they made that would make someone an administrator, each recorded in the audit log as account_invitation_revoked with the reason. Accepting such an invitation, and the lookup that shows its form, are refused unless the administrator who made it is still an active administrator not locked by an administrator; the refusal answers as for an unknown invitation and is recorded as account_invitation_accept_failed with the reason inviter_not_admin. Invitations for other roles are unchanged. In 0.33.0 every administrator is also told when an account becomes an administrator, including through an invitation.",
+      "mitigation": "Until you upgrade, before you remove an administrator, revoke every pending invitation with the Admin role under Pending invitations on the Users page (DELETE /invites/{id}); the audit log's account_invitation_created rows say who made each one, by its token prefix. To check the past, look for account_invitation_accepted rows with role admin and compare each with when the administrator who made the invitation was demoted, deactivated, locked or deleted, which the audit log also records. Turning invitations off in Settings stops every pending invitation from being accepted while you check.",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:H/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "unbounded-request-bodies-before-sign-in": {
+      "title": "Anyone could stall or crash the web app with large request bodies",
+      "description": "The web app limited a request body only by the length the request declared: a declared Content-Length over 256 MiB was refused (up to 0.10.0, over the maximum file size plus 256 MiB). A body sent in chunks declares no length, and nothing limited it at all. The web framework reads a JSON body whole and parses it on the web app's single event loop before a route checks who is calling, so every route that takes a JSON body, sign-in included, read and parsed a body of any size from anyone. Many small JSON objects are the costliest to parse. Measured on 0.32.6: 10 MB of them held every request to the web app for about 9 seconds and raised its memory by about 500 MiB; 20 MB raised it by about 850 MiB, and with the container's memory capped at 640 MiB the web process was killed. The 422 answer to a rejected body also repeated all of it back, which cost as much memory again and returned whatever had been typed, such as a password entered in the username field. The live socket at /ws/monitor had the same fault: anyone could open it, and it parsed the first message before checking who sent it, while the server accepted messages of up to 16 MiB with per-message compression on, so about 16 KB sent on the wire became a 16 MiB message. Measured in-process, one such message held the event loop for about a second and raised the process's memory by about 400 MiB. Nothing limited how often one address opened such a socket.",
+      "impact": "Anyone who can reach the web port could, without an account, make the web app unresponsive to everyone for as long as they kept sending such requests or such socket messages, and could get the web process killed, which ends every transfer in progress. With the shipped 4 GB memory limit, about five 20 MB requests sent in parallel from one address, or one of about 90 MB, would be enough, inside the default sign-in rate limit, which counts requests but not their size. No data was exposed.",
+      "remediation": "Upgrade to 0.33.0. Every request body is counted as it arrives, whether or not it declares a length, and refused with 413 as soon as it passes its limit, without the rest being read. Anyone who is not signed in may send at most 64 KiB to any route. A larger limit is given only to a session that is signed in at that moment, checked before the body is read: the session exists and has not been ended, the account is active and not locked by an administrator, and a temporary credential is still valid. That session gets 1 MiB on most routes, 8 MiB for a note or an email template, a few MiB for the image uploads, and, for files sent in one multipart request (POST /vaults/{id}/files), MAX_SINGLE_REQUEST_UPLOAD_MB (64 MiB by default, or the largest file the deployment accepts if that is smaller) plus 1 MiB for the form. A token whose session has ended is refused with 401 before any of its body is read. One chunk of a resumable upload may be 64 MiB, signed in or through an upload link, because those routes check the caller before they read. The live socket takes messages of at most 16 KiB without per-message compression, closes on any message over 4 KiB before parsing it, and limits how often one address may connect (RATE_LIMIT_WS_CONNECT, 120 a minute by default). A 422 now returns each error's type, location and message, never the rejected value.",
+      "mitigation": "Until you upgrade, put a reverse proxy in front of the vault that limits request body size, counting chunked bodies too (nginx's client_max_body_size does): 1m by default, 65m on the resumable chunk paths (/vaults/*/uploads/*/chunks/* and /receivers/*/upload-session/*/chunks/*), and your largest direct upload on POST /vaults/*/files if you use it. A per-address request rate limit alone does not help. For the live socket, have the proxy remove the Sec-WebSocket-Extensions request header (nginx: proxy_set_header Sec-WebSocket-Extensions \"\";) so compression is never negotiated, and limit the request rate to /ws/monitor per address (nginx: limit_req).",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "second-factor-failure-wrote-unbounded-audit-rows": {
+      "title": "A failed second-factor sign-in could write audit rows of any size",
+      "description": "When the second step of a sign-in failed, its audit row recorded the second-factor method as the client sent it, only lowercased. The field was free text with no length limit, bounded only by the request body: at most 256 MiB when the request declared its length, and not at all when it was sent in chunks (unbounded-request-bodies-before-sign-in). So whoever reached that step, which takes the correct password of an account with a second factor, wrote a row of that size with each failed attempt.",
+      "impact": "Any user who set up a second factor on their own account could grow the audit log by up to hundreds of megabytes per request, within the sign-in limits (ten attempts per five minutes from one address), until the database's disk filled and the whole vault stopped working. Reading the audit log also had to load those rows. No data was exposed.",
+      "remediation": "Upgrade to 0.33.0. The row records the method only as one of the known names, or as other. After upgrading, look for second_factor_failed rows with unusually large details and delete them if an attack left any.",
+      "mitigation": "Until you upgrade, watch the free space on the database's volume and the size of the audit_logs table.",
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "failed-sign-ins-locked-out-the-account-owner": {
+      "title": "Wrong passwords from anyone signed a user out and kept them out",
+      "description": "Five wrong passwords for an account (the default login limit), sent by anyone from any address and counted until the account's next successful sign-in or the end of a lock, locked it for the lockout duration (15 minutes by default), and each further wrong password restarted the lock. This automatic lock was enforced like an administrator's: every request from the account's web sessions was refused with a response that tells the browser to delete the site's stored data, which signs the person out in every browser; the account's SFTP connections, its temporary credentials and their sessions stopped; its desktop devices stopped syncing (from 0.28.0); and, up to 0.32.5, its public file links and upload links stopped working. Separately, the sign-in throttle counted attempts per username across all addresses, so the same failed attempts also refused the owner's own sign-in for the rest of the login window.",
+      "impact": "Anyone who knew or guessed a username, the default admin included, could without an account sign that person out everywhere and keep them from signing in, syncing or using SFTP for as long as they kept sending wrong passwords, a few every quarter of an hour. On a deployment with one administrator that also kept everyone from administering it. No account or data was exposed.",
+      "remediation": "Upgrade to 0.33.0. Wrong passwords now lock new sign-ins only from the address they came from (an IPv6 address counts as its /64). A separate account-wide count refuses new sign-ins from every address once it reaches the login limit times ACCOUNT_LOCKOUT_BACKSTOP_MULTIPLIER (4 by default, so 20); it holds about the last 24 hours, losing one failure every 24 hours divided by that number (every 72 minutes by default). Neither lock ends a session already signed in, a device's sync, a temporary credential, an SFTP connection or a link; only an administrator's lock does, and an administrator's unlock clears both. The sign-in throttle counts a username per address. Whoever knows a username can still pause new sign-ins to the account: from the person's own address (a shared office network, for example) with the login limit's worth of wrong passwords, for the lockout duration, and from anywhere with 20 in a day, kept paused with one more about every 72 minutes.",
+      "mitigation": "Until you upgrade, limit repeated failed sign-ins at a proxy in front of the vault, and do not give administrators a guessable username such as admin. A shorter lockout duration shortens each lock but does not prevent the sign-out.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "temp-credential-heard-other-credentials-sign-in": {
+      "title": "A temporary credential learned when the account's other temporary credentials signed in",
+      "description": "Every signed-in web session keeps a live connection to the server (a web socket), which tells an account when one of its temporary credentials signs in. The server chose who hears that notice by the account it belongs to, and a temporary credential's session belongs to the account that created it. So while one temporary credential had the web app open, or a socket opened by hand, it received the same notice whenever another temporary credential of that account signed in on the web: that credential's name, the address it signed in from and the time. Sign-ins over SFTP sent no such notice.",
+      "impact": "Someone holding one temporary credential, such as an outside party it was given to, could learn the names of the account's other temporary credentials and the addresses and times at which they were used on the web, which can identify the other parties the account works with. No file, vault, password or credential secret was exposed.",
+      "remediation": "Upgrade to 0.33.0. A temporary credential's session receives nothing over the web socket; the account's own sessions still receive the notice.",
+      "mitigation": "None through settings. Temporary credentials created from different accounts do not hear each other.",
+      "severity": "low",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
+    },
+    "demoted-administrator-kept-the-live-feed": {
+      "title": "An administrator whose role was taken away kept receiving the live activity feed",
+      "description": "The Live Monitor's feed of the whole deployment's activity reached administrators over the web socket each signed-in session keeps open. Whether a socket belonged to an administrator was decided once, when it opened, and never checked again, and changing someone's role ends none of their sessions. A socket opened while the person was an administrator therefore went on receiving the feed after they were made an ordinary user: every sign-in and sign-out with its username and address, temporary credentials' sign-ins with their names, security alerts, and every upload and download with who made it and the vault's id (before 0.32.5, the file and vault names too).",
+      "impact": "A former administrator could keep watching the deployment's activity after losing the role, until that socket closed or their sessions were ended. They could not act as an administrator: every request checks the role afresh.",
+      "remediation": "Upgrade to 0.33.0. The deployment-wide feed is gone. The Activity page's signal carries only an event's id and category, and a socket stops receiving it within seconds of its account losing the administrator role.",
+      "mitigation": "Until you upgrade, end a person's sessions when you take the administrator role away from them.",
+      "severity": "low",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:H/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.0",
+      "published": "2026-09-29"
     }
   },
   "versions": {
@@ -257,6 +353,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -317,6 +438,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -377,6 +523,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -437,6 +608,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -497,6 +693,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -557,6 +778,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -617,6 +863,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -677,6 +948,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -737,6 +1033,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -797,6 +1118,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -857,6 +1203,31 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -917,6 +1288,36 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -977,6 +1378,36 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1052,6 +1483,36 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1127,6 +1588,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1202,6 +1698,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1277,6 +1808,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1352,6 +1918,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1427,6 +2028,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1502,6 +2138,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1577,6 +2248,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1652,6 +2358,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1727,6 +2468,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1802,6 +2578,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1877,6 +2688,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -1952,6 +2798,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2027,6 +2908,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2102,6 +3018,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2177,6 +3128,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2252,6 +3238,41 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2327,6 +3348,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2402,6 +3463,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2492,6 +3593,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2582,6 +3723,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2662,6 +3843,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2727,6 +3948,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2782,6 +4043,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2837,6 +4138,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2892,6 +4233,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -2947,6 +4328,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -3002,6 +4423,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -3052,6 +4513,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -3102,6 +4603,46 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
@@ -3137,12 +4678,102 @@
           "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
           "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
           "fixed_in": "0.32.6"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
         }
       ]
     },
     "0.32.6": {
       "released": "2026-09-27",
       "notes": "Security fixes, five advisories. Files past their expiry are hidden at once and deleted within about a minute, with an audit record per file; turning a vault's expiry off removes its files' deadlines, and an expiry longer than 100 years is refused. Links stop while their owner is deactivated or locked by an administrator; a lock armed by wrong passwords no longer pauses them. Ending a user's sessions, changing or resetting a password, and signing out other sessions after setting up a second factor now also reach web sessions that went idle, and every way of deactivating a user now ends their sessions. Only an account that holds a zero-knowledge vault's current key can rotate it, share it or create its name-index key; a member removed by someone without the key stays removed, and the vault asks its key holders to rotate. A vault's owner can no longer be removed through the vault's permissions, which could switch off the owner's zero-knowledge keys. Administrators can no longer give themselves access to another person's vault or to a file shared with a department, cannot demote, deactivate or lock their own account, and the last active administrator cannot be removed. An SFTP sign-in is refused when its policy check fails. Automatic account locks and unlocks are audited, and finished session and sign-in rows are deleted after 30 days. Before upgrading: files already past their deadline are deleted soon after 0.32.6 first starts, so set ENFORCE_FILE_EXPIRY=false to review them first (a vault whose expiry is off keeps its files). With a single administrator, only a vault's owner can now give that administrator access to the vault. No schema change; a rollback to 0.32.5 is clean, but files deleted by expiry stay deleted.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account",
+          "title": "A user given the permission to manage users could take an administrator's account",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
+          "title": "A demoted administrator kept the permission to manage users",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker",
+          "title": "A removed administrator could become an administrator again through an invitation they had made",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in",
+          "title": "Anyone could stall or crash the web app with large request bodies",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
+          "title": "A failed second-factor sign-in could write audit rows of any size",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner",
+          "title": "Wrong passwords from anyone signed a user out and kept them out",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in",
+          "title": "A temporary credential learned when the account's other temporary credentials signed in",
+          "fixed_in": "0.33.0"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed",
+          "title": "An administrator whose role was taken away kept receiving the live activity feed",
+          "fixed_in": "0.33.0"
+        }
+      ]
+    },
+    "0.33.0": {
+      "released": "2026-09-29",
+      "notes": "Security fixes, eight advisories, and the Activity page. A change of role now resets the account's permissions to the new role's defaults, keeping those another administrator granted it, so a demoted administrator no longer keeps the permissions to view and manage users; accounts demoted before 0.33.0 keep them until reviewed (the upgrade condition review-former-administrators; python dockvault.py accounts --action user-managers lists every account that may view or manage users without being an administrator). A user given the permission to manage users can no longer make a reset link for an administrator or for anyone whose role is above theirs (403), and a second change of theirs to someone's sign-in details within 14 days is refused (409). A reset link someone else made is judged again when it is used, and refused as an unknown link once its maker could no longer make it; making an account an administrator revokes the open links a non-administrator made for it. Demoting, deactivating, locking or deleting an administrator revokes the invitations they made to be an administrator, and such an invitation is accepted only while its maker is still an active administrator. Wrong passwords lock new sign-ins only from the address they came from, with a count per account over about 24 hours from all addresses, and an automatic lock no longer signs anyone out or stops their devices, temporary credentials, SFTP connections or links. Request bodies are counted as they arrive and refused with 413 past their route's limit (64 KiB before sign-in, 1 MiB for most routes when signed in), the live socket bounds its messages and its connections per address (RATE_LIMIT_WS_CONNECT), and a 422 no longer repeats the rejected input. A failed second-factor sign-in records its method only by a known name. A temporary credential no longer hears the account's other temporary credentials sign in, and the live signal stops within seconds for an account that loses the administrator role. The Activity page replaces the Live Monitor and Settings, Audit Log: a summary band whose charts filter, a live list of every audited event with its detail beside it, numbered pages or loading as you scroll, saved searches and an export. Every change is now audited, with the way it came in, its route and its user agent. A second change to another person's sign-in details within 14 days needs the approval of another administrator independent of it, the server's operator can reset an account or approve a held change from the host with python dockvault.py accounts, users are told of every administrator's change to their account, and every other administrator is told when an account becomes an administrator. An upload link's owner can change how long it keeps uploads. A folder delete that cannot delete all its files keeps the folder; before, a file moved in during the delete could be lost with its bytes left on disk and the vault counted fuller than it was. Hide note text is kept on the account. For scripts: GET /monitor/stats and GET /audit/export are gone; export the audit log with GET /activity/export (CSV or NDJSON, up to 100,000 rows per export, each export audited), and GET /audit/log is unchanged. Files sent in one multipart request to POST /vaults/{id}/files are capped at 64 MiB (MAX_SINGLE_REQUEST_UPLOAD_MB, never more than the largest file allowed; 0 turns the cap off) and a larger request is answered 413: send large files through the resumable upload, as the web app, the desktop app and the upload-link page already do. A JSON body over 1 MiB is refused with 413 (8 MiB for a note or an email template). Personal data this release stores (docs/data-inventory.md lists every store): audit rows now also carry the browser's user agent (up to 512 characters), the HTTP method, the route and the channel, also for people with no account who open a public link or send through an upload link, and a temporary credential's name after the credential is deleted, to say who did what and how, kept as long as the audit log (for ever with the default AUDIT_LOG_RETENTION_DAYS=0). Names typed at failed sign-ins, which can be a password typed as a username, were already audited; the Activity page lists them and its export includes them. sign_in_lockouts holds failed sign-ins per account and source address and per account over about 24 hours, for the automatic locks: a count goes about a day after its last failure, a lock when it ends. credential_changes holds the requesting and deciding administrators, a summary that can hold a new email address or an SSH key's name and fingerprint, and for an email change the address before and after, for the approval rule and for the 14 days a reset the person asks for goes to the address before; while a request waits it also holds what the change would set (a password hash, an address or a key) and the ids of the administrators the approval rule weighs, cleared when the request is decided or expires (at most 7 days); each record goes 14 days after the change or decision. users.second_factor_reset_at records when an administrator reset the person's second factor, so that their next sign-in sets it up again, and is cleared once they have. admin_grants holds who made each administrator one and when, for the approval rule, while the account is an administrator; an administrator's invitation keeps the administrators its maker descends from, with the invitation. activity_saved_searches holds up to 50 saved filters per administrator, which can hold usernames and addresses, until deleted. The notices and the emails Account changed by an administrator and New administrator name the administrator and, for an email change, both addresses (the email masks the new one); a notice stays until the person deletes it. An Activity export holds usernames, addresses and user agents wherever it is saved. Hide note text and the Activity page's choices are kept on the account. The cache keys and the fallback table that count failed sign-ins by name now hold a keyed stand-in, not the name as typed. The Live Monitor's feed to every administrator's open page is gone. Schema: new tables activity_saved_searches, admin_grants, credential_changes and sign_in_lockouts, and nullable columns audit_logs.channel, audit_logs.temp_credential_name, users.second_factor_reset_at, account_invitations.inviter_lineage and password_reset_tokens.made_by_other, created at the first start. A rollback to 0.32.6 works, since it ignores all of them, but brings back 0.32.6's flaws: among them, an account made an administrator on 0.33.0 holds the administrator's permissions as stored rows, and a demotion on 0.32.6 leaves them in place, so after rolling forward again review the accounts the review-former-administrators check lists. Requests waiting for approval are not applied, automatic locks made by 0.33.0 are forgotten while an account with five or more failed sign-ins since its last successful one is locked at its next wrong password, a second-factor reset no longer asks the user to set the factor up again, and Hide note text is off until chosen again. 0.33.x receives security fixes until six months after 0.34.0 ships (.github/SECURITY.md).",
       "support": {
         "eol": false,
         "secure": true
@@ -3484,6 +5115,32 @@
           "id": "expired-files-deleted",
           "summary": "0.32.6 enforces file expiry, which no earlier release did: within about a minute of its first start it deletes every file whose deadline has passed in a vault whose expiry is on, stored bytes included, and that cannot be undone by rolling back. To review those files first, set ENFORCE_FILE_EXPIRY=false before upgrading, and set it back when you are done; turning a vault's expiry off keeps its files.",
           "detect": "SELECT count(*) FROM files f JOIN vaults v ON v.id = f.vault_id WHERE f.expires_at IS NOT NULL AND f.expires_at < (now() AT TIME ZONE 'utc') AND v.expire_files_after_days > 0"
+        }
+      ]
+    },
+    {
+      "from": "0.32.6",
+      "to": "0.33.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "review-former-administrators",
+          "summary": "Before 0.33.0, an administrator made a user or an external user kept the permissions to manage and to view users that an account created as an administrator holds, though nobody had granted them to a non-administrator. With them the account could still make password reset links for other people's accounts, and in 0.16.0 to 0.32.6 for an administrator's, and so become an administrator again. From 0.33.0 a change of role resets an account's permissions to the new role's defaults, but accounts demoted before the upgrade keep what they hold, because a permission an administrator granted on purpose cannot always be told apart. After upgrading, review every account that is not an administrator and holds Manage Users or View Users, above all former administrators. 'python dockvault.py accounts --action user-managers' lists them, as does the check below; '(no granter recorded)' marks a permission kept from an administrator account, or one whose granter was deleted. Where it is not wanted, revoke View Users under the account's Permissions button on the Users page, which removes Manage Users with it; revoking only Manage Users leaves View Users. Where it is wanted, revoke it and then grant it, so that it records who granted it and outlasts a later change of role: granting it again while the account still holds it does nothing.",
+          "detect": "SELECT u.username, u.role, u.is_active AS active, p.endpoint_group AS permission, coalesce(g.username, '(no granter recorded)') AS granted_by, p.granted_at FROM user_endpoint_permissions p JOIN users u ON u.id = p.user_id LEFT JOIN users g ON g.id = p.granted_by WHERE u.role <> 'ADMIN' AND p.endpoint_group IN ('USER_MANAGE', 'USER_VIEW') ORDER BY (p.granted_by IS NULL) DESC, u.username, p.endpoint_group"
+        },
+        {
+          "id": "live-monitor-and-audit-export-removed",
+          "summary": "The Activity page replaces the Live Monitor page and the Audit Log tab in Settings. GET /monitor/stats and GET /audit/export are removed: a script that exports the audit log must move to GET /activity/export (CSV or NDJSON, up to 100,000 rows per export, and each export is itself audited). GET /audit/log is unchanged."
+        },
+        {
+          "id": "automatic-locks-per-address",
+          "summary": "Wrong passwords now lock new sign-ins to an account only from the address they came from (an IPv6 address counts as its /64), after the login limit (5 by default). A count per account from all addresses together, over about 24 hours, pauses new sign-ins from every address once it reaches the login limit times ACCOUNT_LOCKOUT_BACKSTOP_MULTIPLIER (4 by default, so 20), and it loses one failure every 24 hours divided by that number (every 72 minutes by default): so no more than about 20 passwords a day are checked for an account, where 0.32.6's sign-in throttle let 5 through every 5 minutes, and whoever knows a username can keep new sign-ins to it paused for everyone, its owner included, with one more wrong password about every 72 minutes, until an administrator unlocks it. An automatic lock no longer signs anyone out or stops their devices, temporary credentials, SFTP connections or links; an administrator's lock still does. The sign-in throttle counts a username per address. Behind a proxy not listed in TRUSTED_PROXIES every client has the proxy's address and shares one lock."
+        },
+        {
+          "id": "second-credential-change-needs-approval",
+          "summary": "An administrator may make one change to another person's sign-in details (setting their password or making a reset link, resetting their second factor, changing their email address, adding an SSH key) per account in 14 days. A second one within that time is held for another administrator's approval and expires after 7 days. The approver must be independent of the change: not the one who asked nor the account's owner, not one who made the other an administrator, directly or through administrators they made, not one who changed that account's sign-in details in the 14 days before, and an administrator for at least 14 days (those from before 0.33.0 count as such). With no such administrator the change is refused (409), and the server's operator can make it from the host with python dockvault.py accounts. A user given the permission to manage users may make a first change to an ordinary user's account; a second one within 14 days is refused (409). Users are told in the app, and by email when email is set up, of every change an administrator makes to their account, lock, activation or role, and every other administrator is told when an account becomes an administrator."
         }
       ]
     }
