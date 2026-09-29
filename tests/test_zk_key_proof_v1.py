@@ -678,6 +678,24 @@ def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
         }, ln["mode"]
 
 
+def test_a_direct_lineage_tag_needs_a_32_byte_key_check():
+    out = _node("""
+  const l = V.lineage.find(x => x.mode === 'direct');
+  const prev = await aes(l.prev_dek_hex);
+  const f = { vaultId: l.vault_id, prevEpoch: l.prev_epoch, mode: 'direct', nextTeamEpoch: l.next_team_epoch,
+    nextVerifierPem: l.next_verifier_pem, nextDekCheck: l.next_dek_check_b64 };
+  const check = Buffer.from(l.next_dek_check_b64, 'base64');
+  const res = { right: await code(() => lib.keyLineageTag(prev, f)) };
+  for (const [name, value] of Object.entries({
+    short: check.subarray(1).toString('base64'), long: Buffer.concat([check, Buffer.alloc(1)]).toString('base64'),
+    missing: undefined, empty: '',
+  })) res[name] = await code(() => lib.keyLineageTag(prev, { ...f, nextDekCheck: value }));
+  realLog(JSON.stringify(res));
+""")
+    assert out == {"right": "NONE", "short": "INVALID_INPUT", "long": "INVALID_INPUT", "missing": "INVALID_INPUT",
+                   "empty": "INVALID_INPUT"}
+
+
 def test_the_team_key_match_compares_points():
     i = _vector()["inputs"]
     new_der = ref.private_from_scalar(i["new_scalar_hex"]).private_bytes(
