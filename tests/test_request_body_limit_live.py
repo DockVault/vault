@@ -373,6 +373,69 @@ def test_a_signed_in_multipart_upload_is_held_to_the_largest_file(admin, temp_us
     assert r.status_code == 200, r.text
 
 
+def _tmp_kib():
+    """How much the API container's /tmp holds, in KiB (the multipart spool; a tmpfs, so memory)."""
+    container = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    r = subprocess.run(["docker", "exec", container, "du", "-sk", "/tmp"], capture_output=True, text=True,
+                       timeout=30)
+    if r.returncode != 0 or not r.stdout.split():
+        pytest.skip(f"cannot read the API container's /tmp: {r.stderr[:200]}")
+    return int(r.stdout.split()[0])
+
+
+@pytest.fixture
+def largest_file_at_the_ceiling(admin):
+    """No maximum file size set by the administrators, as on a new deployment: the largest file is then
+    MAX_FILE_SIZE_MB, 10 GiB by default. Put back afterwards."""
+    before = admin.get("/settings").json().get("max_file_size") or 0
+    r = admin.put("/settings", json={"max_file_size": 0})
+    assert r.status_code == 200, r.text
+    try:
+        yield
+    finally:
+        admin.put("/settings", json={"max_file_size": before})
+
+
+def test_a_signed_in_multipart_upload_is_held_to_the_single_request_cap(admin, temp_user_client, temp_vault,
+                                                                        largest_file_at_the_ceiling):
+    """With the defaults the largest file is 10 GiB, more than the web container's memory, and a multipart
+    form is spooled whole to /tmp (memory) before the route checks anything: one signed-in request could
+    fill it. The single-request cap (MAX_SINGLE_REQUEST_UPLOAD_MB, 64 MiB by default) holds it to 64 MiB
+    plus 1 MiB for the form; a larger file goes through the resumable uploader."""
+    limit, vid = 65 * MiB, temp_vault["id"]
+    for who, token in (("administrator", admin.token), ("user", temp_user_client.token)):
+        for size in (limit + 1, 11 * 1024 * MiB):
+            status, text, _headers, seconds = _declare_only(f"/vaults/{vid}/files", size, token)
+            assert status == 413, (who, size, status, text)
+            detail = json.loads(text)["detail"]
+            assert "The limit for this request is 65 MiB" in detail and "resumable uploader" in detail, detail
+            assert seconds < 5, f"refusing it took {seconds:.1f} s"
+
+    # Chunked, so nothing is declared: counted as it arrives, and refused once it passes the cap, with the
+    # spool gone again once the refusal is answered.
+    tmp_before = _tmp_kib()
+    memory = _Memory()
+    try:
+        status, text, seconds = _post(f"/vaults/{vid}/files", _multipart(160 * MiB), chunked=True,
+                                      headers={"Authorization": f"Bearer {temp_user_client.token}",
+                                               "Content-Type": "multipart/form-data; boundary=b"})
+    finally:
+        rise = memory.rise()
+    tmp_after = _tmp_kib()
+    print(f"{status} after {seconds:.2f} s; memory +{rise / MiB:.1f} MiB; /tmp {tmp_before} -> {tmp_after} KiB")
+    assert status == 413, text
+    assert "The limit for this request is 65 MiB" in json.loads(text)["detail"], text
+    assert rise < 100 * MiB, f"the API's memory rose {rise / MiB:.1f} MiB for 160 MiB refused at 65 MiB"
+    assert tmp_after - tmp_before < 1024, f"/tmp kept {tmp_after - tmp_before} KiB of a refused upload"
+
+    # A normal upload still works, and so does one just under the cap.
+    for size in (MiB + MiB // 2, 60 * MiB):
+        content = os.urandom(size)
+        name = unique("f") + ".bin"
+        r = admin.post(f"/vaults/{vid}/files", files=[("files", (name, content, "application/octet-stream"))])
+        assert r.status_code == 200, (size, r.text[:300])
+
+
 def test_a_large_email_template_still_saves(admin):
     body_html = "<p>" + "Welcome to the vault. " * 12_000 + "</p>"      # about 260 KB
     r = admin.post("/email/templates", json={"name": unique("big"), "subject": "Hello",

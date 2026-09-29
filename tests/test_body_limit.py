@@ -10,6 +10,7 @@ gives each answer in turn.
 """
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,7 @@ from app.core import live_session as ls
 pytestmark = pytest.mark.unit
 
 KiB, MiB = bl.KiB, bl.MiB
+ROOT = Path(__file__).resolve().parent.parent
 LIVE, ENDED, UNKNOWN = b"Bearer live", b"Bearer ended", b"Bearer unknown"
 
 
@@ -392,6 +394,81 @@ def test_the_multipart_limit_follows_the_largest_file_the_deployment_accepts_now
         status, _, _, _ = _drive(_App(), "POST", "/vaults/v/files", _pieces(limit, 256 * KiB), chunked=True,
                                  auth=LIVE, largest_file=_largest_file(largest))
         assert status == 200, largest
+
+
+# The single-request cap (MAX_SINGLE_REQUEST_UPLOAD_MB). The largest file is 10 GiB by default, more than
+# the web container's memory, so it is no bound on a body spooled to /tmp (a tmpfs) before the handler
+# runs: the multipart upload has a cap of its own, bounded by the largest file.
+
+DEFAULT_LARGEST = 10240 * MiB     # MAX_FILE_SIZE_MB's default
+
+
+@pytest.fixture
+def cap(monkeypatch):
+    from app.core.config import settings
+
+    def set_cap(mb):
+        monkeypatch.setattr(settings, "max_single_request_upload_mb", mb)
+    return set_cap
+
+
+def test_the_single_request_cap_holds_a_multipart_upload_below_the_largest_file(cap):
+    cap(4)
+    limit = 4 * MiB + bl._MULTIPART_HEADROOM
+    app = _App()
+    status, body, reads, _ = _drive(app, "POST", "/vaults/v/files", [b"x"], declared=limit + 1, auth=LIVE,
+                                    largest_file=_largest_file(DEFAULT_LARGEST))
+    assert (status, reads, app.calls) == (413, 0, 0), "a declared body over the cap was read"
+    assert json.loads(body)["detail"] == (
+        "Request body too large. The limit for this request is 5 MiB. Send a larger file, or several files "
+        "together, with the resumable uploader (POST /vaults/{vault_id}/uploads).")
+    chunked = _App()
+    status, _, reads, _ = _drive(chunked, "POST", "/vaults/v/files", _pieces(64 * MiB, size=1 * MiB),
+                                 chunked=True, auth=LIVE, largest_file=_largest_file(DEFAULT_LARGEST))
+    assert status == 413 and reads == limit // MiB + 1, f"read {reads} pieces of a body over the cap"
+    assert chunked.body == b"x" * limit, "handed on as it came, up to the cap"
+    at_cap = _App()
+    status, _, _, _ = _drive(at_cap, "POST", "/vaults/v/files", _pieces(limit, 256 * KiB), chunked=True,
+                             auth=LIVE, largest_file=_largest_file(DEFAULT_LARGEST))
+    assert status == 200, "a body at the cap was refused"
+
+
+@pytest.mark.parametrize("cap_mb,largest,expected", [
+    (4, 3 * MiB, 3 * MiB),               # bounded by the largest file the deployment accepts
+    (4, DEFAULT_LARGEST, 4 * MiB),       # the cap below the largest file
+    (0, 20 * MiB, 20 * MiB),             # turned off: the largest file alone
+])
+def test_the_multipart_limit_is_the_smaller_of_the_cap_and_the_largest_file(cap, cap_mb, largest, expected):
+    cap(cap_mb)
+    assert bl.multipart_limit(largest) == expected + bl._MULTIPART_HEADROOM
+    status, _, _, _ = _drive(_App(), "POST", "/vaults/v/files", [b"x"],
+                             declared=expected + bl._MULTIPART_HEADROOM + 1, auth=LIVE,
+                             largest_file=_largest_file(largest))
+    assert status == 413
+
+
+def test_the_default_cap_is_well_below_the_containers_memory_and_matches_a_resumable_chunk():
+    # The web container is given 4 GiB in the shipped compose files; one request may take a chunk's worth.
+    from app.core.config import Settings
+    default = Settings.model_fields["max_single_request_upload_mb"].default * MiB
+    assert default == bl.CHUNK_LIMIT == 64 * MiB
+    compose = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "mem_limit: 4g" in compose and default * 32 <= 4 * 1024 * MiB
+
+
+def test_no_client_the_project_ships_sends_a_file_in_one_multipart_request():
+    # So the cap breaks none of them. The web app (the desktop app carries a copy of it) sends files only
+    # through the resumable uploader; its only multipart forms are a logo or favicon and an email image,
+    # which have limits of their own. The upload-link page sends chunks to its own route.
+    import re as _re
+    for js in sorted((ROOT / "static" / "js").glob("*.js")):
+        src = js.read_text(encoding="utf-8")
+        for m in _re.finditer(r"new FormData\(", src):
+            window = src[m.start():m.start() + 700]
+            posts_to = _re.findall(r"fetch\(`\$\{API_BASE\}(/[^`]*)`", window)
+            assert posts_to and posts_to[0] in ("/settings/brand/asset/${slot}", "/email/resources"), (
+                f"{js.name}: a multipart form goes to {posts_to or 'somewhere unknown'}")
+        assert not _re.search(r"/vaults/\$\{[^}]+\}/files`,\s*\{\s*method:\s*'POST'", src), js.name
 
 
 def test_an_anonymous_multipart_upload_is_held_to_64_kib_and_the_largest_file_is_not_asked():

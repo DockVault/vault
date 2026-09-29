@@ -18,10 +18,13 @@ Three classes, and an explicit entry for every route that needs more than the JS
   64 KiB is read on any route before its caller is known, not even to be refused with a 401.
 - ROUTE_RULES: the file routes and the few JSON routes whose legitimate body is larger, each with its
   own limit and the reason for it. The direct multipart upload (POST /vaults/{vault_id}/files) is
-  held to the largest file the deployment accepts right now, plus the form's framing (largest_file):
-  the framework spools its whole form to /tmp, a tmpfs in the shipped compose files and so memory,
-  before the route checks anything about the caller's rights. A batch larger than one file, and any
-  large file, goes through the resumable uploader, whose chunks are checked before they are read.
+  held to the single-request upload cap (MAX_SINGLE_REQUEST_UPLOAD_MB, 64 MiB by default), or to the
+  largest file the deployment accepts right now when that is smaller, plus the form's framing
+  (largest_file, multipart_limit): the framework spools its whole form to /tmp, a tmpfs in the
+  shipped compose files and so memory, before the route checks anything about the caller's rights.
+  A batch larger than that, and any large file, goes through the resumable uploader, whose chunks are
+  checked before they are read. The web app (also the copy inside the desktop app) and the
+  upload-link page never send a file this way: they always use chunks.
 
 A route whose rule has needs_session=True (the JSON class and every explicit rule but the chunk
 routes) has its body read before it authenticates the caller, so a limit there above PUBLIC_LIMIT is
@@ -124,9 +127,9 @@ ROUTE_RULES: Sequence[Tuple[Tuple[str, ...], str, BodyRule, str]] = (
      BodyRule("multipart_upload", None, stream=True, needs_session=True, largest_file=True,
               hint="Send a larger file, or several files together, with the resumable uploader "
                    "(POST /vaults/{vault_id}/uploads)."),
-     "a multipart upload, spooled whole to /tmp (memory) before the handler runs: at most the largest "
-     "file the deployment accepts, plus the form's framing; each file is then held to that size and "
-     "the quotas by the handler"),
+     "a multipart upload, spooled whole to /tmp (memory) before the handler runs: at most the "
+     "single-request upload cap, or the largest file the deployment accepts when that is smaller, plus "
+     "the form's framing; each file is then held to the largest file and the quotas by the handler"),
     (_POST, "/settings/brand/asset/{slot}",
      BodyRule("brand_asset", 2 * MiB + _MULTIPART_HEADROOM, stream=True, needs_session=True),
      "a logo or favicon, at most 2 MB"),
@@ -210,6 +213,25 @@ def _ceiling_bytes() -> int:
     """The deployment's ceiling on one file (MAX_FILE_SIZE_MB), in bytes."""
     from app.core.config import settings
     return max(0, int(settings.max_file_size_mb or 0)) * MiB
+
+
+def single_request_upload_bytes() -> int:
+    """The cap on the files of one multipart upload request (MAX_SINGLE_REQUEST_UPLOAD_MB), in bytes;
+    0 when the operator turned it off."""
+    from app.core.config import settings
+    return max(0, int(settings.max_single_request_upload_mb or 0)) * MiB
+
+
+def multipart_limit(largest_file: int) -> int:
+    """The body limit of a signed-in multipart upload: the single-request cap, bounded by the largest
+    file the deployment accepts right now (``largest_file``, so never more than MAX_FILE_SIZE_MB), plus
+    the form's framing. The largest file alone when the cap is off.
+
+    The cap exists because the largest file is no bound on memory: MAX_FILE_SIZE_MB is 10 GiB by
+    default, far above the web container's memory, and the whole form is spooled to /tmp (a tmpfs)
+    before the handler runs. Files larger than the cap go through the resumable uploader."""
+    cap = single_request_upload_bytes()
+    return (min(largest_file, cap) if cap else largest_file) + _MULTIPART_HEADROOM
 
 
 def largest_file_from(db) -> int:
@@ -331,7 +353,7 @@ class BodyLimitMiddleware:
                     rule = PUBLIC   # no credential: what anyone may send, held until it is whole
         limit = rule.limit
         if rule.largest_file:
-            limit = await (self.largest_file or largest_file_bytes)() + _MULTIPART_HEADROOM
+            limit = multipart_limit(await (self.largest_file or largest_file_bytes)())
         if limit is None:
             await self.app(scope, receive, send)
             return

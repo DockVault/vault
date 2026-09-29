@@ -372,7 +372,8 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written)."""
+    invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written),
+    max_single_request_upload_mb (int or None; written only when set)."""
     lines = []
 
     def q(k):
@@ -479,6 +480,11 @@ def build_env_lines(cfg):
     for key in ("max_concurrent_transfers", "max_queued_transfers", "transfer_queue_wait_seconds"):
         if cfg.get(key) not in (None, ""):
             bare(key.upper(), str(cfg[key]))
+    # The cap on one multipart upload request, which the web container holds in memory before it
+    # checks anything. Same rule: written only when this deployment has a value, so an install that
+    # never mentions it authors the .env it always did and the app's default (64) applies.
+    if cfg.get("max_single_request_upload_mb") not in (None, ""):
+        bare("MAX_SINGLE_REQUEST_UPLOAD_MB", int(cfg["max_single_request_upload_mb"]))
     # File expiry is enforced by default, so a normal install never mentions it. Author
     # ENFORCE_FILE_EXPIRY only when the operator has postponed enforcement, so that choice survives
     # a fresh volume set instead of silently switching back on.
@@ -1039,6 +1045,14 @@ def parse_transfer_wait(raw):
     return int(value) if value == int(value) else value
 
 
+def parse_single_request_upload_mb(raw):
+    """MAX_SINGLE_REQUEST_UPLOAD_MB -> the cap the application would apply, in MiB, or None if unset.
+    Zero is a real choice (the cap is off); a negative is refused by the application, so it is
+    carried as zero rather than as "not configured", which would be the default of 64."""
+    value = _finite_float(raw)
+    return None if value is None else max(0, int(value))
+
+
 def format_gb_value(gb):
     """A GB number as an .env value. Deliberately not '%g': that renders large numbers in
     exponent notation ('1e+06'), and a whole number should read as '64', not '64.0'."""
@@ -1264,6 +1278,9 @@ def new_set_config(current_env, new_prefix, new_id):
         "max_queued_transfers": parse_transfer_queue(current_env.get("MAX_QUEUED_TRANSFERS")),
         "transfer_queue_wait_seconds": parse_transfer_wait(
             current_env.get("TRANSFER_QUEUE_WAIT_SECONDS")),
+        # And the cap on one multipart upload request, for the same reason.
+        "max_single_request_upload_mb": parse_single_request_upload_mb(
+            current_env.get("MAX_SINGLE_REQUEST_UPLOAD_MB")),
         # Keep a postponed file-expiry enforcement across a fresh volume set, like the choices above
         # (raw, so an explicit "false" survives; the default is on).
         "enforce_file_expiry": (current_env.get("ENFORCE_FILE_EXPIRY") or "").strip() or None,
@@ -3370,6 +3387,8 @@ class DockVault:
                 getattr(args, "max_queued_transfers", None) if args else None),
             "transfer_queue_wait_seconds": parse_transfer_wait(
                 getattr(args, "transfer_queue_wait_seconds", None) if args else None),
+            "max_single_request_upload_mb": parse_single_request_upload_mb(
+                getattr(args, "max_single_request_upload_mb", None) if args else None),
             "_generated_pw": generated,
         }
 
@@ -5436,6 +5455,11 @@ def build_parser():
                     type=float,
                     help="how long a transfer waits for a slot before the caller is told to come "
                          "back (20 by default)")
+    sp.add_argument("--max-single-request-upload-mb", dest="max_single_request_upload_mb", type=int,
+                    help="the largest upload the server takes in one request, in MiB (64 by default; "
+                         "0 = no cap but the file-size ceiling). It is held in memory before it is "
+                         "checked; larger files go through the resumable uploader, which the web "
+                         "app and the upload-link page always use")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")

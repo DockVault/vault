@@ -303,7 +303,7 @@ is answered `413` without the rest being read (`app/core/body_limit.py`):
 | A note, an email template | 8 MiB, signed in only |
 | Sealing zero-knowledge names | 4 MiB, signed in only |
 | A logo or favicon; an email image | 3 MiB; 6 MiB, signed in only |
-| A multipart file upload | the largest file the deployment accepts (`MAX_FILE_SIZE_MB`, lowered by the administrators' maximum file size) plus 1 MiB for the form, signed in only |
+| A multipart file upload | the single-request upload cap (`MAX_SINGLE_REQUEST_UPLOAD_MB`, 64 MiB by default), or the largest file the deployment accepts when that is smaller (`MAX_FILE_SIZE_MB`, lowered by the administrators' maximum file size), plus 1 MiB for the form, signed in only |
 
 "Signed in only" means the larger limit needs a session that is signed in right now: the token is
 signed and unexpired, and the session, the account and any temporary credential behind it pass the
@@ -324,13 +324,20 @@ event loop) and about 50 µs when the answer is kept.
 A signed-in multipart upload is still received whole before the handler runs. Its parts are spooled
 to `/tmp`, which the shipped compose files mount as a tmpfs, so until the handler has read them they
 are held in memory, before the route has checked that the caller may upload to that vault at all.
-So its body is held to the largest file the deployment accepts right now plus 1 MiB for the form:
-the file-size ceiling, lowered by the administrators' setting (read once every 5 seconds, and again
-as soon as the setting is saved). It used to have no limit here, so any signed-in session could
-fill the tmpfs. A batch larger than one file, and any large file, goes through the resumable path
-(what the browser uses), whose chunks are checked before they are read. With the default ceiling of
-10 GB, a signed-in caller can still have one such request spool 10 GB into `/tmp`; lower
-`MAX_FILE_SIZE_MB`, or the maximum file size in Settings, to bound it further.
+So its body is held to a cap of its own, `MAX_SINGLE_REQUEST_UPLOAD_MB` (64 MiB by default), or to
+the largest file the deployment accepts right now when that is smaller (the file-size ceiling,
+lowered by the administrators' setting, read once every 5 seconds and again as soon as the setting
+is saved), plus 1 MiB for the form. It used to have no limit here, so any signed-in session could
+fill the tmpfs, and the file-size ceiling alone is no bound on memory: it is 10 GB by default, more
+than the whole container is given. A batch larger than the cap, and any large file, goes through the
+resumable path, whose chunks are checked before they are read. The web app (also the copy inside
+the desktop app, which carries the 0.27.0 web app) and the upload-link page always use that path,
+whatever the file's size, so no shipped client sends a multipart file upload at all; the cap only
+meets a script that sends one, which is answered `413` with a pointer to the resumable uploader. The
+default matches the resumable chunk cap, so no single request carries more than a chunk may.
+Requests made at the same time each hold up to the cap until their handlers run; the upload rate
+limit (`RATE_LIMIT_API_UPLOAD`, 60 a minute by default) bounds how many one caller can start. Raise the cap only for a script of your own that needs
+it; `0` turns it off, leaving the file-size ceiling alone.
 
 ## WebSocket messages
 

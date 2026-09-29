@@ -282,6 +282,13 @@ class Settings(BaseSettings):
     # Deployment ceiling on a single file, in MB. New deployments default to 10 GB; an
     # administrator can lower the live limit from the admin panel, but only DOWNWARD from this.
     max_file_size_mb: int = Field(default=10240)
+    # Cap on the files of ONE multipart upload request (POST /vaults/{vault_id}/files), in MB, bounded
+    # by the largest file above. Such a request is spooled whole to /tmp (a tmpfs, so memory) before
+    # the route checks anything, so the file ceiling (10 GB, more than the web container's memory) is
+    # no bound on it. Larger files go through the resumable uploader, which the web app (also the copy
+    # inside the desktop app) and the upload-link page always use. 0 turns this cap off (the largest
+    # file alone then bounds the request).
+    max_single_request_upload_mb: int = Field(default=64, ge=0)
     # The deployment's HARD ceiling on total STORED bytes, in GB (-1, the default, = unlimited).
     # An administrator tunes the live limit from the admin panel, but only DOWNWARD from this
     # value — the panel offers 0 .. MAX_STORAGE_GB and shows the ceiling, so the operator who set

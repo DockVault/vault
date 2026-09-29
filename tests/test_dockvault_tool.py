@@ -3241,6 +3241,49 @@ def test_the_written_transfer_ceiling_is_what_the_application_reads():
     assert Settings(max_concurrent_transfers=written).max_concurrent_transfers == 4
 
 
+# The cap on one multipart upload request (MAX_SINGLE_REQUEST_UPLOAD_MB): the same rules as the transfer
+# ceiling above. Written only when this deployment has a value, kept across a fresh volume set, and zero
+# (the cap turned off) carried as a choice rather than as unset.
+
+def test_setup_writes_the_single_request_upload_cap_only_when_asked():
+    cfg = _reusable_env_cfg()
+    assert not [l for l in dv.build_env_lines(cfg) if l.startswith("MAX_SINGLE_REQUEST_UPLOAD_MB")]
+    cfg["max_single_request_upload_mb"] = 128
+    assert "MAX_SINGLE_REQUEST_UPLOAD_MB=128" in dv.build_env_lines(cfg)
+
+
+def test_setup_accepts_the_single_request_upload_cap_flag():
+    args = dv.build_parser().parse_args(
+        ["setup", "--non-interactive", "--max-single-request-upload-mb", "128"])
+    assert dv.parse_single_request_upload_mb(args.max_single_request_upload_mb) == 128
+    unset = dv.build_parser().parse_args(["setup", "--non-interactive"])
+    assert dv.parse_single_request_upload_mb(unset.max_single_request_upload_mb) is None
+
+
+@pytest.mark.parametrize("raw,read", [("128", 128), ("0", 0), ("-5", 0), ("", None), (None, None)])
+def test_the_single_request_upload_cap_is_read_as_the_application_reads_it(raw, read):
+    assert dv.parse_single_request_upload_mb(raw) == read
+
+
+def test_a_fresh_volume_set_keeps_the_single_request_upload_cap():
+    cfg = dv.new_set_config({"MAX_SINGLE_REQUEST_UPLOAD_MB": "0"}, "prefix-1", "dep-1")
+    assert cfg["max_single_request_upload_mb"] == 0, "the cap turned off was read as unset"
+    assert "MAX_SINGLE_REQUEST_UPLOAD_MB=0" in dv.build_env_lines({**cfg, "server_name": "localhost"})
+    never = dv.new_set_config({}, "prefix-1", "dep-1")
+    assert not [l for l in dv.build_env_lines({**never, "server_name": "localhost"})
+                if l.startswith("MAX_SINGLE_REQUEST_UPLOAD_MB")]
+
+
+def test_the_single_request_upload_cap_is_documented_and_read_by_the_application():
+    from app.core.config import Settings
+    assert "# MAX_SINGLE_REQUEST_UPLOAD_MB=64" in (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert Settings.model_fields["max_single_request_upload_mb"].default == 64
+    cfg = dv.new_set_config({"MAX_SINGLE_REQUEST_UPLOAD_MB": "128"}, "prefix-1", "dep-1")
+    written = dv.parse_env("\n".join(
+        dv.build_env_lines({**cfg, "server_name": "localhost"})))["MAX_SINGLE_REQUEST_UPLOAD_MB"]
+    assert Settings(max_single_request_upload_mb=written).max_single_request_upload_mb == 128
+
+
 def test_stored_bytes_parses_the_database_answer(tmp_path, monkeypatch):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Proc(0, stdout="\n 123456 \n"))
