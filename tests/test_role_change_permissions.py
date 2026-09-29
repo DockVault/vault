@@ -286,6 +286,41 @@ def test_each_route_that_demotes_an_administrator_resets_their_permissions(db, t
 
 
 @pytest.mark.parametrize("route", sorted(ROUTES))
+def test_each_route_that_makes_an_administrator_an_external_user_resets_their_permissions(db, told, route):
+    # The external role has no permissions of its own, so an administrator made an external user keeps
+    # none. Kept, the permission to manage users would reach every other external account, whose role is
+    # not above theirs: the check on whose account a link is for does not stop that on its own.
+    ada = _user(db, "ada", RoleEnum.ADMIN)
+    bob = _user(db, "bob", RoleEnum.ADMIN)
+    xena = _user(db, "xena", RoleEnum.EXTERNAL)
+    token = _mint(db, xena, bob)           # made while bob was an administrator
+
+    ROUTES[route](db, ada, bob, RoleEnum.EXTERNAL)
+
+    db.expire_all()
+    assert db.get(User, bob.id).role == RoleEnum.EXTERNAL
+    assert _groups(db, bob) == [], "an external user holds no permission nobody granted them"
+    (row,) = _audit(db, "permissions_reset_for_role")
+    assert (row.details["old_role"], row.details["new_role"]) == ("admin", "external")
+    assert (row.details["removed"], row.details["added"], row.details["kept"]) == (ADMIN_DEFAULTS, [], [])
+    notice = [n for n in told if n[0] == "bob" and n[1] == "Your role was changed"]
+    assert len(notice) == 1 and "Manage Users" in notice[0][2], told
+
+    # No reset link for another external account now...
+    with pytest.raises(HTTPException) as refused:
+        _mint_through_the_route(db, db.get(User, bob.id), xena)
+    assert refused.value.status_code == 403
+    assert db.query(PasswordResetToken).filter(PasswordResetToken.created_by == bob.id).count() == 1
+    # ...and the one made before is refused when used, because its maker may no longer manage users.
+    with pytest.raises(HTTPException) as used:
+        _use(db, token)
+    assert (used.value.status_code, used.value.detail) == (404, UNKNOWN)
+    assert [r.details["reason"] for r in _audit(db, "password_reset_link_refused")] == [aa.MAKER_WITHOUT_PERMISSION]
+    db.expire_all()
+    assert db.get(User, xena.id).password_hash == "old-hash"
+
+
+@pytest.mark.parametrize("route", sorted(ROUTES))
 def test_a_promotion_and_a_demotion_through_the_route_come_back_to_the_users_defaults(db, told, route):
     ada = _user(db, "ada", RoleEnum.ADMIN)
     carol = _user(db, "carol")

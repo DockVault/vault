@@ -7,6 +7,8 @@ working. Each route that changes a role now resets the permissions in the same t
 was removed, and names it in the notice of the role change. test_role_change_permissions.py holds the rule
 offline.
 """
+import json
+
 import pytest
 import requests
 
@@ -124,6 +126,40 @@ def test_a_demoted_administrator_loses_the_permission_to_manage_users(admin, acc
     body = psql("SELECT body FROM notifications WHERE user_id = '{0}' AND title = 'Your role was changed'"
                 .format(bob["id"]))
     assert "Manage Users" in body and "View Users" in body, body
+
+
+def _held(user_id):
+    rows = psql(f"SELECT endpoint_group FROM user_endpoint_permissions WHERE user_id = '{user_id}' "
+                "ORDER BY endpoint_group")
+    return rows.split("\n") if rows else []
+
+
+@pytest.mark.parametrize("route", sorted(ROUTES))
+def test_an_administrator_made_an_external_user_keeps_no_permission(admin, accounts, route):
+    # The external role has no permissions of its own. Kept, the permission to manage users would reach
+    # every other external account, whose role is not above the former administrator's.
+    bob = accounts("admin")
+    xena = accounts("external")
+    held = _held(bob["id"])
+    assert set(ADMIN_ONLY) <= set(held), held
+    token = _link(_signed_in(bob), xena["id"])        # made while bob was an administrator
+
+    _change_role(admin, route, bob["id"], "external")
+
+    assert _held(bob["id"]) == [], "an external user holds no permission nobody granted them"
+    (removed,) = _reset_rows(bob["id"])
+    assert json.loads(removed) == held
+    # No reset link for another external account now...
+    yves = accounts("external")
+    r = _signed_in(bob).post(f"/users/{yves['id']}/reset-link")
+    assert r.status_code == 403, r.text
+    # ...and the one made before is refused when used, because its maker may no longer manage users.
+    use = _use(token)
+    assert (use.status_code, use.json().get("detail")) == (404, UNKNOWN), use.text
+    why = psql("SELECT details->>'reason' FROM audit_logs WHERE action = 'password_reset_link_refused' "
+               f"AND resource_id = '{xena['id']}'")
+    assert why == "maker_without_permission", why
+    assert not _signs_in(xena["_username"], TAKEN)
 
 
 @pytest.mark.parametrize("route", sorted(ROUTES))
