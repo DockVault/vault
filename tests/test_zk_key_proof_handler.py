@@ -46,7 +46,7 @@ import zk_key_proof_reference as ref  # noqa: E402
 from app.api import ecc_router as E  # noqa: E402
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO, TEAMPRIV_ALGO  # noqa: E402
 from app.core.models import (  # noqa: E402
-    RoleEnum, User, UserKeyPair, Vault, VaultKeyProof, VaultMemberIndexKey, VaultMemberKey,
+    AuditLog, RoleEnum, User, UserKeyPair, Vault, VaultKeyProof, VaultMemberIndexKey, VaultMemberKey,
     ZkKeyProofChallenge, vault_members,
 )
 from app.core.security import encrypt_secret  # noqa: E402
@@ -57,6 +57,7 @@ pytestmark = pytest.mark.unit
 REKEY = inspect.unwrap(E.rekey_vault)
 GRANT = inspect.unwrap(E.grant_member_key)
 PUT_INDEX_KEY = inspect.unwrap(E.put_vault_index_key)
+BOOTSTRAP = inspect.unwrap(E.bootstrap_key_proof)
 
 
 # --------------------------------------------------------------------------------------- database
@@ -80,13 +81,24 @@ def world(monkeypatch):
     monkeypatch.setattr(E, "_ecc_rate_limit", lambda *a, **k: None)
     audit = []
     monkeypatch.setattr(E, "_audit_zk", lambda db, actor, action, **kw: audit.append((action, kw.get("details"))))
-    state = {"enforce": True}
+    state = {"enforce": True, "step_ups": []}
     monkeypatch.setattr(E.zk_key_proof, "enforcement_enabled", lambda: state["enforce"])
+    # The owner reset's step-up (the account's second factor) is exercised live; here it is recorded, or
+    # made to refuse, to see where it runs.
+    import app.api.api_server as S
+
+    def step_up(db, user, request, action):
+        state["step_ups"].append(action)
+        if state.get("step_up_refuses"):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail={"second_factor_required": True, "action": action,
+                                                         "reason": "step_up_required", "methods": ["totp"]})
+    monkeypatch.setattr(S, "_enforce_step_up", step_up)
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'zk.db'}", connect_args={"check_same_thread": False})
         for table in (User.__table__, Vault.__table__, vault_members, VaultMemberKey.__table__,
                       UserKeyPair.__table__, VaultMemberIndexKey.__table__, VaultKeyProof.__table__,
-                      ZkKeyProofChallenge.__table__):
+                      ZkKeyProofChallenge.__table__, AuditLog.__table__):
             table.create(engine)
         yield World(sessionmaker(bind=engine, autocommit=False, autoflush=False), audit, state)
         engine.dispose()
@@ -180,7 +192,7 @@ class World:
                 server_private_key_sealed=encrypt_secret(ref.private_pem(server)) if sealed else ref.private_pem(server),
                 nonce=_b64(os.urandom(32)), mode="hierarchical" if hier else "direct",
                 dek_epoch=v.dek_version or 1, team_epoch=v.team_key_version or 1,
-                verifier_sha256=hashlib.sha256(ref.point(verifier)).hexdigest() if verifier else None,
+                verifier_sha256=_point_sha_or_none(verifier),
                 created_at=datetime.utcnow() - timedelta(seconds=age_seconds),
             )
             s.add(ch)
@@ -247,6 +259,14 @@ class World:
     def failures(self):
         return [d["reason"] for a, d in self.audit if a == "zk_key_proof_failed"]
 
+    def stored_audit(self, action):
+        """Audit rows written in a handler's own transaction (build_row), not through _audit_zk."""
+        s = self.Session()
+        try:
+            return [r.details for r in s.query(AuditLog).filter(AuditLog.action == action).all()]
+        finally:
+            s.close()
+
 
 class FakeRequest:
     """What the handlers read from the HTTP request: the header and the raw body."""
@@ -257,6 +277,14 @@ class FakeRequest:
 
     async def body(self):
         return self._body
+
+
+def _point_sha_or_none(pem):
+    """As the challenge route records a verifier: the SHA-256 of its point, or None when there is no usable key."""
+    try:
+        return hashlib.sha256(ref.point(pem)).hexdigest() if pem else None
+    except (ValueError, TypeError):
+        return None
 
 
 def _b64(raw: bytes) -> str:
@@ -473,6 +501,29 @@ def test_the_vault_must_still_be_in_the_state_the_challenge_was_issued_for(world
     assert _rows_for(world, vid, target) == 0
 
 
+def test_a_verifier_that_changed_under_the_same_epoch_is_stale(world):
+    """The pin covers the verifier itself, not only the epochs: material replaced at the same epoch (which
+    no route does, but a database edit can) means the proof was prepared for another key."""
+    vid, owner, manager, proof_key = world.direct_vault()
+    target = world.new_person()
+    body = _share_body(target)
+    raw = _serialize(body)
+    ch = world.challenge(manager, vid, "share")
+    replacement = ec.generate_private_key(ec.SECP384R1())
+    s = world.Session()
+    s.query(VaultKeyProof).filter(VaultKeyProof.vault_id == vid).update(
+        {"proof_public_key": ref.public_pem(replacement)})
+    s.commit()
+    s.close()
+    # Even a caller who holds the replacement and proves with it was not given a challenge for it.
+    header = world.prove(dict(ch, verifier=ref.public_pem(replacement)), manager, vid, "share", raw,
+                         current_key=replacement)
+    err = world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.GrantMemberKeyRequest(**body))
+    assert (err.status_code, err.reason) == (409, "zk-key-proof-stale")
+    assert _rows_for(world, vid, target) == 0
+
+
 def test_a_direct_epoch_without_a_proof_key_needs_setting_up_first(world):
     vid, owner, manager, _ = world.direct_vault(with_row=False)
     target = world.new_person()
@@ -664,3 +715,260 @@ def test_a_proven_index_key_mint_passes(world):
     out = world.call(PUT_INDEX_KEY, owner, FakeRequest(raw, header), vault_id=str(vid), body=E.IndexKeyPut(**body))
     assert out["wraps"] == 2
     assert [d["proof"] for a, d in world.audit if a == "zk_index_key_wrapped"] == ["key"]
+
+
+# ------------------------------------------------------------------------------------ bootstrap
+
+def _bootstrap_request(world, vid, caller, *, key=None, material=None, identity_key=None, epoch=1, ch=None):
+    if material is None:
+        key, material = _direct_material()
+    body = dict({"dek_epoch": epoch}, **material)
+    raw = _serialize(body)
+    ch = ch or world.challenge(caller, vid, "bootstrap")
+    header = world.prove(ch, caller, vid, "bootstrap", raw, new_pem=material["public_key"], new_key=key,
+                         identity_key=identity_key)
+    return key, material, body, raw, header
+
+
+def _run_bootstrap(world, vid, caller, body, raw, header, *, user_flags=None):
+    s = world.Session()
+    try:
+        user = s.query(User).filter(User.id == caller).first()
+        for k, v in (user_flags or {}).items():
+            setattr(user, k, v)
+        return run_coroutine(BOOTSTRAP(vault_id=str(vid), request=E.KeyProofBootstrapRequest(**body),
+                                       current_user=user, db=s, http_request=FakeRequest(raw, header)))
+    finally:
+        s.close()
+
+
+def test_a_legacy_epoch_is_set_up_by_a_manager_who_holds_the_key_and_then_proves(world):
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    key, material, body, raw, header = _bootstrap_request(world, vid, manager)
+    out = _run_bootstrap(world, vid, manager, body, raw, header)
+    assert out["status"] == "ok" and out["dek_epoch"] == 1 and "unchanged" not in out
+    assert world.proof_rows(vid)[1] == ("bootstrap", material["public_key"], None)
+    assert world.stored_audit("zk_key_proof_bootstrapped") == [{"op": "bootstrap", "mode": "direct", "dek_epoch": 1}]
+    # The epoch now has a verifier, and a share proves the current key with it.
+    target = world.new_person()
+    _, sbody, sraw, sheader = _proved_share(world, vid, manager, target, key)
+    assert _share(world, vid, manager, target, header=sheader, body=sbody, raw=sraw)["status"] == "ok"
+
+
+def test_rows_are_immutable_so_a_second_bootstrap_is_refused_unless_it_is_the_same(world):
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    first = world.challenge(manager, vid, "bootstrap")
+    second = world.challenge(manager, vid, "bootstrap")
+    third = world.challenge(owner, vid, "bootstrap")
+    key, material, body, raw, header = _bootstrap_request(world, vid, manager, ch=first)
+    _run_bootstrap(world, vid, manager, body, raw, header)
+    # The same material again from the same person (a retry whose answer was lost): 200, nothing changes.
+    _, _, _, _, again = _bootstrap_request(world, vid, manager, key=key, material=material, ch=second)
+    assert _run_bootstrap(world, vid, manager, body, raw, again)["unchanged"] is True
+    # Anything else: 409, and the row is the first one.
+    _, other_material, obody, oraw, oheader = _bootstrap_request(world, vid, owner, ch=third)
+    err = world.refused(BOOTSTRAP, owner, FakeRequest(oraw, oheader), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**obody))
+    assert (err.status_code, err.reason) == (409, "zk-key-proof-exists")
+    assert world.proof_rows(vid)[1][1] == material["public_key"]
+    assert len(world.stored_audit("zk_key_proof_bootstrapped")) == 1
+
+
+def test_bootstrap_is_only_for_a_manager_who_holds_the_key_proving_their_own_identity(world):
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    # A plain member who holds the key.
+    s = world.Session()
+    member = world.person(s)
+    s.execute(vault_members.insert().values(vault_id=vid, user_id=member, read_permission=True,
+                                            manage_permission=False))
+    s.add(VaultMemberKey(vault_id=vid, user_id=member, wrapped_dek="w", ephemeral_public_key="e",
+                         wrapping_algorithm=DIRECT_DEK_ALGO, key_version=1))
+    # A manager who holds no key.
+    keyless = world.person(s)
+    s.execute(vault_members.insert().values(vault_id=vid, user_id=keyless, read_permission=True,
+                                            manage_permission=True))
+    s.commit()
+    s.close()
+    _, _, body, raw, header = _bootstrap_request(world, vid, member)
+    err = world.refused(BOOTSTRAP, member, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**body))
+    assert err.status_code == 403 and "manager" in err.detail
+    _, _, body, raw, header = _bootstrap_request(world, vid, keyless)
+    err = world.refused(BOOTSTRAP, keyless, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**body))
+    assert err.status_code == 403 and "holds this vault's key" in err.detail
+    # The manager who holds the key, but proving with a key that is not their identity key.
+    _, _, body, raw, header = _bootstrap_request(world, vid, manager, identity_key=ec.generate_private_key(ec.SECP384R1()))
+    err = world.refused(BOOTSTRAP, manager, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**body))
+    assert (err.status_code, err.reason) == (403, "zk-key-proof-failed")
+    # ... or proving a key other than the one installed.
+    key, material = _direct_material()
+    body = dict({"dek_epoch": 1}, **material)
+    raw = _serialize(body)
+    ch = world.challenge(manager, vid, "bootstrap")
+    header = world.prove(ch, manager, vid, "bootstrap", raw, new_pem=material["public_key"],
+                         new_key=ec.generate_private_key(ec.SECP384R1()))
+    err = world.refused(BOOTSTRAP, manager, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**body))
+    assert (err.status_code, err.reason) == (403, "zk-key-proof-failed")
+    assert world.failures() == ["identity", "new_key"]
+    assert world.proof_rows(vid) == {}
+
+
+def test_bootstrap_refuses_a_temporary_session_a_team_vault_and_a_request_without_a_proof(world):
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    _, _, body, raw, header = _bootstrap_request(world, vid, manager)
+    with pytest.raises(KeyProofRefusal) as exc:
+        _run_bootstrap(world, vid, manager, body, raw, header, user_flags={"_is_temp_session": True})
+    assert (exc.value.status_code, exc.value.reason) == (403, "zk-key-proof-interactive-only")
+    assert world.challenges_left() == 1, "the temporary session consumed the challenge"
+    # Enforcement off does not make bootstrap optional: it exists only with proofs.
+    world.enforce(False)
+    err = world.refused(BOOTSTRAP, manager, FakeRequest(raw), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**body))
+    assert (err.status_code, err.reason) == (428, "zk-key-proof-required")
+    hvid, howner, _, _ = world.hier_vault()
+    _, _, hbody, hraw, hheader = _bootstrap_request(world, hvid, howner)
+    err = world.refused(BOOTSTRAP, howner, FakeRequest(hraw, hheader), vault_id=str(hvid),
+                        request=E.KeyProofBootstrapRequest(**hbody))
+    assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed")
+    assert world.proof_rows(vid) == {}
+
+
+def test_bootstrap_of_an_epoch_that_moved_is_stale(world):
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    key, material, body, raw, header = _bootstrap_request(world, vid, manager)
+    s = world.Session()
+    s.query(Vault).filter(Vault.id == vid).update({"dek_version": 2})
+    s.add(VaultMemberKey(vault_id=vid, user_id=manager, wrapped_dek="w", ephemeral_public_key="e",
+                         wrapping_algorithm=DIRECT_DEK_ALGO, key_version=2))
+    s.commit()
+    s.close()
+    err = world.refused(BOOTSTRAP, manager, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.KeyProofBootstrapRequest(**body))
+    assert (err.status_code, err.reason) == (409, "zk-key-proof-stale")
+
+
+# ---------------------------------------------------------------------------------- owner reset
+
+def _damaged_direct_vault(world):
+    """A direct vault whose epoch-1 proof row names a key nobody holds: no current-key proof can pass."""
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    s = world.Session()
+    s.add(VaultKeyProof(vault_id=vid, dek_epoch=1, proof_public_key=ref.public_pem(ec.generate_private_key(ec.SECP384R1())),
+                        sealed_private_key=_sealed_stub(), dek_check=_b64(os.urandom(32)), source="bootstrap",
+                        created_by=manager))
+    s.commit()
+    s.close()
+    return vid, owner, manager
+
+
+def _reset_request(world, vid, caller, owner, manager, *, op="owner_reset", identity_key=None, lineage=False):
+    new_key, material = _direct_material()
+    body = _rekey_body(owner, manager, material, lineage=lineage)
+    body["owner_reset"] = True
+    raw = _serialize(body)
+    ch = world.challenge(caller, vid, op)
+    header = world.prove(ch, caller, vid, op, raw, new_pem=material["public_key"], new_key=new_key,
+                         identity_key=identity_key)
+    return body, raw, header
+
+
+def test_the_owner_resets_damaged_material_to_a_new_epoch(world):
+    vid, owner, manager = _damaged_direct_vault(world)
+    # Nobody can rotate normally: the current key cannot be proved.
+    _, material = _direct_material()
+    body = _rekey_body(owner, manager, material)
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "rekey")
+    header = world.prove(ch, owner, vid, "rekey", raw, current_key=ec.generate_private_key(ec.SECP384R1()))
+    err = world.refused(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert (err.status_code, err.reason) == (403, "zk-key-proof-failed")
+
+    body, raw, header = _reset_request(world, vid, owner, owner, manager)
+    out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert out["dek_version"] == 2
+    assert world.proof_rows(vid)[2] == ("owner_reset", body["next_key_proof"]["public_key"], None)
+    assert world.proof_rows(vid)[1][0] == "bootstrap", "the damaged row was replaced instead of left behind"
+    assert world.stored_audit("zk_owner_key_reset") == [{"op": "owner_reset", "mode": "direct", "dek_epoch": 2,
+                                                         "team_epoch": 1}]
+    assert [d["proof"] for a, d in world.audit if a == "zk_vault_rekeyed"] == ["owner_reset"]
+    assert world._state["step_ups"] == ["vault.owner_key_reset"]
+
+
+def test_only_the_owner_resets_and_only_with_their_identity_key(world):
+    vid, owner, manager = _damaged_direct_vault(world)
+    # A manager holding a challenge for the owner reset (which the challenge route would not give them).
+    body, raw, header = _reset_request(world, vid, manager, owner, manager)
+    err = world.refused(REKEY, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert err.status_code == 403 and "owner" in err.detail
+    body, raw, header = _reset_request(world, vid, owner, owner, manager,
+                                       identity_key=ec.generate_private_key(ec.SECP384R1()))
+    err = world.refused(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert (err.status_code, err.reason) == (403, "zk-key-proof-failed")
+    assert world.failures() == ["identity"]
+    assert world.dek_version(vid) == 1
+
+
+def test_an_owner_reset_is_refused_early_to_a_temporary_session_and_needs_its_step_up_first(world):
+    vid, owner, manager = _damaged_direct_vault(world)
+    body, raw, header = _reset_request(world, vid, owner, owner, manager)
+    s = world.Session()
+    try:
+        user = s.query(User).filter(User.id == owner).first()
+        user._is_temp_session = True
+        with pytest.raises(KeyProofRefusal) as exc:
+            run_coroutine(REKEY(vault_id=str(vid), request=E.RekeyRequest(**body), current_user=user, db=s,
+                                http_request=FakeRequest(raw, header)))
+    finally:
+        s.close()
+    assert (exc.value.status_code, exc.value.reason) == (403, "zk-key-proof-interactive-only")
+    assert world._state["step_ups"] == []
+    # The step-up is asked for before the challenge is consumed, so the retry after the prompt finds it.
+    world._state["step_up_refuses"] = True
+    err = world.refused(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert err.status_code == 403 and err.detail["second_factor_required"] is True
+    assert world.challenges_left() == 1
+    world._state["step_up_refuses"] = False
+    assert world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid),
+                      request=E.RekeyRequest(**body))["dek_version"] == 2
+
+
+def test_an_owner_reset_always_needs_a_proof_and_a_challenge_for_itself(world):
+    vid, owner, manager = _damaged_direct_vault(world)
+    world.enforce(False)
+    body, raw, header = _reset_request(world, vid, owner, owner, manager)
+    err = world.refused(REKEY, owner, FakeRequest(raw), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert (err.status_code, err.reason) == (428, "zk-key-proof-required")
+    # A challenge for a rotation does not open the reset, nor the reverse, and neither is consumed.
+    body, raw, header = _reset_request(world, vid, owner, owner, manager, op="rekey")
+    err = world.refused(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed")
+    assert world.challenges_left() == 2
+    assert world.dek_version(vid) == 1
+
+
+def test_an_owner_reset_of_a_team_vault_replaces_the_team_key(world):
+    vid, owner, manager, team = world.hier_vault()
+    s = world.Session()
+    s.query(Vault).filter(Vault.id == vid).update({"team_public_key": "damaged"})
+    s.commit()
+    s.close()
+    dek_only = {"from_version": 1, "to_version": 2, "member_keys": [], "team_dek_wrapped": _b64(b"w" * 32),
+                "team_dek_ephemeral_public_key": "e", "owner_reset": True}
+    raw = _serialize(dek_only)
+    ch = world.challenge(owner, vid, "owner_reset")
+    header = world.prove(ch, owner, vid, "owner_reset", raw)
+    err = world.refused(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**dek_only))
+    assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed")
+    assert world.challenges_left() == 1
+
+    new_team = ec.generate_private_key(ec.SECP384R1())
+    body = dict(_team_body(owner, manager, ref.public_pem(new_team)), owner_reset=True)
+    del body["lineage_tag"]
+    raw = _serialize(body)
+    header = world.prove(ch, owner, vid, "owner_reset", raw, new_pem=body["team_public_key"], new_key=new_team)
+    out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert (out["dek_version"], out["team_key_version"]) == (2, 2)
+    assert world.proof_rows(vid)[2] == ("owner_reset", None, None)

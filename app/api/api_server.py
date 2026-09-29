@@ -4139,9 +4139,17 @@ def _sf_action_toggles(db, action):
 
 
 def _sf_requirement_for(db, user, action):
-    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy."""
+    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy.
+
+    A fixed action (second_factor_actions.FIXED_STEP_UP_ACTIONS) has no toggles: it needs the person's
+    second factor whenever they have one enrolled, and nothing when they have none."""
     from app.core import second_factor_actions as acts
     from app.core import second_factor_policy as pol
+    if action in acts.FIXED_STEP_UP_ACTIONS:
+        has_active = db.query(SecondFactorEnrollment.id).filter(
+            SecondFactorEnrollment.user_id == user.id,
+            SecondFactorEnrollment.status == "active").first() is not None
+        return {"password": False, "otp": has_active, "must_enroll": False}, has_active
     require_otp, require_password = _sf_action_toggles(db, action)
     has_active = db.query(SecondFactorEnrollment.id).filter(
         SecondFactorEnrollment.user_id == user.id,
@@ -7457,7 +7465,7 @@ async def second_factor_challenge(
     from app.core import second_factor_actions as acts
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
-    if body.action not in acts.ACTION_KEYS:
+    if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     req, has_active = _sf_requirement_for(db, current_user, body.action)
     if req["must_enroll"]:
@@ -7481,7 +7489,7 @@ async def second_factor_step_up(
     from app.core.rate_limiter import rate_limiter as _rl
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
-    if body.action not in acts.ACTION_KEYS:
+    if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = get_client_ip(request)
     allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{current_user.id}",

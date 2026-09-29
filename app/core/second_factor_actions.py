@@ -40,6 +40,22 @@ SECOND_FACTOR_ACTIONS = [
 
 # Fast lookups.
 ACTION_KEYS = [k for (k, _n, _o) in SECOND_FACTOR_ACTIONS]
+
+# Step-ups whose requirement is fixed in code rather than chosen in the admin's matrix: whenever the person
+# has a second factor enrolled, the action needs it; an account without one is not asked. They are kept OUT
+# of SECOND_FACTOR_ACTIONS on purpose -- every catalogued action except sign-in and managing one's own second
+# factor ships off, so a catalogued one would ship unguarded -- and so out of the seeded rows, the matrix and
+# the step-up boot contract. The step-up routes accept them, and the receipt and the 403 shape are the usual
+# ones, so the web app's step-up prompt and retry work unchanged.
+OWNER_KEY_RESET = "vault.owner_key_reset"
+FIXED_STEP_UP_ACTIONS = {
+    OWNER_KEY_RESET: "Reset a zero-knowledge vault's key as its owner",
+}
+
+
+def is_step_up_action(key: str) -> bool:
+    """A key the step-up routes accept: a catalogued action or a fixed one."""
+    return key in ACTION_KEYS or key in FIXED_STEP_UP_ACTIONS
 ACTION_META = {k: {"name": n, "default_require_otp": o} for (k, n, o) in SECOND_FACTOR_ACTIONS}
 
 # The admin-plane actions, kept only as a CLASSIFICATION (e.g. to group/label the admin rows in the

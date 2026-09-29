@@ -44,6 +44,7 @@ def _once(text: str, needle: str, where: str) -> int:
 # (router source, handler, operation, the shape checks that must precede consumption)
 GUARDED = (
     (ECC, "rekey_vault", "rekey", ("_direct_proof_material(", "_lineage_tag_or_none(")),
+    (ECC, "bootstrap_key_proof", "bootstrap", ("_direct_proof_material(",)),
     (ECC, "grant_member_key", "share", ("dek_version is required with a key proof",)),
     (ECC, "put_vault_index_key", "index_key", ()),
 )
@@ -54,7 +55,8 @@ def test_each_guarded_handler_checks_in_the_design_order(source, name, op, shape
     fn = _function(source, name)
     header = _once(fn, "_key_proof_header(http_request", name)
     consume = _once(fn, "_consume_key_proof_challenge(", name)
-    assert f'op="{op}"' in fn[consume:consume + 200], f"{name} consumes a challenge for another operation"
+    assert (f'op="{op}"' in fn[consume:consume + 200] or "op=op" in fn[consume:consume + 200]), \
+        f"{name} consumes a challenge for another operation"
     for shape in shapes:
         at = fn.find(shape)
         assert header < at < consume, f"{name}: {shape!r} is not checked between the header and consumption"
@@ -91,6 +93,7 @@ def test_a_zero_knowledge_create_checks_everything_before_the_vault_is_built():
 KEY_MATERIAL_WRITERS = {
     ("app/api/api_server.py", "create_vault"): "guarded (create)",
     ("app/api/ecc_router.py", "rekey_vault"): "guarded (rekey, owner reset)",
+    ("app/api/ecc_router.py", "bootstrap_key_proof"): "guarded (bootstrap)",
     ("app/api/ecc_router.py", "grant_member_key"): "guarded (share)",
     ("app/api/ecc_router.py", "put_vault_index_key"): "guarded (index key)",
     ("app/api/ecc_router.py", "retire_dek_versions"): "prunes the team-wrap entries of retired epochs",
@@ -154,8 +157,52 @@ def test_only_the_first_verifier_and_the_owner_reset_skip_the_current_key():
     verify = _function(ECC, "_verify_key_proof")
     _once(verify, "if ch.op in zk_key_proof.OPS_WITHOUT_CURRENT_KEY:\n        current_pem = None", "_verify_key_proof")
     # The handlers for operations that must prove the current key take it from the vault, never from the body.
-    for name in ("rekey_vault", "grant_member_key", "put_vault_index_key"):
-        fn = _function(ECC, name)
-        call = fn[fn.index("_verify_key_proof("):]
-        call = call[:call.index(")\n") + 1]
-        assert "current_pem=_current_key_verifier(db, locked)" in call, name
+    for name in ("grant_member_key", "put_vault_index_key"):
+        assert "current_pem=_current_key_verifier(db, locked)" in _verify_call(_function(ECC, name)), name
+    # A rotation skips it only as an owner reset, which only the vault's owner may make, with a challenge
+    # issued for that operation (checked under the lock, before the MACs).
+    rekey = _function(ECC, "rekey_vault")
+    assert "current_pem=(None if owner_reset else _current_key_verifier(db, locked))" in _verify_call(rekey)
+    _once(rekey, 'op = "owner_reset" if owner_reset else "rekey"', "rekey_vault")
+    owner_check = _once(rekey, "if owner_reset and str(current_user.id) != str(locked.owner_id):", "rekey_vault")
+    assert owner_check < rekey.index("_verify_key_proof(")
+    # The two doors that set up a verifier prove the key they install and no current key.
+    assert "current_pem=None, new_pem=material[\"public_key\"]" in _verify_call(_function(ECC, "bootstrap_key_proof"))
+    assert "current_pem=None, new_pem=new_pem" in _verify_call(_function(API, "create_vault"))
+
+
+def _verify_call(fn: str) -> str:
+    call = fn[fn.index("_verify_key_proof("):]
+    depth = 0
+    for i, c in enumerate(call):
+        depth += c == "("
+        depth -= c == ")"
+        if depth == 0 and c == ")":
+            return call[:i + 1]
+    raise AssertionError("unbalanced call")
+
+
+def test_the_owner_reset_step_up_is_fixed_and_outside_the_admins_matrix():
+    """Every catalogued step-up action but two ships off, so the owner reset is not one of them: its
+    step-up is required whenever the owner has a second factor, whatever the matrix says."""
+    from app.core import second_factor_actions as acts
+    assert acts.OWNER_KEY_RESET not in acts.ACTION_KEYS
+    assert acts.OWNER_KEY_RESET in acts.FIXED_STEP_UP_ACTIONS and acts.is_step_up_action(acts.OWNER_KEY_RESET)
+    requirement = _function(API, "_sf_requirement_for")
+    fixed = _once(requirement, "if action in acts.FIXED_STEP_UP_ACTIONS:", "_sf_requirement_for")
+    assert fixed < requirement.index("_sf_action_toggles(")
+    assert 'return {"password": False, "otp": has_active, "must_enroll": False}, has_active' in requirement
+    rekey = _function(ECC, "rekey_vault")
+    step_up = _once(rekey, "_enforce_step_up(db, current_user, http_request, OWNER_KEY_RESET)", "rekey_vault")
+    assert step_up < rekey.index("_ecc_rate_limit(") < rekey.index("_consume_key_proof_challenge(")
+
+
+def test_the_step_up_boot_contract_still_holds():
+    """The server refuses to start when the catalogued step-up actions and the guarded ones differ; the
+    owner reset's fixed step-up is in neither."""
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    import app.api.api_server as S
+    from app.core.second_factor_actions import OWNER_KEY_RESET
+    S._assert_step_up_boot_contract()
+    assert OWNER_KEY_RESET not in S.GUARDED_STEP_UP_ACTIONS

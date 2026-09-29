@@ -459,3 +459,193 @@ def test_a_create_is_proved_before_anything_is_built(admin, people):
         assert r.status_code == 400 and r.json()["reason"] == "zk-key-proof-malformed", r.text
         assert _psql(f"SELECT count(*) FROM zk_key_proof_challenges WHERE id = '{ch['challenge_id']}'") == "1", \
             "a malformed create consumed its challenge"
+
+
+# ------------------------------------------------------------------------------------- bootstrap
+
+def _legacy_direct_vault(client, admin):
+    """A direct vault as one made before key proofs existed: its epoch has no proof key."""
+    vid = _direct_vault(client, admin)
+    _psql(f"DELETE FROM vault_key_proofs WHERE vault_id = '{vid}'")
+    return vid
+
+
+def _bootstrap_body(vid, epoch=1):
+    _, material = harness.direct_proof_material(vid, epoch)
+    return dict({"dek_epoch": epoch}, **material)
+
+
+def test_a_legacy_epoch_is_set_up_once_by_a_manager_who_holds_its_key(admin, people):
+    owner, oc = people("kpbo")
+    target, _ = people("kpbt")
+    vid = _legacy_direct_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/key-proof"
+    try:
+        # Until it is set up, a change that proves the current key cannot run.
+        _refused(post_zk(oc, f"/ecc/vaults/{vid}/members", json=_share_body(target["id"])), 428,
+                 "zk-key-proof-setup-required")
+        body = _bootstrap_body(vid)
+        first = harness.prepare_zk(oc, path, body, method="PUT")
+        retry = harness.prepare_zk(oc, path, body, method="PUT")
+        r = harness.send_prepared(oc, path, first, method="PUT")
+        assert r.status_code == 200 and "unchanged" not in r.json(), r.text
+        assert _psql(f"SELECT source || '|' || created_by FROM vault_key_proofs WHERE vault_id = '{vid}'") \
+            == f"bootstrap|{owner['id']}"
+        assert _psql("SELECT details->>'dek_epoch' FROM audit_logs WHERE action = 'zk_key_proof_bootstrapped' "
+                     f"AND resource_id = '{vid}'") == "1"
+        # The same material again from the same person, on a challenge taken before it was set up: a retry.
+        r = harness.send_prepared(oc, path, retry, method="PUT")
+        assert r.status_code == 200 and r.json()["unchanged"] is True, r.text
+        # A new attempt is refused already at the challenge: the epoch has its row, and rows never change.
+        r = put_zk(oc, path, json=_bootstrap_body(vid))
+        assert r.zk_challenge_status == 409 and r.zk_challenge_refusal["reason"] == "zk-key-proof-exists"
+        assert _psql(f"SELECT count(*) FROM vault_key_proofs WHERE vault_id = '{vid}'") == "1"
+        # And the change that needed it now runs.
+        assert post_zk(oc, f"/ecc/vaults/{vid}/members", json=_share_body(target["id"])).status_code == 200
+    finally:
+        oc.delete_vault(vid)
+
+
+def test_bootstrap_is_refused_to_everyone_else(admin, people):
+    owner, oc = people("kpbr")
+    member, mc = people("kpbm")
+    keyless, kc = people("kpbk")
+    vid = _direct_vault(oc, admin)
+    team_vid = _team_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/key-proof"
+    try:
+        post_zk(oc, f"/ecc/vaults/{vid}/members", json=_share_body(member["id"])).raise_for_status()
+        oc.post(f"/vaults/{vid}/permissions", json={"user_id": member["id"], "level": "read"}).raise_for_status()
+        oc.post(f"/vaults/{vid}/permissions", json={"user_id": keyless["id"], "level": "manage"}).raise_for_status()
+        _psql(f"DELETE FROM vault_key_proofs WHERE vault_id = '{vid}'")   # as a vault made before key proofs
+        # A plain member who holds the key.
+        r = put_zk(mc, path, json=_bootstrap_body(vid))
+        assert r.status_code == 403 and "manager" in r.json()["detail"], r.text
+        # A manager who holds no key: no challenge, so no proof, and bootstrap exists only with one.
+        r = put_zk(kc, path, json=_bootstrap_body(vid))
+        assert r.zk_challenge_status == 403 and "holds this vault's key" in r.zk_challenge_refusal["detail"]
+        _refused(r, 428, "zk-key-proof-required")
+        # The owner, proving with a key that is not their identity key.
+        _refused(put_zk(oc, path, json=_bootstrap_body(vid), roles={"identity": _foreign()}))
+        # A temporary session, even of the owner's own account.
+        cred = oc.post("/auth/temp-credentials", json={"note": unique("kpbtemp")}).json()
+        temp = oc.clone_anonymous()
+        temp.login(cred["temp_username"], cred["credential"])
+        r = temp.put(path, json=_bootstrap_body(vid))
+        assert r.status_code == 403, r.text
+        # A team vault: its team public key is its verifier.
+        r = put_zk(oc, f"/ecc/vaults/{team_vid}/key-proof", json=_bootstrap_body(team_vid))
+        assert r.status_code == 400 and r.json()["reason"] == "zk-key-proof-malformed", r.text
+        assert _psql(f"SELECT count(*) FROM vault_key_proofs WHERE vault_id = '{vid}'") == "0"
+        assert _failures(vid) == "identity"
+    finally:
+        oc.delete_vault(vid)
+        oc.delete_vault(team_vid)
+
+
+def test_two_bootstraps_at_once_leave_exactly_one_row(admin, people):
+    owner, oc = people("kpb2")
+    vid = _legacy_direct_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/key-proof"
+    try:
+        a = harness.prepare_zk(oc, path, _bootstrap_body(vid), method="PUT")
+        b = harness.prepare_zk(oc, path, _bootstrap_body(vid), method="PUT")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            codes = sorted(f.result().status_code for f in
+                           [pool.submit(harness.send_prepared, oc, path, p, method="PUT") for p in (a, b)])
+        assert codes == [200, 409], codes
+        assert _psql(f"SELECT count(*) FROM vault_key_proofs WHERE vault_id = '{vid}'") == "1"
+    finally:
+        oc.delete_vault(vid)
+
+
+# ----------------------------------------------------------------------------------- owner reset
+
+def _damage(vid):
+    """Replace the current epoch's proof key with one nobody holds, as a bad client or a database edit
+    would: no current-key proof can pass any more."""
+    stray = ec.generate_private_key(ec.SECP384R1()).public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    _psql(f"UPDATE vault_key_proofs SET proof_public_key = '{stray}' WHERE vault_id = '{vid}'")
+
+
+def _reset(frm, *remaining):
+    return dict(_rotation(frm, *remaining), owner_reset=True)
+
+
+def test_the_owner_resets_damaged_key_material(admin, people):
+    owner, oc = people("kpor")
+    manager, gc = people("kporm")
+    vid = _direct_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/rekey"
+    try:
+        post_zk(oc, f"/ecc/vaults/{vid}/members", json=_share_body(manager["id"])).raise_for_status()
+        oc.post(f"/vaults/{vid}/permissions", json={"user_id": manager["id"], "level": "manage"}).raise_for_status()
+        _damage(vid)
+        # Nobody can rotate normally now.
+        _refused(post_zk(oc, path, json=_rotation(1, owner["id"], manager["id"])))
+        # A manager may not reset: only the owner gets a challenge for it.
+        r = post_zk(gc, path, json=_reset(1, owner["id"], manager["id"]))
+        assert r.zk_challenge_status == 403 and "owner" in r.zk_challenge_refusal["detail"]
+        _refused(r, 428, "zk-key-proof-required")
+        # The owner without their identity key.
+        _refused(post_zk(oc, path, json=_reset(1, owner["id"], manager["id"]), roles={"identity": _foreign()}))
+        assert _psql(f"SELECT dek_version FROM vaults WHERE id = '{vid}'") == "1"
+
+        r = post_zk(oc, path, json=_reset(1, owner["id"], manager["id"]))
+        assert r.status_code == 200 and r.json()["dek_version"] == 2, r.text
+        assert _psql(f"SELECT source FROM vault_key_proofs WHERE vault_id = '{vid}' AND dek_epoch = 2") \
+            == "owner_reset"
+        assert _psql("SELECT details->>'dek_epoch' FROM audit_logs WHERE action = 'zk_owner_key_reset' "
+                     f"AND resource_id = '{vid}'") == "2"
+        assert _psql("SELECT details->>'proof' FROM audit_logs WHERE action = 'zk_vault_rekeyed' "
+                     f"AND resource_id = '{vid}'") == "owner_reset"
+        # The vault works again: the next change proves the new epoch's key.
+        assert post_zk(gc, path, json=_rotation(2, owner["id"], manager["id"])).status_code == 200
+    finally:
+        oc.delete_vault(vid)
+
+
+def test_an_owner_reset_asks_for_the_owners_second_factor_first_whatever_the_matrix_says(admin, people):
+    """The step-up is fixed, not a matrix action: every catalogued action but two ships off. It is asked
+    for before the challenge is consumed, so the web app's retry after the prompt finds it."""
+    from _sf_helpers import enroll_totp, step_up_receipt
+    owner, oc = people("kpsu")
+    vid = _direct_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/rekey"
+    try:
+        actions = admin.get("/second-factor/actions").json()["actions"]
+        assert "vault.owner_key_reset" not in {a["key"] for a in actions}
+        assert actions and not [a["key"] for a in actions if a["require_otp"] or a["require_password"]
+                                if a["key"] not in ("login", "account.second_factor")], "a matrix toggle is on"
+        _damage(vid)
+        _, codes = enroll_totp(owner, oc)
+        prepared = harness.prepare_zk(oc, path, _reset(1, owner["id"]))
+        r = harness.send_prepared(oc, path, prepared)
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        assert detail["second_factor_required"] is True and detail["action"] == "vault.owner_key_reset"
+        assert "recovery" in detail["methods"]
+        assert _psql("SELECT count(*) FROM zk_key_proof_challenges "
+                     f"WHERE id = '{prepared['challenge']['challenge_id']}'") == "1", "consumed before the step-up"
+        receipt = step_up_receipt(oc, action="vault.owner_key_reset", recovery_codes=codes)
+        r = harness.send_prepared(oc, path, prepared, headers={"X-Second-Factor": receipt})
+        assert r.status_code == 200 and r.json()["dek_version"] == 2, r.text
+    finally:
+        oc.delete_vault(vid)
+
+
+def test_a_temporary_session_cannot_reset_a_key(admin, people):
+    owner, oc = people("kptr")
+    vid = _direct_vault(oc, admin)
+    try:
+        cred = oc.post("/auth/temp-credentials", json={"note": unique("kprtemp")}).json()
+        temp = oc.clone_anonymous()
+        temp.login(cred["temp_username"], cred["credential"])
+        r = temp.post(f"/ecc/vaults/{vid}/key-proof/challenge", json={"op": "owner_reset"})
+        assert r.status_code == 403 and r.json()["reason"] == "zk-key-proof-interactive-only", r.text
+        path = f"/ecc/vaults/{vid}/rekey"   # sent as is: a temporary session cannot make a proof
+        r = temp.post(path, data=harness.serialize(_reset(1, owner["id"])), headers={"Content-Type": "application/json"})
+        assert r.status_code == 403 and r.json()["reason"] == "zk-key-proof-interactive-only", r.text
+    finally:
+        oc.delete_vault(vid)

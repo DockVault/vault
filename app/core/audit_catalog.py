@@ -196,12 +196,15 @@ ACTIONS: Tuple[AuditAction, ...] = (
     # A request to change a vault's keys whose proof that the caller holds the keys did not check out, and
     # one accepted without such a proof (only while the host operator has turned enforcement off).
     AuditAction("zk_key_proof_absent", "zero_knowledge", "Vault key changed without proof of the key", "warning"),
+    AuditAction("zk_key_proof_bootstrapped", "zero_knowledge", "Vault key check set up", "notice"),
     AuditAction("zk_key_proof_failed", "zero_knowledge", "Vault key change refused: key not proven", "warning"),
     AuditAction("zk_key_update_pop_failed", "zero_knowledge", "Encryption key change refused", "warning"),
     AuditAction("zk_keypair_registered", "zero_knowledge", "Encryption keys set up", "notice"),
     AuditAction("zk_member_key_granted", "zero_knowledge", "Vault key given to a member", "notice"),
     AuditAction("zk_member_key_revoked", "zero_knowledge", "Member's vault keys removed", "notice"),
     AuditAction("zk_names_sealed", "zero_knowledge", "File names encrypted in the browser", "info"),
+    # The owner replaced damaged key material with fresh material (a new epoch), without proving the old key.
+    AuditAction("zk_owner_key_reset", "zero_knowledge", "Vault key reset by its owner", "warning"),
     AuditAction("zk_passphrase_changed", "zero_knowledge", "Encryption passphrase changed", "notice"),
     AuditAction("zk_share_invited", "zero_knowledge", "Zero-knowledge vault invite created", "notice"),
     AuditAction("zk_vault_rekeyed", "zero_knowledge", "Vault encryption key rotated", "notice"),

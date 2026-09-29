@@ -1680,6 +1680,104 @@ async def _raw_body(http_request) -> bytes:
     return await http_request.body()
 
 
+class KeyProofBootstrapRequest(BaseModel):
+    """A direct vault epoch's proof material, for an epoch made before key proofs existed (or while they
+    were not required): the proof public key, its private key sealed under the epoch's DEK, and the key
+    check. The server checks only their shape; members' clients check them against the DEK."""
+    dek_epoch: int
+    public_key: Optional[str] = None
+    sealed_private_key: Optional[str] = None
+    dek_check: Optional[str] = None
+
+
+@router.put("/vaults/{vault_id}/key-proof")
+@require_endpoint_permission("VAULT_PERMISSIONS")
+@require_vault_cap("vault.change_permissions")
+async def bootstrap_key_proof(
+    vault_id: str,
+    request: KeyProofBootstrapRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    http_request: Request = None,
+):
+    """Install the proof material of a direct vault's current epoch that has none ("bootstrap").
+
+    One of the two operations that accept a proof without the current key, since there is no verifier to
+    prove against yet. It needs a manager who holds the current key, in an interactive session, proving
+    their own identity key and the proof key they install -- so an account taken over, which lacks the
+    identity key, can neither set it up nor plant material before an honest manager does. Rows are
+    immutable: an epoch that has one answers 409 (the same material again from the same person, 200).
+    A team vault needs none: its team public key is its verifier.
+    """
+    # Refused before the budget is charged: this installs durable security material.
+    if getattr(current_user, "_is_temp_session", False):
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-interactive-only")
+    _ecc_rate_limit(current_user, "mutate")
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if getattr(vault, 'type', None) != 'zero_knowledge' or _is_hierarchical(vault):
+        raise zk_key_proof.malformed("only a direct zero-knowledge vault's key check is set up this way")
+    if not _can_manage_vault(db, vault, current_user):
+        raise HTTPException(status_code=403,
+                            detail="Only the vault owner or a manager can set up this vault's key check")
+    header = _key_proof_header(http_request, always=True)
+    material = _direct_proof_material(
+        {"public_key": request.public_key, "sealed_private_key": request.sealed_private_key,
+         "dek_check": request.dek_check}, "the key check material")
+    raw_body = await _raw_body(http_request)
+    ch = _consume_key_proof_challenge(db, current_user, vault_id=vault.id, op="bootstrap", header=header)
+    # The material is for the epoch the challenge was issued at; under the lock below, that epoch must still
+    # be the vault's current one.
+    if request.dek_epoch != ch.dek_epoch:
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-stale")
+
+    locked = (db.query(Vault).populate_existing()
+              .filter(Vault.id == vault_id).with_for_update().first())
+    if locked is None:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    if not _holds_current_key(db, locked, current_user.id):
+        raise HTTPException(status_code=403,
+                            detail="Only someone who holds this vault's key can set up its key check")
+    epoch = getattr(locked, 'dek_version', 1) or 1
+    if (ch.mode, ch.dek_epoch, ch.team_epoch) != ("direct", epoch, getattr(locked, 'team_key_version', 1) or 1):
+        db.rollback()
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-stale")
+    existing = _current_key_proof(db, locked)
+    unchanged = False
+    if existing is not None:
+        # Someone set it up since the challenge. The same material from the same person is a retry.
+        unchanged = (str(existing.created_by) == str(current_user.id)
+                     and (existing.proof_public_key, existing.sealed_private_key, existing.dek_check)
+                     == (material["public_key"], material["sealed_private_key"], material["dek_check"]))
+        if not unchanged:
+            db.rollback()
+            raise zk_key_proof.KeyProofRefusal("zk-key-proof-exists")
+    else:
+        _pin_key_proof_state(db, ch, locked)
+    _verify_key_proof(db, current_user, ch, header, vault_id=locked.id, body=raw_body,
+                      current_pem=None, new_pem=material["public_key"])
+    if unchanged:
+        db.rollback()
+        return {"status": "ok", "vault_id": str(locked.id), "dek_epoch": epoch, "unchanged": True}
+
+    db.add(VaultKeyProof(
+        vault_id=locked.id, dek_epoch=epoch, proof_public_key=material["public_key"],
+        sealed_private_key=material["sealed_private_key"], dek_check=material["dek_check"],
+        source="bootstrap", created_by=current_user.id,
+    ))
+    db.add(AuditLogger(db).build_row(
+        action="zk_key_proof_bootstrapped", status="success", user=current_user, resource_type="vault",
+        resource_id=str(locked.id), details={"op": "bootstrap", "mode": "direct", "dek_epoch": epoch},
+    ))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise zk_key_proof.KeyProofRefusal("zk-key-proof-exists")
+    return {"status": "ok", "vault_id": str(locked.id), "dek_epoch": epoch}
+
+
 @router.get("/users/{user_id}/public-key")
 async def get_user_public_key(
     user_id: str,
@@ -2104,6 +2202,10 @@ class RekeyRequest(BaseModel):
     # previous epoch's DEK over what this rotation installs, so members can tell it came from a holder.
     next_key_proof: Optional[Dict[str, Any]] = None
     lineage_tag: Optional[str] = None
+    # The owner's repair of damaged key material: a rotation to fresh material that proves the owner's
+    # identity key and the new key but not the current one (which may be what is damaged). Only the
+    # owner, holding a current-epoch key row, in an interactive session, past the owner-reset step-up.
+    owner_reset: Optional[StrictBool] = None
 
 
 @router.get("/vaults/{vault_id}/member-keys")
@@ -2205,7 +2307,21 @@ async def rekey_vault(
     identity key, the vault's current key, and the private half of any public key the rotation installs
     (a direct vault's new proof key, a hierarchical vault's new team key). The new epoch's proof row is
     written in the same commit as the rotation.
+
+    `owner_reset: true` is the owner's way out when the current epoch's proof material is damaged, so that
+    nobody can prove the current key: a rotation to fresh material (a team vault must replace its team
+    key), proving the owner's identity key and the new key only. It needs the owner, a key row at the
+    current epoch, an interactive session and, when the owner has a second factor, that factor -- asked for
+    before anything is consumed, so the retry after the prompt still finds its challenge.
     """
+    owner_reset = bool(request.owner_reset)
+    if owner_reset:
+        # Refused before the budget is charged: a temporary session is the owner's own row.
+        if getattr(current_user, "_is_temp_session", False):
+            raise zk_key_proof.KeyProofRefusal("zk-key-proof-interactive-only")
+        from app.api.api_server import _enforce_step_up
+        from app.core.second_factor_actions import OWNER_KEY_RESET
+        _enforce_step_up(db, current_user, http_request, OWNER_KEY_RESET)
     _ecc_rate_limit(current_user, "mutate")
     vault = db.query(Vault).filter(Vault.id == vault_id).first()
     if not vault:
@@ -2214,19 +2330,24 @@ async def rekey_vault(
         raise HTTPException(status_code=403, detail="Only the vault owner or a manager can rotate the vault key")
 
     # The key proof: the header and the material's shape first (a malformed request consumes nothing),
-    # then the challenge, before the vault lock below.
-    header = _key_proof_header(http_request)
+    # then the challenge, before the vault lock below. An owner reset needs a proof whatever the switch.
+    header = _key_proof_header(http_request, always=owner_reset)
+    op = "owner_reset" if owner_reset else "rekey"
     next_material = None
     lineage_tag = None
     if header is not None:
         if _is_hierarchical(vault):
             if request.team_public_key is not None:
                 _p384_or_malformed(request.team_public_key, "team_public_key")
+            elif owner_reset:
+                raise zk_key_proof.malformed("an owner reset of a team vault replaces its team key")
         else:
             next_material = _direct_proof_material(request.next_key_proof, "next_key_proof")
-        lineage_tag = _lineage_tag_or_none(request.lineage_tag, required=True)
+        # The owner may not be able to open the previous epoch, and then cannot tag the new one.
+        lineage_tag = _lineage_tag_or_none(request.lineage_tag, required=not owner_reset)
+        _refuse_other_rotation_op(db, current_user, vault.id, header, op)
     raw_body = await _raw_body(http_request) if header else None
-    ch = (_consume_key_proof_challenge(db, current_user, vault_id=vault.id, op="rekey", header=header)
+    ch = (_consume_key_proof_challenge(db, current_user, vault_id=vault.id, op=op, header=header)
           if header else None)
 
     # Clean up any pre-existing orphan keys FIRST (it commits) so the 'remaining members'
@@ -2253,9 +2374,12 @@ async def rekey_vault(
         raise HTTPException(status_code=403, detail=_NOT_A_KEY_HOLDER)
     if ch is not None:
         _pin_key_proof_state(db, ch, locked)
+        if owner_reset and str(current_user.id) != str(locked.owner_id):
+            raise HTTPException(status_code=403, detail="Only the vault's owner can reset its key")
         _verify_key_proof(
             db, current_user, ch, header, vault_id=locked.id, body=raw_body,
-            current_pem=_current_key_verifier(db, locked),
+            # An owner reset proves no current key: the current material may be what is damaged.
+            current_pem=(None if owner_reset else _current_key_verifier(db, locked)),
             new_pem=(request.team_public_key if _is_hierarchical(locked)
                      else next_material["public_key"]),
         )
@@ -2414,13 +2538,15 @@ async def rekey_vault(
         if ch is not None:
             # The team key is the verifier; the row records who made the epoch and its lineage tag.
             db.add(VaultKeyProof(vault_id=locked.id, dek_epoch=request.to_version, lineage_tag=lineage_tag,
-                                 source="rotate", created_by=current_user.id))
+                                 source="owner_reset" if owner_reset else "rotate", created_by=current_user.id))
+            if owner_reset:
+                _add_owner_reset_audit_row(db, current_user, locked, request, "hierarchical")
         _commit_rotation(db)
         _audit_zk(db, current_user, "zk_vault_rekeyed", resource_id=vault_id, details={
             "revoked_user_id": str(request.revoke_user_id) if request.revoke_user_id else None,
             "from_version": request.from_version, "to_version": request.to_version,
             "mode": "hierarchical", "team_key_version": getattr(locked, 'team_key_version', 1),
-            "proof": "key" if ch is not None else "absent"})
+            "proof": _proof_detail(ch, owner_reset)})
         if ch is None:
             _audit_key_proof_absent(db, current_user, vault_id, "rekey", "hierarchical")
         return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version,
@@ -2466,16 +2592,50 @@ async def rekey_vault(
             proof_public_key=next_material["public_key"],
             sealed_private_key=next_material["sealed_private_key"],
             dek_check=next_material["dek_check"], lineage_tag=lineage_tag,
-            source="rotate", created_by=current_user.id,
+            source="owner_reset" if owner_reset else "rotate", created_by=current_user.id,
         ))
+        if owner_reset:
+            _add_owner_reset_audit_row(db, current_user, locked, request, "direct")
     _commit_rotation(db)
     _audit_zk(db, current_user, "zk_vault_rekeyed", resource_id=vault_id, details={
         "revoked_user_id": str(request.revoke_user_id) if request.revoke_user_id else None,
         "from_version": request.from_version, "to_version": request.to_version, "mode": "direct",
-        "proof": "key" if ch is not None else "absent"})
+        "proof": _proof_detail(ch, owner_reset)})
     if ch is None:
         _audit_key_proof_absent(db, current_user, vault_id, "rekey", "direct")
     return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version}
+
+
+def _proof_detail(ch, owner_reset: bool) -> str:
+    """How a rotation was proved, for its audit row: `key`, `owner_reset`, or `absent` (no proof, accepted
+    only while enforcement is off)."""
+    if ch is None:
+        return "absent"
+    return "owner_reset" if owner_reset else "key"
+
+
+def _add_owner_reset_audit_row(db: Session, user: User, locked: Vault, request: "RekeyRequest", mode: str) -> None:
+    """The owner reset's own audit row, in the rotation's transaction: it commits with the reset or not at all."""
+    db.add(AuditLogger(db).build_row(
+        action="zk_owner_key_reset", status="success", user=user, resource_type="vault",
+        resource_id=str(locked.id),
+        details={"op": "owner_reset", "mode": mode, "dek_epoch": request.to_version,
+                 "team_epoch": getattr(locked, 'team_key_version', 1) or 1},
+    ))
+
+
+def _refuse_other_rotation_op(db: Session, user: User, vault_id, header, op: str) -> None:
+    """A rotation and an owner reset are one route; a challenge issued for the other one is a mismatch in
+    the request (400, nothing consumed), not a failed proof."""
+    other = {"rekey": "owner_reset", "owner_reset": "rekey"}[op]
+    if db.query(ZkKeyProofChallenge.id).filter(
+            ZkKeyProofChallenge.id == uuid.UUID(header.challenge_id),
+            ZkKeyProofChallenge.user_id == user.id,
+            ZkKeyProofChallenge.vault_id == vault_id,
+            ZkKeyProofChallenge.op == other).first() is not None:
+        raise zk_key_proof.malformed(
+            "this key proof was prepared for " + ("an owner reset" if other == "owner_reset" else "a rotation")
+            + ", not for this request")
 
 
 def _commit_rotation(db: Session) -> None:
