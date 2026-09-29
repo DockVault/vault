@@ -204,6 +204,29 @@ def test_a_mac_does_not_verify_for_another_transcript():
     assert kp.verify_role("identity", server, i["identity_public_key_pem"], _case_transcript(v, b), mac) is False
 
 
+def test_only_the_whole_mac_verifies():
+    """The comparison covers all 32 bytes and the length: the right MAC with any one bit flipped, with a
+    byte appended or with a byte dropped is refused, in every role."""
+    v = _vector()
+    i = v["inputs"]
+    server = _server_pem(v)
+    case = next(c for c in v["transcripts"] if c["name"] == "rekey-direct")
+    t = _case_transcript(v, case)
+    keys = {"identity": i["identity_public_key_pem"], "current-key": i["current_public_key_pem"],
+            "new-key": i["new_public_key_pem"]}
+    for role, pem in keys.items():
+        mac = ref.b64url_decode(case["macs_b64url"][role])
+        assert len(mac) == 32
+        assert kp.verify_role(role, server, pem, t, mac) is True, role
+        for position in range(32):
+            for bit in range(8):
+                near = bytearray(mac)
+                near[position] ^= 1 << bit
+                assert kp.verify_role(role, server, pem, t, bytes(near)) is False, (role, position, bit)
+        for near in (mac + b"\x00", mac + mac[-1:], mac[:-1], mac[1:]):
+            assert kp.verify_role(role, server, pem, t, near) is False, (role, len(near))
+
+
 def test_verification_never_raises():
     v = _vector()
     server = _server_pem(v)
