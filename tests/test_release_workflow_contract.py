@@ -103,7 +103,7 @@ class _History:
         _git(path, "config", "core.autocrlf", "false")
 
     def commit(self, version: str, *, branch: str = "main", tag: bool = True,
-               matrix: dict | None = None, annotated: bool = False) -> str:
+               matrix: dict | None = None, annotated: bool = True) -> str:
         """One commit on `branch` whose VERSION is `version`, tagged unless told otherwise."""
         if self._born:
             _git(self.path, "checkout", "-q", branch)
@@ -122,8 +122,9 @@ class _History:
             self.tag(version, annotated=annotated)
         return _git(self.path, "rev-parse", "HEAD")
 
-    def tag(self, version: str, *, annotated: bool = False) -> None:
-        # A lightweight tag's date is its commit's; an annotated tag carries its own.
+    def tag(self, version: str, *, annotated: bool = True) -> None:
+        # A release tag is annotated, and so carries the time it was made. A lightweight tag has no
+        # time of its own (git reports its commit's); the gate refuses one for the release it cuts.
         if annotated:
             _git(self.path, "tag", "-a", f"v{version}", "-m", f"release {version}",
                  env=self._tick())
@@ -399,7 +400,7 @@ def test_tag_and_version_mismatch_is_rejected_before_git(tmp_path):
 def test_valid_main_tag_resolves_one_immutable_version(tmp_path):
     repository = tmp_path / "valid"
     sha = _new_repository(repository)
-    _git(repository, "tag", "v0.8.0")
+    _git(repository, "tag", "-a", "v0.8.0", "-m", "release 0.8.0")
 
     metadata = _GATE.validate_release(
         repository,
@@ -814,6 +815,68 @@ def test_the_older_of_a_pair_tagged_second_still_publishes(tmp_path):
 
     assert metadata.floating_tags == ("v0.1",)
     assert metadata.make_latest is False
+
+
+def test_a_lightweight_release_tag_is_refused(tmp_path):
+    """A lightweight tag records no time of its own, and the gate orders releases cut the same day
+    by when each was tagged."""
+    repository = tmp_path / "lightweight"
+    sha = _new_repository(repository)
+    _git(repository, "tag", "v0.8.0")
+
+    with pytest.raises(_GATE.ReleaseGateError) as refused:
+        _GATE.validate_release(
+            repository,
+            ref="refs/tags/v0.8.0",
+            event_sha=sha,
+            main_ref="refs/remotes/origin/main",
+            repository_owner="DockVault",
+        )
+
+    assert "v0.8.0 does not record when it was tagged" in str(refused.value)
+    assert "git tag -a v0.8.0" in str(refused.value)
+
+
+def _newest_line_committed_first(tmp_path, *, newest_annotated: bool) -> _History:
+    """A fix on two lines where the newest line's release commit was made before the older line's,
+    but, as prescribed, the older line was tagged first and the newest last. The newest release's
+    matrix declares the older one, as its release commit must."""
+    history = _History(tmp_path / f"committed-first-{newest_annotated}")
+    history.commit("0.1.0")
+    history.commit("0.1.1")
+    history.commit("0.2.0")
+    history.branch_line("0.1", "0.1.1")
+    history.commit("0.2.1", tag=False, matrix=_matrix(
+        {**history.released, "0.1.2": "2026-01-04", "0.2.1": "2026-01-05"}))
+    history.commit("0.1.2", branch="release/0.1")
+    _git(history.path, "checkout", "-q", "main")
+    history.tag("0.2.1", annotated=newest_annotated)
+    history.push()
+    return history
+
+
+def test_tags_order_a_pair_by_when_they_were_tagged_not_when_their_commits_were_made(tmp_path):
+    history = _newest_line_committed_first(tmp_path, newest_annotated=True)
+
+    older = history.gate("0.1.2")
+
+    assert (older.channel, older.floating_tags, older.make_latest) == ("line", ("v0.1",), False)
+    assert history.gate("0.2.1").floating_tags == ("latest", "v0.2")
+
+
+def test_a_lightweight_tag_never_counts_as_tagged_later(tmp_path):
+    """Its date is its commit's, which here is older than the older line's tag, though the tag itself
+    came later. The gate cannot tell, so it holds the older release to the rule and says why."""
+    history = _newest_line_committed_first(tmp_path, newest_annotated=False)
+
+    with pytest.raises(_GATE.ReleaseGateError) as refused:
+        history.gate("0.1.2")
+    assert "no entry for the released version(s) 0.2.1" in str(refused.value)
+    assert ("v0.2.1: a lightweight tag does not record when it was made, so it cannot count as "
+            "tagged after this one; release tags must be annotated") in str(refused.value)
+
+    with pytest.raises(_GATE.ReleaseGateError, match="v0.2.1 does not record when it was tagged"):
+        history.gate("0.2.1")
 
 
 def test_a_higher_tag_on_the_same_commit_is_not_a_release_built_on_it(tmp_path):

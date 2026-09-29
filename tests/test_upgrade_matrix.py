@@ -863,13 +863,15 @@ def _repo(tmp_path, version, matrix):
     git("init", "-q", "-b", "main")
     git("config", "user.email", "test@example.test")
     git("config", "user.name", "test")
+    git("config", "tag.gpgsign", "false")
     git("add", "-A")
     git("commit", "-qm", version)
     # Tag every version the matrix declares, not only the one being cut: the gate now checks that
     # a declared version corresponds to a real release, so a fixture that declares versions it
-    # never tagged is describing a repository that could not exist.
+    # never tagged is describing a repository that could not exist. Annotated, as release tags are:
+    # the gate refuses a lightweight one for the release it cuts.
     for declared in sorted(set(matrix.get("versions", {})) | {version}):
-        git("tag", f"v{declared}")
+        git("tag", "-a", f"v{declared}", "-m", f"release {declared}")
     # The gate requires the tagged commit to be an ancestor of the main ref it is given.
     return tmp_path
 

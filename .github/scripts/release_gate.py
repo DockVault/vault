@@ -137,10 +137,12 @@ def _line(version: str) -> str:
     return f"{major}.{minor}"
 
 
-def _release_tags(repository: Path) -> tuple[dict[str, str], dict[str, int]]:
+def _release_tags(repository: Path) -> tuple[dict[str, str], dict[str, int | None]]:
     """Every released version in this checkout: the commit its tag names, and when it was tagged.
 
-    The time is the tagger's date for an annotated tag and the commit's date for a lightweight one.
+    Only an annotated tag records when it was made (its tagger's date). A lightweight tag carries no
+    date of its own -- git reports its commit's, which says nothing about when the tag appeared -- so
+    its time is None, as is one that cannot be read.
 
     A failure to read tags is an error rather than an empty answer: treating "cannot see" as "none
     exist" would switch off every check that compares this release with the others, exactly when it
@@ -157,7 +159,7 @@ def _release_tags(repository: Path) -> tuple[dict[str, str], dict[str, int]]:
     if listed.returncode != 0:
         raise ReleaseGateError("cannot list tags, so this release cannot be placed among the others")
     tags: dict[str, str] = {}
-    created: dict[str, int] = {}
+    created: dict[str, int | None] = {}
     for line in listed.stdout.splitlines():
         fields = line.split("\t")
         if len(fields) != 6:
@@ -177,7 +179,7 @@ def _release_tags(repository: Path) -> tuple[dict[str, str], dict[str, int]]:
         if commit is None:
             continue
         tags[match.group(1)] = commit
-        created[match.group(1)] = int(when) if when.isdigit() else 0
+        created[match.group(1)] = int(when) if kind == "tag" and when.isdigit() else None
     return tags, created
 
 
@@ -220,15 +222,23 @@ def validate_release(
     # The releases this one's matrix cannot know: tagged on top of it, or tagged after it. The gate
     # runs again just before publication, an hour or more after the tag, and by then a release on
     # another line may have been tagged too -- which is the prescribed order when a fix lands on
-    # several lines (the older lines first, the newest last, within hours).
-    tagged_at = created.get(version, 0)
-    later = queued | {v for v, when in created.items() if when > tagged_at}
+    # several lines (the older lines first, the newest last, within hours). Which was tagged first is
+    # read from the tags themselves, so a release tag must say when it was made: an annotated tag
+    # does, a lightweight one does not. A release tag whose time is unknown never counts as later.
+    tagged_at = created.get(version)
+    if tagged_at is None:
+        raise ReleaseGateError(
+            f"v{version} does not record when it was tagged: a release tag must be an annotated tag "
+            f"(git tag -a v{version}), because its time decides which releases this one's matrix "
+            "must already declare")
+    later = queued | {v for v, when in created.items() if when is not None and when > tagged_at}
 
     waiver, data = _check_upgrade_matrix(
         upgrade_matrix or repository / "docs" / "upgrade-matrix.json",
         version,
         set(tags),
         later=frozenset(later),
+        undated=frozenset(v for v, when in created.items() if when is None),
     )
     warning = line_support_warning(
         data, version, today or datetime.datetime.now(datetime.timezone.utc).date())
@@ -388,7 +398,8 @@ def _upgrade_matrix_module():
 
 
 def _check_upgrade_matrix(
-    path: Path, version: str, released: set[str], *, later: frozenset[str] = frozenset()
+    path: Path, version: str, released: set[str], *, later: frozenset[str] = frozenset(),
+    undated: frozenset[str] = frozenset(),
 ) -> tuple[str | None, dict]:
     """Require the release to have declared how an operator reaches it, and every other release too.
 
@@ -429,10 +440,15 @@ def _check_upgrade_matrix(
         (v for v in released if v != version and v not in later and v not in data["versions"]),
         key=_version_key)
     if undeclared:
+        # Say why a tag that may well be newer still counts: it cannot show that it is.
+        lightweight = [f"v{v}" for v in undeclared if v in undated]
+        hint = (f" ({', '.join(lightweight)}: a lightweight tag does not record when it was made, "
+                "so it cannot count as tagged after this one; release tags must be annotated)"
+                if lightweight else "")
         raise ReleaseGateError(
             f"docs/upgrade-matrix.json has no entry for the released version(s) "
             f"{', '.join(undeclared)}; bring the matrix up to date with every release before "
-            "cutting this one")
+            f"cutting this one{hint}")
 
     if reason is not None:
         print(f"::warning::{version} ships without a declared upgrade path: {reason}")
