@@ -243,8 +243,10 @@ user is told.
 view or manage users without being administrators, with who granted each permission. A change of role
 resets an account's permissions to the new role's defaults, keeping those another administrator granted
 it; before 0.33.0 it did not, so an administrator demoted then kept the permission to manage users, and is
-listed with no granter recorded. Remove what you did not mean to give with the account's Permissions
-button on the Users page.
+listed with no granter recorded. Where one is not wanted, revoke View Users with the account's
+Permissions button on the Users page, which removes Manage Users with it (revoking only Manage Users
+leaves View Users). To keep a leftover one, revoke it and then grant it, so that it records who granted
+it: granting it while the account still holds it does nothing.
 
 ### Sealing credentials at rest (optional)
 

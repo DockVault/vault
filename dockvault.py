@@ -5330,8 +5330,11 @@ class DockVault:
                            "no granter recorded: kept from when the account was an administrator, "
                            "or its granter was deleted")
                     print("      %-12s %s" % (server_text(p.get("group")), how))
-            print(pal.paint("  Remove one you did not mean to give with the account's Permissions button on the "
-                            "Users page, or DELETE /permissions/users/{id}/revoke/USER_MANAGE.\n", "yellow"))
+            print(pal.paint("  Where one is not wanted, revoke View Users with the account's Permissions button "
+                            "on the Users page (DELETE /permissions/users/{id}/revoke/USER_VIEW), which removes "
+                            "Manage Users with it.", "yellow"))
+            print(pal.paint("  To keep a leftover one, revoke it and then grant it, so that it records who granted "
+                            "it: granting it while the account still holds it does nothing.\n", "yellow"))
             return
 
         if action == "approve":
