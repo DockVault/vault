@@ -132,6 +132,9 @@ def test_a_team_vault_names_its_team_key_and_never_its_private_material(admin):
         v = _create_team_vault(admin)
     vid = v["id"]
     try:
+        # Its create challenge was issued for the mode the body creates, so that is the mode the proof binds.
+        assert _psql(f"SELECT mode FROM zk_key_proof_challenges WHERE vault_id = '{vid}' AND op = 'create'") \
+            == "hierarchical"
         team_key = _psql(f"SELECT team_public_key FROM vaults WHERE id = '{vid}'")
         r = _challenge(admin, vid, "share")
         assert r.status_code == 200, r.text
