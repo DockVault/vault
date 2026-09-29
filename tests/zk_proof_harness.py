@@ -362,7 +362,12 @@ def post_zk(client, path, json=None, *, method="POST", headers=None, augment=Tru
         return response
     op, vault_id = guarded
     challenge_vault = vault_id or str(uuid.uuid4())
-    challenge = client.post(CHALLENGE_PATH.format(vault_id=challenge_vault), json={"op": op})
+    # The vault a create makes does not exist yet, so its challenge names the mode the body creates it
+    # in, which the proof then binds. Every other operation's mode is the vault's own.
+    request = {"op": op}
+    if op == "create":
+        request["mode"] = body.get("key_wrapping_mode") or "direct"
+    challenge = client.post(CHALLENGE_PATH.format(vault_id=challenge_vault), json=request)
     if challenge.status_code == 200:
         # A create names its vault. Only a body with no `id` at all gets one: a test that sends an
         # empty or malformed id is testing exactly that and keeps it.

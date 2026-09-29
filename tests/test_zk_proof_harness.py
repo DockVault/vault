@@ -172,7 +172,7 @@ def test_a_zero_knowledge_create_without_an_id_is_sent_unchanged_to_an_old_serve
     harness.post_zk(client, "/vaults", json=body)
     (_, challenge_path, challenge_kw), (_, _, kw) = client.calls
     assert re.fullmatch(r"/ecc/vaults/[0-9a-f-]{36}/key-proof/challenge", challenge_path)
-    assert challenge_kw["json"] == {"op": "create"}
+    assert challenge_kw["json"] == {"op": "create", "mode": "direct"}
     assert json.loads(kw["data"]) == body, "no id or proof material is added when no challenge was issued"
 
 
@@ -307,25 +307,32 @@ class ProvingServer:
             cid = "5d4c3b2a-1908-4f7e-8d6c-5b4a39281706"
             vid = path.split("/")[3]
             op = kw["json"]["op"]
-            self.issued = {"priv": priv, "nonce": nonce, "cid": cid, "vid": vid, "op": op}
+            # As the server does: a create's vault does not exist yet, so its mode is the one asked for;
+            # every other operation's mode is the vault's own, and a requested one is ignored.
+            mode = (kw["json"].get("mode") or "direct") if op == "create" else self.mode
+            if mode not in self.kp.MODES:
+                return FakeResponse(400, {"detail": "mode must be direct or hierarchical",
+                                          "reason": "zk-key-proof-malformed"})
+            self.issued = {"priv": priv, "nonce": nonce, "cid": cid, "vid": vid, "op": op, "mode": mode}
             verifier = None
             if self.verifier_pem and op not in self.kp.OPS_WITHOUT_CURRENT_KEY:
                 verifier = {"public_key": self.verifier_pem}
             return FakeResponse(200, {
                 "challenge_id": cid, "server_ephemeral_public_key": pub, "nonce": nonce, "expires_in": 300,
-                "mode": self.mode, "dek_epoch": self.de, "team_epoch": self.te, "verifier": verifier})
+                "mode": mode, "dek_epoch": self.de, "team_epoch": self.te, "verifier": verifier})
         self.sent.append((method, path, kw))
         return FakeResponse(200, {"ok": True})
 
-    def check(self, user_id, current_pem, new_pem):
-        """Verify the last request's proof as the server would; return (body, {role: ok})."""
+    def check(self, user_id, current_pem, new_pem, mode=None):
+        """Verify the last request's proof as the server would, in the mode the challenge was issued for
+        unless `mode` says otherwise; return (body, {role: ok})."""
         method, path, kw = self.sent[-1]
         raw = kw["data"]
         header = self.kp.parse_header(kw["headers"][harness.PROOF_HEADER])
         i = self.issued
         digest = self.kp.transcript(
             op=i["op"], challenge_id=i["cid"], nonce_b64=i["nonce"], user_id=user_id,
-            vault_id=i["vid"], mode=self.mode, dek_epoch=self.de, team_epoch=self.te,
+            vault_id=i["vid"], mode=mode or i["mode"], dek_epoch=self.de, team_epoch=self.te,
             identity_public_key=self.identity_pem, current_public_key=current_pem,
             new_public_key=new_pem, body=raw)
         ok = {"identity": self.kp.verify_role("identity", i["priv"], self.identity_pem, digest, header.identity_mac)}
@@ -362,8 +369,35 @@ def test_a_create_carries_its_id_and_a_proof_for_the_key_it_installs():
                                              "ephemeral_public_key": "e"})
     sent = json.loads(server.sent[-1][2]["data"])
     assert sent["id"] == server.issued["vid"], "the body names the vault the challenge was issued for"
+    assert _challenges_asked(client) == [{"op": "create", "mode": "direct"}]
     body, ok = server.check(client.user["id"], None, sent["key_proof"]["public_key"])
     assert ok == {"identity": True, "new-key": True}
+
+
+def _challenges_asked(client):
+    return [kw["json"] for _, path, kw in client.calls if path.endswith("/key-proof/challenge")]
+
+
+def test_a_team_vault_create_asks_for_its_mode_and_proves_the_team_key():
+    """A team vault does not exist when its create challenge is issued, so the challenge must name the
+    mode the body creates it in: the proof then binds mode 2, and its new-key MAC is for the team public
+    key the body installs."""
+    team = harness.team_public_key()
+    server = ProvingServer("kate", dek_epoch=1, team_epoch=1)
+    client = FakeClient(server.route, username="kate")
+    harness.post_zk(client, "/vaults", json={
+        "type": "zero_knowledge", "key_wrapping_mode": "hierarchical", "team_public_key": team,
+        "team_wrapped_dek": "w", "team_dek_ephemeral_public_key": "e", "wrapped_team_privkey": "p",
+        "team_privkey_ephemeral_public_key": "q"})
+    assert _challenges_asked(client) == [{"op": "create", "mode": "hierarchical"}]
+    assert server.kp.MODES[server.issued["mode"]] == 2
+    sent = json.loads(server.sent[-1][2]["data"])
+    assert "key_proof" not in sent, "a team vault's verifier is its team key"
+    body, ok = server.check(client.user["id"], None, team)
+    assert ok == {"identity": True, "new-key": True}
+    # The mode is bound: the same proof read as a direct create does not verify.
+    _, as_direct = server.check(client.user["id"], None, team, mode="direct")
+    assert as_direct == {"identity": False, "new-key": False}
 
 
 def test_a_hierarchical_share_proves_with_the_remembered_team_key_and_adds_no_epoch():
