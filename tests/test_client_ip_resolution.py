@@ -111,7 +111,7 @@ class _CountingLimiter:
     def __init__(self):
         self.hits = {}
 
-    def check_rate_limit(self, key, limit, window, prefix="rate_limit", fail_open=False):
+    def check_rate_limit(self, key, limit, window, prefix="rate_limit", fail_open=False, entry_id=None):
         full = f"{prefix}:{key}"
         self.hits[full] = self.hits.get(full, 0) + 1
         return self.hits[full] <= limit, max(0, limit - self.hits[full]), 0

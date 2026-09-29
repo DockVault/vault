@@ -514,8 +514,10 @@ class AuthService:
         # Check rate limit. Keyed on the RAW submitted identifier (login_user:{identifier}), NOT the
         # resolved username — the limiter must throttle a junk/never-resolving identifier too, and
         # keying on the resolved username would let an attacker spread attempts across the two
-        # forms (username and email) of one account.
-        self._check_rate_limit(username, ip_address)
+        # forms (username and email) of one account. The charge is taken before any password is checked,
+        # so parallel guesses cannot pass the limit; a sign-in that succeeds gives it back below, so the
+        # throttle counts failed attempts only.
+        throttle = self._check_rate_limit(username, ip_address)
 
         # Resolve the submitted identifier to AT MOST ONE account per org policy. This MUST return a
         # User or None and never raise or early-return: every no-match outcome — username miss,
@@ -561,12 +563,15 @@ class AuthService:
         except sign_in_lockout.Busy as busy:
             raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
         try:
-            return self._authenticate_in_turn(user, username, password, ip_address)
+            signed_in = self._authenticate_in_turn(user, username, password, ip_address)
         except Exception:
             # Whatever ended the attempt early ends its turn too, and keeps nothing it had not
             # committed: a failure is committed with its count, a refusal with its releases.
             self.db.rollback()
             raise
+        # The right password, and the session is committed: not a guess, so it does not count.
+        self._give_back(throttle)
+        return signed_in
 
     def _authenticate_in_turn(self, user: User, username: str, password: str,
                               ip_address: str) -> Tuple[User, str]:
@@ -697,14 +702,17 @@ class AuthService:
         # cost); the web door is uniform, and the
         # not-found path below still equalises the UNTHROTTLED miss.
         device_id = getattr(temp_cred, "device_id", None) if temp_cred else None
+        # A success gives the login charges back (the throttle counts failures), but not a device's:
+        # its bucket bounds how often a looping sync client signs in at all.
+        throttle = None
         if not allow_device_credential:
-            self._check_rate_limit(temp_username, ip_address)
+            throttle = self._check_rate_limit(temp_username, ip_address)
         elif device_id is not None:
             self._check_device_rate_limit(device_id, ip_address)
         elif temp_cred is not None:
-            self._check_username_rate_limit(temp_username)
+            throttle = self._check_username_rate_limit(temp_username)
         else:
-            self._check_rate_limit(temp_username, ip_address)
+            throttle = self._check_rate_limit(temp_username, ip_address)
 
         if not temp_cred:
             # Equalize timing with the real verify path so an absent temp_username isn't
@@ -827,6 +835,7 @@ class AuthService:
         )
         
         self.db.commit()
+        self._give_back(throttle)
         
         return user, session_token
     
@@ -2013,10 +2022,12 @@ class AuthService:
         from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable, retry_after_seconds
         user_limit = rate_limit_settings.effective("max_login_attempts")
         window = rate_limit_settings.effective("rate_limit_login_window_seconds")
+        entry = str(uuid.uuid4())
+        bucket = f"login_user:{name_key(username)}"
         try:
             allowed, remaining, reset = rate_limiter.check_rate_limit(
-                f"login_user:{name_key(username)}", user_limit, window,
-                prefix="rate_limit", fail_open=False,
+                bucket, user_limit, window,
+                prefix="rate_limit", fail_open=False, entry_id=entry,
             )
             if not allowed:
                 retry_after = retry_after_seconds(reset, window)
@@ -2024,16 +2035,17 @@ class AuthService:
                     f"Too many login attempts. Please try again in {retry_after} seconds.",
                     retry_after=retry_after, limit=user_limit, remaining=0,
                 )
-            return {'limit': user_limit, 'remaining': remaining, 'reset': reset}
+            return {'limit': user_limit, 'remaining': remaining, 'reset': reset,
+                    'charges': [("cache", bucket, entry)]}
         except RateLimiterUnavailable:
-            allowed, retry = self._db_throttle_hit(name_key(username), "login_user", user_limit, window)
+            allowed, retry, charge = self._db_throttle_charge(name_key(username), "login_user", user_limit, window)
             if not allowed:
                 raise RateLimitExceededError(
                     f"Too many login attempts. Please try again in {retry} seconds.",
                     retry_after=retry, limit=user_limit, remaining=0,
                 )
             return {'limit': user_limit, 'remaining': max(0, user_limit - 1),
-                    'reset': int(time.time()) + window}
+                    'reset': int(time.time()) + window, 'charges': [("database",) + charge]}
 
     def _redis_rate_limit(self, rate_limiter, identifier, ip_address,
                           user_limit, ip_limit, window):
@@ -2041,10 +2053,13 @@ class AuthService:
         from app.core.rate_limiter import retry_after_seconds
         # Per-name limit, from this address: the same limit from somewhere else is a separate
         # budget, so guessing from one address cannot throttle the account's owner signing in from
-        # another. Guessing from many addresses at once meets the account-wide lock.
+        # another. Guessing from many addresses at once meets the account-wide lock. Each charge is named,
+        # so a sign-in that succeeds can give it back (_give_back).
+        charges = []
+        user_bucket, user_entry = login_user_key(identifier, ip_address), str(uuid.uuid4())
         allowed_user, remaining_user, reset_user = rate_limiter.check_rate_limit(
-            login_user_key(identifier, ip_address), user_limit, window,
-            prefix="rate_limit", fail_open=False,
+            user_bucket, user_limit, window,
+            prefix="rate_limit", fail_open=False, entry_id=user_entry,
         )
         if not allowed_user:
             retry_after = retry_after_seconds(reset_user, window)
@@ -2053,10 +2068,13 @@ class AuthService:
                 retry_after=retry_after, limit=user_limit, remaining=0,
             )
 
+        charges.append(("cache", user_bucket, user_entry))
+
         # Per-IP limit (2x threshold).
+        ip_bucket, ip_entry = f"login_ip:{ip_address}", str(uuid.uuid4())
         allowed_ip, remaining_ip, reset_ip = rate_limiter.check_rate_limit(
-            f"login_ip:{ip_address}", ip_limit, window,
-            prefix="rate_limit", fail_open=False,
+            ip_bucket, ip_limit, window,
+            prefix="rate_limit", fail_open=False, entry_id=ip_entry,
         )
         if not allowed_ip:
             retry_after = retry_after_seconds(reset_ip, window)
@@ -2064,15 +2082,16 @@ class AuthService:
                 f"Too many login attempts from this IP. Try again in {retry_after} seconds.",
                 retry_after=retry_after, limit=ip_limit, remaining=0,
             )
+        charges.append(("cache", ip_bucket, ip_entry))
 
         # Return rate limit info for response headers (use more restrictive limit).
-        return {'limit': user_limit, 'remaining': remaining_user, 'reset': reset_user}
+        return {'limit': user_limit, 'remaining': remaining_user, 'reset': reset_user, 'charges': charges}
 
     def _db_fallback_rate_limit(self, identifier, ip_address,
                                 user_limit, ip_limit, window):
         """DB-backed throttle used only when Redis is unavailable, so a Redis
         outage cannot silently disable login throttling."""
-        allowed_user, retry_user = self._db_throttle_hit(
+        allowed_user, retry_user, user_charge = self._db_throttle_charge(
             login_user_key(identifier, ip_address, prefixed=False), "login_user", user_limit, window
         )
         if not allowed_user:
@@ -2081,7 +2100,7 @@ class AuthService:
                 retry_after=retry_user, limit=user_limit, remaining=0,
             )
 
-        allowed_ip, retry_ip = self._db_throttle_hit(
+        allowed_ip, retry_ip, ip_charge = self._db_throttle_charge(
             ip_address, "login_ip", ip_limit, window
         )
         if not allowed_ip:
@@ -2091,13 +2110,53 @@ class AuthService:
             )
 
         return {'limit': user_limit, 'remaining': max(0, user_limit - 1),
-                'reset': int(time.time()) + window}
+                'reset': int(time.time()) + window,
+                'charges': [("database",) + user_charge, ("database",) + ip_charge]}
+
+    @classmethod
+    def _give_back(cls, throttle) -> None:
+        """A sign-in succeeded: give back the login throttle's charges its attempt made (the info
+        _check_rate_limit or _check_username_rate_limit returned), so the throttle counts failed
+        attempts only. Since 0.33.0 the smart lockout bounds guessing per account and per address, and
+        a right password is not a guess: counting them refused the sixth sign-in in five minutes, and
+        the eleventh from one address, to people who typed their password right. Best-effort: a charge
+        that cannot be given back stays counted until its window passes it."""
+        from app.core.rate_limiter import rate_limiter
+        for charge in (throttle or {}).get("charges") or ():
+            try:
+                if charge[0] == "cache":
+                    rate_limiter.release(charge[1], charge[2], prefix="rate_limit")
+                else:
+                    cls._db_throttle_release(*charge[1:])
+            except Exception:  # noqa: BLE001 - never fail a sign-in that has succeeded
+                pass
+
+    @classmethod
+    def _db_throttle_hit(cls, identifier: str, action: str, limit: int, window: int):
+        """_db_throttle_charge without the charge: (allowed, retry_after_seconds)."""
+        return cls._db_throttle_charge(identifier, action, limit, window)[:2]
 
     @staticmethod
-    def _db_throttle_hit(identifier: str, action: str, limit: int, window: int):
+    def _db_throttle_release(identifier: str, action: str, window_start) -> None:
+        """Give back one attempt _db_throttle_charge counted in the window that started at
+        ``window_start``: one fewer in that window, never below zero. A window that has started over
+        since holds none of it, and is left alone. Own short-lived session, like the charge;
+        best-effort."""
+        try:
+            tbl = RateLimitRecord.__table__
+            with get_db_context() as db:
+                db.execute(tbl.update().where(
+                    tbl.c.identifier == identifier, tbl.c.action == action,
+                    tbl.c.window_start == window_start, tbl.c.attempt_count > 0,
+                ).values(attempt_count=tbl.c.attempt_count - 1))
+        except Exception:  # noqa: BLE001 - a charge not given back stays counted, as before
+            pass
+
+    @staticmethod
+    def _db_throttle_charge(identifier: str, action: str, limit: int, window: int):
         """Count one login attempt against a fixed DB window (RateLimitRecord).
 
-        Returns (allowed, retry_after_seconds). Coarser than the Redis sliding
+        Returns (allowed, retry_after_seconds, charge; see below). Coarser than the Redis sliding
         window but durable, so throttling survives a Redis outage. Implemented as
         a single atomic INSERT ... ON CONFLICT (identifier, action) DO UPDATE so
         concurrent attempts can't create duplicate rows that split the count (the
@@ -2115,6 +2174,9 @@ class AuthService:
 
         Timestamps are naive UTC to match the column type (TIMESTAMP WITHOUT TIME
         ZONE) and so the window comparison happens entirely inside Postgres.
+
+        Returns (allowed, retry_after_seconds, charge): ``charge`` is (identifier, action,
+        window_start) for an allowed attempt, which _db_throttle_release gives back, else None.
         """
         from app.core.rate_limiter import retry_after_seconds
         now = datetime.utcnow()
@@ -2151,18 +2213,18 @@ class AuthService:
                 row = redis_guard.timed_db(
                     "_db_throttle_hit", lambda: db.execute(stmt).first())  # commits on exit
             if row is None:
-                return False, fail_closed_retry
+                return False, fail_closed_retry, None
             count, win_start = row[0], row[1]
             if count > limit:
                 return False, retry_after_seconds(_window_reset(win_start, window, now), window,
-                                                  _epoch(now))
-            return True, 0
+                                                  _epoch(now)), None
+            return True, 0, (identifier, action, win_start)
         except Exception:
             # Fail CLOSED: with Redis already down, silently allowing here would
             # disable login throttling entirely. Deny briefly; the DB account
             # lockout remains the final backstop.
-            return False, fail_closed_retry
-    
+            return False, fail_closed_retry, None
+
     @staticmethod
     def _db_throttle_peek(identifier: str, action: str, limit: int, window: int) -> Tuple[bool, int]:
         """Read-only twin of _db_throttle_hit: is (identifier, action) at/over its limit in the

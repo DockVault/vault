@@ -85,7 +85,8 @@ REGISTRY: tuple[RateLimitSpec, ...] = (
         "max_login_attempts", "rate_limit_login_attempts", 1, _ATTEMPTS_MAX, "attempts", "login",
         "Failed sign-ins before a lock (per address)",
         "The number of wrong passwords allowed for one account from one network address. It also "
-        "bounds how many sign-in attempts one address may make to one account within the login window.",
+        "bounds how many failed sign-ins one address may make to one account within the login window, "
+        "and how many may be under way at once; a sign-in that succeeds is not counted.",
         "Triggers on repeated failed sign-ins to one account from one address: new sign-ins to it "
         "from that address are refused for the lockout duration. Other addresses, and sessions "
         "already signed in, keep working.",
