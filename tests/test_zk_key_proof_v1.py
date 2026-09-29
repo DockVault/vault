@@ -636,6 +636,8 @@ def test_a_browser_sealed_key_opens_in_the_reference_and_its_check_matches():
 
 
 def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
+    """The tag verifies only whole: the right tag with any one byte changed, with a byte appended or
+    with a byte dropped is refused."""
     out = _node("""
   const res = { checks: [], lineage: {} };
   for (const d of V.dek_check) res.checks.push(await lib.dekCheck(await aes(d.dek_hex), d.vault_id, d.dek_epoch));
@@ -643,12 +645,25 @@ def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
     const prev = await aes(l.prev_dek_hex);
     const f = { vaultId: l.vault_id, prevEpoch: l.prev_epoch, mode: l.mode, nextTeamEpoch: l.next_team_epoch,
       nextVerifierPem: l.next_verifier_pem, nextDekCheck: l.next_dek_check_b64, nextTeamWrap: l.next_team_wrap_b64 };
+    const tag = Buffer.from(l.lineage_tag_b64, 'base64');
+    const flipped = [];
+    for (let i = 0; i < tag.length; i++) {
+      const changed = Buffer.from(tag);
+      changed[i] ^= 1;
+      flipped.push(await lib.verifyKeyLineageTag(prev, f, changed.toString('base64')));
+    }
+    const near = {};
+    for (const [name, bytes] of Object.entries({
+      appended_zero: Buffer.concat([tag, Buffer.alloc(1)]), appended_copy: Buffer.concat([tag, tag.subarray(-1)]),
+      dropped_last: tag.subarray(0, tag.length - 1), dropped_first: tag.subarray(1),
+    })) near[name] = await lib.verifyKeyLineageTag(prev, f, bytes.toString('base64'));
     res.lineage[l.mode] = {
       tag: await lib.keyLineageTag(prev, f),
       verifies: await lib.verifyKeyLineageTag(prev, f, l.lineage_tag_b64),
       other_field: await lib.verifyKeyLineageTag(prev, { ...f, nextTeamEpoch: f.nextTeamEpoch + 1 }, l.lineage_tag_b64),
       other_dek: await lib.verifyKeyLineageTag(await aes('00'.repeat(32)), f, l.lineage_tag_b64),
       garbage: await lib.verifyKeyLineageTag(prev, { ...f, mode: 'flat' }, l.lineage_tag_b64),
+      flipped, near,
     };
   }
   realLog(JSON.stringify(res));
@@ -656,8 +671,11 @@ def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
     v = _vector()
     assert out["checks"] == [d["dek_check_b64"] for d in v["dek_check"]]
     for ln in v["lineage"]:
-        assert out["lineage"][ln["mode"]] == {"tag": ln["lineage_tag_b64"], "verifies": True, "other_field": False,
-                                              "other_dek": False, "garbage": False}, ln["mode"]
+        assert out["lineage"][ln["mode"]] == {
+            "tag": ln["lineage_tag_b64"], "verifies": True, "other_field": False, "other_dek": False,
+            "garbage": False, "flipped": [False] * 32,
+            "near": {"appended_zero": False, "appended_copy": False, "dropped_last": False, "dropped_first": False},
+        }, ln["mode"]
 
 
 def test_the_team_key_match_compares_points():
