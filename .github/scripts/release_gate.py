@@ -1,8 +1,20 @@
-"""Fail-closed validation for a tag-triggered DockVault release."""
+"""Fail-closed validation for a tag-triggered DockVault release.
+
+A release comes from one of two places:
+
+- `main`, the newest line. The tagged commit is an ancestor of origin/main.
+- a maintenance line `release/X.Y`, for security fixes to an older minor once a newer one has
+  shipped. The tagged commit is an ancestor of origin/release/X.Y and not of origin/main.
+
+The gate says which, and derives from it what the publication may move: the version's own tag
+always, `:vX.Y` only for the newest release of its line, and `:latest` (and GitHub's "latest
+release") only for the highest version there is. Nothing is moved backwards.
+"""
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import re
 import subprocess
 from dataclasses import dataclass
@@ -12,6 +24,9 @@ from typing import Sequence
 
 _VERSION_RE = re.compile(r"([0-9]+\.[0-9]+\.[0-9]+)\n", re.ASCII)
 _TAG_REF_RE = re.compile(r"refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)", re.ASCII)
+# A released tag is named exactly vX.Y.Z. Anything else under refs/tags is not a release this
+# workflow could have published (the tag trigger refuses it), so it takes no part in ordering.
+_RELEASE_TAG_RE = re.compile(r"v((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2})", re.ASCII)
 _OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", re.ASCII)
 _UTF8_BOM = b"\xef\xbb\xbf"
 
@@ -30,6 +45,19 @@ class ReleaseMetadata:
     # matrix. Carried out as a job output so the workflow can act on it; the durable record is the
     # waiver itself, which is in the release commit and in the published asset.
     upgrade_entry_waived: bool = False
+    # "main" or "line" (a maintenance branch release/X.Y).
+    channel: str = "main"
+    # The moving image tags this release may take, besides its own vX.Y.Z: "vX.Y" when it is the
+    # newest release of its line, and "latest" when it is the highest version there is. Empty when a
+    # newer release of its line is already tagged on top of this commit and will take them itself.
+    floating_tags: tuple[str, ...] = ()
+    # Whether GitHub should show this release as the latest one. The same rule as `latest`.
+    make_latest: bool = False
+    # The release the notes compare against: the highest released tag below this version in this
+    # commit's own history. Empty for the very first release.
+    previous_tag: str = ""
+    # A first line for the release notes of a maintenance release, else empty.
+    notes_preamble: str = ""
 
 
 def read_canonical_version(path: Path) -> str:
@@ -77,6 +105,82 @@ def _commit(repository: Path, revision: str) -> str:
     return result.stdout.strip()
 
 
+def _commit_or_none(repository: Path, revision: str) -> str | None:
+    result = _git(
+        repository,
+        ["rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
+        check=False,
+    )
+    commit = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else None
+
+
+def _is_ancestor(repository: Path, ancestor: str, descendant: str) -> bool:
+    """True when `ancestor` is in `descendant`'s history (a commit is its own ancestor).
+
+    git answers 0 for yes and 1 for no; anything else is a failure, which is not a "no".
+    """
+    result = _git(repository, ["merge-base", "--is-ancestor", ancestor, descendant], check=False)
+    if result.returncode not in (0, 1):
+        raise ReleaseGateError(f"cannot tell whether {ancestor} is an ancestor of {descendant}")
+    return result.returncode == 0
+
+
+def _version_key(version: str) -> tuple[int, int, int]:
+    major, minor, patch = (int(part) for part in version.split("."))
+    return major, minor, patch
+
+
+def _line(version: str) -> str:
+    """The release line a version belongs to: "0.33" for 0.33.2."""
+    major, minor, _ = _version_key(version)
+    return f"{major}.{minor}"
+
+
+def _release_tags(repository: Path) -> tuple[dict[str, str], dict[str, int]]:
+    """Every released version in this checkout: the commit its tag names, and when it was tagged.
+
+    The time is the tagger's date for an annotated tag and the commit's date for a lightweight one.
+
+    A failure to read tags is an error rather than an empty answer: treating "cannot see" as "none
+    exist" would switch off every check that compares this release with the others, exactly when it
+    cannot do its job.
+    """
+    listed = _git(
+        repository,
+        ["for-each-ref",
+         "--format=%(refname:strip=2)%09%(objecttype)%09%(objectname)%09%(*objecttype)"
+         "%09%(*objectname)%09%(creatordate:unix)",
+         "refs/tags/"],
+        check=False,
+    )
+    if listed.returncode != 0:
+        raise ReleaseGateError("cannot list tags, so this release cannot be placed among the others")
+    tags: dict[str, str] = {}
+    created: dict[str, int] = {}
+    for line in listed.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            raise ReleaseGateError("cannot read the tag list, so this release cannot be placed")
+        name, kind, target, peeled_kind, peeled, when = fields
+        match = _RELEASE_TAG_RE.fullmatch(name)
+        if match is None:
+            continue
+        if kind == "commit":
+            commit: str | None = target
+        elif peeled_kind == "commit":
+            commit = peeled
+        else:
+            commit = _commit_or_none(repository, f"refs/tags/{name}")
+        # A tag that names no commit was never published by this workflow, which checks out the
+        # tagged commit before anything else.
+        if commit is None:
+            continue
+        tags[match.group(1)] = commit
+        created[match.group(1)] = int(when) if when.isdigit() else 0
+    return tags, created
+
+
 def validate_release(
     repository: Path,
     *,
@@ -86,6 +190,8 @@ def validate_release(
     repository_owner: str,
     version_file: Path | None = None,
     upgrade_matrix: Path | None = None,
+    line_ref_prefix: str = "refs/remotes/origin/release/",
+    today: datetime.date | None = None,
 ) -> ReleaseMetadata:
     repository = repository.resolve()
     version = read_canonical_version(version_file or repository / "VERSION")
@@ -101,19 +207,33 @@ def validate_release(
     if len({head, tagged, event}) != 1:
         raise ReleaseGateError("checkout, tag, and event do not resolve to one immutable commit")
 
-    ancestry = _git(
+    tags, created = _release_tags(repository)
+    placement, queued = _place_release(
         repository,
-        ["merge-base", "--is-ancestor", head, main_ref],
-        check=False,
+        version=version,
+        head=head,
+        tags=tags,
+        main_ref=main_ref,
+        line_ref_prefix=line_ref_prefix,
     )
-    if ancestry.returncode != 0:
-        raise ReleaseGateError("tagged commit is not an ancestor of origin/main")
 
-    waiver = _check_upgrade_matrix(
+    # The releases this one's matrix cannot know: tagged on top of it, or tagged after it. The gate
+    # runs again just before publication, an hour or more after the tag, and by then a release on
+    # another line may have been tagged too -- which is the prescribed order when a fix lands on
+    # several lines (the older lines first, the newest last, within hours).
+    tagged_at = created.get(version, 0)
+    later = queued | {v for v, when in created.items() if when > tagged_at}
+
+    waiver, data = _check_upgrade_matrix(
         upgrade_matrix or repository / "docs" / "upgrade-matrix.json",
         version,
-        _released_versions(repository),
+        set(tags),
+        later=frozenset(later),
     )
+    warning = line_support_warning(
+        data, version, today or datetime.datetime.now(datetime.timezone.utc).date())
+    if warning is not None:
+        print(f"::warning::{warning}")
 
     return ReleaseMetadata(
         version=version,
@@ -121,7 +241,132 @@ def validate_release(
         sha=head,
         image=f"ghcr.io/{repository_owner.lower()}/vault",
         upgrade_entry_waived=waiver is not None,
+        **placement,
     )
+
+
+def _place_release(
+    repository: Path,
+    *,
+    version: str,
+    head: str,
+    tags: dict[str, str],
+    main_ref: str,
+    line_ref_prefix: str,
+) -> tuple[dict, frozenset[str]]:
+    """Decide where this release comes from and what it may move. Raises when it may not ship.
+
+    Returns the ReleaseMetadata fields it decides, and the releases already tagged on top of this
+    commit (which this commit's matrix cannot know about).
+
+    The rule that holds everywhere: version order agrees with history. A release above this one (on
+    main; on a maintenance branch, above it in its own line) may exist only as a descendant of this
+    commit -- a newer release already tagged on top of it and queued behind this run, which is what
+    happens when two releases are cut the same day. That one then takes the moving tags, and this run
+    leaves them alone. A higher release anywhere else means this version is being cut out of order,
+    and is refused.
+    """
+    main_commit = _commit_or_none(repository, main_ref)
+    if main_commit is None:
+        raise ReleaseGateError(f"cannot resolve {main_ref}, so the tagged commit cannot be placed")
+    line = _line(version)
+    minor = _version_key(version)[:2]
+
+    if _is_ancestor(repository, head, main_commit):
+        # Reachable from main, whether or not a maintenance branch also contains it: a release/X.Y
+        # branch is cut from a tag on main, and that tag stays a main release.
+        channel = "main"
+    else:
+        line_commit = _commit_or_none(repository, f"{line_ref_prefix}{line}")
+        if line_commit is None or not _is_ancestor(repository, head, line_commit):
+            raise ReleaseGateError(
+                f"tagged commit is not an ancestor of origin/main, nor of the maintenance branch "
+                f"release/{line}")
+        channel = "line"
+        # A maintenance branch serves a line that is no longer the newest. Until a newer minor has
+        # shipped from main, patches to this line come from main itself, so main stays linear and
+        # each new minor contains every fix of the one below it.
+        newer_minor = sorted(
+            (v for v in tags if _version_key(v)[:2] > minor), key=_version_key, reverse=True)
+        if not any(_is_ancestor(repository, tags[v], main_commit) for v in newer_minor):
+            raise ReleaseGateError(
+                f"release/{line} can publish only after a newer minor has been released from main; "
+                f"until then a {line} release comes from main")
+        # The branch must start at a release of its own line. Cut from anywhere else, it would carry
+        # main commits that no release of this line has ever contained.
+        fork = _git(repository, ["merge-base", head, main_commit], check=False)
+        fork_point = fork.stdout.strip() if fork.returncode == 0 else ""
+        if not any(commit == fork_point for v, commit in tags.items()
+                   if _version_key(v)[:2] == minor and v != version):
+            raise ReleaseGateError(
+                f"release/{line} does not branch from a released {line} tag on main")
+
+    higher = sorted((v for v in tags if _version_key(v) > _version_key(version)), key=_version_key)
+    if channel == "line":
+        # Newer minors are expected above a maintenance release. Within its own line the rule holds.
+        in_scope = [v for v in higher if _version_key(v)[:2] == minor]
+    else:
+        in_scope = higher
+    out_of_order = [v for v in in_scope
+                    if tags[v] == head or not _is_ancestor(repository, head, tags[v])]
+    if out_of_order:
+        raise ReleaseGateError(
+            f"v{version} is below v{out_of_order[-1]}, which does not build on this commit; a "
+            "release must be above every release before it")
+    if in_scope:
+        print(f"::warning::v{in_scope[-1]} is already tagged on top of this commit, so this release "
+              "leaves the moving tags to it")
+
+    floating: list[str] = []
+    if not higher:
+        floating.append("latest")
+    if not any(_version_key(v)[:2] == minor for v in higher):
+        floating.append(f"v{line}")
+
+    below = sorted((v for v in tags if _version_key(v) < _version_key(version)),
+                   key=_version_key, reverse=True)
+    previous = next((v for v in below if _is_ancestor(repository, tags[v], head)), None)
+
+    preamble = ""
+    if channel == "line":
+        newest = max(tags, key=_version_key)
+        preamble = (f"Maintenance release of the {line} line. The newest release is "
+                    f"v{newest}.")
+
+    placement = {
+        "channel": channel,
+        "floating_tags": tuple(floating),
+        "make_latest": "latest" in floating,
+        "previous_tag": f"v{previous}" if previous else "",
+        "notes_preamble": preamble,
+    }
+    return placement, frozenset(in_scope)
+
+
+def line_support_warning(data: dict, version: str, today: datetime.date) -> str | None:
+    """A warning, never a refusal, when this version's line is past its published support date.
+
+    The promise is a minimum: a critical fix may still be worth shipping on a line whose support has
+    ended, and the maintainer who tags it has decided so. Reads the matrix's optional top-level
+    `lines` map; a matrix without one says nothing about support periods.
+    """
+    lines = data.get("lines")
+    if not isinstance(lines, dict):
+        return None
+    entry = lines.get(_line(version))
+    if not isinstance(entry, dict):
+        return None
+    until = entry.get("security_fixes_until")
+    if not isinstance(until, str):
+        return None
+    try:
+        ends = datetime.date.fromisoformat(until)
+    except ValueError:
+        return None
+    if ends >= today:
+        return None
+    return (f"the {_line(version)} line's security fixes ended on {until}; this release is "
+            "published after its support period")
 
 
 def _upgrade_matrix_module():
@@ -142,26 +387,18 @@ def _upgrade_matrix_module():
     return module
 
 
-def _released_versions(repository: Path) -> set[str]:
-    """The versions that have actually been released, from the tags in this checkout.
+def _check_upgrade_matrix(
+    path: Path, version: str, released: set[str], *, later: frozenset[str] = frozenset()
+) -> tuple[str | None, dict]:
+    """Require the release to have declared how an operator reaches it, and every other release too.
 
-    A failure to read tags is an error rather than an empty answer: treating "cannot see" as "none
-    exist" would turn the phantom-version check into a no-op exactly when it cannot do its job.
+    Returns the stated reason when this version is waived in the matrix (else None), and the matrix.
 
-    There is deliberately no check that the version being cut is among them. It always is -- the
-    caller has already resolved `refs/tags/v<version>` to a commit before reaching here, so a
-    missing tag has failed the gate several lines earlier, with a clearer message.
-    """
-    listed = _git(repository, ["tag", "--list", "v*"], check=False)
-    if listed.returncode != 0:
-        raise ReleaseGateError("cannot list tags, so declared versions cannot be checked")
-    return {line[1:] for line in listed.stdout.split() if line.startswith("v")}
-
-
-def _check_upgrade_matrix(path: Path, version: str, released: set[str]) -> str | None:
-    """Require the release to have declared how an operator reaches it.
-
-    Returns the stated reason when this version is waived in the matrix, else None.
+    Every released tag must have its entry. The published file is what the site, the running app and
+    the host tool read about every version, not only this one, so a release whose matrix misses an
+    earlier release -- one cut on another line and never synced, say -- would tell every install of
+    it nothing about that release. The exception is `later`: releases tagged after this one, or on
+    top of it, which its file cannot know about.
 
     The escape hatch is a `waivers` entry in the file rather than a command-line flag. A flag would
     have to be threaded through a tag-triggered workflow to be reachable at all, and once passed it
@@ -180,17 +417,26 @@ def _check_upgrade_matrix(path: Path, version: str, released: set[str]) -> str |
         # the newest released version: the highest of the already-released tags and the one being cut
         # now (which is being released by this very run). Taking the max rather than just the version
         # being cut keeps it correct for a backport, whose version is below the newest release.
-        newest_released = max({version} | released,
-                              key=lambda v: tuple(int(p) for p in v.split(".")))
+        newest_released = max({version} | released, key=_version_key)
         data = matrix.validate_matrix(matrix.load_matrix(path), released_ceiling=newest_released)
         matrix.assert_no_phantom_versions(data, released, version)
         reason = matrix.assert_release_declared(data, version)
     except matrix.UpgradeMatrixError as exc:
         raise ReleaseGateError(str(exc)) from exc
 
+    # The version being cut is covered above, with its own message and its own waiver.
+    undeclared = sorted(
+        (v for v in released if v != version and v not in later and v not in data["versions"]),
+        key=_version_key)
+    if undeclared:
+        raise ReleaseGateError(
+            f"docs/upgrade-matrix.json has no entry for the released version(s) "
+            f"{', '.join(undeclared)}; bring the matrix up to date with every release before "
+            "cutting this one")
+
     if reason is not None:
         print(f"::warning::{version} ships without a declared upgrade path: {reason}")
-    return reason
+    return reason, data
 
 
 def write_github_outputs(path: Path, metadata: ReleaseMetadata) -> None:
@@ -201,6 +447,11 @@ def write_github_outputs(path: Path, metadata: ReleaseMetadata) -> None:
         stream.write(f"image={metadata.image}\n")
         stream.write(
             f"upgrade_entry_waived={'true' if metadata.upgrade_entry_waived else 'false'}\n")
+        stream.write(f"channel={metadata.channel}\n")
+        stream.write(f"floating_tags={' '.join(metadata.floating_tags)}\n")
+        stream.write(f"make_latest={'true' if metadata.make_latest else 'false'}\n")
+        stream.write(f"previous_tag={metadata.previous_tag}\n")
+        stream.write(f"notes_preamble={metadata.notes_preamble}\n")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -209,6 +460,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref", required=True)
     parser.add_argument("--event-sha", required=True)
     parser.add_argument("--main-ref", default="refs/remotes/origin/main")
+    parser.add_argument("--line-ref-prefix", default="refs/remotes/origin/release/")
     parser.add_argument("--repository-owner", required=True)
     parser.add_argument("--version-file", type=Path)
     parser.add_argument("--upgrade-matrix", type=Path)
@@ -224,6 +476,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ref=args.ref,
             event_sha=args.event_sha,
             main_ref=args.main_ref,
+            line_ref_prefix=args.line_ref_prefix,
             repository_owner=args.repository_owner,
             version_file=args.version_file,
             upgrade_matrix=args.upgrade_matrix,
