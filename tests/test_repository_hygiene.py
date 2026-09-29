@@ -192,3 +192,22 @@ def test_the_contributor_rules_require_a_schema_change_to_declare_itself():
     assert "ADD COLUMN IF NOT EXISTS` is a no-op" in guide or "no-op where the column already" in guide, (
         "the note about ADD COLUMN not tightening an existing column is gone. That is the mistake "
         "that put two columns out of step for several releases")
+
+
+def test_every_test_file_a_docstring_names_exists():
+    """A docstring that says another test file proves something live sends a reader to look for it.
+    If that file was never written, or was renamed, the claim is empty and nothing says so."""
+    import ast
+
+    tests = ROOT / "tests"
+    present = {p.name for p in tests.glob("*.py")}
+    missing = []
+    for path in sorted(tests.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [tree] + [n for n in ast.walk(tree)
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        for node in nodes:
+            for name in re.findall(r"\btest_\w+\.py\b", ast.get_docstring(node) or ""):
+                if name not in present:
+                    missing.append(f"{path.name} names {name}")
+    assert not missing, missing

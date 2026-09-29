@@ -9,7 +9,9 @@ by name: the token ``gateway`` (the container's default route, read at start) or
 A proxy container on the network is trusted by a range as before. The web process says at start when a
 range covers the gateway, and once when a request from it arrives with a header it now ignores, naming
 the .env lines for a reverse proxy on the host (TRUSTED_PROXIES=gateway with WEB_BIND=127.0.0.1).
-test_gateway_trust_live.py proves it on a running stack.
+The proxy matrix (.github/scripts/proxy_matrix.py, run by the proxy-matrix workflow) proves it on a
+running stack: a client on the Docker host, an IPv6 client and an nginx on the host, all relayed through
+the gateway.
 """
 import importlib.util
 import ipaddress
