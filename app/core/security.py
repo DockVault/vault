@@ -65,6 +65,21 @@ def decrypt_secret(stored: str) -> str:
     except (InvalidToken, ValueError, UnicodeDecodeError):
         return stored  # legacy plaintext (pre-encryption) — used as-is until re-saved
 
+
+def decrypt_secret_strict(stored: str) -> str:
+    """Decrypt a value written by encrypt_secret, and ONLY such a value.
+
+    decrypt_secret hands a value that is not a Fernet token back unchanged, which is right for a stored
+    credential written before at-rest encryption and wrong for anything a verifier then relies on: there
+    a planted plaintext value would be used as if this server had sealed it. This variant raises
+    ValueError for an empty value, a value that is not a Fernet token, and one sealed under another key."""
+    if not stored or not isinstance(stored, str):
+        raise ValueError("no sealed value")
+    try:
+        return _fernet().decrypt(stored.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("not a value sealed by this deployment") from exc
+
 # --- AES-256-GCM chunked at-rest stream (format version 0x10) ---------------
 # The legacy at-rest format is a global-key Fernet chunk stream (encrypt_chunk /
 # decrypt_chunk_stream). Fernet has no AAD, so a stored blob is not bound to the

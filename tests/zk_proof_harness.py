@@ -22,18 +22,27 @@ the way the web client does, so the HTTP suite keeps exercising the real routes:
   then sent without a proof, as the web client sends it to an old server, so what the test sees is the
   guarded route's own answer.
 
+The proofs themselves are computed by the independent reference (``zk_key_proof_reference``). The
+material a request installs (a direct vault's proof key and its seal, the key check, the lineage tag) is
+generated here when the test's body does not carry it; the server checks only its shape, so a stand-in
+DEK the harness remembers per vault and epoch is enough for the HTTP suite.
+
 Nothing here imports the application.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
 import re
 import uuid
 from typing import Optional
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+
+import zk_key_proof_reference as reference
 
 # The derivation's domain. Public on purpose: these are test identities, never a deployment's.
 IDENTITY_SEED = b"dockvault-test-identity-key-v1"
@@ -56,6 +65,9 @@ _GUARDED_ROUTES = (
 )
 
 _KEYS: dict = {}
+# Stand-in DEKs by (vault id, DEK epoch): the harness seals proof keys and computes key checks and
+# lineage tags under these, so its material is consistent with itself. The server never sees a DEK.
+_DEKS: dict = {}
 
 
 class HarnessError(AssertionError):
@@ -201,11 +213,121 @@ def _json_or_empty(response) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _prove(client, op, vault_id, challenge, body):
-    """Complete a body with the material the operation installs and return (body, header value)."""
-    raise HarnessError(
-        "the server issued a key-proof challenge, but this harness cannot compute key proofs yet"
+def stand_in_dek(vault_id: str, dek_epoch: int) -> bytes:
+    """The harness's DEK for a vault's epoch (random, remembered)."""
+    return _DEKS.setdefault((str(vault_id).lower(), int(dek_epoch)), os.urandom(32))
+
+
+def direct_proof_material(vault_id: str, dek_epoch: int) -> tuple:
+    """(proof key, {public_key, sealed_private_key, dek_check}) for a direct vault's epoch: a fresh,
+    remembered proof keypair, sealed under the harness's stand-in DEK for that epoch."""
+    key = new_private_key()
+    pem = public_pem(key)
+    dek = stand_in_dek(vault_id, dek_epoch)
+    pkcs8 = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption())
+    sealed = reference.seal_key_proof_key(dek, vault_id, dek_epoch, pem, pkcs8, os.urandom(12))
+    return key, {
+        "public_key": pem,
+        "sealed_private_key": base64.b64encode(sealed).decode(),
+        "dek_check": base64.b64encode(reference.dek_check(dek, vault_id, dek_epoch)).decode(),
+    }
+
+
+def _epoch(value, fallback: int) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else fallback
+
+
+def _lineage(vault_id, prev_epoch, mode, next_team_epoch, next_verifier_pem, next_check, team_wrap):
+    """A lineage tag under the harness's stand-in DEK for the previous epoch, or random bytes when the
+    inputs are not well-formed (the server checks only the tag's length)."""
+    try:
+        return base64.b64encode(reference.lineage_tag(
+            stand_in_dek(vault_id, prev_epoch), vault_id=vault_id, prev_epoch=prev_epoch, mode=mode,
+            next_team_epoch=next_team_epoch, next_verifier_pem=next_verifier_pem,
+            next_dek_check=next_check, next_team_wrap_b64=team_wrap)).decode()
+    except (ValueError, TypeError, KeyError):
+        return base64.b64encode(os.urandom(32)).decode()
+
+
+def _complete(op, vault_id, challenge, body, current_pem):
+    """Add the material the operation installs, when the body does not carry it; return (body, the
+    public key the request installs or None)."""
+    if not isinstance(body, dict):
+        return body, None
+    body = dict(body)
+    mode = challenge.get("mode") or "direct"
+    de = _epoch(challenge.get("dek_epoch"), 1)
+    te = _epoch(challenge.get("team_epoch"), 1)
+    if op == "create":
+        if body.get("key_wrapping_mode") == "hierarchical":
+            return body, body.get("team_public_key")
+        if "key_proof" not in body:
+            _, body["key_proof"] = direct_proof_material(vault_id, 1)
+        return body, (body.get("key_proof") or {}).get("public_key")
+    if op in ("rekey", "owner_reset"):
+        to = _epoch(body.get("to_version"), de + 1)
+        if mode == "hierarchical":
+            new_pem = body.get("team_public_key")
+            if "lineage_tag" not in body:
+                body["lineage_tag"] = _lineage(vault_id, de, mode, te + 1 if new_pem else te,
+                                               new_pem or current_pem, None, body.get("team_dek_wrapped"))
+            return body, new_pem
+        if "next_key_proof" not in body:
+            _, body["next_key_proof"] = direct_proof_material(vault_id, to)
+        nkp = body.get("next_key_proof") or {}
+        if "lineage_tag" not in body:
+            try:
+                check = base64.b64decode(nkp.get("dek_check") or "", validate=True)
+            except (ValueError, TypeError):
+                check = None
+            body["lineage_tag"] = _lineage(vault_id, de, mode, te, nkp.get("public_key"), check, None)
+        return body, nkp.get("public_key")
+    if op == "share":
+        if mode == "direct" and "dek_version" not in body:
+            body["dek_version"] = de
+        return body, None
+    if op == "bootstrap":
+        return body, body.get("public_key")
+    return body, None
+
+
+def _prove(client, op, vault_id, challenge, body, augment=True):
+    """Complete the body, serialize it once and prove it. Returns (the exact string to send, header)."""
+    identity = identity_key_for(client)
+    verifier = challenge.get("verifier") or {}
+    current_pem = None if op in reference.OPS_WITHOUT_CURRENT_KEY else verifier.get("public_key")
+    if augment:
+        body, new_pem = _complete(op, vault_id, challenge, body, current_pem)
+    else:
+        _, new_pem = _complete(op, vault_id, challenge, body, current_pem)
+    raw = serialize(body)
+
+    def valid(pem):
+        try:
+            reference.point(pem)
+            return pem
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    new_pem, current_pem = valid(new_pem), valid(current_pem)
+    digest = reference.transcript(
+        op=op, challenge_id=challenge["challenge_id"], nonce_b64=challenge["nonce"],
+        user_id=client_user_id(client), vault_id=vault_id, mode=challenge.get("mode") or "direct",
+        dek_epoch=_epoch(challenge.get("dek_epoch"), 1), team_epoch=_epoch(challenge.get("team_epoch"), 1),
+        identity_pem=public_pem(identity), current_pem=current_pem, new_pem=new_pem,
+        body=raw.encode("utf-8"),
     )
+    server = challenge["server_ephemeral_public_key"]
+    current_key = private_key_for(current_pem)
+    new_key = private_key_for(new_pem)
+    header = reference.proof_header(
+        challenge["challenge_id"],
+        reference.role_mac("identity", identity, server, digest),
+        reference.role_mac("current-key", current_key, server, digest) if current_key else None,
+        reference.role_mac("new-key", new_key, server, digest) if new_key else None,
+    )
+    return raw, header
 
 
 def _send(client, method, path, raw: Optional[str], extra_headers: dict):
@@ -216,13 +338,17 @@ def _send(client, method, path, raw: Optional[str], extra_headers: dict):
     return verb(path, data=raw.encode("utf-8"), headers=headers)
 
 
-def post_zk(client, path, json=None, *, method="POST", headers=None):
+def post_zk(client, path, json=None, *, method="POST", headers=None, augment=True):
     """Send one request to a route that may take a key proof, the way the web client does.
 
     Not a guarded request (for example a standard vault create): sent as is. Otherwise: ask for a
     challenge; if the server issues none (it predates the route, or refuses), send the body without a
     proof; if it issues one, prove and send. The body is serialized exactly once and those bytes are what
     is sent.
+
+    With a challenge, the body gains the material its operation installs when it does not carry it
+    already (a create's `key_proof` and `id`, a rotation's `next_key_proof` and `lineage_tag`, a direct
+    share's `dek_version`); `augment=False` sends the test's body exactly as given.
 
     The response carries `zk_challenge_status`: the challenge's status code, or None when no challenge
     was asked for.
@@ -238,15 +364,19 @@ def post_zk(client, path, json=None, *, method="POST", headers=None):
     challenge_vault = vault_id or str(uuid.uuid4())
     challenge = client.post(CHALLENGE_PATH.format(vault_id=challenge_vault), json={"op": op})
     if challenge.status_code == 200:
-        if op == "create" and isinstance(body, dict) and not body.get("id"):
+        # A create names its vault. Only a body with no `id` at all gets one: a test that sends an
+        # empty or malformed id is testing exactly that and keeps it.
+        if op == "create" and augment and isinstance(body, dict) and "id" not in body:
             body = {**body, "id": challenge_vault}
-        body, proof = _prove(client, op, challenge_vault, _json_or_empty(challenge), body)
-        headers[PROOF_HEADER] = proof
-    response = _send(client, method, path, serialize(body), headers)
+        raw, headers[PROOF_HEADER] = _prove(client, op, challenge_vault, _json_or_empty(challenge), body,
+                                            augment=augment)
+    else:
+        raw = serialize(body)
+    response = _send(client, method, path, raw, headers)
     response.zk_challenge_status = challenge.status_code
     return response
 
 
-def put_zk(client, path, json=None, *, headers=None):
+def put_zk(client, path, json=None, *, headers=None, augment=True):
     """`post_zk` for the guarded PUT routes (the name-index key, the proof bootstrap)."""
-    return post_zk(client, path, json, method="PUT", headers=headers)
+    return post_zk(client, path, json, method="PUT", headers=headers, augment=augment)

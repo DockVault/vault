@@ -283,3 +283,142 @@ def test_the_unproven_request_detector_sees_one():
         assert len(_unproven_sites(sample)) == 1, sample
     assert _unproven_sites('post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={})') == []
     assert _unproven_sites('admin.post("/vaults", json={"name": "s"})') == []
+
+
+# ------------------------------------------------------------------------------ proofs it makes
+
+class ProvingServer:
+    """A stand-in server: issues challenges with the server module and checks the harness's proofs
+    against the server module's transcript and MAC check."""
+
+    def __init__(self, username, mode="direct", dek_epoch=3, team_epoch=1, verifier_pem=None):
+        from app.services import zk_key_proof as kp
+        self.kp = kp
+        self.identity_pem = harness.public_pem(harness.identity_private_key(username))
+        self.mode, self.de, self.te, self.verifier_pem = mode, dek_epoch, team_epoch, verifier_pem
+        self.issued = {}
+        self.sent = []
+
+    def route(self, method, path, kw):
+        if path == "/ecc/keys/public":
+            return FakeResponse(200, {"has_keypair": True, "public_key": self.identity_pem})
+        if path.endswith("/key-proof/challenge"):
+            priv, pub, nonce = self.kp.generate_challenge()
+            cid = "5d4c3b2a-1908-4f7e-8d6c-5b4a39281706"
+            vid = path.split("/")[3]
+            op = kw["json"]["op"]
+            self.issued = {"priv": priv, "nonce": nonce, "cid": cid, "vid": vid, "op": op}
+            verifier = None
+            if self.verifier_pem and op not in self.kp.OPS_WITHOUT_CURRENT_KEY:
+                verifier = {"public_key": self.verifier_pem}
+            return FakeResponse(200, {
+                "challenge_id": cid, "server_ephemeral_public_key": pub, "nonce": nonce, "expires_in": 300,
+                "mode": self.mode, "dek_epoch": self.de, "team_epoch": self.te, "verifier": verifier})
+        self.sent.append((method, path, kw))
+        return FakeResponse(200, {"ok": True})
+
+    def check(self, user_id, current_pem, new_pem):
+        """Verify the last request's proof as the server would; return (body, {role: ok})."""
+        method, path, kw = self.sent[-1]
+        raw = kw["data"]
+        header = self.kp.parse_header(kw["headers"][harness.PROOF_HEADER])
+        i = self.issued
+        digest = self.kp.transcript(
+            op=i["op"], challenge_id=i["cid"], nonce_b64=i["nonce"], user_id=user_id,
+            vault_id=i["vid"], mode=self.mode, dek_epoch=self.de, team_epoch=self.te,
+            identity_public_key=self.identity_pem, current_public_key=current_pem,
+            new_public_key=new_pem, body=raw)
+        ok = {"identity": self.kp.verify_role("identity", i["priv"], self.identity_pem, digest, header.identity_mac)}
+        if current_pem:
+            ok["current-key"] = self.kp.verify_role("current-key", i["priv"], current_pem, digest,
+                                                    header.current_key_mac)
+        if new_pem:
+            ok["new-key"] = self.kp.verify_role("new-key", i["priv"], new_pem, digest, header.new_key_mac)
+        assert header.challenge_id == i["cid"]
+        return json.loads(raw), ok
+
+
+def test_a_direct_rotation_carries_new_material_and_all_three_proofs():
+    from app.services import zk_key_proof as kp
+    current = harness.new_private_key()
+    server = ProvingServer("erin", verifier_pem=harness.public_pem(current))
+    client = FakeClient(server.route, username="erin")
+    harness.post_zk(client, "/ecc/vaults/0a1b2c3d-4e5f-4061-8273-8495a6b7c8d9/rekey",
+                    json={"from_version": 3, "to_version": 4, "member_keys": []})
+    sent = json.loads(server.sent[-1][2]["data"])
+    nkp = sent["next_key_proof"]
+    body, ok = server.check(client.user["id"], harness.public_pem(current), nkp["public_key"])
+    assert ok == {"identity": True, "current-key": True, "new-key": True}
+    kp.validate_sealed_key(nkp["sealed_private_key"])
+    kp.validate_mac32(nkp["dek_check"], "dek_check")
+    kp.validate_mac32(body["lineage_tag"], "lineage_tag")
+    assert harness.private_key_for(nkp["public_key"]) is not None, "the next epoch's key is remembered"
+
+
+def test_a_create_carries_its_id_and_a_proof_for_the_key_it_installs():
+    server = ProvingServer("frank", dek_epoch=1, team_epoch=1)
+    client = FakeClient(server.route, username="frank")
+    harness.post_zk(client, "/vaults", json={"type": "zero_knowledge", "wrapped_dek": "w",
+                                             "ephemeral_public_key": "e"})
+    sent = json.loads(server.sent[-1][2]["data"])
+    assert sent["id"] == server.issued["vid"], "the body names the vault the challenge was issued for"
+    body, ok = server.check(client.user["id"], None, sent["key_proof"]["public_key"])
+    assert ok == {"identity": True, "new-key": True}
+
+
+def test_a_hierarchical_share_proves_with_the_remembered_team_key_and_adds_no_epoch():
+    team = harness.team_public_key()
+    server = ProvingServer("gina", mode="hierarchical", team_epoch=2, verifier_pem=team)
+    client = FakeClient(server.route, username="gina")
+    harness.post_zk(client, "/ecc/vaults/0a1b2c3d-4e5f-4061-8273-8495a6b7c8d9/members",
+                    json={"user_id": "u", "wrapped_team_privkey": "t", "team_ephemeral_public_key": "e"})
+    body, ok = server.check(client.user["id"], team, None)
+    assert ok == {"identity": True, "current-key": True}
+    assert "dek_version" not in body
+
+
+def test_a_direct_share_names_the_challenges_epoch_unless_the_test_sets_one():
+    current = harness.new_private_key()
+    server = ProvingServer("hank", verifier_pem=harness.public_pem(current))
+    client = FakeClient(server.route, username="hank")
+    path = "/ecc/vaults/0a1b2c3d-4e5f-4061-8273-8495a6b7c8d9/members"
+    harness.post_zk(client, path, json={"user_id": "u", "wrapped_dek": "w", "ephemeral_public_key": "e"})
+    assert json.loads(server.sent[-1][2]["data"])["dek_version"] == 3
+    harness.post_zk(client, path, json={"user_id": "u", "wrapped_dek": "w", "ephemeral_public_key": "e",
+                                        "dek_version": 9})
+    assert json.loads(server.sent[-1][2]["data"])["dek_version"] == 9
+    harness.post_zk(client, path, json={"user_id": "u"}, augment=False)
+    assert json.loads(server.sent[-1][2]["data"]) == {"user_id": "u"}
+    body, ok = server.check(client.user["id"], harness.public_pem(current), None)
+    assert ok["identity"] and ok["current-key"], "a body sent as given is still proved"
+
+
+def test_a_key_the_harness_does_not_hold_gets_no_mac():
+    stranger = ec.generate_private_key(ec.SECP384R1())
+    server = ProvingServer("ivy", verifier_pem=harness.public_pem(stranger))
+    client = FakeClient(server.route, username="ivy")
+    harness.put_zk(client, "/ecc/vaults/0a1b2c3d-4e5f-4061-8273-8495a6b7c8d9/index-key", json={"wraps": []})
+    header = server.kp.parse_header(server.sent[-1][2]["headers"][harness.PROOF_HEADER])
+    assert header.current_key_mac is None and header.new_key_mac is None
+    body, ok = server.check(client.user["id"], harness.public_pem(stranger), None)
+    assert ok == {"identity": True, "current-key": False}
+
+
+@pytest.mark.parametrize("given", ["", None])
+def test_a_create_that_names_an_id_keeps_it_even_when_it_is_empty(given):
+    server = ProvingServer("jill", dek_epoch=1, team_epoch=1)
+    client = FakeClient(server.route, username="jill")
+    harness.post_zk(client, "/vaults", json={"type": "zero_knowledge", "id": given})
+    assert json.loads(server.sent[-1][2]["data"])["id"] == given
+
+
+def test_a_create_whose_id_the_server_refuses_to_challenge_is_sent_as_given():
+    def route(method, path, kw):
+        if path.endswith("/key-proof/challenge"):
+            return FakeResponse(400, {"detail": "the vault id is not a UUID", "reason": "zk-key-proof-malformed"})
+        return FakeResponse(422, {"detail": "bad id"})
+    client = FakeClient(route, username="jill")
+    r = harness.post_zk(client, "/vaults", json={"type": "zero_knowledge", "id": "not-a-uuid"})
+    assert r.status_code == 422 and r.zk_challenge_status == 400
+    method, path, kw = client.calls[-1]
+    assert json.loads(kw["data"])["id"] == "not-a-uuid" and harness.PROOF_HEADER not in kw["headers"]
