@@ -23,6 +23,7 @@ A release older than this module has no reader, so a rollback to one of those is
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -185,6 +186,8 @@ def check_at_startup(process: str) -> None:
         with _require_engine().connect() as connection:
             check(connection, version, allow=bool(settings.allow_start_on_newer_data))
     except NewerDataRefusal as refusal:
-        print(f"[{process}] " + str(refusal).replace("\n", f"\n[{process}] "),
-              file=sys.stderr, flush=True)
+        # Each line names the process, except under the one-container launcher, which already puts
+        # the process's name in front of every line it passes on.
+        prefix = "" if os.environ.get("VAULT_LOG_SINK_OWNER") == "run_combined" else f"[{process}] "
+        print(prefix + str(refusal).replace("\n", "\n" + prefix), file=sys.stderr, flush=True)
         raise

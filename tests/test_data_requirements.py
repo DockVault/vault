@@ -206,6 +206,7 @@ def startup(monkeypatch, marked):
     monkeypatch.setattr(database, "_require_engine", lambda: marked)
     monkeypatch.setattr(dr, "running_version", lambda: "0.33.1")
     monkeypatch.setattr(config.settings, "allow_start_on_newer_data", False)
+    monkeypatch.delenv("VAULT_LOG_SINK_OWNER", raising=False)
     return marked
 
 
@@ -220,6 +221,19 @@ def test_the_start_up_check_leads_the_log_with_the_plain_message(startup, capsys
     assert err.startswith("[sftp] DockVault 0.33.1 will not start")
     assert "[sftp]   To go back to this version, first undo it with the newer version: release " \
         "the holds" in err
+
+
+def test_under_the_one_container_launcher_the_lines_are_named_once(startup, monkeypatch, capsys):
+    """The launcher puts [web] or [sftp] in front of every line it passes on; the check adds none."""
+    _mark(startup, "legal-holds", "0.34.0", undo="release the holds")
+    monkeypatch.setenv("VAULT_LOG_SINK_OWNER", "run_combined")
+
+    with pytest.raises(dr.NewerDataRefusal):
+        dr.check_at_startup("web")
+
+    err = capsys.readouterr().err
+    assert err.startswith("DockVault 0.33.1 will not start")
+    assert "[web]" not in err
 
 
 def test_the_start_up_check_reads_the_setting(startup, monkeypatch, capsys):
