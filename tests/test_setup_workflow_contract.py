@@ -158,3 +158,16 @@ def test_mask_helper_emits_only_escaped_secret_workflow_commands(tmp_path):
         "::add-mask::abc%25def",
         "::add-mask::database-secret",
     ]
+
+
+def test_the_published_release_scenario_installs_the_highest_release_not_above_the_checkout():
+    """The releases list is ordered by creation time, so its first entry can be an older line's
+    maintenance release. The choice goes to a picker that orders by version and stops at VERSION."""
+    step = _step("Scenario I — install from the published release image",
+                 "Scenario I2 — an unpublished version falls back to a source build")
+
+    assert "python3 .github/scripts/pick_published_release.py --version-file VERSION" in step
+    assert "releases?per_page=100" in step
+    assert "next((" not in step, "the first entry of the list is not the newest release"
+    # The pick reads the checkout's own VERSION, so it has to happen before VERSION is pinned.
+    assert step.index("pick_published_release.py") < step.index('> VERSION')
