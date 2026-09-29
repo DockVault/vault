@@ -16,9 +16,10 @@ stored preference, so a skin chosen against the shared account could be replaced
 the skin that applied. test_credential_change_rule_live.py covers the rule through the API.
 """
 import re
+import time
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Error as PlaywrightError, Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
 from _account_change_helpers import make_independent, psql
@@ -61,6 +62,22 @@ def _open_users(page: Page):
 def _confirm(page: Page):
     expect(page.locator("#confirm-modal.active")).to_be_visible(timeout=10000)
     page.click("#confirm-modal-confirm-btn")
+
+
+def _settled(page: Page, row, quiet_ms=1500, timeout_s=20):
+    """Wait until `row` has not been drawn again for `quiet_ms`. A held change reads the list at once,
+    and again when the page is told of the new request over the live socket; each reading draws every
+    row afresh, so a row measured or scrolled to between the two can be gone mid-way."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            mark = row.evaluate("r => r.dataset.settle || (r.dataset.settle = String(Math.random()))")
+            page.wait_for_timeout(quiet_ms)
+            if row.evaluate("r => r.dataset.settle || ''") == mark:
+                return
+        except PlaywrightError:
+            pass                                                # drawn again while being read
+        assert time.monotonic() < deadline, "the row was still being drawn again"
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
@@ -147,6 +164,7 @@ def test_a_held_change_made_on_a_phone_shows_as_waiting_and_can_be_withdrawn(pag
         "a held reset link must not exist yet"
 
     # On the phone: the buttons on a line of their own, tall enough to tap, and nothing off screen.
+    _settled(page, row)
     withdraw = row.get_by_role("button", name="Withdraw")
     withdraw.scroll_into_view_if_needed()
     geometry = row.evaluate("""row => {
