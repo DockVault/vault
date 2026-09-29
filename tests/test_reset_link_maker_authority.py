@@ -388,3 +388,52 @@ def test_every_route_that_uses_a_reset_link_judges_its_maker():
     assert set(uses) == {("GET", "/reset/{token}"), ("POST", "/reset/{token}")}, sorted(uses)
     for route, names in uses.items():
         assert {"_reset_link_refusal", "_refuse_reset_link"} <= names, f"{route} does not judge the link's maker"
+
+
+# --------------------------------------------------------------------------- an approved request's link
+
+
+@pytest.fixture
+def held_link(db, monkeypatch):
+    """A second reset link for carol asked for by alice and held, as the rule on credential changes holds
+    it; approving it mints the link and hands it to the approver."""
+    from app.core import credential_changes as cc
+    from app.core import email_actions
+    from app.core.models import CredentialChange
+    CredentialChange.__table__.create(db.get_bind())
+    monkeypatch.setattr(email_actions, "public_base_url", lambda request: "https://vault.example.com")
+    monkeypatch.setattr(api, "_announce_decided_change", lambda *a, **k: None)
+    alice, bob = _user(db, "alice", RoleEnum.ADMIN), _user(db, "bob", RoleEnum.ADMIN)
+    carol = _user(db, "carol")
+    change = cc.hold(db, kind=cc.RESET_LINK, target_id=carol.id, requester_id=alice.id, requester_name="alice",
+                     summary="s", payload={"delivery": "copy"})
+    db.commit()
+
+    def approve(approver):
+        result = api._approve_credential_change(db, change, carol, approver=approver)
+        return result["reset_link"].split("?reset=")[1]
+    return SimpleNamespace(alice=alice, bob=bob, carol=carol, approve=approve)
+
+
+def test_an_approved_link_is_made_by_the_administrator_who_approved_it(db, held_link):
+    # The approver receives the link to pass on; the one who asked never sees it. So the link stands on
+    # the approver: the asker leaving takes nothing away, and the approver leaving does.
+    token = held_link.approve(held_link.bob)
+    row = db.query(PasswordResetToken).one()
+    assert (row.created_by, row.made_by_other) == (held_link.bob.id, True)
+    held_link.alice.is_active = False
+    db.commit()
+    assert _look_up(db, token) == {"username": "carol"}, "the asker's leaving refused the approver's link"
+    held_link.bob.is_active = False
+    db.commit()
+    assert _refused(lambda: _use(db, token)) == (404, UNKNOWN)
+    assert [r.details["reason"] for r in _audit(db, "password_reset_link_refused")] == [aa.MAKER_INACTIVE]
+
+
+def test_a_link_approved_on_the_host_stands_on_its_own(db, held_link):
+    token = held_link.approve(None)
+    row = db.query(PasswordResetToken).one()
+    assert (row.created_by, row.made_by_other) == (None, False)
+    held_link.alice.is_active = False
+    db.commit()
+    assert _use(db, token) == {"ok": True}

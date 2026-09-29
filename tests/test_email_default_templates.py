@@ -102,9 +102,9 @@ def test_tokened_email_links_are_wired_through_public_base_url():
     assert ("base_url = _public_base_url(request) if request is not None else _configured_base_url(None)"
             in norm)
     # (and whether another account made the link, so it is judged again when used)
-    assert ("_mint_and_send_reset(db, target, base_url, created_by_id=actor_id, made_by_other=made_by_other)"
+    assert ("_mint_and_send_reset(db, target, base_url, created_by_id=maker_id, made_by_other=made_by_other)"
             in norm)
-    assert "_mint_reset_link(db, target, base_url, created_by_id=actor_id, made_by_other=made_by_other)" in norm
+    assert "_mint_reset_link(db, target, base_url, created_by_id=maker_id, made_by_other=made_by_other)" in norm
     assert 'base = _public_base_url(request) if request is not None else ""' in norm     # invitation mint
     # the tokened links still exist AND are never assembled straight from the request Host
     assert "/?reset=" in norm and "/?invite=" in norm

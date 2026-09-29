@@ -5545,14 +5545,21 @@ def _earlier_changer(last, requester_id) -> str:
     return last.requested_by_name or "An administrator"
 
 
+_LINK_MAKER_IS_ACTOR = object()
+
+
 def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name, request=None,
-                             for_someone_else=True) -> dict:
+                             for_someone_else=True, link_maker_id=_LINK_MAKER_IS_ACTOR) -> dict:
     """Apply one credential change to ``target`` in the caller's transaction, and return what the
     caller shows. The routes run it for a change made at once, approving a held request runs it with
     the payload stored at the time, and the host operator runs it too. ``for_someone_else`` is False
     only when an administrator changes their own account through an administrator's route.
 
-    A password reset link is minted through the reset-link helpers, which commit on their own."""
+    A password reset link is minted through the reset-link helpers, which commit on their own. Its
+    maker is the account the link is handed to: ``actor_id`` for a change made at once, and for an
+    approved request ``link_maker_id``, the approving administrator (None: the server's operator on the
+    host), who receives the link to pass on; the one who asked never sees it. The maker's authority is
+    judged again when the link is used (_reset_link_refusal)."""
     from app.core import credential_changes as cc
     payload = payload or {}
     if kind == cc.PASSWORD:
@@ -5564,9 +5571,10 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     if kind == cc.RESET_LINK:
         from app.core.email_actions import public_base_url as _configured_base_url
         base_url = _public_base_url(request) if request is not None else _configured_base_url(None)
-        # Made by another account (an administrator, or a user who manages users, or an approved request's
-        # asker): judged again when it is used. Not one the server's operator makes (actor_id None).
-        made_by_other = actor_id is not None and actor_id != target.id
+        # Made by another account (an administrator, or a user who manages users, or the administrator who
+        # approved a held request): judged again when it is used. Not one the server's operator makes.
+        maker_id = actor_id if link_maker_id is _LINK_MAKER_IS_ACTOR else link_maker_id
+        made_by_other = maker_id is not None and maker_id != target.id
         if payload.get("delivery") == "email":
             if not (target.email or "").strip():
                 raise HTTPException(status_code=400,
@@ -5574,9 +5582,9 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
             if not _smtp_configured(db):
                 raise HTTPException(status_code=400, detail="Email is not configured. Add a sending "
                                     "profile in Settings -> Email first.")
-            return {"email_sent": bool(_mint_and_send_reset(db, target, base_url, created_by_id=actor_id,
+            return {"email_sent": bool(_mint_and_send_reset(db, target, base_url, created_by_id=maker_id,
                                                             made_by_other=made_by_other))}
-        link = _mint_reset_link(db, target, base_url, created_by_id=actor_id, made_by_other=made_by_other)
+        link = _mint_reset_link(db, target, base_url, created_by_id=maker_id, made_by_other=made_by_other)
         if not link:
             raise HTTPException(status_code=400, detail="Password reset is not configured on this "
                                 "deployment (LOG_TOKEN_PEPPER is unset).")
@@ -10778,8 +10786,9 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
         db.rollback()
         raise HTTPException(status_code=409, detail="That request was already decided, so nothing was changed.")
     try:
+        # A reset link is handed to the approver, not to the one who asked: its maker is the approver.
         result = _apply_credential_change(db, kind, target, payload, actor_id=requested_by_id,
-                                          actor_name=requested_by, request=request)
+                                          actor_name=requested_by, request=request, link_maker_id=approver_id)
     except Exception:
         # Refused while applying (the address is in use, email is not set up): the request stays held.
         # Rolled back here, because the host tool's session commits whatever is left when it ends.
