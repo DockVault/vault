@@ -306,6 +306,7 @@ def test_publication_is_serial_and_scan_auth_push_release_order_is_fail_closed()
         publish.index("Scan the exact staged image (arm64)"),
         publish.index("Refresh release refs immediately before authentication"),
         publish.index("Revalidate immediately before authentication"),
+        publish.index("Refuse to publish a finished release again"),
         publish.index("Log in to GHCR"),
         publish.index("Copy the scanned index to GHCR and resolve its digest"),
         publish.index("Verify every published platform is anonymously pullable"),
@@ -638,7 +639,10 @@ def test_two_releases_cut_the_same_day_each_keep_their_own_moving_tags(tmp_path)
 
 def test_an_older_release_re_run_after_its_successor_moves_no_tag(tmp_path):
     """Re-running a release whose successor on the same line is already tagged on top of it
-    republishes only its own version tag: the line tag and `latest` belong to newer releases."""
+    republishes only its own version tag: the line tag and `latest` belong to newer releases. The
+    gate cannot tell this from the first run of the older of a same-day pair, so it accepts both;
+    a re-run of a release that finished is stopped by the publish step, which finds its GitHub
+    Release (see test_a_finished_release_is_not_published_again)."""
     history = _two_lines(tmp_path)
     history.commit("0.1.3", branch="release/0.1")
     history.push()
@@ -1097,3 +1101,94 @@ def test_a_moving_tag_that_names_another_image_after_the_copy_fails_the_release(
     assert len(created) == 1
     assert "resolves to sha256:elsewhere, not sha256:staged" in run.stdout
     assert not (tmp_path / "output").exists()
+
+
+# The GitHub Release is the last thing a publication makes, so the step before authentication reads
+# it to tell a finished release from one that is running for the first time or after a failure. The
+# step runs here against a stand-in `gh` that answers what GitHub would.
+_GH_STUB = r"""#!/usr/bin/env bash
+echo "gh $*" >> "$STUB_LOG"
+case "$GH_ANSWER" in
+  exists) echo '{"tagName":"v0.34.0"}' ;;
+  missing) echo "release not found" >&2; exit 1 ;;
+  broken) echo "HTTP 502: Bad Gateway (https://api.github.com/graphql)" >&2; exit 1 ;;
+  no-repo) echo "HTTP 404: Not Found (https://api.github.com/repos/DockVault/vault/releases/tags/v0.34.0)" >&2; exit 1 ;;
+esac
+"""
+
+
+def _run_release_check(tmp_path: Path, answer: str):
+    bash = _bash()
+    if bash is None:
+        if os.environ.get("CI"):
+            pytest.fail("no bash to run the publish step with; this check would silently not run")
+        pytest.skip("no bash on this machine")
+    import yaml
+
+    steps = yaml.safe_load(_WORKFLOW)["jobs"]["publish"]["steps"]
+    (step,) = [s for s in steps if s.get("id") == "not_published"]
+    (tmp_path / "check.sh").write_text(step["run"], encoding="utf-8", newline="\n")
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    (stub_dir / "gh").write_text(_GH_STUB, encoding="utf-8", newline="\n")
+    (stub_dir / "gh").chmod(0o755)
+    (tmp_path / "gh.log").write_text("", encoding="utf-8")
+    env = {
+        **os.environ,
+        "STUB_BIN": str(stub_dir),
+        "STUB_LOG": str(tmp_path / "gh.log"),
+        "GH_ANSWER": answer,
+        "TAG": "v0.34.0",
+        "GITHUB_REPOSITORY": "DockVault/vault",
+        "RUNNER_TEMP": str(tmp_path),
+    }
+    run = subprocess.run(
+        [bash, "-c",
+         'PATH="$( (cygpath -u "$STUB_BIN") 2>/dev/null || printf %s "$STUB_BIN"):$PATH"; '
+         '. "$1"', "check-step", str(tmp_path / "check.sh")],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    return run, (tmp_path / "gh.log").read_text(encoding="utf-8").splitlines()
+
+
+def test_the_finished_release_check_runs_before_authentication_on_this_releases_tag():
+    import yaml
+
+    steps = yaml.safe_load(_WORKFLOW)["jobs"]["publish"]["steps"]
+    names = [s.get("name") for s in steps]
+    (step,) = [s for s in steps if s.get("id") == "not_published"]
+    assert names.index(step["name"]) == names.index("Revalidate immediately before authentication") + 1
+    assert names.index(step["name"]) + 1 == names.index("Log in to GHCR")
+    assert step["env"]["TAG"] == "${{ steps.publish_gate.outputs.tag }}"
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    # Its answer rests on the GitHub Release being the last thing a publication makes.
+    assert names[-1] == "Create GitHub Release"
+
+
+def test_a_first_run_goes_on(tmp_path):
+    run, calls = _run_release_check(tmp_path, "missing")
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert calls == ["gh release view v0.34.0 --repo DockVault/vault --json tagName"]
+
+
+def test_a_finished_release_is_not_published_again(tmp_path):
+    run, calls = _run_release_check(tmp_path, "exists")
+
+    assert run.returncode != 0
+    assert len(calls) == 1
+    assert "the GitHub Release v0.34.0 exists, so v0.34.0 has already been published" in run.stdout
+    assert "delete the release (not the tag) and re-run" in run.stdout
+    assert "cannot tell" not in run.stdout, "stopped as finished, not as unknown"
+
+
+@pytest.mark.parametrize("answer, shown", [
+    ("broken", "HTTP 502"),
+    # "Not Found" about the repository is not "release not found": it says nothing of the release.
+    ("no-repo", "HTTP 404: Not Found"),
+])
+def test_not_knowing_whether_a_release_is_out_stops_the_publication(tmp_path, answer, shown):
+    run, calls = _run_release_check(tmp_path, answer)
+
+    assert run.returncode != 0
+    assert "cannot tell whether v0.34.0 has already been published" in run.stdout
+    assert shown in run.stdout

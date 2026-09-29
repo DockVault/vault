@@ -287,6 +287,30 @@ jobs:
             --repository-owner "$REPOSITORY_OWNER" \
             --github-output "$GITHUB_OUTPUT"
 
+      # A version is published once. The gate accepts a release with a newer one already tagged on
+      # top of it (the older of two releases cut the same day is checked again that way), and a
+      # re-run after a partial failure; a re-run of a finished release would copy this run's new
+      # build over the image its version tag already names. The GitHub Release is the last thing a
+      # run makes, so its existence marks a finished release.
+      - name: Refuse to publish a finished release again
+        id: not_published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.publish_gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName \
+               >/dev/null 2>"$RUNNER_TEMP/release-view.err"; then
+            echo "::error::the GitHub Release ${TAG} exists, so ${TAG} has already been published and is not published again. If a run failed while creating that release, delete the release (not the tag) and re-run."
+            exit 1
+          fi
+          if ! grep -qi "release not found" "$RUNNER_TEMP/release-view.err"; then
+            echo "::error::cannot tell whether ${TAG} has already been published"
+            cat "$RUNNER_TEMP/release-view.err"
+            exit 1
+          fi
+
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
