@@ -68,7 +68,7 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `groups`, `user_groups`, `user_permissions`, `user_endpoint_permissions` | Group names and descriptions; who belongs to which group with what role, who added them and when; granted permissions. | Access control. | Until changed. **New in 0.33.0:** a change of role resets an account's granted permissions (`user_endpoint_permissions`) to the new role's defaults, keeping those another administrator granted it. | An administrator; memberships and grants are deleted with the account. |
 | `vault_members`, `vault_group_access`, `vault_favorites`, `vault_views` | Who can use which vault and how, who added them and when; a person's starred vaults and when they last opened each. | Access control; the vault list's order. | Until changed. | The vault owner or an administrator; deleted with the account or the vault. |
 | `shares`, `share_claims` | Who shared what with which people or departments, limits, status; who claimed it, when they last used it, how many downloads. | Sharing inside the deployment. | After expiry or revocation too, until the shared item, the vault or the sharer's account is deleted. | Deleting the item, the vault or the account. |
-| `user_keypairs`, `vault_member_keys`, `vault_member_index_keys`, `zk_share_invites` | Public keys, fingerprints, wrapped keys, who granted or revoked them. | Zero-knowledge vaults. | Until revoked or replaced. | Deleted with the account or the vault. |
+| `user_keypairs`, `vault_member_keys`, `vault_member_index_keys`, `zk_share_invites`, `vault_key_proofs` | Public keys, fingerprints, wrapped keys, who granted or revoked them. **New in 0.33.2:** `vault_key_proofs` holds each zero-knowledge key epoch's proof material (a public key, a sealed key and two MACs, none of them personal) and the id of the account that installed it. | Zero-knowledge vaults. | Until revoked or replaced; a key epoch's proof material until the vault is deleted or the epoch is retired. | Deleted with the account or the vault; the installer's id is cleared when that account is deleted. |
 
 ### Content
 
@@ -107,8 +107,10 @@ Visits to a link and uploads through one are also in the audit log.
 
 `system_settings`, `schema_steps`, `retired_object_ids`, `share_tags`, `note_link_tags`,
 `receiver_tags`, `second_factor_actions`, `email_actions`, `email_profiles`, `email_templates`,
-`email_resources`, `vault_storage_grants`, `vault_key_history`, `ecc_registration_challenges` and
-`ecc_key_update_challenges` hold settings, policies, templates, storage allocations and key material.
+`email_resources`, `vault_storage_grants`, `vault_key_history`, `ecc_registration_challenges`,
+`ecc_key_update_challenges` and `zk_key_proof_challenges` hold settings, policies, templates, storage
+allocations and key material. (`zk_key_proof_challenges`, **new in 0.33.2**, also holds the id of the vault
+a challenge is for; its rows last five minutes and the periodic cleanup deletes them.)
 Their only personal data is the id of the account that created, owns or was allocated an item, and
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
 account and group ids that may use a tag. `data_requirements` holds no personal data: each row

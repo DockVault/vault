@@ -8,7 +8,7 @@ from enum import Enum as PyEnum
 import uuid
 
 from sqlalchemy import (
-    Column, String, Integer, Boolean, DateTime, ForeignKey,
+    Column, String, Integer, SmallInteger, Boolean, DateTime, ForeignKey,
     Text, BigInteger, LargeBinary, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
@@ -2091,6 +2091,84 @@ class ECCKeyUpdateChallenge(Base):
 
     __table_args__ = (
         Index('idx_ecc_update_challenge_user', 'user_id'),
+    )
+
+
+class ZkKeyProofChallenge(Base):
+    """A one-time challenge for the key proof that changes to a zero-knowledge vault's keys carry
+    (app/services/zk_key_proof.py).
+
+    A separate table from the two other challenge tables, for the reason ECCKeyUpdateChallenge gives:
+    a challenge issued for one protocol is then unreachable from another's verifier, not merely
+    filtered out.
+
+    Holds the server's one-time private key SEALED with the deployment key (encrypt_secret), read back
+    only through the strict decrypt: ECDH is symmetric, so anyone who read a live plaintext key could
+    compute the MAC the server expects. It also records the vault's state when the challenge was
+    issued (mode, epochs and the SHA-256 of the verifier's point), which the guarded request must still
+    match. Never a user key, never a DEK: transient, single-use and short-lived; expired rows are
+    swept by the periodic cleanup (app/core/session_retention.py).
+
+    `vault_id` has no foreign key on purpose: a challenge to create a vault names an id that does not
+    exist yet.
+    """
+    __tablename__ = 'zk_key_proof_challenges'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    vault_id = Column(UUID(as_uuid=True), nullable=False)
+    op = Column(String(16), nullable=False)
+    server_private_key_sealed = Column(Text, nullable=False)
+    nonce = Column(Text, nullable=False)               # base64 of 32 bytes
+    mode = Column(String(16), nullable=False)          # 'direct' | 'hierarchical'
+    dek_epoch = Column(Integer, nullable=False)
+    team_epoch = Column(Integer, nullable=False)
+    verifier_sha256 = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index('idx_zk_key_proof_challenge_user', 'user_id', 'created_at'),
+        Index('idx_zk_key_proof_challenge_created', 'created_at'),
+    )
+
+
+class VaultKeyProof(Base):
+    """The key-proof material of one DEK epoch of a zero-knowledge vault.
+
+    DIRECT vaults: the epoch's proof public key (the verifier), its private key sealed under the
+    epoch's DEK (opened only by the DEK's holders), and the epoch's key check. HIERARCHICAL vaults: the
+    team public key on the vault is the verifier, so a row carries only provenance and the lineage tag.
+    `lineage_tag` is a MAC by the previous epoch's DEK over what the rotation installed; it is NULL at
+    epoch 1, after a bootstrap, and on an owner reset whose owner could not open the previous epoch.
+
+    Rows are immutable: no route updates one, and repair goes through a new epoch. They are deleted only
+    with their vault and by retiring old epochs. The server stores the material without parsing it;
+    `format` names the format of the stored material. No read path consults this table, so a missing,
+    damaged or unknown row can block a key change, never a read.
+    """
+    __tablename__ = 'vault_key_proofs'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
+    dek_epoch = Column(Integer, nullable=False)
+    format = Column(SmallInteger, nullable=False, default=1, server_default='1')
+    proof_public_key = Column(Text, nullable=True)     # direct: SPKI PEM; NULL for hierarchical
+    sealed_private_key = Column(Text, nullable=True)   # direct: base64 of the sealed proof key
+    dek_check = Column(Text, nullable=True)            # direct: base64 of 32 bytes
+    lineage_tag = Column(Text, nullable=True)          # base64 of 32 bytes, when there is one
+    source = Column(String(16), nullable=False)        # create | rotate | bootstrap | owner_reset
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('vault_id', 'dek_epoch', name='uq_vault_key_proof_epoch'),
+        CheckConstraint("source IN ('create', 'rotate', 'bootstrap', 'owner_reset')",
+                        name='ck_vault_key_proof_source'),
+        # A direct row has all three direct columns, or none of them (a hierarchical row).
+        CheckConstraint(
+            "(proof_public_key IS NULL AND sealed_private_key IS NULL AND dek_check IS NULL) OR "
+            "(proof_public_key IS NOT NULL AND sealed_private_key IS NOT NULL AND dek_check IS NOT NULL)",
+            name='ck_vault_key_proof_direct_complete'),
     )
 
 

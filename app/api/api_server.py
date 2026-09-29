@@ -23483,6 +23483,18 @@ async def cleanup_expired_sessions():
                     db.rollback()
                     print(f"⚠ session retention purge failed: {type(purge_err).__name__}")
 
+                # Delete key-proof challenges nobody answered in time (each holds a sealed one-time
+                # key; see app/core/session_retention.py).
+                try:
+                    from app.core.session_retention import purge_expired_key_proof_challenges
+                    purged_challenges = purge_expired_key_proof_challenges(db)
+                    if purged_challenges:
+                        db.commit()
+                        print(f"🧹 Deleted {purged_challenges} expired key-proof challenge(s)")
+                except Exception as challenge_err:
+                    db.rollback()
+                    print(f"⚠ key-proof challenge purge failed: {type(challenge_err).__name__}")
+
                 # Prune abandoned chunked-upload sessions AND reclaim their buffered chunks
                 # on disk. A terminal/expired session holds the plaintext filename/MIME as
                 # transfer working state, and its raw chunks sit under _uploads/<sid>/. The
