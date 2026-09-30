@@ -11981,18 +11981,41 @@ async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem
     if (readBack !== expectedPem) {
         throw new Error('Internal error preparing the new encryption key — nothing was changed.');
     }
-    const challenge = await apiRequest('/ecc/keys/private/challenge', { method: 'POST' });
-    const mac = await eccLib().computeKeyUpdatePoP(
-        challenge.server_ephemeral_public_key, challenge.nonce, challenge.challenge_id,
-        userId, registeredPublicKeyPem, body, privateKey
-    );
-    await apiRequest('/ecc/keys/private', {
-        method: 'PUT',
-        body: JSON.stringify({
-            encrypted_private_key: body,
-            pop: { challenge_id: challenge.challenge_id, mac },
-        }),
-    });
+    // A challenge the server cannot open is refused once (see zkIsPossessionChallengeRefusal); the
+    // fresh one asked for then goes through.
+    for (let attempt = 0; ; attempt++) {
+        const challenge = await apiRequest('/ecc/keys/private/challenge', { method: 'POST' });
+        const mac = await eccLib().computeKeyUpdatePoP(
+            challenge.server_ephemeral_public_key, challenge.nonce, challenge.challenge_id,
+            userId, registeredPublicKeyPem, body, privateKey
+        );
+        try {
+            await apiRequest('/ecc/keys/private', {
+                method: 'PUT',
+                body: JSON.stringify({
+                    encrypted_private_key: body,
+                    pop: { challenge_id: challenge.challenge_id, mac },
+                }),
+            });
+            return;
+        } catch (e) {
+            if (attempt === 0 && zkIsPossessionChallengeRefusal(e)) continue;
+            throw e;
+        }
+    }
+}
+
+// A refusal that a fresh challenge may fix, when a key registration or an envelope replacement is
+// refused. The server keeps each challenge's one-time key sealed, and refuses a challenge it cannot open
+// -- one an older release issued before an upgrade -- like one that does not exist; an older server
+// given a challenge a newer one sealed, before a rollback, fails the proof instead. Either way the
+// caller asks once more, with a fresh challenge. A proof that is really wrong fails again, and that
+// answer is the one the caller sees.
+function zkIsPossessionChallengeRefusal(err) {
+    if (!err || err.status !== 400 || typeof err.message !== 'string') return false;
+    return err.message.startsWith('Invalid or expired proof-of-possession challenge')
+        || err.message.startsWith('Proof-of-possession challenge has expired')
+        || err.message.startsWith('Proof of possession failed');
 }
 
 // Turn a crypto failure code into the sentence a user should read, for the flow they are in.
@@ -12214,20 +12237,29 @@ async function zkRegisterNewKeypair() {
     const privatePem = await lib.exportPrivateKeyPEM(kp.privateKey);
     const enc = await zkWrapPrivateKey(privatePem, pass);  // legacy shape, or v1 when enabled
     // Proof-of-possession: prove we hold this key's private half (ECDH key-confirmation) so the
-    // server won't accept a substituted/unheld public key.
-    const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
-    const mac = await lib.computeRegistrationPoP(
-        challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
-    await apiRequest('/ecc/keys/register', {
-        method: 'POST',
-        body: JSON.stringify({
-            public_key: publicPem,
-            // Pack salt+iterations into the opaque blob so a later session can
-            // decrypt it; the server stores this verbatim and cannot read it.
-            encrypted_private_key: JSON.stringify(enc),
-            pop: { challenge_id: challenge.challenge_id, mac },
-        }),
-    });
+    // server won't accept a substituted/unheld public key. A challenge the server cannot open is
+    // refused once (see zkIsPossessionChallengeRefusal); the fresh one asked for then goes through.
+    for (let attempt = 0; ; attempt++) {
+        const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
+        const mac = await lib.computeRegistrationPoP(
+            challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
+        try {
+            await apiRequest('/ecc/keys/register', {
+                method: 'POST',
+                body: JSON.stringify({
+                    public_key: publicPem,
+                    // Pack salt+iterations into the opaque blob so a later session can
+                    // decrypt it; the server stores this verbatim and cannot read it.
+                    encrypted_private_key: JSON.stringify(enc),
+                    pop: { challenge_id: challenge.challenge_id, mac },
+                }),
+            });
+            break;
+        } catch (e) {
+            if (attempt === 0 && zkIsPossessionChallengeRefusal(e)) continue;
+            throw e;
+        }
+    }
     // Hold a NON-extractable runtime copy (the generated key was extractable only
     // so we could export + password-encrypt it above).
     zkState.privateKey = await lib.importPrivateKeyPEM(privatePem, false);

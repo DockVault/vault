@@ -2203,16 +2203,17 @@ class ZKShareInvite(Base):
 class ECCRegistrationChallenge(Base):
     """A one-time proof-of-possession challenge for ECC public-key registration (app/services/ecc_pop.py).
 
-    Holds the server's EPHEMERAL private key + nonce so the register endpoint can verify the
-    client's ECDH key-confirmation MAC. NOT a user key and never a DEK — a transient,
-    single-use, short-TTL server challenge (deleted on verify; expired rows swept). This is
-    what stops a caller registering a public key whose private key they don't hold.
+    Holds the server's EPHEMERAL private key, SEALED with the deployment key (encrypt_secret; read back
+    only through the strict decrypt), + nonce so the register endpoint can verify the client's ECDH
+    key-confirmation MAC. NOT a user key and never a DEK — a transient, single-use, short-TTL server
+    challenge (deleted on verify; expired rows deleted by the pruner). This is what stops a
+    caller registering a public key whose private key they don't hold.
     """
     __tablename__ = 'ecc_registration_challenges'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM (transient)
+    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM, sealed (transient)
     nonce = Column(Text, nullable=False)               # base64
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -2229,15 +2230,16 @@ class ECCKeyUpdateChallenge(Base):
     make a registration challenge simply unreachable from the update verifier. The key-derivation
     domain differs too, so even a misrouted row could not yield a valid MAC.
 
-    Holds the server's EPHEMERAL private key and nonce so the update endpoint can verify the
-    client's proof. Never a user key, never a DEK: transient, single-use and short-lived.
+    Holds the server's EPHEMERAL private key, sealed with the deployment key as a registration
+    challenge's is, and nonce so the update endpoint can verify the client's proof. Never a user key,
+    never a DEK: transient, single-use and short-lived; expired rows are deleted by the pruner.
     See app/services/ecc_update_pop.py and docs/design/vault-private-key-update-pop-v1.md.
     """
     __tablename__ = 'ecc_key_update_challenges'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM (transient)
+    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM, sealed (transient)
     nonce = Column(Text, nullable=False)               # base64
     created_at = Column(DateTime, default=datetime.utcnow)
 

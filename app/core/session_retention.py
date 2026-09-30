@@ -66,3 +66,14 @@ def expired_key_proof_challenge_conditions(model, now: datetime):
     either way."""
     from app.services.zk_key_proof import CHALLENGE_TTL_SECONDS
     return (model.created_at < now - timedelta(seconds=CHALLENGE_TTL_SECONDS),)
+
+
+def expired_possession_challenge_conditions(model, now: datetime):
+    """Filter conditions for the key registration and envelope-replacement challenges the pruner deletes:
+    those past their lifetime.
+
+    Issuing one of these deletes the account's previous one, so a challenge nobody came back for stayed in the
+    database until the account's next issuance, with its one-time key. Like a key-proof challenge, a row past
+    its lifetime can no longer be answered, so deleting it changes no outcome."""
+    from app.services.ecc_update_pop import CHALLENGE_TTL_SECONDS
+    return (model.created_at < now - timedelta(seconds=CHALLENGE_TTL_SECONDS),)

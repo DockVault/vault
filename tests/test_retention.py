@@ -33,7 +33,8 @@ from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
 from app.core.models import (ActiveSession, AuditLog, CredentialChange, ManagedSetting,  # noqa: E402
                              ManagedSettingChange, PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert,
-                             SystemSetting, User, ZkKeyProofChallenge)
+                             SystemSetting, User, ZkKeyProofChallenge, ECCKeyUpdateChallenge,
+                             ECCRegistrationChallenge)
 
 pytestmark = pytest.mark.unit
 
@@ -64,7 +65,8 @@ def factory(monkeypatch):
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'retention.db'}")
         copies = sa.MetaData()
         for model in (User, ActiveSession, PendingLogin, CredentialChange, RateLimitRecord, SecurityAlert,
-                      AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting, ZkKeyProofChallenge):
+                      AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting, ZkKeyProofChallenge,
+                      ECCRegistrationChallenge, ECCKeyUpdateChallenge):
             # Each column as it is, without the foreign keys (the tables they name are not copied), and with
             # SQLite's spelling of "now" where Postgres's is the default.
             columns = []
@@ -202,7 +204,7 @@ def test_the_retention_settings_are_configured_documented_and_kept_by_the_tool(m
 def test_the_jobs_and_which_the_hold_switch_stops():
     assert [(j.name, j.held) for j in retention.JOBS] == [
         ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
-        ("credential_changes", False),
+        ("possession_challenges", False), ("credential_changes", False),
         ("rate_limit_records", False), ("security_alerts", True), ("security_records", True),
         ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True)]
 
@@ -581,6 +583,7 @@ def _job_functions() -> set:
 # pass itself, the functions it replaced, and the models its jobs delete from.
 OWNED_FUNCTIONS = _job_functions() | {"Pass", "delete_in_batches", "run_pass", "prune_done", "apply_due",
                                       "purge_old_session_data", "purge_expired_key_proof_challenges",
+                                      "purge_expired_possession_challenges",
                                       "cleanup_old_audit_logs", "cleanup_old_alerts"}
 # ZkKeyProofChallenge is not listed: issuing a key-proof challenge deletes the caller's own expired ones (a few
 # rows, which keeps the account under its cap of live challenges), and the pruner sweeps the rest.

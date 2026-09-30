@@ -481,11 +481,24 @@ async def register_challenge(
     db.query(ECCRegistrationChallenge).filter(
         ECCRegistrationChallenge.user_id == current_user.id
     ).delete(synchronize_session=False)
-    ch = ECCRegistrationChallenge(user_id=current_user.id, server_private_key=priv_pem, nonce=nonce_b64)
+    # The one-time key is stored sealed with the deployment key and read back only through the strict
+    # decrypt: ECDH is symmetric, so anyone who read a live key in the clear could compute the MAC the
+    # server expects for any public key.
+    ch = ECCRegistrationChallenge(user_id=current_user.id, server_private_key=encrypt_secret(priv_pem),
+                                  nonce=nonce_b64)
     db.add(ch)
     db.commit()
     db.refresh(ch)
     return {"challenge_id": str(ch.id), "server_ephemeral_public_key": pub_pem, "nonce": nonce_b64}
+
+
+def _unseal_pop_challenge_key(sealed) -> Optional[str]:
+    """The one-time key of a registration or envelope-replacement challenge, or None when the row does not
+    hold a key this deployment sealed (see register_challenge)."""
+    try:
+        return decrypt_secret_strict(sealed)
+    except (ValueError, TypeError):
+        return None
 
 
 def _verify_registration_pop(db: Session, user: User, request: "KeypairRegisterRequest") -> None:
@@ -507,11 +520,16 @@ def _verify_registration_pop(db: Session, user: User, request: "KeypairRegisterR
         raise HTTPException(status_code=400, detail="Invalid or expired proof-of-possession challenge.")
     # Consume it FIRST (single-use): capture the values, then delete + commit so a wrong MAC
     # can't be brute-forced by retrying against the same challenge.
-    created_at, server_priv, nonce = ch.created_at, ch.server_private_key, ch.nonce
+    created_at, sealed, nonce = ch.created_at, ch.server_private_key, ch.nonce
     db.delete(ch)
     db.commit()
     if created_at is None or (datetime.utcnow() - created_at) > timedelta(seconds=_POP_CHALLENGE_TTL_SECONDS):
         raise HTTPException(status_code=400, detail="Proof-of-possession challenge has expired; request a new one.")
+    server_priv = _unseal_pop_challenge_key(sealed)
+    if server_priv is None:
+        # Not a key this server sealed: written in the clear by an older release (a challenge issued
+        # before an upgrade) or by someone who can write the table. The client asks for a new one.
+        raise HTTPException(status_code=400, detail="Invalid or expired proof-of-possession challenge.")
     if not ecc_pop.verify_pop(server_priv, request.public_key, nonce, pop.mac):
         raise HTTPException(status_code=400, detail="Proof of possession failed for this public key.")
 
@@ -775,8 +793,9 @@ async def key_update_challenge(
     db.query(ECCKeyUpdateChallenge).filter(
         ECCKeyUpdateChallenge.user_id == current_user.id
     ).delete(synchronize_session=False)
+    # Sealed with the deployment key, as a registration challenge is (see register_challenge).
     ch = ECCKeyUpdateChallenge(
-        user_id=current_user.id, server_private_key=priv_pem, nonce=nonce_b64
+        user_id=current_user.id, server_private_key=encrypt_secret(priv_pem), nonce=nonce_b64
     )
     db.add(ch)
     db.commit()
@@ -869,9 +888,17 @@ async def update_private_key(
                   resource_id=current_user.id, resource_type="user",
                   details={"reason": "no_live_challenge"}, status="failure")
         raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
-    created_at, server_priv, nonce = ch.created_at, ch.server_private_key, ch.nonce
+    created_at, sealed, nonce = ch.created_at, ch.server_private_key, ch.nonce
     db.delete(ch)
     db.commit()
+    server_priv = _unseal_pop_challenge_key(sealed)
+    if server_priv is None:
+        # Not a key this server sealed (an older release's challenge, or a row someone wrote): refused like
+        # a challenge that does not exist, and the client asks for a new one.
+        _audit_zk(db, current_user, "zk_key_update_pop_failed",
+                  resource_id=current_user.id, resource_type="user",
+                  details={"reason": "no_live_challenge"}, status="failure")
+        raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
 
     # STEP 3 - expiry, then the proof. Failures are audited with a short reason code and never the
     # attempted MAC, nonce or envelope bytes: both routes are authenticated and rate-limited, and

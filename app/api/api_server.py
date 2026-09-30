@@ -25357,7 +25357,7 @@ async def lifespan(app: FastAPI):
     from app.services import zk_key_proof
     zk_key_proof.report_at_startup()
 
-    # The pruner: every timed deletion of records (finished sessions, expired key-proof challenges, the
+    # The pruner: every timed deletion of records (finished sessions, expired key challenges, the
     # records of credential changes, the sign-in throttle's fallback rows, resolved alerts, audit rows) and
     # the settings changes that wait, on a thread of its own, one runner at a time, first a minute after the
     # start. Only this process runs it. See app/core/retention.py.

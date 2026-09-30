@@ -113,6 +113,9 @@ Visits to a link and uploads through one are also in the audit log.
 `receiver_tags`, `second_factor_actions`, `email_actions`, `email_profiles`, `email_templates`,
 `email_resources`, `vault_storage_grants`, `vault_key_history`, `ecc_registration_challenges` and
 `ecc_key_update_challenges` hold settings, policies, templates, storage allocations and key material.
+(**New in 0.34.0:** the pruner also deletes the rows of the two challenge tables once their five minutes
+are up, and both keep their one-time key only sealed with the deployment key, as
+`zk_key_proof_challenges` does.)
 Their only personal data is the id of the account that created, owns or was allocated an item, and
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
 account and group ids that may use a tag. `data_requirements` holds no personal data: each row
