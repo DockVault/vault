@@ -32,9 +32,12 @@ the version the tag holds now and refuses to move it backwards.
 ## For an install on an older line
 
 - `dockvault.py update` lists the published releases and what each move involves, from the upgrade
-  matrix (`docs/upgrade-matrix.json`). A patch release on your own line is normally the smallest
-  move that fixes a vulnerability; moving to the newer line works too, and the matrix says whether
-  that move needs a backup or cannot be undone.
+  matrix (`docs/upgrade-matrix.json`). It names your release line, until when it gets security
+  fixes, and its newest published release, with what that release fixes in yours. A patch release
+  on your own line is normally the smallest move that fixes a vulnerability, and the tool points to
+  it before a release on another line; moving to the newer line works too, and the matrix says
+  whether that move needs a backup or cannot be undone. A move is described from the target
+  release's matrix, or, for a patch release made after the target, from your release's own.
 - To have `docker compose pull` follow your line, set `DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:vX.Y`
   in `.env`. To choose each release yourself, set the exact `:vX.Y.Z`.
 - Going back to an older release is protected from 0.33.1 on: an image refuses to start on data a

@@ -188,3 +188,45 @@ def test_a_raising_merge_falls_back_to_the_local_matrix(monkeypatch):
     merged, source = dv.merge_lifecycle_matrix(local, _matrix(V, secure=True), "0.30.0")
     assert source == "local"
     assert merged is local   # untouched; the tool's upgrade path never crashes on a bad remote
+
+
+# ---- release lines -------------------------------------------------------------------------------
+def test_vulnerabilities_are_one_finding_when_both_name_the_same_advisory():
+    # main may word a title differently, or a reference name another line's fix; the id is the same.
+    merged, _ = _merged(
+        _matrix(V, vulns=[{"advisory": "x", "title": "A", "fixed_in": "0.29.1"}]),
+        _matrix(V, vulns=[{"advisory": "x", "title": "A, reworded", "fixed_in": "0.29.1"},
+                          {"advisory": "y", "title": "A", "fixed_in": "0.29.1"},
+                          {"title": "A", "fixed_in": "0.29.1"}]))
+    got = [(x.get("advisory"), x.get("title")) for x in dv.version_vulnerabilities(merged, V)]
+    # x once; y is another advisory with the same wording, so it stays; the entry without an id
+    # matches x's (title, fixed_in) and is the same finding.
+    assert got == [("x", "A"), ("y", "A")]
+
+
+def _lines(**lines):
+    return {"versions": {}, "lines": {k.replace("_", "."): {"security_fixes_until": v}
+                                      for k, v in lines.items()}}
+
+
+def test_line_support_periods_merge_add_only_and_the_earlier_end_wins():
+    merged, _ = _merged(_lines(**{"0_33": None}), _lines(**{"0_33": "2027-06-10", "0_34": None}))
+    assert merged["lines"] == {"0.33": {"security_fixes_until": "2027-06-10"},
+                               "0.34": {"security_fixes_until": None}}
+    merged, _ = _merged(_lines(**{"0_33": "2027-06-10"}), _lines(**{"0_33": "2027-12-01"}))
+    assert merged["lines"]["0.33"]["security_fixes_until"] == "2027-06-10"
+    merged, _ = _merged(_lines(**{"0_33": "2027-06-10"}), _lines(**{"0_33": "soon", "x_y": None}))
+    assert merged["lines"] == {"0.33": {"security_fixes_until": "2027-06-10"}}
+    # Only a plain day is ever printed: anything else from main is not a support period.
+    merged, _ = _merged(_lines(**{"0_33": None}), _lines(**{"0_34": "\x1b[2Jsoon"}))
+    assert merged["lines"] == {"0.33": {"security_fixes_until": None}}
+
+
+def test_a_line_note_reads_the_merged_period():
+    merged, _ = _merged(_lines(**{"0_33": None}), _lines(**{"0_33": "2027-06-10", "0_34": None}))
+    assert dv.line_support_note(merged, "0.33.1", today="2027-06-10") == \
+        "security fixes until 2027-06-10"
+    assert dv.line_support_note(merged, "0.33.1", today="2027-06-11") == \
+        "security fixes ended on 2027-06-10"
+    assert dv.line_support_note(merged, "v0.34.0", today="2027-06-11").startswith("the newest line")
+    assert dv.line_support_note({"versions": {}}, "0.33.1") == ""
