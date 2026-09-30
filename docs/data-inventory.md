@@ -93,7 +93,7 @@ Visits to a link and uploads through one are also in the audit log.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
-| `audit_logs` | See [The audit log](#the-audit-log). | Accountability and security. | **For ever by default** (`AUDIT_LOG_RETENTION_DAYS=0`). | A positive `AUDIT_LOG_RETENTION_DAYS` makes the pruner delete older rows, unless `RETENTION_HOLD` or the panel's hold switch is on. **Not** deleted with the account. |
+| `audit_logs` | See [The audit log](#the-audit-log). | Accountability and security. | **For ever by default** (`AUDIT_LOG_RETENTION_DAYS=0`). | The pruner, by the maximum days (`AUDIT_LOG_RETENTION_DAYS`, or the panel) and the size cap (`AUDIT_LOG_MAX_MB`, or the panel), never below the protected minimums (`AUDIT_MIN_RETENTION_DAYS`; `AUDIT_PROTECTED_MIN_DAYS`, 365 days, for administration and security rows, which the size cap never deletes), and not while the hold switch (`RETENTION_HOLD`, or the panel) is on. **Not** deleted with the account. |
 | `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. | The pruner deletes old resolved alerts, unless the hold switch is on. **Not** deleted with the account. |
 | `rate_limit_records` | An address; for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The pruner. |
 | `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key), and the ids of the administrator who asked, of the administrators that administrator's grant descends from, and of those who had changed the account in the 14 days before; and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
@@ -149,8 +149,13 @@ Each row of `audit_logs` holds:
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is
 kept for ever. A positive value makes the pruner delete rows older than that many days, on a timer, unless
-the hold switch is on (`RETENTION_HOLD`, or the panel). The application only adds rows and deletes old
-ones; anyone with database access can change the table.
+the hold switch is on (`RETENTION_HOLD`, or the panel). Administration and security rows are kept at least
+`AUDIT_PROTECTED_MIN_DAYS` (365 days by default) whatever the maximum, and a size cap (`AUDIT_LOG_MAX_MB`)
+never deletes them. An administrator can change the maximum, the minimums and the cap in the panel,
+within the limits `.env` sets; a change that deletes sooner waits `RETENTION_REDUCTION_DELAY_DAYS` and
+every administrator is told. After an upgrade from a release that deleted only when an administrator's
+dashboard loaded, a positive `AUDIT_LOG_RETENTION_DAYS` first waits in the same way. The application only
+adds rows and deletes old ones; anyone with database access can change the table.
 
 Names typed at failed sign-ins appear on the Activity page (filtered as "no account") and in its
 exports. The summary charts' "most active people" leaves them out, and the page's username search
@@ -292,7 +297,14 @@ There is no built-in per-person erasure yet.
 
 | Setting | Default | Governs |
 |---|---|---|
-| `AUDIT_LOG_RETENTION_DAYS` | `0` (keep for ever) | Audit rows. |
+| `AUDIT_LOG_RETENTION_DAYS` | `0` (keep for ever) | Audit rows: the deployment's maximum days, which the panel can change. |
+| `AUDIT_MIN_RETENTION_DAYS` | `0` | Audit rows: none younger is deleted; the panel cannot go below it. |
+| `AUDIT_PROTECTED_MIN_DAYS` | `365` | Administration and security audit rows: none younger is deleted by age; only `.env` lowers it. |
+| `AUDIT_LOG_MAX_MB` | `0` (off) | Audit rows: a size cap; the oldest go first, never administration or security rows. |
+| `PLAN_LOG_MAX_DAYS`, `PLAN_LOG_MAX_MB` | `-1` (none) | Ceilings on the audit log's maximum days and size cap. |
+| `RETENTION_REDUCTION_DELAY_DAYS` | `7` | How long a change that deletes sooner waits; any administrator can cancel it meanwhile. |
+| `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
+| `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |
 | `ACCOUNT_LOCKOUT_MINUTES` | `15` | Automatic locks, and the phantom-name counters in Redis. |
 | `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `300` | Sign-in counters. |

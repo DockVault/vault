@@ -74,7 +74,8 @@ SOURCE_ADMIN = "admin"
 SOURCE_LOCKED = "locked"
 
 # The modules that register specs, imported the first time the registry is read.
-SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes", "app.core.retention")
+SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes", "app.core.retention",
+                                 "app.core.audit_retention")
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
 ENV_ONLY_KEYS: frozenset[str] = frozenset()
@@ -296,13 +297,16 @@ def _bound(spec: SettingSpec, bound: Bound, settings):
     value = bound(settings) if callable(bound) else getattr(settings, bound, None)
     if spec.kind == "int" and not _is_int(value):
         return None
+    if spec.kind == "int" and value < 0:
+        return None          # -1, as for the PLAN_* limits: no bound
     if spec.kind == "bool" and not isinstance(value, bool):
         return None
     return value
 
 
 def bounds(spec: SettingSpec, settings=None):
-    """(floor, ceiling) the deployment sets for ``spec``; each None when it sets none."""
+    """(floor, ceiling) the deployment sets for ``spec``; each None when it sets none. A negative number, as
+    -1 is for the PLAN_* limits, sets none."""
     settings = settings if settings is not None else _deployment_settings()
     return _bound(spec, spec.floor, settings), _bound(spec, spec.ceiling, settings)
 
@@ -480,7 +484,8 @@ def check_contract(settings=None) -> list[str]:
                 problems.append(f"{spec.env.upper()} is not valid ({why})")
         floor, ceiling = bounds(spec, settings)
         for name, bound, value in (("floor", spec.floor, floor), ("ceiling", spec.ceiling, ceiling)):
-            if isinstance(bound, str) and getattr(settings, bound, None) is not None and value is None:
+            raw = getattr(settings, bound, None) if isinstance(bound, str) else None
+            if raw is not None and value is None and not (spec.kind == "int" and _is_int(raw) and raw < 0):
                 problems.append(f"{bound.upper()}, the {name} of {spec.key}, is not a valid value")
         if floor is not None and ceiling is not None and _rank(spec, floor) > _rank(spec, ceiling):
             problems.append(f"{spec.key}: the floor ({floor}) is above the ceiling ({ceiling})")

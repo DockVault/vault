@@ -670,3 +670,14 @@ def test_describe_names_the_env_lines_that_set_a_value_and_its_bounds(clean):
     assert (rows["plain_days"]["env"], rows["plain_days"]["floor_env"], rows["plain_days"]["ceiling_env"]) == (
         None, None, None)
 
+
+
+@pytest.mark.parametrize("ceiling", [-1, -5])
+def test_a_negative_bound_as_for_the_plan_limits_is_no_bound(clean, ceiling):
+    clean.keep_ceiling = ceiling
+    with registered(_days()):
+        assert reg.bounds(reg.spec_for("keep_days")) == (None, None)
+        assert reg.check_contract() == []
+        assert reg.check_bounds(reg.spec_for("keep_days"), 0) is None
+        _store("keep_days", 0)
+        assert reg.resolve("keep_days") == 0

@@ -127,7 +127,8 @@ def _managed_routes():
 def test_the_routes_are_plain_functions_mounted_on_the_app():
     found = _managed_routes()
     assert {("GET", "/settings/managed"), ("PUT", "/settings/managed/{key}"),
-            ("POST", "/settings/managed/changes/{change_id}/cancel")} <= set(found)
+            ("POST", "/settings/managed/changes/{change_id}/cancel"),
+            ("GET", "/settings/managed/audit/preview")} <= set(found)
     for route in found.values():
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
 
@@ -135,7 +136,7 @@ def test_the_routes_are_plain_functions_mounted_on_the_app():
 def test_only_an_interactive_administrator_reaches_them():
     from app.api import user_management_api as um
     found = _managed_routes()
-    assert len(found) == 3
+    assert len(found) == 4
     for route in found.values():
         deps = {d.call for d in route.dependant.dependencies}
         assert um.require_interactive_admin in deps, route.path
@@ -298,7 +299,7 @@ def test_no_limit_is_refused_under_a_ceiling(env, db):
 
 
 def test_a_check_across_settings_refuses_before_anything_is_asked(env, db, monkeypatch, quiet):
-    monkeypatch.setattr(routes, "CROSS_CHECKS", [lambda spec, value: "too short for the minimum"
+    monkeypatch.setattr(sc, "CROSS_CHECKS", [lambda spec, value: "too short for the minimum"
                                                  if value == 8 else None])
     user = _admin(db)
     with refused(400) as caught:

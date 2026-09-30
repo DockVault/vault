@@ -51,8 +51,13 @@ registry.register(registry.SettingSpec(
 # The audit rows this module writes.
 CHANGED = "setting_changed"
 REQUESTED = "setting_change_requested"
+SCHEDULED_ACTION = "setting_change_scheduled"
 CANCELLED_ACTION = "setting_change_cancelled"
 APPLIED_ACTION = "setting_change_applied"
+
+# Checks across settings, added by the modules whose settings must agree with each other: each is given the
+# spec and the value asked for (None: the deployment's value) and returns a refusal in plain words, or None.
+CROSS_CHECKS: list = []
 
 # The in-app notice's type, and the system email every administrator is sent.
 NOTICE_TYPE = "retention_change"
@@ -178,6 +183,28 @@ def request(db, key: str, requested, *, actor, now: Optional[datetime] = None) -
     return Outcome("pending", change=change, superseded=waiting, **base)
 
 
+def schedule(db, key: str, setting, *, by_name: str, old_value, now: Optional[datetime] = None) -> dict:
+    """A waiting change the server itself asks for, with no administrator behind it (the first pass after
+    an upgrade, app/core/audit_retention.py): recorded like a request, in ``db``'s transaction, with its
+    audit row. It supersedes a waiting change of the setting. Returns the details its notice needs."""
+    from app.core.models import ManagedSettingChange as Change
+    spec = registry.spec_for(key)
+    now = now or utcnow()
+    _lock(db)
+    for change in pending_for(db, key):
+        _end(change, SUPERSEDED, by_id=None, by_name=by_name, now=now, reason="a newer change of the same setting")
+    change = Change(key=key, setting=setting, old_value=old_value, new_value=resolved(spec, setting),
+                    status=PENDING, requested_by=None, requested_by_name=by_name, requested_at=now,
+                    effective_at=now + delay())
+    db.add(change)
+    db.flush()
+    details = {"key": key, "old": old_value, "new": change.new_value, "setting": setting,
+               "change_id": str(change.id), "effective_at": change.effective_at.isoformat() + "Z",
+               "requested_by": by_name}
+    _audit(db, SCHEDULED_ACTION, key=key, details=details)
+    return details
+
+
 def cancel(db, change_id, *, actor, now: Optional[datetime] = None):
     """Cancel a pending change, by any administrator, in ``db``'s transaction, with its audit row. Raises
     LookupError for no such change and SettingRefused for one no longer pending."""
@@ -251,6 +278,7 @@ def apply_due(session_factory: Callable, *, now: Optional[datetime] = None, limi
 
 CHANGED_AT_ONCE = "changed"
 ASKED = "asked"
+SCHEDULED = "scheduled"
 CANCELLED_BY_ADMIN = "cancelled"
 KEPT = "kept"
 TOOK_EFFECT = "took_effect"
@@ -285,6 +313,13 @@ def notice_text(event: str, details: dict, by: Optional[str] = None) -> tuple:
                 f"{by} asked to change “{label}” from {old} to {new}. Records would be deleted sooner, "
                 f"so the change takes effect on {_date(details.get('effective_at'))} unless an administrator "
                 "cancels it on the Settings page.")
+    if event == SCHEDULED:
+        spec = registry.spec_for(details.get("key", ""))
+        where = f"{spec.env.upper()} in .env" if spec is not None and spec.env else "The deployment"
+        return ("Old audit rows will be deleted after a wait",
+                f"{where} sets “{label}” to {new}. Old records are now deleted on a timer, so this "
+                f"change from {old} to {new} takes effect on {_date(details.get('effective_at'))} unless an "
+                "administrator cancels it on the Settings page. Until then it deletes nothing.")
     if event == CANCELLED_BY_ADMIN:
         return ("A waiting change was cancelled",
                 f"{by} cancelled the change of “{label}” from {old} to {new} that "

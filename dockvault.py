@@ -253,6 +253,11 @@ RETENTION_ENV_KEYS = (
     ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
     ("log_prune_batch_rows", "LOG_PRUNE_BATCH_ROWS", "5000"),
     ("retention_hold", "RETENTION_HOLD", "false"),
+    ("audit_min_retention_days", "AUDIT_MIN_RETENTION_DAYS", "0"),
+    ("audit_protected_min_days", "AUDIT_PROTECTED_MIN_DAYS", "365"),
+    ("audit_log_max_mb", "AUDIT_LOG_MAX_MB", "0"),
+    ("plan_log_max_days", "PLAN_LOG_MAX_DAYS", "-1"),
+    ("plan_log_max_mb", "PLAN_LOG_MAX_MB", "-1"),
 )
 
 # Admin-password rules mirror the app's startup guard (app/core/config.py): the shipped placeholder

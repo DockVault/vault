@@ -430,6 +430,17 @@ class Settings(BaseSettings):
     # The app only adds rows and deletes old ones; the table is an ordinary one that anyone with
     # database access can change.
     audit_log_retention_days: int = Field(default=0)
+    # The rest of the audit log's retention (app/core/audit_retention.py). AUDIT_MIN_RETENTION_DAYS: no row
+    # younger is deleted, and the panel cannot go below it. AUDIT_PROTECTED_MIN_DAYS: no administration or
+    # security row younger is deleted by age; only .env can lower it. AUDIT_LOG_MAX_MB: a size cap (0 is
+    # off) that deletes the oldest rows, never administration or security rows. PLAN_LOG_MAX_DAYS and
+    # PLAN_LOG_MAX_MB: ceilings on the maximum and the cap (-1 is none; a ceiling forbids "for ever" and
+    # "off").
+    audit_min_retention_days: int = Field(default=0)
+    audit_protected_min_days: int = Field(default=365)
+    audit_log_max_mb: int = Field(default=0)
+    plan_log_max_days: int = Field(default=-1)
+    plan_log_max_mb: int = Field(default=-1)
     # How long records are kept is managed in the panel (app/core/settings_registry.py), within the limits
     # set here. A change there that makes records be deleted sooner waits this many days before it takes
     # effect (1-90); any administrator can cancel it meanwhile (app/core/setting_changes.py).

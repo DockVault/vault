@@ -31,7 +31,8 @@ from app.api import api_server as api  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
 from app.core.models import (ActiveSession, AuditLog, CredentialChange, ManagedSetting,  # noqa: E402
-                             ManagedSettingChange, PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert, User)
+                             ManagedSettingChange, PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert,
+                             SystemSetting, User)
 
 pytestmark = pytest.mark.unit
 
@@ -62,7 +63,7 @@ def factory(monkeypatch):
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'retention.db'}")
         copies = sa.MetaData()
         for model in (User, ActiveSession, PendingLogin, CredentialChange, RateLimitRecord, SecurityAlert,
-                      AuditLog, ManagedSetting, ManagedSettingChange):
+                      AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting):
             # Each column as it is, without the foreign keys (the tables they name are not copied), and with
             # SQLite's spelling of "now" where Postgres's is the default.
             columns = []
@@ -85,6 +86,10 @@ def factory(monkeypatch):
 
         session.made = made
         monkeypatch.setattr(reg, "_default_session_factory", session)
+        # An install past its first pass after the upgrade (test_audit_retention.py covers that pass).
+        first = session()
+        first.add(SystemSetting(key="audit_env_retention_scheduled", value={}))
+        first.commit()
         yield session
         for s in made:
             s.close()
@@ -196,7 +201,8 @@ def test_the_retention_settings_are_configured_documented_and_kept_by_the_tool(m
 def test_the_jobs_and_which_the_hold_switch_stops():
     assert [(j.name, j.held) for j in retention.JOBS] == [
         ("setting_changes", False), ("sessions", False), ("credential_changes", False),
-        ("rate_limit_records", False), ("security_alerts", True), ("audit_logs", True)]
+        ("rate_limit_records", False), ("security_alerts", True), ("audit_env_retention", False),
+        ("audit_logs", True)]
 
 
 def test_finished_sessions_and_sign_ins_go_after_their_window(env, factory):

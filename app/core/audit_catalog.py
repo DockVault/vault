@@ -242,6 +242,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("setting_change_applied", "administration", "Waiting setting change applied", "warning",
                 automatic=True),
     AuditAction("setting_change_cancelled", "administration", "Waiting setting change cancelled", "notice"),
+    AuditAction("setting_change_scheduled", "administration",
+                "Setting change that deletes records sooner scheduled by the server", "warning", automatic=True),
     AuditAction("setting_change_requested", "administration", "Setting change that deletes records sooner requested",
                 "warning"),
     AuditAction("settings_updated", "administration", "Settings changed", "notice"),

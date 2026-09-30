@@ -264,15 +264,17 @@ def prune_resolved_alerts(p: Pass) -> JobResult:
         SecurityAlert.timestamp)
 
 
+def schedule_env_audit_retention(p: Pass) -> JobResult:
+    """Once, after an upgrade: a positive AUDIT_LOG_RETENTION_DAYS waits like a change that deletes sooner
+    (app/core/audit_retention.py)."""
+    from app.core import audit_retention
+    return audit_retention.schedule_env_retention_once(p)
+
+
 def prune_audit_logs(p: Pass) -> JobResult:
-    """Audit rows older than AUDIT_LOG_RETENTION_DAYS, when it is positive."""
-    from app.core.models import AuditLog
-    days = int(getattr(_settings(), "audit_log_retention_days", 0) or 0)
-    if days <= 0:
-        return JobResult()
-    return p.delete_in_batches(
-        AuditLog, deletable(AuditLog, p.now, AuditLog.timestamp < p.now - timedelta(days=days)),
-        AuditLog.timestamp)
+    """Audit rows past the maximum, and the oldest the size cap has no room for (app/core/audit_retention.py)."""
+    from app.core import audit_retention
+    return audit_retention.prune(p)
 
 
 JOBS: list[Job] = [
@@ -281,6 +283,7 @@ JOBS: list[Job] = [
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
+    Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
 ]
 

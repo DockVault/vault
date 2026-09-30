@@ -1,5 +1,7 @@
 """The settings the panel manages through the settings registry (app/core/settings_registry.py).
 
+    GET  /settings/managed/audit/preview               what the audit job would delete now under three
+                                                       numbers of an administrator's choosing.
     GET  /settings/managed                             every managed setting (the value in force, where it
                                                        came from: the default, .env, an administrator, or
                                                        locked by the deployment; its bounds, and the .env
@@ -21,7 +23,7 @@ made either.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -44,17 +46,12 @@ STATEMENT_TIMEOUT_MS = 5000
 STEP_UP_ACTION = "admin.retention.write"
 _step_up = fixed_step_up.guard(STEP_UP_ACTION)
 
-# Checks across settings, added by the modules whose settings must agree with each other: each is given
-# the spec and the value asked for (None: the deployment's value) and returns a refusal or None.
-CROSS_CHECKS: list[Callable[[registry.SettingSpec, Any], Optional[str]]] = []
-
-
-def limit_statements(db: Session) -> None:
+def limit_statements(db: Session, timeout_ms: int = STATEMENT_TIMEOUT_MS) -> None:
     """Bound every statement of the transaction ``db`` is in (Postgres; another database has no such
     setting). Call it again after anything that commits."""
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
-        db.execute(text(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+        db.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
 
 
 class ManagedValue(BaseModel):
@@ -106,7 +103,7 @@ def refusal(spec: registry.SettingSpec, value) -> Optional[str]:
         why = registry.check_value(spec, value) or registry.check_bounds(spec, value)
         if why:
             return why
-    for check in CROSS_CHECKS:
+    for check in setting_changes.CROSS_CHECKS:
         why = check(spec, value)
         if why:
             return why
@@ -167,3 +164,35 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
                                                     "be written. It is still waiting.")
     setting_changes.announce(setting_changes.CANCELLED_BY_ADMIN, details, current_user.username)
     return {"status": "cancelled", "change": out}
+
+
+# A preview counts over the whole audit table, so it may take longer than a change.
+PREVIEW_STATEMENT_TIMEOUT_MS = 30000
+
+
+@router.get("/settings/managed/audit/preview")
+def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[int] = None,
+                            admin_min_days: Optional[int] = None, max_mb: Optional[int] = None,
+                            current_user: User = Depends(require_interactive_admin),
+                            db: Session = Depends(get_db)):
+    """What the audit job would delete now if the three numbers were these (each left out: the value in
+    force): rows and bytes by age and by size, by the same conditions the job uses."""
+    limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)
+    from app.core import audit_retention as ar
+    numbers = ar.current()
+    asked = {}
+    for key, value in ((ar.MAX_DAYS, max_days), (ar.MIN_DAYS, min_days), (ar.ADMIN_MIN_DAYS, admin_min_days),
+                       (ar.MAX_MB, max_mb)):
+        if value is None:
+            continue
+        spec = registry.spec_for(key)
+        why = registry.check_value(spec, value) or registry.check_bounds(spec, value)
+        if why:
+            raise HTTPException(status_code=400, detail=why)
+        asked[key] = value
+    numbers = ar.Numbers(asked.get(ar.MAX_DAYS, numbers.max_days), asked.get(ar.MIN_DAYS, numbers.min_days),
+                         asked.get(ar.ADMIN_MIN_DAYS, numbers.admin_min_days), asked.get(ar.MAX_MB, numbers.max_mb))
+    out = ar.preview(db, setting_changes.utcnow(), numbers)
+    out["numbers"] = {ar.MAX_DAYS: numbers.max_days, ar.MIN_DAYS: numbers.min_days,
+                      ar.ADMIN_MIN_DAYS: numbers.admin_min_days, ar.MAX_MB: numbers.max_mb}
+    return out
