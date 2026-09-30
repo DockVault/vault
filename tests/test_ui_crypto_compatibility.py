@@ -440,10 +440,11 @@ def test_candidate_served_browser_reads_all_pinned_zero_knowledge_formats(browse
         context.close()
 
 
-def test_create_only_temp_existing_key_uses_public_key_without_private_unlock(
-    browser, admin
-):
-    """Create-only uses the registered public key and never requests the private envelope."""
+def test_create_only_temp_credential_cannot_create_without_the_identity_key(browser, admin):
+    """A zero-knowledge create proves the account's identity key, so the browser must unlock it. A
+    temporary credential allowed only to create vaults may not receive the account's private-key
+    envelope: the browser asks for it once, is refused, sends no create and registers nothing, keeps no
+    private key, and says why; no vault exists afterwards."""
     settings_before = None
     user = None
     owner = None
@@ -503,40 +504,48 @@ def test_create_only_temp_existing_key_uses_public_key_without_private_unlock(
         page.fill("#vault-name", vault_name)
         expect(page.locator("#vault-type-group")).to_be_visible(timeout=5_000)
         page.select_option("#vault-type", "zero_knowledge")
+        # A zero-knowledge vault's name is sealed in the browser; its non-secret label is the name
+        # the vault list shows, so a vault created here in spite of the refusal would be found below.
+        page.fill("#vault-label", vault_name)
 
         requests_seen = []
+        responses_seen = []
+
+        def _tracked(request):
+            path = urlsplit(request.url).path
+            watched = path in {"/ecc/keys/public", "/ecc/keys/private", "/ecc/keys/register/challenge",
+                               "/ecc/keys/register", "/vaults"} or path.endswith("/key-proof/challenge")
+            if watched and (path != "/vaults" or request.method == "POST"):
+                return request.method, path
+            return None
 
         def record_request(request):
-            path = urlsplit(request.url).path
-            if path in {
-                "/ecc/keys/public",
-                "/ecc/keys/private",
-                "/ecc/keys/register/challenge",
-                "/ecc/keys/register",
-                "/vaults",
-            } and (path != "/vaults" or request.method == "POST"):
-                requests_seen.append((request.method, path))
+            event = _tracked(request)
+            if event is not None:
+                requests_seen.append(event)
+
+        def record_response(response):
+            event = _tracked(response.request)
+            if event is not None:
+                responses_seen.append((*event, response.status))
 
         page.on("request", record_request)
+        page.on("response", record_response)
         assert page.evaluate("() => zkState.privateKey === null") is True
         page.click("#create-vault-form button[type=submit]")
-        expect(page.locator("#create-vault-modal")).to_be_hidden(timeout=20_000)
+        expect(page.locator("#toast-container")).to_contain_text(
+            "not eligible for zero-knowledge key access", timeout=20_000
+        )
         expect(page.locator("#confirm-modal")).to_be_hidden()
         assert page.evaluate("() => zkState.privateKey === null") is True
 
-        matches = [v for v in owner.get("/vaults").json() if v["name"] == vault_name]
-        assert len(matches) == 1, (
-            f"create-only zero-knowledge vault mismatch: {matches!r}"
-        )
-        vault_id = matches[0]["id"]
-
         assert requests_seen == [
             ("GET", "/ecc/keys/public"),
-            ("POST", "/vaults"),
+            ("GET", "/ecc/keys/private"),
         ], requests_seen
-        assert not any(
-            path.startswith("/ecc/keys/register") for _, path in requests_seen
-        ), requests_seen
+        assert ("GET", "/ecc/keys/private", 403) in responses_seen, responses_seen
+        matches = [v for v in owner.get("/vaults").json() if v["name"] == vault_name]
+        assert matches == [], f"a vault was created without the identity key: {matches!r}"
     finally:
         _cleanup_contexts(contexts, cleanup_errors)
         if temp_username is not None:
