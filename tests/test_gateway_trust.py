@@ -81,8 +81,14 @@ def test_the_default_routes_are_read_from_the_kernels_tables(tmp_path):
 
 # --------------------------------------------------------------------------- the rule
 
-def test_a_range_that_contains_the_gateway_does_not_trust_it(trust):
-    trust("172.16.0.0/12")
+# Docker's default pool, and the network's own /16 and /24: a range as narrow as the network itself
+# still does not trust its gateway. Only the gateway's exact address does.
+RANGES = ["172.16.0.0/12", "172.18.0.0/16", "172.18.0.0/24"]
+
+
+@pytest.mark.parametrize("spec", RANGES)
+def test_a_range_that_contains_the_gateway_does_not_trust_it(trust, spec):
+    trust(spec)
     assert net_utils.client_ip(_request(GATEWAY, FORGED)) == GATEWAY
     assert net_utils.client_ip(_request(PROXY, FORGED)) == FORGED, "a proxy container is still trusted"
     assert not net_utils._is_trusted_peer(GATEWAY) and net_utils._is_trusted_peer(PROXY)
@@ -133,15 +139,16 @@ def test_the_scheme_from_the_gateway_follows_the_same_rule(trust):
 
 # --------------------------------------------------------------------------- what is said about it
 
-def test_at_start_a_range_that_covers_the_gateway_is_named_with_the_lines_to_change(trust):
-    trust("172.16.0.0/12")
+@pytest.mark.parametrize("spec", RANGES)
+def test_at_start_a_range_that_covers_the_gateway_is_named_with_the_lines_to_change(trust, spec):
+    trust(spec)
     (warning,) = net_utils.trust_warnings()
     assert GATEWAY in warning and "TRUSTED_PROXIES=gateway" in warning and "WEB_BIND=127.0.0.1" in warning
 
 
 @pytest.mark.parametrize("spec,gateways", [
     ("gateway", (GATEWAY,)), (f"{GATEWAY}/32", (GATEWAY,)), ("10.0.0.0/8", (GATEWAY,)), ("", (GATEWAY,)),
-    ("172.16.0.0/12", ()), (f"172.16.0.0/12, {GATEWAY}", (GATEWAY,)),
+    ("172.16.0.0/12", ()), (f"172.16.0.0/12, {GATEWAY}", (GATEWAY,)), ("172.16.0.0/12, gateway", (GATEWAY,)),
 ])
 def test_nothing_is_said_when_nothing_changed(trust, spec, gateways):
     trust(spec, gateways=gateways)
@@ -213,6 +220,7 @@ def _cli():
 
 @pytest.mark.parametrize("trusted,gateways,current,target,flagged", [
     ("172.16.0.0/12", ["172.18.0.1"], "0.33.0", "v0.33.1", True),
+    ("172.18.0.0/24", ["172.18.0.1"], "0.33.0", "v0.33.1", True),     # the network's own /24
     ("172.16.0.0/12", ["172.18.0.1"], "unknown", "0.34.0", True),
     ("172.16.0.0/12", [], "0.33.0", "0.33.1", True),            # the network could not be read
     ("192.168.0.0/16", [], "0.33.0", "0.33.1", True),
