@@ -63,7 +63,9 @@ def _in(container, *cmd):
 
 
 SPLIT = {"COMPOSE_PROFILES": "split"}
-NO_SFTP = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": ""}
+# What run_combined.py tells a web process it started with no SFTP server beside it.
+NO_SFTP = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": "", "VAULT_COMBINED_SFTP": "off"}
+OWN = None      # the web container's own environment
 
 
 def _sftp_rows():
@@ -119,3 +121,17 @@ def test_with_none_live_the_answer_follows_whether_the_deployment_runs_sftp():
     assert (none_live["ok"], none_live["reason"]) == (False, "none_live"), none_live
     off = _check(NO_SFTP, ahead_seconds=3600)
     assert (off["ok"], off["reason"]) == (True, "off"), off
+
+
+def test_a_web_container_started_on_its_own_never_answers_that_sftp_is_off():
+    # This stack's web container runs `python -m app.api.api_server` beside an SFTP container, as the trial
+    # compose and the split profile do, whatever its .env says of RUN_SFTP and COMPOSE_PROFILES. An SFTP
+    # server of an older release never records itself, so with none live the answer is no, never "off".
+    assert "VAULT_COMBINED_SFTP" not in _in(_api(), "env")
+    deadline = time.monotonic() + 60
+    while not _sftp_rows() and time.monotonic() < deadline:
+        time.sleep(1)
+    now = _check(OWN)
+    assert (now["ok"], now["reason"]) == (True, "same"), now
+    none_live = _check(OWN, ahead_seconds=3600)
+    assert (none_live["ok"], none_live["reason"]) == (False, "none_live"), none_live

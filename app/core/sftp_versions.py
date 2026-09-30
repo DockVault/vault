@@ -1,7 +1,7 @@
 """Which version each SFTP server process runs, so the web app can tell whether they all run its own.
 
-In the split profile the SFTP server is a container of its own, and nothing stops it running an older
-image than the web container after an update of only one of them. Some changes are safe only while no
+In the split profile and the trial compose the SFTP server is a container of its own, and nothing stops
+it running an older image than the web container after an update of only one of them. Some changes are safe only while no
 older SFTP process can act on the same data (an older one may delete what the newer web app keeps), so
 the web app asks before it makes one.
 
@@ -15,10 +15,11 @@ sftp_same_version() answers whether SFTP is off, or every live SFTP process runs
 
 - a live process of another version: no;
 - live processes, all of this version: yes;
-- none live, and the deployment runs no SFTP: yes. It runs none when RUN_SFTP is not set and
-  COMPOSE_PROFILES does not name ``split`` (the split profile always runs an SFTP container);
-- none live while the deployment runs SFTP: no. A release before this one never records itself, so an
-  older SFTP process may be running unseen.
+- none live, where no SFTP server runs: yes. Only one layout proves that: run_combined.py started this
+  web process and no SFTP server beside it (RUN_SFTP not set), and says so in VAULT_COMBINED_SFTP;
+- none live anywhere else: no. A web process started on its own (the split profile, the trial compose)
+  has an SFTP container beside it whatever .env says, and an SFTP server of a release before this one
+  never records itself, so it may be running unseen.
 
 The version is the one baked into the image (its VERSION file), not the brand's display version, which
 .env can override for both containers alike.
@@ -58,16 +59,18 @@ def code_version() -> str:
     return "unknown"
 
 
-def _truthy(value) -> bool:
-    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+# Set by run_combined.py on the processes it starts, over anything inherited: ``off`` when it starts no
+# SFTP server beside them, ``on`` when it does. An internal marker, not a setting.
+COMBINED_SFTP_ENV = "VAULT_COMBINED_SFTP"
 
 
 def deployment_runs_sftp(environ=None) -> bool:
-    """Whether the deployment says it runs an SFTP server: RUN_SFTP set (the combined container), or the
-    split profile in COMPOSE_PROFILES (which always runs one)."""
+    """Whether an SFTP server may be running beside this web process: yes, unless run_combined.py started
+    it and started no SFTP server (COMBINED_SFTP_ENV is ``off``). RUN_SFTP and COMPOSE_PROFILES do not
+    decide it: the trial compose runs an SFTP container whatever they say, and a web process started on
+    its own cannot see what runs in another container."""
     env = os.environ if environ is None else environ
-    profiles = {p.strip().lower() for p in str(env.get("COMPOSE_PROFILES") or "").split(",")}
-    return _truthy(env.get("RUN_SFTP")) or "split" in profiles
+    return str(env.get(COMBINED_SFTP_ENV) or "").strip().lower() != "off"
 
 
 @dataclass(frozen=True)
@@ -82,8 +85,8 @@ class VersionCheck:
             return ("An SFTP server of another version is running ("
                     + ", ".join(self.versions) + "); update it to this version first.")
         if self.reason == NONE_LIVE:
-            return ("This deployment runs an SFTP server that has not reported its version; it may be of an "
-                    "older release. Update it to this version and wait a minute.")
+            return ("No SFTP server has reported its version, and one may be running: an SFTP server of an "
+                    "older release does not report it. Update it to this version and wait a minute.")
         return "Every SFTP server runs this version." if self.reason == SAME else "This deployment runs no SFTP server."
 
 

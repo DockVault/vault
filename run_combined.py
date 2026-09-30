@@ -230,6 +230,23 @@ def mark_sftp_in_container() -> bool:
     return True
 
 
+def mark_combined_sftp() -> str:
+    """Tell the children whether this launcher starts an SFTP server beside them: ``on`` or ``off``.
+
+    Some changes the web app makes are safe only while no SFTP server of an older release can act on the
+    same data (app/core/sftp_versions.py). An SFTP server of this release records its version; one of an
+    older release does not, so when none has recorded itself the web app has to know whether one may be
+    running unseen. Only this launcher can say that none is: it serves both halves from one container
+    and starts SFTP only under RUN_SFTP. A web process started any other way (the split profile, the
+    trial compose) has an SFTP container beside it, gets no marker, and assumes one may be running.
+
+    Written every time, over whatever the environment held, so a value inherited from .env never stands
+    here. Must run BEFORE the first _spawn, which snapshots os.environ per child. Returns the value."""
+    value = "on" if _truthy(os.environ.get("RUN_SFTP")) else "off"
+    os.environ["VAULT_COMBINED_SFTP"] = value
+    return value
+
+
 def _wait_api_ready(timeout: float = 60.0) -> bool:
     """Poll the API's /health until it answers, so the SFTP server starts only AFTER the
     API's lifespan has created/migrated the schema the SFTP path reads. Returns False on
@@ -295,9 +312,10 @@ def main() -> None:
     # and drop — safe — but starting the writer first captures early startup lines too).
     _init_sink()
     threading.Thread(target=_sink_writer_loop, daemon=True).start()
-    # Both markers must run BEFORE the first spawn — _spawn snapshots os.environ per child.
+    # The markers must run BEFORE the first spawn — _spawn snapshots os.environ per child.
     mark_sink_active()
     mark_sftp_in_container()
+    mark_combined_sftp()
     # Start the API first — its lifespan runs the schema create/migrations the SFTP
     # server relies on.
     _spawn("app.api.api_server", "web")

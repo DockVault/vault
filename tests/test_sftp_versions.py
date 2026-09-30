@@ -28,9 +28,13 @@ pytestmark = pytest.mark.unit
 
 _ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 12, 1, 12, 0, 0)
+# The web process's environment in each layout. The split profile and the trial compose start the web
+# app on its own, beside an SFTP container; the trial compose does so with .env.example's values, which
+# name the combined profile and leave RUN_SFTP empty. run_combined.py marks what it starts.
 SPLIT = {"COMPOSE_PROFILES": "split", "RUN_SFTP": ""}
-COMBINED_WITH_SFTP = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": "1"}
-NO_SFTP = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": ""}
+TRIAL = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": ""}
+COMBINED_WITH_SFTP = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": "1", SV.COMBINED_SFTP_ENV: "on"}
+NO_SFTP = {"COMPOSE_PROFILES": "combined", "RUN_SFTP": "", SV.COMBINED_SFTP_ENV: "off"}
 
 
 @pytest.fixture
@@ -59,7 +63,7 @@ def _check(factory, environ, version="0.34.0"):
 
 # --------------------------------------------------------------------------- the answer
 
-@pytest.mark.parametrize("environ", [SPLIT, COMBINED_WITH_SFTP, NO_SFTP])
+@pytest.mark.parametrize("environ", [SPLIT, TRIAL, COMBINED_WITH_SFTP, NO_SFTP])
 def test_an_older_sftp_process_registered_and_live_means_no(factory, environ):
     db = factory()
     _row(db, "0.34.0", 10)
@@ -70,11 +74,13 @@ def test_an_older_sftp_process_registered_and_live_means_no(factory, environ):
     assert "another version is running (0.33.9)" in check.explain()
 
 
-@pytest.mark.parametrize("environ", [SPLIT, COMBINED_WITH_SFTP])
+@pytest.mark.parametrize("environ", [SPLIT, TRIAL, COMBINED_WITH_SFTP])
 def test_none_registered_while_the_deployment_runs_sftp_means_no(factory, environ):
+    # TRIAL is the trial compose: an SFTP container runs beside the web one whatever .env says, and one of
+    # an older release never records itself. Answering "off" there would let the change through.
     check = _check(factory, environ)
     assert (check.ok, check.reason) == (False, SV.NONE_LIVE)
-    assert "has not reported its version" in check.explain()
+    assert "No SFTP server has reported its version" in check.explain()
 
 
 def test_only_stale_rows_count_as_none(factory):
@@ -83,6 +89,7 @@ def test_only_stale_rows_count_as_none(factory):
     _row(db, "0.33.9", SV.LIVE_WITHIN_SECONDS + 60)
     db.close()
     assert _check(factory, SPLIT).reason == SV.NONE_LIVE
+    assert _check(factory, TRIAL).reason == SV.NONE_LIVE
     assert _check(factory, NO_SFTP) == SV.VersionCheck(True, SV.OFF)
 
 
@@ -91,7 +98,7 @@ def test_the_same_version_everywhere_means_yes(factory):
     _row(db, "0.34.0", 5, pid="a")
     _row(db, "0.34.0", SV.LIVE_WITHIN_SECONDS - 1, pid="b")
     db.close()
-    for environ in (SPLIT, COMBINED_WITH_SFTP, NO_SFTP):
+    for environ in (SPLIT, TRIAL, COMBINED_WITH_SFTP, NO_SFTP):
         check = _check(factory, environ)
         assert (check.ok, check.reason, check.versions) == (True, SV.SAME, ("0.34.0",))
 
@@ -102,14 +109,39 @@ def test_sftp_off_and_nothing_registered_means_yes(factory):
 
 
 @pytest.mark.parametrize("environ,runs", [
-    ({}, False),
-    ({"RUN_SFTP": "1"}, True), ({"RUN_SFTP": "true"}, True), ({"RUN_SFTP": "0"}, False),
-    ({"COMPOSE_PROFILES": "split"}, True), ({"COMPOSE_PROFILES": " Split "}, True),
-    ({"COMPOSE_PROFILES": "combined"}, False), ({"COMPOSE_PROFILES": "combined,split"}, True),
-    ({"COMPOSE_PROFILES": "splitter"}, False),
+    # A web process that run_combined.py did not start: an SFTP container may run beside it, whatever
+    # RUN_SFTP and COMPOSE_PROFILES say.
+    ({}, True), (SPLIT, True), (TRIAL, True), ({"RUN_SFTP": "0"}, True), ({"COMPOSE_PROFILES": "combined"}, True),
+    # Started by run_combined.py, which says whether it started SFTP beside it.
+    (NO_SFTP, False), ({SV.COMBINED_SFTP_ENV: " Off "}, False), (COMBINED_WITH_SFTP, True),
+    ({SV.COMBINED_SFTP_ENV: ""}, True), ({SV.COMBINED_SFTP_ENV: "0"}, True), ({SV.COMBINED_SFTP_ENV: "no"}, True),
 ])
 def test_whether_the_deployment_runs_sftp(environ, runs):
     assert SV.deployment_runs_sftp(environ) is runs
+
+
+def test_the_combined_launcher_says_whether_it_starts_sftp_and_the_web_app_reads_it(monkeypatch):
+    import importlib
+    import os
+    import sys
+    sys.path.insert(0, str(_ROOT))
+    run_combined = importlib.import_module("run_combined")
+    monkeypatch.setenv(SV.COMBINED_SFTP_ENV, "")          # so monkeypatch restores whatever the test writes
+    monkeypatch.setenv("RUN_SFTP", "")
+    assert run_combined.mark_combined_sftp() == "off"
+    assert SV.deployment_runs_sftp(os.environ) is False
+    # A value inherited from outside never stands: the launcher writes its own every time.
+    monkeypatch.setenv("RUN_SFTP", "1")
+    assert run_combined.mark_combined_sftp() == "on"
+    assert os.environ[SV.COMBINED_SFTP_ENV] == "on"
+    assert SV.deployment_runs_sftp(os.environ) is True
+    monkeypatch.setenv("RUN_SFTP", "")
+    monkeypatch.setenv(SV.COMBINED_SFTP_ENV, "on")
+    assert run_combined.mark_combined_sftp() == "off"
+    # ...and it does so before the first child is started, which takes a copy of the environment.
+    src = inspect.getsource(run_combined.main)
+    assert src.count("mark_combined_sftp()") == 1
+    assert src.index("mark_combined_sftp()") < src.index("_spawn(")
 
 
 def test_the_version_is_the_images_own_not_the_brands(monkeypatch):
