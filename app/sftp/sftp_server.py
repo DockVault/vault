@@ -2581,6 +2581,12 @@ def start_sftp_server():
     from app.core import settings_registry
     settings_registry.start(load_now=False)
 
+    # Which version this process runs, recorded in the database now and while it runs, on a thread of its
+    # own, so the web app can tell whether every SFTP process runs its version (app/core/sftp_versions.py).
+    from app.core.sftp_versions import Recorder
+    version_recorder = Recorder()
+    version_recorder.start()
+
     # The write-progress watchdog (0 disables it). See _WriteProgressWatchdog.
     if settings.sftp_write_progress_timeout_seconds and settings.sftp_write_progress_timeout_seconds > 0:
         threading.Thread(target=_write_progress.run, daemon=True, name="sftp-write-progress").start()
@@ -2683,6 +2689,7 @@ def start_sftp_server():
         server_socket.close()
     except Exception:  # noqa: BLE001
         pass
+    version_recorder.stop()
     safe_event('server.stopped')
 
 

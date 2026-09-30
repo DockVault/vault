@@ -1278,6 +1278,19 @@ class ManagedSetting(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class SftpProcess(Base):
+    """An SFTP server process and the version it runs (app/core/sftp_versions.py): recorded when it starts
+    and refreshed while it runs, so the web app can tell whether every live SFTP process runs its own
+    version. ``host`` is the container's host name. Created by create_all; an older release ignores it."""
+    __tablename__ = 'sftp_processes'
+
+    id = Column(String(36), primary_key=True)
+    version = Column(String(32), nullable=False)
+    host = Column(String(255), nullable=True)
+    started_at = Column(DateTime, nullable=False)
+    seen_at = Column(DateTime, nullable=False, index=True)
+
+
 class UserPreference(Base):
     """Per-user UI preferences (light/dark theme, accent, background, skin) so a
     user's look-and-feel follows their ACCOUNT across browsers and devices instead

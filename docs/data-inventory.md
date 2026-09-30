@@ -117,6 +117,10 @@ account and group ids that may use a tag.
 manages within the deployment's limits, one row per setting, with the id and username of whoever set
 each one last and when. A row is overwritten by the next change and never deleted.
 
+`sftp_processes` (new in 0.34.0) holds each running SFTP server process's version and its container's
+host name, refreshed every 30 seconds; it holds no personal data. A process removes its row when it
+stops, and rows not refreshed for 7 days are removed.
+
 ### The audit log
 
 Each row of `audit_logs` holds:
