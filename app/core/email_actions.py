@@ -198,6 +198,19 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "encryption_key_notice": {
+        "name": "Encryption key notice",
+        "subject": "About the encryption keys of your {{vault.name}} account",
+        "body_html": (
+            "<h2>About your encryption keys</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>If you did not expect this, contact your administrators.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -233,6 +246,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
      SYSTEM),
+    ("encryption_key_notice", "Encryption key notice",
+     "Sent to a user when a change to a zero-knowledge vault's key was refused because it did not come with "
+     "their own encryption key (at most once an hour), when an encryption key is set up for their account, "
+     "and to a vault's managers when its owner resets its key — says what happened and when.", SYSTEM),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(

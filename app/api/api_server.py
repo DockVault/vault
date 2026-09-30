@@ -15800,16 +15800,18 @@ async def list_shared_with_me(
 # ---------------------------------------------------------------------------
 
 def _notify_users(user_ids, ntype: str, title: str, body: str = None,
-                  target: str = None, dedup_prefix: str = None) -> None:
+                  target: str = None, dedup_prefix: str = None) -> list:
     """Best-effort: create an in-app notification for each user in a SEPARATE session, so a failure
     or a dedup collision can never affect the caller's request/transaction. When dedup_prefix is
     given, each row's dedup_key is f"{dedup_prefix}:{user_id}" and a UNIQUE(user_id, dedup_key)
-    collision is silently skipped (that user was already notified for this event)."""
+    collision is silently skipped (that user was already notified for this event). Returns the ids of
+    the users a notification was written for (none after a failure), so a caller can send an email only
+    to the people the deduplicated notice reached."""
     from app.core.database import get_db_context
     from app.core.models import Notification
     ids = [str(u) for u in dict.fromkeys(user_ids) if u]  # de-dup + drop falsy, preserve order
     if not ids:
-        return
+        return []
     notified = []
     try:
         with get_db_context() as db:
@@ -15836,6 +15838,8 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
                           include_metrics=False)
     except Exception as e:
         print(f"⚠ notification write skipped: {type(e).__name__}")
+        return []
+    return notified
 
 
 def _notification_dict(n) -> dict:
@@ -24821,6 +24825,10 @@ END $$;""",
             # so the vault still owes a rotation after the account's key rows are gone. Nullable, no
             # default: nothing is owed on an existing vault, and an older release ignores the column.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS rotation_owed_epoch INTEGER",
+            # Whether an account's encryption key was set up within 14 days after an administrator changed
+            # its sign-in details, shown beside the key when a vault is shared with the account. Nullable,
+            # no default: unknown for a key set up before, and an older release ignores the column.
+            "ALTER TABLE user_keypairs ADD COLUMN IF NOT EXISTS registered_after_admin_change BOOLEAN",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

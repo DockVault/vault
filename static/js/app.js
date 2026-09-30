@@ -18394,11 +18394,60 @@ function renderVaultGrantList() {
         nameEl.className = 'cell-user-name';
         nameEl.textContent = u.username || '';
         textWrap.appendChild(nameEl);
+        if (isZkVault(state.currentVault)) {
+            const keyInfo = document.createElement('div');
+            keyInfo.className = 'grant-key-info';
+            textWrap.appendChild(keyInfo);
+            cb.addEventListener('change', () => {
+                if (cb.checked) { showGrantRecipientKey(u.id, keyInfo); return; }
+                keyInfo.dataset.seq = String(Number(keyInfo.dataset.seq || 0) + 1);  // drops a lookup in flight
+                keyInfo.replaceChildren();
+            });
+        }
         label.append(cb, avatar, textWrap);
         frag.appendChild(label);
     }
     listEl.replaceChildren(frag);
     updateVaultGrantCount();
+}
+
+// A zero-knowledge vault is shared with a person's encryption key, and whoever sets up an account's key
+// first owns it. So for each person ticked, the dialog shows their key's fingerprint -- the one they see
+// under "Your account" -- and when it was set up, and flags a key set up within 14 days after an
+// administrator changed that account's sign-in details: that key may be someone else's.
+async function showGrantRecipientKey(userId, box) {
+    const seq = String(Number(box.dataset.seq || 0) + 1);
+    box.dataset.seq = seq;
+    const shown = document.createElement('div');
+    shown.className = 'text-xs text-tertiary';
+    shown.textContent = 'Looking up their encryption key…';
+    box.replaceChildren(shown);
+    let pk = null;
+    try {
+        pk = await apiRequest(`/ecc/users/${encodeURIComponent(userId)}/public-key`, { silent: true });
+    } catch (_) {
+        if (box.dataset.seq === seq) shown.textContent = "Their encryption key could not be looked up.";
+        return;
+    }
+    if (box.dataset.seq !== seq) return;   // unticked (or ticked again) while this was on its way
+    if (!pk || !pk.has_keypair || !pk.public_key) {
+        shown.textContent = 'No encryption key yet: they get the vault once they set one up.';
+        return;
+    }
+    const fingerprint = await zkKeyFingerprint(pk.public_key);
+    if (box.dataset.seq !== seq) return;
+    const setUp = parseServerTime(pk.registered_at);
+    shown.textContent = `Key ${fingerprint}` + (setUp ? `, set up ${setUp.toLocaleDateString()}` : '');
+    shown.setAttribute('data-key-fingerprint', fingerprint);
+    if (pk.registered_after_admin_change === true) {
+        const flag = document.createElement('div');
+        flag.className = 'text-xs text-warning grant-key-flag';
+        flag.setAttribute('role', 'note');
+        flag.textContent = "Set up within 14 days after an administrator changed this account's sign-in "
+            + 'details. Whoever sets up a key first owns it: check this fingerprint with the person before '
+            + 'sharing.';
+        box.appendChild(flag);
+    }
 }
 
 function updateVaultGrantCount() {

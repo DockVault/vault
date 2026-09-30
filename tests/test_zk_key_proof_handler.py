@@ -81,7 +81,12 @@ def world(monkeypatch):
     monkeypatch.setattr(E, "_ecc_rate_limit", lambda *a, **k: None)
     audit = []
     monkeypatch.setattr(E, "_audit_zk", lambda db, actor, action, **kw: audit.append((action, kw.get("details"))))
-    state = {"enforce": True, "step_ups": []}
+    state = {"enforce": True, "step_ups": [], "told": []}
+    # Who the notices would tell (app/services/zk_notices.py is exercised in test_zk_notices.py).
+    monkeypatch.setattr(E.zk_notices, "failed_identity_proof",
+                        lambda db, user: state["told"].append(("failed_identity_proof", str(user.id))))
+    monkeypatch.setattr(E.zk_notices, "owner_reset",
+                        lambda db, owner, vault: state["told"].append(("owner_reset", str(vault.id))))
     monkeypatch.setattr(E.zk_key_proof, "enforcement_enabled", lambda: state["enforce"])
     # The owner reset's step-up (the account's second factor) is exercised live; here it is recorded, or
     # made to refuse, to see where it runs.
@@ -115,6 +120,10 @@ class World:
 
     def enforce(self, on: bool):
         self._state["enforce"] = on
+
+    @property
+    def told(self):
+        return self._state["told"]
 
     # ------------------------------------------------------------------ people and vaults
     def person(self, s, role=RoleEnum.USER):
@@ -1136,3 +1145,41 @@ def test_with_enforcement_off_a_share_without_a_proof_still_replaces_no_one(worl
     before = _wrap_of(world, vid, manager)
     out = _share(world, vid, owner, manager)
     assert out["unchanged"] is True and _wrap_of(world, vid, manager) == before
+
+
+# ------------------------------------------------------------------ who is told
+
+def test_only_a_failed_identity_proof_tells_the_account_it_was_made_for(world):
+    """A wrong identity MAC means a session for the account without the account's key: its user is told. A
+    wrong current-key or new-key MAC, or no live challenge, is not that, and tells nobody."""
+    vid, owner, manager, proof_key = world.direct_vault()
+    target = world.new_person()
+    body = _share_body(target)
+    raw = _serialize(body)
+    ch = world.challenge(manager, vid, "share")
+    header = world.prove(ch, manager, vid, "share", raw, current_key=ec.generate_private_key(ec.SECP384R1()))
+    world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.GrantMemberKeyRequest(**body))
+    world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.GrantMemberKeyRequest(**body))
+    assert world.failures() == ["current_key", "no_live_challenge"] and world.told == []
+    ch = world.challenge(manager, vid, "share")
+    header = world.prove(ch, manager, vid, "share", raw, current_key=proof_key,
+                         identity_key=ec.generate_private_key(ec.SECP384R1()))
+    world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.GrantMemberKeyRequest(**body))
+    assert world.told == [("failed_identity_proof", str(manager))]
+
+
+def test_an_owner_reset_tells_the_managers_and_a_rotation_does_not(world):
+    reset_vid, owner, manager = _damaged_direct_vault(world)
+    body, raw, header = _reset_request(world, reset_vid, owner, owner, manager)
+    out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(reset_vid), request=E.RekeyRequest(**body))
+    assert out["status"] == "ok" and world.told == [("owner_reset", str(reset_vid))]
+    vid, owner, manager, proof_key = world.direct_vault()
+    new_key, material = _direct_material()
+    body = _rekey_body(owner, manager, material)
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "rekey")
+    header = world.prove(ch, owner, vid, "rekey", raw, current_key=proof_key, new_pem=material["public_key"],
+                         new_key=new_key)
+    out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert out["status"] == "ok" and world.told == [("owner_reset", str(reset_vid))]
+

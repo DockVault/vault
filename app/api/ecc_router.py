@@ -23,6 +23,7 @@ from app.services import ecc_pop, ecc_update_pop
 from app.services import zk_key_proof
 from app.core import fixed_step_up
 from app.core.second_factor_actions import OWNER_KEY_RESET
+from app.services import zk_notices
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
 from app.core.rate_limiter import rate_limiter as _rate_limiter, retry_after_seconds
@@ -606,6 +607,10 @@ async def register_public_key(
         # substituted / not-held key can't be registered. Raises 400 on missing/invalid/expired.
         _verify_registration_pop(db, current_user, request)
 
+        # A key set up within 14 days after an administrator changed the account's sign-in details may be
+        # someone else's: whoever sets up the key first owns it. Recorded now, while the record of the change
+        # still exists, so the share dialog can say so for as long as the key lives.
+        from app.core import credential_changes as _cc
         keypair = UserKeyPair(
             user_id=current_user.id,
             public_key=request.public_key,
@@ -614,7 +619,8 @@ async def register_public_key(
             fingerprint=fingerprint,
             version=1,
             created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc)
+            updated_at=datetime.now(timezone.utc),
+            registered_after_admin_change=_cc.last_applied(db, current_user.id) is not None,
         )
         db.add(keypair)
         db.commit()
@@ -635,6 +641,9 @@ async def register_public_key(
         _audit_zk(db, current_user, "zk_keypair_registered",
                   resource_id=current_user.id, resource_type="user",
                   details={"fingerprint": fingerprint})
+        # Whoever sets up an account's key first owns it: the account's user is told, so a key they did
+        # not set up themselves does not go unnoticed.
+        zk_notices.key_registered(db, current_user)
 
         return KeypairRegisterResponse(
             message="Public key registered successfully",
@@ -1786,6 +1795,9 @@ def _verify_key_proof(db: Session, user: User, ch: _IssuedChallenge, header, *, 
     if failed:
         db.rollback()
         _audit_key_proof_failed(db, user, vault_id, ch.op, failed, ch)
+        if failed == "identity":
+            # A session for this account without the account's own key: its user is told (at most once an hour).
+            zk_notices.failed_identity_proof(db, user)
         raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
 
 
@@ -1920,6 +1932,10 @@ async def get_user_public_key(
         "public_key": kp.public_key,
         "fingerprint": kp.fingerprint,
         "has_keypair": True,
+        # When the key was set up, and whether that was within 14 days after an administrator changed the
+        # account's sign-in details (null: set up before this was recorded). Shown in the share dialog.
+        "registered_at": kp.created_at.isoformat() if kp.created_at else None,
+        "registered_after_admin_change": kp.registered_after_admin_change,
     }
 
 
@@ -2682,6 +2698,8 @@ async def rekey_vault(
             "proof": _proof_detail(ch, owner_reset)})
         if ch is None:
             _audit_key_proof_absent(db, current_user, vault_id, "rekey", "hierarchical")
+        if owner_reset:
+            zk_notices.owner_reset(db, current_user, locked)
         return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version,
                 "team_key_version": getattr(locked, 'team_key_version', 1)}
 
@@ -2736,6 +2754,8 @@ async def rekey_vault(
         "proof": _proof_detail(ch, owner_reset)})
     if ch is None:
         _audit_key_proof_absent(db, current_user, vault_id, "rekey", "direct")
+    if owner_reset:
+        zk_notices.owner_reset(db, current_user, locked)
     return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version}
 
 
