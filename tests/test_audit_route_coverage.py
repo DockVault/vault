@@ -2,9 +2,10 @@
 
 The scan reads app/ as source (no app import). A route is a function decorated with a POST, PUT, PATCH or
 DELETE route. It records itself when its body calls an AuditLogger method (a log_... method, or build_row
-for a row committed with the route's own change), or a function of the same module that does (followed to
-any depth). A route that records nothing must be in NOT_RECORDED with a
-reason, so a new route cannot quietly join them.
+for a row committed with the route's own change), or a function that does (followed to any depth): one of
+the same module called by name, or one of another app module called through that module
+(``from app.core import setting_changes`` ... ``setting_changes.request(...)``). A route that records
+nothing must be in NOT_RECORDED with a reason, so a new route cannot quietly join them.
 
 What it cannot see: which path writes. A route that records only its failures (or only one of two
 branches) counts as recording; those are covered by the live tests of the rows themselves.
@@ -84,29 +85,58 @@ LOGGER_METHODS = _logger_methods()
 
 
 def _names_used(fn):
-    """Attribute names and called function names inside fn."""
-    attrs, calls = set(), set()
+    """Attribute names, called function names, and (module alias, function) pairs used inside fn."""
+    attrs, calls, through = set(), set(), set()
     for node in ast.walk(fn):
         if isinstance(node, ast.Attribute):
             attrs.add(node.attr)
+            if isinstance(node.value, ast.Name):
+                through.add((node.value.id, node.attr))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             calls.add(node.func.id)
-    return attrs, calls
+    return attrs, calls, through
+
+
+def _app_module_aliases(tree):
+    """{alias: module path relative to ROOT} for every app module the file imports as a module."""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app"):
+            for name in node.names:
+                target = (ROOT / Path(*f"{node.module}.{name.name}".split("."))).with_suffix(".py")
+                if target.is_file():
+                    aliases[name.asname or name.name] = target.relative_to(ROOT).as_posix()
+        elif isinstance(node, ast.Import):
+            for name in node.names:
+                target = (ROOT / Path(*name.name.split("."))).with_suffix(".py")
+                if name.name.startswith("app.") and name.asname and target.is_file():
+                    aliases[name.asname] = target.relative_to(ROOT).as_posix()
+    return aliases
 
 
 def _scan():
     routes, unrecorded = [], []
+    modules = {}
     for path in sorted(APP.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         rel = path.relative_to(ROOT).as_posix()
         funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        used = {f.name: _names_used(f) for f in funcs}
-        writers = {name for name, (attrs, _calls) in used.items() if attrs & LOGGER_METHODS}
-        while True:   # a function that calls a writer of the same module writes too
-            more = {name for name, (_a, calls) in used.items() if name not in writers and calls & writers}
-            if not more:
-                break
-            writers |= more
+        modules[rel] = (funcs, {f.name: _names_used(f) for f in funcs}, _app_module_aliases(tree))
+    writers = {(rel, name) for rel, (_f, used, _al) in modules.items()
+               for name, (attrs, _c, _t) in used.items() if attrs & LOGGER_METHODS}
+    while True:   # a function that calls a writer, by name in its module or through another module, writes
+        more = set()
+        for rel, (_funcs, used, aliases) in modules.items():
+            for name, (_attrs, calls, through) in used.items():
+                if (rel, name) in writers:
+                    continue
+                if any((rel, c) in writers for c in calls) or any(
+                        (aliases[alias], fn) in writers for alias, fn in through if alias in aliases):
+                    more.add((rel, name))
+        if not more:
+            break
+        writers |= more
+    for rel, (funcs, _used, _aliases) in modules.items():
         for fn in funcs:
             for dec in fn.decorator_list:
                 if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
@@ -114,7 +144,7 @@ def _scan():
                         and isinstance(dec.args[0], ast.Constant)):
                     key = (rel, f"{dec.func.attr.upper()} {dec.args[0].value}")
                     routes.append(key)
-                    if fn.name not in writers:
+                    if (rel, fn.name) not in writers:
                         unrecorded.append(key)
     return routes, unrecorded
 
@@ -133,6 +163,12 @@ def test_every_mutating_route_writes_an_audit_row_or_says_why_not():
     missing = sorted(set(UNRECORDED) - set(NOT_RECORDED))
     assert not missing, ("these routes change something and write no audit row; record the change, "
                          f"or list the route in NOT_RECORDED with the reason: {missing}")
+
+
+def test_a_route_that_records_through_another_modules_function_is_seen_to_record():
+    for route in (("app/api/managed_settings_router.py", "PUT /settings/managed/{key}"),
+                  ("app/api/managed_settings_router.py", "POST /settings/managed/changes/{change_id}/cancel")):
+        assert route in ROUTES and route not in UNRECORDED, route
 
 
 def test_the_list_holds_only_routes_that_exist_and_record_nothing():

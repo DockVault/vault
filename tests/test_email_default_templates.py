@@ -22,7 +22,8 @@ _REQUIRED_TOKEN = {"email_change": "action.code",
                    "password_reset": "action.link",
                    "account_invite": "action.link",
                    "account_changed_by_admin": "action.change",
-                   "administrator_added": "action.change"}
+                   "administrator_added": "action.change",
+                   "retention_change": "action.change"}
 
 
 def test_every_action_has_a_default_template():

@@ -60,7 +60,12 @@ def is_admin_action(key: str) -> bool:
 # them, with the usual receipt and 403 shape, so the web app's step-up prompt and retry work unchanged. A
 # route guards one with app.core.fixed_step_up.guard(key), called inside its body, and the boot contract
 # refuses to start while one is guarded by no route.
-FIXED_STEP_UP_ACTIONS: dict = {}
+FIXED_STEP_UP_ACTIONS: dict = {
+    # How long records are kept (app/api/managed_settings_router.py): the password every time, plus any second
+    # factor the account has enrolled, so an install with one administrator and no second factor can still
+    # manage it.
+    "admin.retention.write": ("Change how long records are kept", "password_always"),
+}
 
 
 def fixed_policy(key: str):

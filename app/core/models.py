@@ -1278,6 +1278,35 @@ class ManagedSetting(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class ManagedSettingChange(Base):
+    """A change of a managed setting that deletes data sooner, waiting before it applies
+    (app/core/setting_changes.py), and how it ended.
+
+    ``setting`` is what the administrator asked for (NULL: back to the deployment's value); ``old_value`` and
+    ``new_value`` the values in force before it and once it applies, as they stood when it was asked for.
+    ``status`` is pending, applied, cancelled or superseded; ``reason`` says why one that did not apply ended.
+    Any administrator may cancel a pending change. Rows are kept: they are the record of every such change,
+    alongside the audit log. Created by create_all; an older release ignores it, and a pending change then
+    waits until the next upgrade.
+    """
+    __tablename__ = 'managed_setting_changes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key = Column(String(64), nullable=False, index=True)
+    setting = Column(JSON, nullable=True)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    status = Column(String(16), nullable=False, index=True)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=True)
+    requested_at = Column(DateTime, nullable=False)
+    effective_at = Column(DateTime, nullable=False, index=True)
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    reason = Column(String(255), nullable=True)
+
+
 class SftpProcess(Base):
     """An SFTP server process and the version it runs (app/core/sftp_versions.py): recorded when it starts
     and refreshed while it runs, so the web app can tell whether every live SFTP process runs its own

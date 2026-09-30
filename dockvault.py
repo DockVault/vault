@@ -246,6 +246,12 @@ import tempfile # noqa: E402
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
 REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
 
+# The .env limits on how long records are kept, as (config key, .env name, the app's default): written
+# only when they differ from the default, and kept across a fresh volume set (see .env.example).
+RETENTION_ENV_KEYS = (
+    ("retention_reduction_delay_days", "RETENTION_REDUCTION_DELAY_DAYS", "7"),
+)
+
 # Admin-password rules mirror the app's startup guard (app/core/config.py): the shipped placeholder
 # is refused everywhere; a reachable (non-development) deploy also rejects a known-weak value or one
 # under 12 chars. A BLANK password is allowed (the post-bootstrap no-op).
@@ -500,6 +506,11 @@ def build_env_lines(cfg):
     # install's .env never mentions it, and kept across a fresh volume set.
     if str(cfg.get("settings_locked_keys") or "").strip():
         bare("SETTINGS_LOCKED_KEYS", "'%s'" % str(cfg["settings_locked_keys"]).strip())
+    # The limits on how long records are kept (see .env.example). Written only when they differ from the
+    # app's defaults, so an install that never mentions them authors the .env it always did.
+    for _cfg_key, _env_name, _default in RETENTION_ENV_KEYS:
+        if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
+            bare(_env_name, str(cfg[_cfg_key]).strip())
     # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
     # decoupled from the JWT secret (the app falls back to the JWT secret only when this is absent).
     if cfg.get("invite_token_pepper"):
@@ -1273,6 +1284,9 @@ def new_set_config(current_env, new_prefix, new_id):
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
         # The settings the deployment locks against the admin panel.
         "settings_locked_keys": (current_env.get("SETTINGS_LOCKED_KEYS") or "").strip() or None,
+        # And its limits on how long records are kept.
+        **{cfg_key: (current_env.get(env_name) or "").strip() or None
+           for cfg_key, env_name, _default in RETENTION_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.

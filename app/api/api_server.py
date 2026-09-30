@@ -4221,6 +4221,32 @@ def require_step_up(action: str):
     return decorator
 
 
+# A value longer than this is recorded in the settings audit by its digest and length, not as itself.
+_SETTINGS_AUDIT_TEXT_MAX = 200
+
+
+def _settings_value_for_audit(key, value):
+    """How the settings audit records ``value`` of ``key``: a secret only as whether it is set, a long text
+    (an image, a template) by its SHA-256 and length, anything else as itself."""
+    if key in _SETTINGS_SENSITIVE:
+        return "(set)" if value not in (None, "") else None
+    if isinstance(value, str) and len(value) > _SETTINGS_AUDIT_TEXT_MAX:
+        return {"sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(), "length": len(value)}
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, sort_keys=True, default=str)
+        if len(text) > _SETTINGS_AUDIT_TEXT_MAX:
+            return {"sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "length": len(text)}
+    return value
+
+
+def _settings_changes_for_audit(existing: dict, merged: dict) -> dict:
+    """{key: {"old": ..., "new": ...}} for every key a settings save changed, each value as the audit
+    records it (_settings_value_for_audit)."""
+    return {key: {"old": _settings_value_for_audit(key, existing.get(key)),
+                  "new": _settings_value_for_audit(key, merged.get(key))}
+            for key in sorted(merged) if existing.get(key) != merged.get(key)}
+
+
 @app.put("/settings")
 async def update_settings(
     payload: dict,
@@ -4266,7 +4292,22 @@ async def update_settings(
         # Shared writer (also used by asset uploads): non-empty sets, empty
         # clears -> env default. Values were validated by _validate_brand_overrides above.
         set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
-    db.commit()
+    # The audit row, with each changed key's values before and after, commits with the change or neither
+    # does: a save whose record cannot be written is not made.
+    try:
+        db.add(AuditLogger(db).build_row(
+            action="settings_updated",
+            status="success",
+            user=current_user,
+            ip_address=get_client_ip(request),
+            details={"keys": sorted((payload or {}).keys()),
+                     "changes": _settings_changes_for_audit(existing, merged)},
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="The settings were not saved: their audit record could not "
+                                                    "be written. Nothing was changed.")
     if (
         _api_rate_limit_policy_cache is not None
         and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
@@ -4281,16 +4322,6 @@ async def update_settings(
     if "max_file_size" in (payload or {}):
         from app.core import body_limit as _body_limit
         _body_limit.forget_largest_file()
-    try:
-        AuditLogger(db).log_action(
-            action="settings_updated",
-            status="success",
-            user=current_user,
-            ip_address=get_client_ip(request),
-            details={"keys": sorted((payload or {}).keys())},
-        )
-    except Exception:
-        pass  # never fail the save just because the audit write did
     return {"status": "ok"}
 
 

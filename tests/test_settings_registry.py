@@ -58,6 +58,7 @@ def clean(monkeypatch):
     for table, _ in saved:
         table.clear()
     reg._CONTRACTS.clear()
+    env.release_specs = saved                          # what a test of the release's own specs puts back
     yield env
     for table, before in saved:
         table.clear()
@@ -343,9 +344,11 @@ def test_put_settings_still_takes_other_keys(clean):
 
 
 @pytest.mark.parametrize("key", sorted(reg.refused_settings_keys()) or ["(none registered)"])
-def test_put_settings_refuses_every_key_the_registry_holds(key):
+def test_put_settings_refuses_every_key_the_registry_holds(clean, key):
     if key == "(none registered)":
         pytest.skip("no setting is registered yet")
+    for table, before in clean.release_specs:
+        table.update(before)
     refused = _refused({key: None})
     assert refused is not None and refused.status_code == 400
 

@@ -430,6 +430,10 @@ class Settings(BaseSettings):
     # loads its recent activity (AuditLogger.cleanup_old_audit_logs). The app only adds rows and
     # deletes old ones; the table is an ordinary one that anyone with database access can change.
     audit_log_retention_days: int = Field(default=0)
+    # How long records are kept is managed in the panel (app/core/settings_registry.py), within the limits
+    # set here. A change there that makes records be deleted sooner waits this many days before it takes
+    # effect (1-90); any administrator can cancel it meanwhile (app/core/setting_changes.py).
+    retention_reduction_delay_days: int = Field(default=7)
     
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
     # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old

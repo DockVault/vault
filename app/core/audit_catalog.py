@@ -235,6 +235,13 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
     # A managed setting (app/core/settings_registry.py): the row carries the values before and after.
     AuditAction("setting_changed", "administration", "Managed setting changed", "notice"),
+    # A change that deletes records sooner waits (app/core/setting_changes.py): asked for, cancelled by any
+    # administrator (or kept at the value in force), and applied by the server once it is due.
+    AuditAction("setting_change_applied", "administration", "Waiting setting change applied", "warning",
+                automatic=True),
+    AuditAction("setting_change_cancelled", "administration", "Waiting setting change cancelled", "notice"),
+    AuditAction("setting_change_requested", "administration", "Setting change that deletes records sooner requested",
+                "warning"),
     AuditAction("settings_updated", "administration", "Settings changed", "notice"),
     AuditAction("share_tag_created", "administration", "Share tag created", "notice"),
     AuditAction("share_tag_deactivated", "administration", "Share tag deactivated", "notice"),

@@ -74,7 +74,7 @@ SOURCE_ADMIN = "admin"
 SOURCE_LOCKED = "locked"
 
 # The modules that register specs, imported the first time the registry is read.
-SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings",)
+SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes")
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
 ENV_ONLY_KEYS: frozenset[str] = frozenset()
@@ -119,6 +119,8 @@ class SettingSpec:
     label: str = ""
     help: str = ""
     since: str = ""
+    # What a number counts ("days", "MB"), for the text that names a value.
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -323,12 +325,18 @@ def clamp(spec: SettingSpec, value, floor, ceiling):
     return value
 
 
-def _shown(spec: SettingSpec, value) -> str:
+def shown(spec: SettingSpec, value) -> str:
+    """``value`` of ``spec`` in words: "no limit", "on" or "off", or the number and its unit."""
     if spec.unlimited is not None and value == spec.unlimited:
         return "no limit"
     if isinstance(value, bool):
         return "on" if value else "off"
-    return str(value)
+    if isinstance(value, list):
+        return ", ".join(map(str, value)) or "none"
+    return f"{value} {spec.unit}" if spec.unit else str(value)
+
+
+_shown = shown
 
 
 def check_bounds(spec: SettingSpec, value, settings=None) -> Optional[str]:
@@ -442,7 +450,8 @@ def describe(keys: Optional[Iterable[str]] = None) -> list[dict]:
         rows.append({
             "key": spec.key, "group": spec.group, "label": spec.label, "help": spec.help, "since": spec.since,
             "kind": spec.kind, "choices": list(spec.choices), "min": spec.minimum, "max": spec.maximum,
-            "unlimited": spec.unlimited, "floor": floor, "ceiling": ceiling, "editable": spec.editable,
+            "unlimited": spec.unlimited, "unit": spec.unit, "floor": floor, "ceiling": ceiling,
+            "editable": spec.editable,
             "lockable": spec.lockable, "locked": is_locked(spec, settings), "reduction": spec.reduction,
             "value": value, "source": source, "clamped": clamped, "deployment": deployment,
             "deployment_source": deployment_source, "stored": admin,
