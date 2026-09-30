@@ -240,6 +240,37 @@ def test_a_proof_authorizes_exactly_one_request(admin, people):
         oc.delete_vault(other_vid)
 
 
+def test_twenty_shares_of_one_vault_at_once_all_go_through(admin, people):
+    """A bulk share proves one share per person, all at once and all on the same vault: its challenges are
+    for the same vault and operation, and must not evict one another; each share then takes the vault's
+    lock in turn. Every one of twenty goes through, and none is recorded as a failed proof."""
+    owner, oc = people("kpbulk")
+    targets = [people("kpbkt")[0] for _ in range(20)]
+    vid = _direct_vault(oc, admin)
+    path = f"/ecc/vaults/{vid}/members"
+
+    def as_owner():
+        """The owner's session on a connection of its own, as the browser's parallel requests are."""
+        worker = ApiClient()
+        worker.token, worker.user = oc.token, oc.user
+        worker.session.headers.update({"Authorization": f"Bearer {oc.token}"})
+        return worker
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+            prepared = list(pool.map(lambda t: harness.prepare_zk(as_owner(), path, _share_body(t["id"])), targets))
+        assert [p["challenge_status"] for p in prepared] == [200] * 20
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+            responses = list(pool.map(lambda p: harness.send_prepared(as_owner(), path, p), prepared))
+        assert [r.status_code for r in responses] == [200] * 20, [r.text[:120] for r in responses]
+        granted = ", ".join(f"'{t['id']}'" for t in targets)
+        assert _psql(f"SELECT count(*) FROM vault_member_keys WHERE vault_id = '{vid}' "
+                     f"AND user_id IN ({granted}) AND is_active") == "20"
+        assert _failures(vid) == ""
+    finally:
+        oc.delete_vault(vid)
+
+
 def test_the_proof_covers_the_exact_bytes_sent_through_the_whole_stack(admin, people):
     """The server hashes the body exactly as it arrives, after every middleware. A body with unusual but
     valid JSON -- spacing, escaped characters, keys in another order -- proves as sent."""
