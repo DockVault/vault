@@ -226,7 +226,9 @@ included); and the approver must have been an administrator for 14 days when the
 of these applied. Every administrator is told when an administrator is created or promoted, and the
 user of every change to their sign-in details. What remains, and is accepted: someone who creates
 several administrator accounts and waits 14 days can approve their own changes through them, in full
-view of those notices. On a deployment with one administrator, or when no administrator may approve,
+view of those notices; and, until 0.34.0, an administrator whose current password someone else set
+can still approve another administrator's change, so whoever set it can approve through that account.
+On a deployment with one administrator, or when no administrator may approve,
 whoever runs the server acts from the host instead:
 
 ```bash
@@ -324,9 +326,11 @@ health. Because the database has no down-migrations, it **warns before any versi
 recommends a Backup first (Backup & Restore menu). The manual steps below do the same thing by hand:
 
 **From a prebuilt image** — every tagged release is published to GHCR as
-`ghcr.io/dockvault/vault:<tag>` (plus `:latest`), for `linux/amd64` and `linux/arm64`. The package
-is public: no login, no GitHub account. Set `DOCKVAULT_IMAGE` in `.env` to the release tag, then
-pull + restart with no local build:
+`ghcr.io/dockvault/vault:vX.Y.Z`, for `linux/amd64` and `linux/arm64`. The newest release of each
+release line is also `:vX.Y` (for example `:v0.33`), and the highest release overall is `:latest`,
+so a patch release of an older line never moves `:latest`. The package is public: no login, no
+GitHub account. Set `DOCKVAULT_IMAGE` in `.env` to the release tag, then pull + restart with no
+local build:
 
 ```bash
 # in .env:  DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.9.0
@@ -361,6 +365,15 @@ not quietly serve.
 schema change can leave a deployment unable to start, and nothing in the product will undo a
 migration for you.
 
+From 0.33.1 on, an image also refuses to start on data a newer release has changed in a way it
+cannot read. A release that stores something older versions would misread or delete leaves a mark in
+the database naming the oldest version that can read it; an older image then stops before it touches
+the data, and its log says what changed and how to undo it with the newer version. The web and SFTP
+processes both check, whichever tool changed the image. `ALLOW_START_ON_NEWER_DATA=true` starts it
+anyway, at the risk described in `.env.example`. 0.33.0 and earlier do not read the mark, so a
+rollback to one of them is not protected by it; `dockvault.py update` from 0.33.1 on refuses such a
+rollback while the running version reports a change in the way.
+
 What a given upgrade involves is declared in [`docs/upgrade-matrix.json`](docs/upgrade-matrix.json)
 and published with each release as an `upgrade.json` asset: whether the hop can be taken directly,
 whether it is reversible, whether it requires a backup, and any conditions worth knowing before
@@ -379,6 +392,14 @@ it is **secure** (free of known unpatched vulnerabilities), and — for an end-o
 extended support — the dates its code fixes and its (usually longer) security-only support run until.
 `dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
 one, and warns before moving to a version with known unpatched vulnerabilities.
+
+End-of-life is not the end of security support. It marks the releases an install can no longer move
+to or from in place (see the minimum supported version below). Which release lines still receive
+security fixes, and until when, is stated in [`.github/SECURITY.md`](.github/SECURITY.md): each line
+from 0.33 on is supported until six months after the next minor release ships. A release outside that
+period is not marked end-of-life, so a move within its line, or back to it, still works; it is
+marked not secure as soon as an advisory affects it. How a fix reaches an older line that is still
+supported is described in [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
 
 When a version is not secure, the matrix says why. Each vulnerability is recorded once, in the
 top-level `advisories`: a title and description, its **impact** (what it let someone do), its

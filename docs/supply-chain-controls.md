@@ -17,11 +17,13 @@ proof of a hosted setting.
   Dockerfile installs the same lock with hash enforcement.
 - A release builds the already-tested commit into a local image before registry authentication.
   It generates an SPDX JSON SBOM and scans that exact local image before login. Only a passing
-  image is pushed. Both release tags must resolve to one registry digest, and GitHub attestations
-  bind build provenance and the SBOM to that digest. The digest comes from each successful push;
-  both push responses and both immediate tag resolutions must agree before it can become an
-  attestation subject. The live branch/tag refs are force-fetched and revalidated again
-  immediately before registry authentication.
+  image is pushed. The release tag `:vX.Y.Z` and each moving tag the release gate names must
+  resolve to the scanned digest: `:vX.Y` for the newest release of a line, and `:latest` only for
+  the highest version released, so a patch release of an older line never moves it. A moving tag is
+  refused if what it holds now is a higher version. GitHub attestations bind build provenance and
+  the SBOM to that digest. The live refs of `main`, every `release/X.Y` branch and every version
+  tag are force-fetched and the gate is run again immediately before registry authentication; a
+  release whose GitHub Release already exists is not published again.
 - Release OCI metadata includes the public source URL, semantic version, tested revision, and
   `AGPL-3.0-only` license identifier.
 - Dependabot covers the production and test Python manifests, the Dockerfile, both Compose
@@ -128,7 +130,7 @@ cannot be added quietly; any change to it is a reviewed source change.
 | Main branch rules | The public ruleset endpoint returned one active default-branch ruleset. It prevents deletion and non-fast-forward updates. | Verified, limited |
 | Required status checks | The public main ruleset contains no required-status-check rule. The classic branch-protection endpoint required authenticated API access, so no second layer could be proven. | Not proven; do not rely on it |
 | Tag protection | The public ruleset inventory contains no tag-targeting ruleset, and the legacy tag-protection endpoint returned no configuration. | Not present in public evidence |
-| CodeQL/default code scanning | No CodeQL workflow exists in source or in the public workflow inventory. The default-setup endpoint required authenticated API access. | Not proven |
+| CodeQL/default code scanning | No CodeQL workflow existed at the time. One has since been added in source (`.github/workflows/codeql.yml`): it runs on pull requests and pushes to `main` and each `release/X.Y` branch, and weekly. Whether its results are required before a merge is a hosted setting this audit did not cover. | Workflow in source; enforcement not proven |
 | Secret scanning | The setting is not represented in source and its state was unavailable through the connected repository API. | Not proven |
 | Secret-scanning push protection | The setting is not represented in source and its state was unavailable through the connected repository API. | Not proven |
 | Dependabot alerts and security updates | Dependabot and dependency-graph workflows are active, but alert/security-update settings required authenticated API access. | Partially evidenced; setting not proven |

@@ -492,8 +492,11 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert "vulnerable_code_not_in_execute_path" in evidence
     assert "CVE-2026-85091" in evidence
     assert "exact registry manifest digest" in evidence
+    # Publication copies the scanned index (no push digest is scraped), and every tag it writes,
+    # the moving ones included, is checked against the scanned digest.
     assert (
-        "both push responses and both immediate tag resolutions must agree" in evidence
+        "The release tag `:vX.Y.Z` and each moving tag the release gate names must\n"
+        "  resolve to the scanned digest" in evidence
     )
     for control in (
         "Private vulnerability reporting",

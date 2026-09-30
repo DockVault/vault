@@ -192,3 +192,79 @@ def test_the_contributor_rules_require_a_schema_change_to_declare_itself():
     assert "ADD COLUMN IF NOT EXISTS` is a no-op" in guide or "no-op where the column already" in guide, (
         "the note about ADD COLUMN not tightening an existing column is gone. That is the mistake "
         "that put two columns out of step for several releases")
+
+
+# --- what the public documents say about release lines -------------------------------------------
+#
+# Once a second line is supported, the published texts are what an operator acts on: which image
+# tag follows their line, which lines get fixes, and what a rollback is protected from. Each claim
+# below is enforced elsewhere: the tags by the release gate and workflow, the rollback mark by the
+# data-requirements check, the approval rule by the credential-change code.
+
+def _public(name: str) -> str:
+    return (ROOT / name).read_text(encoding="utf-8")
+
+
+def test_the_security_policy_states_the_lines_the_tags_and_the_backport_rule():
+    policy = _public(".github/SECURITY.md")
+    assert "| 0.33.x, the latest line | Yes |" in policy
+    # The row it replaces read "The minor line before the latest, 0.33.x and later lines only".
+    assert "0.33.x and later lines only" not in policy
+    assert "until six\nmonths after the next minor release ships" in policy
+    assert ("Low\n  findings are fixed in the next regular release, and in the supported previous "
+            "line in the same\n  release window.") in policy
+    assert "`ghcr.io/dockvault/vault:vX.Y.Z`, which never changes" in policy
+    assert "tagged `:vX.Y` (for example `:v0.33`)" in policy
+    assert "so a patch release of an older line never moves them" in policy
+    assert "](../docs/guides/maintenance-releases.md)" in policy
+
+
+def test_the_security_policy_and_readme_publish_the_accepted_approval_residuals():
+    policy = _public(".github/SECURITY.md")
+    readme = _public("README.md")
+    assert "creates several administrator accounts and waits 14 days" in policy
+    assert ("an administrator whose current password someone else set can still approve another\n"
+            "  administrator's credential change") in policy
+    assert "0.34.0 refuses such approvals." in policy
+    assert ("until 0.34.0, an administrator whose current password someone else set\ncan still "
+            "approve another administrator's change") in readme
+
+
+def test_the_readme_names_the_line_tags_and_separates_end_of_life_from_support():
+    readme = _public("README.md")
+    assert "The newest release of each\nrelease line is also `:vX.Y`" in readme
+    assert "(plus `:latest`)" not in readme
+    assert "End-of-life is not the end of security support." in readme
+    assert "](.github/SECURITY.md)" in readme
+    assert "](docs/guides/maintenance-releases.md)" in readme
+
+
+def test_the_readme_says_which_rollbacks_the_data_mark_protects():
+    readme = _public("README.md")
+    assert "From 0.33.1 on, an image also refuses to start on data a newer release has changed" in readme
+    assert "0.33.0 and earlier do not read the mark, so a\nrollback to one of them is not protected" in readme
+    assert "`ALLOW_START_ON_NEWER_DATA=true`" in readme
+
+
+def test_the_supply_chain_document_describes_the_moving_tags_and_the_codeql_workflow():
+    evidence = _public("docs/supply-chain-controls.md")
+    assert "Both release tags must resolve to one registry digest" not in evidence
+    assert "`:latest` only for\n  the highest version released" in evidence
+    assert "No CodeQL workflow exists in source" not in evidence
+    assert "(`.github/workflows/codeql.yml`)" in evidence and (ROOT / ".github/workflows/codeql.yml").is_file()
+
+
+def test_the_maintenance_release_guide_exists_and_stays_public():
+    guide = _public("docs/guides/maintenance-releases.md")
+    for heading in ("## Release lines", "## Image tags", "## For an install on an older line",
+                    "### What the release gate accepts", "### A fix on several lines",
+                    "### After each release"):
+        assert heading in guide
+    assert "git cat-file -t vX.Y.Z" in guide and "git tag -a vX.Y.Z" in guide
+    # Every script the guide tells a maintainer to run exists.
+    for script in re.findall(r"\.github/scripts/[a-z_]+\.py", guide):
+        assert (ROOT / script).is_file(), script
+    # Written for anyone: no local paths (a Windows drive, or a drive as a shell mounts it), and no
+    # short work-item codes (one or two capitals and a number).
+    leak = re.search(r"[A-Z]:[\\/]|(?<![\w.])/[a-z]/|\b[A-Z]{1,2}[0-9]{1,2}[a-z]?\b", guide)
+    assert leak is None, leak.group(0)
