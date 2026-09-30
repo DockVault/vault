@@ -233,6 +233,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("receiver_tag_created", "administration", "Upload-link tag created", "notice"),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
+    # A managed setting (app/core/settings_registry.py): the row carries the values before and after.
+    AuditAction("setting_changed", "administration", "Managed setting changed", "notice"),
     AuditAction("settings_updated", "administration", "Settings changed", "notice"),
     AuditAction("share_tag_created", "administration", "Share tag created", "notice"),
     AuditAction("share_tag_deactivated", "administration", "Share tag deactivated", "notice"),

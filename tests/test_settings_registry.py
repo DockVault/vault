@@ -46,15 +46,23 @@ def registered(*specs):
 
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
-    """No stored values, no registered throwaway spec, and deployment settings the test controls."""
+    """No stored values, only the throwaway specs a test registers (the release's own are set aside for
+    the test and put back after it), and deployment settings the test controls."""
     monkeypatch.setattr(reg, "_cache", reg._Cache())
     env = SimpleNamespace(settings_locked_keys="", keep_days=30, keep_floor=None, keep_ceiling=None,
                           hold=False, mode="fast")
     monkeypatch.setattr(reg, "_deployment_settings", lambda: env)
-    before = dict(reg._SPECS)
+    reg.all_specs()                                   # import the spec modules before setting them aside
+    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS)]
+    contracts = list(reg._CONTRACTS)
+    for table, _ in saved:
+        table.clear()
+    reg._CONTRACTS.clear()
     yield env
-    reg._SPECS.clear()
-    reg._SPECS.update(before)
+    for table, before in saved:
+        table.clear()
+        table.update(before)
+    reg._CONTRACTS[:] = contracts
 
 
 def _days(**kw):
@@ -557,3 +565,105 @@ def test_an_invalid_env_value_is_never_the_value_in_force(clean, value):
         assert reg.resolve("keep_days") == 90
         row = reg.describe()[0]
         assert (row["deployment"], row["deployment_source"]) == (90, "default")
+
+
+# --------------------------------------------------------------------------- what else the lock can name
+
+def test_a_key_another_store_keeps_is_locked_by_its_key_its_group_or_everything(clean):
+    reg.register_listed("some_limit", group="limits", label="Some limit")
+    assert reg.listed_locked("some_limit") is False
+    for tokens in ("some_limit", "LIMITS", "*", "other, some_limit"):
+        clean.settings_locked_keys = tokens
+        assert reg.listed_locked("some_limit") is True, tokens
+    clean.settings_locked_keys = "keeping"
+    assert reg.listed_locked("some_limit") is False
+    assert reg.listed_locked("nobody_listed_this") is False
+
+
+def test_a_listed_key_is_never_refused_by_put_settings_and_never_a_managed_row(clean):
+    reg.register_listed("some_limit", group="limits")
+    assert "some_limit" not in reg.refused_settings_keys()
+    assert reg.describe() == []
+    assert [e.key for e in reg.all_listed()] == ["some_limit"]
+
+
+def test_a_listed_key_is_listed_once_and_named_like_a_setting(clean):
+    reg.register_listed("some_limit", group="limits")
+    with pytest.raises(ValueError, match="twice"):
+        reg.register_listed("some_limit", group="limits")
+    with pytest.raises(ValueError, match="lower-case"):
+        reg.register_listed("Some-Limit", group="limits")
+    with registered(_days()):
+        with pytest.raises(ValueError, match="twice"):
+            reg.register_listed("keep_days", group="limits")
+
+
+def test_a_group_with_a_table_of_its_own_is_locked_by_its_name_or_everything(clean):
+    reg.register_lock_group("audit_levels", "Recording levels")
+    assert reg.group_locked("audit_levels") is False
+    for tokens in ("audit_levels", "AUDIT_LEVELS", "*"):
+        clean.settings_locked_keys = tokens
+        assert reg.group_locked("audit_levels") is True, tokens
+
+
+def test_the_lock_names_a_listed_key_its_group_and_a_group_without_specs(clean):
+    reg.register_listed("some_limit", group="limits")
+    reg.register_lock_group("audit_levels")
+    clean.settings_locked_keys = "some_limit, limits, audit_levels, nothing_here"
+    assert reg.unknown_locked_tokens() == ["nothing_here"]
+
+
+def test_a_module_adds_its_own_check_to_the_startup_contract(clean, db, monkeypatch):
+    monkeypatch.setattr(reg, "_refresher", None)
+    monkeypatch.setattr(reg, "_refresher_stop", threading.Event())
+    seen = []
+
+    def check(settings):
+        seen.append(settings)
+        return ["the minimum is longer than the maximum"]
+
+    assert reg.register_contract(check) is check
+    reg.register_contract(check)                          # once, however often it is added
+    assert reg.check_contract() == ["the minimum is longer than the maximum"]
+    assert seen == [clean]
+    with pytest.raises(reg.SettingsContractError, match="the minimum is longer than the maximum"):
+        reg.start(session_factory=db, interval=10)
+    assert reg._refresher is None
+
+
+@pytest.mark.parametrize("value,why", [
+    (400, "keep_days cannot be 400: the deployment allows at most 365 (KEEP_CEILING in .env)"),
+    (0, "keep_days cannot be no limit: the deployment allows at most 365 (KEEP_CEILING in .env)"),
+    (5, "keep_days cannot be 5: the deployment keeps it at least 7 (KEEP_FLOOR in .env)"),
+    (7, None),
+    (365, None),
+    (None, None),
+])
+def test_a_value_outside_the_deployments_bounds_is_named_with_its_env_line(clean, value, why):
+    clean.keep_floor, clean.keep_ceiling = 7, 365
+    with registered(_days()):
+        assert reg.check_bounds(reg.spec_for("keep_days"), value) == why
+
+
+def test_without_a_ceiling_no_limit_is_within_the_bounds(clean):
+    clean.keep_floor = 7
+    with registered(_days()):
+        assert reg.check_bounds(reg.spec_for("keep_days"), 0) is None
+
+
+def test_a_computed_bound_is_named_without_an_env_line(clean):
+    with registered(_days(floor=lambda s: 10, ceiling=None)):
+        assert reg.check_bounds(reg.spec_for("keep_days"), 9) == (
+            "keep_days cannot be 9: the deployment keeps it at least 10")
+
+
+def test_describe_names_the_env_lines_that_set_a_value_and_its_bounds(clean):
+    with registered(_days(), _days(key="fixed_days", editable=reg.FIXED),
+                    _days(key="plain_days", env=None, floor=None, ceiling=lambda s: 99)):
+        rows = {r["key"]: r for r in reg.describe()}
+    assert (rows["keep_days"]["env"], rows["keep_days"]["floor_env"], rows["keep_days"]["ceiling_env"]) == (
+        "KEEP_DAYS", "KEEP_FLOOR", "KEEP_CEILING")
+    assert rows["fixed_days"]["env"] is None
+    assert (rows["plain_days"]["env"], rows["plain_days"]["floor_env"], rows["plain_days"]["ceiling_env"]) == (
+        None, None, None)
+

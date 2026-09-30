@@ -31,6 +31,19 @@ one, and says what it is.
 
 Specs are registered with register(), by the modules listed in SPEC_MODULES, which are imported the first
 time the registry is read.
+
+Two more kinds of name may be locked, so that SETTINGS_LOCKED_KEYS covers every setting an administrator
+changes in the panel, whatever store keeps it:
+
+- a key another store keeps (register_listed): the rate limits stay in the general settings blob, so that
+  a rollback reads them where it always did. The registry lists them, the lock names them, and their own
+  resolving ignores an administrator's value while they are locked (listed_locked). PUT /settings still
+  takes them, and refuses them while they are locked.
+- a group whose settings keep a table of their own (register_lock_group), such as the recording levels:
+  their module asks group_locked().
+
+A module whose settings must agree with each other adds a check to the startup contract with
+register_contract(): it is given the deployment's settings and returns what contradicts, in plain words.
 """
 from __future__ import annotations
 
@@ -61,7 +74,7 @@ SOURCE_ADMIN = "admin"
 SOURCE_LOCKED = "locked"
 
 # The modules that register specs, imported the first time the registry is read.
-SPEC_MODULES: tuple[str, ...] = ()
+SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings",)
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
 ENV_ONLY_KEYS: frozenset[str] = frozenset()
@@ -108,7 +121,18 @@ class SettingSpec:
     since: str = ""
 
 
+@dataclass(frozen=True)
+class ListedKey:
+    """A setting another store keeps, listed so that SETTINGS_LOCKED_KEYS can name it."""
+    key: str
+    group: str
+    label: str = ""
+
+
 _SPECS: dict[str, SettingSpec] = {}
+_LISTED: dict[str, ListedKey] = {}
+_LOCK_GROUPS: dict[str, str] = {}
+_CONTRACTS: list = []
 _modules_loaded = False
 _modules_lock = threading.Lock()
 
@@ -117,7 +141,7 @@ def register(spec: SettingSpec) -> SettingSpec:
     """Add a spec. A key is registered once; a spec that cannot be right is refused here."""
     if not spec.key or spec.key != spec.key.lower() or not spec.key.replace("_", "").isalnum():
         raise ValueError(f"a setting key is lower-case letters, digits and underscores: {spec.key!r}")
-    if spec.key in _SPECS:
+    if spec.key in _SPECS or spec.key in _LISTED:
         raise ValueError(f"{spec.key} is registered twice")
     if spec.kind not in KINDS:
         raise ValueError(f"{spec.key}: unknown kind {spec.kind!r}")
@@ -132,6 +156,37 @@ def register(spec: SettingSpec) -> SettingSpec:
         raise ValueError(f"{spec.key}: an enum needs its choices")
     _SPECS[spec.key] = spec
     return spec
+
+
+def _name_is_valid(name: str) -> bool:
+    return bool(name) and name == name.lower() and name.replace("_", "").isalnum()
+
+
+def register_listed(key: str, *, group: str, label: str = "") -> ListedKey:
+    """List a setting another store keeps, so that the lock can name it (and its group)."""
+    if not _name_is_valid(key) or not _name_is_valid(group):
+        raise ValueError(f"a listed key and its group are lower-case letters, digits and underscores: "
+                         f"{key!r}, {group!r}")
+    if key in _LISTED or key in _SPECS:
+        raise ValueError(f"{key} is registered twice")
+    entry = ListedKey(key=key, group=group, label=label)
+    _LISTED[key] = entry
+    return entry
+
+
+def register_lock_group(name: str, label: str = "") -> str:
+    """Name a group of settings that keep a table of their own, so that the lock can name it."""
+    if not _name_is_valid(name):
+        raise ValueError(f"a group is lower-case letters, digits and underscores: {name!r}")
+    _LOCK_GROUPS[name] = label
+    return name
+
+
+def register_contract(check: Callable[[Any], list]) -> Callable[[Any], list]:
+    """Add a check to the startup contract: ``check(settings)`` returns what contradicts, in plain words."""
+    if check not in _CONTRACTS:
+        _CONTRACTS.append(check)
+    return check
 
 
 def _load_spec_modules() -> None:
@@ -153,6 +208,11 @@ def all_specs() -> list[SettingSpec]:
 def spec_for(key: str) -> Optional[SettingSpec]:
     _load_spec_modules()
     return _SPECS.get(key)
+
+
+def all_listed() -> list[ListedKey]:
+    _load_spec_modules()
+    return list(_LISTED.values())
 
 
 def refused_settings_keys() -> frozenset[str]:
@@ -263,6 +323,29 @@ def clamp(spec: SettingSpec, value, floor, ceiling):
     return value
 
 
+def _shown(spec: SettingSpec, value) -> str:
+    if spec.unlimited is not None and value == spec.unlimited:
+        return "no limit"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return str(value)
+
+
+def check_bounds(spec: SettingSpec, value, settings=None) -> Optional[str]:
+    """Why ``value`` lies outside the floor or the ceiling the deployment sets for ``spec``, in plain words
+    naming the .env line that sets the bound, or None. A value inside them is one resolve() keeps as it is."""
+    if spec.kind not in ("int", "bool") or value is None:
+        return None
+    floor, ceiling = bounds(spec, settings)
+    if floor is not None and _rank(spec, value) < _rank(spec, floor):
+        where = f" ({spec.floor.upper()} in .env)" if isinstance(spec.floor, str) else ""
+        return f"{spec.key} cannot be {_shown(spec, value)}: the deployment keeps it at least {_shown(spec, floor)}{where}"
+    if ceiling is not None and _rank(spec, value) > _rank(spec, ceiling):
+        where = f" ({spec.ceiling.upper()} in .env)" if isinstance(spec.ceiling, str) else ""
+        return f"{spec.key} cannot be {_shown(spec, value)}: the deployment allows at most {_shown(spec, ceiling)}{where}"
+    return None
+
+
 def is_reduction(spec: SettingSpec, old, new) -> bool:
     """Whether changing ``old`` to ``new`` makes data be deleted sooner, by the spec's ``reduction``."""
     if spec.reduction is None or old is None or new is None:
@@ -288,9 +371,28 @@ def is_locked(spec: SettingSpec, settings=None) -> bool:
     return "*" in tokens or spec.key in tokens or bool(spec.group and spec.group.lower() in tokens)
 
 
+def _tokens_lock(tokens: frozenset, key: str, group: str) -> bool:
+    return "*" in tokens or key in tokens or bool(group and group.lower() in tokens)
+
+
+def listed_locked(key: str, settings=None) -> bool:
+    """Whether the deployment has locked the listed setting ``key`` (by its key, its group or ``*``). A key
+    nobody listed is never locked here."""
+    _load_spec_modules()
+    entry = _LISTED.get(key)
+    return entry is not None and _tokens_lock(locked_tokens(settings), entry.key, entry.group)
+
+
+def group_locked(name: str, settings=None) -> bool:
+    """Whether the deployment has locked the group ``name`` (by its name or ``*``)."""
+    tokens = locked_tokens(settings)
+    return "*" in tokens or name.lower() in tokens
+
+
 def unknown_locked_tokens(settings=None) -> list[str]:
     """Tokens of SETTINGS_LOCKED_KEYS that name no registered key or group."""
-    known = {"*"} | {s.key for s in all_specs()} | {s.group.lower() for s in all_specs() if s.group}
+    known = ({"*"} | {s.key for s in all_specs()} | {s.group.lower() for s in all_specs() if s.group}
+             | set(_LISTED) | {e.group for e in _LISTED.values()} | set(_LOCK_GROUPS))
     return sorted(locked_tokens(settings) - known)
 
 
@@ -345,6 +447,9 @@ def describe(keys: Optional[Iterable[str]] = None) -> list[dict]:
             "value": value, "source": source, "clamped": clamped, "deployment": deployment,
             "deployment_source": deployment_source, "stored": admin,
             "stored_version": stored.get(spec.key, (None, None))[1],
+            "env": spec.env.upper() if spec.env and spec.editable != FIXED else None,
+            "floor_env": spec.floor.upper() if isinstance(spec.floor, str) else None,
+            "ceiling_env": spec.ceiling.upper() if isinstance(spec.ceiling, str) else None,
         })
     return rows
 
@@ -368,6 +473,8 @@ def check_contract(settings=None) -> list[str]:
                 problems.append(f"{bound.upper()}, the {name} of {spec.key}, is not a valid value")
         if floor is not None and ceiling is not None and _rank(spec, floor) > _rank(spec, ceiling):
             problems.append(f"{spec.key}: the floor ({floor}) is above the ceiling ({ceiling})")
+    for check in list(_CONTRACTS):
+        problems.extend(check(settings))
     return problems
 
 

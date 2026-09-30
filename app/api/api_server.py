@@ -538,6 +538,12 @@ _RATE_LIMIT_API_SETTING_KEYS = tuple(
 )
 
 
+def _rate_limit_overrides_in_force(blob) -> dict:
+    """The stored settings without the rate-limit overrides the deployment locked."""
+    from app.core.rate_limit_settings import unlocked_overrides
+    return dict(unlocked_overrides(blob))
+
+
 def _api_rate_limit_deployment_defaults() -> dict:
     return {key: int(getattr(settings, key)) for key in _RATE_LIMIT_API_SETTING_KEYS}
 
@@ -549,7 +555,9 @@ def _load_stored_api_rate_limit_overrides() -> dict:
     db = SessionLocal()
     try:
         row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
-        return dict(row.value) if row and row.value else {}
+        # A limit the deployment locked (SETTINGS_LOCKED_KEYS) keeps its deployment value.
+        from app.core.rate_limit_settings import unlocked_overrides
+        return dict(unlocked_overrides(dict(row.value))) if row and row.value else {}
     finally:
         db.close()
 
@@ -720,6 +728,10 @@ app.include_router(ecc_router, prefix="/ecc")
 # Import and include Email Studio router (SMTP profiles / HTML templates / image resources)
 from app.api.email_studio_router import router as email_studio_router
 app.include_router(email_studio_router, prefix="/email")
+
+# The settings the panel manages through the settings registry (app/core/settings_registry.py)
+from app.api.managed_settings_router import router as managed_settings_router
+app.include_router(managed_settings_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -3819,6 +3831,10 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
                 _rl_settings.validate_override(_rl_key, payload[_rl_key])
             except ValueError as _rl_err:
                 raise HTTPException(status_code=400, detail=str(_rl_err))
+            # A limit the deployment locked keeps its deployment value: clearing an override (0) is taken,
+            # a new one is refused rather than saved and ignored.
+            if payload[_rl_key] != 0 and _rl_settings.is_locked(_rl_key):
+                raise HTTPException(status_code=400, detail=f"{_rl_key} is locked by the deployment")
 
     for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
                      "sharing_enabled"):
@@ -4255,7 +4271,7 @@ async def update_settings(
         _api_rate_limit_policy_cache is not None
         and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
     ):
-        _api_rate_limit_policy_cache.replace(merged)
+        _api_rate_limit_policy_cache.replace(_rate_limit_overrides_in_force(merged))
     # Drop the login/vault/SFTP throttle-override cache so a just-saved change takes effect immediately
     # (the general-API buckets have their own cache, replaced just above).
     from app.core import rate_limit_settings as _rl_settings_write
