@@ -531,6 +531,35 @@ def test_a_create_is_proved_before_anything_is_built(admin, people):
             oc.delete_vault(ch_vault)
 
 
+def test_a_team_vault_whose_team_key_is_not_p384_is_never_created(admin, people):
+    """A team vault's team public key is its verifier, so it must be a P-384 key. One that is not is refused
+    for its shape (400) before anything else: with a proof, whose challenge is left for a corrected request,
+    and without one, which does not even get as far as asking for a proof. No vault is made."""
+    owner, oc = people("kpcrp")
+    other_curve = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    with _zk_enabled(admin):
+        vid = str(uuid.uuid4())
+        body = {"name": unique("kpcrp"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB,
+                "name_key_version": 1, "key_wrapping_mode": "hierarchical", "team_public_key": other_curve,
+                "team_wrapped_dek": ZK_WRAPPED_DEK_STUB, "team_dek_ephemeral_public_key": ZK_EPHEMERAL_STUB,
+                "wrapped_team_privkey": ZK_WRAPPED_DEK_STUB, "team_privkey_ephemeral_public_key": ZK_EPHEMERAL_STUB,
+                "id": vid}
+        ch = oc.post(f"/ecc/vaults/{vid}/key-proof/challenge", json={"op": "create", "mode": "hierarchical"}).json()
+        assert ch["mode"] == "hierarchical", ch
+        raw, header = harness._prove(oc, "create", vid, ch, body)
+        r = harness.send_prepared(oc, "/vaults", {"raw": raw, "header": header, "challenge_status": 200})
+        assert r.status_code == 400 and r.json()["reason"] == "zk-key-proof-malformed", r.text
+        assert "P-384" in r.json()["detail"], r.text
+        assert _psql(f"SELECT count(*) FROM zk_key_proof_challenges WHERE id = '{ch['challenge_id']}'") == "1", \
+            "a create with a malformed team key consumed its challenge"
+        r = harness.send_prepared(oc, "/vaults", {"raw": raw, "header": header, "challenge_status": 200},
+                                  header=None)
+        assert r.status_code == 400 and r.json()["reason"] == "zk-key-proof-malformed", r.text
+        assert _psql(f"SELECT count(*) FROM vaults WHERE id = '{vid}'") == "0"
+        assert _psql(f"SELECT count(*) FROM vault_key_proofs WHERE vault_id = '{vid}'") == "0"
+
+
 # ------------------------------------------------------------------------------------- bootstrap
 
 def _legacy_direct_vault(client, admin):
