@@ -85,6 +85,32 @@ async function main() {
         note(plain && plain.type === 'private' && !('matchesPublic' in plain),
              `${label}: the unchecked unwrap still returns the key itself`);
     }
+    // A stored team public key that cannot be read: the comparison could not run, which is not a mismatch.
+    const p256 = await lib._subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const p256Pem = '-----BEGIN PUBLIC KEY-----\n'
+        + Buffer.from(await lib._subtle().exportKey('spki', p256.publicKey)).toString('base64')
+        + '\n-----END PUBLIC KEY-----';
+    const unreadable = [['a stored team public key that does not parse',
+                         '-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----'],
+                        ['a P-256 key stored as the team key', p256Pem]];
+    // What app.js zkGetTeamPrivKey records from the answer (true, false, or null).
+    const recorded = m => (m === true ? true : (m === false ? false : null));
+    const unreadableCheckWrap = await lib.wrapTeamPrivateKeyV2(teamB.privateKey, member.publicKey, ctx);
+    const teamPkcs8 = await lib._subtle().exportKey('pkcs8', teamB.privateKey);
+    for (const [what, pem] of unreadable) {
+        const out = await lib.unwrapTeamPrivateKeyWithCheck(
+            unreadableCheckWrap.wrappedKey, unreadableCheckWrap.ephemeralPublicKey, member.privateKey, ctx, pem);
+        note(out.matchesPublic === null, `team: ${what} is a comparison that could not run, not a mismatch`);
+        const v = await Checks.writeVerdict(lib, {
+            mode: 'hierarchical', vaultId: VAULT, epoch: 7, view: { state: 'team' }, isCurrent: true,
+            teamKeyMatches: recorded(out.matchesPublic) });
+        note(v.verdict === Checks.WRITE_UNCHECKED, `team: ${what} never blocks a write`);
+        note((await lib.teamPrivateKeyMatchesPublic(teamPkcs8, pem)) === false,
+             `team: ${what} still fails the yes-or-no comparison closed`);
+    }
+    note(recorded(true) === true && recorded(false) === false && recorded(undefined) === null,
+         'team: the recorded answer keeps a mismatch a mismatch');
+
     let refused = 'NONE';
     try {
         const wrap = await lib.wrapTeamPrivateKeyV2(teamB.privateKey, member.publicKey, ctx);

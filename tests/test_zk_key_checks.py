@@ -52,6 +52,8 @@ def test_a_key_that_is_not_the_vaults_is_refused_on_the_write_path(run):
     "team: after a team rotation the new key writes",
     "team: an older team epoch is never checked against the current public key",
     "team: an uncompared key never blocks",
+    "team: a stored team public key that does not parse never blocks a write",
+    "team: a P-256 key stored as the team key never blocks a write",
 ])
 def test_what_must_never_block_an_honest_member(run, case):
     _ok(run, case)
@@ -64,6 +66,15 @@ def test_the_team_key_is_compared_while_it_is_unwrapped_in_both_wrap_formats(run
         _ok(run, f"{fmt}: a team key that is not the vault's is told apart")
         _ok(run, f"{fmt}: the unchecked unwrap still returns the key itself")
     _ok(run, "a checked unwrap without the public key to check is refused")
+
+
+def test_a_team_key_comparison_that_cannot_run_is_not_a_mismatch(run):
+    """A stored team public key the browser cannot read gives no answer (null), which the write path takes as
+    a check that could not run; the yes-or-no comparison a proof would use still fails closed."""
+    for what in ("a stored team public key that does not parse", "a P-256 key stored as the team key"):
+        _ok(run, f"team: {what} is a comparison that could not run, not a mismatch")
+        _ok(run, f"team: {what} still fails the yes-or-no comparison closed")
+    _ok(run, "team: the recorded answer keeps a mismatch a mismatch")
 
 
 @pytest.mark.parametrize("case", [

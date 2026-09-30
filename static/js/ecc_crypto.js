@@ -1333,13 +1333,14 @@ class ECCCryptoLibrary {
      * The unwrapped team key, or -- when the caller named the vault's team public key -- the key and
      * whether it is that key's pair, compared while the PKCS8 bytes are in hand (the key comes out of
      * here non-extractable, so nothing later could compare it). A mismatch is an answer, not an error:
-     * reading goes on as before, and the caller decides what else it stops.
+     * reading goes on as before, and the caller decides what else it stops. matchesPublic is null when the
+     * comparison could not run (compareTeamPrivateKeyToPublic).
      * @private
      */
     async _withTeamKeyCheck(key, pkcs8, checkPublicKeyPem) {
         if (checkPublicKeyPem === null || checkPublicKeyPem === undefined) return key;
         return { privateKey: key,
-                 matchesPublic: await this.teamPrivateKeyMatchesPublic(pkcs8, checkPublicKeyPem) };
+                 matchesPublic: await this.compareTeamPrivateKeyToPublic(pkcs8, checkPublicKeyPem) };
     }
 
     /**
@@ -2230,13 +2231,26 @@ class ECCCryptoLibrary {
      * @returns {Promise<boolean>}
      */
     async teamPrivateKeyMatchesPublic(teamPrivatePkcs8, teamPublicKeyPem) {
+        return (await this.compareTeamPrivateKeyToPublic(teamPrivatePkcs8, teamPublicKeyPem)) === true;
+    }
+
+    /**
+     * The same comparison with three answers: true when the private key is the pair of the public one, false
+     * when both keys were read and they differ, and null when either cannot be read -- a stored team public
+     * key that does not parse or is not a P-384 key. A member's write path takes null as a check that could
+     * not run, which writes as before: only a positive mismatch blocks. Anything that needs the pair proved
+     * reads teamPrivateKeyMatchesPublic, which counts null as false.
+     * @returns {Promise<boolean|null>}
+     */
+    async compareTeamPrivateKeyToPublic(teamPrivatePkcs8, teamPublicKeyPem) {
+        let derived, stored;
         try {
-            const derived = await this._rawPointFromPkcs8(new Uint8Array(teamPrivatePkcs8));
-            const stored = await this._rawPointFromPublicPEM(teamPublicKeyPem);
-            return this._bytesEqual(derived, stored);
+            derived = await this._rawPointFromPkcs8(new Uint8Array(teamPrivatePkcs8));
+            stored = await this._rawPointFromPublicPEM(teamPublicKeyPem);
         } catch (error) {
-            return false;
+            return null;
         }
+        return this._bytesEqual(derived, stored);
     }
 
     /**
@@ -2400,8 +2414,10 @@ class ECCCryptoLibrary {
      * team public key `teamPublicKeyPem`. Every member who unwraps the team key of the current team epoch
      * compares it: a team key that is not the vault's -- a wrap swapped by someone who holds the key, or a
      * database edit -- is what the member's app then refuses to write with. The key is non-extractable.
+     * matchesPublic is null when the comparison could not run, because the team public key given cannot be
+     * read (compareTeamPrivateKeyToPublic); that never blocks a write.
      *
-     * @returns {Promise<{privateKey: CryptoKey, matchesPublic: boolean}>}
+     * @returns {Promise<{privateKey: CryptoKey, matchesPublic: (boolean|null)}>}
      */
     async unwrapTeamPrivateKeyWithCheck(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey,
                                         context, teamPublicKeyPem) {
@@ -3967,6 +3983,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     keyLineageTag: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     verifyKeyLineageTag: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
     teamPrivateKeyMatchesPublic: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
+    compareTeamPrivateKeyToPublic: CRYPTO_ERROR_CODES.KEY_UNUSABLE,
     keyProofTranscript: CRYPTO_ERROR_CODES.INVALID_INPUT,
     computeKeyProof: CRYPTO_ERROR_CODES.CRYPTO_OPERATION_FAILED,
 });

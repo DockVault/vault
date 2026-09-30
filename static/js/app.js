@@ -11917,7 +11917,7 @@ function eccLib() {
 // keyChecks: vaultId -> { [dek_epoch]: what the /keys answer said about that epoch's key, and the verdict on
 // the key this browser holds for it } plus `reported` (the findings already sent) -- see zk_key_checks.js
 // teamKeyMatches: vaultId -> { [team_epoch]: {pem, matches} } whether the unwrapped team key is the pair of
-// the vault's team public key, compared while it was unwrapped
+// the vault's team public key, compared while it was unwrapped (true, false, or null: it could not be compared)
 const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {}, vaultIndexKeys: {}, keyProofKeys: {}, keyChecks: {}, teamKeyMatches: {} };
 function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; zkState.vaultIndexKeys = {}; zkState.keyProofKeys = {}; zkState.keyChecks = {}; zkState.teamKeyMatches = {}; }
 
@@ -12892,7 +12892,10 @@ async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphe
         const out = await eccLib().unwrapTeamPrivateKeyWithCheck(
             wrappedTeamPrivkey, teamEphemeralPublicKey, priv, { vaultId, recipientUserId }, pem);
         teamPriv = out.privateKey;
-        compared[teamEpoch] = { pem, matches: out.matchesPublic === true };
+        // Three answers: only a positive mismatch (false) stops a write; null, a comparison that could not run
+        // (a stored team public key that cannot be read), writes as before.
+        const m = out.matchesPublic;
+        compared[teamEpoch] = { pem, matches: m === true ? true : (m === false ? false : null) };
     } else {
         teamPriv = await eccLib().unwrapPrivateKeyFromWrapped(
             wrappedTeamPrivkey, teamEphemeralPublicKey, priv, false,

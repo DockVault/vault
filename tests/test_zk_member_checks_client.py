@@ -84,7 +84,12 @@ def test_the_team_key_is_compared_only_at_the_current_epoch_as_it_is_unwrapped()
     dek = _function("zkGetVaultDek")
     assert "version === keys.current_dek_version ? keys.team_public_key : null);" in dek
     team = _function("zkGetTeamPrivKey")
-    assert "unwrapTeamPrivateKeyWithCheck(" in team and "compared[teamEpoch] = { pem, matches: out.matchesPublic === true };" in team
+    assert "unwrapTeamPrivateKeyWithCheck(" in team
+    # Three answers kept as they came: a comparison that could not run (null) is not recorded as a mismatch
+    # (tests/js/zk_key_checks.js runs the same mapping on real keys).
+    assert team.count("const m = out.matchesPublic;") == 1
+    assert "compared[teamEpoch] = { pem, matches: m === true ? true : (m === false ? false : null) };" in team
+    assert "matchesPublic === true }" not in team
 
 
 def test_the_checks_run_on_open_and_never_ask_for_the_passphrase():

@@ -758,8 +758,8 @@ of an old name -- takes its key through one checked path, which asks, once per k
 A key that does not match is refused: nothing is written with it, the person is told "The key you were given for
 this vault does not match it", and the vault's owner is told (§11.3). **Only a positive mismatch blocks.** An epoch
 with no stored material (made before 0.33.2, while the server was rolled back, or by a change accepted without a
-proof), an older team epoch, an answer from an older server, or a check that cannot run for any other reason
-writes as before. Reading is never affected.
+proof), an older team epoch, an answer from an older server, or a check that cannot run for any other reason (a
+stored team public key the browser cannot read, for one) writes as before. Reading is never affected.
 
 ### 11.2 When a vault is opened
 
