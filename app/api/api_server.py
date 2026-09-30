@@ -15125,6 +15125,27 @@ def _user_group_ids(db: Session, user_id) -> list:
     return [str(r[0]) for r in db.query(user_groups.c.group_id).filter(user_groups.c.user_id == user_id).all()]
 
 
+def _share_eligible_ids(db: Session, current_user: User, user_ids) -> set:
+    """The ids among ``user_ids`` that ``current_user`` could reach through the recipient picker (GET
+    /users/search): active, non-EXTERNAL accounts, and -- when the org sets
+    directory_search_scope='same_department' -- accounts sharing a department with them. An interactive admin
+    is not department-scoped (they have the unrestricted /users directory). As strings."""
+    ids = [u for u in user_ids if u]
+    if not ids:
+        return set()
+    from sqlalchemy import select as _select
+    q = db.query(User.id).filter(
+        User.id.in_(ids),
+        User.is_active == True,  # noqa: E712
+        User.role != RoleEnum.EXTERNAL,
+    )
+    if getattr(current_user, "role", None) != RoleEnum.ADMIN and _directory_search_scope(db) == "same_department":
+        caller_gids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
+        q = q.join(user_groups, User.id == user_groups.c.user_id).filter(
+            user_groups.c.group_id.in_(caller_gids)).distinct()
+    return {str(r[0]) for r in q.all()}
+
+
 def _validate_share_audience_users(db: Session, current_user: User, aud_users: list) -> None:
     """A direct-push 'users' audience must be limited to recipients the creator could actually reach
     through the recipient picker (GET /users/search): active, non-EXTERNAL accounts, and — when the org
@@ -15136,17 +15157,7 @@ def _validate_share_audience_users(db: Session, current_user: User, aud_users: l
     closed: any ineligible id is rejected with a non-enumerating 400 (the specific ids are not echoed)."""
     if not aud_users:
         return
-    from sqlalchemy import select as _select
-    q = db.query(User.id).filter(
-        User.id.in_(aud_users),
-        User.is_active == True,  # noqa: E712
-        User.role != RoleEnum.EXTERNAL,
-    )
-    if getattr(current_user, "role", None) != RoleEnum.ADMIN and _directory_search_scope(db) == "same_department":
-        caller_gids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
-        q = q.join(user_groups, User.id == user_groups.c.user_id).filter(
-            user_groups.c.group_id.in_(caller_gids)).distinct()
-    eligible = {str(r[0]) for r in q.all()}
+    eligible = _share_eligible_ids(db, current_user, aud_users)
     if any(str(u) not in eligible for u in aud_users):
         raise HTTPException(
             status_code=400,

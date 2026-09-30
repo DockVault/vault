@@ -399,12 +399,49 @@ def test_the_share_dialog_shows_a_ticked_recipients_key_for_a_zero_knowledge_vau
 def test_the_public_key_lookup_says_when_the_key_was_set_up_and_whether_it_is_flagged():
     router = (ROOT / "app" / "api" / "ecc_router.py").read_text(encoding="utf-8")
     lookup = _slice(router, "async def get_user_public_key(", "\nclass GrantMemberKeyRequest(")
-    assert '"registered_at": kp.created_at.isoformat() if kp.created_at else None,' in lookup
-    assert '"registered_after_admin_change": kp.registered_after_admin_change,' in lookup
+    assert '"registered_at": (kp.created_at.isoformat() if kp.created_at else None) if shareable else None,' in lookup
+    assert '"registered_after_admin_change": kp.registered_after_admin_change if shareable else None,' in lookup
     register = _slice(router, "async def register_public_key(", "\n@router.get(\"/keys/public\"")
     assert "registered_after_admin_change=_cc.last_applied(db, current_user.id) is not None," in register
     from app.core import credential_changes as cc
     assert cc.WINDOW == timedelta(days=14)
+
+
+@pytest.mark.parametrize("case,given", [
+    ("anyone, across the deployment", True),
+    ("another department", False),
+    ("the same department", True),
+    ("an account that is switched off", False),
+    ("an administrator asking, another department", True),
+])
+def test_when_a_key_was_set_up_is_told_only_for_someone_the_caller_could_share_with(world, monkeypatch, case, given):
+    """The share dialog shows when a recipient's key was set up, and flags one set up soon after an
+    administrator changed the account. For anyone the caller could not pick there, that would say of any
+    account that an administrator changed its sign-in details: the lookup leaves both out."""
+    from app.api import ecc_router as E
+    from app.core.models import UserKeyPair, user_groups
+    from _async_run import run_coroutine
+    engine = world.db.get_bind()
+    for table in (UserKeyPair.__table__, user_groups):
+        table.create(engine, checkfirst=True)
+    monkeypatch.setattr(E, "_ecc_rate_limit", lambda *a, **k: None)
+    monkeypatch.setattr(E, "_manages_any_vault", lambda db, user: True)
+    monkeypatch.setattr(S, "_directory_search_scope",
+                        lambda db: "deployment" if case.startswith("anyone") else "same_department")
+    caller = _person(world, role=RoleEnum.ADMIN if case.startswith("an administrator") else RoleEnum.USER)
+    target = _person(world, is_active=case != "an account that is switched off")
+    world.db.add(UserKeyPair(user_id=target.id, public_key="P", fingerprint="f", encrypted_private_key="E",
+                             registered_after_admin_change=True))
+    group, other = uuid.uuid4(), uuid.uuid4()
+    world.db.execute(user_groups.insert().values(user_id=target.id, group_id=group))
+    world.db.execute(user_groups.insert().values(
+        user_id=caller.id, group_id=group if case in ("the same department", "an account that is switched off")
+        else other))
+    world.db.commit()
+    out = run_coroutine(E.get_user_public_key(user_id=str(target.id), current_user=caller, db=world.db))
+    assert out["has_keypair"] is True and out["public_key"] == "P" and out["fingerprint"] == "f"
+    assert out["registered_after_admin_change"] is (True if given else None)
+    assert (out["registered_at"] is not None) is given
 
 
 def test_the_web_app_still_parses():

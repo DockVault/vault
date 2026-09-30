@@ -823,7 +823,9 @@ None names a vault: a zero-knowledge vault's name is sealed, and the server does
 The share dialog of a zero-knowledge vault shows, for each person ticked, their key's fingerprint (the one they
 see for their own key) and when it was set up, and flags a key set up within 14 days after an administrator
 changed that account's sign-in details. Whether it was is decided when the key is set up, while the record of the
-change still exists.
+change still exists. `GET /ecc/users/{id}/public-key` gives when and whether only for someone the caller could pick
+in the recipient picker (the directory's own rule, `directory_search_scope`); for anyone else it would say of any
+account that an administrator changed its sign-in details shortly before.
 
 ---
 
