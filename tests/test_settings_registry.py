@@ -207,6 +207,9 @@ def test_a_reduction_is_a_change_towards_deleting_sooner(old, new, reduces):
     (reg.SettingSpec(key="k", kind="list", default=[], choices=("a", "b")), ["a", "b"], True),
     (reg.SettingSpec(key="k", kind="list", default=[], choices=("a", "b")), ["a", "z"], False),
     (reg.SettingSpec(key="k", kind="list", default=[]), "a", False),
+    (reg.SettingSpec(key="k", kind="list", default=[]), ["a", "b"], True),
+    (reg.SettingSpec(key="k", kind="list", default=[]), ["a", 3], False),
+    (reg.SettingSpec(key="k", kind="list", default=[]), [None], False),
     (reg.SettingSpec(key="k", kind="str", default=""), "x", True),
     (reg.SettingSpec(key="k", kind="str", default=""), 3, False),
     (reg.SettingSpec(key="k", kind="bool", default=False), 1, False),
@@ -280,8 +283,10 @@ def test_the_contract_refuses_an_invalid_env_value_and_names_it(clean, value):
         assert problem.startswith("KEEP_DAYS is not valid")
 
 
-def test_the_contract_refuses_a_bound_of_the_wrong_kind(clean):
-    clean.keep_ceiling = "a year"
+@pytest.mark.parametrize("ceiling", ["a year", True])
+def test_the_contract_refuses_a_bound_of_the_wrong_kind(clean, ceiling):
+    # A switch is not a number, though Python counts True as 1.
+    clean.keep_ceiling = ceiling
     with registered(_days()):
         assert reg.check_contract() == ["KEEP_CEILING, the ceiling of keep_days, is not a valid value"]
 
