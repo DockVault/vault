@@ -11377,6 +11377,14 @@ async def delete_user(
             detail="Cannot delete your own account"
         )
 
+    # Their zero-knowledge key rows go with the account, so the vaults whose current key they were given
+    # record, before the delete and in its transaction, that they owe a rotation. This locks those vault
+    # rows, and comes before the last-administrator check, which locks every administrator's row: vault
+    # rows are always locked first, since a rotation holding one goes on to write key rows, and writing a
+    # key row locks the user it names (see _blacklist_user_vault_keys). A refusal below rolls it back.
+    from app.api.ecc_router import record_rotations_owed_by
+    record_rotations_owed_by(db, user.id)
+
     # Never delete the last administrator who can act (see app/core/last_admin.py).
     if user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=LAST_ADMIN_DETAIL)
@@ -11395,10 +11403,6 @@ async def delete_user(
     username = user.username
     # Their open requests are withdrawn first: deleting the account would leave them with no asker.
     lost = _account_lost_standing(db, user, actor=current_user, because="deleted")
-    # Their zero-knowledge key rows go with the account, so the vaults whose current key they held
-    # record, before the delete and in its transaction, that they owe a rotation.
-    from app.api.ecc_router import record_rotations_owed_by
-    record_rotations_owed_by(db, user.id)
     db.delete(user)
     db.commit()
     

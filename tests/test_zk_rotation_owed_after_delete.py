@@ -197,6 +197,11 @@ def test_the_user_delete_records_what_is_owed_before_the_account_goes():
     # The record and the delete commit together: no commit between them.
     between = body[body.index("record_rotations_owed_by(db, user.id)"):body.index("db.delete(user)")]
     assert "commit" not in between
+    # The record locks vault rows; the last-administrator check locks every administrator's row. Vault rows
+    # are locked first everywhere (a rotation holding one writes key rows, which lock the users they name),
+    # so the record comes before the check, or a rotation for an administrator could deadlock with the delete.
+    assert body.count("removes_last_admin(db, user)") == 1
+    assert body.index("record_rotations_owed_by(db, user.id)") < body.index("removes_last_admin(db, user)")
     # Every hard delete of an account goes through that route.
     app_py = [p for p in (ROOT / "app").rglob("*.py")]
     deletes = [p for p in app_py if "db.delete(user)" in p.read_text(encoding="utf-8")]

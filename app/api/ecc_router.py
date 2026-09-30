@@ -1065,7 +1065,9 @@ def record_rotations_owed_by(db: Session, user_id) -> List[str]:
 
     Each vault row is locked first, in a fixed order, and the account is judged against the locked
     epoch, so a rotation in flight either committed before (and this reads its new epoch) or waits for
-    the delete."""
+    the delete. Call it before anything in the same transaction locks a user row (the last-administrator
+    check locks every administrator's): vault rows are always locked first (see
+    _blacklist_user_vault_keys)."""
     vault_ids = sorted({str(v) for (v,) in db.query(VaultMemberKey.vault_id).filter(
         VaultMemberKey.user_id == user_id,
     ).distinct().all()})
