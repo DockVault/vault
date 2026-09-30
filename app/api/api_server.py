@@ -11391,6 +11391,10 @@ async def delete_user(
     username = user.username
     # Their open requests are withdrawn first: deleting the account would leave them with no asker.
     lost = _account_lost_standing(db, user, actor=current_user, because="deleted")
+    # Their zero-knowledge key rows go with the account, so the vaults whose current key they held
+    # record, before the delete and in its transaction, that they owe a rotation.
+    from app.api.ecc_router import record_rotations_owed_by
+    record_rotations_owed_by(db, user.id)
     db.delete(user)
     db.commit()
     
@@ -24813,6 +24817,10 @@ END $$;""",
             "ALTER TABLE user_ssh_keys ADD COLUMN IF NOT EXISTS created_by_name VARCHAR(255)",
             SSH_KEY_MAKER_FROM_ACCOUNT,
             SSH_KEY_MAKER_FROM_AUDIT,
+            # The epoch at which an account that held a zero-knowledge vault's current key was deleted,
+            # so the vault still owes a rotation after the account's key rows are gone. Nullable, no
+            # default: nothing is owed on an existing vault, and an older release ignores the column.
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS rotation_owed_epoch INTEGER",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

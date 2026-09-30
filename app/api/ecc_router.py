@@ -924,6 +924,43 @@ def _team_key_map(vault: Vault) -> dict:
         return {}
 
 
+def _owed_since_a_holder_was_deleted(vault: Vault, current_epoch: int) -> bool:
+    """True when an account that held the vault's key at its current epoch was deleted (see
+    record_rotations_owed_by). Compared with the current epoch, so the next rotation ends it."""
+    owed = getattr(vault, 'rotation_owed_epoch', None)
+    return owed is not None and owed == current_epoch
+
+
+def record_rotations_owed_by(db: Session, user_id) -> List[str]:
+    """Before an account is deleted: record, on every zero-knowledge vault where it holds the CURRENT key,
+    that the vault owes a rotation at that epoch. Returns the ids of the vaults marked; the caller commits,
+    in the same transaction as the delete.
+
+    Deleting an account takes its key rows with it (they cascade), so without this nothing would show
+    that someone who held the key is gone: the "rotation owed" notice would stay quiet, and a hierarchical
+    vault would accept a rotation of its DEK alone, wrapped to the team key the deleted person still has.
+    The epoch is on the vault's own axis: the DEK epoch of a direct vault, the team epoch of a
+    hierarchical one (only a new team key shuts out someone who held the old one).
+
+    Each vault row is locked first, in a fixed order, and the account is judged against the locked
+    epoch, so a rotation in flight either committed before (and this reads its new epoch) or waits for
+    the delete."""
+    vault_ids = sorted({str(v) for (v,) in db.query(VaultMemberKey.vault_id).filter(
+        VaultMemberKey.user_id == user_id,
+        VaultMemberKey.is_active == True,  # noqa: E712
+    ).distinct().all()})
+    marked = []
+    for vid in vault_ids:
+        locked = (db.query(Vault).populate_existing()
+                  .filter(Vault.id == vid).with_for_update().first())
+        if locked is None or not _holds_current_key(db, locked, user_id):
+            continue
+        axis = 'team_key_version' if _is_hierarchical(locked) else 'dek_version'
+        locked.rotation_owed_epoch = getattr(locked, axis, 1) or 1
+        marked.append(vid)
+    return marked
+
+
 def _team_rotation_owed(db: Session, vault: Vault) -> bool:
     """True iff a TEAMPRIV holder was deactivated at the CURRENT team epoch WITHOUT the team
     keypair being rotated — the signature of a bare revoke (DELETE /permissions, DELETE /members)
@@ -935,6 +972,8 @@ def _team_rotation_owed(db: Session, vault: Vault) -> bool:
     if not _is_hierarchical(vault):
         return False
     cur = getattr(vault, 'team_key_version', 1) or 1
+    if _owed_since_a_holder_was_deleted(vault, cur):
+        return True
     return db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault.id,
         VaultMemberKey.key_version == cur,
@@ -949,10 +988,16 @@ def _rekey_owed(db: Session, vault: Vault) -> bool:
     (a deactivated user's wrapped-DEK rows). A manager should rotate the vault key (browser
     /rekey) for forward secrecy on new content. Derived (not stored): a rekey mints a new epoch
     the removed member never receives, so no deactivated row remains at the NEW current epoch and
-    the flag clears itself. Hierarchical vaults reuse the team-rotation-owed signal."""
+    the flag clears itself. Hierarchical vaults reuse the team-rotation-owed signal.
+
+    A member deleted with their account leaves no row at all (their key rows go with the account), so
+    the deletion records the epoch on the vault instead (record_rotations_owed_by), and that counts too
+    until a rotation moves the epoch past it."""
     if _is_hierarchical(vault):
         return _team_rotation_owed(db, vault)
     cur = getattr(vault, 'dek_version', 1) or 1
+    if _owed_since_a_holder_was_deleted(vault, cur):
+        return True
     return db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault.id,
         VaultMemberKey.key_version == cur,

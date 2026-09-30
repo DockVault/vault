@@ -780,7 +780,14 @@ class Vault(Base):
     # conflating the two would regress Standard vaults. Always 1 for never-rotated /
     # non-ZK vaults.
     dek_version = Column(Integer, nullable=False, default=1, server_default='1')
-    
+
+    # A rotation this vault owes because an account that held its CURRENT key was deleted: the epoch on
+    # the vault's own axis (the DEK epoch of a direct vault, the team epoch of a hierarchical one) at which
+    # that happened. Deleting an account takes its key rows with it, so the removal leaves no deactivated
+    # row for the "rotation owed" check to find; this records it instead. A rotation moves the epoch past
+    # it, which ends it. NULL when nothing is owed this way; an older release ignores the column.
+    rotation_owed_epoch = Column(Integer, nullable=True)
+
     # Expiration policy
     expire_files_after_days = Column(Integer, nullable=True)  # null means never expire
     expire_files_unit = Column(String(20), default='days')  # 'minutes', 'hours', or 'days'
