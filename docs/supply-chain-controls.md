@@ -89,16 +89,8 @@ from all three, or, if the new version is still affected and the reasoning still
 again and its version changed in all three.
 
 One further exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
-`CVE-2026-14456`, an OpenSSL QUIC-server-listener resource-exhaustion defect in the base image's
-`libssl3`/`libcrypto3`. There is no upstream fix yet, but DockVault serves HTTP/HTTPS with uvicorn
-over Python's `ssl` module (OpenSSL TLS) and ships no QUIC listener, `aioquic`, or HTTP/3 stack, so
-OpenSSL's QUIC Listener is never instantiated and the vulnerable code is not reachable. The
-statement binds the `pkg:apk/alpine/libssl3` and `pkg:apk/alpine/libcrypto3` subcomponents; if a
-future base image changes those package versions, the pin stops matching and the exception is
-re-reviewed rather than silently carried forward.
-
-A second is reviewed on the same justification: `CVE-2026-85091`, a heap buffer overflow in the base
-image's `zlib` (1.3.1.2 through 1.3.2), reached only through the gz file API's write path —
+`CVE-2026-85091`, a heap buffer overflow in the base image's `zlib` (1.3.1.2 through 1.3.2), reached
+only through the gz file API's write path —
 `gzprintf()` or `gzvprintf()` after a stalled non-blocking `gzwrite()`. There is no fixed Alpine
 package yet. No binary in the image imports any gz write function (zlib's consumers there, Python's
 `zlib` module and `apk`, use the deflate/inflate stream API), and no Python code loads zlib through

@@ -46,8 +46,7 @@ def _image_as_reviewed() -> dict:
     """The packages the committed VEX was reviewed against, as syft names them."""
     return _spdx(
         "pkg:generic/python@3.14.7",
-        f"pkg:apk/alpine/libssl3@3.5.7-r0{_ALPINE}&upstream=openssl",
-        f"pkg:apk/alpine/libcrypto3@3.5.7-r0{_ALPINE}&upstream=openssl",
+        f"pkg:apk/alpine/libssl3@3.5.8-r0{_ALPINE}&upstream=openssl",
         f"pkg:apk/alpine/zlib@1.3.2-r0{_ALPINE}",
         "pkg:pypi/fastapi@0.136.0",
     )
@@ -60,8 +59,7 @@ def _vex() -> dict:
 def test_the_committed_vex_matches_the_image_it_was_reviewed_against():
     assert _CHECK.stale_pins(_vex(), _image_as_reviewed()) == []
     pinned = {purl for _, purl, _ in _CHECK.vex_pins(_vex())}
-    assert pinned == {"pkg:generic/python@3.14.7", "pkg:apk/alpine/libssl3@3.5.7-r0",
-                      "pkg:apk/alpine/libcrypto3@3.5.7-r0", "pkg:apk/alpine/zlib@1.3.2-r0"}
+    assert pinned == {"pkg:generic/python@3.14.7", "pkg:apk/alpine/zlib@1.3.2-r0"}
 
 
 def test_a_newer_package_in_the_image_makes_its_statement_stale():
@@ -136,9 +134,9 @@ def test_a_subcomponent_without_a_version_pins_nothing():
 def test_each_pin_is_reported_once_per_finding():
     # The template binds each subcomponent twice, under the digest and under the image reference.
     vex = _vex()
-    assert len(_CHECK.vex_pins(vex)) == 6
+    assert len(_CHECK.vex_pins(vex)) == 4
     sbom = _spdx("pkg:pypi/fastapi@0.136.0")
-    assert len(_CHECK.stale_pins(vex, sbom)) == 6
+    assert len(_CHECK.stale_pins(vex, sbom)) == 4
 
 
 @pytest.mark.parametrize("shape", ["syft-json", "cyclonedx"])
@@ -169,9 +167,9 @@ def test_the_command_fails_with_an_annotation_on_the_template(tmp_path, capsys):
     sbom.write_text(json.dumps(_image_as_reviewed()), encoding="utf-8")
 
     assert _CHECK.main(["--vex", str(vex), "--sbom", str(sbom)]) == 0
-    assert "every package version the VEX names is in the image (6 checked)" in capsys.readouterr().out
+    assert "every package version the VEX names is in the image (4 checked)" in capsys.readouterr().out
 
-    sbom.write_text(json.dumps(_spdx("pkg:generic/python@3.14.7")), encoding="utf-8")
+    sbom.write_text(json.dumps(_spdx(f"pkg:apk/alpine/zlib@1.3.2-r0{_ALPINE}")), encoding="utf-8")
     assert _CHECK.main(["--vex", str(vex), "--sbom", str(sbom)]) == 1
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 3
