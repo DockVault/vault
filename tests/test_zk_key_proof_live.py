@@ -271,6 +271,34 @@ def test_the_proof_covers_the_exact_bytes_sent_through_the_whole_stack(admin, pe
         oc.delete_vault(vid)
 
 
+def test_a_rotation_for_the_most_members_fits_the_size_limit_and_is_proved_whole(admin, people):
+    """A rotation carries one wrap per remaining member, up to 512, and the proof adds its own fields. At
+    that size, with wraps larger than the web app makes, the body still fits the JSON size limit and the
+    proof over all of it verifies: the request gets as far as the check that the wraps name exactly the
+    vault's members, which runs after the proof."""
+    from app.core.body_limit import JSON_LIMIT
+
+    owner, oc = people("kpbig")
+    vid = _direct_vault(oc, admin)
+    try:
+        before = _state(vid)
+        ephemeral = harness.public_pem(_foreign())          # a P-384 key in its longest form
+        wrap = base64.b64encode(os.urandom(256)).decode()
+        members = [{"user_id": owner["id"], "wrapped_dek": wrap, "ephemeral_public_key": ephemeral}]
+        members += [{"user_id": str(uuid.uuid4()), "wrapped_dek": wrap, "ephemeral_public_key": ephemeral}
+                    for _ in range(511)]
+        path = f"/ecc/vaults/{vid}/rekey"
+        prepared = harness.prepare_zk(oc, path, {"from_version": 1, "to_version": 2, "member_keys": members})
+        size = len(prepared["raw"].encode("utf-8"))
+        assert 250 * 1024 < size < JSON_LIMIT, size
+        r = harness.send_prepared(oc, path, prepared)
+        assert r.status_code == 400 and "must cover EXACTLY" in r.json()["detail"], r.text[:300]
+        assert _failures(vid) == "", "the proof over the whole body did not verify"
+        assert _state(vid) == before, "a refused rotation changed the vault"
+    finally:
+        oc.delete_vault(vid)
+
+
 # -------------------------------------------------------------------------------------- the lock
 
 _HOLD = 4
