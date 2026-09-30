@@ -18,6 +18,9 @@ This module holds only the server's side: the transcript, the MAC check, the hea
 shape of the stored material. It never sees a DEK or a private key other than the server's one-time key.
 The client side is ``static/js/ecc_crypto.js``; both reproduce the frozen vectors in
 ``tests/fixtures/crypto/zk-key-proof-v1/``.
+
+Specified by ``docs/design/vault-zk-key-proof-v1.md``. Where this file and that document differ, one of
+them is wrong.
 """
 from __future__ import annotations
 
