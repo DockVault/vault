@@ -332,6 +332,41 @@ def test_without_a_way_to_send_the_code_it_says_so_and_sends_nothing(world, rout
     assert routes.sent == [] and routes.codes == {}
 
 
+def test_asking_for_and_entering_the_code_are_rate_limited(world, routes, monkeypatch):
+    user = _account(world)
+    _keyed(world, user)
+    _change(world, user, days_ago=1, payload={"email_at_change": "p@example.com"})
+    run_coroutine(SEND_CODE(current_user=user, db=world.db))
+    buckets = []
+
+    def limited(u, bucket):
+        buckets.append(bucket)
+        raise HTTPException(status_code=429, detail="Too many requests")
+    monkeypatch.setattr(E, "_ecc_rate_limit", limited)
+    for route, kwargs in ((SEND_CODE, {}), (RELEASE, {"request": E.EnvelopeReleaseRequest(code="c0de12")})):
+        with pytest.raises(HTTPException) as refused:
+            run_coroutine(route(current_user=user, db=world.db, **kwargs))
+        assert refused.value.status_code == 429
+    assert buckets == ["envelope_hold", "envelope_hold"]
+    # The right code, refused by the limit, released nothing.
+    assert H.held_until(world.db, user, NOW) is not None
+    assert len(routes.sent) == 1
+
+
+def test_the_right_code_releases_nothing_without_a_session_row_to_record_it_on(world, routes):
+    user = _account(world)
+    _keyed(world, user)
+    _change(world, user, days_ago=1, payload={"email_at_change": "p@example.com"})
+    run_coroutine(SEND_CODE(current_user=user, db=world.db))
+    token, user._session_token = user._session_token, None
+    with pytest.raises(KeyProofRefusal) as refused:
+        run_coroutine(RELEASE(request=E.EnvelopeReleaseRequest(code="c0de12"), current_user=user, db=world.db))
+    assert (refused.value.status_code, refused.value.reason) == (403, "zk-envelope-hold-code-failed")
+    assert routes.audit[-1] == ("zk_envelope_release_failed", {"reason": "no_session"})
+    user._session_token = token
+    assert H.held_until(world.db, user, NOW) is not None
+
+
 def test_an_account_that_is_not_held_is_sent_nothing_and_has_nothing_to_release(world, routes):
     user = _account(world)
     assert run_coroutine(SEND_CODE(current_user=user, db=world.db)) == {"held": False}

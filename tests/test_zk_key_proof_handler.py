@@ -1215,6 +1215,25 @@ def test_a_key_holders_report_is_recorded_and_the_owner_told(world, monkeypatch)
     assert world.dek_version(vid) == 1 and world.proof_rows(vid).keys() == {1}
 
 
+def test_a_report_through_a_session_that_may_not_receive_the_vaults_key_is_refused(world, monkeypatch):
+    """A temporary credential that may not receive this vault's key gets the same refusal it gets for the key,
+    and its report records and tells nothing."""
+    from fastapi import HTTPException
+    told, asked = [], []
+    monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda db, vault, finding: told.append(finding))
+
+    def may_not(db, user, vault):
+        asked.append(str(vault.id))
+        return False
+    monkeypatch.setattr(E, "may_release_vault_key", may_not)
+    vid, owner, manager, _ = world.direct_vault()
+    with pytest.raises(HTTPException) as exc:
+        _report(world, vid, manager)
+    assert (exc.value.status_code, exc.value.detail) == (403, E.TEMP_ZK_KEY_ACCESS_DENIED)
+    assert asked == [str(vid)] and told == []
+    assert not [a for a, _ in world.audit if a == "zk_key_check_mismatch"]
+
+
 def test_a_report_is_refused_to_anyone_without_a_key_and_for_what_is_not_a_finding(world, monkeypatch):
     monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda *a: None)
     vid, owner, manager, _ = world.direct_vault()

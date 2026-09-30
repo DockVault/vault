@@ -178,6 +178,17 @@ def test_a_switched_off_key_at_the_current_epoch_is_still_owed_after_the_delete(
     assert E._rekey_owed(s, vault) is False
 
 
+def test_each_vault_is_locked_and_read_again_before_the_account_is_judged():
+    """A rotation in flight holds the vault row; the recorder takes the same lock and reads the row again under
+    it, so it judges the account against the epoch the rotation left, never a stale one."""
+    import inspect
+    src = inspect.getsource(E.record_rotations_owed_by)
+    lock = src.index("with_for_update()")
+    assert src.count("with_for_update()") == 1
+    assert src.index("populate_existing()") < lock < src.index("_had_current_key(db, locked, user_id)")
+    assert src.index("vault_ids = sorted(") < lock           # every vault, in a fixed order
+
+
 def test_nothing_owed_reads_as_before(Session):
     """A vault with no recorded epoch answers from its rows alone, as it did before the column."""
     s = Session()
