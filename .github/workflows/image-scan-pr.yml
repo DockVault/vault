@@ -38,6 +38,7 @@ on:
       - "security/**"
       - ".github/workflows/image-scan-pr.yml"
       - ".github/scripts/render_release_vex.py"
+      - ".github/scripts/check_vex_sbom.py"
   workflow_dispatch:
     inputs:
       release_policy:
@@ -83,6 +84,26 @@ jobs:
             --build-arg "OCI_REVISION=${SOURCE_REVISION}" \
             --tag ghcr.io/dockvault/vault:v0.0.0-amd64 \
             .
+
+      # Each reviewed VEX statement names exact package versions. Once the image has moved past one
+      # (a base-image update, or the build's `apk upgrade` taking a newer package), the statement
+      # suppresses nothing and only misleads; the check says what to remove, or to review again.
+      - name: Generate the SPDX SBOM (amd64)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/dockvault/vault:v0.0.0-amd64
+          format: spdx-json
+          syft-version: v1.44.0
+          output-file: scan-amd64.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Check the VEX against the image's packages
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check_vex_sbom.py \
+            --vex security/vex.openvex.json \
+            --sbom scan-amd64.spdx.json
 
       # The reviewed OpenVEX marks the accepted CPython findings not_affected. Without it the scan
       # would fail on findings the release has already reviewed, so the PR gate reuses the exact

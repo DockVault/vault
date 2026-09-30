@@ -77,6 +77,17 @@ Every statement contains both the immutable OCI digest PURL and versioned image 
 GitHub Release publishes that rendered VEX beside the SBOM. Any additional exception requires a
 source-reviewed template change.
 
+Each statement names the exact package versions it was reviewed for, so an image that has moved on
+(a newer base image, or a newer Alpine package from the build's `apk upgrade`) is no longer covered
+by it. The image scan checks this before it scans: it writes the image's SPDX SBOM and
+`.github/scripts/check_vex_sbom.py` compares every versioned subcomponent in the template with the
+packages the SBOM lists, ignoring purl qualifiers such as the architecture. A version the image no
+longer contains fails the scan, pull requests and release candidates alike, with the statement's
+finding and the version the image has instead. The statement then lives in three places: the
+template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph below. It is removed
+from all three, or, if the new version is still affected and the reasoning still holds, reviewed
+again and its version changed in all three.
+
 One further exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
 `CVE-2026-14456`, an OpenSSL QUIC-server-listener resource-exhaustion defect in the base image's
 `libssl3`/`libcrypto3`. There is no upstream fix yet, but DockVault serves HTTP/HTTPS with uvicorn
