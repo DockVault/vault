@@ -99,12 +99,14 @@ _SUPPORT_KEYS = {"eol", "secure", "code_support", "security_support"}
 _VULN_KEYS = {"advisory", "title", "fixed_in"}
 # Below this version a reference may carry only its advisory's id ({"advisory": "<slug>"}); the
 # readers of 0.33.0 and later, and the documentation site, take the title and fix from the advisory.
-# The boundary is where the older readers stop looking. The host tool of 0.30.0 to 0.32.x merges
-# main's copy of this file into every version it knows, and prints a line for each of the 15 newest
-# releases that are not end-of-life, counting what each reference's own `title` and `fixed_in` say:
-# an id-only reference in that window would read as "no fix released yet". That window reaches
-# 0.27.0 today and only moves up as releases are added, so references on 0.27.0 and later keep both
-# fields.
+# The boundary is where the older readers' list of releases stops. The host tool of 0.30.0 to
+# 0.32.x merges main's copy of this file into every version it knows, and prints a line for each of
+# the 15 newest releases that are not end-of-life, counting what each reference's own `title` and
+# `fixed_in` say: an id-only reference in that window would read as "no fix released yet". That
+# window reaches 0.27.0 today and only moves up as releases are added, so references on 0.27.0 and
+# later keep both fields. Below it that tool still reads a short reference for a release asked for
+# by name, or for the release a container runs; tests/test_upgrade_matrix_older_readers.py states
+# what it then shows.
 ID_ONLY_REFERENCES_BELOW = "0.27.0"
 # One record per vulnerability. title, description, impact and remediation carry the meaning and are
 # always stated. The ratings are required keys that may be null, so an unrated finding says so rather

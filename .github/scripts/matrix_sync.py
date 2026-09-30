@@ -35,9 +35,12 @@ same bytes whichever side runs it.
         Shortens each reference on a version below the validator's ID_ONLY_REFERENCES_BELOW to the
         advisory's id alone. Readers from 0.33.0 on, and the documentation site, take the title and
         fix from the advisory record. The host tools of 0.30.0 to 0.32.x list the newest releases
-        from each reference's own fields, and that list stops above the boundary; they read a
-        shortened reference only when asked for such an old release by name, and still report it
-        as not secure. The file is validated before and after. Running it again changes nothing.
+        from each reference's own fields, and that list stops above the boundary. They read a
+        shortened reference when asked for such an old release by name, and still report it as not
+        secure, and when the container runs one: then, from 0.31.0 on, what they say a move fixes
+        is miscounted, and a target that is itself affected is said to bring back findings the
+        running release has too. tests/test_upgrade_matrix_older_readers.py states both. The file
+        is validated before and after. Running it again changes nothing.
         OUT defaults to MATRIX.json. Run it in a release commit, never on its own.
 
 Stdlib only, like the rest of the release scripts.

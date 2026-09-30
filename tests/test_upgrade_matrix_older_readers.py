@@ -2,7 +2,10 @@
 carry only the advisory id.
 
 Every deployed host tool and running app reads main's docs/upgrade-matrix.json, so the short form is
-safe only if none of them tells an operator something different. The readers are taken from the
+safe only if none of them tells an operator something different, apart from the two costs stated
+below for the host tools of 0.30.0 to 0.32.x: a release below the boundary asked for by name, and a
+container running one. The in-app check is not affected: up to 0.26.0 it reads no findings, and
+from 0.27.0 on it reads only those of the release it runs. The readers are taken from the
 release tags themselves (`git show vX.Y.Z:...`), not copied, so the check is against the code that
 is actually installed. The two forms compared are the committed matrix with every reference written
 out in full and the same matrix shortened by `matrix_sync.py compact`; whichever form is committed,
@@ -32,6 +35,9 @@ _RELEASE_TAG = re.compile(r"v((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2})", re.
 #: The host tools whose update list merges main's matrix into their own copy and prints a line per
 #: release from each reference's own title and fixed_in: the first and the last release of that code.
 _HOST_TOOLS = ("v0.30.0", "v0.32.6")
+#: The host tools that end the description of a move with what it fixes and what it brings back,
+#: comparing the running version's list with the target's: the first and the last release of that code.
+_MOVE_SUMMARY_TOOLS = ("v0.31.0", "v0.32.6")
 #: The first release whose readers take a short reference's title and fix from its advisory.
 _FIRST_ID_READER = "v0.33.0"
 #: How many releases the host tools of 0.30.0 to 0.32.x list (`offered[:15]`).
@@ -149,7 +155,7 @@ def test_an_older_host_tool_lists_the_same_releases_with_the_same_notes(tool_tag
 def test_an_older_host_tool_asked_for_an_older_release_still_warns(tool_tag, forms, shipped):
     """`dockvault.py update --tag vX` of 0.30.0 to 0.32.x, for a release below the boundary.
 
-    The accepted cost of the short form. The tool merges main's references into its own by (title,
+    The first accepted cost of the short form. The tool merges main's references into its own by (title,
     fixed_in), and a short reference has neither, so the advisories its own copy already knew are
     shown as before and those published later collapse into one entry without a title that reads
     "no fix released yet". The release is still reported as not secure, and nothing names a fix
@@ -173,6 +179,59 @@ def test_an_older_host_tool_asked_for_an_older_release_still_warns(tool_tag, for
         assert tool.version_support(merged["short"], target).get("secure") is False, target
         assert short, target
         assert set(short) - set(full) <= {(None, None)}, target
+
+
+def _move(tool, matrix: dict, current: str, target: str) -> tuple[int, set]:
+    """What the host tool says a move does: how many of the running version's findings the target
+    does not have, and which of the target's findings the running version does not have, both by
+    (title, fixed_in) as the tool compares them."""
+    now = {(v.get("title"), v.get("fixed_in")) for v in tool.version_vulnerabilities(matrix, current)}
+    after = [(v.get("title"), v.get("fixed_in")) for v in tool.version_vulnerabilities(matrix, target)]
+    return len(now - set(after)), {key for key in after if key not in now}
+
+
+@pytest.mark.parametrize("tool_tag", _MOVE_SUMMARY_TOOLS)
+def test_an_older_host_tool_on_an_older_running_release_misreads_only_its_own_findings(
+        tool_tag, forms, shipped):
+    """`dockvault.py update` of 0.31.0 to 0.32.x on a host whose container runs a release below
+    the boundary (a checkout newer than the running release).
+
+    The second accepted cost of the short form. After the target's own warnings the tool says what
+    the move fixes and what it brings back, comparing the running version's findings with the
+    target's by (title, fixed_in). The running version's short references collapse into one entry
+    without a title, so "Moving to vX fixes N known vulnerabilities" counts wrong (for the newest
+    release far too few), and a target that is itself affected is said, in red, to bring back
+    findings that the running version has as well. Nothing it names as brought back is missing
+    from the running version, nothing really brought back goes unnamed, and a target with no
+    findings is never said to bring anything back. From the boundary on, nothing changes.
+    """
+    tool = shipped(tool_tag, "dockvault.py")
+    local = json.loads(_at(tool_tag, "docs/upgrade-matrix.json"))
+    tags = _released_tags()
+    listed = [t for t in tags if not tool.is_eol(local, t)][:_LISTED]
+    merged = {name: tool.merge_lifecycle_matrix(local, main, tags[0])[0]
+              for name, main in forms.items()}
+    boundary = _vkey(_UM.ID_ONLY_REFERENCES_BELOW)
+    said_brought_back = 0
+
+    for current in forms["full"]["versions"]:
+        if not tool._declares_version(merged["short"], current):
+            continue
+        has = {(v.get("title"), v.get("fixed_in"))
+               for v in tool.version_vulnerabilities(merged["full"], current)}
+        for target in listed:
+            full_fixed, full_back = _move(tool, merged["full"], current, target)
+            short_fixed, short_back = _move(tool, merged["short"], current, target)
+            if _vkey(current) >= boundary:
+                assert (short_fixed, short_back) == (full_fixed, full_back), (current, target)
+                continue
+            assert full_back <= short_back, (current, target)
+            assert short_back - full_back <= has, (current, target)
+            if not tool.version_vulnerabilities(merged["full"], target):
+                assert not short_back, (current, target)
+            said_brought_back += len(short_back - full_back)
+
+    assert said_brought_back, "no move below the boundary misreads anything; restate this cost"
 
 
 @pytest.mark.parametrize("reader", [
