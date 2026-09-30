@@ -2056,6 +2056,16 @@ async def grant_member_key(
         VaultMemberKey.user_id == request.user_id,
         VaultMemberKey.key_version == epoch,
     ).first()
+    if existing is not None and existing.is_active and str(existing.user_id) != str(current_user.id):
+        # Someone else who already holds the current key keeps the copy they have. The server cannot
+        # tell a correct wrap from one of another key, so replacing it would hand that person a key of
+        # the caller's choosing: they could no longer open what is there, and what they upload next
+        # would be readable to whoever chose it. A share to someone who holds the key adds nothing, so
+        # it changes nothing and says so. A first share, bringing back a switched-off copy and
+        # replacing your own still go ahead.
+        db.rollback()
+        return {"status": "ok", "unchanged": True, "vault_id": vault_id, "user_id": request.user_id,
+                "key_version": epoch, "mode": getattr(vault, 'key_wrapping_mode', 'direct')}
     if existing:
         existing.wrapped_dek = blob
         existing.ephemeral_public_key = eph

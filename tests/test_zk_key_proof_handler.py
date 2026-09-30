@@ -1071,3 +1071,68 @@ def test_a_refusal_after_the_vault_lock_ends_its_transaction_first(world):
     assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed") and "P-384" in err.detail
     assert not still_open, "the refusal of a team key that is not P-384 kept the vault lock"
     assert world.dek_version(vid) == 1
+
+
+# ------------------------------------------------------------------ a share never replaces another's key
+
+def _wrap_of(world, vid, user_id, epoch=1):
+    s = world.Session()
+    try:
+        row = s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid, VaultMemberKey.user_id == user_id,
+                                             VaultMemberKey.key_version == epoch).first()
+        return None if row is None else (row.wrapped_dek, row.is_active, str(row.granted_by))
+    finally:
+        s.close()
+
+
+def test_a_share_to_someone_who_holds_the_current_key_changes_nothing(world):
+    """The server cannot tell a correct wrap from one of another key, so a key holder's copy is never
+    replaced by someone else's share: the answer is 200 with `unchanged`, and the row is as it was."""
+    vid, owner, manager, proof_key = world.direct_vault()
+    before = _wrap_of(world, vid, manager)
+    _, body, raw, header = _proved_share(world, vid, owner, manager, proof_key)
+    out = _share(world, vid, owner, manager, header=header, body=body, raw=raw)
+    assert out["status"] == "ok" and out["unchanged"] is True and out["key_version"] == 1
+    assert _wrap_of(world, vid, manager) == before
+    assert world.challenges_left() == 0
+    assert not [a for a, _ in world.audit if a == "zk_member_key_granted"]
+
+    # A team vault's copy of the team key likewise.
+    vid, owner, manager, team = world.hier_vault()
+    before = _wrap_of(world, vid, manager)
+    body = {"user_id": str(manager), "wrapped_team_privkey": "t2", "team_ephemeral_public_key": "e2"}
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "share")
+    header = world.prove(ch, owner, vid, "share", raw, current_key=team)
+    out = _share(world, vid, owner, manager, header=header, body=body, raw=raw)
+    assert out["unchanged"] is True and _wrap_of(world, vid, manager) == before
+
+
+def test_a_first_share_a_switched_off_copy_and_your_own_still_go_ahead(world):
+    vid, owner, manager, proof_key = world.direct_vault()
+    # A first share.
+    target = world.new_person()
+    _, body, raw, header = _proved_share(world, vid, owner, target, proof_key)
+    out = _share(world, vid, owner, target, header=header, body=body, raw=raw)
+    assert "unchanged" not in out and _wrap_of(world, vid, target)[:2] == ("w2", True)
+    # A copy that was switched off is brought back with the new wrap.
+    s = world.Session()
+    row = s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid, VaultMemberKey.user_id == target).one()
+    row.is_active, row.wrapped_dek = False, "old"
+    s.commit()
+    s.close()
+    _, body, raw, header = _proved_share(world, vid, owner, target, proof_key)
+    out = _share(world, vid, owner, target, header=header, body=body, raw=raw)
+    assert "unchanged" not in out and _wrap_of(world, vid, target)[:2] == ("w2", True)
+    # The caller's own copy is theirs to replace.
+    _, body, raw, header = _proved_share(world, vid, manager, manager, proof_key)
+    out = _share(world, vid, manager, manager, header=header, body=body, raw=raw)
+    assert "unchanged" not in out and _wrap_of(world, vid, manager)[:2] == ("w2", True)
+
+
+def test_with_enforcement_off_a_share_without_a_proof_still_replaces_no_one(world):
+    world.enforce(False)
+    vid, owner, manager, _ = world.direct_vault()
+    before = _wrap_of(world, vid, manager)
+    out = _share(world, vid, owner, manager)
+    assert out["unchanged"] is True and _wrap_of(world, vid, manager) == before
