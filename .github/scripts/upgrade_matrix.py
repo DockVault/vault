@@ -23,6 +23,8 @@ Stdlib only, like the rest of the release scripts.
 
 from __future__ import annotations
 
+import calendar
+import datetime
 import importlib.util
 import json
 import re
@@ -133,7 +135,19 @@ _EDGE_KEYS = {"from", "to", "kind", "reversible", "requires_backup", "reason", "
 # the version it needs, which the image reads at startup whatever tool is used.
 _CONDITION_KEYS = {"id", "summary", "detect", "blocks_rollback"}
 _WAIVER_KEYS = {"version", "reason"}
-_TOP_KEYS = {"schema_version", "about", "kinds", "advisories", "versions", "edges", "waivers"}
+_TOP_KEYS = {"schema_version", "about", "kinds", "advisories", "versions", "edges", "waivers",
+             "lines"}
+# The optional top-level `lines` map says until when each release line receives security fixes:
+# {"0.33": {"security_fixes_until": "2027-06-26"}, "0.34": {"security_fixes_until": null}}. It is
+# separate from a version's `eol`, which marks the releases an install can no longer move to or from.
+# Lines start at 0.33, the first with a support period (.github/SECURITY.md); older lines are
+# unsupported by definition and are not listed. The newest line's date is null, as its end is not
+# known until the next minor ships; every other listed line has a date at least SUPPORT_MONTHS after
+# the next line's first release, which is the published promise, checked here.
+_FIRST_SUPPORTED_LINE = "0.33"
+SUPPORT_MONTHS = 6
+_LINE_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", re.ASCII)
+_LINE_KEYS = {"security_fixes_until"}
 
 
 class UpgradeMatrixError(ValueError):
@@ -491,6 +505,88 @@ def _validate_advisory_coverage(advisories: dict, versions: dict) -> None:
                      "affected")
 
 
+def _add_months(day: datetime.date, months: int) -> datetime.date:
+    """The same day `months` calendar months later, or the month's last day when it has no such day."""
+    year, month = divmod(day.month - 1 + months, 12)
+    year += day.year
+    month += 1
+    return day.replace(year=year, month=month, day=min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _validate_lines(lines: object, versions: dict, advisories: dict) -> None:
+    """The support period of each release line, and what it means for an unfixed advisory.
+
+    Every line from the first listed one up to the newest declared line is listed. Only the newest
+    has no date. Every other date is at least SUPPORT_MONTHS after the next line's first release,
+    the promise .github/SECURITY.md makes. And an advisory that leaves the newest release of a line
+    affected while that line was still supported (on the advisory's `published` date) must say what
+    to do meanwhile: a supported line is expected to be fixed, and when it is not, the mitigation is
+    all its operators have.
+    """
+    _require(isinstance(lines, dict) and lines, "upgrade matrix 'lines' must be a non-empty object")
+    by_line: dict[str, list[str]] = {}
+    for version in versions:
+        by_line.setdefault(_line(version), []).append(version)
+    declared = sorted(by_line, key=lambda name: _sort_key(name + ".0"))
+    newest = declared[-1]
+    until: dict[str, str | None] = {}
+    for line, entry in lines.items():
+        where = f"lines[{line}]"
+        _string(line, "line key", pattern=_LINE_RE)
+        _require(_sort_key(line + ".0") >= _sort_key(_FIRST_SUPPORTED_LINE + ".0"),
+                 f"{where}: lines start at {_FIRST_SUPPORTED_LINE}, the first with a support period; "
+                 "an older line is unsupported by definition")
+        _require(line in by_line, f"{where} names a line with no declared release")
+        _require(isinstance(entry, dict), f"{where} must be an object")
+        _no_unknown_keys(entry, _LINE_KEYS, where)
+        _require("security_fixes_until" in entry, f"{where} is missing required key(s): "
+                                                   "security_fixes_until")
+        date = entry["security_fixes_until"]
+        if date is None:
+            _require(line == newest,
+                     f"{where}.security_fixes_until is null, but only the newest line, {newest}, has "
+                     "no end date; the support of every earlier line ends on a stated day")
+        else:
+            _string(date, f"{where}.security_fixes_until", pattern=_DATE_RE)
+            _require(line != newest,
+                     f"{where}.security_fixes_until is {date}, but {line} is the newest line; its "
+                     "support ends six months after the next minor release, which has not shipped")
+        until[line] = date
+    first_listed = min(until, key=lambda name: _sort_key(name + ".0"))
+    missing = [line for line in declared
+               if _sort_key(line + ".0") >= _sort_key(first_listed + ".0") and line not in until]
+    _require(not missing, f"upgrade matrix 'lines' does not list {', '.join(missing)}; every line "
+                          f"from {first_listed} on states its support period")
+    for line, date in until.items():
+        if date is None:
+            continue
+        successor = declared[declared.index(line) + 1]
+        start = min(by_line[successor], key=_sort_key)
+        released = versions[start]["released"]
+        try:
+            promised = _add_months(datetime.date.fromisoformat(released), SUPPORT_MONTHS)
+            ends = datetime.date.fromisoformat(date)
+        except ValueError as exc:
+            raise UpgradeMatrixError(f"lines[{line}]: {exc}") from exc
+        _require(ends >= promised,
+                 f"lines[{line}].security_fixes_until is {date}, but {start} was released on "
+                 f"{released}, so the promise of {SUPPORT_MONTHS} months after the next minor "
+                 f"release runs to {promised.isoformat()}")
+
+    for slug, advisory in advisories.items():
+        if advisory["mitigation"] is not None:
+            continue
+        for line, date in until.items():
+            if date is not None and date < advisory["published"]:
+                continue                           # support had ended when it was published
+            last = max(by_line[line], key=_sort_key)
+            listed = {ref.get("advisory") for ref in versions[last].get("vulnerabilities") or []}
+            _require(slug not in listed,
+                     f"advisories[{slug}] leaves {last}, the newest release of the {line} line, "
+                     f"affected while that line is supported, and has no mitigation; fix it on that "
+                     "line or say what operators can do meanwhile")
+
+
 def load_matrix(path: Path) -> dict:
     """Read and parse the matrix, refusing anything that is not plainly a UTF-8 JSON object."""
     # A symlink would let the file the gate validates differ from the file the release publishes,
@@ -582,6 +678,8 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
                      "its known vulnerabilities")
 
     _validate_advisory_coverage(advisories, versions)
+    if "lines" in data:
+        _validate_lines(data["lines"], versions, advisories)
 
     edges = data.get("edges")
     _require(isinstance(edges, list), "upgrade matrix needs an 'edges' list")

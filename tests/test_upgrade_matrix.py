@@ -911,6 +911,103 @@ def test_the_readers_in_this_tree_describe_a_flagged_condition_like_any_other():
     assert [c["id"] for c in dockvault.plan_upgrade_path(data, "0.1.0", "0.2.0")["conditions"]] == [
         "kept-rows"]
 
+# --- support periods of release lines ------------------------------------------------------------
+
+def _lines(**lines):
+    """_two_lines() with a `lines` map: 0.34.0 shipped on 2026-12-10."""
+    data = _two_lines()
+    data["lines"] = {line: {"security_fixes_until": until} for line, until in lines.items()}
+    return data
+
+
+def test_support_periods_are_accepted_when_they_keep_the_promise():
+    # Six calendar months after 0.34.0 shipped (2026-12-10) is 2027-06-10.
+    um.validate_matrix(_lines(**{"0.33": "2027-06-10", "0.34": None}), released_ceiling=None)
+    um.validate_matrix(_lines(**{"0.34": None}), released_ceiling=None)
+
+
+@pytest.mark.parametrize("lines, expected", [
+    ({"0.33": None, "0.34": None},
+     "lines[0.33].security_fixes_until is null, but only the newest line, 0.34, has no end date"),
+    ({"0.33": "2027-06-10", "0.34": "2027-12-31"},
+     "lines[0.34].security_fixes_until is 2027-12-31, but 0.34 is the newest line"),
+    ({"0.33": "2027-06-10"}, "upgrade matrix 'lines' does not list 0.34"),
+    ({"0.33": "2027-06-09", "0.34": None},
+     "lines[0.33].security_fixes_until is 2027-06-09, but 0.34.0 was released on 2026-12-10, so "
+     "the promise of 6 months after the next minor release runs to 2027-06-10"),
+    ({"0.32": "2027-06-10", "0.33": "2027-06-10", "0.34": None},
+     "lines[0.32]: lines start at 0.33, the first with a support period"),
+    ({"0.34": None, "0.35": None}, "lines[0.35] names a line with no declared release"),
+    ({"0.33": "10 June 2027", "0.34": None}, "malformed"),
+    ({"0.33.0": None}, "malformed"),
+])
+def test_the_validator_rejects_bad_support_periods(lines, expected):
+    _reject(_lines(**lines), expected)
+
+
+def test_a_line_entry_names_only_its_end_of_security_fixes():
+    data = _lines(**{"0.34": None})
+    data["lines"]["0.34"]["code_fixes_until"] = None
+    _reject(data, "unknown key")
+    data = _lines(**{"0.34": None})
+    data["lines"]["0.34"] = {}
+    _reject(data, "lines[0.34] is missing required key(s): security_fixes_until")
+    data["lines"] = {}
+    _reject(data, "'lines' must be a non-empty object")
+
+
+def test_six_calendar_months_end_on_the_last_day_of_a_shorter_month():
+    assert um._add_months(__import__("datetime").date(2026, 8, 31), 6).isoformat() == "2027-02-28"
+    assert um._add_months(__import__("datetime").date(2027, 8, 31), 6).isoformat() == "2028-02-29"
+    assert um._add_months(__import__("datetime").date(2026, 12, 10), 6).isoformat() == "2027-06-10"
+
+
+def _left_unfixed_on_the_older_line(published="2027-01-11", mitigation=None):
+    """The advisory fixed only on the 0.34 line, leaving 0.33.2, the newest 0.33, affected."""
+    data = _lines(**{"0.33": "2027-06-10", "0.34": None})
+    advisory = data["advisories"]["on-two-lines"]
+    advisory.update({"fixed_in": "0.34.1", "fixed_in_lines": ["0.34.1"], "published": published,
+                     "mitigation": mitigation})
+    for ver in ("0.32.6", "0.33.0", "0.33.1", "0.33.2", "0.34.0"):
+        data["versions"][ver]["support"] = _support(secure=False)
+        data["versions"][ver]["vulnerabilities"] = [
+            _ref(slug="on-two-lines", title="On two lines", fixed_in="0.34.1")]
+    return data
+
+
+def test_an_advisory_that_leaves_a_supported_line_affected_needs_a_mitigation():
+    _reject(_left_unfixed_on_the_older_line(),
+            "advisories[on-two-lines] leaves 0.33.2, the newest release of the 0.33 line, affected "
+            "while that line is supported, and has no mitigation")
+    um.validate_matrix(_left_unfixed_on_the_older_line(mitigation="Turn the feature off."),
+                       released_ceiling=None)
+
+
+def test_a_line_whose_support_had_ended_needs_no_mitigation():
+    # Published after 0.33's support ended: that line is no longer promised a fix.
+    um.validate_matrix(_left_unfixed_on_the_older_line(published="2027-06-11"),
+                       released_ceiling=None)
+    _reject(_left_unfixed_on_the_older_line(published="2027-06-10"), "has no mitigation")
+
+
+def test_the_gate_warns_from_the_same_field():
+    # The release gate reads lines[X.Y].security_fixes_until for its support-date warning.
+    import datetime
+
+    data = _lines(**{"0.33": "2027-06-10", "0.34": None})
+    assert gate.line_support_warning(data, "0.33.3", datetime.date(2027, 6, 10)) is None
+    assert "ended on 2027-06-10" in gate.line_support_warning(data, "0.33.3",
+                                                              datetime.date(2027, 6, 11))
+
+
+def test_the_committed_matrix_takes_the_lines_map_its_next_release_writes():
+    # Until a release commit writes `lines`, the next one adds the newest line with no end date.
+    data = um.load_matrix(MATRIX_PATH)
+    if "lines" not in data:
+        newest = max(data["versions"], key=um._sort_key)
+        data["lines"] = {um._line(newest): {"security_fixes_until": None}}
+    um.validate_matrix(data, released_ceiling=None)
+
 
 # --- coverage: an advisory affects an unbroken run of releases ------------------------------------
 

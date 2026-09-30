@@ -398,8 +398,12 @@ one, and warns before moving to a version with known unpatched vulnerabilities.
 End-of-life is not the end of security support. It marks the releases an install can no longer move
 to or from in place (see the minimum supported version below). Which release lines still receive
 security fixes, and until when, is stated in [`.github/SECURITY.md`](.github/SECURITY.md): each line
-from 0.33 on is supported until six months after the next minor release ships. A release outside that
-period is not marked end-of-life, so a move within its line, or back to it, still works; it is
+from 0.33 on is supported until six months after the next minor release ships. The matrix states the
+same in its top-level `lines` map: each line from 0.33 on with the day its security fixes end
+(`security_fixes_until`), null for the newest line, whose end is not known until the next minor
+release ships. The validator checks each date against that promise, and requires a mitigation on an
+advisory that leaves the newest release of a line affected while the line is supported. A release
+outside that period is not marked end-of-life, so a move within its line, or back to it, still works; it is
 marked not secure as soon as an advisory affects it. How a fix reaches an older line that is still
 supported is described in [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
 
