@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.models import AuditLog, User
+from app.services import audit_row_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class AuditLogger:
             except Exception:  # noqa: BLE001 -- a missing name never stops the row
                 username = None
 
+        # What the caller passed, before anything is taken out, for the privacy hook below. A copy, so a
+        # hook cannot change the caller's dict.
+        raw_details = dict(details) if isinstance(details, dict) else details
+
         # At-rest privacy: file/folder names are encrypted in the files/folders tables,
         # so we must not persist their plaintext in the audit details JSON (that would
         # leave the very names one table over, recoverable from a DB/backup read).
@@ -168,6 +173,9 @@ class AuditLogger:
             ip_address = current_client_ip()
 
         audit_log = AuditLog(
+            # Set here, not left to the column default, which SQLAlchemy applies only when the row is
+            # flushed: the hooks below may bind something to the row's id.
+            id=uuid.uuid4(),
             user_id=user_id,
             username=username,
             temp_credential_id=temp_credential_id,
@@ -185,6 +193,11 @@ class AuditLogger:
             details=details,
             error_message=error_message
         )
+        # Then what other modules decide about the row, in this order (app/services/audit_row_hooks.py).
+        audit_row_hooks.provenance(audit_log)
+        audit_row_hooks.case(audit_log)
+        audit_row_hooks.privacy(audit_log, raw_details)
+        audit_row_hooks.seal_nonce(audit_log)
         return audit_log
 
     def log_custom_action(

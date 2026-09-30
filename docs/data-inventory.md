@@ -131,7 +131,11 @@ Each row of `audit_logs` holds:
 - details, which depend on the action: for example the account a change was made to, an email
   address before and after a change, who a share went to, or the filters of an export. Vault, file
   and folder names are never stored: they are removed from the details as each row is written;
-- an error message for a failure.
+- an error message for a failure;
+- **New in 0.34.0, and empty on every row so far:** `recorded` (what the recording policy keeps of the
+  row's personal values), `privacy_version` (which policy that was), `seal_nonce` (a random value per
+  row for the log's integrity chain), `ip_via` (how the address was learned) and `case_id` (a
+  compliance case). `security_alerts` gains the same `ip_via`, also empty.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is

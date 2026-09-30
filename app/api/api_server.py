@@ -23873,6 +23873,16 @@ class _SchemaStepRecorder:
             print(f"⚠ Could not prune stale schema-step records: {exc}")
 
 
+AUDIT_ROW_COLUMNS_DDL = (
+    "ALTER TABLE audit_logs"
+    " ADD COLUMN IF NOT EXISTS seal_nonce BYTEA,"
+    " ADD COLUMN IF NOT EXISTS privacy_version INTEGER,"
+    " ADD COLUMN IF NOT EXISTS recorded JSONB,"
+    " ADD COLUMN IF NOT EXISTS ip_via VARCHAR(24),"
+    " ADD COLUMN IF NOT EXISTS case_id UUID"
+)
+
+
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
@@ -23955,6 +23965,11 @@ def _run_lightweight_migrations():
             # The name of the temporary credential that wrote a row, kept after the credential is
             # deleted. Nullable: older rows have none and an older release ignores the column.
             "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS temp_credential_name VARCHAR(255)",
+            # The columns AuditLogger.build_row's hooks fill (see AuditLog in models.py). One statement,
+            # so the table's lock is taken once. Nullable with no default, so Postgres adds them without
+            # rewriting a row, however large the log, and an older release ignores them.
+            AUDIT_ROW_COLUMNS_DDL,
+            "ALTER TABLE security_alerts ADD COLUMN IF NOT EXISTS ip_via VARCHAR(24)",
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",

@@ -1220,7 +1220,22 @@ class AuditLog(Base):
     status = Column(String(20), nullable=False)  # success, failure, error
     details = Column(JSON, nullable=True)  # Additional context
     error_message = Column(Text, nullable=True)
-    
+
+    # Set through AuditLogger.build_row's hooks (app/services/audit_row_hooks.py), which leave them NULL
+    # for now. Nullable with no default: adding them to an existing table rewrites no row, and a release
+    # that does not know them writes NULL and never reads them.
+    #   seal_nonce      -- a random value per row, under which the log's integrity chain commits to the
+    #                      row's personal values;
+    #   privacy_version -- the recording policy the row was written under;
+    #   recorded        -- what that policy kept of the row's personal values;
+    #   ip_via          -- how the recorded address was learned;
+    #   case_id         -- the compliance case the row was written under.
+    seal_nonce = Column(LargeBinary, nullable=True)
+    privacy_version = Column(Integer, nullable=True)
+    recorded = Column(JSON().with_variant(JSONB(), 'postgresql'), nullable=True)
+    ip_via = Column(String(24), nullable=True)
+    case_id = Column(UUID(as_uuid=True), nullable=True)
+
     # Relationships
     user = relationship('User', back_populates='audit_logs', foreign_keys=[user_id])
     
@@ -1943,8 +1958,10 @@ class SecurityAlert(Base):
     username = Column(String(255), nullable=True)  # Username involved
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     ip_address = Column(String(45), nullable=True)  # IPv4 or IPv6
+    # How ip_address was learned, as audit_logs.ip_via. NULL for now; nullable with no default.
+    ip_via = Column(String(24), nullable=True)
     details = Column(JSON, nullable=True)  # Additional structured details
-    
+
     # Timestamps
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
     resolved = Column(Boolean, default=False, nullable=False)
