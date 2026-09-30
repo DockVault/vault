@@ -148,9 +148,12 @@ What this does not cover:
   someone signs in as a person before that person has set up a key, a vault shared to that account
   afterwards is shared to them.
 - **Keys changed before the upgrade.** A vault whose key someone else chose before 0.33.2 keeps that
-  key. Check the `zk_vault_rekeyed`, `zk_member_key_granted` and `zk_index_key_wrapped` entries in
-  the audit log made after an administrator changed a vault member's sign-in details, and have a key
-  holder rotate any vault with a change nobody recognises.
+  key. Check the audit log for entries made after an administrator changed a vault member's sign-in
+  details: `zk_vault_rekeyed` and `zk_member_key_granted`, and `vault_created` for a zero-knowledge
+  vault made by that member's account. Have a key holder rotate any vault with a change nobody
+  recognises, and do not upload to a zero-knowledge vault its owner did not create. Setting a vault's
+  name-index key is recorded, as `zk_index_key_wrapped`, only from 0.33.0; before that it left no
+  entry.
 
 ## Update check (opt-in phone-home)
 

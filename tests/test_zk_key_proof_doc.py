@@ -145,3 +145,30 @@ def test_the_security_policy_and_the_readme_tell_operators_what_the_proof_needs(
         assert f"`{action}`" in policy and audit_catalog.lookup(action) is not None, action
     checklist = _section((ROOT / "README.md").read_text(encoding="utf-8"), "## Production checklist")
     assert f"forward the `{kp.HEADER_NAME}` request header and\n  the request body as they are" in checklist
+
+
+def test_both_documents_name_every_audit_entry_a_key_change_before_the_upgrade_left():
+    """What an operator checks for key changes made through a taken-over account before 0.33.2: the entries
+    the four operations wrote. A rotation and a share have always been recorded; a zero-knowledge create is
+    recorded as the vault's creation, like any other; setting a name-index key only from 0.33.0."""
+    policy = _section((ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8"),
+                      "## Zero-knowledge key changes need proof of the key")
+    spec = _section(_doc(), "### 2.3 What this does not remove")
+    for bullet in (policy[policy.index("- **Keys changed before the upgrade.**"):],
+                   spec[spec.index("- **History.**"):]):
+        flat = " ".join(bullet.split())
+        for action in ("zk_vault_rekeyed", "zk_member_key_granted", "vault_created", "zk_index_key_wrapped"):
+            assert f"`{action}`" in flat and audit_catalog.lookup(action) is not None, action
+        assert "`vault_created` for a zero-knowledge vault made by that member's account" in flat
+        assert "do not upload to a zero-knowledge vault its owner did not create" in flat
+        assert "`zk_index_key_wrapped`, only from 0.33.0; before that it left no entry" in flat
+    # The create route records every vault it makes, a zero-knowledge one included, as vault_created.
+    source = (ROOT / "app" / "services" / "audit_logger.py").read_text(encoding="utf-8")
+    logger = source[source.index("    def log_vault_created("):source.index("    def log_vault_updated(")]
+    assert 'action="vault_created"' in logger
+    server = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    assert server.count("audit_logger.log_vault_created(") == 1
+    assert "\n    audit_logger.log_vault_created(" in server, "the create no longer records every vault it makes"
+    create = server[server.index("zk_hierarchical = (vault_create.key_wrapping_mode == 'hierarchical')"):]
+    create = create[:create.index("audit_logger.log_vault_created(")]
+    assert "\n    if vault_type == 'zero_knowledge':" in create and not re.search(r"\n +return\b", create)

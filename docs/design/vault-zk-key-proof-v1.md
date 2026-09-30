@@ -85,9 +85,11 @@ member); retroactive secrecy for content a removed member could already read.
   repairs it with an owner reset (§4.4).
 - **The switch set to false, or a rollback below 0.33.2,** accepts changes without a proof again (§3.8, §9).
 - **History.** A vault whose key someone else chose before 0.33.2 keeps that key. Nothing can detect that after
-  the fact: check the `zk_vault_rekeyed`, `zk_member_key_granted` and `zk_index_key_wrapped` audit entries made
-  after an administrator changed a member's sign-in details, and have a key holder rotate any vault with a change
-  nobody recognises.
+  the fact: check the audit entries made after an administrator changed a member's sign-in details
+  (`zk_vault_rekeyed`, `zk_member_key_granted`, and `vault_created` for a zero-knowledge vault made by that
+  member's account), have a key holder rotate any vault with a change nobody recognises, and do not upload to a
+  zero-knowledge vault its owner did not create. Setting a name-index key is recorded, as `zk_index_key_wrapped`,
+  only from 0.33.0; before that it left no entry.
 
 ---
 
