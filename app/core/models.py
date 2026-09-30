@@ -1202,8 +1202,9 @@ class AuditLog(Base):
     resource_type = Column(String(50), nullable=True)
     resource_id = Column(String(255), nullable=True)
     
-    # When
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    # When. Indexed once, by idx_audit_timestamp below (an install made before 0.34.0 also has a second,
+    # identical ix_audit_logs_timestamp, which background maintenance drops).
+    timestamp = Column(DateTime, default=datetime.utcnow)
     
     # Where
     ip_address = Column(String(45), nullable=True)

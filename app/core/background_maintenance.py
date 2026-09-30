@@ -84,7 +84,21 @@ def statement(name: str, sql: str, done_sql: str) -> Step:
 
 
 # The steps every start runs, in order.
-STEPS: list[Step] = []
+STEPS: list[Step] = [
+    # The audit log's timestamp was indexed twice (idx_audit_timestamp and ix_audit_logs_timestamp, identical):
+    # every audit write paid for both.
+    drop_index("ix_audit_logs_timestamp"),
+    # Vacuum and analyze the audit log after 2 % of its rows changed rather than 20 %: the pruner deletes
+    # from it in batches, and on a large log the default would leave the dead rows and the planner's
+    # statistics behind for a long time. ALTER TABLE ... SET takes a lock that audit writes pass through.
+    statement("audit_logs_autovacuum",
+              "ALTER TABLE audit_logs SET (autovacuum_vacuum_scale_factor = 0.02, "
+              "autovacuum_analyze_scale_factor = 0.02)",
+              "SELECT coalesce(c.reloptions @> ARRAY['autovacuum_vacuum_scale_factor=0.02', "
+              "'autovacuum_analyze_scale_factor=0.02']::text[], false) FROM pg_class c "
+              "JOIN pg_namespace n ON n.oid = c.relnamespace "
+              "WHERE c.relname = 'audit_logs' AND n.nspname = current_schema()"),
+]
 
 _STATE_SQL = text(
     "SELECT i.indisvalid FROM pg_class c "
