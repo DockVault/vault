@@ -179,6 +179,24 @@ def test_an_unenrolled_admin_is_refused_by_the_compliance_policy(db):
         assert refused.detail["reason"] == "enroll_required" and refused.detail["methods"] == []
 
 
+def test_an_enrollment_never_confirmed_is_no_second_factor_for_either_policy(db):
+    # An account that began enrolling TOTP and never entered a code has an unconfirmed enrollment. It is not a
+    # second factor: password always still asks for the password alone, and compliance still sends the
+    # account to enroll first.
+    ada = _admin(db)
+    db.add(SecondFactorEnrollment(user_id=ada.id, method="totp", secret_enc=encrypt_secret(sf.generate_totp_secret()),
+                                  status="unconfirmed", last_used_step=0))
+    db.commit()
+    assert fixed_step_up.requirement(db, ada, RETENTION)[1] is False
+    assert _refusal(_guarded, db, ada, RETENTION).detail["methods"] == ["password"]
+    receipt = _step_up(db, ada, RETENTION, method="password", password=PASSWORD)["receipt"]
+    assert _guarded(db, ada, RETENTION, receipt) is None
+    for fn in (lambda: _step_up(db, ada, COMPLIANCE, method="password", password=PASSWORD),
+               lambda: _guarded(db, ada, COMPLIANCE)):
+        refused = _refusal(fn)
+        assert refused.status_code == 403 and refused.detail["reason"] == "enroll_required"
+
+
 # --------------------------------------------------------------------------- with TOTP
 
 def test_compliance_needs_the_password_and_a_totp_code(db):
