@@ -250,6 +250,9 @@ REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
 # only when they differ from the default, and kept across a fresh volume set (see .env.example).
 RETENTION_ENV_KEYS = (
     ("retention_reduction_delay_days", "RETENTION_REDUCTION_DELAY_DAYS", "7"),
+    ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
+    ("log_prune_batch_rows", "LOG_PRUNE_BATCH_ROWS", "5000"),
+    ("retention_hold", "RETENTION_HOLD", "false"),
 )
 
 # Admin-password rules mirror the app's startup guard (app/core/config.py): the shipped placeholder

@@ -32,10 +32,6 @@ logger = logging.getLogger(__name__)
 # the FIRST emit always runs (monotonic() can be < the window on a freshly-booted host).
 _last_degraded_signal_at = None
 
-# Process-wide throttle for opportunistic old-alert cleanup (see cleanup_old_alerts): run at most once
-# per hour per process. None = never run yet, so the first cleanup always runs.
-_last_alert_cleanup_at = None
-
 
 def _sanitize_for_log(value: Optional[str], max_len: int = 256) -> Optional[str]:
     """Neutralise a user-controlled value before it is embedded in a persisted SecurityAlert
@@ -662,45 +658,6 @@ class SecurityMonitor:
             logger.info(f"Security alert {alert_id} resolved by {_sanitize_for_log(resolved_by)}")
             return True
         return False
-    
-    # ========================================================================
-    # Cleanup
-    # ========================================================================
-    
-    def cleanup_old_alerts(self, days: Optional[int] = None):
-        """
-        Delete old RESOLVED alerts beyond the retention window (unresolved alerts are always kept).
-        Process-wide throttled to at most once per hour so it can be wired into a frequently-hit
-        endpoint without issuing a DELETE per request.
-
-        Args:
-            days: retention window; defaults to settings.security_alert_retention_days.
-        """
-        global _last_alert_cleanup_at
-        now = time.monotonic()
-        if _last_alert_cleanup_at is not None and now - _last_alert_cleanup_at < 3600:
-            return 0
-        _last_alert_cleanup_at = now
-
-        if days is None:
-            days = getattr(settings, 'security_alert_retention_days', 90)
-        # Naive UTC to match the TIMESTAMP-WITHOUT-TIME-ZONE column, and synchronize_session=False so
-        # the DELETE runs entirely in Postgres (the default 'evaluate' would compare the naive column
-        # value against the cutoff in Python and raise on naive-vs-aware).
-        cutoff = datetime.utcnow() - timedelta(days=days)
-
-        deleted = self.db.query(SecurityAlert).filter(
-            and_(
-                SecurityAlert.resolved == True,
-                SecurityAlert.timestamp < cutoff
-            )
-        ).delete(synchronize_session=False)
-
-        self.db.commit()
-
-        logger.info(f"Cleaned up {deleted} old security alerts (retention {days}d)")
-
-        return deleted
 
 
 # Global security monitor instance (initialized with db session when needed)

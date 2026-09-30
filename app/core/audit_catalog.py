@@ -231,6 +231,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("note_link_tag_deactivated", "administration", "Note-link tag deactivated", "notice"),
     AuditAction("note_link_tag_updated", "administration", "Note-link tag changed", "notice"),
     AuditAction("receiver_tag_created", "administration", "Upload-link tag created", "notice"),
+    # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
+    AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
     # A managed setting (app/core/settings_registry.py): the row carries the values before and after.

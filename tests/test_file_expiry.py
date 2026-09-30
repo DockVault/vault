@@ -659,7 +659,7 @@ def test_the_web_process_starts_the_sweep_and_the_sftp_process_does_not():
     loop = "expiry_task = asyncio.create_task(file_expiry.run_forever(cleared=expiry_cleared))"
     assert lifespan.count(prepare) == 1 and lifespan.count(loop) == 1
     assert lifespan.index(prepare) < lifespan.index(loop)
-    assert "run_forever" not in lifespan.replace(loop, "")
+    assert "file_expiry.run_forever" not in lifespan.replace(loop, "")
     assert lifespan.count("expiry_task.cancel()") == 1
     assert "run_forever" not in SFTP and "sweep_once" not in SFTP
     assert "cleanup_expired_files" not in SFTP

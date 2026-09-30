@@ -74,7 +74,7 @@ SOURCE_ADMIN = "admin"
 SOURCE_LOCKED = "locked"
 
 # The modules that register specs, imported the first time the registry is read.
-SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes")
+SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes", "app.core.retention")
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
 ENV_ONLY_KEYS: frozenset[str] = frozenset()
@@ -347,6 +347,8 @@ def check_bounds(spec: SettingSpec, value, settings=None) -> Optional[str]:
     floor, ceiling = bounds(spec, settings)
     if floor is not None and _rank(spec, value) < _rank(spec, floor):
         where = f" ({spec.floor.upper()} in .env)" if isinstance(spec.floor, str) else ""
+        if spec.kind == "bool":
+            return f"{spec.key} cannot be {_shown(spec, value)}: the deployment keeps it on{where}"
         return f"{spec.key} cannot be {_shown(spec, value)}: the deployment keeps it at least {_shown(spec, floor)}{where}"
     if ceiling is not None and _rank(spec, value) > _rank(spec, ceiling):
         where = f" ({spec.ceiling.upper()} in .env)" if isinstance(spec.ceiling, str) else ""

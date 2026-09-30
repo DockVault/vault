@@ -58,5 +58,5 @@ def test_the_env_example_says_what_the_retention_setting_does():
     comment = _comment_above(lines, "AUDIT_LOG_RETENTION_DAYS")
     assert "0 (the default) keeps every audit row" in comment, comment
     assert "deletes audit rows older than that many days" in comment, comment
-    assert "at most once an hour" in comment, comment
+    assert "the pruner does it on a timer (LOG_PRUNE_INTERVAL_MINUTES below)" in comment, comment
     assert "anyone with access to the database" in comment, comment

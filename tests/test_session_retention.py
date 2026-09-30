@@ -2,8 +2,8 @@
 
 Each row in active_sessions and pending_logins holds the address a sign-in came from. Sessions were
 only ever marked inactive and pending sign-ins only marked consumed, so every address stayed in the
-database for as long as the deployment ran. The periodic cleanup now deletes the finished ones once
-they are older than SESSION_DATA_RETENTION_DAYS (app/core/session_retention.py).
+database for as long as the deployment ran. The pruner now deletes the finished ones once they are older
+than SESSION_DATA_RETENTION_DAYS (app/core/session_retention.py, the sessions job of app/core/retention.py).
 
 The real conditions run here against the real active_sessions table and a stand-in for
 pending_logins (whose creation default is Postgres-only SQL), in a throwaway SQLite database.
@@ -21,6 +21,7 @@ from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
 
+from app.core import retention  # noqa: E402
 from app.core import session_retention as R  # noqa: E402
 from app.core.models import ActiveSession  # noqa: E402
 
@@ -73,10 +74,34 @@ def _pending(db, *, created, consumed=None, expires=None):
 
 
 def _purge(db, token_minutes=30):
-    out = R.purge_old_session_data(db, now=NOW, token_lifetime_minutes=token_minutes,
-                                   pending_model=Pending)
-    db.commit()
-    return out
+    """The pruner's sessions job over the test database: (sessions deleted, pending sign-ins deleted)."""
+    from sqlalchemy.orm import sessionmaker
+    made = []
+
+    def factory():
+        made.append(sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)())
+        return made[-1]
+
+    counts = []
+    real = retention.Pass.delete_in_batches
+
+    def counting(self, model, conditions, time_column):
+        result = real(self, model, conditions, time_column)
+        counts.append(result.deleted)
+        return result
+
+    original, retention.Pass.delete_in_batches = retention.Pass.delete_in_batches, counting
+    real_settings = retention._settings
+    retention._settings = lambda: type("S", (), {"jwt_access_token_expire_minutes": token_minutes})()
+    try:
+        retention.prune_sessions(retention.Pass(factory, now=NOW, batch_rows=2), pending_model=Pending)
+    finally:
+        retention.Pass.delete_in_batches = original
+        retention._settings = real_settings
+        for s in made:
+            s.close()
+    db.expire_all()
+    return tuple(counts)
 
 
 def _left(db, model):
@@ -127,9 +152,6 @@ def test_the_retention_is_thirty_days():
     assert R.SESSION_DATA_RETENTION_DAYS == 30
 
 
-def test_the_periodic_cleanup_runs_the_purge_and_commits_it():
-    src = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
-    reaper = src[src.index("async def cleanup_expired_sessions"):]
-    reaper = reaper[:reaper.index("\ndef ")]
-    call = reaper.index("purge_old_session_data(db)")
-    assert reaper.index("db.commit()", call) < reaper.index("db.rollback()", call)
+def test_the_pruner_deletes_them_and_its_sessions_job_is_not_held():
+    job = next(j for j in retention.JOBS if j.name == "sessions")
+    assert job.run is retention.prune_sessions and job.held is False

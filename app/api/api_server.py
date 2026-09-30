@@ -2362,14 +2362,6 @@ async def recent_audit_events(
     """Recent audit-log entries for the dashboard activity feed (admin only)."""
     from app.core.models import AuditLog
     limit = max(1, min(limit, 50))
-    # Opportunistically prune audit rows past the retention window (throttled once/hour; a no-op
-    # unless an operator set a positive audit_log_retention_days). Do it BEFORE the fetch: the prune
-    # commits, and a failed DELETE must not leave the shared session aborted and 500 the feed.
-    try:
-        from app.services.audit_logger import AuditLogger
-        AuditLogger(db).cleanup_old_audit_logs()
-    except Exception:
-        db.rollback()
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
     for r in rows:
@@ -23088,19 +23080,6 @@ async def get_security_alerts(
         from app.services.security_monitor import get_security_monitor
         
         monitor = get_security_monitor(db)
-
-        # Opportunistically prune old RESOLVED alerts (throttled process-wide to once/hour, reads the
-        # retention setting). Do it BEFORE fetching: cleanup commits, and expire_on_commit would
-        # otherwise expire the fetched rows -> a just-deleted one raises ObjectDeletedError on
-        # serialization. Best-effort: never let cleanup fail the alerts view.
-        try:
-            monitor.cleanup_old_alerts()
-        except Exception:
-            # A failed cleanup DELETE/commit aborts the transaction; roll back so the shared session
-            # stays usable for the fetch below (mirrors _raise_alert's except pattern) -- else the
-            # next SELECT raises "current transaction is aborted" and 500s the view.
-            db.rollback()
-
         alerts = monitor.get_recent_alerts(limit=limit, severity=severity)
 
         # Convert to dict for JSON response
@@ -23429,8 +23408,11 @@ from contextlib import asynccontextmanager
 import asyncio
 
 async def cleanup_expired_sessions():
-    """Background task to periodically clean up expired sessions."""
-    from app.core.models import ActiveSession, RateLimitRecord
+    """Background task to periodically clean up expired sessions.
+
+    It runs on the event loop, so nothing that can take long belongs here: every timed deletion of records
+    is a job of the pruner (app/core/retention.py), which runs on a thread of its own."""
+    from app.core.models import ActiveSession
     from app.core.database import get_db_context
 
     while True:
@@ -23498,18 +23480,6 @@ async def cleanup_expired_sessions():
                     db.commit()
                     print(f"🧹 Released {released_slots} finished credential slot(s)")
 
-                # Prune stale DB-backed login-throttle rows (only written when Redis
-                # is down). Their window is minutes; anything older than an hour is
-                # dead and would otherwise accumulate one row per distinct
-                # username/IP seen during an outage. Bounds the table's growth.
-                rl_cutoff = datetime.utcnow() - timedelta(hours=1)
-                pruned = db.query(RateLimitRecord).filter(
-                    RateLimitRecord.window_start < rl_cutoff
-                ).delete(synchronize_session=False)
-                if pruned:
-                    db.commit()
-                    print(f"🧹 Pruned {pruned} stale rate-limit record(s)")
-
                 # Automatic sign-in locks whose time ran out end, each recorded with its scope; and
                 # counts with nothing left to count are dropped.
                 try:
@@ -23523,33 +23493,6 @@ async def cleanup_expired_sessions():
                 except Exception as lockout_err:
                     db.rollback()
                     print(f"⚠ sign-in lock release failed: {type(lockout_err).__name__}")
-
-                # Records of changes applied, or requests decided, more than 14 days ago are read by
-                # nothing and name addresses and keys that may never have been applied: they go (the
-                # audit log keeps the history).
-                try:
-                    from app.core import credential_changes as _cc_prune
-                    pruned_changes = _cc_prune.prune_done(db)
-                    if pruned_changes:
-                        db.commit()
-                        print(f"🧹 Pruned {pruned_changes} finished credential change record(s)")
-                except Exception as prune_err:
-                    db.rollback()
-                    print(f"⚠ credential change pruning failed: {type(prune_err).__name__}")
-
-                # Delete finished session and pending-login rows once they are past retention.
-                # Each holds the address a sign-in came from, and nothing else ever removed them
-                # (see app/core/session_retention.py).
-                try:
-                    from app.core.session_retention import purge_old_session_data
-                    purged_sessions, purged_pending = purge_old_session_data(db)
-                    if purged_sessions or purged_pending:
-                        db.commit()
-                        print(f"🧹 Deleted {purged_sessions} old session row(s) and "
-                              f"{purged_pending} old pending sign-in row(s)")
-                except Exception as purge_err:
-                    db.rollback()
-                    print(f"⚠ session retention purge failed: {type(purge_err).__name__}")
 
                 # Prune abandoned chunked-upload sessions AND reclaim their buffered chunks
                 # on disk. A terminal/expired session holds the plaintext filename/MIME as
@@ -24919,6 +24862,13 @@ async def lifespan(app: FastAPI):
     expiry_cleared = file_expiry.prepare_at_startup()
     expiry_task = asyncio.create_task(file_expiry.run_forever(cleared=expiry_cleared))
 
+    # The pruner: every timed deletion of records (finished sessions, the records of credential changes,
+    # the sign-in throttle's fallback rows, resolved alerts, audit rows) and the settings changes that
+    # wait, on a thread of its own, one runner at a time, first a minute after the start. Only this process
+    # runs it. See app/core/retention.py.
+    from app.core import retention
+    retention_task = asyncio.create_task(retention.run_forever())
+
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.
     _install_access_log_redaction()
@@ -24963,6 +24913,11 @@ async def lifespan(app: FastAPI):
     expiry_task.cancel()
     try:
         await expiry_task
+    except asyncio.CancelledError:
+        pass
+    retention_task.cancel()
+    try:
+        await retention_task
     except asyncio.CancelledError:
         pass
     settings_registry.stop()
