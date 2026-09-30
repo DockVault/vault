@@ -17,10 +17,12 @@ from conftest import (create_zk_vault, ensure_ecc_keypair, compute_key_update_po
 
 
 def _register(client, blob: str):
-    from cryptography.hazmat.primitives.asymmetric import ec
+    """Register the account's identity key with `blob` as its envelope. The key is the one the test
+    harness derives for the account, so a zero-knowledge vault made afterwards can carry its key proof."""
     from cryptography.hazmat.primitives import serialization
     from conftest import compute_registration_pop
-    priv = ec.generate_private_key(ec.SECP384R1())
+    import zk_proof_harness as harness
+    priv = harness.identity_private_key(harness.client_username(client))
     pub_pem = priv.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
     client.post("/ecc/keys/register", json={
