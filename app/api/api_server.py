@@ -4130,9 +4130,15 @@ def _sf_action_toggles(db, action):
 
 
 def _sf_requirement_for(db, user, action):
-    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy."""
+    """(requirement dict, has_active_enrollment) for this user + action, per the two-toggle policy.
+
+    A fixed action (second_factor_actions.FIXED_STEP_UP_ACTIONS) has no toggles: its policy decides, and the
+    matrix is never read for it (app/core/fixed_step_up.py)."""
     from app.core import second_factor_actions as acts
     from app.core import second_factor_policy as pol
+    if acts.fixed_policy(action) is not None:
+        from app.core import fixed_step_up
+        return fixed_step_up.requirement(db, user, action)
     require_otp, require_password = _sf_action_toggles(db, action)
     has_active = db.query(SecondFactorEnrollment.id).filter(
         SecondFactorEnrollment.user_id == user.id,
@@ -7447,7 +7453,7 @@ async def second_factor_challenge(
     from app.core import second_factor_actions as acts
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
-    if body.action not in acts.ACTION_KEYS:
+    if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     req, has_active = _sf_requirement_for(db, current_user, body.action)
     if req["must_enroll"]:
@@ -7471,7 +7477,7 @@ async def second_factor_step_up(
     from app.core.rate_limiter import rate_limiter as _rl
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
-    if body.action not in acts.ACTION_KEYS:
+    if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = get_client_ip(request)
     allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{current_user.id}",
@@ -23605,6 +23611,11 @@ def _assert_step_up_boot_contract():
             "Second-factor step-up boot contract violated: "
             f"catalog actions not guarded by any route: {sorted(missing)}; "
             f"guarded actions not in the catalog: {sorted(extra)}.")
+    # The step-ups the matrix cannot switch off, the same way: each guarded by a route, and only those.
+    from app.core import fixed_step_up
+    fixed = fixed_step_up.contract_problems()
+    if fixed:
+        raise RuntimeError("Second-factor step-up boot contract violated: " + "; ".join(fixed) + ".")
 
 
 def _seed_default_share_tags(bootstrap_status=None):

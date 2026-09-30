@@ -51,3 +51,24 @@ ADMIN_ALWAYS_ENFORCED = {"admin.user.manage", "admin.settings.write"}
 
 def is_admin_action(key: str) -> bool:
     return key in ADMIN_ALWAYS_ENFORCED
+
+
+# Step-ups whose requirement is fixed in code rather than chosen in the admin's matrix: key -> (human name,
+# policy), the policy one of second_factor_policy.FIXED_POLICIES. They are kept OUT of SECOND_FACTOR_ACTIONS,
+# and so out of the seeded rows and the matrix's toggles, which could otherwise switch them off (every
+# catalogued action but signing in and managing your own second factor ships off). The step-up routes accept
+# them, with the usual receipt and 403 shape, so the web app's step-up prompt and retry work unchanged. A
+# route guards one with app.core.fixed_step_up.guard(key), called inside its body, and the boot contract
+# refuses to start while one is guarded by no route.
+FIXED_STEP_UP_ACTIONS: dict = {}
+
+
+def fixed_policy(key: str):
+    """The policy of a fixed step-up, or None for any other key."""
+    entry = FIXED_STEP_UP_ACTIONS.get(key)
+    return entry[1] if entry else None
+
+
+def is_step_up_action(key: str) -> bool:
+    """A key the step-up routes accept: a catalogued action or a fixed one."""
+    return key in ACTION_KEYS or key in FIXED_STEP_UP_ACTIONS
