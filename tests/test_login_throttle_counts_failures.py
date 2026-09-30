@@ -278,6 +278,54 @@ def test_the_database_count_given_back_is_that_windows_and_never_below_zero(Sess
     s.close()
 
 
+@pytest.fixture
+def database(Session, monkeypatch):
+    """The fallback's own statements (_db_throttle_charge, _db_throttle_release) on this test's
+    database, each in a short session of its own as on a running server."""
+    @contextmanager
+    def ctx():
+        session = Session()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(A, "get_db_context", ctx)
+    return Session
+
+
+def test_an_allowed_database_charge_names_the_window_it_was_counted_in(database):
+    # The charge is what a sign-in that succeeds gives back; without it nothing could be.
+    first = A.AuthService._db_throttle_charge(HOME, "login_ip", 2, 300)
+    second = A.AuthService._db_throttle_charge(HOME, "login_ip", 2, 300)
+    s = database()
+    row = s.query(RateLimitRecord).one()
+    count, start = row.attempt_count, row.window_start
+    s.close()
+    assert count == 2
+    assert first == second == (True, 0, (HOME, "login_ip", start))
+    allowed, retry, charge = A.AuthService._db_throttle_charge(HOME, "login_ip", 2, 300)
+    assert (allowed, charge) == (False, None) and retry > 0
+
+
+def test_with_the_cache_down_the_databases_own_count_is_given_back(Session, database, limits, monkeypatch):
+    # As test_with_the_cache_down_right_passwords_are_given_back_too, with the real fallback
+    # statements in place of a count kept in memory.
+    class _Unavailable:
+        def check_rate_limit(self, *a, **k):
+            raise R.RateLimiterUnavailable("down")
+
+    monkeypatch.setattr(R, "rate_limiter", _Unavailable())
+    name = _add(Session)
+    assert [_sign_in(Session, name) for _ in range(12)] == [200] * 12
+    s = Session()
+    counts = {r.action: r.attempt_count for r in s.query(RateLimitRecord)}
+    s.close()
+    assert counts == {"login_user": 0, "login_ip": 0}
+    assert [_sign_in(Session, name, "wrong") for _ in range(LIMIT + 1)] == [401] * LIMIT + [429]
+
+
 # --------------------------------------------------------------------------- temporary credentials
 
 class _Q:
