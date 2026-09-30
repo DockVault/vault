@@ -1858,8 +1858,9 @@ def plan_upgrade_path(matrix, current, target):
 
 def env_upgrade_notes(env, current, target):
     """What an upgrade from ``current`` to ``target`` changes for this deployment because of a line in
-    its .env, as sentences to show before the image changes. Pure: ``env`` is the parsed .env. Only
-    installs that update from a checkout see these (the pull path runs the tool it already has)."""
+    its .env, as sentences to show before the image changes. Pure: ``env`` is the parsed .env. update()
+    prints them, so only a checkout whose tool has them (0.33.1 or later) shows them: both the pull and
+    the source path run the tool already installed, and the source path checks out the target itself."""
     notes = []
     cur, tgt = parse_semver(current), parse_semver(target)
 

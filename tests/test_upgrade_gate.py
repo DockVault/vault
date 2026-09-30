@@ -339,6 +339,33 @@ def test_the_conditions_on_a_hop_are_printed(tmp_path, monkeypatch, capsys):
     assert "SELECT lower(email)" in out
 
 
+def test_what_the_env_changes_in_the_upgrade_is_said_before_it(tmp_path, monkeypatch, capsys):
+    """The notes about lines in .env are worked out by their own functions and printed by the update
+    itself: a lockout duration of 0 first, then a TRUSTED_PROXIES range that covers the gateway, each
+    once, before anything changes. Without the prints the functions would still pass their own tests."""
+    matrix = _matrix()
+    matrix["versions"] = {"0.33.0": {"released": "2026-01-01", "notes": "a"},
+                          "0.33.1": {"released": "2026-01-02", "notes": "b"}}
+    matrix["edges"][0].update({"from": "0.33.0", "to": "0.33.1"})
+    tool = _deployment(tmp_path, version="0.33.0", matrix=matrix)
+    with open(tmp_path / ".env", "a", encoding="utf-8", newline="") as fh:
+        fh.write("ACCOUNT_LOCKOUT_MINUTES=0\nTRUSTED_PROXIES=172.16.0.0/12\n")
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(dv, "fetch_main_lifecycle_matrix", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.33.0", "the running container"))
+    monkeypatch.setattr(tool, "_network_gateways", lambda: ["172.18.0.1"])
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    (lockout,) = dv.env_upgrade_notes(env, "0.33.0", "v0.33.1")
+    gateway = dv.gateway_trust_note(env["TRUSTED_PROXIES"], ["172.18.0.1"], "0.33.0", "v0.33.1")
+    assert gateway
+
+    _update(tool, tag="v0.33.1", dry_run=True)
+    out = capsys.readouterr().out
+    assert out.count("  Note: " + lockout) == 1 and out.count("  Note: " + gateway) == 1
+    assert out.index("  Note: " + lockout) < out.index("  Note: " + gateway)
+    assert out.index("  Note: " + gateway) < out.index("--dry-run: nothing was changed.")
+
+
 # --- which version is running -----------------------------------------------------------------
 
 def test_the_running_version_comes_from_the_container(tmp_path, monkeypatch):
