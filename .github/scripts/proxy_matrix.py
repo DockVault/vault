@@ -10,9 +10,12 @@ an attacker, and an operator that signs in as the administrator.
 
 Each address check is a failed sign-in under a new, unique name, sent through one proxy set-up; the
 address the vault stored for it is read back from the audit log. Each scheme check mints a
-password-reset link through a TLS proxy and reads the scheme the link was built with. The API is
-restarted once per trust setting (nothing trusted, 127.0.0.1, the three proxies, trust all, the
-whole network, the gateway by name).
+password-reset link through a TLS proxy and reads the scheme the link was built with. Each key-proof
+check creates a zero-knowledge vault and rotates its key through one proxy, both requests carrying a
+key proof: the proof is a MAC over the exact request body and travels in the X-ZK-Key-Proof header,
+so it verifies only when the proxy passes both on unchanged. The API is restarted once per trust
+setting (nothing trusted, 127.0.0.1, the three proxies, trust all, the whole network, the gateway by
+name).
 
 Two trust settings also publish the API's port on the Docker host's loopback (IPv4, and IPv6 where the
 host allows it), as the shipped secure compose publishes it: connections Docker relays to a published
@@ -27,7 +30,9 @@ Usage:
 
 Needs Docker and Python 3.10+ on the host, nothing else: the probes run inside the image under test
 (it has Python), the proxy configurations are copied into their containers, and the TLS certificate
-is made inside the image as well. Postgres and Redis are the images deploy/docker-compose.yml pins.
+is made inside the image as well. The key-proof probe takes the test suite's key-proof client
+(tests/zk_proof_harness.py and tests/zk_key_proof_reference.py) into the image in its own source.
+Postgres and Redis are the images deploy/docker-compose.yml pins.
 
 Safety: every container and network it creates carries the label `com.dockvault.proxy-matrix` set
 to the prefix, and a name starting with `<prefix>-`. Cleanup (at start, at the end, and with
@@ -61,6 +66,7 @@ from typing import Callable, Iterable, Optional
 
 LABEL = "com.dockvault.proxy-matrix"
 DEFAULT_PREFIX = "dockvault-proxy-matrix"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 _PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 
 # The proxies under test, pinned like every other image the pipeline runs. They are fixtures, not
@@ -75,6 +81,11 @@ JUNK = "not-an-address-junk"
 LOGIN_LIMIT = 5              # failed sign-ins per name; the vault allows twice that per address
 VICTIM_TRIES = 16            # more than the per-address allowance, so the throttle must show
 PROBE_PASSWORD = "not-the-password-1"
+
+# The key-proof check: what it does and what it reports when every step passed. A proof covers the
+# exact body bytes and arrives in a header, so a proxy that rewrites either one makes it fail.
+KEY_PROOF_ACTION = "zero-knowledge vault created and its key rotated, each with a key proof"
+KEY_PROOF_PASSED = "proved"
 
 # Host numbers inside the test network. The API keeps .2 across restarts, so the proxies in front
 # of it never need reconfiguring.
@@ -140,10 +151,11 @@ class Check:
     config: str
     setup: str
     action: str
-    probe: str                        # "address" | "scheme" | "budget" | "log"
+    probe: str                        # "address" | "scheme" | "budget" | "log" | "key-proof"
     via: str                          # a key of VIA
     expect: str                       # a role ("client", "loopback", "forged", "edge", "gateway"), a
-                                      # scheme, "baseline" for the budget check, or "warned" for a log
+                                      # scheme, "baseline" for the budget check, "warned" for a log
+                                      # check, or KEY_PROOF_PASSED
     xff: Optional[str] = None         # X-Forwarded-For the client sends
     xfp: Optional[str] = None         # X-Forwarded-Proto the client sends
     note: str = ""
@@ -180,6 +192,14 @@ CHECKS = (
           "address", "edge", "client", xff=FORGED),
     Check("proxies", "TLS nginx on another host, listed", "reset link scheme",
           "scheme", "nginx-tls", "https"),
+    Check("proxies", "nginx that appends, listed", KEY_PROOF_ACTION,
+          "key-proof", "nginx", KEY_PROOF_PASSED),
+    Check("proxies", "TLS nginx on another host, listed", KEY_PROOF_ACTION,
+          "key-proof", "nginx-tls", KEY_PROOF_PASSED),
+    Check("proxies", "two nginx in a chain, both listed", KEY_PROOF_ACTION,
+          "key-proof", "edge", KEY_PROOF_PASSED),
+    Check("proxies", "HAProxy 'option forwardfor' (its own header line), listed", KEY_PROOF_ACTION,
+          "key-proof", "haproxy", KEY_PROOF_PASSED),
     Check("all", "nginx that appends, trust all", "client sends a forged X-Forwarded-For",
           "address", "nginx", "client", xff=FORGED),
     Check("all", "two nginx in a chain, trust all", "real client",
@@ -380,6 +400,20 @@ def link_scheme(body: str) -> str:
     return link.split("://", 1)[0]
 
 
+def key_proof_outcome(stdout: str) -> str:
+    """What the key-proof probe reports on its last line: KEY_PROOF_PASSED, or the step that failed."""
+    lines = [line for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        raise HarnessError("the key-proof probe printed nothing")
+    try:
+        outcome = json.loads(lines[-1]).get("outcome")
+    except (ValueError, AttributeError) as exc:
+        raise HarnessError(f"the key-proof probe's last line is not its outcome: {lines[-1][:200]!r}") from exc
+    if not isinstance(outcome, str) or not outcome:
+        raise HarnessError(f"the key-proof probe's outcome has the wrong shape: {lines[-1][:200]!r}")
+    return outcome
+
+
 def owned_names(listing: str, prefix: str) -> list[str]:
     """The names in a `docker ... --format {{.Name}}` listing that belong to this prefix.
 
@@ -530,6 +564,150 @@ print(json.dumps({
 }))
 '''
 
+# The key-proof probe proves with the test suite's own client: the harness makes each proof the way the
+# web app does, with the independent reference implementation. Both modules travel in the probe's
+# source and are written to a directory of their own inside the container before the probe imports
+# them; they need only `cryptography`, which the image has.
+KEY_PROOF_MODULES = ("zk_key_proof_reference", "zk_proof_harness")
+
+KEY_PROOF_LOADER = r'''
+import os, sys, tempfile
+_modules = tempfile.mkdtemp(prefix="key-proof-")
+for _name, _source in MODULES:
+    with open(os.path.join(_modules, _name + ".py"), "w", encoding="utf-8") as _fh:
+        _fh.write(_source)
+sys.path.insert(0, _modules)
+'''
+
+KEY_PROOF_PROBE = r'''
+import base64, hashlib, hmac, json, ssl, sys, urllib.error, urllib.request
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import zk_proof_harness as harness
+
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+# Stand-ins for what a browser wraps and seals: the server stores them and cannot read them.
+WRAPPED = base64.b64encode(b"wrapped-dek-stub" * 4).decode()
+EPHEMERAL = base64.b64encode(b"ephemeral-pubkey-stub" * 5).decode()
+SEALED_NAME = "zk2:" + base64.urlsafe_b64encode(b"zk-vault-name-seal-stub" * 3).decode()
+
+
+class Response:
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class Client:
+    """The part of the test suite's HTTP client the key-proof harness uses."""
+
+    def __init__(self, base, token=None, user=None):
+        self.base, self.token, self.user = base, token, user
+
+    def call(self, method, path, body=None, data=None, headers=None):
+        headers = dict(headers or {})
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers.setdefault("Content-Type", "application/json")
+        request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+        try:
+            with opener.open(request, timeout=30) as resp:
+                return Response(resp.status, resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            return Response(e.code, e.read().decode("utf-8", "replace"))
+
+    def get(self, path, headers=None):
+        return self.call("GET", path, headers=headers)
+
+    def post(self, path, json=None, data=None, headers=None):
+        return self.call("POST", path, json, data, headers)
+
+    def put(self, path, json=None, data=None, headers=None):
+        return self.call("PUT", path, json, data, headers)
+
+
+def finish(outcome):
+    print(json.dumps({"outcome": outcome}))
+    sys.exit(0)
+
+
+def need(step, response, status):
+    if response.status_code != status:
+        finish(f"{step}: {response.status_code} {response.text[:160]}")
+
+
+def proved(step, response):
+    """A guarded request that was sent with a proof, and passed."""
+    if response.zk_challenge_status != 200:
+        finish(f"{step}: no challenge was issued ({response.zk_challenge_status}), so nothing was proved")
+    need(step, response, 200)
+
+
+args = json.loads(sys.argv[1])
+try:
+    signin = Client(args["direct"]).post(
+        "/auth/login", json={"username": args["username"], "password": args["password"]})
+    need("sign-in", signin, 200)
+    session = signin.json()
+    direct = Client(args["direct"], session["access_token"], session["user"])
+    via = Client(args["via"], session["access_token"], session["user"])
+
+    # The account's encryption key, registered with its proof of possession, directly.
+    key = harness.identity_private_key(args["username"])
+    pem = harness.public_pem(key)
+    challenge = direct.post("/ecc/keys/register/challenge")
+    need("key registration challenge", challenge, 200)
+    challenge = challenge.json()
+    server = serialization.load_pem_public_key(challenge["server_ephemeral_public_key"].encode())
+    mac_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"dv-ecc-pop-v1",
+                   info=b"registration-pop").derive(key.exchange(ec.ECDH(), server))
+    mac = hmac.new(mac_key, base64.b64decode(challenge["nonce"]) + pem.encode(), hashlib.sha256).digest()
+    need("key registration", direct.post("/ecc/keys/register", json={
+        "public_key": pem,
+        "encrypted_private_key": json.dumps({"encrypted": "opaque", "salt": "opaque", "iterations": 600000}),
+        "pop": {"challenge_id": challenge["challenge_id"], "mac": base64.b64encode(mac).decode()}}), 201)
+
+    # Through the proxy: create a zero-knowledge vault, then rotate its key, each with a proof.
+    made = harness.post_zk(via, "/vaults", json={
+        "name": "zkproxy-" + args["username"], "type": "zero_knowledge", "enc_name": SEALED_NAME,
+        "name_key_version": 1, "wrapped_dek": WRAPPED, "ephemeral_public_key": EPHEMERAL})
+    proved("create", made)
+    vault = made.json()["id"]
+    path = f"/ecc/vaults/{vault}/rekey"
+    member = [{"user_id": session["user"]["id"], "wrapped_dek": WRAPPED, "ephemeral_public_key": EPHEMERAL}]
+    proved("rotation", harness.post_zk(via, path, json={
+        "from_version": 1, "to_version": 2, "member_keys": member}))
+
+    # The same request without its proof is refused, so the two above passed on their proofs.
+    unproved = harness.prepare_zk(via, path, {"from_version": 2, "to_version": 3, "member_keys": member})
+    need("a rotation without its proof", harness.send_prepared(via, path, unproved, header=None), 428)
+
+    keys = direct.get(f"/ecc/vaults/{vault}/keys")
+    need("reading the vault's keys", keys, 200)
+    keys = keys.json()
+    material = keys.get("key_proof") or {}
+    if (keys.get("current_dek_version"), material.get("state"), material.get("source")) != (2, "set", "rotate"):
+        finish(f"stored: epoch {keys.get('current_dek_version')}, key proof "
+               f"{material.get('state')} from {material.get('source')}")
+    finish(args["passed"])
+except Exception as exc:
+    finish(f"(the probe failed: {exc!r})"[:300])
+'''
+
+
+def key_proof_script(root: Path) -> str:
+    """The key-proof probe's source: the test suite's key-proof modules, then the probe itself."""
+    modules = [[name, (root / "tests" / f"{name}.py").read_text(encoding="utf-8")]
+               for name in KEY_PROOF_MODULES]
+    # A JSON list of [name, source] pairs is also a Python literal.
+    return f"MODULES = {json.dumps(modules)}\n" + KEY_PROOF_LOADER + KEY_PROOF_PROBE
+
 
 # --- Docker -------------------------------------------------------------------------------------
 
@@ -579,6 +757,7 @@ class Matrix:
         self.docker, self.image, self.prefix, self.log = docker, image, prefix, log
         self.run_id = secrets.token_hex(3)
         self.images = compose_images(compose_path.read_text(encoding="utf-8"))
+        self.key_proof_probe = key_proof_script(REPO_ROOT)
         self.requested_subnet = subnet
         self.addr: dict[str, str] = {}
         self.admin_password = "Matrix-Admin-" + secrets.token_urlsafe(18)
@@ -849,6 +1028,32 @@ class Matrix:
         attacked = victim()
         return judge_budget(check, baseline, attacked, attacker)
 
+    def probe_key_proof(self, check: Check) -> str:
+        """Through the check's set-up, as an account made for it alone: create a zero-knowledge vault
+        and rotate its key, each with a key proof, and see a rotation without one refused. Returns
+        KEY_PROOF_PASSED, or the step that went otherwise."""
+        self.reset_throttles()      # every check signs in twice; the sign-in budget is not under test
+        direct = f"http://{self.addr['api']}:8000"
+        auth = {"Authorization": f"Bearer {self.admin_token()}"}
+        name = "keyproof" + secrets.token_hex(5)
+        password = "Key-Proof-" + secrets.token_hex(8)
+        setup = self.requests("operator", [
+            {"url": f"{direct}/settings", "method": "PUT", "headers": auth,
+             "body": {"zero_knowledge_enabled": True}},
+            {"url": f"{direct}/users", "headers": auth,
+             "body": {"username": name, "email": f"{name}@example.com", "password": password, "role": "user"}},
+        ])
+        if setup[0]["status"] != 200 or setup[1]["status"] not in (200, 201):
+            raise HarnessError("could not prepare the key-proof account: "
+                               + "; ".join(f"{r['status']} {r['body'][:160]}" for r in setup))
+        args = {"direct": direct, "via": url_for(check, self.addr), "username": name, "password": password,
+                "passed": KEY_PROOF_PASSED}
+        r = self.docker("exec", "-i", self.name("client"), "python", "-", json.dumps(args),
+                        input=self.key_proof_probe, check=False, timeout=180)
+        if r.returncode != 0:
+            raise HarnessError(f"the key-proof probe did not run: {(r.stderr or '').strip()[-600:]}")
+        return key_proof_outcome(r.stdout)
+
     def run_checks(self, checks: Iterable[Check] = CHECKS) -> list[Result]:
         """Run the checks one trust setting at a time, collecting into self.results as it goes
         (so a run that stops half way still reports what it saw)."""
@@ -871,6 +1076,8 @@ class Matrix:
                     result = judge(check, self.probe_scheme(check), self.addr)
                 elif check.probe == "log":
                     result = judge(check, self.probe_log(check), self.addr)
+                elif check.probe == "key-proof":
+                    result = judge(check, self.probe_key_proof(check), self.addr)
                 else:
                     result = judge(check, self.probe_address(check), self.addr)
                 results.append(result)

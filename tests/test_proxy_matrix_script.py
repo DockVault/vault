@@ -12,6 +12,7 @@ import io
 import ipaddress
 import json
 import random
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -93,6 +94,8 @@ def test_every_check_resolves_to_a_concrete_url_and_expectation(addr):
             assert check.via in ("direct", "local-tls", "nginx-tls")
         elif check.probe == "log":
             assert expect == "warned" and check.config == "subnet"
+        elif check.probe == "key-proof":
+            assert expect == pm.KEY_PROOF_PASSED and check.action == pm.KEY_PROOF_ACTION
         else:
             assert check.probe == "budget" and check.expect == "baseline"
     # every trust setting is exercised, and run in table order (the API restarts once per setting)
@@ -347,7 +350,7 @@ def _results(addr, fail_haproxy=False):
             out.append(pm.Result(check, "10", "10", True, "attacker got [401]"))
             continue
         got = pm.expected_value(check, addr)
-        if fail_haproxy and check.via == "haproxy":
+        if fail_haproxy and check.via == "haproxy" and check.probe == "address":
             got = pm.FORGED
         out.append(pm.judge(check, got, addr))
     return out
@@ -525,3 +528,57 @@ def test_a_candidate_or_release_tests_run_includes_the_proxy_matrix():
     assert job["permissions"] == {"contents": "read"}
     release = yaml.safe_load((_WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
     assert "tests" in release["jobs"]["publish"]["needs"]    # so publication waits for it
+
+
+# --- the key-proof probe ------------------------------------------------------------------------
+
+def test_a_key_proof_passes_through_every_proxy_on_another_host():
+    """A key proof is a MAC over the exact body bytes, carried in a header, so each proxy in front of the
+    vault -- nginx plain and over TLS, two nginx in a chain, and HAProxy -- must pass both on unchanged."""
+    proved = [c for c in pm.CHECKS if c.probe == "key-proof"]
+    assert sorted(c.via for c in proved) == ["edge", "haproxy", "nginx", "nginx-tls"]
+    assert all(c.config == "proxies" and c.xff is None and c.xfp is None for c in proved)
+    assert all(c.expect == pm.KEY_PROOF_PASSED for c in proved)
+
+
+def test_the_key_proof_probe_carries_the_suites_own_client():
+    script = pm.key_proof_script(_ROOT)
+    compile(script, "key-proof-probe", "exec")
+    first, _ = script.split("\n", 1)
+    assert first.startswith("MODULES = ")
+    modules = json.loads(first[len("MODULES = "):])
+    assert [name for name, _ in modules] == ["zk_key_proof_reference", "zk_proof_harness"]
+    for name, source in modules:
+        assert source == (_ROOT / "tests" / f"{name}.py").read_text(encoding="utf-8")
+    assert script.endswith(pm.KEY_PROOF_PROBE)
+
+
+def test_the_key_proof_probe_runs_and_reports_the_step_it_could_not_take(tmp_path):
+    """Run the probe as the image would, against an address where nothing listens: its modules load and it
+    reports the first step, the sign-in, as the one that failed -- never KEY_PROOF_PASSED."""
+    args = {"direct": "http://127.0.0.1:9", "via": "http://127.0.0.1:9", "username": "u",
+            "password": "p", "passed": pm.KEY_PROOF_PASSED}
+    out = subprocess.run([sys.executable, "-", json.dumps(args)], input=pm.key_proof_script(_ROOT),
+                         capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert out.returncode == 0, out.stderr[-600:]
+    outcome = pm.key_proof_outcome(out.stdout)
+    assert outcome.startswith("(the probe failed:") and "URLError" in outcome, outcome
+
+
+@pytest.mark.parametrize("out, outcome", [
+    ('noise\n{"outcome": "proved"}\n', "proved"),
+    ('{"outcome": "rotation: 403 {}"}', "rotation: 403 {}"),
+])
+def test_the_key_proof_outcome_is_the_probes_last_line(out, outcome):
+    assert pm.key_proof_outcome(out) == outcome
+
+
+@pytest.mark.parametrize("out, message", [
+    ("", "printed nothing"),
+    ("Traceback (most recent call last):\n  boom\n", "not its outcome"),
+    ('{"outcome": ""}', "wrong shape"),
+    ('{"status": 200}', "wrong shape"),
+])
+def test_an_unusable_key_proof_outcome_is_a_harness_error(out, message):
+    with pytest.raises(pm.HarnessError, match=message):
+        pm.key_proof_outcome(out)

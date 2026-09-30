@@ -6,7 +6,10 @@ name: Proxy matrix
 # 127.0.0.1), under each trust setting, with clients at fixed addresses on a private network, and
 # connections Docker relays through the network's gateway to a port published on loopback. The
 # unit tests prove the address parser on strings; this proves it on the wire, where the proxies
-# decide what the header looks like. .github/scripts/proxy_matrix.py documents every check.
+# decide what the header looks like. Behind each proxy on another host it also creates a
+# zero-knowledge vault and rotates its key with key proofs, which verify only when the proxy passes
+# the request body and the X-ZK-Key-Proof header on unchanged. .github/scripts/proxy_matrix.py
+# documents every check.
 #
 # It needs no test lock and no preflight: the script is standard-library Python that drives Docker,
 # and the probes run inside the image under test. Pull requests run it on their own; the Tests
