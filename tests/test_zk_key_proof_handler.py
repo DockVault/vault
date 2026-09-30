@@ -395,6 +395,26 @@ def test_a_challenge_for_another_operation_or_vault_is_not_this_one(world):
     assert world.failures() == ["no_live_challenge", "no_live_challenge"]
 
 
+def test_a_challenge_issued_to_another_key_holder_of_the_same_vault_is_not_this_callers(world):
+    """A challenge belongs to the account it was issued to. Another holder of the same vault's key who names
+    it, and proves everything else with their own keys, gets nowhere, and the challenge is left for the
+    person it was issued to."""
+    vid, owner, manager, proof_key = world.direct_vault()
+    target = world.new_person()
+    body = _share_body(target)
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "share")
+    header = world.prove(ch, manager, vid, "share", raw, current_key=proof_key)
+    err = world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid),
+                        request=E.GrantMemberKeyRequest(**body))
+    assert (err.status_code, err.reason) == (403, "zk-key-proof-failed")
+    assert world.failures() == ["no_live_challenge"]
+    assert world.challenges_left() == 1 and _rows_for(world, vid, target) == 0
+    header = world.prove(ch, owner, vid, "share", raw, current_key=proof_key)
+    assert _share(world, vid, owner, target, header=header, body=body, raw=raw)["status"] == "ok"
+    assert world.challenges_left() == 0 and _rows_for(world, vid, target) == 1
+
+
 def test_malformed_headers_and_material_consume_nothing(world):
     """A request whose header or key material has the wrong shape is refused before its challenge is
     touched, so the honest client that sent it can still use the challenge."""
