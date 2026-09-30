@@ -237,6 +237,19 @@ def test_older_lines_are_the_ones_mains_lines_map_lists_newest_first_and_bounded
         "0.33.2", "0.32.6", "0.31.0", "0.30.0", "0.29.0"]
 
 
+def test_the_security_policy_names_the_older_lines_the_check_fetches():
+    # The policy lists every request the check makes. An older line is fetched whether or not its
+    # security fixes have ended, up to the cap, and the policy says so.
+    main = _two_lines()
+    main["lines"]["0.33"]["security_fixes_until"] = "2020-01-01"
+    assert uc._older_line_releases(main, "v0.34.1") == ["0.33.2"]
+    policy = (ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8")
+    section = " ".join(policy.split("## Update check", 1)[1].split("\n## ", 1)[0].split())
+    assert uc._MAX_OLDER_LINES == 5
+    assert ("each older line that the copy on `main` lists (at most five, whether or not the line "
+            "still gets security fixes)") in section
+
+
 def test_a_malformed_lines_map_never_breaks_the_status(monkeypatch):
     calls = []
     _stub_round(monkeypatch, latest="v0.34.1", calls=calls)
