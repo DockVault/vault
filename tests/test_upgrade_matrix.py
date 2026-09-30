@@ -1099,6 +1099,13 @@ def test_a_skip_edge_never_passes_a_release_an_upgrade_must_land_on():
     um.validate_matrix(data, released_ceiling=None)
 
 
+def test_a_skip_edge_may_end_on_a_release_an_upgrade_must_land_on():
+    # Landing there is what must_land_here asks for; only passing it is refused.
+    data = _two_lines()
+    data["versions"]["0.34.1"]["must_land_here"] = True
+    um.validate_matrix(data, released_ceiling=None)
+
+
 def test_a_skip_edge_over_a_blocked_step_is_refused():
     data = _two_lines()
     _edge_between(data, "0.33.1", "0.34.0").update({"kind": "blocked", "reversible": False,
