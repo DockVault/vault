@@ -90,7 +90,9 @@ def test_two_approvals_at_once_apply_the_change_once(factory, applied):
     check = factory()
     try:
         row = check.get(CredentialChange, change_id)
-        assert (row.status, row.decided_by_name, row.payload) == (cc.APPROVED, "bob", None)
+        # What the request would have set is not kept: only the address the account had when it was applied
+        # (none here), where the code that releases its encryption key goes during the hold.
+        assert (row.status, row.decided_by_name, row.payload) == (cc.APPROVED, "bob", {"email_at_change": None})
         approvals = check.query(AuditLog).filter(AuditLog.action == "credential_change_approved").all()
         assert len(approvals) == 1
     finally:

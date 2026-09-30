@@ -9,11 +9,14 @@ account from changing its vaults' keys, but not from downloading the envelope an
 So for ``ZK_ENVELOPE_HOLD_DAYS`` (default 14, 0 turns it off, at most 14) after an administrator -- or the
 server's operator -- changed an account's sign-in details (app/core/credential_changes.py: a password, a
 reset link, a second factor, an email address, an SSH key), the envelope is released to a session only once
-that session has entered a code sent by email. After an email change the code goes to the address the
-account had before, as a password reset link does in those 14 days, so it reaches the person rather than
-whoever changed the address. The person's own sessions are held too: the server cannot tell them apart from
-the administrator's, and the email is what does. A deployment without mail, or an account with no address to
-send to, needs the host operator: ``dockvault.py accounts`` releases the hold (``release-key-hold``).
+that session has entered a code sent by email. The code goes to the address the account had just before the
+first of the changes that hold it was applied (code_destination): for an email change, the address it
+replaced. Never to the address the account has now: whoever made the change can sign in with the password
+they set and move the address through the account's own settings, and the code would follow them. The
+person's own sessions are held too: the server cannot tell them apart from the administrator's, and the
+mailbox is what does. A deployment without mail, an account that had no address, and a change recorded
+before 0.34.0 that kept none (only an email change did) need the host operator: ``dockvault.py accounts``
+releases the hold (``release-key-hold``).
 
 What it reads: the applied changes to the account within the hold, from credential_changes, whose rows are
 pruned 14 days after they apply; that is why the hold cannot be longer. A session's release is kept on its
@@ -65,6 +68,17 @@ def holding_changes(db, user_id, now: Optional[datetime] = None) -> list:
                     CredentialChange.applied_at > now - timedelta(days=days),
                     CredentialChange.envelope_released_at.is_(None))
             .order_by(CredentialChange.applied_at.desc()).all())
+
+
+def code_destination(db, user, now: Optional[datetime] = None) -> Optional[str]:
+    """Where the code that releases this account's envelope goes: the address the account had just before
+    the earliest change that holds it was applied (credential_changes.address_before). None when nothing
+    holds it, when the account had no address then, or when the change's record does not say."""
+    from app.core.credential_changes import address_before
+    changes = holding_changes(db, user.id, now)
+    if not changes:
+        return None
+    return address_before(changes[-1]) or None
 
 
 def held_until(db, user, now: Optional[datetime] = None) -> Optional[datetime]:

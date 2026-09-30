@@ -1,8 +1,9 @@
 """Live: the hold on the encryption-key envelope after an administrator changed an account's sign-in details.
 
 After an administrator sets a person's password, the person's sessions get GET /ecc/keys/private refused with
-`zk-envelope-hold` until they enter a code sent by email; the code releases that session only. After an email
-change the code goes to the address before it. Without mail the request for a code says so, and the host
+`zk-envelope-hold` until they enter a code sent by email; the code releases that session only. The code goes to
+the address the account had before the change: after an email change, the address before it, and after the
+address was moved through the account's own settings, still the one it had. Without mail the request for a code says so, and the host
 operator releases the account with `dockvault.py accounts`, which tells the person. The hold reads the change's
 record, and ends 14 days after the change. A value above 14 stops the server starting.
 test_zk_envelope_hold.py pins the same offline.
@@ -101,6 +102,35 @@ def test_after_an_email_change_the_code_goes_to_the_address_before(admin, person
         assert body["sent_to"] == f"{old[0]}***@example.com", body
         assert mail_to(old, subject_contains="Your code to open your encryption key"), "not sent to the address before"
         assert mail_to(new, subject_contains="Your code to open your encryption key", timeout=3) is None
+
+
+@needs_mailpit
+def test_the_code_does_not_follow_an_address_moved_through_the_accounts_own_settings(admin, person):
+    """An administrator sets the password, signs in with it and moves the account's address through its own
+    settings: a self-service change, not recorded as an administrator's. The code still goes to the address
+    the account had when the password was set, so it reaches the person and the envelope stays held."""
+    with mail_sink(admin):
+        person_address = f"{person['_username']}@example.com"
+        taker_address = f"{unique('taker')}@example.com"
+        taker = _set_password(admin, person)
+        assert _held(taker) is True
+        moved = taker.patch("/users/me", json={"email": taker_address, "current_password": NEW_PASSWORD})
+        if moved.status_code == 400 and "verification" in moved.text:
+            r = taker.post("/users/me/request-email-change",
+                           json={"new_email": taker_address, "current_password": NEW_PASSWORD})
+            assert r.status_code in (200, 202), r.text
+            m = mail_to(taker_address)
+            code = re.search(r"\b\d{6}\b|\b[0-9a-f]{6,12}\b", m["text"]).group(0)
+            moved = taker.post("/users/me/confirm-email-change", json={"code": code})
+        assert moved.status_code == 200, moved.text
+        assert admin.get(f"/users/{person['id']}").json()["email"] == taker_address
+
+        sent = taker.post("/ecc/keys/private/hold/code")
+        assert sent.status_code == 200, sent.text
+        assert sent.json()["sent_to"] == f"{person_address[0]}***@example.com", sent.text
+        assert mail_to(person_address, subject_contains="Your code to open your encryption key"),             "the code did not reach the person's address"
+        assert mail_to(taker_address, subject_contains="Your code to open your encryption key", timeout=3) is None
+        assert _held(taker) is True
 
 
 def test_without_mail_the_host_operator_releases_the_account(admin, person):

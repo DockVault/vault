@@ -198,8 +198,11 @@ def test_another_administrator_approves_and_the_change_is_made(admin, temp_user,
     assert user_client.get("/users/me").status_code == 401, "setting the password ends the sessions"
     assert not [r for r in _requests(admin) if r["id"] == req["id"]], "a decided request leaves the list"
 
-    row = psql(f"SELECT status, decided_by_name, payload IS NULL FROM credential_changes WHERE id='{req['id']}'")
-    assert row == f"approved|{me}|t"
+    # The password the request held is not kept: only the address the account had when it was applied.
+    row = psql("SELECT c.status, c.decided_by_name, c.payload->>'email_at_change' IS NOT DISTINCT FROM u.email, "
+               "(SELECT count(*) FROM json_object_keys(c.payload::json)) FROM credential_changes c "
+               f"JOIN users u ON u.id = c.target_user_id WHERE c.id='{req['id']}'")
+    assert row == f"approved|{me}|t|1"
     audit = admin.get("/audit/log", params={"action": "credential_change_approved", "limit": 500}).json()
     assert [a for a in audit if a["resource_id"] == temp_user["id"] and a["username"] == me]
     assert [n for n in notifications(other_client, "credential_change_approved")

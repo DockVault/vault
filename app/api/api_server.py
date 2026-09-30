@@ -5844,12 +5844,13 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     if last is None:
         change = cc.record_made(db, kind=kind, target_id=target.id, requester_id=requester_id,
                                 requester_name=requester_name, summary=summary, now=now)
+        email_before = target.email
         result = _apply_credential_change(db, kind, target, payload, actor_id=requester_id,
                                           actor_name=requester_name, request=request)
-        if kind == cc.EMAIL:
-            # The address before and after, for the 14 days a self-service reset link goes to the old
-            # one (_self_service_reset_destination).
-            change.payload = cc.applied_email_payload(result)
+        # The address the account had before the change (for an email change, before and after): for the 14
+        # days a self-service reset link goes to the old one (_self_service_reset_destination), and the
+        # code that releases the encryption-key envelope goes there (app/core/envelope_hold.py).
+        change.payload = cc.applied_payload(kind, email_before, result)
         return _CredentialOutcome(change, False, result)
     change = cc.hold(db, kind=kind, target_id=target.id, requester_id=requester_id,
                      requester_name=requester_name, summary=summary, payload=payload, now=now)
@@ -11244,6 +11245,7 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
     if not cc.claim_approval(db, change, approver_id=approver_id, approver_name=approver_name):
         db.rollback()
         raise HTTPException(status_code=409, detail="That request was already decided, so nothing was changed.")
+    email_before = target.email
     try:
         # A reset link is handed to the approver, not to the one who asked: its maker is the approver.
         result = _apply_credential_change(db, kind, target, payload, actor_id=requested_by_id,
@@ -11253,10 +11255,9 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
         # Rolled back here, because the host tool's session commits whatever is left when it ends.
         db.rollback()
         raise
-    if kind == cc.EMAIL:
-        # The address before and after, for the 14 days a self-service reset link goes to the old one
-        # (_self_service_reset_destination). Nothing else a decided request held is kept.
-        change.payload = cc.applied_email_payload(result)
+    # The address the account had before the change (for an email change, before and after), as for a change
+    # made at once (_credential_change). Nothing else a decided request held is kept.
+    change.payload = cc.applied_payload(kind, email_before, result)
     db.add(AuditLogger(db).build_row(
         action="credential_change_approved", status="success", user=approver,
         username=None if approver is not None else cc.HOST_OPERATOR,

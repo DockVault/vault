@@ -849,9 +849,11 @@ by email:
 
 1. Refused session: 403 `zk-envelope-hold`.
 2. `POST /ecc/keys/private/hold/code` sends a code (it lives 15 minutes, and three wrong guesses end it) to the
-   account's address; within 14 days of an email change an administrator made, to the address before it, as a
-   password reset link does, so it reaches the person rather than whoever changed the address. No mail, or no
-   address to send to: 409 `zk-envelope-hold-no-mail`.
+   address the account had just before the first of the changes that hold it: for an email change, the address
+   it replaced. Every applied change keeps that address with its record. Never to the address the account has
+   now: whoever made the change can sign in with a password they set and move the address through the
+   account's own settings, and the code would follow them. No mail, an account that had no address, or a
+   change recorded before 0.34.0 that kept none (only an email change did): 409 `zk-envelope-hold-no-mail`.
 3. `POST /ecc/keys/private/hold/release` with the code releases the envelope to that session, for the changes made
    so far; a later change holds it again. A wrong or expired code: 403 `zk-envelope-hold-code-failed`.
 

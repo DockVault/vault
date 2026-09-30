@@ -763,19 +763,19 @@ async def send_envelope_release_code(
     """Send the code that releases the account's encryption-key envelope to this session, during the hold
     after an administrator changed the account's sign-in details (app/core/envelope_hold.py).
 
-    It goes by email, to the account's address -- after an email change, to the address before it, as a
-    password reset link does in those days -- so it reaches the person and not whoever made the change.
+    It goes by email, to the address the account had before the first change that holds it (for an email
+    change, the address it replaced; envelope_hold.code_destination), so it reaches the person and not
+    whoever made the change -- who could since have moved the account's address through its own settings.
     Without mail, or an address to send to: 409, and the host operator can release the hold instead. Not
     held: nothing is sent."""
     _ecc_rate_limit(current_user, "envelope_hold")
     if envelope_hold.held_until(db, current_user) is None:
         return {"held": False}
-    from app.api.api_server import _mask_email, _self_service_reset_destination, _smtp_configured
+    from app.api.api_server import _mask_email, _smtp_configured
     from app.core import email_send, otp_service
     from app.core.config import settings as _settings
     from app.core.email_actions import send_action_email
-    destination = _self_service_reset_destination(db, current_user)
-    address = ((destination[0] if destination else "") or "").strip()
+    address = (envelope_hold.code_destination(db, current_user) or "").strip()
     if not address or not _smtp_configured(db):
         raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-no-mail")
     code = otp_service.issue(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id, destination=address,

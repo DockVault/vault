@@ -154,10 +154,10 @@ def _account(world):
     return user
 
 
-def _change(world, user, *, days_ago, status=cc.MADE, kind=cc.PASSWORD):
+def _change(world, user, *, days_ago, status=cc.MADE, kind=cc.PASSWORD, payload=None):
     applied = NOW - timedelta(days=days_ago) if status in cc.APPLIED else None
     row = CredentialChange(target_user_id=user.id, kind=kind, status=status, requested_by_name="admin",
-                           requested_at=NOW - timedelta(days=days_ago), applied_at=applied)
+                           requested_at=NOW - timedelta(days=days_ago), applied_at=applied, payload=payload)
     world.db.add(row)
     world.db.commit()
     return row
@@ -291,11 +291,11 @@ def test_a_held_session_gets_the_hold_refusal_and_the_rest_get_the_envelope(worl
     assert (refused.value.status_code, refused.value.reason) == (403, "zk-envelope-hold")
 
 
-def test_the_code_goes_to_the_address_the_reset_link_would_and_releases_this_session(world, routes, monkeypatch):
+def test_the_code_goes_to_the_address_before_the_change_and_releases_this_session(world, routes):
     user = _account(world)
     _keyed(world, user)
-    _change(world, user, days_ago=1)
-    monkeypatch.setattr(api, "_self_service_reset_destination", lambda db, u: ("before@example.com", "<p>n</p>"))
+    # The account's address now (p@example.com) is not where the code goes: the change kept the one before.
+    _change(world, user, days_ago=1, payload={"email_at_change": "before@example.com"})
     out = run_coroutine(SEND_CODE(current_user=user, db=world.db))
     assert out == {"held": True, "sent_to": "b***@example.com", "expires_in_minutes": H.CODE_TTL_MINUTES}
     assert routes.sent == [(H.EMAIL_ACTION, "before@example.com", "c0de12")]
@@ -312,12 +312,12 @@ def test_the_code_goes_to_the_address_the_reset_link_would_and_releases_this_ses
     assert run_coroutine(GET_PRIVATE(current_user=user, db=world.db))["encrypted_private_key"] == "ENV"
 
 
-@pytest.mark.parametrize("case", ["no address", "no mail", "the send fails"])
+@pytest.mark.parametrize("case", ["no address", "an older record", "no mail", "the send fails"])
 def test_without_a_way_to_send_the_code_it_says_so_and_sends_nothing(world, routes, monkeypatch, case):
     user = _account(world)
-    _change(world, user, days_ago=1)
-    monkeypatch.setattr(api, "_self_service_reset_destination",
-                        lambda db, u: None if case == "no address" else ("p@example.com", ""))
+    payload = {"no address": {"email_at_change": None}, "an older record": None}.get(
+        case, {"email_at_change": "p@example.com"})
+    _change(world, user, days_ago=1, payload=payload)
     if case == "no mail":
         monkeypatch.setattr(api, "_smtp_configured", lambda db: False)
     if case == "the send fails":
