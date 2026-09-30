@@ -273,7 +273,10 @@ create another vault. Every check happens **before** anything is created: a refu
 
 This closes the vault a taken-over account could create "as" its victim, and gives every vault created from
 0.33.2 on its first material from a proven creator. The cost is that creating a zero-knowledge vault now needs
-the identity key unlocked, which the name-index key set right after creation needed anyway.
+the identity key unlocked, which the name-index key set right after creation needed anyway. A temporary
+credential can therefore create a zero-knowledge vault only when its policy lets it unlock the account's
+identity key; one allowed only to create vaults is refused, and nothing is created. (Before, such a credential
+could create a vault it could not then open.)
 
 ### 3.8 The enforcement switch
 
