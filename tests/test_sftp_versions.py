@@ -103,6 +103,17 @@ def test_the_same_version_everywhere_means_yes(factory):
         assert (check.ok, check.reason, check.versions) == (True, SV.SAME, ("0.34.0",))
 
 
+@pytest.mark.parametrize("seconds_ago,live", [
+    (SV.LIVE_WITHIN_SECONDS - 1, True), (SV.LIVE_WITHIN_SECONDS, True), (SV.LIVE_WITHIN_SECONDS + 1, False),
+])
+def test_a_process_is_live_while_it_recorded_itself_within_the_window(factory, seconds_ago, live):
+    db = factory()
+    _row(db, "0.33.9", seconds_ago)
+    db.close()
+    check = _check(factory, SPLIT)
+    assert check.reason == (SV.OTHER_VERSION if live else SV.NONE_LIVE), check
+
+
 def test_sftp_off_and_nothing_registered_means_yes(factory):
     check = _check(factory, NO_SFTP)
     assert (check.ok, check.reason) == (True, SV.OFF)
