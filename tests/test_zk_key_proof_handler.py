@@ -972,3 +972,63 @@ def test_an_owner_reset_of_a_team_vault_replaces_the_team_key(world):
     out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
     assert (out["dek_version"], out["team_key_version"]) == (2, 2)
     assert world.proof_rows(vid)[2] == ("owner_reset", None, None)
+
+
+# ------------------------------------------------------------------------- refusals under the lock
+
+def _refused_under_lock(world, handler, caller, http_request, **kwargs):
+    """Run a handler that refuses, and return (the refusal, whether its transaction was still open when it
+    answered). On PostgreSQL that transaction holds the vault row lock: left open, the lock lasts until the
+    session is torn down, and a request on the same vault that waits for it can stall the whole server."""
+    s = world.Session()
+    try:
+        user = s.query(User).filter(User.id == caller).first()
+        with pytest.raises(Exception) as exc:
+            run_coroutine(handler(current_user=user, db=s, http_request=http_request, **kwargs))
+        return exc.value, s.in_transaction()
+    finally:
+        s.close()
+
+
+def test_a_refusal_after_the_vault_lock_ends_its_transaction_first(world):
+    # A bootstrap by a manager who holds no key.
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    s = world.Session()
+    keyless = world.person(s)
+    s.execute(vault_members.insert().values(vault_id=vid, user_id=keyless, read_permission=True,
+                                            manage_permission=True))
+    s.commit()
+    s.close()
+    _, _, body, raw, header = _bootstrap_request(world, vid, keyless)
+    err, still_open = _refused_under_lock(world, BOOTSTRAP, keyless, FakeRequest(raw, header), vault_id=str(vid),
+                                          request=E.KeyProofBootstrapRequest(**body))
+    assert err.status_code == 403 and "holds this vault's key" in err.detail
+    assert not still_open, "the bootstrap refusal kept the vault lock"
+
+    # An owner reset by a manager who is not the owner.
+    vid, owner, manager = _damaged_direct_vault(world)
+    body, raw, header = _reset_request(world, vid, manager, owner, manager)
+    err, still_open = _refused_under_lock(world, REKEY, manager, FakeRequest(raw, header), vault_id=str(vid),
+                                          request=E.RekeyRequest(**body))
+    assert err.status_code == 403 and "owner" in err.detail
+    assert not still_open, "the owner-reset refusal kept the vault lock"
+
+    # A team rotation to the current team key, proved; and, with enforcement off, to a key that is not P-384
+    # (with a proof that one is refused before the lock).
+    vid, owner, manager, team = world.hier_vault()
+    body = _team_body(owner, manager, ref.public_pem(team))
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "rekey")
+    header = world.prove(ch, owner, vid, "rekey", raw, current_key=team, new_pem=body["team_public_key"],
+                         new_key=team)
+    err, still_open = _refused_under_lock(world, REKEY, owner, FakeRequest(raw, header), vault_id=str(vid),
+                                          request=E.RekeyRequest(**body))
+    assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed") and "current team key" in err.detail
+    assert not still_open, "the refusal of the current team key kept the vault lock"
+    world.enforce(False)
+    body = _team_body(owner, manager, ref.public_pem(ec.generate_private_key(ec.SECP256R1())))
+    err, still_open = _refused_under_lock(world, REKEY, owner, FakeRequest(_serialize(body)), vault_id=str(vid),
+                                          request=E.RekeyRequest(**body))
+    assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed") and "P-384" in err.detail
+    assert not still_open, "the refusal of a team key that is not P-384 kept the vault lock"
+    assert world.dek_version(vid) == 1

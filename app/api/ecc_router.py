@@ -1774,6 +1774,9 @@ async def bootstrap_key_proof(
     if locked is None:
         raise HTTPException(status_code=404, detail="Vault not found")
     if not _holds_current_key(db, locked, current_user.id):
+        # A refusal under the lock ends the transaction first. Left to the session's teardown, the lock
+        # would outlive the answer, and a request waiting for it could stall the whole server.
+        db.rollback()
         raise HTTPException(status_code=403,
                             detail="Only someone who holds this vault's key can set up its key check")
     epoch = getattr(locked, 'dek_version', 1) or 1
@@ -2412,6 +2415,7 @@ async def rekey_vault(
     if ch is not None:
         _pin_key_proof_state(db, ch, locked)
         if owner_reset and str(current_user.id) != str(locked.owner_id):
+            db.rollback()                           # a refusal under the lock releases it at once
             raise HTTPException(status_code=403, detail="Only the vault's owner can reset its key")
         _verify_key_proof(
             db, current_user, ch, header, vault_id=locked.id, body=raw_body,
@@ -2509,12 +2513,18 @@ async def rekey_vault(
         # A team key supplied at all must be a P-384 key and must not be the current one.
         rotating_team_key = request.team_public_key is not None
         if rotating_team_key:
-            new_point = _p384_or_malformed(request.team_public_key, "team_public_key")
+            # Both refusals here come under the lock, so each releases it at once.
+            try:
+                new_point = _p384_or_malformed(request.team_public_key, "team_public_key")
+            except zk_key_proof.KeyProofRefusal:
+                db.rollback()
+                raise
             try:
                 current_point = zk_key_proof.public_point(getattr(locked, 'team_public_key', None))
             except zk_key_proof.MalformedProof:
                 current_point = None
             if new_point == current_point:
+                db.rollback()
                 raise zk_key_proof.malformed(
                     "team_public_key is the vault's current team key; a team rotation needs a new one")
 
