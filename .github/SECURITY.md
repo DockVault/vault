@@ -108,6 +108,50 @@ If your threat model does not include an attacker obtaining the raw data volume 
 image, filesystem backup, or storage snapshot), this residue is not reachable and no
 action is needed.
 
+## Zero-knowledge key changes need proof of the key
+
+From 0.33.2, creating or sharing a zero-knowledge vault, rotating its key and setting its
+name-index key each carry a proof, made in the person's browser over a one-time challenge and
+the exact request, that they hold their own encryption key, the vault's current key and any key
+the change puts in place. The server refuses a change without a proof (428) or with a wrong one
+(403), and changes nothing when it refuses. Signing in as someone — as an administrator who reset
+their password can, or anyone holding a stolen session — is therefore no longer enough to change
+the key of a zero-knowledge vault they hold. The protocol is specified in
+[docs/design/vault-zk-key-proof-v1.md](../docs/design/vault-zk-key-proof-v1.md).
+
+- **`ZK_KEY_PROOF_ENFORCE`** (`.env` only, default `true`). Setting it to `false` accepts changes
+  without a proof again, which reopens the problem the proof closes; use it only to postpone
+  enforcement while older clients are updated. Each change then made without a proof is recorded
+  in the audit log as `zk_key_proof_absent`, and the web container says at startup that it is off.
+  An administrator cannot change it from the settings page. Rolling back below 0.33.2 has the same
+  effect as `false`.
+- **Clients.** The web app a server serves always matches it; reload browser tabs opened before
+  an upgrade. A DockVault Desktop build whose built-in web app predates 0.33.2 cannot create or
+  share a zero-knowledge vault, rotate its key or set its name-index key, and cannot remove a
+  member from one (removal rotates the key first), until it is updated. Reading, uploading,
+  downloading and syncing are unaffected, and nobody is signed out.
+- **Reverse proxies** must pass the `X-ZK-Key-Proof` request header and the request body on
+  unchanged: the proof is a MAC over the body's exact bytes.
+- **The compatibility promise.** A request without a proof never half-applies: it gets a refusal
+  with a plain `detail` and a `reason`, never a 401. Reads, uploads, downloads and sync never depend
+  on proof material. A client recognises a server without key proofs by a 404 without a `reason`
+  from the challenge route, and sends its request without one. A new version of the proof header
+  is accepted by servers at least one minor release before any client sends it, and a new format of
+  the stored material ships its reader at least one minor release before its writer.
+
+What this does not cover:
+
+- **A weak zero-knowledge passphrase.** Someone who can sign in as a person can download their
+  passphrase-encrypted key and try to guess the passphrase offline; a guessed passphrase makes them
+  that person. Use a long passphrase.
+- **An account that has not set up its encryption key yet.** Whoever sets it up first owns it. If
+  someone signs in as a person before that person has set up a key, a vault shared to that account
+  afterwards is shared to them.
+- **Keys changed before the upgrade.** A vault whose key someone else chose before 0.33.2 keeps that
+  key. Check the `zk_vault_rekeyed`, `zk_member_key_granted` and `zk_index_key_wrapped` entries in
+  the audit log made after an administrator changed a vault member's sign-in details, and have a key
+  holder rotate any vault with a change nobody recognises.
+
 ## Update check (opt-in phone-home)
 
 The optional update check (`UPDATE_CHECK_ENABLED=true`, **default off**) makes an outbound request

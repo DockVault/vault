@@ -128,3 +128,20 @@ def test_every_file_the_specification_names_exists_and_it_names_no_line():
     missing = sorted(path for path in named if not (ROOT / path).exists())
     assert not missing, missing
     assert not re.search(r"\.(?:py|js|md|yml):\d", doc), "the specification points at a line"
+
+
+def test_the_security_policy_and_the_readme_tell_operators_what_the_proof_needs():
+    """What an operator must know without reading the specification: the switch and what turning it off
+    does, what older clients lose, that a proxy must pass the header and the body unchanged, and which
+    audit entries to check for changes made before the upgrade."""
+    policy = _section((ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8"),
+                      "## Zero-knowledge key changes need proof of the key")
+    assert f"]({'../' + DOC_PATH})" in policy
+    assert "**`ZK_KEY_PROOF_ENFORCE`** (`.env` only, default `true`)" in policy
+    assert "reopens the problem" in policy and "Rolling back below 0.33.2 has the same" in policy
+    assert "cannot remove a\n  member from one (removal rotates the key first)" in policy
+    assert f"`{kp.HEADER_NAME}` request header and the request body on\n  unchanged" in policy
+    for action in ("zk_key_proof_absent", "zk_vault_rekeyed", "zk_member_key_granted", "zk_index_key_wrapped"):
+        assert f"`{action}`" in policy and audit_catalog.lookup(action) is not None, action
+    checklist = _section((ROOT / "README.md").read_text(encoding="utf-8"), "## Production checklist")
+    assert f"forward the `{kp.HEADER_NAME}` request header and\n  the request body as they are" in checklist

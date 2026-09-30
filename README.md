@@ -541,6 +541,9 @@ them, but a README-only reader can miss them (the off-host key backup is always 
   backup of the storage volume — is **permanently unrecoverable**.
 - **Change the seeded admin password.** Boot is refused with the shipped placeholder, but pick a strong one.
 - **Terminate TLS** in front of the app (or run it with `API_USE_HTTPS=true` + certs). Never expose plaintext.
+- **Pass requests through unchanged.** A reverse proxy must forward the `X-ZK-Key-Proof` request header and
+  the request body as they are (no re-encoding of JSON bodies): changes to a zero-knowledge vault's keys carry a
+  proof over the body's exact bytes, and are refused without it. Stock nginx and HAProxy do this by default.
 - **Restrict network exposure:** publish only the web/API (and SFTP if used) ports; keep Postgres/Redis on the
   internal network. Set `REDIS_PASSWORD` and `ALLOWED_HOSTS` for defense-in-depth.
 - **Behind a reverse proxy, name it in `TRUSTED_PROXIES`** so the audit log and the sign-in limits see real
