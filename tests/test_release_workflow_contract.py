@@ -57,7 +57,8 @@ def _matrix(released: dict[str, str]) -> dict:
 
     Each version is reached from the one before it in version order, except a maintenance release
     shipped after the next minor: the next minor is then reached from the newest release no later
-    than it, which is the shape the validator's backport rule asks for.
+    than it, which is the shape the validator's backport rule asks for, and the maintenance release
+    has its own way up, into the next minor's first release.
     """
     ordered = sorted(released, key=_vkey)
     edges = []
@@ -67,6 +68,8 @@ def _matrix(released: dict[str, str]) -> dict:
             source = max((v for v in ordered
                           if _vkey(v) < _vkey(later) and released[v] <= released[later]),
                          key=_vkey)
+            edges.append({"from": earlier, "to": later, "kind": "direct",
+                          "reversible": True, "requires_backup": False})
         edges.append({"from": source, "to": later, "kind": "direct",
                       "reversible": True, "requires_backup": False})
     return {

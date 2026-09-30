@@ -505,6 +505,128 @@ def _validate_advisory_coverage(advisories: dict, versions: dict) -> None:
                      "affected")
 
 
+def _validate_routes(edges: list, versions: dict) -> None:
+    """What the edges must allow together, once releases come from more than one line.
+
+    - Every edge leads from an older release to a newer one: edges describe upgrades, and a
+      downgrade is read off them in reverse.
+    - Every release that is not end-of-life reaches the newest release by edges that are not
+      blocked. A release of an older line made after the next line began has no newer neighbour on
+      its own line, so it needs an edge of its own into the next line.
+    - No edge brings back a vulnerability: an edge from `a` to `b` is refused when `b` is affected by
+      an advisory that already affected `a` or a release below it, and `a` is not affected.
+    - A step is an edge to the next release of the same line, or into the first release of the next
+      line. Any other edge skips releases, and the readers take the shortest route, so it replaces
+      the route of steps it jumps over: the shortest route of steps that are not blocked from `a`,
+      or, where the line was left from below `a`, from the highest lower release of `a`'s line that
+      has one (0.33.2 -> 0.34.1 replaces 0.33.1 -> 0.34.0 -> 0.34.1). It must be at least as
+      cautious as that route: it requires a backup if any step does, is irreversible if any step
+      is, carries every step's conditions, and passes no release an upgrade must land on
+      (`must_land_here`). A skip with no such route, because a step it jumps is blocked or missing,
+      is refused.
+    """
+    ordered = sorted(versions, key=_sort_key)
+    lines: list[str] = []
+    for version in ordered:
+        if _line(version) not in lines:
+            lines.append(_line(version))
+    in_line = {line: [v for v in ordered if _line(v) == line] for line in lines}
+    takeable = [edge for edge in edges if edge["kind"] != "blocked"]
+
+    for index, edge in enumerate(edges):
+        _require(_sort_key(edge["from"]) < _sort_key(edge["to"]),
+                 f"edges[{index}] goes from {edge['from']} down to {edge['to']}; an edge describes an "
+                 "upgrade, and a downgrade is read off it in reverse")
+
+    newest = ordered[-1]
+    forward: dict[str, set[str]] = {}
+    for edge in takeable:
+        forward.setdefault(edge["from"], set()).add(edge["to"])
+    reaches = {newest}
+    for version in reversed(ordered):               # every edge leads upwards, so one pass is enough
+        if forward.get(version, set()) & reaches:
+            reaches.add(version)
+    stranded = [v for v in ordered if v not in reaches and not versions[v]["support"]["eol"]]
+    _require(not stranded,
+             f"{', '.join(stranded)} cannot reach {newest} by edges that are not blocked; a release "
+             "that is not end-of-life needs a way to the newest one (a release of an older line needs "
+             "an edge of its own into the next line)")
+
+    listed = {v: {ref["advisory"] for ref in versions[v].get("vulnerabilities") or []}
+              for v in ordered}
+    first: dict[str, str] = {}
+    for version in ordered:
+        for slug in listed[version]:
+            first.setdefault(slug, version)
+    for edge in takeable:
+        source, target = edge["from"], edge["to"]
+        back = sorted(slug for slug in listed[target] - listed[source]
+                      if _sort_key(first[slug]) <= _sort_key(source))
+        _require(not back,
+                 f"the edge {source} -> {target} brings back {', '.join(back)}: {target} is affected "
+                 f"and {source} is not; an upgrade must not reinstate a fixed vulnerability")
+
+    def is_step(edge: dict) -> bool:
+        source, target = edge["from"], edge["to"]
+        if _line(source) == _line(target):
+            same = in_line[_line(source)]
+            return same.index(target) == same.index(source) + 1
+        return (target == in_line[_line(target)][0]
+                and lines.index(_line(target)) == lines.index(_line(source)) + 1)
+
+    steps: dict[str, list[dict]] = {}
+    for edge in takeable:
+        if is_step(edge):
+            steps.setdefault(edge["from"], []).append(edge)
+    for outgoing in steps.values():
+        outgoing.sort(key=lambda e: _sort_key(e["to"]))
+
+    def route_of_steps(source: str, target: str) -> list[dict] | None:
+        # Breadth-first, as the readers walk; `source` first, then each lower release of its line,
+        # so the route leaves the line from the highest release that can.
+        starts = [v for v in reversed(in_line[_line(source)]) if _sort_key(v) <= _sort_key(source)]
+        queue: list[tuple[str, list[dict]]] = [(v, []) for v in starts]
+        seen = set(starts)
+        while queue:
+            node, path = queue.pop(0)
+            if node == target:
+                return path
+            for step in steps.get(node, []):
+                if step["to"] not in seen:
+                    seen.add(step["to"])
+                    queue.append((step["to"], path + [step]))
+        return None
+
+    for edge in takeable:
+        if is_step(edge):
+            continue
+        source, target = edge["from"], edge["to"]
+        where = f"the edge {source} -> {target}"
+        route = route_of_steps(source, target)
+        _require(route is not None,
+                 f"{where} skips releases, but no route of steps that are not blocked leads from "
+                 f"{source}, or a lower release of its line, to {target}; there is no route for it "
+                 "to replace")
+        described = " -> ".join([route[0]["from"]] + [step["to"] for step in route])
+        for step in route[:-1]:
+            _require(not versions[step["to"]].get("must_land_here"),
+                     f"{where} passes {step['to']}, where an upgrade must land (must_land_here); the "
+                     f"route it replaces is {described}")
+        if any(step["requires_backup"] for step in route):
+            _require(edge["requires_backup"],
+                     f"{where} must require a backup: the route it replaces, {described}, does")
+        if not all(step["reversible"] for step in route):
+            _require(not edge["reversible"],
+                     f"{where} cannot be reversible: the route it replaces, {described}, is not")
+        have = {condition["id"] for condition in edge.get("conditions", [])}
+        left_out = [cid for cid in dict.fromkeys(condition["id"] for step in route
+                                                 for condition in step.get("conditions", []))
+                    if cid not in have]
+        _require(not left_out,
+                 f"{where} leaves out the condition(s) {', '.join(left_out)} of the route it "
+                 f"replaces, {described}")
+
+
 def _add_months(day: datetime.date, months: int) -> datetime.date:
     """The same day `months` calendar months later, or the month's last day when it has no such day."""
     year, month = divmod(day.month - 1 + months, 12)
@@ -742,8 +864,9 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
                          f"{spot}.blocks_rollback needs a detect query: it is the query finding rows "
                          "that stops the rollback")
 
-    # Adjacency completeness. Declaring edges only between neighbours is what lets a longer upgrade
-    # be composed by walking them, so a missing neighbour link silently breaks every path across it.
+    # Adjacency completeness. Declaring an edge between every pair of neighbours is what lets a longer
+    # upgrade be composed by walking them, so a missing neighbour link silently breaks every path
+    # across it. An edge that skips releases is allowed only as _validate_routes describes.
     #
     # "Adjacent" is by version order, but the requirement is skipped where the later version was
     # released EARLIER -- a backport. Inserting 0.9.1 after 0.10.0 has shipped makes (0.9.1, 0.10.0)
@@ -765,6 +888,7 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
                      for source, target in seen):
             missing.append(f"(some release older than {later}) -> {later}")
     _require(not missing, "no edge declared between adjacent releases: " + ", ".join(missing))
+    _validate_routes(edges, versions)
 
     waivers = data.get("waivers", [])
     _require(isinstance(waivers, list), "upgrade matrix 'waivers' must be a list")

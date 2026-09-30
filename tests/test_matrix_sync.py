@@ -53,10 +53,11 @@ def _main() -> dict:
 
 
 def _branch_release(main: dict) -> dict:
-    """release/0.33 at its 0.33.2 candidate: main's matrix as it was, plus its own entry."""
+    """release/0.33 at its 0.33.2 candidate: main's matrix as it was, plus its own entry, the edge
+    into it and its own way up into the 0.34 line."""
     branch = copy.deepcopy(main)
     branch["versions"]["0.33.2"] = _entry("2026-12-20")
-    branch["edges"].append(_edge("0.33.1", "0.33.2"))
+    branch["edges"] += [_edge("0.33.1", "0.33.2"), _edge("0.33.2", "0.34.0")]
     return branch
 
 
@@ -80,9 +81,11 @@ def test_a_maintenance_release_entry_joins_mains_matrix_in_version_order():
 
     assert list(result["versions"]) == ["0.33.0", "0.33.1", "0.33.2", "0.34.0", "0.34.1"]
     assert [(e["from"], e["to"]) for e in result["edges"]] == [
-        ("0.33.0", "0.33.1"), ("0.33.1", "0.33.2"), ("0.33.1", "0.34.0"), ("0.34.0", "0.34.1")]
+        ("0.33.0", "0.33.1"), ("0.33.1", "0.33.2"), ("0.33.1", "0.34.0"), ("0.33.2", "0.34.0"),
+        ("0.34.0", "0.34.1")]
     assert "took 0.33.2 from the branch" in notes
     assert "took the edge 0.33.1 -> 0.33.2 from the branch" in notes
+    assert "took the edge 0.33.2 -> 0.34.0 from the branch" in notes
 
 
 def test_both_branches_end_with_the_same_bytes():
@@ -235,6 +238,7 @@ def test_a_waiver_only_the_branch_declares_is_carried():
     branch["edges"].append({"from": "0.33.1", "to": "0.33.2", "kind": "blocked",
                             "reversible": False, "requires_backup": True,
                             "reason": "restore from a backup instead"})
+    branch["edges"].append(_edge("0.33.2", "0.34.0"))
     branch["waivers"] = [{"version": "0.33.2", "reason": "reached by restore only"}]
 
     result, notes = _SYNC.sync(main, branch)

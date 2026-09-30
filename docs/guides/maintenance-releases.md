@@ -83,12 +83,18 @@ release before it until the newer one publishes.
 1. Prepare a candidate for each supported line the fix affects: the newest line from `main`, each
    older line as `candidate/X.Y.N` from its `release/X.Y` branch. Run the full test run on every
    candidate.
-2. Tag the older lines first. Their matrix is `main`'s plus their own new entry and edge, without
-   the advisory, and their notes say that a security fix is included and that its details are
-   published with the newest line's release the same day.
+2. Tag the older lines first. Their matrix is `main`'s plus their own new entry, the edge into it
+   and an edge from it up to the newest release, without the advisory, and their notes say that a
+   security fix is included and that its details are published with the newest line's release the
+   same day. The validator requires that way up: every release that is not end-of-life must reach
+   the newest one.
 3. Tag the newest line last, within hours. Its release commit adds the advisory once, complete, with
-   the fix on every line, the older releases' entries, and edges from them to the newest line that
-   carry the conditions of the route they replace. `main` moves forward with it.
+   the fix on every line and the older releases' entries. Each older release's edge into a release
+   the fix leaves affected becomes an edge to the newest line's fix: the validator refuses an edge
+   that brings a fixed vulnerability back. Such an edge skips releases, so it must be at least as
+   cautious as the route it replaces (the edge into the newest line from the older one, then that
+   line up to the fix): a backup if any step needs one, irreversible if any step is, every step's
+   conditions, and no release an upgrade must land on in between. `main` moves forward with it.
 4. Bring each older branch's matrix back in line with `main`'s:
 
    ```bash

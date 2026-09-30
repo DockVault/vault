@@ -813,6 +813,10 @@ def test_a_line_between_two_fixes_with_none_of_its_own_stays_affected():
     data["versions"]["0.35.1"] = {"released": "2027-01-13", "notes": "0.35.1", "support": _support()}
     data["edges"] += [{"from": a, "to": b, "kind": "direct", "reversible": True,
                        "requires_backup": False} for a, b in (("0.34.1", "0.35.0"), ("0.35.0", "0.35.1"))]
+    # 0.33.2 cannot move into the affected 0.34 line; its way up skips to the fix on 0.35.
+    data["edges"] = [e for e in data["edges"] if (e["from"], e["to"]) != ("0.33.2", "0.34.1")]
+    data["edges"].append({"from": "0.33.2", "to": "0.35.1", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
     advisory = data["advisories"]["on-two-lines"]
     advisory["fixed_in_lines"] = ["0.33.2", "0.35.1"]
     data["versions"]["0.35.0"]["support"] = _support(secure=False)
@@ -856,7 +860,8 @@ def test_a_short_reference_is_refused_where_its_line_has_another_fix():
                         for ver, day in sorted(days.items(), key=lambda item: um._sort_key(item[0]))}
     data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
                       "requires_backup": False}
-                     for a, b in (("0.25.0", "0.25.1"), ("0.25.0", "0.26.0"), ("0.26.0", "0.26.1"))]
+                     for a, b in (("0.25.0", "0.25.1"), ("0.25.0", "0.26.0"), ("0.26.0", "0.26.1"),
+                                  ("0.25.1", "0.26.1"))]
     data["advisories"] = {"two": _advisory(title="Two", fixed_in="0.25.1",
                                            fixed_in_lines=["0.25.1", "0.26.1"])}
     for ver in ("0.25.0", "0.26.0"):
@@ -1007,6 +1012,142 @@ def test_the_committed_matrix_takes_the_lines_map_its_next_release_writes():
         newest = max(data["versions"], key=um._sort_key)
         data["lines"] = {um._line(newest): {"security_fixes_until": None}}
     um.validate_matrix(data, released_ceiling=None)
+
+
+# --- routes across lines ---------------------------------------------------------------------------
+# _two_lines(): 0.33.2 (the fix on 0.33) leads up by the edge 0.33.2 -> 0.34.1, which skips 0.34.0.
+# The route of steps it replaces is 0.33.1 -> 0.34.0 -> 0.34.1.
+
+def _edge_between(data, source, target):
+    return next(e for e in data["edges"] if (e["from"], e["to"]) == (source, target))
+
+
+def _without_edge(data, source, target):
+    data["edges"] = [e for e in data["edges"] if (e["from"], e["to"]) != (source, target)]
+    return data
+
+
+def test_a_maintenance_release_with_no_way_up_is_refused():
+    _reject(_without_edge(_two_lines(), "0.33.2", "0.34.1"),
+            "0.33.2 cannot reach 0.34.1 by edges that are not blocked")
+    data = _two_lines()
+    _edge_between(data, "0.33.2", "0.34.1").update({"kind": "blocked", "reason": "not this way"})
+    _reject(data, "0.33.2 cannot reach 0.34.1 by edges that are not blocked")
+
+
+def test_an_edge_into_a_release_the_fix_leaves_affected_is_refused():
+    data = _without_edge(_two_lines(), "0.33.2", "0.34.1")
+    data["edges"].append({"from": "0.33.2", "to": "0.34.0", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
+    _reject(data, "the edge 0.33.2 -> 0.34.0 brings back on-two-lines: 0.34.0 is affected and 0.33.2 "
+                  "is not; an upgrade must not reinstate a fixed vulnerability")
+    # Kept as a blocked edge beside the way up, it is no route, so it reinstates nothing.
+    data = _two_lines()
+    data["edges"].append({"from": "0.33.2", "to": "0.34.0", "kind": "blocked", "reversible": False,
+                          "requires_backup": True, "reason": "0.34.0 is affected; go to 0.34.1"})
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def test_an_edge_into_the_release_that_introduced_a_vulnerability_is_not_a_regression():
+    data = _two_lines()
+    data["advisories"]["new-in-0-34"] = _advisory(title="New in 0.34", fixed_in="0.34.1")
+    data["versions"]["0.34.0"]["vulnerabilities"].append(
+        _ref(slug="new-in-0-34", title="New in 0.34", fixed_in="0.34.1"))
+    um.validate_matrix(data, released_ceiling=None)            # 0.33.1 -> 0.34.0 brings it in first
+
+
+@pytest.mark.parametrize("step", [("0.33.1", "0.34.0"), ("0.34.0", "0.34.1")])
+def test_a_skip_edge_is_as_cautious_as_the_route_it_replaces(step):
+    data = _two_lines()
+    _edge_between(data, *step).update({"requires_backup": True})
+    _reject(data, "the edge 0.33.2 -> 0.34.1 must require a backup: the route it replaces, "
+                  "0.33.1 -> 0.34.0 -> 0.34.1, does")
+    _edge_between(data, "0.33.2", "0.34.1")["requires_backup"] = True
+    um.validate_matrix(data, released_ceiling=None)
+
+    data = _two_lines()
+    _edge_between(data, *step).update({"reversible": False, "requires_backup": True})
+    _edge_between(data, "0.33.2", "0.34.1")["requires_backup"] = True
+    _reject(data, "the edge 0.33.2 -> 0.34.1 cannot be reversible: the route it replaces, "
+                  "0.33.1 -> 0.34.0 -> 0.34.1, is not")
+    _edge_between(data, "0.33.2", "0.34.1")["reversible"] = False
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def test_a_skip_edge_carries_every_condition_of_the_route_it_replaces():
+    data = _two_lines()
+    crossing = {"id": "crossing-note", "summary": "Said on the way into 0.34."}
+    in_line = {"id": "patch-note", "summary": "Said on the way to 0.34.1."}
+    _edge_between(data, "0.33.1", "0.34.0")["conditions"] = [crossing]
+    _edge_between(data, "0.34.0", "0.34.1")["conditions"] = [in_line]
+    _edge_between(data, "0.33.2", "0.34.1")["conditions"] = [in_line]
+    _reject(data, "the edge 0.33.2 -> 0.34.1 leaves out the condition(s) crossing-note of the route "
+                  "it replaces, 0.33.1 -> 0.34.0 -> 0.34.1")
+    _edge_between(data, "0.33.2", "0.34.1")["conditions"] = [crossing]
+    _reject(data, "leaves out the condition(s) patch-note")
+    _edge_between(data, "0.33.2", "0.34.1")["conditions"] = [
+        in_line, crossing, {"id": "own-note", "summary": "Only this way."}]
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def test_a_skip_edge_never_passes_a_release_an_upgrade_must_land_on():
+    data = _two_lines()
+    data["versions"]["0.34.0"]["must_land_here"] = True
+    _reject(data, "the edge 0.33.2 -> 0.34.1 passes 0.34.0, where an upgrade must land "
+                  "(must_land_here); the route it replaces is 0.33.1 -> 0.34.0 -> 0.34.1")
+    data["versions"]["0.34.0"]["must_land_here"] = False
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def test_a_skip_edge_over_a_blocked_step_is_refused():
+    data = _two_lines()
+    _edge_between(data, "0.33.1", "0.34.0").update({"kind": "blocked", "reversible": False,
+                                                     "requires_backup": True, "reason": "no"})
+    _reject(data, "the edge 0.33.2 -> 0.34.1 skips releases, but no route of steps that are not "
+                  "blocked leads from 0.33.2, or a lower release of its line, to 0.34.1")
+
+
+def test_the_route_a_skip_replaces_leaves_the_line_from_the_highest_release_that_can():
+    data = _two_lines()
+    older = {"id": "from-0-33-0-only", "summary": "What moving from 0.33.0 involves."}
+    data["edges"].append({"from": "0.33.0", "to": "0.34.0", "kind": "direct", "reversible": True,
+                          "requires_backup": False, "conditions": [older]})
+    um.validate_matrix(data, released_ceiling=None)            # replaced: 0.33.1 -> 0.34.0 -> 0.34.1
+    _edge_between(data, "0.33.1", "0.34.0").update({"kind": "blocked", "reversible": False,
+                                                     "requires_backup": True, "reason": "no"})
+    _reject(data, "leaves out the condition(s) from-0-33-0-only of the route it replaces, "
+                  "0.33.0 -> 0.34.0 -> 0.34.1")
+
+
+def test_a_skip_within_a_line_replaces_the_releases_in_between():
+    data = _two_lines()
+    data["edges"].append({"from": "0.33.0", "to": "0.33.2", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
+    um.validate_matrix(data, released_ceiling=None)
+    _edge_between(data, "0.33.1", "0.33.2")["requires_backup"] = True
+    _reject(data, "the edge 0.33.0 -> 0.33.2 must require a backup: the route it replaces, "
+                  "0.33.0 -> 0.33.1 -> 0.33.2, does")
+
+
+def test_a_skip_over_a_whole_line_replaces_the_route_through_it():
+    data = _two_lines()
+    data["versions"]["0.35.0"] = {"released": "2027-02-01", "notes": "0.35.0", "support": _support()}
+    data["edges"] += [
+        {"from": "0.34.1", "to": "0.35.0", "kind": "direct", "reversible": False,
+         "requires_backup": True},
+        {"from": "0.33.2", "to": "0.35.0", "kind": "direct", "reversible": True,
+         "requires_backup": False}]
+    _reject(data, "the edge 0.33.2 -> 0.35.0 must require a backup: the route it replaces, "
+                  "0.33.1 -> 0.34.0 -> 0.34.1 -> 0.35.0, does")
+    _edge_between(data, "0.33.2", "0.35.0").update({"reversible": False, "requires_backup": True})
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def test_an_edge_leads_upwards():
+    data = _two_lines()
+    data["edges"].append({"from": "0.34.1", "to": "0.33.2", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
+    _reject(data, f"edges[{len(data['edges']) - 1}] goes from 0.34.1 down to 0.33.2")
 
 
 # --- coverage: an advisory affects an unbroken run of releases ------------------------------------
@@ -1251,6 +1392,10 @@ def test_the_shapes_a_real_non_trivial_upgrade_will_need_are_accepted():
         "reversible": False, "requires_backup": True,
         "reason": "the 0.4.0 boot rewrites a column 0.3.0 still writes to.",
     })
+    # A blocked route into the newest release leaves every release below it end-of-life, as the
+    # floor release did: an install there has no way up in place.
+    for ver in ("0.1.0", "0.2.0", "0.3.0"):
+        data["versions"][ver]["support"] = _support(eol=True)
     um.validate_matrix(data, released_ceiling=None)
 
 
@@ -1381,6 +1526,8 @@ def test_an_inbound_edge_marked_blocked_is_not_a_way_in(tmp_path):
         "reversible": False, "requires_backup": True,
         "reason": "0.4.0 rewrites a column 0.3.0 still writes to.",
     })
+    for ver in ("0.1.0", "0.2.0", "0.3.0"):                  # below a blocked way up, as the floor
+        matrix["versions"][ver]["support"] = _support(eol=True)
     repo = _repo(tmp_path, "0.4.0", matrix)
     with pytest.raises(gate.ReleaseGateError, match="marked blocked"):
         _run_gate(repo, "0.4.0", tmp_path)
@@ -1436,6 +1583,7 @@ def test_a_waiver_may_cover_a_declared_floor_release_reached_only_by_a_blocked_e
     data = _valid()
     data["edges"][0]["kind"] = "blocked"
     data["edges"][0]["reason"] = "no in-place upgrade; deploy fresh and restore"
+    data["versions"]["0.1.0"]["support"] = _support(eol=True)  # below the floor, as in the real file
     data["waivers"] = [{"version": "0.2.0", "reason": "floor release, reached by restore only"}]
     um.validate_matrix(data, released_ceiling=None)                                  # accepted, not stale
     # And the gate lets it be cut, returning the waiver reason rather than refusing on the blocked edge.
@@ -1788,8 +1936,9 @@ def test_an_undeclared_release_fails_on_main_and_a_newer_lines_warns_on_a_mainte
 
 
 def test_a_minor_after_a_later_maintenance_release_is_still_reachable():
-    """Once 0.2.1 ships on the 0.2 line after 0.3.0, 0.3.0's version-order predecessor is 0.2.1, and
-    no honest edge leads from it into 0.3.0. The route in from 0.2.0 still counts."""
+    """Once 0.2.1 ships on the 0.2 line after 0.3.0, 0.3.0's version-order predecessor is 0.2.1, made
+    after it, so an edge from 0.2.1 is 0.2.1's way up, not 0.3.0's way in. The route in from 0.2.0
+    still counts."""
     data = _valid()
     data["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "third", "support": _support()}
     data["versions"]["0.2.1"] = {"released": "2026-01-04", "notes": "patch", "support": _support()}
@@ -1797,6 +1946,9 @@ def test_a_minor_after_a_later_maintenance_release_is_still_reachable():
         {"from": "0.2.0", "to": "0.3.0", "kind": "direct", "reversible": True,
          "requires_backup": False},
         {"from": "0.2.0", "to": "0.2.1", "kind": "direct", "reversible": True,
+         "requires_backup": False},
+        # 0.2.1's own way up to the newest release.
+        {"from": "0.2.1", "to": "0.3.0", "kind": "direct", "reversible": True,
          "requires_backup": False},
     ]
     um.validate_matrix(data, released_ceiling=None)
@@ -1806,10 +1958,6 @@ def test_a_minor_after_a_later_maintenance_release_is_still_reachable():
     # Without that route, it is not reachable, and says so -- an edge from the later patch into a
     # release that predates its fix is not a route in either.
     data["edges"] = [e for e in data["edges"] if (e["from"], e["to"]) != ("0.2.0", "0.3.0")]
-    assert [p.split(":")[0] for p in _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"])] == [
-        "0.3.0"]
-    data["edges"].append({"from": "0.2.1", "to": "0.3.0", "kind": "direct", "reversible": True,
-                          "requires_backup": False})
     assert [p.split(":")[0] for p in _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"])] == [
         "0.3.0"]
 
