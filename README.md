@@ -226,7 +226,9 @@ included); and the approver must have been an administrator for 14 days when the
 of these applied. Every administrator is told when an administrator is created or promoted, and the
 user of every change to their sign-in details. What remains, and is accepted: someone who creates
 several administrator accounts and waits 14 days can approve their own changes through them, in full
-view of those notices. On a deployment with one administrator, or when no administrator may approve,
+view of those notices; and, until 0.34.0, an administrator whose current password someone else set
+can still approve another administrator's change, so whoever set it can approve through that account.
+On a deployment with one administrator, or when no administrator may approve,
 whoever runs the server acts from the host instead:
 
 ```bash
@@ -304,7 +306,9 @@ DockVault can tell an admin when a newer release is available. It is **off by de
 `UPDATE_CHECK_ENABLED=true` in `.env` to turn it on. The running container then checks GitHub on a
 configurable interval (`UPDATE_CHECK_INTERVAL_MINUTES`, default 360) — or on demand via a **Check for
 updates** button — and shows a dismissible banner in **Settings → General** to every admin when a
-newer version exists (see [Upgrading](#upgrading) for how to apply it).
+newer version exists (see [Upgrading](#upgrading) for how to apply it). On an older release line it
+also names the newest release of that line, once that release's own published upgrade matrix could
+be fetched, and says when the line's security fixes have ended; that banner is dismissed separately.
 
 The check is privacy-preserving: it sends **no** identifier, account data, version, or telemetry —
 just an unauthenticated request to GitHub's public release API (the only thing GitHub sees is your
@@ -324,9 +328,11 @@ health. Because the database has no down-migrations, it **warns before any versi
 recommends a Backup first (Backup & Restore menu). The manual steps below do the same thing by hand:
 
 **From a prebuilt image** — every tagged release is published to GHCR as
-`ghcr.io/dockvault/vault:<tag>` (plus `:latest`), for `linux/amd64` and `linux/arm64`. The package
-is public: no login, no GitHub account. Set `DOCKVAULT_IMAGE` in `.env` to the release tag, then
-pull + restart with no local build:
+`ghcr.io/dockvault/vault:vX.Y.Z`, for `linux/amd64` and `linux/arm64`. The newest release of each
+release line is also `:vX.Y` (for example `:v0.33`), and the highest release overall is `:latest`,
+so a patch release of an older line never moves `:latest`. The package is public: no login, no
+GitHub account. Set `DOCKVAULT_IMAGE` in `.env` to the release tag, then pull + restart with no
+local build:
 
 ```bash
 # in .env:  DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.9.0
@@ -361,11 +367,22 @@ not quietly serve.
 schema change can leave a deployment unable to start, and nothing in the product will undo a
 migration for you.
 
+From 0.33.1 on, an image also refuses to start on data a newer release has changed in a way it
+cannot read. A release that stores something older versions would misread or delete leaves a mark in
+the database naming the oldest version that can read it; an older image then stops before it touches
+the data, and its log says what changed and how to undo it with the newer version. The web and SFTP
+processes both check, whichever tool changed the image. `ALLOW_START_ON_NEWER_DATA=true` starts it
+anyway, at the risk described in `.env.example`. 0.33.0 and earlier do not read the mark, so a
+rollback to one of them is not protected by it; `dockvault.py update` from 0.33.1 on refuses such a
+rollback while the running version reports a change in the way.
+
 What a given upgrade involves is declared in [`docs/upgrade-matrix.json`](docs/upgrade-matrix.json)
 and published with each release as an `upgrade.json` asset: whether the hop can be taken directly,
 whether it is reversible, whether it requires a backup, and any conditions worth knowing before
-starting. A release cannot be cut without an entry, so the description is not something a release
-might forget to write.
+starting. A condition may carry a query that finds whether it applies to a deployment, and may say
+that while the query finds rows, going back across that step is not possible until the state is
+undone with the newer version (`blocks_rollback`). A release cannot be cut without an entry, so the
+description is not something a release might forget to write.
 
 `dockvault.py update` reads it. It tells you what the hop involves before doing anything, takes a
 backup when one is required, and, run interactively, asks you to type an acknowledgement for a change
@@ -380,17 +397,32 @@ extended support — the dates its code fixes and its (usually longer) security-
 `dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
 one, and warns before moving to a version with known unpatched vulnerabilities.
 
+End-of-life is not the end of security support. It marks the releases an install can no longer move
+to or from in place (see the minimum supported version below). Which release lines still receive
+security fixes, and until when, is stated in [`.github/SECURITY.md`](.github/SECURITY.md): each line
+from 0.33 on is supported until six months after the next minor release ships. The matrix states the
+same in its top-level `lines` map: each line from 0.33 on with the day its security fixes end
+(`security_fixes_until`), null for the newest line, whose end is not known until the next minor
+release ships. The validator checks each date against that promise, and requires a mitigation on an
+advisory that leaves the newest release of a line affected while the line is supported. A release
+outside that period is not marked end-of-life, so a move within its line, or back to it, still works; it is
+marked not secure as soon as an advisory affects it. How a fix reaches an older line that is still
+supported is described in [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
+
 When a version is not secure, the matrix says why. Each vulnerability is recorded once, in the
 top-level `advisories`: a title and description, its **impact** (what it let someone do), its
 **remediation** (usually the release that fixes it, and anything to do after upgrading), an optional
 **mitigation** (what to do before, or instead of, upgrading), a **CVSS v4.0 base vector** with the
 severity band it scores to, an optional advisory id, the release that fixes it (`fixed_in`) and the
-date it was published. Each affected version lists the advisories that apply to it. **A version
+date it was published. When a fix is released on more than one release line, `fixed_in_lines` lists
+one release per line and `fixed_in` is the lowest of them. Each affected version lists the advisories
+that apply to it, and each entry names the fix for that version's own line. **A version
 affected by even one advisory, of any severity, is not secure.** Each entry in that list repeats its
 advisory's title and `fixed_in`, which is all that `dockvault.py` and the in-app check read before
 0.33.0; from 0.33.0 they also accept an entry that carries only the advisory's id and take the rest
-from `advisories`. The validator keeps requiring the repeated fields while releases that need them
-are still supported.
+from `advisories`. Below 0.27.0 an entry may carry only the id, which keeps the file small. From
+0.27.0 on the validator requires the repeated fields, because the `dockvault.py` of 0.30.0 to 0.32.x
+lists the newest releases from them.
 
 The validator recomputes every vector's score and refuses a severity that does not match it, requires
 an advisory to be listed on every release from the first it affects up to its fix, and refuses a

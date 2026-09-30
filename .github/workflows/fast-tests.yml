@@ -3,7 +3,8 @@ name: Fast tests
 on:
   pull_request:
   push:
-    branches: ["main"]
+    # main and each maintenance line release/X.Y; candidates run these lanes through Tests.
+    branches: ["main", "release/[0-9]+.[0-9]+"]
   workflow_dispatch: {}
   # Called by the Tests workflow when it runs on a release candidate or inside a release, so the one
   # set of lanes that installs only the test lock also gates the commit that reaches main and is
@@ -37,10 +38,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.expected_sha || github.sha }}
-          # Tags, because part of the offline lane checks the upgrade matrix against the releases
-          # that actually exist. Tags only, not full history: the check reads `git tag -l`, so
-          # fetch-depth: 0 would slow every run to fetch commits nothing looks at.
-          fetch-tags: true
+          # Tags and history, because part of the offline lane checks the upgrade matrix against the
+          # releases that actually exist (`git tag -l`) and against the versions this commit's
+          # history prepared (`git log -- VERSION`): two candidates cut the same day are tested
+          # before either is tagged.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python 3.14

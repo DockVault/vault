@@ -7813,9 +7813,70 @@ function renderSecurityBanner(us) {
     banner.style.display = '';
 }
 
+const RELEASE_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+    'September', 'October', 'November', 'December'];
+
+function formatReleaseDay(iso) {
+    // '2027-06-10' -> '10 June 2027'; '' for anything that is not such a day (the value comes from a
+    // fetched matrix, so nothing else is ever shown).
+    const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const month = m ? RELEASE_MONTHS[parseInt(m[2], 10) - 1] : null;
+    return month ? `${parseInt(m[3], 10)} ${month} ${m[1]}` : '';
+}
+
+function lineBannerMessage(us) {
+    // What an install on an older release line is told, as {text, key}, or null. The newest release
+    // of its own line (the server offers it only after fetching that release's own matrix), and a
+    // notice once the line's security fixes have ended. `key` is what a dismissal remembers: a newer
+    // release on the line, or the line ending, shows the banner again.
+    const lu = us && us.line_update;
+    const line = us && us.line;
+    const ended = !!(line && line.ended === true);
+    if (!lu && !ended) { return null; }
+    const clip = (value, n) => String(value == null ? '' : value).replace(/^v/i, '').slice(0, n);
+    const parts = [];
+    if (lu) {
+        const until = formatReleaseDay(lu.security_fixes_until);
+        const period = clip(lu.line, 16) + (until ? `, security fixes until ${until}` : '');
+        parts.push(`${lu.fixes_vulnerability === true ? 'Security update' : 'Update'} `
+            + `v${clip(lu.version, 32)} is available for your release line (${period}).`);
+    }
+    if (ended) {
+        const day = formatReleaseDay(line.security_fixes_until);
+        parts.push(`Security fixes for your release line (${clip(line.line, 16)}) `
+            + `${day ? `ended on ${day}` : 'have ended'}; move to a newer line.`);
+    }
+    if (us.latest) { parts.push(`The newest release is v${clip(us.latest, 32)}.`); }
+    return {
+        text: parts.join(' '),   // every part is clipped above, so the whole is bounded
+        key: `${lu ? clip(lu.version, 32) : ''}|${ended ? clip(line.line, 16) : ''}`,
+    };
+}
+
+function renderLineBanner(us) {
+    // Its own dismissal key, separate from the update banner's. textContent only: the text comes from
+    // a fetched matrix.
+    const banner = document.getElementById('line-banner');
+    if (!banner) return;
+    const message = lineBannerMessage(us);
+    if (!message || localStorage.getItem('dv-line-banner-dismissed') === message.key) {
+        banner.style.display = 'none';
+        return;
+    }
+    const text = document.getElementById('line-banner-text');
+    if (text) { text.textContent = message.text; }
+    const dismiss = document.getElementById('line-banner-dismiss');
+    if (dismiss) dismiss.onclick = () => {
+        localStorage.setItem('dv-line-banner-dismissed', message.key);
+        banner.style.display = 'none';
+    };
+    banner.style.display = '';
+}
+
 function renderUpdateStatus(us) {
     renderUpdateBanner(us);
     renderSecurityBanner(us);
+    renderLineBanner(us);
     const controls = document.getElementById('update-controls');
     if (!controls) return;
     // Only expose the check-now + interval controls when the check is enabled and not managed.

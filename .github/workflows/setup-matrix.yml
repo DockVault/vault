@@ -616,6 +616,10 @@ jobs:
         # the registry for most of its life, so keying off the checkout's own VERSION would make
         # this scenario silently test the fallback instead — which the step after this one asserts
         # deliberately.
+        #
+        # "Newest" is the highest final release not above the checkout's VERSION, never the first
+        # entry of the list: GitHub orders it by creation time, so a maintenance release of an older
+        # line would come first on main, and a maintenance branch must not install a newer line.
         shell: bash
         env:
           # Authenticated: an anonymous read shares an IP rate limit with every other job on
@@ -631,8 +635,8 @@ jobs:
             body="$(curl -sS \
                       -H "Authorization: Bearer ${GH_API_TOKEN}" \
                       -H "X-GitHub-Api-Version: 2022-11-28" \
-                      https://api.github.com/repos/DockVault/vault/releases || true)"
-            published="$(printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((r["tag_name"] for r in d if isinstance(r, dict) and not r.get("draft")), ""))' 2>/dev/null || true)"
+                      "https://api.github.com/repos/DockVault/vault/releases?per_page=100" || true)"
+            published="$(printf '%s' "$body" | python3 .github/scripts/pick_published_release.py --version-file VERSION || true)"
             [ -n "$published" ] && break
             echo "the releases list came back empty or unreadable (attempt ${attempt} of 5)"
             sleep 10
@@ -641,7 +645,7 @@ jobs:
             echo "::error::could not find a published release of DockVault/vault to install. The releases API returned nothing usable after 5 attempts, so this scenario has no version to pin."
             exit 1
           fi
-          echo "newest published release: $published"
+          echo "newest published release not above this checkout: $published"
           cp VERSION "$RUNNER_TEMP/VERSION.checkout"
           printf '%s\n' "${published#v}" > VERSION
 

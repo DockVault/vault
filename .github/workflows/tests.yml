@@ -8,7 +8,9 @@ name: Tests
 on:
   pull_request:
   push:
-    branches: ["main"]
+    # main, and each maintenance line release/X.Y, which publishes too. Release candidates
+    # (candidate/X.Y.Z) are tested by a manual run only.
+    branches: ["main", "release/[0-9]+.[0-9]+"]
   workflow_dispatch: {}
   workflow_call:
     inputs:
@@ -96,11 +98,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.expected_sha || github.sha }}
-          # Tags, because part of the suite checks the upgrade matrix against the releases that
-          # actually exist. The default checkout is shallow and tagless, which made that check skip
-          # -- silently, and specifically here, in the job that gates publication. Tags only, not
-          # full history: the check reads `git tag -l`.
-          fetch-tags: true
+          # Tags and history, because part of the suite checks the upgrade matrix against the releases
+          # that actually exist (`git tag -l`) and against the versions this commit's history
+          # prepared (`git log -- VERSION`). The default checkout is shallow and tagless, which made
+          # the first check skip -- silently, and specifically here, in the job that gates
+          # publication.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify requested commit
@@ -338,11 +341,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.expected_sha || github.sha }}
-          # Tags, because part of the suite checks the upgrade matrix against the releases that
-          # actually exist. The default checkout is shallow and tagless, which made that check skip
-          # -- silently, and specifically here, in the job that gates publication. Tags only, not
-          # full history: the check reads `git tag -l`.
-          fetch-tags: true
+          # Tags and history, because part of the suite checks the upgrade matrix against the releases
+          # that actually exist (`git tag -l`) and against the versions this commit's history
+          # prepared (`git log -- VERSION`). The default checkout is shallow and tagless, which made
+          # the first check skip -- silently, and specifically here, in the job that gates
+          # publication.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify requested commit

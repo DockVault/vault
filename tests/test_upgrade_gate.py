@@ -168,10 +168,12 @@ def _deployment(tmp_path, version="0.1.0", matrix=None):
 
 def _stub(monkeypatch, tool, *, backups):
     """Stub the engine; record backups instead of taking them."""
-    monkeypatch.setattr(dv, "fetch_upgrade_matrix",
-                        lambda tag, root=None, opener=None: (
-                            json.loads((Path(root) / "docs" / "upgrade-matrix.json").read_text(
-                                encoding="utf-8")), "the test matrix"))
+    def fetch(tag, root=None, opener=None):
+        if root is None:                       # another tag's published matrix: none offline
+            return None, "no upgrade matrix could be read"
+        return json.loads((Path(root) / "docs" / "upgrade-matrix.json").read_text(
+            encoding="utf-8")), "the test matrix"
+    monkeypatch.setattr(dv, "fetch_upgrade_matrix", fetch)
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: argparse.Namespace(
         returncode=0, stdout="", stderr=""))
     monkeypatch.setattr(tool, "_recreate_stack", lambda build: True)
@@ -1089,3 +1091,203 @@ def test_lifecycle_is_read_from_the_newest_local_view_not_the_frozen_target():
              "versions": {"0.9.0": {"released": "2026-01-01", "notes": "n",
                                     "support": {"eol": False, "secure": True}}}, "edges": []}
     assert dv.preferred_lifecycle_matrix(local, newer, "0.9.0") is newer
+
+
+# --- release lines ----------------------------------------------------------------------------------
+# A synthetic matrix shaped like the one after the first fix released on two lines: `fixed_in_lines`,
+# a skip edge from the older line (0.33.2 -> 0.34.1), dated `lines` and a condition that blocks a
+# rollback. It passes the release validator; the app's update check reads the same file.
+
+_TWO_LINES = ROOT / "tests" / "fixtures" / "upgrade-matrix-two-lines.json"
+# As the releases list gives them: by when each was made, not by version.
+_LISTED = ["v0.33.2", "v0.34.1", "v0.34.0", "v0.33.1", "v0.33.0", "v0.32.6"]
+
+
+def _two_lines():
+    return json.loads(_TWO_LINES.read_text(encoding="utf-8"))
+
+
+def _as_published_with(matrix, *versions):
+    """`matrix` as a release made before `versions` published it: without them, their edges, and the
+    advisories only they are the fix for."""
+    import copy
+    m = copy.deepcopy(matrix)
+    for version in versions:
+        m["versions"].pop(version, None)
+    m["edges"] = [e for e in m["edges"] if e["from"] in m["versions"] and e["to"] in m["versions"]]
+    for slug, record in list(m["advisories"].items()):
+        if record["fixed_in"] in versions:
+            del m["advisories"][slug]
+            for meta in m["versions"].values():
+                meta["vulnerabilities"] = [r for r in meta.get("vulnerabilities", [])
+                                           if r["advisory"] != slug]
+                if not meta["vulnerabilities"]:
+                    del meta["vulnerabilities"]
+                    meta["support"]["secure"] = True
+    return m
+
+
+def test_the_synthetic_matrix_is_one_the_release_gate_accepts():
+    spec = importlib.util.spec_from_file_location(
+        "upgrade_matrix_for_lines", ROOT / ".github" / "scripts" / "upgrade_matrix.py")
+    um = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(um)
+    um.validate_matrix(um.load_matrix(_TWO_LINES), released_ceiling="0.34.1")
+
+
+def test_release_tags_are_taken_highest_version_first():
+    assert dv.sort_release_tags(_LISTED) == ["v0.34.1", "v0.34.0", "v0.33.2", "v0.33.1", "v0.33.0",
+                                             "v0.32.6"]
+    assert dv.parse_releases([{"tag_name": t} for t in _LISTED])[0] == "v0.34.1"
+    assert dv.newest_on_line(_LISTED, "0.33.1") == "v0.33.2"
+    assert dv.newest_on_line(_LISTED, "v0.34.0") == "v0.34.1"
+    assert dv.newest_on_line(_LISTED, "0.35.0") is None
+
+
+def _lines_deployment(tmp_path, monkeypatch, *, running, bundled=None, main=None, tags=_LISTED,
+                      published=None, today="2027-02-01"):
+    """update() with this checkout's matrix `bundled`, main's copy `main`, the releases `tags` in
+    the order the list gives them, and each tag's published matrix from `published`."""
+    tool = _deployment(tmp_path, matrix=bundled or _two_lines())
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: (running, "the running container"))
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: list(tags))
+    monkeypatch.setattr(dv, "fetch_main_lifecycle_matrix", lambda *a, **k: main)
+    monkeypatch.setattr(dv, "_today", lambda: today)
+    if published is not None:
+        monkeypatch.setattr(dv, "fetch_upgrade_matrix", lambda tag, root=None, opener=None: (
+            (published[tag], "the published %s matrix" % tag) if tag in published
+            else (None, "no upgrade matrix could be read")))
+    return tool
+
+
+def _list_only(tool):
+    tool.update(argparse.Namespace(tag=None, source=False, yes=True, non_interactive=True,
+                                   dry_run=True, backup_verified=False))
+
+
+def test_the_install_is_shown_its_lines_newest_release_and_support_period(tmp_path, monkeypatch, capsys):
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.1")
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "release line    : 0.33 -- security fixes until 2027-06-10" in out
+    assert "newest on line  : v0.33.2 (fixes 1 known vulnerability in 0.33.1)" in out
+    assert "    v0.33.2   <- newest of your line" in out
+    listed = [line.split()[0] for line in out.splitlines() if line.startswith("    v0.")]
+    assert listed == dv.sort_release_tags(_LISTED), "the list is highest version first"
+
+
+def test_a_line_past_its_support_date_says_so(tmp_path, monkeypatch, capsys):
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.2", today="2027-06-11")
+    _list_only(tool)
+    assert "release line    : 0.33 -- security fixes ended on 2027-06-10" in capsys.readouterr().out
+
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1", today="2027-06-11")
+    with pytest.raises(SystemExit):                     # the way back is irreversible, and refused
+        _update(tool, tag="v0.33.2", dry_run=True)
+    assert ("Note: v0.33.2 is on the 0.33 line, which stopped receiving security fixes on "
+            "2027-06-10.") in capsys.readouterr().out
+
+
+def test_the_newest_line_has_no_end_yet(tmp_path, monkeypatch, capsys):
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1")
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "release line    : 0.34 -- the newest line: security fixes continue until six months" in out
+    assert "newest on line" not in out, "it is the newest release of its line"
+
+
+def test_a_line_older_than_every_supported_one_says_it_gets_no_fixes(tmp_path, monkeypatch, capsys):
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.32.6")
+    _list_only(tool)
+    assert ("release line    : 0.32 -- no longer receives security fixes (lines before 0.33 are not "
+            "supported)") in capsys.readouterr().out
+
+
+def test_only_a_published_release_is_named_as_the_newest_of_the_line(tmp_path, monkeypatch, capsys):
+    main = _two_lines()
+    main["versions"]["0.33.3"] = {"released": "2027-02-10", "notes": "not published yet",
+                                  "support": {"eol": False, "secure": True}}
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.1", main=main)
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "newest on line  : v0.33.2" in out and "0.33.3" not in out
+
+
+def test_the_newest_release_is_the_highest_version_not_the_first_listed(tmp_path, monkeypatch, capsys):
+    # 0.34.0's own matrix predates the fix; main's copy lists it, fixed in 0.34.1. The list gives
+    # 0.33.2 first, and a fix in 0.34.1 is above 0.33.2: taking the first listed tag as the newest
+    # release would drop main's finding as not yet released.
+    bundled = _as_published_with(_two_lines(), "0.33.2", "0.34.1")
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.0", bundled=bundled,
+                             main=_two_lines())
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "newest on line  : v0.34.1 (fixes 1 known vulnerability in 0.34.0)" in out
+    row = next(line for line in out.splitlines() if line.startswith("    v0.34.0"))
+    assert "1 known vulnerability (1 high) -- fixed in 0.34.1" in row
+
+
+def test_a_move_the_target_predates_is_described_by_the_running_versions_matrix(
+        tmp_path, monkeypatch, capsys):
+    # 0.33.2 was released after 0.34.0, with its way up into 0.34.0 in its own matrix. 0.34.0's
+    # matrix does not know 0.33.2.
+    at_0340 = _as_published_with(_two_lines(), "0.33.2", "0.34.1")
+    at_0332 = _as_published_with(_two_lines(), "0.34.1")
+    at_0332["edges"].append({"from": "0.33.2", "to": "0.34.0", "kind": "direct",
+                             "reversible": False, "requires_backup": True})
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.2", bundled=at_0332,
+                             published={"v0.34.0": at_0340, "v0.33.2": at_0332})
+    _update(tool, tag="v0.34.0", dry_run=True)
+    out = capsys.readouterr().out
+    assert "described by : the published v0.33.2 matrix" in out
+    assert "steps        : 1 adjacent release(s)" in out and "NOT DESCRIBED" not in out
+
+
+def test_a_move_neither_tag_matrix_declares_is_not_described_even_if_main_does(
+        tmp_path, monkeypatch, capsys):
+    at_0340 = _as_published_with(_two_lines(), "0.33.2", "0.34.1")
+    at_0332 = _as_published_with(_two_lines(), "0.34.1")
+    main = _two_lines()
+    main["edges"].append({"from": "0.33.2", "to": "0.34.0", "kind": "direct",
+                          "reversible": True, "requires_backup": False})
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.2", bundled=at_0332, main=main,
+                             published={"v0.34.0": at_0340, "v0.33.2": at_0332})
+    _update(tool, tag="v0.34.0", dry_run=True)
+    out = capsys.readouterr().out
+    # 0.33.2's own matrix knows both releases but no way between them; main's edge is not used.
+    assert "described by : the published v0.33.2 matrix" in out and "NOT DESCRIBED" in out
+
+
+def test_a_move_across_lines_is_not_counted_as_fixing_and_bringing_back_one_advisory(
+        tmp_path, monkeypatch, capsys):
+    # 0.33.1 and 0.34.0 are both affected by two-lines; each reference names its own line's fix.
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.1")
+    _update(tool, tag="v0.34.0", dry_run=True, backup_verified=True)
+    out = capsys.readouterr().out
+    assert "brings back" not in out and "Moving to v0.34.0 fixes" not in out
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.0")
+    _update(tool, tag="v0.34.0", dry_run=True, backup_verified=True)
+    assert "Moving to v0.34.0 fixes 1 known vulnerability in 0.33.0." in capsys.readouterr().out
+
+
+def test_the_fix_on_every_line_is_shown():
+    lines = dv.describe_vulnerabilities(dv.version_vulnerabilities(_two_lines(), "0.33.1"))
+    assert any("fixed in 0.33.2; on other lines in 0.34.1" in line for line in lines), lines
+    lines = dv.describe_vulnerabilities(dv.version_vulnerabilities(_two_lines(), "0.34.0"))
+    assert any("fixed in 0.34.1; on other lines in 0.33.2" in line for line in lines), lines
+
+
+def test_a_short_reference_is_told_the_fix_on_its_own_line():
+    m = _two_lines()
+    m["versions"]["0.34.0"]["vulnerabilities"] = [{"advisory": "two-lines"}]
+    m["versions"]["0.32.6"]["vulnerabilities"][1] = {"advisory": "two-lines"}
+    assert dv.version_vulnerabilities(m, "0.34.0")[0]["fixed_in"] == "0.34.1"
+    assert dv.version_vulnerabilities(m, "0.32.6")[1]["fixed_in"] == "0.33.2"   # lowest fix above
+    del m["advisories"]["two-lines"]["fixed_in_lines"]
+    assert dv.version_vulnerabilities(m, "0.34.0")[0]["fixed_in"] == "0.33.2"   # one fix: fixed_in
+
+
+def test_the_safer_alternative_prefers_the_targets_own_line():
+    assert dv.safer_alternative(_two_lines(), "0.33.1", ["v0.34.1", "v0.33.2"]) == "v0.33.2"
+    assert dv.safer_alternative(_two_lines(), "0.34.0", ["v0.34.1", "v0.33.2"]) == "v0.34.1"

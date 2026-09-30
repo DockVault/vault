@@ -390,7 +390,7 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert "git fetch --force --no-tags --prune origin" in publish
     assert "id: auth_gate" in publish
     assert 'test "$resolved_version" = "$staged_digest"' in publish
-    assert 'test "$resolved_latest" = "$staged_digest"' in publish
+    assert 'test "$resolved_floating" = "$staged_digest"' in publish
     assert 'echo "digest=${resolved_version}" >> "$GITHUB_OUTPUT"' in publish
     # provenance + one SBOM per platform, every one bound to the published index digest
     assert publish.count("subject-digest: ${{ steps.push.outputs.digest }}") == 3
@@ -437,14 +437,12 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     vex = json.loads(
         (_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8")
     )
-    # The three CPython findings the vendored backport removes, plus the OpenSSL QUIC-listener and
-    # zlib gz-write findings DockVault never reaches. Any OTHER exception must be a deliberate,
-    # reviewed addition.
+    # The three CPython findings the vendored backport removes, plus the zlib gz-write finding
+    # DockVault never reaches. Any OTHER exception must be a deliberate, reviewed addition.
     cpython_cves = {"CVE-2026-11940", "CVE-2026-11972", "CVE-2026-15308"}
-    openssl_cve = "CVE-2026-14456"
     zlib_cve = "CVE-2026-85091"
     by_name = {s["vulnerability"]["name"]: s for s in vex["statements"]}
-    assert set(by_name) == cpython_cves | {openssl_cve, zlib_cve}
+    assert set(by_name) == cpython_cves | {zlib_cve}
 
     for name in cpython_cves:
         statement = by_name[name]
@@ -465,30 +463,6 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
         ]
         assert _CPYTHON_SNAPSHOT in statement["impact_statement"]
         assert "__SOURCE_REVISION__" in statement["impact_statement"]
-
-    # The OpenSSL finding (CVE-2026-14456) is a QUIC-server-listener defect; DockVault serves TLS
-    # via uvicorn + Python's ssl only and never instantiates an OpenSSL QUIC listener, so the
-    # vulnerable code is not in the execute path. Distinct justification + apk (not python)
-    # subcomponents, kept as strict as the CPython entries so a bogus addition still fails.
-    openssl = by_name[openssl_cve]
-    assert openssl["status"] == "not_affected"
-    assert openssl["justification"] == "vulnerable_code_not_in_execute_path"
-    openssl_subs = [
-        {"@id": "pkg:apk/alpine/libssl3@3.5.7-r0"},
-        {"@id": "pkg:apk/alpine/libcrypto3@3.5.7-r0"},
-    ]
-    assert openssl["products"] == [
-        {
-            "@id": (
-                "pkg:oci/vault@__IMAGE_DIGEST__"
-                "?repository_url=ghcr.io/dockvault/vault"
-            ),
-            "subcomponents": openssl_subs,
-        },
-        {"@id": "__IMAGE_REFERENCE__", "subcomponents": openssl_subs},
-    ]
-    assert "__SOURCE_REVISION__" in openssl["impact_statement"]
-    assert "QUIC" in openssl["impact_statement"]
 
     # The zlib finding (CVE-2026-85091) is a heap overflow reached only through gzprintf()/
     # gzvprintf() after a stalled gzwrite(); nothing in the image imports the gz write API. Bound to
@@ -516,11 +490,13 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert _CPYTHON_SNAPSHOT in evidence
     assert "vulnerable_code_not_present" in evidence
     assert "vulnerable_code_not_in_execute_path" in evidence
-    assert "CVE-2026-14456" in evidence
     assert "CVE-2026-85091" in evidence
     assert "exact registry manifest digest" in evidence
+    # Publication copies the scanned index (no push digest is scraped), and every tag it writes,
+    # the moving ones included, is checked against the scanned digest.
     assert (
-        "both push responses and both immediate tag resolutions must agree" in evidence
+        "The release tag `:vX.Y.Z` and each moving tag the release gate names must\n"
+        "  resolve to the scanned digest" in evidence
     )
     for control in (
         "Private vulnerability reporting",

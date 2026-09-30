@@ -167,3 +167,75 @@ def test_an_ordinary_upgrade_says_nothing_about_stages(page: Page, admin_creds):
                                         "conditions": [], "steps": 1, "stages": 1}))
     _open_general(page, admin_creds)
     expect(page.locator("#update-banner-text")).not_to_contain_text("stages")
+
+
+# --- release lines -----------------------------------------------------------------------------------
+
+def _line_payload(**extra):
+    payload = {"enabled": True, "managed": False, "current": "0.33.1", "latest": "0.34.1",
+               "update_available": True, "url": "https://github.com/DockVault/vault/releases",
+               "notes": "x", "checked_at": 1700000000, "interval_minutes": 360}
+    payload.update(extra)
+    return payload
+
+
+def _reopen_general(page):
+    # After a reload the session is kept; the banners render when Settings loads the status.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator("#settings-tab-general")).to_be_visible(timeout=10000)
+    # The update banner is drawn in the same pass as the line banner, so once it shows, the line
+    # banner is as this status leaves it.
+    expect(page.locator("#update-banner-text")).to_contain_text("0.34.1")
+
+
+def test_an_install_on_an_older_line_is_told_about_its_lines_newest_release(page: Page, admin_creds):
+    status = _line_payload(
+        line_update={"version": "0.33.2", "line": "0.33", "fixes_vulnerability": True,
+                     "security_fixes_until": "2027-06-10"},
+        line={"line": "0.33", "security_fixes_until": "2027-06-10", "ended": False})
+    _mock_status(page, status)          # serves the dict as it is when asked, so it can change below
+    _open_general(page, admin_creds)
+    expect(page.locator("#line-banner")).to_be_visible()
+    expect(page.locator("#line-banner-text")).to_have_text(
+        "Security update v0.33.2 is available for your release line (0.33, security fixes until "
+        "10 June 2027). The newest release is v0.34.1.")
+    # Its own dismissal: dismissing it leaves the update banner as it was.
+    page.click("#line-banner-dismiss")
+    expect(page.locator("#line-banner")).to_be_hidden()
+    expect(page.locator("#update-banner")).to_be_visible()
+    assert page.evaluate("localStorage.getItem('dv-line-banner-dismissed')") == "0.33.2|"
+    assert page.evaluate("localStorage.getItem('dv-update-dismissed')") is None
+
+    # The dismissal outlasts a reload: the line banner stays hidden, the update banner still shows.
+    _reopen_general(page)
+    expect(page.locator("#update-banner")).to_be_visible()
+    expect(page.locator("#line-banner")).to_be_hidden()
+
+    # A newer release on the line shows it again.
+    status["line_update"] = dict(status["line_update"], version="0.33.3")
+    _reopen_general(page)
+    expect(page.locator("#line-banner")).to_be_visible()
+    expect(page.locator("#line-banner-text")).to_have_text(
+        "Security update v0.33.3 is available for your release line (0.33, security fixes until "
+        "10 June 2027). The newest release is v0.34.1.")
+
+
+def test_an_install_on_the_newest_line_gets_no_line_banner(page: Page, admin_creds):
+    _mock_status(page, _line_payload(current="0.34.0",
+                                     line={"line": "0.34", "security_fixes_until": None,
+                                           "ended": False}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#update-banner")).to_be_visible()
+    expect(page.locator("#line-banner")).to_be_hidden()
+
+
+def test_a_line_whose_security_fixes_ended_says_so(page: Page, admin_creds):
+    _mock_status(page, _line_payload(current="0.33.2", latest="0.35.0",
+                                     line={"line": "0.33", "security_fixes_until": "2027-06-10",
+                                           "ended": True}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#line-banner-text")).to_have_text(
+        "Security fixes for your release line (0.33) ended on 10 June 2027; move to a newer line. "
+        "The newest release is v0.35.0.")

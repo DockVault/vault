@@ -5,22 +5,43 @@ project — and of everyone who self-hosts it — seriously.
 
 ## Supported versions
 
-| Version | Security fixes |
+| Release line | Security fixes |
 |---|---|
 | 0.33.x, the latest line | Yes |
-| The minor line before the latest, 0.33.x and later lines only | Yes, until six months after the next minor release ships |
 | 0.32.x and earlier | No. Upgrade to the latest release. |
 
-0.33.0 is the first release with a support period. Each minor release line from 0.33 on (0.33.x,
-0.34.x, ...) receives security fixes until six months after the next minor release ships, so for a
-while two lines are supported: the latest and the one before it. 0.32.x and earlier receive no
-more security fixes. (The README's "minimum supported version" is a different thing: the oldest
-release `dockvault.py update` can upgrade from.)
+Each minor release line from 0.33 on (0.33.x, 0.34.x, ...) receives security fixes until six
+months after the next minor release ships. When 0.34.0 ships, 0.33.x gets its own row here with
+that date, so for a while two lines are supported: the latest and the one before it. 0.32.x and
+earlier receive no more security fixes. (The README's "minimum supported version" is a different
+thing: the oldest release `dockvault.py update` can upgrade from.)
 
-Security fixes ship as patch releases. Every fixed vulnerability is published as an advisory,
-with a CVSS v4 score, in the upgrade matrix (`docs/upgrade-matrix.json`), which marks each
-release that has a known advisory as not secure. `dockvault.py update`, the in-app update notice
-and the upgrades page of the documentation site read that matrix.
+Security fixes ship as patch releases. Once a newer line exists, a fix for an older line that is
+still supported is released from that line's `release/X.Y` branch, in the same release window as
+the fix for the latest line; [docs/guides/maintenance-releases.md](../docs/guides/maintenance-releases.md)
+describes how. Every fixed vulnerability is published as an advisory, with a CVSS v4 score, in the
+upgrade matrix (`docs/upgrade-matrix.json`), which marks each release that has a known advisory as
+not secure. `dockvault.py update`, the in-app update notice and the upgrades page of the
+documentation site read that matrix.
+
+### Release images
+
+Every release is published as `ghcr.io/dockvault/vault:vX.Y.Z`, which never changes. The newest
+release of each line is also tagged `:vX.Y` (for example `:v0.33`), which moves to each new patch
+release of that line. `:latest`, and GitHub's "latest release", name the highest version released,
+so a patch release of an older line never moves them.
+
+### Accepted residuals
+
+Two ways round the rule that another administrator's credential change needs an independent
+approver remain in 0.33.x, and each step of them is announced to every administrator or to the
+account's user:
+
+- someone who creates several administrator accounts and waits 14 days can approve their own
+  changes through them;
+- an administrator whose current password someone else set can still approve another
+  administrator's credential change, so whoever set that password can approve through that
+  account. 0.34.0 refuses such approvals.
 
 ## Reporting a vulnerability
 
@@ -37,8 +58,9 @@ What to expect:
 - an acknowledgement within 5 business days;
 - a first assessment within 10 business days: whether we can reproduce it, and its severity
   (CVSS v4);
-- a fix within 30 days for Critical and High severity and within 90 days for Medium; Low
-  findings are fixed in a later regular release.
+- a fix within 30 days for Critical and High severity and within 90 days for Medium. Low
+  findings are fixed in the next regular release, and in the supported previous line in the same
+  release window.
 
 We will keep you informed, coordinate disclosure with you, and credit you in the release notes
 unless you ask us not to. Please allow us to release a fix before any public disclosure.
@@ -91,7 +113,10 @@ action is needed.
 The optional update check (`UPDATE_CHECK_ENABLED=true`, **default off**) makes an outbound request
 on a configurable interval (`UPDATE_CHECK_INTERVAL_MINUTES`, default 360; a shared cache bounds real
 requests to that rate no matter how often the UI polls) to GitHub's public API (`api.github.com` /
-`raw.githubusercontent.com`) to learn the latest published version. It sends **no** instance identifier, account data, version,
+`raw.githubusercontent.com`) to learn the latest published version, its upgrade matrix, the copy on
+`main`, and the matrix of the newest release of each older line that the copy on `main` lists (at
+most five, whether or not the line still gets security fixes); these are the same requests
+whatever version an install runs. It sends **no** instance identifier, account data, version,
 or other telemetry — only the request's egress IP reaches GitHub (inherent to any outbound HTTP).
 It is fail-closed-silent (never blocks a request, never errors), the "update available" status is
 admin-only, and it is suppressed on centrally managed deployments. Leave `UPDATE_CHECK_ENABLED`

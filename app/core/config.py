@@ -316,6 +316,12 @@ class Settings(BaseSettings):
     # enforcement existed -- so an operator can postpone it while reviewing what it would remove.
     # Expiry times are recorded at upload either way. See app/core/file_expiry.py.
     enforce_file_expiry: bool = Field(default=True)
+    # Start although a newer release has changed this database in a way this one cannot read (a row
+    # in data_requirements names a version above this one). Off, the web and SFTP processes refuse to
+    # start and say what changed and how to undo it with the newer release. An escape for an operator
+    # who has decided to run the older release on that data anyway; never written by setup. See
+    # app/core/data_requirements.py.
+    allow_start_on_newer_data: bool = Field(default=False)
     
     # Rate Limiting
     rate_limit_login_attempts: int = Field(default=5)

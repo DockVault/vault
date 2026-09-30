@@ -24779,6 +24779,10 @@ async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     # Startup
     initialize_runtime()
+    # Before anything touches the database: a newer release may have changed it in a way this one
+    # cannot read. Raises, and the start stops, unless ALLOW_START_ON_NEWER_DATA is set.
+    from app.core.data_requirements import check_at_startup as _check_data_requirements
+    _check_data_requirements("web")
     init_db()
     print("Database initialized")
     recorded = _run_lightweight_migrations()

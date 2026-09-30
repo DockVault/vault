@@ -17,11 +17,13 @@ proof of a hosted setting.
   Dockerfile installs the same lock with hash enforcement.
 - A release builds the already-tested commit into a local image before registry authentication.
   It generates an SPDX JSON SBOM and scans that exact local image before login. Only a passing
-  image is pushed. Both release tags must resolve to one registry digest, and GitHub attestations
-  bind build provenance and the SBOM to that digest. The digest comes from each successful push;
-  both push responses and both immediate tag resolutions must agree before it can become an
-  attestation subject. The live branch/tag refs are force-fetched and revalidated again
-  immediately before registry authentication.
+  image is pushed. The release tag `:vX.Y.Z` and each moving tag the release gate names must
+  resolve to the scanned digest: `:vX.Y` for the newest release of a line, and `:latest` only for
+  the highest version released, so a patch release of an older line never moves it. A moving tag is
+  refused if what it holds now is a higher version. GitHub attestations bind build provenance and
+  the SBOM to that digest. The live refs of `main`, every `release/X.Y` branch and every version
+  tag are force-fetched and the gate is run again immediately before registry authentication; a
+  release whose GitHub Release already exists is not published again.
 - Release OCI metadata includes the public source URL, semantic version, tested revision, and
   `AGPL-3.0-only` license identifier.
 - Dependabot covers the production and test Python manifests, the Dockerfile, both Compose
@@ -77,17 +79,20 @@ Every statement contains both the immutable OCI digest PURL and versioned image 
 GitHub Release publishes that rendered VEX beside the SBOM. Any additional exception requires a
 source-reviewed template change.
 
-One further exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
-`CVE-2026-14456`, an OpenSSL QUIC-server-listener resource-exhaustion defect in the base image's
-`libssl3`/`libcrypto3`. There is no upstream fix yet, but DockVault serves HTTP/HTTPS with uvicorn
-over Python's `ssl` module (OpenSSL TLS) and ships no QUIC listener, `aioquic`, or HTTP/3 stack, so
-OpenSSL's QUIC Listener is never instantiated and the vulnerable code is not reachable. The
-statement binds the `pkg:apk/alpine/libssl3` and `pkg:apk/alpine/libcrypto3` subcomponents; if a
-future base image changes those package versions, the pin stops matching and the exception is
-re-reviewed rather than silently carried forward.
+Each statement names the exact package versions it was reviewed for, so an image that has moved on
+(a newer base image, or a newer Alpine package from the build's `apk upgrade`) is no longer covered
+by it. The image scan checks this before it scans: it writes the image's SPDX SBOM and
+`.github/scripts/check_vex_sbom.py` compares every versioned subcomponent in the template with the
+packages the SBOM lists, ignoring purl qualifiers such as the architecture. A version the image no
+longer contains fails the scan, pull requests and release candidates alike, with the statement's
+finding and the version the image has instead. The statement then lives in three places: the
+template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph below. It is removed
+from all three, or, if the new version is still affected and the reasoning still holds, reviewed
+again and its version changed in all three.
 
-A second is reviewed on the same justification: `CVE-2026-85091`, a heap buffer overflow in the base
-image's `zlib` (1.3.1.2 through 1.3.2), reached only through the gz file API's write path —
+One further exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
+`CVE-2026-85091`, a heap buffer overflow in the base image's `zlib` (1.3.1.2 through 1.3.2), reached
+only through the gz file API's write path —
 `gzprintf()` or `gzvprintf()` after a stalled non-blocking `gzwrite()`. There is no fixed Alpine
 package yet. No binary in the image imports any gz write function (zlib's consumers there, Python's
 `zlib` module and `apk`, use the deflate/inflate stream API), and no Python code loads zlib through
@@ -125,7 +130,7 @@ cannot be added quietly; any change to it is a reviewed source change.
 | Main branch rules | The public ruleset endpoint returned one active default-branch ruleset. It prevents deletion and non-fast-forward updates. | Verified, limited |
 | Required status checks | The public main ruleset contains no required-status-check rule. The classic branch-protection endpoint required authenticated API access, so no second layer could be proven. | Not proven; do not rely on it |
 | Tag protection | The public ruleset inventory contains no tag-targeting ruleset, and the legacy tag-protection endpoint returned no configuration. | Not present in public evidence |
-| CodeQL/default code scanning | No CodeQL workflow exists in source or in the public workflow inventory. The default-setup endpoint required authenticated API access. | Not proven |
+| CodeQL/default code scanning | No CodeQL workflow existed at the time. One has since been added in source (`.github/workflows/codeql.yml`): it runs on pull requests and pushes to `main` and each `release/X.Y` branch, and weekly. Whether its results are required before a merge is a hosted setting this audit did not cover. | Workflow in source; enforcement not proven |
 | Secret scanning | The setting is not represented in source and its state was unavailable through the connected repository API. | Not proven |
 | Secret-scanning push protection | The setting is not represented in source and its state was unavailable through the connected repository API. | Not proven |
 | Dependabot alerts and security updates | Dependabot and dependency-graph workflows are active, but alert/security-update settings required authenticated API access. | Partially evidenced; setting not proven |

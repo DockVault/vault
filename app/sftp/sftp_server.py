@@ -2789,4 +2789,8 @@ def handle_sftp_client(
 
 
 if __name__ == '__main__':
+    # Before serving anyone: a newer release may have changed the database in a way this one cannot
+    # read, and this process deletes stored files. Raises unless ALLOW_START_ON_NEWER_DATA is set.
+    from app.core.data_requirements import check_at_startup as _check_data_requirements
+    _check_data_requirements("sftp")
     start_sftp_server()
