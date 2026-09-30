@@ -1014,6 +1014,50 @@ def test_the_committed_matrix_takes_the_lines_map_its_next_release_writes():
     um.validate_matrix(data, released_ceiling=None)
 
 
+# The validator takes a matrix with no `lines` map, since the ones before 0.33.1 have none. From 0.33.1,
+# the release that first wrote it, every matrix keeps it: dropped from a release commit, it would still
+# validate, and every reader would lose until when each line gets security fixes.
+_FIRST_WITH_LINES = "0.33.1"
+
+
+def _support_periods_left_out(data):
+    """The support periods a matrix fails to state: none before 0.33.1 is declared; from then on each
+    line from the first supported one to the newest declared, the newest alone with no end date."""
+    versions = sorted(data["versions"], key=um._sort_key)
+    if um._sort_key(versions[-1]) < um._sort_key(_FIRST_WITH_LINES):
+        return []
+    first = um._sort_key(um._FIRST_SUPPORTED_LINE + ".0")
+    declared = list(dict.fromkeys(um._line(v) for v in versions if um._sort_key(v) >= first))
+    lines = data.get("lines") or {}
+    left_out = [f"no support period for {line}" for line in declared if line not in lines]
+    open_ended = [line for line in declared if line in lines
+                  and lines[line].get("security_fixes_until") is None]
+    if open_ended != declared[-1:]:
+        left_out.append(f"no end date for {', '.join(open_ended) or 'no line'}, where only the newest "
+                        f"line, {declared[-1]}, has none")
+    return left_out
+
+
+def test_from_0_33_1_on_the_committed_matrix_states_every_lines_support_period():
+    assert _support_periods_left_out(um.load_matrix(MATRIX_PATH)) == []
+
+
+def test_a_matrix_from_0_33_1_on_without_its_support_periods_is_caught():
+    assert _support_periods_left_out(_lines(**{"0.33": "2027-06-10", "0.34": None})) == []
+    data = _lines(**{"0.33": "2027-06-10", "0.34": None})
+    del data["lines"]
+    um.validate_matrix(data, released_ceiling=None)     # what the validator alone lets through
+    assert _support_periods_left_out(data) == [
+        "no support period for 0.33", "no support period for 0.34",
+        "no end date for no line, where only the newest line, 0.34, has none"]
+    assert _support_periods_left_out(_lines(**{"0.34": None})) == ["no support period for 0.33"]
+    before = _lines(**{"0.33": "2027-06-10", "0.34": None})
+    del before["lines"]
+    for version in ("0.33.1", "0.33.2", "0.34.0", "0.34.1"):
+        del before["versions"][version]
+    assert _support_periods_left_out(before) == [], "no matrix before 0.33.1 has the map"
+
+
 # --- routes across lines ---------------------------------------------------------------------------
 # _two_lines(): 0.33.2 (the fix on 0.33) leads up by the edge 0.33.2 -> 0.34.1, which skips 0.34.0.
 # The route of steps it replaces is 0.33.1 -> 0.34.0 -> 0.34.1.
