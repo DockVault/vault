@@ -34,7 +34,7 @@ from app.core import endpoint_permissions as ep  # noqa: E402
 from app.core import password_reset  # noqa: E402
 from app.core.models import (AccountInvitation, AdminGrant, AuditLog, CredentialChange, Group,  # noqa: E402
                              PasswordResetToken, RoleEnum, SystemSetting, User, UserEndpointPermission,
-                             user_groups)
+                             UserSSHKey, user_groups)
 
 pytestmark = pytest.mark.unit
 
@@ -48,8 +48,9 @@ ADMIN_ONLY = ["USER_MANAGE", "USER_VIEW"]
 def db():
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'roles.db'}")
+        # UserSSHKey: an administrator demoted has the keys they added to other accounts reported.
         for model in (User, UserEndpointPermission, AuditLog, AdminGrant, CredentialChange, AccountInvitation,
-                      PasswordResetToken, SystemSetting, Group):
+                      PasswordResetToken, SystemSetting, Group, UserSSHKey):
             model.__table__.create(engine)
         user_groups.create(engine)          # PATCH /users/{id} answers with the account and its departments
         session = sessionmaker(bind=engine, autocommit=False, autoflush=False)()

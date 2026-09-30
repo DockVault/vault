@@ -224,7 +224,10 @@ have made the other an administrator (directly, or through administrators they m
 included); and the approver must have been an administrator for 14 days when the request was made
 (administrators from before 0.33.0, and the first one, count as long-standing). A refusal says which
 of these applied. Every administrator is told when an administrator is created or promoted, and the
-user of every change to their sign-in details. What remains, and is accepted: someone who creates
+user of every change to their sign-in details. An SSH key shows who added it; when an administrator who
+added keys to other people's accounts is demoted, deactivated, locked or deleted, each such account's
+owner is told again, by email too, with the way to remove the key, and so are the other administrators.
+The keys keep working until someone removes them. What remains, and is accepted: someone who creates
 several administrator accounts and waits 14 days can approve their own changes through them, in full
 view of those notices. On a deployment with one administrator, or when no administrator may approve,
 whoever runs the server acts from the host instead:

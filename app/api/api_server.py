@@ -984,6 +984,11 @@ class SSHKeyResponse(BaseModel):
     fingerprint: str
     created_at: datetime
     last_used: Optional[datetime] = None
+    # Who added the key, by name ("operator@host" for the server's operator), and whether that was
+    # someone other than the key's owner; both None when it is not known (a key from before the name
+    # was kept, whose maker the audit log does not name). Filled in by _ssh_key_response.
+    added_by: Optional[str] = None
+    added_by_other: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -5634,9 +5639,11 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
         if db.query(UserSSHKey.id).filter(UserSSHKey.user_id == target.id,
                                           UserSSHKey.fingerprint == payload["fingerprint"]).first():
             raise HTTPException(status_code=409, detail="This key is already registered for the user")
+        # Who added it, by name too: the name stays when that account is deleted, for the key's owner
+        # to see, and to tell them when an administrator who added it leaves (_report_keys_added_by).
         key = UserSSHKey(user_id=target.id, name=payload["name"], key_type=payload.get("key_type"),
                          public_key=payload["public_key"], fingerprint=payload["fingerprint"],
-                         created_by=actor_id)
+                         created_by=actor_id, created_by_name=actor_name)
         db.add(key)
         db.flush()
         return {"ssh_key": key}
@@ -6241,15 +6248,117 @@ def _withdraw_requests_of(db, user, *, actor, because) -> list:
     return out
 
 
-def _account_lost_standing(db, user, *, actor, because) -> list:
+def _report_keys_added_by(db, user, *, actor, because) -> Optional[dict]:
+    """``user`` is about to lose their standing (as for _account_lost_standing). When they are an
+    administrator who could act until now, find the SSH keys they added to other people's accounts, write
+    one audit row per account (in the caller's transaction, by ``actor``), and return what
+    _announce_keys_reported tells after the commit: {"maker", "because", "owners": [{"id", "username",
+    "email", "keys": [(name, fingerprint)]}]}. None when there is nothing to tell.
+
+    The keys are never switched off: that would lock out people whose own key an administrator installed
+    for them. Each account's owner was told when the key was added, and is told again now, with the way
+    to remove it. An account that could not act already (demoted, deactivated or locked by an
+    administrator before) was reported when it lost that standing, and is not reported again."""
+    from app.core import credential_changes as cc
+    from app.core.models import UserSSHKey
+    if user is None or user.id is None or not cc.can_approve(user):
+        return None
+    rows = (db.query(UserSSHKey, User)
+            .join(User, User.id == UserSSHKey.user_id)
+            .filter(UserSSHKey.created_by == user.id, UserSSHKey.user_id != user.id)
+            .order_by(User.username, UserSSHKey.created_at)
+            .all())
+    if not rows:
+        return None
+    owners = {}
+    for key, owner in rows:
+        entry = owners.setdefault(owner.id, {"id": owner.id, "username": owner.username,
+                                             "email": owner.email, "keys": []})
+        entry["keys"].append((key.name, key.fingerprint))
+    for entry in owners.values():
+        db.add(AuditLogger(db).build_row(
+            action="ssh_keys_adder_left", status="success", user=actor,
+            username=None if actor is not None else cc.HOST_OPERATOR,
+            resource_type="user", resource_id=str(entry["id"]),
+            details={"target_username": entry["username"], "added_by": user.username,
+                     "added_by_left_because": because,
+                     "keys": [{"name": n, "fingerprint": f} for n, f in entry["keys"]]}))
+    return {"maker": user.username, "because": because, "owners": list(owners.values())}
+
+
+class _LostStanding:
+    """What _account_lost_standing did that is told after the commit (_announce_lost_standing): the
+    requests withdrawn (_withdraw_requests_of) and the SSH keys reported (_report_keys_added_by)."""
+
+    def __init__(self, withdrawn=(), keys=None):
+        self.withdrawn = list(withdrawn)
+        self.keys = keys
+
+
+def _account_lost_standing(db, user, *, actor, because) -> _LostStanding:
     """``user`` is about to lose their standing: demoted from administrator, deactivated, locked by an
     administrator, or deleted (``because``: demoted, deactivated, locked or deleted), by ``actor``. Every
     route that does one of those calls this, and nothing else calls _withdraw_requests_of, so whatever
     follows from an account losing its standing follows on every route. Call it BEFORE the change to
-    ``user`` is made in the session, in the same transaction. What follows today: their open requests are
-    withdrawn and their pending administrator invitations revoked (_withdraw_requests_of). Returns what
-    _announce_withdrawn_requests tells after the commit."""
-    return _withdraw_requests_of(db, user, actor=actor, because=because)
+    ``user`` is made in the session, in the same transaction. What follows: their open requests are
+    withdrawn and their pending administrator invitations revoked (_withdraw_requests_of), and the SSH
+    keys an administrator added to other people's accounts are reported (_report_keys_added_by). Returns
+    what _announce_lost_standing tells after the commit."""
+    withdrawn = _withdraw_requests_of(db, user, actor=actor, because=because)
+    keys = _report_keys_added_by(db, user, actor=actor, because=because)
+    return _LostStanding(withdrawn, keys)
+
+
+def _announce_lost_standing(db, told, request=None) -> None:
+    """Tell, after the commit, what _account_lost_standing did (``told``; an empty list when the route
+    did not call it). Best-effort."""
+    if not isinstance(told, _LostStanding):
+        return
+    _announce_withdrawn_requests(db, told.withdrawn)
+    if told.keys:
+        _announce_keys_reported(db, told.keys, request=request)
+
+
+def _announce_keys_reported(db, report, request=None) -> None:
+    """Tell each account's owner, in the app and by email with the way to remove them, that the
+    administrator who added SSH keys to their account has left (_report_keys_added_by), and tell every
+    other active administrator in the app which accounts hold such keys. After the commit; best-effort."""
+    from app.core.email_actions import public_base_url
+    maker = report["maker"]
+    why = _WITHDRAWN_BECAUSE.get(report["because"], "can no longer act as an administrator")
+    # "Your account", where the owner removes a key; the page opens it after signing in (#profile).
+    link = f"{public_base_url(request)}/#profile"
+    for owner in report["owners"]:
+        keys = owner["keys"]
+        many = len(keys) > 1
+        listed = _names_text([f"\"{name}\" ({fingerprint})" for name, fingerprint in keys])
+        what = (f"The administrator {maker} added the SSH key{'s' if many else ''} {listed} to your account, "
+                f"and {maker} {why}. {'They still sign' if many else 'It still signs'} in to SFTP as you.")
+        try:
+            _notify_users([str(owner["id"])], "ssh_keys_adder_left", title="Check the SSH keys on your account",
+                          body=(f"{what} If you do not use {'them' if many else 'it'}, remove "
+                                f"{'them' if many else 'it'} in Your account, under SSH keys."),
+                          target="#profile")
+        except Exception as e:  # noqa: BLE001 - a notice never undoes the change
+            print(f"⚠ SSH key notice skipped: {type(e).__name__}")
+        try:
+            _fire_action_email(db, "ssh_keys_adder_left", email=owner["email"], username=owner["username"],
+                               action_context={"change": what, "link": link})
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠ SSH key email skipped: {type(e).__name__}")
+    try:
+        accounts = [o["username"] for o in report["owners"]]
+        admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN,
+                                                             User.is_active.is_(True)).all()
+                  if a.username != maker]
+        _notify_users(admins, "ssh_keys_adder_left", title="SSH keys an administrator added",
+                      body=(f"{maker} {why}. {maker} had added SSH keys to the "
+                            f"{'account' if len(accounts) == 1 else 'accounts'} of {_names_text(accounts)}. "
+                            "The keys still sign in to SFTP. Each account's owner was told and can remove "
+                            "them, and so can you on the Users page."),
+                      target="#users")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ SSH key notice to administrators skipped: {type(e).__name__}")
 
 
 def _announce_withdrawn_requests(db, withdrawn) -> None:
@@ -10499,18 +10608,18 @@ async def update_user(
 
     # Admin-only fields
     admin_granted = False
-    withdrawn = []
+    lost = []
     permissions_removed = []
     if is_admin:
-        # An administrator demoted, deactivated or locked here has their open requests withdrawn, before
-        # any of that is set: who was asked to approve them is read as it stands.
+        # An account demoted, deactivated or locked here loses its standing (_account_lost_standing)
+        # before any of that is set: who was asked to approve its requests is read as it stands.
         from app.services.auth_service import admin_locked
         for because, leaves in (("demoted", user_update.role is not None and user_update.role != RoleEnum.ADMIN
                                  and user.role == RoleEnum.ADMIN),
                                 ("deactivated", user_update.is_active is False and user.is_active),
                                 ("locked", user_update.is_locked is True and not admin_locked(user))):
             if leaves:
-                withdrawn = _account_lost_standing(db, user, actor=current_user, because=because)
+                lost = _account_lost_standing(db, user, actor=current_user, because=because)
                 break
         if user_update.role is not None:
             changes['role'] = {'old': user.role.value, 'new': user_update.role.value}
@@ -10600,7 +10709,7 @@ async def update_user(
                                        permissions_removed=permissions_removed)
     if admin_granted:
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
@@ -10667,6 +10776,19 @@ def _ssh_key_target_user(user_id, current_user, db, *, write=False):
     return user
 
 
+def _ssh_key_response(key, owner) -> SSHKeyResponse:
+    """A key as the lists show it, with who added it: ``added_by`` their name, and ``added_by_other``
+    whether that was someone other than ``owner``, the key's account. With the maker's account deleted
+    (created_by is then NULL) the kept name says it; a key with neither is not known (None)."""
+    out = SSHKeyResponse.model_validate(key)
+    out.added_by = key.created_by_name
+    if key.created_by is not None:
+        out.added_by_other = key.created_by != key.user_id
+    elif key.created_by_name is not None:
+        out.added_by_other = key.created_by_name != getattr(owner, "username", None)
+    return out
+
+
 @app.get("/users/{user_id}/ssh-keys", response_model=List[SSHKeyResponse])
 async def list_ssh_keys(
     user_id: uuid.UUID,
@@ -10675,9 +10797,9 @@ async def list_ssh_keys(
 ):
     """List a user's authorized SSH public keys (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db)
+    owner = _ssh_key_target_user(user_id, current_user, db)
     keys = db.query(UserSSHKey).filter(UserSSHKey.user_id == user_id).order_by(UserSSHKey.created_at).all()
-    return [SSHKeyResponse.model_validate(k) for k in keys]
+    return [_ssh_key_response(k, owner) for k in keys]
 
 
 @app.post("/users/{user_id}/ssh-keys", response_model=SSHKeyResponse)
@@ -10729,7 +10851,7 @@ async def add_ssh_key(
         )
     except Exception:  # noqa: BLE001
         pass
-    return SSHKeyResponse.model_validate(key)
+    return _ssh_key_response(key, target)
 
 
 @app.delete("/users/{user_id}/ssh-keys/{key_id}")
@@ -11000,7 +11122,7 @@ async def delete_user(
 
     username = user.username
     # Their open requests are withdrawn first: deleting the account would leave them with no asker.
-    withdrawn = _account_lost_standing(db, user, actor=current_user, because="deleted")
+    lost = _account_lost_standing(db, user, actor=current_user, because="deleted")
     db.delete(user)
     db.commit()
     
@@ -11009,7 +11131,7 @@ async def delete_user(
     audit_logger.log_user_deleted(
         username, user_id, current_user, get_client_ip(request)
     )
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
     
     return {"message": f"User {username} deleted successfully"}
 
@@ -23914,6 +24036,23 @@ AUDIT_ROW_COLUMNS_DDL = (
 )
 
 
+# Fill UserSSHKey.created_by_name for a key that has none: from the account that added it while it exists,
+# else from the audit row of the key's addition (the newest for that account and fingerprint), whose
+# username is the one who added it. A key whose maker neither names stays NULL: not known.
+SSH_KEY_MAKER_FROM_ACCOUNT = (
+    "UPDATE user_ssh_keys AS k SET created_by_name = u.username FROM users AS u"
+    " WHERE k.created_by_name IS NULL AND k.created_by = u.id"
+)
+SSH_KEY_MAKER_FROM_AUDIT = (
+    "UPDATE user_ssh_keys AS k SET created_by_name = ("
+    "SELECT a.username FROM audit_logs AS a"
+    " WHERE a.action = 'ssh_key_add' AND a.status = 'success' AND a.resource_id = CAST(k.user_id AS TEXT)"
+    " AND a.details ->> 'fingerprint' = k.fingerprint AND a.username IS NOT NULL"
+    " ORDER BY a.timestamp DESC LIMIT 1)"
+    " WHERE k.created_by_name IS NULL AND k.created_by IS NULL"
+)
+
+
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
@@ -24368,6 +24507,14 @@ END $$;""",
             # again when it is used (_reset_link_refusal). Nullable: a row from before it is read from
             # created_by, and an older release ignores the column.
             "ALTER TABLE password_reset_tokens ADD COLUMN IF NOT EXISTS made_by_other BOOLEAN",
+            # Who added an SSH key, by name, kept when that account is deleted (UserSSHKey.created_by_name).
+            # Nullable: an older release ignores it. The two statements after it fill it, for a key that
+            # has no name yet, from the account that added it, or when that account is gone from the audit
+            # row of the key's addition. Each touches only keys with no name, so it runs again at every
+            # start at no cost and also names a key added while an older release ran.
+            "ALTER TABLE user_ssh_keys ADD COLUMN IF NOT EXISTS created_by_name VARCHAR(255)",
+            SSH_KEY_MAKER_FROM_ACCOUNT,
+            SSH_KEY_MAKER_FROM_AUDIT,
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

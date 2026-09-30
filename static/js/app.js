@@ -1476,8 +1476,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Load dashboard stats
         loadDashboardStats();
 
-        // A copied link to an Activity search, opened before signing in, opens it now.
-        openActivityFromHash();
+        // A copied link to an Activity search, opened before signing in, opens it now; a link to Your
+        // account opens that dialog.
+        openActivityFromHash() || openAccountFromHash();
 
         // Prompt a keyless user who's been invited to a ZK vault to set up a key.
         zkMaybePromptPendingInvites();
@@ -5613,6 +5614,15 @@ function renderUserSshKeys(userId, keys, root = document) {
         fp.className = 'ssh-key-fp';
         fp.textContent = k.fingerprint;
         meta.appendChild(fp);
+        // Who added it, when that is known: the person, an administrator, or the server's operator.
+        if (k.added_by) {
+            const by = document.createElement('span');
+            by.className = 'ssh-key-by text-tertiary text-xs';
+            const mine = currentUser && k.added_by === currentUser.username;
+            by.textContent = 'Added by ' + (k.added_by === 'operator@host' ? "the server's operator"
+                : (mine ? 'you' : k.added_by));
+            meta.appendChild(by);
+        }
         item.appendChild(meta);
         const del = document.createElement('button');
         del.type = 'button';
@@ -14794,6 +14804,18 @@ function openActivityFromHash() {
     return false;
 }
 
+// A link to "Your account" (#profile, sent by email about the account's SSH keys) opens that dialog once
+// the person is signed in with their own account. The hash never reaches the server, and it is dropped
+// either way so the dialog does not open again on the next load.
+function openAccountFromHash() {
+    if (location.hash !== '#profile') return false;
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+    const temporary = isScopedTemp || !!(sessionAccess && sessionAccess.is_temp_session);
+    if (!currentUser || temporary) return false;
+    openUserSettingsModal();
+    return true;
+}
+
 // Restore the saved view on app load. Returns true if it handled navigation.
 async function restoreLastView() {
     const nav = getNavState();
@@ -20895,6 +20917,9 @@ async function enterAuthedSession() {
 
     // Restrict the sidebar for a scoped temp credential AFTER any restore.
     await loadSessionAccess();
+
+    // A link to Your account, opened while signed in, opens that dialog (once the session is known).
+    openAccountFromHash();
 
     // Prompt a keyless user who's been invited to a ZK vault to set up a key.
     zkMaybePromptPendingInvites();

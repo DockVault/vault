@@ -22,7 +22,10 @@ _REQUIRED_TOKEN = {"email_change": "action.code",
                    "password_reset": "action.link",
                    "account_invite": "action.link",
                    "account_changed_by_admin": "action.change",
-                   "administrator_added": "action.change"}
+                   "administrator_added": "action.change",
+                   "ssh_keys_adder_left": "action.link"}
+# The actions whose body needs more than one of them, each kept or the built-in body is used.
+_ALSO_REQUIRED = {"ssh_keys_adder_left": ("action.change",)}
 
 
 def test_every_action_has_a_default_template():
@@ -63,7 +66,7 @@ def test_system_failsafe_restores_default_when_body_is_empty(key, token):
         assert token in out, f"{key}: empty body did not fall back to the token-bearing default"
     # a body that DROPS the token also falls back; one that KEEPS it is returned unchanged
     assert token in ea._fallback_body_if_missing_required_token(ea.SYSTEM, "<p>no token here</p>", spec)
-    kept = f"<p>{{{{{token}}}}}</p>"
+    kept = "".join(f"<p>{{{{{t}}}}}</p>" for t in (token,) + _ALSO_REQUIRED.get(key, ()))
     assert ea._fallback_body_if_missing_required_token(ea.SYSTEM, kept, spec) == kept
 
 

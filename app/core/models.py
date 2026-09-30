@@ -266,6 +266,12 @@ class UserSSHKey(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
     created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    # Who added the key, by name, as it was when they added it: the person, an administrator, or the
+    # server's operator ("operator@host"). Kept when the account that added it is deleted (created_by is
+    # then NULL), so the key's owner and the administrators can still see who put it there. Nullable and
+    # added by the boot DDL, which fills it for older keys from created_by and the audit log; an earlier
+    # release reads the table without it.
+    created_by_name = Column(String(255), nullable=True)
 
     user = relationship('User', back_populates='ssh_keys', foreign_keys=[user_id])
 

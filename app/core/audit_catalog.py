@@ -98,6 +98,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("self_account_update", "accounts", "Own account details changed", "notice"),
     AuditAction("ssh_key_add", "accounts", "SSH key added", "notice"),
     AuditAction("ssh_key_remove", "accounts", "SSH key removed", "notice"),
+    # An administrator who added SSH keys to other people's accounts was demoted, deactivated, locked or
+    # deleted: one row per account holding such keys, whose owner is told (the keys keep working).
+    AuditAction("ssh_keys_adder_left", "accounts", "SSH keys reported: their adder left", "notice"),
     AuditAction("user_created", "accounts", "User created", "notice"),
     AuditAction("user_deleted", "accounts", "User deleted", "warning"),
     AuditAction("USER_LOCK_CHANGED", "accounts", "User locked or unlocked", "notice"),
