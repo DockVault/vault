@@ -167,3 +167,50 @@ def test_an_ordinary_upgrade_says_nothing_about_stages(page: Page, admin_creds):
                                         "conditions": [], "steps": 1, "stages": 1}))
     _open_general(page, admin_creds)
     expect(page.locator("#update-banner-text")).not_to_contain_text("stages")
+
+
+# --- release lines -----------------------------------------------------------------------------------
+
+def _line_payload(**extra):
+    payload = {"enabled": True, "managed": False, "current": "0.33.1", "latest": "0.34.1",
+               "update_available": True, "url": "https://github.com/DockVault/vault/releases",
+               "notes": "x", "checked_at": 1700000000, "interval_minutes": 360}
+    payload.update(extra)
+    return payload
+
+
+def test_an_install_on_an_older_line_is_told_about_its_lines_newest_release(page: Page, admin_creds):
+    _mock_status(page, _line_payload(
+        line_update={"version": "0.33.2", "line": "0.33", "fixes_vulnerability": True,
+                     "security_fixes_until": "2027-06-10"},
+        line={"line": "0.33", "security_fixes_until": "2027-06-10", "ended": False}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#line-banner")).to_be_visible()
+    expect(page.locator("#line-banner-text")).to_have_text(
+        "Security update v0.33.2 is available for your release line (0.33, security fixes until "
+        "10 June 2027). The newest release is v0.34.1.")
+    # Its own dismissal: dismissing it leaves the update banner as it was.
+    page.click("#line-banner-dismiss")
+    expect(page.locator("#line-banner")).to_be_hidden()
+    expect(page.locator("#update-banner")).to_be_visible()
+    assert page.evaluate("localStorage.getItem('dv-line-banner-dismissed')") == "0.33.2|"
+    assert page.evaluate("localStorage.getItem('dv-update-dismissed')") is None
+
+
+def test_an_install_on_the_newest_line_gets_no_line_banner(page: Page, admin_creds):
+    _mock_status(page, _line_payload(current="0.34.0",
+                                     line={"line": "0.34", "security_fixes_until": None,
+                                           "ended": False}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#update-banner")).to_be_visible()
+    expect(page.locator("#line-banner")).to_be_hidden()
+
+
+def test_a_line_whose_security_fixes_ended_says_so(page: Page, admin_creds):
+    _mock_status(page, _line_payload(current="0.33.2", latest="0.35.0",
+                                     line={"line": "0.33", "security_fixes_until": "2027-06-10",
+                                           "ended": True}))
+    _open_general(page, admin_creds)
+    expect(page.locator("#line-banner-text")).to_have_text(
+        "Security fixes for your release line (0.33) ended on 10 June 2027; move to a newer line. "
+        "The newest release is v0.35.0.")

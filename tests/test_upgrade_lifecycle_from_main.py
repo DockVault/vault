@@ -230,3 +230,50 @@ def test_a_line_note_reads_the_merged_period():
         "security fixes ended on 2027-06-10"
     assert dv.line_support_note(merged, "v0.34.0", today="2027-06-11").startswith("the newest line")
     assert dv.line_support_note({"versions": {}}, "0.33.1") == ""
+
+
+def test_the_tool_and_the_app_read_release_lines_the_same_way():
+    # The synthetic matrix of a fix on two lines. main's copy words one reference differently and
+    # brings the 0.33 line's end forward; the bundled copy is the one 0.33.1 shipped.
+    import copy
+    import json
+    from pathlib import Path
+
+    fixture = json.loads((Path(__file__).resolve().parent / "fixtures" /
+                          "upgrade-matrix-two-lines.json").read_text(encoding="utf-8"))
+    bundled = copy.deepcopy(fixture)
+    bundled["lines"] = {"0.33": {"security_fixes_until": None}}
+    main = copy.deepcopy(fixture)
+    main["versions"]["0.33.1"]["vulnerabilities"][0]["title"] = "Reworded on main"
+    main["lines"]["0.33"]["security_fixes_until"] = "2027-05-01"
+    ceiling = "0.34.1"
+
+    merged, _ = dv.merge_lifecycle_matrix(bundled, main, ceiling)
+    for version in fixture["versions"]:
+        tool = dv._finding_keys(merged, version)
+        app = {U._finding_key(v) for v in U._merge_vulnerabilities(
+            U._version_findings(bundled, version),
+            U._credible_remote_vulns(U._version_findings(main, version), ceiling))}
+        assert tool == app, version
+        assert len(dv.version_vulnerabilities(merged, version)) == len(
+            U.merged_security(version, ceiling, local_matrix=bundled,
+                              main_matrix=main)["vulnerabilities"]), version
+
+    assert {line: entry["security_fixes_until"] for line, entry in merged["lines"].items()} == \
+        U._merge_lines(bundled["lines"], main["lines"])
+    for today in ("2027-05-01", "2027-05-02"):
+        ended = dv.line_support_note(merged, "0.33.1", today=today).startswith("security fixes ended")
+        assert ended is U.line_status("0.33.1", bundled, main, today=today)["ended"], today
+
+    # The newest release of the install's line: the tool takes it from the releases list, the app
+    # from main's copy once that release's own matrix was fetched. Given the same releases, the same.
+    tags = ["v0.33.2", "v0.34.1", "v0.34.0", "v0.33.1", "v0.33.0", "v0.32.6"]
+    update = U.line_update("0.33.1", "v0.34.1", bundled, main, {"0.33.2": {"versions": {"0.33.2": {}}}})
+    assert dv.newest_on_line(tags, "0.33.1") == "v" + update["version"]
+    gone = dv._finding_keys(merged, "0.33.1") - dv._finding_keys(merged, "0.33.2")
+    assert bool(gone) is update["fixes_vulnerability"]
+    # And both read a short reference as the fix on its own line.
+    short = copy.deepcopy(fixture)
+    short["versions"]["0.34.0"]["vulnerabilities"] = [{"advisory": "two-lines"}]
+    assert [v["fixed_in"] for v in dv.version_vulnerabilities(short, "0.34.0")] == \
+        [v["fixed_in"] for v in U._version_vulnerabilities(short, "0.34.0")] == ["0.34.1"]
