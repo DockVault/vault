@@ -850,6 +850,23 @@ def test_bootstrap_of_an_epoch_that_moved_is_stale(world):
     assert (err.status_code, err.reason) == (409, "zk-key-proof-stale")
 
 
+def test_a_bootstrap_body_for_another_epoch_than_its_challenge_is_stale(world):
+    """The material is for the epoch the challenge was issued at. A body that names another epoch, even one
+    proved over exactly those bytes, installs nothing."""
+    vid, owner, manager, _ = world.direct_vault(with_row=False)
+    for epoch in (2, 0):
+        _, _, body, raw, header = _bootstrap_request(world, vid, manager, epoch=epoch)
+        err = world.refused(BOOTSTRAP, manager, FakeRequest(raw, header), vault_id=str(vid),
+                            request=E.KeyProofBootstrapRequest(**body))
+        assert (err.status_code, err.reason) == (409, "zk-key-proof-stale"), epoch
+    assert world.proof_rows(vid) == {}
+    assert world.stored_audit("zk_key_proof_bootstrapped") == []
+    # The same request for the challenge's own epoch goes through.
+    _, material, body, raw, header = _bootstrap_request(world, vid, manager, epoch=1)
+    assert _run_bootstrap(world, vid, manager, body, raw, header)["dek_epoch"] == 1
+    assert world.proof_rows(vid)[1] == ("bootstrap", material["public_key"], None)
+
+
 # ---------------------------------------------------------------------------------- owner reset
 
 def _damaged_direct_vault(world):
