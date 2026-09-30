@@ -136,18 +136,46 @@ def test_the_epoch_recorded_is_the_vaults_own_current_one(Session):
     assert s.get(Vault, team).rotation_owed_epoch == 2
 
 
-@pytest.mark.parametrize("case", ["an older epoch only", "a switched-off key", "no key"])
-def test_an_account_that_does_not_hold_the_current_key_marks_nothing(Session, case):
+@pytest.mark.parametrize("case", ["an older epoch only", "a key of another kind", "no key"])
+def test_an_account_that_was_never_given_the_current_key_marks_nothing(Session, case):
     s = Session()
     vid, owner = _vault(s, "direct", dek=2)
     member = _person(s)
     _key(s, vid, owner, 2, algo=DIRECT_DEK_ALGO)
     if case == "an older epoch only":
-        _key(s, vid, member, 1, algo=DIRECT_DEK_ALGO)
-    elif case == "a switched-off key":
-        _key(s, vid, member, 2, algo=DIRECT_DEK_ALGO, active=False)
+        _key(s, vid, member, 1, algo=DIRECT_DEK_ALGO, active=False)
+    elif case == "a key of another kind":
+        # A team key row on a direct vault is not the vault's key.
+        _key(s, vid, member, 2, algo=TEAMPRIV_ALGO, active=False)
     assert E.record_rotations_owed_by(s, member) == []
     assert s.get(Vault, vid).rotation_owed_epoch is None
+
+
+@pytest.mark.parametrize("mode", ["direct", "hierarchical"])
+def test_a_switched_off_key_at_the_current_epoch_is_still_owed_after_the_delete(Session, mode):
+    """Deactivating an account, or removing a member without a rotation, switches the key rows off and
+    leaves them at the current epoch: that row is what makes the vault owe a rotation. Deleting the account
+    later erases it, so the delete records it as it would an active one."""
+    s = Session()
+    vid, owner = _vault(s, mode, dek=3, team=2)
+    member = _person(s)
+    algo, epoch = (DIRECT_DEK_ALGO, 3) if mode == "direct" else (TEAMPRIV_ALGO, 2)
+    _key(s, vid, owner, epoch, algo=algo)
+    _key(s, vid, member, epoch, algo=algo, active=False)
+    vault = s.get(Vault, vid)
+    assert E._rekey_owed(s, vault) is True          # owed while the switched-off row is there
+    assert E.record_rotations_owed_by(s, member) == [str(vid)]
+    _delete_rows_of(s, member)
+    vault = s.get(Vault, vid)
+    assert vault.rotation_owed_epoch == epoch
+    assert E._rekey_owed(s, vault) is True          # and still owed once the delete took the row
+    if mode == "hierarchical":
+        vault.dek_version = 4                       # a rotation of the DEK alone does not end it
+        assert E._team_rotation_owed(s, vault) is True
+        vault.team_key_version = 3
+    else:
+        vault.dek_version = 4
+    assert E._rekey_owed(s, vault) is False
 
 
 def test_nothing_owed_reads_as_before(Session):

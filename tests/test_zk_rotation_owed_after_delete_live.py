@@ -3,7 +3,8 @@
 The account's key rows go with it, so nothing else would show that someone who held the key is gone.
 Direct: the key holders' /keys answer reports ``rekey_owed`` until a rotation. Hierarchical: a rotation of
 the DEK alone is refused (the deleted person still has the team key it would be wrapped to) until the team
-key is rotated. test_zk_rotation_owed_after_delete.py pins the recorder and the checks offline.
+key is rotated. The same holds when the account was deactivated, or the member removed without a rotation, before
+the delete. test_zk_rotation_owed_after_delete.py pins the recorder and the checks offline.
 """
 import base64
 import contextlib
@@ -103,6 +104,63 @@ def test_a_deleted_team_member_forces_a_team_rotation(admin):
         assert team.status_code == 200, team.text
         assert team.json()["team_key_version"] == 2
         assert admin.get(f"/ecc/vaults/{vid}/keys").json()["rekey_owed"] is False
+    finally:
+        if member is not None:
+            admin.delete_user(member["id"])
+        admin.delete_vault(vid)
+
+
+def _vault(admin, mode):
+    with _zk_enabled(admin):
+        if mode == "direct":
+            return create_zk_vault(admin)["id"]
+        r = post_zk(admin, "/vaults", json={
+            "name": unique("hteam"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB,
+            "name_key_version": 1, "key_wrapping_mode": "hierarchical", "team_public_key": team_public_key(),
+            "team_wrapped_dek": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
+            "wrapped_team_privkey": _stub("tpriv"), "team_privkey_ephemeral_public_key": _stub("tpeph")})
+        assert r.status_code == 200, r.text
+        return r.json()["id"]
+
+
+def _give_key(admin, vid, member, mode):
+    body = ({"wrapped_dek": _stub("dek"), "ephemeral_public_key": _stub("eph")} if mode == "direct"
+            else {"wrapped_team_privkey": _stub("tpriv"), "team_ephemeral_public_key": _stub("tpeph")})
+    r = post_zk(admin, f"/ecc/vaults/{vid}/members", json={"user_id": str(member["id"]), **body})
+    assert r.status_code == 200, r.text
+    assert admin.post(f"/vaults/{vid}/permissions",
+                      json={"user_id": str(member["id"]), "level": "read"}).status_code in (200, 201)
+
+
+@pytest.mark.parametrize("mode", ["direct", "hierarchical"])
+@pytest.mark.parametrize("first", ["deactivated", "removed without a rotation"])
+def test_a_holder_switched_off_first_and_deleted_later_still_leaves_the_rotation_owed(admin, mode, first):
+    """The usual offboarding: deactivate the account (or remove the member without a rotation), delete it
+    later. The first step switches the key rows off and leaves them at the current epoch, which is what makes
+    the vault owe a rotation; the delete then takes those rows with the account, and must not take the owed
+    rotation with them."""
+    ensure_ecc_keypair(admin)
+    vid = _vault(admin, mode)
+    member = _member(admin)
+    try:
+        _give_key(admin, vid, member, mode)
+        assert admin.get(f"/ecc/vaults/{vid}/keys").json()["rekey_owed"] is False
+        if first == "deactivated":
+            r = admin.patch(f"/users/{member['id']}", json={"is_active": False})
+        else:
+            r = admin.delete(f"/ecc/vaults/{vid}/members/{member['id']}")
+        assert r.status_code == 200, r.text
+        assert admin.get(f"/ecc/vaults/{vid}/keys").json()["rekey_owed"] is True
+
+        assert admin.delete_user(member["id"]).status_code == 200
+        member = None
+        assert admin.get(f"/ecc/vaults/{vid}/keys").json()["rekey_owed"] is True
+        if mode == "hierarchical":
+            # A rotation of the DEK alone would wrap it to the team key the deleted person still has.
+            routine = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
+                "from_version": 1, "to_version": 2, "revoke_user_id": None, "member_keys": [],
+                "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph")})
+            assert routine.status_code == 400, routine.text
     finally:
         if member is not None:
             admin.delete_user(member["id"])

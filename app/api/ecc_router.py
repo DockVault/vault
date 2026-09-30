@@ -1048,9 +1048,9 @@ def _owed_since_a_holder_was_deleted(vault: Vault, current_epoch: int) -> bool:
 
 
 def record_rotations_owed_by(db: Session, user_id) -> List[str]:
-    """Before an account is deleted: record, on every zero-knowledge vault where it holds the CURRENT key,
-    that the vault owes a rotation at that epoch. Returns the ids of the vaults marked; the caller commits,
-    in the same transaction as the delete.
+    """Before an account is deleted: record, on every zero-knowledge vault where it has a key row at the
+    CURRENT epoch, switched on or off, that the vault owes a rotation at that epoch. Returns the ids of the
+    vaults marked; the caller commits, in the same transaction as the delete.
 
     Deleting an account takes its key rows with it (they cascade), so without this nothing would show
     that someone who held the key is gone: the "rotation owed" notice would stay quiet, and a hierarchical
@@ -1058,18 +1058,22 @@ def record_rotations_owed_by(db: Session, user_id) -> List[str]:
     The epoch is on the vault's own axis: the DEK epoch of a direct vault, the team epoch of a
     hierarchical one (only a new team key shuts out someone who held the old one).
 
+    A switched-off row counts as much as an active one. Deactivating an account, and removing a member
+    without a rotation, switch the key rows off and leave them at the current epoch; that row is what
+    makes the vault owe a rotation (_rekey_owed, _team_rotation_owed), and the delete would erase it. The
+    usual way out is exactly that: deactivate first, delete later.
+
     Each vault row is locked first, in a fixed order, and the account is judged against the locked
     epoch, so a rotation in flight either committed before (and this reads its new epoch) or waits for
     the delete."""
     vault_ids = sorted({str(v) for (v,) in db.query(VaultMemberKey.vault_id).filter(
         VaultMemberKey.user_id == user_id,
-        VaultMemberKey.is_active == True,  # noqa: E712
     ).distinct().all()})
     marked = []
     for vid in vault_ids:
         locked = (db.query(Vault).populate_existing()
                   .filter(Vault.id == vid).with_for_update().first())
-        if locked is None or not _holds_current_key(db, locked, user_id):
+        if locked is None or not _had_current_key(db, locked, user_id):
             continue
         axis = 'team_key_version' if _is_hierarchical(locked) else 'dek_version'
         locked.rotation_owed_epoch = getattr(locked, axis, 1) or 1
@@ -1129,16 +1133,10 @@ def _rekey_owed(db: Session, vault: Vault) -> bool:
 _NOT_A_KEY_HOLDER = "Only someone who holds this vault's key can rotate it"
 
 
-def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
-    """True if `user_id` holds an ACTIVE key for the vault's CURRENT epoch.
-
-    DIRECT: a wrapped-DEK row at dek_version. HIERARCHICAL: a team-private-key row at
-    team_key_version, the key every current DEK epoch is wrapped under. A row at an older epoch does
-    not count: it opens files written before a rotation, not the key in use now.
-
-    Pass the vault row the handler LOCKED (populate_existing + with_for_update), so the epoch is the
-    live one, and a removal of the caller that takes the same lock is either already visible here or
-    waits until the write that depends on this answer has committed."""
+def _current_key_rows(db: Session, vault: Vault, user_id):
+    """The query for `user_id`'s key rows of the vault's own kind at its CURRENT epoch, switched on or off:
+    a wrapped-DEK row at dek_version for a direct vault, a team-private-key row at team_key_version for a
+    hierarchical one."""
     if _is_hierarchical(vault):
         epoch = getattr(vault, 'team_key_version', 1) or 1
         kind = VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS)
@@ -1150,8 +1148,29 @@ def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
         VaultMemberKey.user_id == user_id,
         VaultMemberKey.key_version == epoch,
         kind,
+    )
+
+
+def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
+    """True if `user_id` holds an ACTIVE key for the vault's CURRENT epoch.
+
+    DIRECT: a wrapped-DEK row at dek_version. HIERARCHICAL: a team-private-key row at
+    team_key_version, the key every current DEK epoch is wrapped under. A row at an older epoch does
+    not count: it opens files written before a rotation, not the key in use now.
+
+    Pass the vault row the handler LOCKED (populate_existing + with_for_update), so the epoch is the
+    live one, and a removal of the caller that takes the same lock is either already visible here or
+    waits until the write that depends on this answer has committed."""
+    return _current_key_rows(db, vault, user_id).filter(
         VaultMemberKey.is_active == True,  # noqa: E712
     ).first() is not None
+
+
+def _had_current_key(db: Session, vault: Vault, user_id) -> bool:
+    """True if `user_id` has ever been given the key of the vault's CURRENT epoch: a row of its kind at
+    that epoch, switched on or off. A switched-off copy was still handed out, so its holder may have the
+    key; only a rotation past that epoch shuts them out."""
+    return _current_key_rows(db, vault, user_id).first() is not None
 
 
 class IndexKeyWrap(BaseModel):

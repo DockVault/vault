@@ -795,7 +795,9 @@ nothing.
   ahead.
 - **Deleting an account that held a vault's current key leaves the vault owing a rotation.** The account's key rows
   go with it, so the epoch is recorded on the vault (`rotation_owed_epoch`) until a rotation moves past it; a
-  hierarchical vault then refuses a rotation of its DEK alone.
+  hierarchical vault then refuses a rotation of its DEK alone. A copy of the current key that was switched off
+  first (the account deactivated, or the member removed without a rotation) counts too: the usual offboarding
+  deactivates an account and deletes it later.
 - **The challenges of key registration and envelope replacement keep their one-time key sealed** with
   `ENCRYPTION_KEY`, as the key-proof challenges do, and the periodic cleanup deletes them once they expire.
 
