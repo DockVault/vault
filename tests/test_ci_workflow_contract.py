@@ -165,6 +165,8 @@ def test_a_candidate_or_release_tests_run_includes_the_fast_lanes():
         assert own in triggers                              # it still runs on its own as well
     lane = fast["jobs"]["fast"]
     assert sorted(lane["strategy"]["matrix"]["os"]) == ["ubuntu-latest", "windows-latest"]
+    # Windows has taken 13 to 15 minutes; a 15-minute limit cancelled a lane with nothing failing.
+    assert lane["timeout-minutes"] == 25
     checkout = [s for s in lane["steps"] if s.get("uses", "").startswith("actions/checkout@")]
     assert len(checkout) == 1
     assert checkout[0]["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"

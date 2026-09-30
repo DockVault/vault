@@ -28,7 +28,9 @@ jobs:
   fast:
     name: Python 3.14 / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The Windows lane has taken 13 to 15 minutes, and the earlier 15-minute limit cancelled it once
+    # with no test failing. The limit is there to end a hang, not to budget a normal run.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
