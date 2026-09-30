@@ -412,8 +412,10 @@ _refresher_stop = threading.Event()
 
 
 def _default_session_factory():
-    from app.core.database import SessionLocal
-    return SessionLocal()
+    # Never the call that initializes this process's runtime: the refresh runs on a thread of its own, and
+    # initializing there would overwrite the settings object under the process (see started_session).
+    from app.core.database import started_session
+    return started_session()
 
 
 def _say(message: str) -> None:
@@ -429,6 +431,9 @@ def refresh(session_factory=None) -> bool:
     try:
         return _cache.refresh(session_factory or _default_session_factory)
     except Exception as exc:  # noqa: BLE001 -- the copy held last stands
+        from app.core.config import RuntimeNotReady
+        if isinstance(exc, RuntimeNotReady):
+            return False  # the process has not started yet: the next turn asks again
         _say(f"Warning: managed settings were not refreshed ({type(exc).__name__}); the values held stay "
              "in force")
         return False

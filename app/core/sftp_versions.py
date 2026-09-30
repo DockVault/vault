@@ -150,8 +150,10 @@ class Recorder:
     def _session(self):
         if self._factory is not None:
             return self._factory()
-        from app.core.database import SessionLocal
-        return SessionLocal()
+        # Never the call that initializes this process's runtime (see started_session): a turn before
+        # the process has done so fails, and the next turn tries again.
+        from app.core.database import started_session
+        return started_session()
 
     def _once(self, first: bool) -> bool:
         """One record (the first also prunes). Never raises: a failure is tried again at the next turn."""

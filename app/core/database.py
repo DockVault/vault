@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import (
     RuntimeBootstrapError,
+    RuntimeNotReady,
     initialize_runtime,
     runtime_is_initialized,
     settings,
@@ -126,6 +127,21 @@ redis_client = _RedisClientProxy()
 def SessionLocal():
     """Return a database session from the initialized process-local factory."""
     return _require_session_factory()()
+
+
+def started_session():
+    """A database session, once this process has initialized its runtime; RuntimeNotReady before.
+
+    SessionLocal() initializes the runtime when nothing has yet, and that installs a newly read value of
+    every setting over the shared settings object. Doing that is the process's own start's job, in its
+    main thread (bootstrap_entrypoint, the web lifespan). Done from a background thread, it would
+    overwrite, at a moment nobody chose, whatever the process has set since. So a background thread's
+    turn (the managed-settings refresh, the SFTP version record) asks here, and a turn that is refused
+    is skipped: the next one asks again.
+    """
+    if not runtime_is_initialized():
+        raise RuntimeNotReady("this process has not initialized its runtime yet")
+    return SessionLocal()
 
 
 def init_db():

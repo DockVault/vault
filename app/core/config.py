@@ -24,6 +24,11 @@ class RuntimeBootstrapError(RuntimeError):
         super().__init__(safe_message)
 
 
+class RuntimeNotReady(RuntimeError):
+    """A session was asked for before this process initialized its runtime, by a caller that must never
+    be the one to initialize it (app.core.database.started_session)."""
+
+
 def _credential_default(name: str, default=None):
     """Read an unlocked credential without making Settings import-time active."""
     if not credential_manager.is_unlocked:
