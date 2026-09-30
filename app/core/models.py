@@ -191,6 +191,14 @@ class User(Base):
     # password, whatever the deployment's second-factor policy; enrolling clears it. Nullable and
     # added by the boot DDL, so an earlier release reads the table without it.
     second_factor_reset_at = Column(DateTime, nullable=True)
+    # The revision of the role defaults this account has been given (app/core/api_catalog.py,
+    # FunctionalityGroup.default_since). At each start an account that is not an administrator is given
+    # the defaults of its role that are newer than this, once, and it is then set to the current
+    # revision; creating the account and changing its role set it too. So a default an administrator
+    # revoked stays revoked. NULL is what every earlier release left: the defaults of revision 1, which
+    # those releases granted again at every start. Nullable and added by the boot DDL, so an earlier
+    # release reads the table without it.
+    permission_defaults_revision = Column(Integer, nullable=True)
 
     # SFTP access controls (per account). sftp_enabled gates ALL direct SFTP login
     # for this user; sftp_password_auth allows password-based SFTP (key auth via
@@ -673,6 +681,13 @@ class ActiveSession(Base):
     # unlike the best-effort Redis logout denylist. A new login does NOT set this, so concurrent
     # sessions keep working (no single-session side effect).
     revoked = Column(Boolean, nullable=False, default=False, server_default='false')
+    # Where the session was signed in: 'web' or 'sftp'. A web sign-in with a password marks the account's
+    # earlier web sessions inactive; it leaves SFTP sessions alone, and an SFTP sign-in (password or key)
+    # leaves every other session alone, since SFTP checks is_active on every operation and a client
+    # opens several connections at once. Revoking, locking and deactivating still end every session.
+    # NULL: written by an earlier release, and treated as a web session. Nullable and added by the boot
+    # DDL, so an earlier release reads the table without it.
+    channel = Column(String(8), nullable=True)
     
     # Relationships
     user = relationship('User', back_populates='active_sessions')
@@ -2827,7 +2842,8 @@ class SignInLockout(Base):
     # When the lock was armed; NULL while the failures are only being counted.
     locked_at = Column(DateTime, nullable=True)
     # When it ends (naive UTC). NULL with locked_at set: no end, for a deployment whose lockout
-    # duration is 0; an administrator clears it.
+    # duration is 0; an administrator clears it. An administrator's own lock is always given an end
+    # (app/core/sign_in_lockout.py, end_administrators_open_locks).
     locked_until = Column(DateTime, nullable=True)
 
     __table_args__ = (

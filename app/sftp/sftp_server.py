@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
 from app.core.database import get_db_context
 from app.core.models import User, ActiveSession, Vault, Folder, File
-from app.services.auth_service import AuthService
+from app.services.auth_service import SFTP_CHANNEL, AuthService
 from app.core.authorization import PermissionService, PermissionDeniedError
 from app.services.vault_service import (
     VaultService,
@@ -2293,7 +2293,7 @@ class SFTPServer(paramiko.ServerInterface):
                     else:
                         # Regular user authentication
                         user, session_token = auth_service.authenticate_user(
-                            username, password, self.client_address
+                            username, password, self.client_address, channel=SFTP_CHANNEL
                         )
 
                         # Per-account SFTP gate: the user may disable SFTP entirely,

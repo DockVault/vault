@@ -52,7 +52,7 @@ MENU = [
     ("reset",   "Reset - tear down (optionally destroy data)"),
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
-    ("accounts", "Accounts - reset a user's password or second factor, approve a held change"),
+    ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
 ]
 
 
@@ -1856,6 +1856,32 @@ def plan_upgrade_path(matrix, current, target):
     }
 
 
+def env_upgrade_notes(env, current, target):
+    """What an upgrade from ``current`` to ``target`` changes for this deployment because of a line in
+    its .env, as sentences to show before the image changes. Pure: ``env`` is the parsed .env. Only
+    installs that update from a checkout see these (the pull path runs the tool it already has)."""
+    notes = []
+    cur, tgt = parse_semver(current), parse_semver(target)
+
+    def crosses(version):
+        # Taken as crossing when the running version is not known.
+        return tgt is not None and tgt >= version and (cur is None or cur < version)
+
+    if crosses((0, 33, 1)):
+        raw = (env.get("ACCOUNT_LOCKOUT_MINUTES") or "").strip()
+        try:
+            minutes = int(raw) if raw else None
+        except ValueError:
+            minutes = None
+        if minutes == 0:
+            notes.append(
+                "ACCOUNT_LOCKOUT_MINUTES=0 in .env: from 0.33.1 an administrator's automatic lock (after "
+                "failed sign-ins) ends after 15 minutes instead of lasting until another administrator "
+                "clears it; other accounts' automatic locks still last until cleared. From the host, "
+                "python dockvault.py accounts --action unlock clears any account's locks.")
+    return notes
+
+
 def backup_reason(plan, down=False):
     """Why a version change needs a backup first, or None when it does not.
 
@@ -2794,6 +2820,8 @@ ACCOUNT_ACTIONS = (
     ("approve", "Approve a change waiting for a second administrator"),
     ("list", "List the changes waiting for approval"),
     ("user-managers", "List who may manage users without being an administrator"),
+    ("regranted-defaults", "List revoked permissions that a restart granted again (before 0.33.1)"),
+    ("unlock", "Unlock an account: its automatic locks and an administrator's lock"),
 )
 
 
@@ -5078,6 +5106,8 @@ class DockVault:
             plan = plan_upgrade_path(None, current, tag)
 
         self._describe_hop(plan, matrix_source, current, tag, down)
+        for note in env_upgrade_notes(env, current, tag):
+            print(pal.paint("  Note: " + note, "yellow"))
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
         # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version
@@ -5661,6 +5691,27 @@ class DockVault:
                             "it: granting it while the account still holds it does nothing.\n", "yellow"))
             return
 
+        if action == "regranted-defaults":
+            answer = self._run_account_tool("regranted-defaults")
+            if not answer.get("ok"):
+                self._fail(server_text(answer.get("error")) or "the list could not be read")
+            rows = answer.get("permissions") or []
+            if not rows:
+                print(pal.paint("  No revoked permission was found granted again by a restart.\n", "green"))
+                return
+            print(pal.paint("\n  Permissions an administrator revoked that a restart granted again", "cyan"))
+            for r in rows:
+                print("  %s  (%s%s)  %-16s revoked %s, granted again %s" % (
+                    server_text(r.get("username")), server_text(r.get("role")),
+                    "" if r.get("active") else ", deactivated", server_text(r.get("group")),
+                    server_text(r.get("revoked_at"))[:16].replace("T", " "),
+                    server_text(r.get("granted_again_at"))[:16].replace("T", " ")))
+            print(pal.paint("  Before 0.33.1 every start granted each role default again. Where one is still not "
+                            "wanted, revoke it again with the account's Permissions button on the Users page "
+                            "(DELETE /permissions/users/{id}/revoke/<group>); from 0.33.1 it stays revoked.\n",
+                            "yellow"))
+            return
+
         if action == "approve":
             request_id = (getattr(args, "request_id", None) if args else None) or (
                 ask("Request id (see: List)", pal) if interactive else None)
@@ -5687,7 +5738,7 @@ class DockVault:
                               % server_text(req.get("target_username")), "yellow")]))
             return
 
-        if action not in ("reset-password", "reset-second-factor"):
+        if action not in ("reset-password", "reset-second-factor", "unlock"):
             self._fail("unknown action: %s" % action)
         username = (getattr(args, "username", None) if args else None) or (
             ask("Username", pal) if interactive else None)
@@ -5707,6 +5758,12 @@ class DockVault:
         answer = self._run_account_tool(*tool_args)
         if not answer.get("ok"):
             self._fail(server_text(answer.get("error")) or "nothing was changed")
+        if action == "unlock":
+            print(pal.paint("  Unlocked %s: %s%d automatic lock(s) cleared. Recorded as the host operator's "
+                            "change, and the account was told." % (
+                                username, "the administrator's lock removed, " if answer.get("was_locked") else "",
+                                int(answer.get("sign_in_locks_cleared") or 0)), "green"))
+            return
         if action == "reset-second-factor":
             print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
                             "with their own password, at the next sign-in." % username, "green"))
@@ -5885,7 +5942,8 @@ def build_parser():
 
     ac = parsers["accounts"]
     ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
-                    help="reset-password | reset-second-factor | approve | list | user-managers")
+                    help="reset-password | reset-second-factor | approve | list | user-managers | "
+                         "regranted-defaults | unlock")
     ac.add_argument("--username", dest="username", help="the account to act on")
     ac.add_argument("--confirm-username", dest="confirm_username",
                     help="the account's username typed again; nothing changes unless it matches")

@@ -199,3 +199,76 @@ def test_login_fast_fail_closed_during_redis_outage(base_url):
             time.sleep(1)
         # Start the next test on the Redis path with a closed breaker.
         wait_out_breaker_cooldown()
+
+
+# ---- right passwords are not counted --------------------------------------------------------------
+#
+# A sign-in is charged before its password is checked, so guesses in parallel cannot pass the limit;
+# one that succeeds gives its charges back, so the throttle counts failed attempts only. Before, the
+# sixth right password in five minutes from one address was refused, and so was the eleventh account
+# signing in from one address. The limit is set to the shipped 5 (10 an address) for these tests through
+# the administrators' override, whatever the stack runs with.
+
+def _sign_in_status(name, password):
+    # A plain session: no X-Forwarded-For, so every attempt comes from this host's one address.
+    s = requests.Session()
+    s.trust_env = False
+    from conftest import BASE_URL
+    return s.post(f"{BASE_URL}/auth/login", json={"username": name, "password": password}, timeout=30).status_code
+
+
+@pytest.fixture
+def shipped_login_limit(admin):
+    from _account_change_helpers import psql, reset_sign_in_throttle
+    before = admin.get("/settings").json().get("max_login_attempts") or 0
+    r = admin.put("/settings", json={"max_login_attempts": 5})
+    assert r.status_code == 200, r.text
+    reset_sign_in_throttle()
+    psql("DELETE FROM rate_limit_records WHERE action IN ('login_user', 'login_ip')")
+    yield 5
+    admin.put("/settings", json={"max_login_attempts": before})
+    reset_sign_in_throttle()
+
+
+def _right_and_wrong(admin, limit):
+    account = admin.create_user()
+    name, pw = account["_username"], account["_password"]
+    assert [_sign_in_status(name, pw) for _ in range(12)] == [200] * 12
+    others = [admin.create_user() for _ in range(11)]
+    assert [_sign_in_status(o["_username"], o["_password"]) for o in others] == [200] * 11
+    # Wrong passwords are still counted: refused after the limit for the name,
+    assert [_sign_in_status(name, "wrong-pw-xyz") for _ in range(limit + 1)] == [401] * limit + [429]
+    # and after twice the limit for the address, whoever signs in.
+    assert [_sign_in_status(unique("nobody"), "wrong-pw-xyz") for _ in range(limit)] == [401] * limit
+    assert _sign_in_status(others[0]["_username"], others[0]["_password"]) == 429
+
+
+def test_right_passwords_do_not_count_against_the_login_throttle(admin, shipped_login_limit):
+    _right_and_wrong(admin, shipped_login_limit)
+
+
+@pytest.mark.skipif(
+    os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
+    reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the Redis-outage test "
+           "(it pauses/unpauses the Redis container via docker)",
+)
+def test_right_passwords_do_not_count_while_the_cache_is_down(admin, shipped_login_limit, base_url):
+    """The same with Redis paused: the database fallback's count is given back too."""
+    container = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
+    account = admin.create_user()
+    name, pw = account["_username"], account["_password"]
+    try:
+        assert subprocess.run(["docker", "pause", container], capture_output=True).returncode == 0
+        time.sleep(2)
+        assert [_sign_in_status(name, pw) for _ in range(7)] == [200] * 7
+        assert [_sign_in_status(name, "wrong-pw-xyz") for _ in range(6)] == [401] * 5 + [429]
+    finally:
+        subprocess.run(["docker", "unpause", container], capture_output=True)
+        for _ in range(30):
+            try:
+                if requests.get(f"{base_url}/health", timeout=5).json().get("redis") == "connected":
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1)
+        wait_out_breaker_cooldown()

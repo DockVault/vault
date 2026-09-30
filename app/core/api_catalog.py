@@ -46,6 +46,12 @@ class FunctionalityGroup:
     default_for_roles: List[str]       # Roles that get this by default
     endpoints: List[APIEndpoint]       # List of endpoints in this group
     dependencies: List[str] = field(default_factory=list)  # Other groups this depends on
+    # The revision of the role defaults in which this group became a default of its roles. Each account
+    # records the revision it has been given (users.permission_defaults_revision), and a start gives it
+    # the defaults newer than that once, so one an administrator revoked is not given back. A group
+    # added to a role's defaults later takes the next number: every account of that role is then given
+    # it, and what it depends on, once, recorded as permission_default_granted.
+    default_since: int = 1
 
 
 # ============================================================================

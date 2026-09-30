@@ -116,7 +116,7 @@ def world(monkeypatch):
         def __init__(self, db):
             pass
 
-        def authenticate_user(self, username, password, ip):
+        def authenticate_user(self, username, password, ip, **kw):
             return state["user"], "session-token"
 
     monkeypatch.setattr(S, "get_db_context", ctx)

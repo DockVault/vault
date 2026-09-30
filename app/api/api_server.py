@@ -7376,7 +7376,8 @@ async def second_factor_login_verify(
     db.commit()
     auth_service = AuthService(db)
     session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at)
+    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at,
+                                                 channel=auth_service.WEB)
     _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
     access_token = create_access_token(
         data={"sub": str(user.id), "username": user.username, "session_token": session_token,
@@ -9885,7 +9886,8 @@ async def acknowledge_recovery_codes(
         db.commit()
         auth_service = AuthService(db)
         session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at)
+        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
+                                                     channel=auth_service.WEB)
         _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
         access_token = create_access_token(
             data={"sub": str(current_user.id), "username": current_user.username,
@@ -23441,10 +23443,13 @@ async def cleanup_expired_sessions():
                 # counts with nothing left to count are dropped.
                 try:
                     from app.core import sign_in_lockout
+                    # An administrator's lock that has no end is given one first (see
+                    # end_administrators_open_locks), so the release below can clear it; the end it is
+                    # given is kept even when nothing is released yet.
+                    sign_in_lockout.end_administrators_open_locks(db)
                     released = sign_in_lockout.release_expired(db)
-                    pruned_counts = sign_in_lockout.prune_stale(db)
-                    if released or pruned_counts:
-                        db.commit()
+                    sign_in_lockout.prune_stale(db)
+                    db.commit()
                     if released:
                         print(f"🔓 Released {released} automatic sign-in lock(s) past their duration")
                 except Exception as lockout_err:
@@ -23740,18 +23745,17 @@ def _seed_default_receiver_tags(bootstrap_status=None):
 
 
 def _backfill_default_permissions():
-    """Grant role-default endpoint permissions to existing non-admin users
-    (idempotent). Picks up newly-added defaults such as temp-credential
-    self-service for the 'user' role without needing the user to be recreated."""
+    """Give existing accounts that are not administrators the role defaults added since they were last
+    given them, once each (endpoint_permissions.grant_newer_role_defaults). Until 0.33.1 this granted
+    every default again at every start, so a default an administrator had revoked came back at the next
+    restart; now a revoked default stays revoked."""
     try:
         from app.core.database import get_db_context
-        from app.core.endpoint_permissions import grant_default_permissions_for_role
-        from app.core.models import RoleEnum, User
+        from app.core.endpoint_permissions import grant_newer_role_defaults
         with get_db_context() as db:
-            users = db.query(User).filter(User.role != RoleEnum.ADMIN).all()
-            for u in users:
-                grant_default_permissions_for_role(str(u.id), u.role.value, db)
-            print(f"[OK] Backfilled default permissions for {len(users)} non-admin user(s)")
+            done = grant_newer_role_defaults(db)
+            print(f"[OK] Role defaults up to date: {done['grants']} new default(s) granted to "
+                  f"{done['accounts']} account(s)")
     except Exception as e:
         print(f"⚠ Permission backfill skipped: {e}")
 
@@ -24038,11 +24042,17 @@ END $$;""",
             # revocation (web logout/lock survives a Redis outage). Both additive + idempotent.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP",
             "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE",
+            # Where a session was signed in ('web' or 'sftp'), so a sign-in on one ends only its own
+            # channel's earlier sessions. Nullable: a release that does not know it ignores it.
+            "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS channel VARCHAR(8)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN NOT NULL DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_password_auth BOOLEAN NOT NULL DEFAULT TRUE",
             # An administrator's second-factor reset asks the user to set the factor up again at the
             # next sign-in. Nullable, so a rollback to a release that does not know it is unaffected.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS second_factor_reset_at TIMESTAMP",
+            # The revision of the role defaults an account has been given, so a start grants each default
+            # once instead of granting again one an administrator revoked. Nullable, for the same reason.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_defaults_revision INTEGER",
             # An administrator's invitation keeps its inviter's lineage from the moment it is made, for
             # the two-administrator rule (app/core/admin_grants.py). Nullable, for the same reason.
             "ALTER TABLE account_invitations ADD COLUMN IF NOT EXISTS inviter_lineage JSON",
