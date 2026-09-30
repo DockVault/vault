@@ -3788,6 +3788,15 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         return
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Settings payload must be an object")
+    # The settings registry's keys have their own store and route (app/core/settings_registry.py), and
+    # the keys only .env sets have none: a copy saved here would never be read, and would look as if it
+    # had changed something. Refused whatever the key's case.
+    from app.core import settings_registry as _registry
+    _refused = _registry.refused_settings_keys()
+    for _key in payload:
+        if isinstance(_key, str) and _key.lower() in _refused:
+            raise HTTPException(status_code=400,
+                                detail=f"{_key.lower()} is not saved here: it is a managed setting")
 
     # Deployment-managed / server-computed rate-limit fields are READ-ONLY: the deployment value comes
     # from the environment and the API must never write it (a client cannot edit it via a payload key).
@@ -24862,6 +24871,11 @@ async def lifespan(app: FastAPI):
             os.environ.pop("VAULT_LOG_SINK_ACTIVE", None)
             os.environ.pop("VAULT_LOG_SINK_COMPONENTS", None)
 
+    # The settings the panel manages: refuse to start while .env contradicts their limits, load the stored
+    # values, and keep them fresh in the background so no request reads them from the database.
+    from app.core import settings_registry
+    settings_registry.start()
+
     yield
     
     # Shutdown - cancel background tasks
@@ -24875,7 +24889,7 @@ async def lifespan(app: FastAPI):
         await expiry_task
     except asyncio.CancelledError:
         pass
-    pass
+    settings_registry.stop()
 
 # Update app initialization
 app.router.lifespan_context = lifespan

@@ -1259,6 +1259,25 @@ class SystemSetting(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ManagedSetting(Base):
+    """An administrator's value for one setting of the settings registry (app/core/settings_registry.py),
+    which resolves it against the deployment's .env, floor, ceiling and lock.
+
+    One row per key, never deleted: clearing a value stores NULL. ``version`` is one sequence across the
+    table (each change takes the highest plus one), so the highest version moves on every change and each
+    process can tell from it alone whether its copy is current. Created by create_all.
+    """
+    __tablename__ = 'managed_settings'
+
+    key = Column(String(64), primary_key=True)
+    value = Column(JSON, nullable=True)
+    version = Column(BigInteger, nullable=False)
+    # Who stored it: the account (NULL once it is deleted, or for the host operator) and its name.
+    updated_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    updated_by_name = Column(String(255), nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class UserPreference(Base):
     """Per-user UI preferences (light/dark theme, accent, background, skin) so a
     user's look-and-feel follows their ACCOUNT across browsers and devices instead

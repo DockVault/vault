@@ -373,7 +373,8 @@ def build_env_lines(cfg):
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
     invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written),
-    max_single_request_upload_mb (int or None; written only when set)."""
+    max_single_request_upload_mb (int or None; written only when set), settings_locked_keys (str;
+    written only when set)."""
     lines = []
 
     def q(k):
@@ -495,6 +496,10 @@ def build_env_lines(cfg):
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
         bare("PLAN_LOG_PULL", "true")
         bare("LOG_TOKEN_PEPPER", "'%s'" % cfg["log_token_pepper"])
+    # Settings the deployment locks against the admin panel: written only when there are some, so a normal
+    # install's .env never mentions it, and kept across a fresh volume set.
+    if str(cfg.get("settings_locked_keys") or "").strip():
+        bare("SETTINGS_LOCKED_KEYS", "'%s'" % str(cfg["settings_locked_keys"]).strip())
     # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
     # decoupled from the JWT secret (the app falls back to the JWT secret only when this is absent).
     if cfg.get("invite_token_pepper"):
@@ -1266,6 +1271,8 @@ def new_set_config(current_env, new_prefix, new_id):
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
+        # The settings the deployment locks against the admin panel.
+        "settings_locked_keys": (current_env.get("SETTINGS_LOCKED_KEYS") or "").strip() or None,
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.

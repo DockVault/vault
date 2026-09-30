@@ -221,6 +221,11 @@ class Settings(BaseSettings):
     # a managing operator injects PLAN_LOG_PULL=1 (plan-tiering) AND an admin enables a
     # component. Even then it is a HARD ceiling the deployment's own admin cannot widen.
     plan_log_pull: bool = Field(default=False)
+    # Settings the panel manages that the deployment locks at their .env value (or default): keys of the
+    # settings registry, their groups, or * for every one that can be locked; comma-separated. The panel
+    # shows a locked setting as set by the deployment and cannot change it. See
+    # app/core/settings_registry.py. Empty (the default) locks nothing.
+    settings_locked_keys: str = Field(default="")
 
     # Security Configuration (loaded from credential_manager)
     encryption_key: str = Field(

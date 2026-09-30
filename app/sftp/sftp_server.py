@@ -2575,6 +2575,12 @@ def start_sftp_server():
     termination_thread.start()
     safe_event('termination-listener.started')
 
+    # The settings the panel manages, as the web process holds them: checked against .env here, then loaded
+    # and kept fresh in the background, so the server never waits on the database to start listening
+    # (app/core/settings_registry.py).
+    from app.core import settings_registry
+    settings_registry.start(load_now=False)
+
     # The write-progress watchdog (0 disables it). See _WriteProgressWatchdog.
     if settings.sftp_write_progress_timeout_seconds and settings.sftp_write_progress_timeout_seconds > 0:
         threading.Thread(target=_write_progress.run, daemon=True, name="sftp-write-progress").start()

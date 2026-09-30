@@ -113,6 +113,10 @@ Their only personal data is the id of the account that created, owns or was allo
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
 account and group ids that may use a tag.
 
+`managed_settings` (new in 0.34.0) holds the values administrators set for the settings the panel
+manages within the deployment's limits, one row per setting, with the id and username of whoever set
+each one last and when. A row is overwritten by the next change and never deleted.
+
 ### The audit log
 
 Each row of `audit_logs` holds:
