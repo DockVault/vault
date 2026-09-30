@@ -95,6 +95,15 @@ _SUPPORT_KEYS = {"eol", "secure", "code_support", "security_support"}
 # advisories shows (the host tool's older copies and the running app read a version's list and
 # nothing else), so the repetition is what keeps them informed. They must match the advisory exactly.
 _VULN_KEYS = {"advisory", "title", "fixed_in"}
+# Below this version a reference may carry only its advisory's id ({"advisory": "<slug>"}); the
+# readers of 0.33.0 and later, and the documentation site, take the title and fix from the advisory.
+# The boundary is where the older readers stop looking. The host tool of 0.30.0 to 0.32.x merges
+# main's copy of this file into every version it knows, and prints a line for each of the 15 newest
+# releases that are not end-of-life, counting what each reference's own `title` and `fixed_in` say:
+# an id-only reference in that window would read as "no fix released yet". That window reaches
+# 0.27.0 today and only moves up as releases are added, so references on 0.27.0 and later keep both
+# fields.
+ID_ONLY_REFERENCES_BELOW = "0.27.0"
 # One record per vulnerability. title, description, impact and remediation carry the meaning and are
 # always stated. The ratings are required keys that may be null, so an unrated finding says so rather
 # than omitting the field: `cvss` is a CVSS v4.0 base vector and `severity` the band it scores to
@@ -301,25 +310,32 @@ def _validate_vulnerabilities(meta: dict, version: str, advisories: dict, where:
     """A version's optional list of references to the advisories that affect it.
 
     Each entry names an advisory and repeats its `title` and `fixed_in` exactly (see `_VULN_KEYS`).
-    A version cannot be affected by an advisory fixed in it or before it, and lists each advisory once.
+    Below ID_ONLY_REFERENCES_BELOW an entry may instead carry the advisory's id alone. A version
+    cannot be affected by an advisory fixed in it or before it, and lists each advisory once.
     """
     vulns = meta.get("vulnerabilities")
     if vulns is None:
         return
     _require(isinstance(vulns, list), f"{where}.vulnerabilities must be a list")
+    id_only_allowed = _sort_key(version) < _sort_key(ID_ONLY_REFERENCES_BELOW)
     seen: set[str] = set()
     for position, ref in enumerate(vulns):
         spot = f"{where}.vulnerabilities[{position}]"
         _require(isinstance(ref, dict), f"{spot} must be an object")
         _no_unknown_keys(ref, _VULN_KEYS, spot)
+        id_only = id_only_allowed and set(ref) == {"advisory"}
         missing = sorted(_VULN_KEYS - set(ref))
-        _require(not missing, f"{spot} is missing required key(s): {', '.join(missing)}")
+        _require(id_only or not missing,
+                 f"{spot} is missing required key(s): {', '.join(missing)}"
+                 + (f"; from {ID_ONLY_REFERENCES_BELOW} on a reference repeats its advisory's "
+                    "title and fixed_in for the host tools of 0.30.0 to 0.32.x"
+                    if set(ref) == {"advisory"} else ""))
         slug = _string(ref["advisory"], f"{spot}.advisory", pattern=_ID_RE)
         _require(slug in advisories, f"{spot}.advisory names {slug}, which 'advisories' does not declare")
         _require(slug not in seen, f"{spot} lists advisory {slug} a second time")
         seen.add(slug)
         advisory = advisories[slug]
-        for field in ("title", "fixed_in"):
+        for field in ("title", "fixed_in") if not id_only else ():
             _require(ref[field] == advisory[field],
                      f"{spot}.{field} must repeat advisories[{slug}].{field} exactly; it is what a "
                      f"reader that predates advisories shows (got {ref[field]!r}, "

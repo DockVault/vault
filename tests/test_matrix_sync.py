@@ -241,3 +241,97 @@ def test_a_waiver_only_the_branch_declares_is_carried():
     result, notes = _SYNC.sync(main, branch)
     assert result["waivers"] == main["waivers"] + branch["waivers"]
     assert "took the waiver for 0.33.2 from the branch" in notes
+
+
+# --- shortening the references below the id-only boundary ----------------------------------------
+
+def _advisory(title: str, fixed_in: str) -> dict:
+    return {"title": title, "description": "Something that was wrong.", "impact": "What it allowed.",
+            "remediation": "Upgrade.", "mitigation": None, "severity": None, "cvss": None,
+            "id": None, "fixed_in": fixed_in, "published": "2026-01-01"}
+
+
+def _across_the_boundary() -> dict:
+    """0.26.0, 0.27.0 and 0.28.0, all affected by one advisory that 0.29.0 fixes."""
+    ref = {"advisory": "an-issue", "title": "An issue", "fixed_in": "0.29.0"}
+    versions = {ver: _entry(f"2026-01-0{day}", secure=False, vulnerabilities=[dict(ref)])
+                for day, ver in enumerate(("0.26.0", "0.27.0", "0.28.0"), start=1)}
+    versions["0.29.0"] = _entry("2026-01-04")
+    return {
+        "schema_version": 3, "about": "fixture",
+        "kinds": {"direct": "one step", "blocked": "do not"},
+        "advisories": {"an-issue": _advisory("An issue", "0.29.0")},
+        "versions": versions,
+        "edges": [_edge("0.26.0", "0.27.0"), _edge("0.27.0", "0.28.0"), _edge("0.28.0", "0.29.0")],
+    }
+
+
+def test_compacting_shortens_only_the_references_below_the_boundary():
+    data = _across_the_boundary()
+
+    result, shortened = _SYNC.compact(data)
+
+    assert shortened == 1
+    assert result["versions"]["0.26.0"]["vulnerabilities"] == [{"advisory": "an-issue"}]
+    for ver in ("0.27.0", "0.28.0"):
+        assert result["versions"][ver] == data["versions"][ver]
+    # Nothing else moves: the advisory, the flags, the edges, the order of the versions.
+    unshortened = copy.deepcopy(result)
+    unshortened["versions"]["0.26.0"]["vulnerabilities"] = data["versions"]["0.26.0"]["vulnerabilities"]
+    assert _SYNC.render(unshortened) == _SYNC.render(data)
+
+
+def test_compacting_twice_changes_nothing_the_second_time():
+    once, first = _SYNC.compact(_across_the_boundary())
+    twice, second = _SYNC.compact(once)
+    assert (first, second) == (1, 0)
+    assert _SYNC.render(twice) == _SYNC.render(once)
+
+
+def test_a_reference_that_disagrees_with_its_advisory_is_reported_not_shortened():
+    # Shortening would hide the disagreement; the file has a mistake to fix first.
+    data = _across_the_boundary()
+    data["versions"]["0.26.0"]["vulnerabilities"][0]["title"] = "An issue, differently worded"
+
+    with pytest.raises(_SYNC.MatrixSyncError, match=r"not valid: .*versions\[0\.26\.0\]"):
+        _SYNC.compact(data)
+
+
+def test_the_committed_matrix_compacts_to_a_valid_smaller_file():
+    data = json.loads(_MATRIX.read_bytes())
+
+    result, _ = _SYNC.compact(data)
+
+    boundary = _SYNC._key(_SYNC._validator().ID_ONLY_REFERENCES_BELOW)
+    for ver, entry in result["versions"].items():
+        for ref in entry.get("vulnerabilities") or []:
+            assert (set(ref) == {"advisory"}) == (_SYNC._key(ver) < boundary), (ver, ref)
+    assert len(_SYNC.render(result)) <= len(_MATRIX.read_bytes())
+
+
+def test_the_compact_command_writes_the_shortened_file(tmp_path, capsys):
+    source = tmp_path / "matrix.json"
+    source.write_bytes(_SYNC.render(_across_the_boundary()))
+    before = source.read_bytes()
+
+    assert _SYNC.main(["compact", str(source), "--output", str(tmp_path / "out.json")]) == 0
+    assert source.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "shortened 1 reference(s) below 0.27.0" in out
+    written = json.loads((tmp_path / "out.json").read_bytes())
+    assert written["versions"]["0.26.0"]["vulnerabilities"] == [{"advisory": "an-issue"}]
+
+    assert _SYNC.main(["compact", str(source)]) == 0
+    assert source.read_bytes() == (tmp_path / "out.json").read_bytes()
+
+
+def test_the_compact_command_writes_nothing_when_it_refuses(tmp_path, capsys):
+    data = _across_the_boundary()
+    data["versions"]["0.26.0"]["vulnerabilities"][0]["fixed_in"] = "0.28.0"
+    source = tmp_path / "matrix.json"
+    source.write_bytes(_SYNC.render(data))
+    before = source.read_bytes()
+
+    assert _SYNC.main(["compact", str(source)]) == 1
+    assert source.read_bytes() == before
+    assert "not valid" in capsys.readouterr().err

@@ -389,8 +389,9 @@ date it was published. Each affected version lists the advisories that apply to 
 affected by even one advisory, of any severity, is not secure.** Each entry in that list repeats its
 advisory's title and `fixed_in`, which is all that `dockvault.py` and the in-app check read before
 0.33.0; from 0.33.0 they also accept an entry that carries only the advisory's id and take the rest
-from `advisories`. The validator keeps requiring the repeated fields while releases that need them
-are still supported.
+from `advisories`. Below 0.27.0 an entry may carry only the id, which keeps the file small. From
+0.27.0 on the validator requires the repeated fields, because the `dockvault.py` of 0.30.0 to 0.32.x
+lists the newest releases from them.
 
 The validator recomputes every vector's score and refuses a severity that does not match it, requires
 an advisory to be listed on every release from the first it affects up to its fix, and refuses a

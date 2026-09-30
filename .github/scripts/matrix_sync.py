@@ -28,6 +28,16 @@ same bytes whichever side runs it.
         Exit status 0 when the two files are byte-identical, 1 otherwise, naming the first line
         that differs. After both syncs, main's file and the branch's are identical.
 
+    python3 .github/scripts/matrix_sync.py compact MATRIX.json [--output OUT]
+
+        Shortens each reference on a version below the validator's ID_ONLY_REFERENCES_BELOW to the
+        advisory's id alone. Readers from 0.33.0 on, and the documentation site, take the title and
+        fix from the advisory record. The host tools of 0.30.0 to 0.32.x list the newest releases
+        from each reference's own fields, and that list stops above the boundary; they read a
+        shortened reference only when asked for such an old release by name, and still report it
+        as not secure. The file is validated before and after. Running it again changes nothing.
+        OUT defaults to MATRIX.json. Run it in a release commit, never on its own.
+
 Stdlib only, like the rest of the release scripts.
 """
 
@@ -176,6 +186,41 @@ def sync(main: dict, branch: dict) -> tuple[dict, list[str]]:
     return result, notes
 
 
+def compact(data: dict) -> tuple[dict, int]:
+    """The matrix with every reference below the id-only boundary shortened to its advisory's id.
+
+    Returns the result and how many references were shortened. Nothing else changes: no advisory,
+    version, flag or edge, and a reference on the boundary or above keeps its title and fixed_in.
+    The input is validated first, so a reference that disagrees with its advisory is reported
+    rather than shortened away.
+    """
+    validator = _validator()
+    if not isinstance(data.get("versions"), dict):
+        raise MatrixSyncError("the matrix has no versions dict")
+    try:
+        validator.validate_matrix(data, released_ceiling=None)
+    except validator.UpgradeMatrixError as exc:
+        raise MatrixSyncError(f"the matrix is not valid: {exc}") from exc
+    boundary = _key(validator.ID_ONLY_REFERENCES_BELOW)
+    result = _copy(data)
+    shortened = 0
+    for version, entry in result["versions"].items():
+        if _key(version) >= boundary or not isinstance(entry, dict):
+            continue
+        refs = entry.get("vulnerabilities")
+        if not isinstance(refs, list):
+            continue
+        for position, ref in enumerate(refs):
+            if isinstance(ref, dict) and "advisory" in ref and set(ref) != {"advisory"}:
+                refs[position] = {"advisory": ref["advisory"]}
+                shortened += 1
+    try:
+        validator.validate_matrix(result, released_ceiling=None)
+    except validator.UpgradeMatrixError as exc:
+        raise MatrixSyncError(f"the shortened matrix is not valid: {exc}") from exc
+    return result, shortened
+
+
 def first_difference(a: bytes, b: bytes) -> str | None:
     """None when identical; otherwise where the two first differ, by line."""
     if a == b:
@@ -207,6 +252,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     do_check = commands.add_parser("check")
     do_check.add_argument("first", type=Path)
     do_check.add_argument("second", type=Path)
+    do_compact = commands.add_parser("compact")
+    do_compact.add_argument("matrix", type=Path)
+    do_compact.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
 
     try:
@@ -216,6 +264,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{args.first} and {args.second} differ: {where}")
                 return 1
             print(f"{args.first} and {args.second} are identical")
+            return 0
+        if args.command == "compact":
+            before = args.matrix.read_bytes()
+            result, shortened = compact(_load(args.matrix))
+            after = render(result)
+            (args.output or args.matrix).write_bytes(after)
+            print(f"shortened {shortened} reference(s) below "
+                  f"{_validator().ID_ONLY_REFERENCES_BELOW}: {len(before)} -> {len(after)} bytes")
+            print(f"wrote {args.output or args.matrix}")
             return 0
         result, notes = sync(_load(args.main), _load(args.branch))
         (args.output or args.branch).write_bytes(render(result))

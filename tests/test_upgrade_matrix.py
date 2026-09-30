@@ -572,6 +572,96 @@ def test_a_release_cannot_be_affected_by_an_issue_fixed_in_it():
     _reject(data, "must be a version later than 0.2.0")
 
 
+# --- references that carry only the advisory id --------------------------------------------------
+
+def _across_the_id_only_boundary():
+    """0.26.0 -> 0.27.0 -> 0.28.0, one advisory affecting the first two and fixed in the third.
+
+    The references are in full; each test shortens the one it is about.
+    """
+    data = _valid()
+    data["versions"] = {
+        ver: {"released": f"2026-01-0{day}", "notes": ver, "support": _support(secure=secure)}
+        for day, (ver, secure) in enumerate((("0.26.0", False), ("0.27.0", False),
+                                             ("0.28.0", True)), start=1)
+    }
+    data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
+                      "requires_backup": False}
+                     for a, b in (("0.26.0", "0.27.0"), ("0.27.0", "0.28.0"))]
+    data["advisories"] = {"a-fixed-issue": _advisory(fixed_in="0.28.0")}
+    for ver in ("0.26.0", "0.27.0"):
+        data["versions"][ver]["vulnerabilities"] = [_ref(fixed_in="0.28.0")]
+    return data
+
+
+def test_the_id_only_boundary_is_0_27_0():
+    # The host tools of 0.30.0 to 0.32.x print a line for each of the 15 newest releases that are not
+    # end-of-life, from each reference's own title and fixed_in; that list reaches 0.27.0 today. The
+    # frozen-reader tests in test_upgrade_matrix_older_readers.py check the list itself.
+    assert um.ID_ONLY_REFERENCES_BELOW == "0.27.0"
+
+
+def test_below_the_boundary_a_reference_may_carry_only_its_advisory_id():
+    data = _across_the_id_only_boundary()
+    um.validate_matrix(data, released_ceiling=None)
+    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    um.validate_matrix(data, released_ceiling="0.28.0")
+
+
+def test_from_the_boundary_on_a_reference_repeats_its_advisory_title_and_fix():
+    data = _across_the_id_only_boundary()
+    data["versions"]["0.27.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    _reject(data, "versions[0.27.0].vulnerabilities[0] is missing required key(s): fixed_in, title; "
+                  "from 0.27.0 on a reference repeats its advisory's title and fixed_in for the host "
+                  "tools of 0.30.0 to 0.32.x")
+
+
+def test_below_the_boundary_a_reference_is_whole_or_the_id_alone():
+    # Half a reference is a mistake, not the short form: it is refused like any missing key, and the
+    # note about the boundary is not given, since the boundary is not the reason.
+    data = _across_the_id_only_boundary()
+    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue",
+                                                      "title": "A fixed issue"}]
+    with pytest.raises(um.UpgradeMatrixError) as caught:
+        um.validate_matrix(data, released_ceiling=None)
+    assert "versions[0.26.0].vulnerabilities[0] is missing required key(s): fixed_in" in str(caught.value)
+    assert "from 0.27.0 on" not in str(caught.value)
+
+
+@pytest.mark.parametrize("refs, expected", [
+    ([{"advisory": "no-such-advisory"}], "which 'advisories' does not declare"),
+    ([{"advisory": "Bad Slug"}], "malformed"),
+    ([{"advisory": "a-fixed-issue"}, {"advisory": "a-fixed-issue"}],
+     "lists advisory a-fixed-issue a second time"),
+    ([{"advisory": "a-fixed-issue"}, _ref(fixed_in="0.28.0")],
+     "lists advisory a-fixed-issue a second time"),
+])
+def test_an_id_only_reference_is_checked_like_a_whole_one(refs, expected):
+    data = _across_the_id_only_boundary()
+    data["versions"]["0.26.0"]["vulnerabilities"] = refs
+    _reject(data, expected)
+
+
+def test_an_id_only_reference_still_counts_toward_the_advisory_coverage():
+    # The advisory affects 0.26.0 and 0.27.0; with 0.26.0's short reference dropped the advisory
+    # starts at 0.27.0, which is still unbroken. With 0.27.0's dropped instead, the gap is found.
+    data = _across_the_id_only_boundary()
+    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    data["versions"]["0.27.0"]["vulnerabilities"] = []
+    data["versions"]["0.27.0"]["support"] = _support(secure=True)
+    data["versions"]["0.28.0"]["support"] = _support(secure=True)
+    _reject(data, "not listed on: 0.27.0")
+
+
+def test_an_id_only_reference_cannot_name_an_advisory_fixed_in_its_own_release():
+    data = _across_the_id_only_boundary()
+    data["advisories"]["a-fixed-issue"]["fixed_in"] = "0.26.0"
+    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    data["versions"]["0.27.0"]["vulnerabilities"] = []
+    data["versions"]["0.27.0"]["support"] = _support(secure=True)
+    _reject(data, "must be a version later than 0.26.0")
+
+
 # --- coverage: an advisory affects an unbroken run of releases ------------------------------------
 
 def test_an_advisory_affects_every_release_up_to_its_fix():
@@ -724,11 +814,14 @@ def test_the_committed_matrix_holds_its_vulnerability_invariants():
             assert by_title[title]["fixed_in"] == "0.29.1", f"{ver}:{title!r} must be fixed_in 0.29.1"
 
     # (b) FIXED_IN STRICTLY LATER, over EVERY version: the release that fixes a defect never lists it.
+    # A reference that carries only the advisory id (below the id-only boundary) takes the fix from
+    # the advisory, as every reader that accepts it does.
     for ver, meta in versions.items():
         for v in (meta.get("vulnerabilities") or []):
-            if v["fixed_in"] is not None:
-                assert um._sort_key(v["fixed_in"]) > um._sort_key(ver), (
-                    f"{ver} lists {v['title']!r} with fixed_in={v['fixed_in']}, "
+            fixed_in = v.get("fixed_in", advisories[v["advisory"]]["fixed_in"])
+            if fixed_in is not None:
+                assert um._sort_key(fixed_in) > um._sort_key(ver), (
+                    f"{ver} lists {v['advisory']} with fixed_in={fixed_in}, "
                     f"which is not strictly later than {ver}")
 
     # (c) SECURE DERIVED: any version carrying a vulnerability entry reads support.secure false.
@@ -738,10 +831,15 @@ def test_the_committed_matrix_holds_its_vulnerability_invariants():
                 f"{ver} lists vulnerabilities but is marked support.secure true")
 
     # (d) ONE RECORD PER FINDING: what an older reader sees on each version (title, fixed_in) is the
-    # advisory's own, so the two can never tell an operator different things.
+    # advisory's own, so the two can never tell an operator different things. Below the id-only
+    # boundary a reference may carry the id alone and say nothing of its own.
     for ver, meta in versions.items():
         for v in (meta.get("vulnerabilities") or []):
             advisory = advisories[v["advisory"]]
+            if set(v) == {"advisory"}:
+                assert um._sort_key(ver) < um._sort_key(um.ID_ONLY_REFERENCES_BELOW), (
+                    f"{ver}:{v['advisory']} carries only the advisory id")
+                continue
             assert (v["title"], v["fixed_in"]) == (advisory["title"], advisory["fixed_in"]), (
                 f"{ver}:{v['advisory']} disagrees with its advisory")
 
@@ -757,16 +855,18 @@ def test_the_committed_matrix_stays_well_inside_what_its_readers_will_read():
     # a margin before a release is refused.
     #
     # The cap was raised once, from 256 to 448 KiB in 0.33.0, when that release's eight advisories
-    # took the file to about 284 KB, past the old cap. That raise was safe because it stays below
+    # took the file to 283,912 bytes, past the old cap. That raise was safe because it stays below
     # every reader: the smallest limit any supported reader has is 512 KiB, so a file the validator
-    # passes is still one they all read, with 64 KiB to spare. There is no such room for another:
-    # past 448 KiB the next step is the format change (references that carry only the advisory id,
-    # which the readers accept from 0.33.0 on), once no supported reader needs the repeated fields,
-    # not a higher line.
+    # passes is still one they all read, with 64 KiB to spare. There is no such room for another.
+    # The other lever is the short form: a reference below the validator's ID_ONLY_REFERENCES_BELOW
+    # may carry only the advisory id, which the readers accept from 0.33.0 on, and a release commit
+    # writes it with `matrix_sync.py compact` (283,912 bytes become 217,553). The boundary sits
+    # where the host tools of 0.30.0 to 0.32.x stop listing releases from the repeated fields; it
+    # can rise as the releases in their list move up, never fall.
     size = MATRIX_PATH.stat().st_size
     assert size < um.MAX_BYTES * 3 // 4, f"docs/upgrade-matrix.json is {size} bytes"
     # The cap itself stays below the smallest reader's limit, or the validator would pass a file a
-    # deployed reader drops; and the file 0.33.0 publishes (about 284 KB with its advisories) sits
+    # deployed reader drops; and the file 0.33.0 publishes (283,912 bytes with its advisories) sits
     # inside the warning line, with room for a few more.
     assert um.MAX_BYTES <= 512 * 1024 - 64 * 1024
     assert 240_000 < um.MAX_BYTES * 3 // 4
