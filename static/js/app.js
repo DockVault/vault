@@ -7077,6 +7077,9 @@ const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds'
 // Targets that open a dialog rather than a page: a notice about the reader's own account (a password,
 // an email address or a second factor an administrator changed) opens "Your account".
 const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
+// A notice about one vault opens it: "#vault/" and its id, nothing else (a zero-knowledge vault's name is
+// sealed, so a notice can only name it by id). The id is matched in full before it is used.
+const _NOTIF_VAULT_TARGET = /^#vault\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -7160,6 +7163,9 @@ async function onNotifClick(n) {
         if (item) item.click();
     } else if (_NOTIF_TARGET_OPEN[n.target]) {
         _NOTIF_TARGET_OPEN[n.target]();
+    } else {
+        const vault = String(n.target || '').match(_NOTIF_VAULT_TARGET);
+        if (vault) await openVault(vault[1]);
     }
 }
 

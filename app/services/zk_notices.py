@@ -11,7 +11,8 @@
   account's key first owns it, and receives what is shared with that account; a key the user did not set up
   themselves means someone else did.
 * **A member's report that their key does not match** (POST /ecc/vaults/{id}/key-proof/report). The vault's
-  owner is told in the app, at most once a day for each vault.
+  owner is told in the app, at most once a day for each vault, in words that fit what was found; the notice
+  opens that vault.
 
 Each notice is best-effort: it runs after what it tells about, in its own session, and never raises, so a
 notice that cannot be delivered never undoes or holds up the change. An email goes to the account's address,
@@ -45,13 +46,31 @@ KEY_REGISTERED_TEXT = (
     "can open what is shared with you."
 )
 MISMATCH_TITLE = "A member's key for one of your vaults does not match"
-# What a report is about, as a sentence can name it.
+# What each kind of report tells the owner. Only a key that does not match (dek_check, team_key) stops the member
+# writing; a seal or lineage finding is a warning (docs/design/vault-zk-key-proof-v1.md, 11.1 and 11.2). The
+# notice opens the vault it is about, by its id: a zero-knowledge vault's name is sealed.
+_RESET = ("Open the vault from this notice: as its owner you can reset its key from its key details, which "
+          "gives every remaining member a new copy.")
 FINDINGS = {
-    "dek_check": "the key a member was given",
-    "seal": "the key check material a manager opened",
-    "team_key": "the team key a member was given",
-    "lineage": "the record that the current key was made by someone who held the one before",
+    "dek_check": ("A member's app found that the key it was given for one of your zero-knowledge vaults is not "
+                  "the vault's key, and it will not write to the vault with it. " + _RESET),
+    "team_key": ("A member's app found that the team key it was given for one of your zero-knowledge vaults is "
+                 "not the vault's team key, and it will not write to the vault with it. " + _RESET),
+    "seal": ("A manager's app could not open the key check of one of your zero-knowledge vaults with the key "
+             "it holds. Nobody is stopped from writing. Open the vault from this notice and look at its key "
+             "details; if the key was not changed as you expected, you can reset it there."),
+    "lineage": ("A member's app could not confirm that the current key of one of your zero-knowledge vaults "
+                "was made by someone who held the key before it. Nobody is stopped from writing. Open the vault "
+                "from this notice and look at its key details; if nobody you trust rotated the key, you can "
+                "reset it there."),
 }
+_FINDING_OTHER = ("A member's app reported a problem with the key of one of your zero-knowledge vaults. Open the "
+                  "vault from this notice and look at its key details.")
+
+
+def vault_target(vault_id) -> str:
+    """The in-app link that opens a vault, by its id."""
+    return f"#vault/{vault_id}"
 
 
 def _now() -> datetime:
@@ -181,13 +200,10 @@ def key_check_mismatch(db, vault, finding: str) -> None:
         if owner is None:
             return
         now = _now()
-        what = FINDINGS.get(finding, "a key")
-        text = (f"A member's app found that {what} for a zero-knowledge vault you own does not match the "
-                "vault's key, and it stops writing to the vault with it. As the owner you can reset the "
-                "vault's key from its key details.")
+        text = FINDINGS.get(finding, _FINDING_OTHER)
         # Once a day for each vault: the key names the vault and the day, so another vault's report still
         # reaches the owner the same day.
-        _tell(db, [owner], title=MISMATCH_TITLE, text=text, target="#vaults", email=False,
+        _tell(db, [owner], title=MISMATCH_TITLE, text=text, target=vault_target(vault.id), email=False,
               dedup=f"zk-key-mismatch:{vault.id}:{now.strftime('%Y-%m-%d')}")
     except Exception as exc:  # noqa: BLE001
         print(f"⚠ key-mismatch notice skipped: {type(exc).__name__}")

@@ -81,6 +81,11 @@ def test_a_members_report_is_recorded_and_the_owner_told_once_a_day_per_vault(ad
         other = mc.post(f"/ecc/vaults/{vids[1]}/key-proof/report", json={"dek_epoch": 1, "finding": "seal"})
         assert other.status_code == 200, other.text
         assert len(_told(oc)) == 2
+        # Each notice opens the vault it is about, and says whether the finding stops the member writing.
+        by_target = {n["target"]: n["body"] for n in _told(oc)}
+        assert set(by_target) == {f"#vault/{vids[0]}", f"#vault/{vids[1]}"}, by_target
+        assert "will not write" in by_target[f"#vault/{vids[0]}"]
+        assert "Nobody is stopped from writing" in by_target[f"#vault/{vids[1]}"]
         assert _told(mc) == [], "the member who reported was told as if they owned the vault"
         assert _psql("SELECT string_agg(details->>'finding', ',' ORDER BY timestamp) FROM audit_logs "
                      f"WHERE action = 'zk_key_check_mismatch' AND resource_id = '{vids[0]}'") == "dek_check,lineage"

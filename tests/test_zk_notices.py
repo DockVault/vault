@@ -265,7 +265,44 @@ def test_a_mismatch_report_tells_the_owner_in_the_app_once_a_day_per_vault(world
     world.clock["now"] += timedelta(days=1)
     N.key_check_mismatch(world.db, first, "dek_check")
     assert len(_notices(world, owner)) == 3
-    assert all(t == N.MISMATCH_TITLE and target == "#vaults" for t, _, target in _notices(world, owner))
+    # Each notice opens the vault it is about, by its id.
+    assert [(t, target) for t, _, target in _notices(world, owner)] == [
+        (N.MISMATCH_TITLE, f"#vault/{first.id}"), (N.MISMATCH_TITLE, f"#vault/{second.id}"),
+        (N.MISMATCH_TITLE, f"#vault/{first.id}")]
+
+
+@pytest.mark.parametrize("finding,blocks", [("dek_check", True), ("team_key", True), ("seal", False),
+                                            ("lineage", False), ("something new", False)])
+def test_a_mismatch_notice_says_what_was_found_and_whether_it_stops_writing(world, finding, blocks):
+    """Only a key that does not match stops a member writing (dek_check, team_key); a seal or lineage finding
+    is a warning. The notice says which, and never names the vault."""
+    owner = _person(world)
+    vid = uuid.uuid4()
+    world.db.add(Vault(id=vid, owner_id=owner.id, type="zero_knowledge", key_wrapping_mode="direct"))
+    world.db.commit()
+    N.key_check_mismatch(world.db, world.db.get(Vault, vid), finding)
+    (title, body, target), = _notices(world, owner)
+    assert target == f"#vault/{vid}"
+    assert ("will not write" in body) is blocks
+    assert ("Nobody is stopped from writing" in body) is (finding in ("seal", "lineage"))
+    assert "Open the vault from this notice" in body
+    assert len({N.FINDINGS[f] for f in ("dek_check", "team_key", "seal", "lineage")}) == 4
+
+
+def test_the_web_app_opens_the_vault_a_notice_names_and_nothing_else():
+    import re
+    app_js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    decl = re.search(r"const _NOTIF_VAULT_TARGET = /(.+)/;", app_js)
+    assert decl, "the vault target pattern is gone"
+    pattern = re.compile(decl.group(1))       # the same syntax in both: an escaped slash is a slash
+    vid = str(uuid.uuid4())
+    assert pattern.fullmatch(N.vault_target(vid)).group(1) == vid
+    for other in (f"#vault/{vid}/x", f"#vault/{vid[:-1]}", "#vault/../settings", f"#vaults/{vid}",
+                  f"#vault/{vid.upper()}", f"javascript:#vault/{vid}"):
+        assert not pattern.fullmatch(other), other
+    click = app_js[app_js.index("async function onNotifClick("):app_js.index("async function markNotifRead(")]
+    assert "String(n.target || '').match(_NOTIF_VAULT_TARGET)" in click
+    assert "if (vault) await openVault(vault[1]);" in click
 
 
 def test_a_notice_that_cannot_be_written_never_raises(world, monkeypatch):

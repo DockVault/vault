@@ -784,7 +784,8 @@ and something about it failed, is offered to remove that person in the same step
 
 `POST /ecc/vaults/{id}/key-proof/report` with `{"dek_epoch": n, "finding": "dek_check" | "seal" | "team_key" |
 "lineage"}` records what a member's check found (`zk_key_check_mismatch`) and tells the vault's owner in the app,
-once a day for each vault. It is open to anyone who holds a key of the vault at any epoch (everyone else gets the
+once a day for each vault. The notice opens that vault (by its id) and says what was found, and whether it stops
+the member writing: a key that does not match does, a seal or lineage finding does not. It is open to anyone who holds a key of the vault at any epoch (everyone else gets the
 same 403 whether or not the vault exists), is rate-limited, and changes nothing else: filing one gives a member
 nothing.
 

@@ -404,3 +404,33 @@ def test_a_member_whose_team_key_is_not_the_vaults_cannot_write_with_it(browser,
         ctx_m.close()
         for v in vids:
             co.delete_vault(v)
+
+
+def test_the_owners_notice_of_a_members_report_opens_that_vault(page: Page, zk):
+    """An owner of several zero-knowledge vaults is told which one a member's report is about: the notice
+    opens it, by its id (a zero-knowledge vault's name is sealed)."""
+    from conftest import ZK_EPHEMERAL_STUB, ZK_WRAPPED_DEK_STUB, create_zk_vault, ensure_ecc_keypair, post_zk
+    owner, co = zk()
+    member, cm = zk()
+    ensure_ecc_keypair(co)
+    ensure_ecc_keypair(cm)
+    vids = [create_zk_vault(co)["id"] for _ in range(2)]
+    try:
+        for vid in vids:
+            post_zk(co, f"/ecc/vaults/{vid}/members", json={
+                "user_id": member["id"], "wrapped_dek": ZK_WRAPPED_DEK_STUB,
+                "ephemeral_public_key": ZK_EPHEMERAL_STUB}).raise_for_status()
+            co.post(f"/vaults/{vid}/permissions", json={"user_id": member["id"], "level": "read"}).raise_for_status()
+        r = cm.post(f"/ecc/vaults/{vids[1]}/key-proof/report", json={"dek_epoch": 1, "finding": "dek_check"})
+        assert r.status_code == 200, r.text
+
+        _login(page, owner["_username"], owner["_password"])
+        page.click("#notif-btn")
+        notice = page.locator("#notif-list .notif-item", has_text="does not match")
+        expect(notice).to_have_count(1, timeout=10000)
+        expect(notice).to_contain_text("will not write")
+        notice.click()
+        page.wait_for_function("(v) => state.currentVaultId === v", arg=vids[1], timeout=15000)
+    finally:
+        for vid in vids:
+            co.delete_vault(vid)
