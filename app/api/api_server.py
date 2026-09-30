@@ -24887,6 +24887,13 @@ async def lifespan(app: FastAPI):
     from app.core import settings_registry
     settings_registry.start()
 
+    # Database maintenance the app does not need in order to be correct (an index built or dropped
+    # concurrently, a table's storage settings), last and off the startup path, on a thread of its own,
+    # so a large table never delays the first answer. See app/core/background_maintenance.py.
+    from app.core import background_maintenance
+    from app.core.database import _require_engine
+    background_maintenance.start_background(_require_engine)
+
     yield
     
     # Shutdown - cancel background tasks
