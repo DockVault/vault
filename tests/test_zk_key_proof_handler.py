@@ -1183,3 +1183,62 @@ def test_an_owner_reset_tells_the_managers_and_a_rotation_does_not(world):
     out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
     assert out["status"] == "ok" and world.told == [("owner_reset", str(reset_vid))]
 
+
+
+# ------------------------------------------------------------------ a member's report of a key that does not match
+
+REPORT = E.report_key_check_mismatch
+
+
+def _report(world, vid, caller, finding="dek_check", epoch=1):
+    s = world.Session()
+    try:
+        user = s.query(User).filter(User.id == caller).first()
+        return run_coroutine(REPORT(vault_id=str(vid), request=E.KeyCheckReport(dek_epoch=epoch, finding=finding),
+                                    current_user=user, db=s))
+    finally:
+        s.close()
+
+
+def test_a_key_holders_report_is_recorded_and_the_owner_told(world, monkeypatch):
+    told = []
+    monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda db, vault, finding: told.append((str(vault.id), finding)))
+    vid, owner, manager, _ = world.direct_vault()
+    out = _report(world, vid, manager, "lineage")
+    assert out == {"status": "recorded", "vault_id": str(vid), "dek_epoch": 1, "finding": "lineage"}
+    assert world.audit[-1] == ("zk_key_check_mismatch", {"dek_epoch": 1, "finding": "lineage", "mode": "direct"})
+    assert told == [(str(vid), "lineage")]
+    # The owner's own report is recorded; the owner sees the warning on the vault already.
+    assert _report(world, vid, owner, "seal")["status"] == "recorded"
+    assert told == [(str(vid), "lineage")]
+    # A report changes nothing about the vault's keys.
+    assert world.dek_version(vid) == 1 and world.proof_rows(vid).keys() == {1}
+
+
+def test_a_report_is_refused_to_anyone_without_a_key_and_for_what_is_not_a_finding(world, monkeypatch):
+    monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda *a: None)
+    vid, owner, manager, _ = world.direct_vault()
+    stranger = world.new_person()
+    from fastapi import HTTPException
+    for caller in (stranger,):
+        with pytest.raises(HTTPException) as exc:
+            _report(world, vid, caller)
+        assert exc.value.status_code == 403
+    # A member whose key was switched off.
+    s = world.Session()
+    row = s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid, VaultMemberKey.user_id == manager).one()
+    row.is_active = False
+    s.commit()
+    s.close()
+    with pytest.raises(HTTPException) as exc:
+        _report(world, vid, manager)
+    assert exc.value.status_code == 403
+    for finding, epoch in (("guess", 1), ("dek_check", 2)):
+        with pytest.raises(HTTPException) as exc:
+            _report(world, vid, owner, finding, epoch)
+        assert exc.value.status_code == 400
+    # A vault that does not exist answers as one the caller cannot reach.
+    with pytest.raises(HTTPException) as exc:
+        _report(world, uuid.uuid4(), owner)
+    assert exc.value.status_code == 403
+    assert not [a for a, _ in world.audit if a == "zk_key_check_mismatch"]

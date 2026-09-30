@@ -414,11 +414,14 @@ let wander = null;                                         // where the user wal
 const resolveUploadConflict = async (name, autoName, by) => { asked.push(name); offered.push(autoName); heldBy.push(by);
     if (wander) state.currentFolderId = wander; return { action: answer, name: autoName }; };
 const zkGetCurrentDekVersion = async () => 2, zkGetVaultDek = async () => 'dek';
+const zkGetWriteDek = async () => 'dek';
 const eccLib = () => ({ ZK_CONTENT_WRITE_V2: true, nameBlindIndex: async (n) => { derived++; return 'bi:' + n; },
                         encryptName: async () => 'sealed' });
 const zkUploadNameCandidates = async (lib, n) => ['bi-old:' + n, 'bi:' + n];
 const zkNewObjId = () => 'obj', zkUploadDecision = () => 'seal', MAX_BUFFERED_DOWNLOAD_BYTES = 1, formatBytes = null;
 const isCodedCryptoError = () => false, safeMessageForCode = () => '';
+const zkWriteFailureMessage = (e) => (e && e.zkKeyMismatch) ? e.message
+    : (isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock') : 'Zero-knowledge encryption failed.');
 const uploadManager = { items: new Map(), enqueueNamed(entries, place) { enqueued.push(...entries); placed.push(place); },
 """ + _resolver_src(js) + """
 };

@@ -616,6 +616,8 @@
 
                     <!-- Zero-knowledge: shown to a key holder when the vault owes a key rotation (filled by app.js) -->
                     <div id="vault-rekey-notice" hidden></div>
+                    <!-- Zero-knowledge: shown when the key this browser holds, or the vault's key history, does not check out (filled by app.js) -->
+                    <div id="vault-key-warning" hidden></div>
 
                     <!-- Files Tab -->
                     <div id="vault-files-tab" class="vault-tab-content active">
@@ -834,6 +836,14 @@
                                         <div id="info-file-expiration">-</div>
                                     </div>
                                 </div>
+                            </div>
+
+                            <!-- Zero-knowledge: what this browser found about the vault's key (filled by app.js) -->
+                            <div class="card" id="vault-key-details-card" hidden>
+                                <div class="card-header">
+                                    <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-key"/></svg> Encryption key</h3>
+                                </div>
+                                <div class="card-body" id="vault-key-details"></div>
                             </div>
                         </div>
                     </div>
@@ -4044,6 +4054,7 @@
     <script src="/static/js/ui-v2.js?v=20260929a"></script>
     <script src="/static/js/transfer_gate.js?v=20260808b"></script>
     <script src="/static/js/ecc_crypto.js?v=20261003b"></script>
+    <script src="/static/js/zk_key_checks.js?v=20260930a"></script>
     <script src="/static/js/app.js?v=20261003b"></script>
     <script src="/static/js/activity.js?v=20260929a"></script>
     <script src="/static/js/settings-records.js?v=20261003a"></script>

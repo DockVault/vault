@@ -203,6 +203,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("activity_vault_unlocked", "vaults", "Vault names unlocked on the Activity page", "notice"),
     # Zero-knowledge keys
     AuditAction("zk_index_key_wrapped", "zero_knowledge", "Name-index key given to members", "notice"),
+    # A member's app found that a key it was given, or the vault's key check, does not match the vault's key.
+    AuditAction("zk_key_check_mismatch", "zero_knowledge", "Vault key did not match a member's check", "warning"),
     # A request to change a vault's keys whose proof that the caller holds the keys did not check out, and
     # one accepted without such a proof (only while the host operator has turned enforcement off).
     AuditAction("zk_key_proof_absent", "zero_knowledge", "Vault key changed without proof of the key", "warning"),

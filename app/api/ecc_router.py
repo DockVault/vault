@@ -1374,16 +1374,19 @@ def _key_proof_view(db: Session, vault: Vault, epoch: int, *, may_manage: bool) 
     """What a key holder sees of an epoch's key-proof material.
 
     Direct, with a row: {"state": "set", source, created_at, public_key, dek_check, lineage_tag}, plus
-    `sealed_private_key` for a caller who may manage the vault. Direct, without one: {"state":
-    "missing"} (the epoch predates key proofs, or was made while they were not required). Hierarchical:
-    {"state": "team"}, with the row's source and lineage tag when it has one; its verifier is the team
-    public key."""
+    `sealed_private_key` and `created_by` (who installed it) for a caller who may manage the vault. Direct,
+    without one: {"state": "missing"} (the epoch predates key proofs, or was made while they were not
+    required). Hierarchical: {"state": "team"}, with the row's source, lineage tag and time when it has one
+    (and `created_by` for a manager); its verifier is the team public key."""
     row = db.query(VaultKeyProof).filter(
         VaultKeyProof.vault_id == vault.id, VaultKeyProof.dek_epoch == epoch).first()
     if _is_hierarchical(vault):
         view = {"state": "team"}
         if row is not None:
-            view.update(source=row.source, lineage_tag=row.lineage_tag)
+            view.update(source=row.source, lineage_tag=row.lineage_tag,
+                        created_at=row.created_at.isoformat() if row.created_at else None)
+            if may_manage:
+                view["created_by"] = str(row.created_by) if row.created_by else None
         return view
     if row is None or not row.proof_public_key:
         return {"state": "missing"}
@@ -1394,6 +1397,9 @@ def _key_proof_view(db: Session, vault: Vault, epoch: int, *, may_manage: bool) 
     }
     if may_manage:
         view["sealed_private_key"] = row.sealed_private_key
+        # Who installed the epoch's material, for a manager's key details: an owner resetting damaged
+        # material is offered to remove that person in the same step.
+        view["created_by"] = str(row.created_by) if row.created_by else None
     return view
 
 
@@ -1906,6 +1912,63 @@ async def bootstrap_key_proof(
         db.rollback()
         raise zk_key_proof.KeyProofRefusal("zk-key-proof-exists")
     return {"status": "ok", "vault_id": str(locked.id), "dek_epoch": epoch}
+
+
+# The findings a member's app can report (POST /ecc/vaults/{id}/key-proof/report): the key check of a direct
+# epoch that the member's DEK does not reproduce; a manager's copy of the epoch's sealed proof key that does not
+# open with it; a team private key whose public point is not the vault's team public key; and a lineage tag
+# that does not check out against the previous epoch's key, or is missing where one is due.
+KEY_CHECK_FINDINGS = ("dek_check", "seal", "team_key", "lineage")
+
+
+class KeyCheckReport(BaseModel):
+    dek_epoch: int = Field(..., ge=1)
+    finding: str = Field(..., max_length=16)
+
+
+@router.post("/vaults/{vault_id}/key-proof/report")
+async def report_key_check_mismatch(
+    vault_id: str,
+    request: KeyCheckReport,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record that a member's app found a key that does not match this vault's key.
+
+    A member's app checks the key it was given against the epoch's key check, a manager's app opens the
+    epoch's sealed proof key, and every app compares the team key it unwrapped with the vault's team public
+    key and checks the lineage tag of the current epoch. What fails is reported here: it is recorded
+    (zk_key_check_mismatch) and the vault's owner is told in the app, once a day for each vault. A report
+    changes nothing else, so filing one gives a member nothing: it cannot lower a check or block anyone.
+
+    Open to anyone who holds a key of the vault at any epoch; everyone else gets the same 403 whether or
+    not the vault exists, as GET /keys does."""
+    _ecc_rate_limit(current_user, "mutate")
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not _reaches_vault(db, vault, current_user.id):
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
+    if not may_release_vault_key(db, current_user, vault):
+        raise HTTPException(status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED)
+    enforce_vault(current_user, vault_id)
+    holds_a_key = db.query(VaultMemberKey.id).filter(
+        VaultMemberKey.vault_id == vault.id,
+        VaultMemberKey.user_id == current_user.id,
+        VaultMemberKey.is_active == True,  # noqa: E712
+    ).first() is not None
+    if not holds_a_key:
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
+    if request.finding not in KEY_CHECK_FINDINGS:
+        raise HTTPException(status_code=400, detail="finding must be one of: " + ", ".join(KEY_CHECK_FINDINGS))
+    if request.dek_epoch > (getattr(vault, 'dek_version', 1) or 1):
+        raise HTTPException(status_code=400, detail="dek_epoch is not an epoch of this vault")
+    mode = getattr(vault, 'key_wrapping_mode', None) or 'direct'
+    _audit_zk(db, current_user, "zk_key_check_mismatch", resource_id=vault.id,
+              details={"dek_epoch": request.dek_epoch, "finding": request.finding, "mode": mode})
+    if str(vault.owner_id) != str(current_user.id):
+        # The owner's own app shows them the same warning on the vault itself.
+        zk_notices.key_check_mismatch(db, vault, request.finding)
+    return {"status": "recorded", "vault_id": str(vault.id), "dek_epoch": request.dek_epoch,
+            "finding": request.finding}
 
 
 @router.get("/users/{user_id}/public-key")

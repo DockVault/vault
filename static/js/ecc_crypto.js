@@ -1302,7 +1302,7 @@ class ECCCryptoLibrary {
      * @private
      */
     async _unwrapTeamPrivateKeyV2(wrapBytes, ephemeralPublicKeyBase64, memberPrivateKey,
-                                  context, extractable) {
+                                  context, extractable, checkPublicKeyPem = null) {
         const { vaultId, recipientUserId } = context || {};
         if (wrapBytes.length < this.V2_TEAMPRIV_MIN_BYTES
             || wrapBytes.length > this.V2_TEAMPRIV_MAX_BYTES) {
@@ -1321,11 +1321,25 @@ class ECCCryptoLibrary {
             // done with a key that will not leave the browser. That copy is a local in one
             // function and is never cached. Any new caller passing true needs the same
             // justification, in writing, at its own call site.
-            return this._subtle().importKey(
+            const key = await this._subtle().importKey(
                 'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, extractable, ['deriveBits']);
+            return this._withTeamKeyCheck(key, pkcs8, checkPublicKeyPem);
         } catch (error) {
             throw _coerceCryptoError(error, CRYPTO_ERROR_CODES.WRAP_FAILED, 'unwrapTeamPriv.v2');
         }
+    }
+
+    /**
+     * The unwrapped team key, or -- when the caller named the vault's team public key -- the key and
+     * whether it is that key's pair, compared while the PKCS8 bytes are in hand (the key comes out of
+     * here non-extractable, so nothing later could compare it). A mismatch is an answer, not an error:
+     * reading goes on as before, and the caller decides what else it stops.
+     * @private
+     */
+    async _withTeamKeyCheck(key, pkcs8, checkPublicKeyPem) {
+        if (checkPublicKeyPem === null || checkPublicKeyPem === undefined) return key;
+        return { privateKey: key,
+                 matchesPublic: await this.teamPrivateKeyMatchesPublic(pkcs8, checkPublicKeyPem) };
     }
 
     /**
@@ -2377,6 +2391,30 @@ class ECCCryptoLibrary {
      * @returns {Promise<CryptoKey>} the team private key (non-extractable)
      */
     async unwrapPrivateKeyFromWrapped(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey, extractable = false, context = null) {
+        return this._unwrapTeamPrivateKey(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey,
+                                          extractable, context, null);
+    }
+
+    /**
+     * unwrapPrivateKeyFromWrapped, which also says whether the team private key is the pair of the vault's
+     * team public key `teamPublicKeyPem`. Every member who unwraps the team key of the current team epoch
+     * compares it: a team key that is not the vault's -- a wrap swapped by someone who holds the key, or a
+     * database edit -- is what the member's app then refuses to write with. The key is non-extractable.
+     *
+     * @returns {Promise<{privateKey: CryptoKey, matchesPublic: boolean}>}
+     */
+    async unwrapTeamPrivateKeyWithCheck(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey,
+                                        context, teamPublicKeyPem) {
+        if (typeof teamPublicKeyPem !== 'string' || !teamPublicKeyPem) {
+            this._fail(CRYPTO_ERROR_CODES.INVALID_INPUT, 'unwrapTeamPrivateKeyWithCheck.publicKey');
+        }
+        return this._unwrapTeamPrivateKey(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey,
+                                          false, context, teamPublicKeyPem);
+    }
+
+    /** @private The two public unwraps of a team private key; see _withTeamKeyCheck for the last argument. */
+    async _unwrapTeamPrivateKey(wrappedKeyBase64, ephemeralPublicKeyBase64, memberPrivateKey, extractable,
+                                context, checkPublicKeyPem) {
         // Judge the size BEFORE materialising it. Base64 is four characters per three bytes,
         // so the encoded length bounds the decoded one without decoding anything -- and a
         // ceiling applied after the decode has already let a hostile server hand us as much
@@ -2401,7 +2439,7 @@ class ECCCryptoLibrary {
                            'unwrapPrivateKeyFromWrapped.v2.context');
             }
             return this._unwrapTeamPrivateKeyV2(wrapBytes, ephemeralPublicKeyBase64,
-                                                memberPrivateKey, context, extractable);
+                                                memberPrivateKey, context, extractable, checkPublicKeyPem);
         }
         const ephemeralPublicKey = await this._importRawPublicKey(
             this._base64ToArrayBuffer(ephemeralPublicKeyBase64)
@@ -2419,9 +2457,10 @@ class ECCCryptoLibrary {
         // Least privilege: the team private key is only ever used to ECDH-unwrap the vault DEK
         // (deriveBits), never deriveKey — so import it with deriveBits only, not the identity
         // keypair's broader KEY_USAGES_PRIVATE.
-        return await this._subtle().importKey(
+        const key = await this._subtle().importKey(
             'pkcs8', pkcs8, { name: 'ECDH', namedCurve: this.CURVE }, extractable, ['deriveBits']
         );
+        return this._withTeamKeyCheck(key, pkcs8, checkPublicKeyPem);
     }
 
     // =========================================================================
@@ -3884,6 +3923,7 @@ const _OPERATION_DEFAULT_CODE = Object.freeze({
     unwrapLinkTokenV2: CRYPTO_ERROR_CODES.WRAP_FAILED,
     wrapPrivateKeyToPublic: CRYPTO_ERROR_CODES.WRAP_FAILED,
     unwrapPrivateKeyFromWrapped: CRYPTO_ERROR_CODES.WRAP_FAILED,
+    unwrapTeamPrivateKeyWithCheck: CRYPTO_ERROR_CODES.WRAP_FAILED,
 
     // Vault-key-encrypted content. The user supplied no secret to reach here, so a failure is
     // never a passphrase problem and must never be reported as one.
