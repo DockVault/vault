@@ -29,7 +29,8 @@ set_bare_api_env()
 import app.api.api_server as S  # noqa: E402
 from app.core import database  # noqa: E402
 from app.core import email_actions as ea  # noqa: E402
-from app.core.models import Notification, RoleEnum, User, Vault, vault_members  # noqa: E402
+from app.core import credential_changes as cc  # noqa: E402
+from app.core.models import CredentialChange, Notification, RoleEnum, User, Vault, vault_members  # noqa: E402
 from app.services import zk_notices as N  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -53,7 +54,8 @@ def world(monkeypatch):
     monkeypatch.setattr(sqltypes.Uuid, "bind_processor", bind_processor)
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'n.db'}", connect_args={"check_same_thread": False})
-        for table in (User.__table__, Vault.__table__, vault_members, Notification.__table__):
+        for table in (User.__table__, Vault.__table__, vault_members, Notification.__table__,
+                      CredentialChange.__table__):
             table.create(engine)
         maker = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         opened = []
@@ -196,6 +198,51 @@ def test_setting_up_a_key_tells_its_user(world):
     (title, body, target), = _notices(world, user)
     assert title == N.KEY_REGISTERED_TITLE and target == "#profile"
     assert world.mails == [(N.EMAIL_ACTION, user.email, N.KEY_REGISTERED_TEXT)]
+
+
+# ------------------------------------------------------------------------------------ which address
+
+def _changed(world, user, kind, payload, days_ago=1):
+    when = cc.utcnow() - timedelta(days=days_ago)
+    world.db.add(CredentialChange(target_user_id=user.id, kind=kind, status=cc.MADE, requested_by_name="admin",
+                                  requested_at=when, applied_at=when, payload=payload))
+    world.db.commit()
+
+
+@pytest.mark.parametrize("notice", ["registered", "failed proof"])
+def test_after_an_administrators_change_the_address_before_it_is_told_too(world, notice):
+    """The administrator set a password, signed in with it, and moved the address through the account's own
+    settings: the notice still reaches the address the account had."""
+    user = _person(world)
+    _changed(world, user, cc.PASSWORD, {"email_at_change": "person@example.com"})
+    (N.key_registered if notice == "registered" else N.failed_identity_proof)(world.db, user)
+    assert sorted(m[1] for m in world.mails) == sorted([user.email, "person@example.com"])
+
+
+def test_an_administrators_email_change_tells_the_address_before_it(world):
+    user = _person(world)
+    _changed(world, user, cc.EMAIL, {"previous_email": "person@example.com", "new_email": user.email})
+    N.key_registered(world.db, user)
+    assert sorted(m[1] for m in world.mails) == sorted([user.email, "person@example.com"])
+
+
+@pytest.mark.parametrize("payload,days_ago", [
+    ({"email_at_change": None}, 1),                 # the account had no address
+    (None, 1),                                      # a change recorded before it kept one
+    ({"email_at_change": "person@example.com"}, 15),  # outside the 14 days
+])
+def test_without_another_known_address_only_the_account_is_told(world, payload, days_ago):
+    user = _person(world)
+    _changed(world, user, cc.PASSWORD, payload, days_ago=days_ago)
+    N.key_registered(world.db, user)
+    assert [m[1] for m in world.mails] == [user.email]
+
+
+def test_the_same_address_is_told_once(world):
+    user = _person(world)
+    _changed(world, user, cc.PASSWORD, {"email_at_change": user.email.upper()})
+    N.key_registered(world.db, user)
+    assert [m[1] for m in world.mails] == [user.email]
 
 
 # ------------------------------------------------------------------------------------ mismatch report

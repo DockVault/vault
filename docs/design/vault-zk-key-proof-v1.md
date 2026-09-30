@@ -807,7 +807,9 @@ nothing.
 ## 12. Who is told (0.34.0)
 
 Each notice is in the app and, where it says so, by email through the system email "Encryption key notice", which
-is locked to its built-in text and the default sending profile (§13.2).
+is locked to its built-in text and the default sending profile (§13.2). The email goes to the account's address and,
+for 14 days after an administrator changed the account's sign-in details, also to the address it had before the
+first of those changes: whoever made the change can move the address through the account's own settings.
 None names a vault: a zero-knowledge vault's name is sealed, and the server does not know it.
 
 | What happened | Who is told | How often |

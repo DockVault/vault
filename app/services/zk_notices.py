@@ -14,7 +14,9 @@
   owner is told in the app, at most once a day for each vault.
 
 Each notice is best-effort: it runs after what it tells about, in its own session, and never raises, so a
-notice that cannot be delivered never undoes or holds up the change. No notice names a vault: a
+notice that cannot be delivered never undoes or holds up the change. An email goes to the account's address,
+and for 14 days after an administrator changed the account's sign-in details also to the address it had before
+(_addresses). No notice names a vault: a
 zero-knowledge vault's name is sealed, and the server does not know it.
 """
 from __future__ import annotations
@@ -71,9 +73,34 @@ def _told_recently(user_id, title: str, since: datetime) -> bool:
         ).first() is not None
 
 
+def _addresses(user) -> list:
+    """Where an email to this person goes: the account's address, and, for 14 days after an administrator
+    changed its sign-in details, also the address it had before the first of those changes, when that is
+    another one. Whoever made the change can sign in with a password they set and move the address through
+    the account's own settings; a notice meant to reach the person would then reach only them. (The notice
+    of an administrator's change goes to the old address too, for the same reason.) Read in a session of its
+    own; the account's address alone when that cannot be read."""
+    out = []
+    current = (getattr(user, "email", None) or "").strip()
+    if current:
+        out.append(current)
+    try:
+        from app.core import credential_changes as cc
+        from app.core.database import get_db_context
+        with get_db_context() as s:
+            first = cc.first_applied(s, user.id)
+            before = cc.address_before(first) if first is not None else None
+        if before and before.lower() not in {a.lower() for a in out}:
+            out.append(before)
+    except Exception as exc:  # noqa: BLE001 -- a notice must never surface anywhere
+        print(f"⚠ key notice: earlier address not read: {type(exc).__name__}")
+    return out
+
+
 def _tell(db, users, *, title: str, text: str, target: str, dedup: Optional[str] = None,
           email: bool = True) -> list:
-    """The in-app notice, and the email to each person the notice reached. Returns the ids told."""
+    """The in-app notice, and the email to each person the notice reached (see _addresses). Returns the ids
+    told."""
     from app.api.api_server import _fire_action_email, _notify_users
     users = [u for u in users if u is not None]
     told = _notify_users([str(u.id) for u in users], NOTICE_TYPE, title=title, body=text, target=target,
@@ -81,9 +108,9 @@ def _tell(db, users, *, title: str, text: str, target: str, dedup: Optional[str]
     if email:
         for u in users:
             if str(u.id) in told:
-                _fire_action_email(db, EMAIL_ACTION, email=getattr(u, "email", None),
-                                   username=getattr(u, "username", None),
-                                   action_context={"change": text, "when": _when()})
+                for address in _addresses(u):
+                    _fire_action_email(db, EMAIL_ACTION, email=address, username=getattr(u, "username", None),
+                                       action_context={"change": text, "when": _when()})
     return told
 
 
