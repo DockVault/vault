@@ -202,8 +202,11 @@ def test_an_older_host_tool_on_an_older_running_release_misreads_only_its_own_fi
     without a title, so "Moving to vX fixes N known vulnerabilities" counts wrong (for the newest
     release far too few), and a target that is itself affected is said, in red, to bring back
     findings that the running version has as well. Nothing it names as brought back is missing
-    from the running version, nothing really brought back goes unnamed, and a target with no
-    findings is never said to bring anything back. From the boundary on, nothing changes.
+    from the running version, and a target with no findings is never said to bring anything back.
+    For a target on the boundary or above, which every release the tool lists is, nothing really
+    brought back goes unnamed either. A target below the boundary, asked for by name, carries short
+    references too, so the tool can leave out findings it really brings back; that case is not
+    checked here. From the boundary on, nothing changes.
     """
     tool = shipped(tool_tag, "dockvault.py")
     local = json.loads(_at(tool_tag, "docs/upgrade-matrix.json"))
@@ -212,6 +215,7 @@ def test_an_older_host_tool_on_an_older_running_release_misreads_only_its_own_fi
     merged = {name: tool.merge_lifecycle_matrix(local, main, tags[0])[0]
               for name, main in forms.items()}
     boundary = _vkey(_UM.ID_ONLY_REFERENCES_BELOW)
+    assert all(_vkey(target) >= boundary for target in listed), "a listed target below the boundary"
     said_brought_back = 0
 
     for current in forms["full"]["versions"]:
