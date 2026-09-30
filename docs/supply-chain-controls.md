@@ -54,7 +54,11 @@ in a chain, HAProxy with `option forwardfor`, and an nginx inside the API's own 
 under each `TRUSTED_PROXIES` / `TRUST_ALL_PROXIES` setting, with clients at fixed addresses on a
 private Docker network. It checks the client address the audit log records, the scheme a reset link
 is built with, and that a client cannot spend another client's sign-in allowance by typing its
-address. Run it locally with `python3 .github/scripts/proxy_matrix.py --image <image>`; it removes
+address. With the API also published on the Docker host's loopback, it checks the connections Docker
+relays through the network's gateway (a client on the host, over IPv4 and IPv6, and an nginx on the
+host): a range that contains the gateway does not trust it, the token `gateway` does, and the web
+process says at start what to change. An IPv6 check is reported as skipped where the Docker host
+relays no IPv6 loopback. Run it locally with `python3 .github/scripts/proxy_matrix.py --image <image>`; it removes
 everything it created when it ends.
 
 The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from

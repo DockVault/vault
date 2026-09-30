@@ -48,6 +48,8 @@ def test_every_role_has_its_own_address_inside_the_network(addr):
     assert all(ipaddress.ip_address(v) in net for v in values)
     assert addr["api"] == "10.201.7.2" and addr["client"] == "10.201.7.101"
     assert addr["subnet"] == _SUBNET and addr["loopback"] == "127.0.0.1" and addr["forged"] == pm.FORGED
+    assert addr["gateway"] == "10.201.7.1", "Docker's gateway for a network made with --subnet"
+    assert addr["gateway"] not in values
 
 
 @pytest.mark.parametrize("subnet", ["fd00::/64", "10.0.0.0/25", "10.0.0.1/24"])
@@ -63,20 +65,34 @@ def test_each_trust_setting_resolves_to_what_the_vault_is_started_with(addr):
     assert pm.trusted_value(configs["proxies"], addr) == "10.201.7.20,10.201.7.21,10.201.7.22"
     assert pm.trusted_value(configs["all"], addr) == "" and configs["all"].trust_all
     assert pm.trusted_value(configs["subnet"], addr) == _SUBNET
+    assert pm.trusted_value(configs["gateway"], addr) == "gateway"
+    assert [c.key for c in pm.CONFIGS if c.publish] == ["subnet", "gateway"]
 
 
 def test_every_check_resolves_to_a_concrete_url_and_expectation(addr):
     config_keys = [c.key for c in pm.CONFIGS]
     assert len(set(config_keys)) == len(config_keys)
+    publishing = {c.key for c in pm.CONFIGS if c.publish}
     for check in pm.CHECKS:
         assert check.config in config_keys
-        assert pm.url_for(check, addr).startswith(("http://10.201.7.", "https://10.201.7."))
+        url = pm.url_for(check, addr)
+        if check.via in pm.HOST_VIAS:
+            assert url.startswith(("http://127.0.0.1:", "http://[::1]:")) and pm.probe_role(check) == "host"
+            assert check.config in publishing
+        elif check.via == "host-proxy":
+            assert url.startswith(f"http://{addr['gateway']}:") and pm.probe_role(check) == "client"
+            assert check.config in publishing
+        else:
+            assert url.startswith(("http://10.201.7.", "https://10.201.7.")) and pm.probe_role(check) == "client"
+        assert check.ipv6 == (check.via == "relayed6")
         expect = pm.expected_value(check, addr)
         if check.probe == "address":
             ipaddress.ip_address(expect)
         elif check.probe == "scheme":
             assert expect in ("http", "https")
             assert check.via in ("direct", "local-tls", "nginx-tls")
+        elif check.probe == "log":
+            assert expect == "warned" and check.config == "subnet"
         else:
             assert check.probe == "budget" and check.expect == "baseline"
     # every trust setting is exercised, and run in table order (the API restarts once per setting)
@@ -113,11 +129,27 @@ def test_the_table_holds_the_set_ups_that_have_mattered():
     assert [c.config for c in pm.CHECKS if c.probe == "budget"] == ["none"]
 
 
+def test_the_table_holds_the_gateway_set_ups():
+    """Docker relays every connection to a published port through the network's gateway: a client on
+    the Docker host, an IPv6 client, and a reverse proxy on the Docker host. A range that contains the
+    gateway must not trust it, and the start-up warning must say what to set; the token `gateway`
+    trusts it, and only it."""
+    table = {(c.config, c.via, c.probe, c.xff): c.expect for c in pm.CHECKS}
+    assert table[("subnet", "relayed", "address", pm.FORGED)] == "gateway"
+    assert table[("subnet", "relayed6", "address", pm.FORGED)] == "gateway"
+    assert table[("subnet", "host-proxy", "address", None)] == "gateway"
+    assert table[("subnet", "direct", "log", None)] == "warned"
+    assert table[("gateway", "host-proxy", "address", None)] == "client"
+    assert table[("gateway", "host-proxy", "address", pm.FORGED)] == "client"
+    assert table[("gateway", "nginx", "address", pm.FORGED)] == "nginx"
+    assert pm.GATEWAY_WARNING == ("TRUSTED_PROXIES=gateway", "WEB_BIND=127.0.0.1")
+
+
 def test_a_forged_address_is_expected_to_be_believed_only_where_the_table_says_why():
     """The one case where the vault records the address a client made up is a client that is itself
     inside a trusted network, and the table has to say so rather than quietly expect it."""
     believed = [c for c in pm.CHECKS if c.probe == "address" and c.expect == "forged"]
-    assert [(c.config, c.via) for c in believed] == [("subnet", "edge")]
+    assert [(c.config, c.via) for c in believed] == [("subnet", "edge"), ("gateway", "relayed")]
     assert all(c.xff == pm.FORGED and c.note.startswith("documented:") for c in believed)
 
 
@@ -290,6 +322,10 @@ def test_each_proxy_forwards_the_header_the_way_its_set_up_says(addr):
     assert all("proxy_pass http://127.0.0.1:8000;" in s for s in local)
     assert "option forwardfor" in cfg["haproxy"]
     assert f"server vault {addr['api']}:8000" in cfg["haproxy"]
+    # The nginx on the Docker host listens on the gateway's address only, and reaches the published port.
+    assert f"listen {addr['gateway']}:{addr['hostproxy']};" in cfg["hostproxy"]
+    assert f"proxy_pass http://127.0.0.1:{addr['published']};" in cfg["hostproxy"]
+    assert "$proxy_add_x_forwarded_for" in cfg["hostproxy"]
 
 
 def test_configuration_files_are_copied_in_owned_by_root_with_their_modes():
@@ -338,6 +374,18 @@ def test_the_step_summary_is_a_table_that_survives_a_pipe_in_a_cell(addr):
     assert all(line.count(" | ") == 5 for line in rows[1:])
 
 
+def test_a_skipped_check_is_reported_and_is_not_a_failure(addr):
+    results = _results(addr)
+    six = next(i for i, r in enumerate(results) if r.check.ipv6)
+    results[six] = pm.Result(results[six].check, "", "x", False, "no IPv6 here", skipped=True)
+    text = pm.format_report("img:1", results, addr)
+    assert f"{len(pm.CHECKS)} checks, 0 failed, 1 skipped" in text
+    assert [line.split()[0] for line in text.splitlines() if line.startswith("  ") and "|" in line].count("SKIP") == 1
+    data = json.loads(pm.results_json("img:1", results, addr))
+    assert data["failed"] == 0 and data["skipped"] == 1 and data["results"][six]["skipped"] is True
+    assert pm.markdown_report("img:1", results, addr).count("| skip |") == 1
+
+
 def test_the_json_results_count_failures(addr):
     data = json.loads(pm.results_json("img:1", _results(addr, fail_haproxy=True), addr))
     assert data["checks"] == len(pm.CHECKS) and data["failed"] == 1
@@ -360,6 +408,9 @@ class _FakeMatrix:
 
     def run_checks(self):
         self.results.extend(_results(self.addr, fail_haproxy=self.outcome == "fail"))
+        if self.outcome == "pass-without-ipv6":
+            six = next(i for i, r in enumerate(self.results) if r.check.ipv6)
+            self.results[six] = pm.Result(self.results[six].check, "", "x", False, "no IPv6", skipped=True)
         if self.outcome == "crash-midway":
             raise KeyError("access_token")
         return self.results
@@ -376,7 +427,7 @@ def fake_run(monkeypatch):
 
 
 @pytest.mark.parametrize("outcome, status", [
-    ("pass", 0), ("fail", 1), ("broken", 2), ("crash-midway", 2),
+    ("pass", 0), ("fail", 1), ("broken", 2), ("crash-midway", 2), ("pass-without-ipv6", 0),
 ])
 def test_the_exit_status_says_which_kind_of_run_it_was(fake_run, capsys, outcome, status, tmp_path):
     _FakeMatrix.outcome = outcome

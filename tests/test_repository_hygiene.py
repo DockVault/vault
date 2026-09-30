@@ -268,3 +268,22 @@ def test_the_maintenance_release_guide_exists_and_stays_public():
     # short work-item codes (one or two capitals and a number).
     leak = re.search(r"[A-Z]:[\\/]|(?<![\w.])/[a-z]/|\b[A-Z]{1,2}[0-9]{1,2}[a-z]?\b", guide)
     assert leak is None, leak.group(0)
+
+
+def test_every_test_file_a_docstring_names_exists():
+    """A docstring that says another test file proves something live sends a reader to look for it.
+    If that file was never written, or was renamed, the claim is empty and nothing says so."""
+    import ast
+
+    tests = ROOT / "tests"
+    present = {p.name for p in tests.glob("*.py")}
+    missing = []
+    for path in sorted(tests.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [tree] + [n for n in ast.walk(tree)
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        for node in nodes:
+            for name in re.findall(r"\btest_\w+\.py\b", ast.get_docstring(node) or ""):
+                if name not in present:
+                    missing.append(f"{path.name} names {name}")
+    assert not missing, missing

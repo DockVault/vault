@@ -1882,6 +1882,63 @@ def env_upgrade_notes(env, current, target):
     return notes
 
 
+# Where Docker puts compose networks by default (its default address pools), for when the deployment's
+# own network cannot be inspected.
+DOCKER_DEFAULT_POOLS = ("172.16.0.0/12", "192.168.0.0/16")
+
+
+def gateway_trust_note(trusted, gateways, current, target):
+    """The sentence to show before an upgrade from ``current`` to ``target`` when TRUSTED_PROXIES
+    (``trusted``, the raw .env value) holds a range that covers the Docker network's gateway: from
+    0.33.1 a range no longer trusts it. ``gateways`` are the gateway addresses of the deployment's
+    network (read with docker network inspect); when none could be read, a range that overlaps Docker's
+    default pools counts. None when nothing changes. Pure."""
+    import ipaddress
+    cur, tgt = parse_semver(current), parse_semver(target)
+    if tgt is None or tgt < (0, 33, 1) or (cur is not None and cur >= (0, 33, 1)):
+        return None
+    ranges, exact, named = [], [], False
+    for spec in (s.strip() for s in (trusted or "").split(",")):
+        if not spec:
+            continue
+        if spec.lower() == "gateway":
+            named = True
+            continue
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            continue
+        (exact if net.num_addresses == 1 else ranges).append(net)
+    if named or not ranges:
+        return None
+    covered = []
+    for gw in gateways or ():
+        try:
+            addr = ipaddress.ip_address(gw)
+        except ValueError:
+            continue
+        if not any(addr in n for n in exact) and any(addr in n for n in ranges):
+            covered.append(str(addr))
+    if gateways:
+        if not covered:
+            return None
+        where = "the gateway of the vault's Docker network (%s)" % ", ".join(covered)
+    else:
+        pools = [ipaddress.ip_network(p) for p in DOCKER_DEFAULT_POOLS]
+        if not any(r.overlaps(p) for r in ranges for p in pools if r.version == p.version):
+            return None
+        where = "the part of Docker's address space where the vault's network gateway usually is"
+    return ("TRUSTED_PROXIES=%s in .env covers %s. From 0.33.1 a range no longer trusts the gateway: every "
+            "connection Docker relays to the published web port arrives from it (IPv6 clients, clients on this "
+            "host, on Docker Desktop every client), so those clients could set their own address. After the "
+            "upgrade they are recorded as the gateway and their X-Forwarded-For is ignored. A reverse proxy on "
+            "this host arrives from the gateway too: for one, set TRUSTED_PROXIES=gateway and WEB_BIND=127.0.0.1 "
+            "in .env (WEB_BIND needs the compose files of 0.33.1 or later; an install that updates by pulling "
+            "images keeps its own, so publish the web port as 127.0.0.1:<port>:8000 there by hand). A proxy "
+            "container on the vault's network is unaffected: list its address."
+            % ((trusted or "").strip(), where))
+
+
 def backup_reason(plan, down=False):
     """Why a version change needs a backup first, or None when it does not.
 
@@ -3780,6 +3837,18 @@ class DockVault:
         return ["docker", "compose", "--env-file", self._env_path(),
                 "-f", os.path.join(self.root, "docker-compose.secure.yml")] + list(args)
 
+    def _network_gateways(self):
+        """The gateway address(es) of the deployment's Docker network, or [] when it cannot be read (no
+        Docker, or the network does not exist yet). Read-only."""
+        name = "%s_vault-network" % DEFAULT_PROJECT
+        try:
+            r = subprocess.run(["docker", "network", "inspect", name, "--format",
+                                "{{range .IPAM.Config}}{{.Gateway}} {{end}}"],
+                               capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return (r.stdout or "").split() if r.returncode == 0 else []
+
     def _run_dc(self, *args, **kw):
         """Run `docker compose ...` with stdin CLOSED, always.
 
@@ -5108,6 +5177,9 @@ class DockVault:
         self._describe_hop(plan, matrix_source, current, tag, down)
         for note in env_upgrade_notes(env, current, tag):
             print(pal.paint("  Note: " + note, "yellow"))
+        gateway_note = gateway_trust_note(env.get("TRUSTED_PROXIES"), self._network_gateways(), current, tag)
+        if gateway_note:
+            print(pal.paint("  Note: " + gateway_note, "yellow"))
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
         # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version

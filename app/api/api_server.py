@@ -24915,6 +24915,12 @@ if __name__ == "__main__":
     # edited to publish on 0.0.0.0, could expose the plaintext API — login credentials and bearer
     # tokens would then cross the network in cleartext. Terminate TLS in-process (API_USE_HTTPS=true
     # + certs) or front the app with an HTTPS reverse proxy (set TRUSTED_PROXIES).
+    # What the trusted-proxy set does that an operator may not expect: TRUST_ALL_PROXIES, and a range
+    # that covers the Docker gateway (a range no longer trusts it; app/core/net_utils.py).
+    from app.core.net_utils import trust_warnings
+    for _warning in trust_warnings():
+        print(f"\n⚠️  WARNING: {_warning}")
+
     if _should_warn_plaintext_transport(settings.api_use_https, settings.environment, settings.trusted_proxies):
         print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
         print("   Login credentials and bearer tokens cross the network in cleartext if this port is")

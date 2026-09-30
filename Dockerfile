@@ -56,6 +56,11 @@ RUN mkdir -p storage logs keys certs brand
 # root-in-container is the most valuable to drop. chown /app so the runtime dirs (storage/
 # logs/keys/certs) are appuser-owned, and a fresh named volume mounted over them inherits it.
 ENV PYTHONDONTWRITEBYTECODE=1
+# One parser decides the client address: app.core.net_utils, from TRUSTED_PROXIES. The app starts
+# uvicorn with proxy_headers off; this also empties uvicorn's own trusted list (127.0.0.1 by default)
+# for anyone who launches the app with the uvicorn command line instead, which would otherwise
+# believe X-Forwarded-For from a loopback peer.
+ENV FORWARDED_ALLOW_IPS=""
 RUN adduser -D -u 10001 appuser && chown -R appuser:appuser /app
 
 # NOTE: we deliberately do NOT `USER appuser`. The container starts as root so the entrypoint
