@@ -9,9 +9,11 @@ same bytes whichever side runs it.
     python3 .github/scripts/matrix_sync.py sync --main MAIN.json --branch BRANCH.json [--output OUT]
 
         Writes main's matrix plus what the branch has and main does not: its version entries, the
-        edges it declares that main does not, waivers, and advisories main does not have yet
-        together with each version's reference to them (and that version's `secure` flag). Where
-        both declare the same thing, main's is kept and the difference is reported. The result is
+        edges to or from them, waivers, and advisories main does not have yet together with each
+        version's reference to them (and that version's `secure` flag). Where both declare the
+        same thing, main's is kept and the difference is reported. An edge between two releases
+        main declares is main's to keep or drop: one only the branch still has (main replaced it
+        when a later fix left its target affected) is left out and reported. The result is
         validated before anything is written. OUT defaults to BRANCH.json.
 
         On a maintenance branch, before its release commit:
@@ -140,7 +142,10 @@ def sync(main: dict, branch: dict) -> tuple[dict, list[str]]:
     extra_edges = []
     for edge in branch["edges"]:
         pair = (edge["from"], edge["to"])
-        if pair not in main_edges:
+        if pair not in main_edges and all(v in main["versions"] for v in pair):
+            notes.append(f"left out the branch's edge {pair[0]} -> {pair[1]}: main declares both "
+                         "releases, not it")
+        elif pair not in main_edges:
             extra_edges.append(_copy(edge))
             notes.append(f"took the edge {pair[0]} -> {pair[1]} from the branch")
         elif edge != main_edges[pair]:

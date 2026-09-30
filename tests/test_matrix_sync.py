@@ -184,6 +184,31 @@ def test_a_fix_only_the_older_line_needs_brings_its_advisory_to_main():
     assert "took the advisory older-line-only from the branch" in notes
 
 
+def test_an_edge_main_replaced_is_not_brought_back_from_the_branch():
+    """0.33.2 shipped first with its way up into 0.34.0. The fix then went out on the 0.34 line as
+    0.34.1 with the advisory, which leaves 0.34.0 affected, so main replaced 0.33.2 -> 0.34.0 with
+    0.33.2 -> 0.34.1. The branch still has the old edge; syncing it keeps main's matrix."""
+    main = _main()
+    branch = _branch_release(main)
+    main, _ = _SYNC.sync(main, branch)                        # main takes 0.33.2 and its way up
+    main["advisories"]["on-two-lines"] = {
+        "title": "On two lines", "description": "d", "impact": "i", "remediation": "r",
+        "mitigation": None, "severity": None, "cvss": None, "id": None, "fixed_in": "0.33.2",
+        "fixed_in_lines": ["0.33.2", "0.34.1"], "published": "2026-12-21"}
+    for version, fix in (("0.33.0", "0.33.2"), ("0.33.1", "0.33.2"), ("0.34.0", "0.34.1")):
+        main["versions"][version]["support"]["secure"] = False
+        main["versions"][version]["vulnerabilities"] = [
+            {"advisory": "on-two-lines", "title": "On two lines", "fixed_in": fix}]
+    main["versions"]["0.34.1"] = _entry("2026-12-21")
+    main["edges"] = [e for e in main["edges"] if (e["from"], e["to"]) != ("0.33.2", "0.34.0")]
+    main["edges"] += [_edge("0.34.0", "0.34.1"), _edge("0.33.2", "0.34.1")]
+
+    result, notes = _SYNC.sync(main, branch)                  # on release/0.33
+
+    assert _SYNC.render(result) == _SYNC.render(main)
+    assert "left out the branch's edge 0.33.2 -> 0.34.0: main declares both releases, not it" in notes
+
+
 def test_a_combination_that_does_not_validate_is_refused():
     main = _main()
     branch = _branch_release(main)
