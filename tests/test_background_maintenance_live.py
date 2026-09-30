@@ -192,6 +192,26 @@ def test_an_index_is_dropped_concurrently_and_a_statement_applied_once():
     assert _run(30000, "maint_probe_vacuum", alter, "statement", done) == "present"
 
 
+def test_an_index_of_the_same_name_in_another_schema_is_not_this_ones():
+    # The state of an index is read in the app's own schema: one of the same name elsewhere neither stands
+    # in for it nor is dropped in its place.
+    other = "maint_probe_other"
+    ours = ("SELECT i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = '{0}' AND n.nspname = {1}")
+    try:
+        _psql(f"CREATE SCHEMA IF NOT EXISTS {other}")
+        _psql(f"CREATE TABLE IF NOT EXISTS {other}.t (x int)")
+        _psql(f"CREATE INDEX IF NOT EXISTS {IDX} ON {other}.t (x)")
+        assert _run(30000, IDX, CREATE, "create") == "built"
+        assert _psql(ours.format(IDX, "current_schema()")) == "t"
+        assert _run(30000, IDX, "", "drop") == "dropped"
+        assert _run(30000, IDX, "", "drop") == "absent"
+        assert _psql(ours.format(IDX, "current_schema()")) == ""
+        assert _psql(ours.format(IDX, f"'{other}'")) == "t"
+    finally:
+        _psql(f"DROP SCHEMA IF EXISTS {other} CASCADE")
+
+
 def test_no_step_is_a_schema_step_and_the_schema_is_complete():
     assert _run(30000, IDX, CREATE, "create") == "built"
     assert _psql(f"SELECT count(*) FROM schema_steps WHERE summary LIKE '%{IDX}%'") == "0"
