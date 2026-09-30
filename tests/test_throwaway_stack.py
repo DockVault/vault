@@ -6,8 +6,9 @@ or a failure while seeding abandoned the generator before its teardown; and dock
 the test process's environment, which carries the worktree's .env, so that file's VAULT_VOLUME_PREFIX
 won over the stack's own --env-file.
 
-These run the real fixture code of both upgrade tests against a fake docker (tests/_throwaway_stack.py
-routes every docker call through one replaceable runner), so nothing here starts a container.
+These run the real fixture code of the upgrade tests and of the key-proof rollback drill against a fake
+docker (tests/_throwaway_stack.py routes every docker call through one replaceable runner), so nothing
+here starts a container.
 """
 import json
 import subprocess
@@ -17,6 +18,7 @@ import pytest
 import _throwaway_stack
 import test_upgrade_drill as drill_module
 import test_upgrade_email_nullable as nullable_module
+import test_zk_key_proof_rollback_drill as rollback_module
 
 pytestmark = pytest.mark.unit
 
@@ -187,3 +189,47 @@ def test_teardown_never_raises_and_still_removes_every_volume(docker):
 
     _throwaway_stack.tear_down(compose, ["p_vault_pg_data", "p_vault_storage"])
     assert docker.removed() == ["p_vault_pg_data", "p_vault_storage"]
+
+
+@pytest.fixture
+def rollback_drill(monkeypatch):
+    # The drill takes its candidate image from the running stack; here there is none.
+    monkeypatch.setattr(rollback_module, "_candidate_image", lambda: "candidate:image")
+    return rollback_module._boot_on_the_candidate
+
+
+def test_the_rollback_drill_is_torn_down_once_its_walk_is_done(docker, rollback_drill, tmp_path_factory):
+    stack = rollback_drill(tmp_path_factory)
+    state = next(stack)
+    assert state["candidate"] == "candidate:image"
+    assert not docker.compose("down"), "torn down while the walk still needed it"
+    with pytest.raises(StopIteration):
+        next(stack)
+    _torn_down(docker)
+
+
+def test_the_rollback_drill_skips_on_a_host_that_cannot_take_a_stack_and_still_tears_down(
+        monkeypatch, rollback_drill, tmp_path_factory):
+    fake = FakeDocker(up_rc=1, up_stderr="Bind for 127.0.0.1:30901 failed: port is already allocated")
+    monkeypatch.setattr(_throwaway_stack, "_spawn", fake)
+    with pytest.raises(pytest.skip.Exception):
+        next(rollback_drill(tmp_path_factory))
+    _torn_down(fake)
+
+
+def test_the_rollback_drill_fails_on_an_image_that_will_not_boot_and_still_tears_down(
+        monkeypatch, rollback_drill, tmp_path_factory):
+    fake = FakeDocker(health="unhealthy")
+    monkeypatch.setattr(_throwaway_stack, "_spawn", fake)
+    with pytest.raises(pytest.fail.Exception, match="did not come up"):
+        next(rollback_drill(tmp_path_factory))
+    _torn_down(fake)
+
+
+def test_the_rollback_drill_refuses_volumes_that_already_exist_and_touches_nothing(
+        monkeypatch, rollback_drill, tmp_path_factory):
+    fake = FakeDocker(existing={"pg_data"})
+    monkeypatch.setattr(_throwaway_stack, "_spawn", fake)
+    with pytest.raises(pytest.fail.Exception, match="already exist"):
+        next(rollback_drill(tmp_path_factory))
+    assert not fake.compose("up") and not fake.compose("down") and not fake.removed()
