@@ -159,8 +159,8 @@ def test_a_pass_deletes_old_resolved_alerts_and_old_throttle_rows_and_records_it
     psql("INSERT INTO rate_limit_records (id, identifier, action, attempt_count, window_start, last_attempt) "
          f"VALUES ('{uuid.uuid4()}', '{identifier}', 'login', 1, now() - interval '3 hours', now() - interval '3 hours')")
     try:
-        done = _run_pass()
-        assert done["security_alerts"] >= 1 and done["rate_limit_records"] >= 1, done
+        # The web app's own pruner may take a pass meanwhile: what the rows became is what counts.
+        _run_pass()
         assert not _alive(old_resolved) and _alive(old_open)
         assert psql(f"SELECT count(*) FROM rate_limit_records WHERE identifier = '{identifier}'") == "0"
         recorded = psql("SELECT details->>'job' FROM audit_logs WHERE action = 'retention_pruned' "
@@ -181,7 +181,7 @@ def test_the_hold_stops_the_log_jobs_and_not_the_working_records(admin):
         # The pass runs in a process of its own, which reads the table at its start.
         done = _run_pass()
         assert done["security_alerts"] is None and done["audit_logs"] is None, done
-        assert done["rate_limit_records"] >= 1, done
+        assert done["rate_limit_records"] is not None, done
         assert _alive(old_resolved)
         assert psql(f"SELECT count(*) FROM rate_limit_records WHERE identifier = '{identifier}'") == "0"
     finally:
