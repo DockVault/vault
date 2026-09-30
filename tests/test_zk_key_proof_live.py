@@ -510,14 +510,25 @@ def test_a_create_is_proved_before_anything_is_built(admin, people):
                  409, "zk-key-proof-stale")
         assert _psql(f"SELECT count(*) FROM vaults WHERE id = '{team_body['id']}'") == "0"
 
-        # A proven create names its vault id.
+        # A proven create names its vault id: a body complete in every other way, its key check included, but
+        # without the id is malformed and consumes nothing; the same body with the id then goes through.
         ch_vault = str(uuid.uuid4())
         ch = oc.post(f"/ecc/vaults/{ch_vault}/key-proof/challenge", json={"op": "create"}).json()
-        raw, header = harness._prove(oc, "create", ch_vault, ch, _create_body(), augment=False)
+        _, material = harness.direct_proof_material(ch_vault, 1)
+        body = dict(_create_body(), key_proof=material)
+        raw, header = harness._prove(oc, "create", ch_vault, ch, body, augment=False)
         r = harness.send_prepared(oc, "/vaults", {"raw": raw, "header": header, "challenge_status": 200})
         assert r.status_code == 400 and r.json()["reason"] == "zk-key-proof-malformed", r.text
+        assert "id is required" in r.json()["detail"], r.text
         assert _psql(f"SELECT count(*) FROM zk_key_proof_challenges WHERE id = '{ch['challenge_id']}'") == "1", \
             "a malformed create consumed its challenge"
+        raw, header = harness._prove(oc, "create", ch_vault, ch, dict(body, id=ch_vault), augment=False)
+        r = harness.send_prepared(oc, "/vaults", {"raw": raw, "header": header, "challenge_status": 200})
+        assert r.status_code == 200, r.text
+        try:
+            assert _psql(f"SELECT source FROM vault_key_proofs WHERE vault_id = '{ch_vault}'") == "create"
+        finally:
+            oc.delete_vault(ch_vault)
 
 
 # ------------------------------------------------------------------------------------- bootstrap
