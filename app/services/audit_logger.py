@@ -2,6 +2,7 @@
 Audit logging system for security and compliance.
 Tracks all significant actions in the system.
 """
+import copy
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 import logging
@@ -135,9 +136,10 @@ class AuditLogger:
             except Exception:  # noqa: BLE001 -- a missing name never stops the row
                 username = None
 
-        # What the caller passed, before anything is taken out, for the privacy hook below. A copy, so a
-        # hook cannot change the caller's dict.
-        raw_details = dict(details) if isinstance(details, dict) else details
+        # What the caller passed, before anything is taken out, for the privacy hook below. A deep copy, so a
+        # hook cannot change the caller's dict or a value inside it, which the row's details share. Details
+        # are JSON values (the column stores nothing else), so they always copy.
+        raw_details = copy.deepcopy(details) if isinstance(details, dict) else details
 
         # At-rest privacy: file/folder names are encrypted in the files/folders tables,
         # so we must not persist their plaintext in the audit details JSON (that would

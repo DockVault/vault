@@ -142,18 +142,21 @@ def test_every_row_gets_its_own_id(db, calls):
 
 
 def test_privacy_is_given_the_callers_details_before_the_names_are_taken_out(db, calls):
-    details = {"file_name": "report.pdf", "vault_name": "Finance", "size": 3}
+    details = {"file_name": "report.pdf", "vault_name": "Finance", "size": 3, "parts": {"n": 1}, "tags": ["a"]}
     row = AuditLogger(db).build_row(action="file_uploaded", status="success", details=details)
     (privacy,) = [c for c in calls if c[0] == "privacy"]
     (raw,) = privacy[3]
-    assert raw == {"file_name": "report.pdf", "vault_name": "Finance", "size": 3}
-    assert row.details == {"size": 3}
+    assert raw == {"file_name": "report.pdf", "vault_name": "Finance", "size": 3, "parts": {"n": 1}, "tags": ["a"]}
+    assert row.details == {"size": 3, "parts": {"n": 1}, "tags": ["a"]}
     assert set(REDACTED_NAME_KEYS) >= {"file_name", "vault_name"}
-    # A copy: a hook that changes what it was given changes neither the caller's dict nor the row.
+    # A copy, all the way down: a hook that changes what it was given, or a value inside it, changes neither
+    # the caller's dict nor the row.
     raw["size"] = 99
     raw.pop("file_name")
-    assert details == {"file_name": "report.pdf", "vault_name": "Finance", "size": 3}
-    assert row.details == {"size": 3}
+    raw["parts"]["n"] = 2
+    raw["tags"].append("b")
+    assert details == {"file_name": "report.pdf", "vault_name": "Finance", "size": 3, "parts": {"n": 1}, "tags": ["a"]}
+    assert row.details == {"size": 3, "parts": {"n": 1}, "tags": ["a"]}
 
 
 def test_privacy_is_given_what_the_caller_passed_when_it_is_not_a_dict(db, calls):
