@@ -878,6 +878,40 @@ def test_an_advisory_without_fixed_in_lines_reads_as_fixed_on_its_one_line():
     assert um._fixes(_advisory(fixed_in=None, mitigation="m")) == []
 
 
+# --- a condition that stops a rollback -----------------------------------------------------------
+
+def _with_condition(**condition):
+    data = _valid()
+    data["edges"][0]["conditions"] = [{"id": "kept-rows", "summary": "Rows are kept.", **condition}]
+    return data
+
+
+def test_a_condition_may_say_it_blocks_a_rollback_when_its_query_finds_rows():
+    um.validate_matrix(_with_condition(detect="SELECT 1 FROM held_files LIMIT 1",
+                                       blocks_rollback=True), released_ceiling=None)
+
+
+@pytest.mark.parametrize("condition, expected", [
+    ({"detect": "SELECT 1", "blocks_rollback": False}, "blocks_rollback is only ever true"),
+    ({"detect": "SELECT 1", "blocks_rollback": "true"}, "blocks_rollback is only ever true"),
+    ({"detect": "SELECT 1", "blocks_rollback": 1}, "blocks_rollback is only ever true"),
+    ({"blocks_rollback": True}, "blocks_rollback needs a detect query"),
+    ({"detect": "SELECT 1", "blocks_rollback": True, "blocks": True}, "unknown key"),
+])
+def test_a_malformed_rollback_flag_is_refused(condition, expected):
+    _reject(_with_condition(**condition), expected)
+
+
+def test_the_readers_in_this_tree_describe_a_flagged_condition_like_any_other():
+    import dockvault
+    from app.services import update_check
+
+    data = _with_condition(detect="SELECT 1 FROM held_files LIMIT 1", blocks_rollback=True)
+    assert update_check.describe_hop(data, "0.1.0", "0.2.0")["conditions"] == ["Rows are kept."]
+    assert [c["id"] for c in dockvault.plan_upgrade_path(data, "0.1.0", "0.2.0")["conditions"]] == [
+        "kept-rows"]
+
+
 # --- coverage: an advisory affects an unbroken run of releases ------------------------------------
 
 def test_an_advisory_affects_every_release_up_to_its_fix():

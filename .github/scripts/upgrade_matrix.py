@@ -124,7 +124,14 @@ _SEVERITIES = ("low", "medium", "high", "critical")
 # status as a bare secure:false without itemising it.
 _VULN_LISTED_FROM = "0.28.0"
 _EDGE_KEYS = {"from", "to", "kind", "reversible", "requires_backup", "reason", "conditions"}
-_CONDITION_KEYS = {"id", "summary", "detect"}
+# A condition is something to know before an upgrade, with an optional `detect` query that finds
+# whether it applies to a deployment. `blocks_rollback: true` marks one that, once its query finds
+# rows, stops the upgraded deployment going back across this edge: the older version cannot read
+# what the newer one wrote until that state is undone with the newer version. A host tool that reads
+# the flag refuses the rollback while the query finds rows; one that predates it ignores the key. The
+# flag informs; what stops an older image from starting on such data is the database's own record of
+# the version it needs, which the image reads at startup whatever tool is used.
+_CONDITION_KEYS = {"id", "summary", "detect", "blocks_rollback"}
 _WAIVER_KEYS = {"version", "reason"}
 _TOP_KEYS = {"schema_version", "about", "kinds", "advisories", "versions", "edges", "waivers"}
 
@@ -629,6 +636,13 @@ def validate_matrix(data: dict, *, released_ceiling: str | None) -> dict:
             _string(condition.get("summary"), f"{spot}.summary")
             if "detect" in condition:
                 _string(condition.get("detect"), f"{spot}.detect")
+            if "blocks_rollback" in condition:
+                _require(condition["blocks_rollback"] is True,
+                         f"{spot}.blocks_rollback is only ever true; leave it out when a condition "
+                         "does not stop a rollback")
+                _require("detect" in condition,
+                         f"{spot}.blocks_rollback needs a detect query: it is the query finding rows "
+                         "that stops the rollback")
 
     # Adjacency completeness. Declaring edges only between neighbours is what lets a longer upgrade
     # be composed by walking them, so a missing neighbour link silently breaks every path across it.

@@ -377,8 +377,10 @@ rollback while the running version reports a change in the way.
 What a given upgrade involves is declared in [`docs/upgrade-matrix.json`](docs/upgrade-matrix.json)
 and published with each release as an `upgrade.json` asset: whether the hop can be taken directly,
 whether it is reversible, whether it requires a backup, and any conditions worth knowing before
-starting. A release cannot be cut without an entry, so the description is not something a release
-might forget to write.
+starting. A condition may carry a query that finds whether it applies to a deployment, and may say
+that while the query finds rows, going back across that step is not possible until the state is
+undone with the newer version (`blocks_rollback`). A release cannot be cut without an entry, so the
+description is not something a release might forget to write.
 
 `dockvault.py update` reads it. It tells you what the hop involves before doing anything, takes a
 backup when one is required, and, run interactively, asks you to type an acknowledgement for a change
