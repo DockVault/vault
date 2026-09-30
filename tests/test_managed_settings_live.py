@@ -29,3 +29,17 @@ def test_a_key_the_registry_does_not_hold_is_not_found(admin):
     r = admin.put("/settings/managed/not_a_managed_setting", json={"value": 1})
     assert r.status_code == 404, r.text
     assert r.json()["detail"] == "not_a_managed_setting is not a managed setting"
+
+
+def test_a_settings_save_records_the_values_before_and_after_each_changed_key(admin):
+    import json
+    import uuid
+
+    from _account_change_helpers import psql
+    marker = f"test_audit_marker_{uuid.uuid4().hex[:8]}"
+    assert admin.put("/settings", json={marker: 1}).status_code == 200
+    assert admin.put("/settings", json={marker: 2}).status_code == 200
+    details = json.loads(psql("SELECT details FROM audit_logs WHERE action = 'settings_updated' "
+                              f"AND (details->'keys')::jsonb ? '{marker}' ORDER BY timestamp DESC LIMIT 1"))
+    assert details["keys"] == [marker]
+    assert details["changes"] == {marker: {"old": 1, "new": 2}}
