@@ -1359,16 +1359,31 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
+# The longest access token verify_access_token will decode. A token this server signs is a few
+# hundred characters (about 450 with a 50-character username); even a 255-character username made
+# entirely of characters that JSON escapes as surrogate pairs, signed with HS512, stays near 4,500.
+# jwt.decode base64-checks and parses the whole string before it can check the signature, so a
+# longer token is refused on its length alone, as any other invalid token is, and never reaches the
+# library: nobody can make a request cost what decoding a megabyte-long header costs.
+MAX_ACCESS_TOKEN_LENGTH = 8192
+
+
 def verify_access_token(token: str) -> Optional[dict]:
     """
     Verify and decode a JWT access token.
-    
+
+    Every bearer token the web API reads goes through here: the request dependencies, sign-out, the
+    live monitor, the rate limiter's per-user bucket and the upload size check.
+
     Args:
         token: JWT token string
-        
+
     Returns:
-        Decoded token data if valid, None otherwise
+        Decoded token data if valid, None otherwise. A token longer than MAX_ACCESS_TOKEN_LENGTH
+        is None without being decoded.
     """
+    if isinstance(token, (str, bytes)) and len(token) > MAX_ACCESS_TOKEN_LENGTH:
+        return None
     try:
         payload = jwt.decode(
             token,
@@ -1376,7 +1391,9 @@ def verify_access_token(token: str) -> Optional[dict]:
             algorithms=[_runtime_settings().jwt_algorithm]
         )
         return payload
-    except jwt.PyJWTError:
+    except (jwt.PyJWTError, RecursionError):
+        # PyJWT before 2.14.0 let the RecursionError from a header nested deeper than the stack out
+        # of jwt.decode. Such a token is invalid like any other, whatever the library does.
         return None
 
 

@@ -2,17 +2,20 @@
 
 jwt.decode parses a token's header as JSON before it checks anything else. PyJWT before 2.14.0 let
 the RecursionError from a header nested deeper than the interpreter's stack escape (GHSA-8wjv-2p76-3863),
-and verify_access_token catches only PyJWTError. So anyone, without signing in, could make every
+and verify_access_token caught only PyJWTError. So anyone, without signing in, could make every
 route behind get_current_user or the second-factor principal answer 500 instead of 401 (in the
 shipped image an Authorization header of about 8 KB was enough) and write a traceback to the log for
 each request. Nothing was exposed and no check was skipped; the answer was simply wrong.
 
 These hold the vault's own entry points to a 401 for such a token, whatever the library does.
+verify_access_token also refuses a token this long on its length before decoding it
+(tests/test_access_token_length.py); these lift that limit, so what they hold is the decode itself.
 tests/test_access_token_nesting_live.py sends the same token to the deployed stack.
 """
 import base64
 import functools
 import json
+import sys
 
 import pytest
 from fastapi import HTTPException
@@ -24,9 +27,16 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 import app.api.api_server as S  # noqa: E402
+import app.core.security as security  # noqa: E402
 from app.core.security import create_access_token, verify_access_token  # noqa: E402
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _decode_whatever_the_length(monkeypatch):
+    monkeypatch.setattr(security, "MAX_ACCESS_TOKEN_LENGTH", sys.maxsize)
+
 
 # Far past any stack a test or a server runs on: a level of JSON nesting takes on the order of a
 # hundred bytes of C stack, so this would need tens of megabytes. An 8 MiB main thread overflows

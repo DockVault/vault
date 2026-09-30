@@ -14,9 +14,10 @@ import requests
 
 from conftest import BASE_URL
 
-# A header of about 133 KB. The shipped image turned such a token into a 500 from about 6,300
-# levels; this is past an 8 MiB main thread as well, so a server that runs the check there is
-# still tested.
+# Tokens of about 267 KB (the array) and 800 KB (the object). The shipped image turned such a token
+# into a 500 from about 6,300 levels; this depth is past an 8 MiB main thread as well. The server now
+# refuses a token this long on its length before decoding it (tests/test_access_token_length_live.py),
+# and the answer asked for here is the same either way.
 DEPTH = 100_000
 TIMEOUT = 30
 
