@@ -84,8 +84,9 @@ member); retroactive secrecy for content a removed member could already read.
   be at least 12 characters and not a common one, and for up to 14 days after an administrator changed the
   account's sign-in details the envelope goes only to a session that entered a code sent by email (§13).
   Neither helps against a weak passphrase set before 0.34.0 and never changed, a stolen session outside the
-  hold, a hold switched off (`ZK_ENVELOPE_HOLD_DAYS=0`), or someone who can read the person's email. Choose a
-  long passphrase.
+  hold, a hold switched off (`ZK_ENVELOPE_HOLD_DAYS=0`), or someone who can read the person's email -- which
+  includes an administrator who repoints the deployment's default sending profile at a relay of their own
+  (§13.2). Choose a long passphrase.
 - **An account with no identity key yet.** Whoever registers first owns the account's identity. If someone
   signs in as a person before that person has registered a key, and an honest manager then shares a vault to
   that account, the key goes to the attacker's key. From 0.34.0 the person is told, in the app and by email,
@@ -805,7 +806,8 @@ nothing.
 
 ## 12. Who is told (0.34.0)
 
-Each notice is in the app and, where it says so, by email through the system email "Encryption key notice".
+Each notice is in the app and, where it says so, by email through the system email "Encryption key notice", which
+is locked to its built-in text and the default sending profile (§13.2).
 None names a vault: a zero-knowledge vault's name is sealed, and the server does not know it.
 
 | What happened | Who is told | How often |
@@ -858,7 +860,16 @@ by email:
    so far; a later change holds it again. A wrong or expired code: 403 `zk-envelope-hold-code-failed`.
 
 The person's own sessions are held too: the server cannot tell them from the administrator's, and the mailbox is
-what does. Without mail, the server's operator releases an account with `python dockvault.py accounts --action
+what does.
+
+The code's email ("Encryption key release code") is locked, as is "Encryption key notice": it always goes out with
+its built-in text through the deployment's default sending profile. A template bound to it is ignored, and so is
+that template's sending profile, and Email Studio refuses to bind one; otherwise an administrator could route every
+code through a relay of their own, or carry it in a link. **What remains:** an administrator who repoints the
+default sending profile itself -- its server, or its address -- at a relay they run can read the code as it passes,
+and use it before the person does. Every change to a sending profile is recorded in the audit log
+(`email_profile_created`, `email_profile_updated`); a deployment that relies on the hold should keep its sending profile out of
+administrators' hands where it can, and check that entry after a change to someone's sign-in details. Without mail, the server's operator releases an account with `python dockvault.py accounts --action
 release-key-hold`, and the person is told. The records the hold reads (`credential_changes`) are kept for 14 days
 after a change, which is why the hold cannot be longer; `app/core/envelope_hold.py` has the rest. Audit entries:
 `zk_envelope_release_code_sent` (info), `zk_envelope_release_failed` (warning), `zk_envelope_released` (notice).

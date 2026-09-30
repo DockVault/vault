@@ -9806,11 +9806,21 @@ function buildActionRow(a, templates) {
     optDefault.value = '';
     optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
     sel.appendChild(optDefault);
-    templates.forEach(t => {
-        const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
-        if (a.template_id === t.id) o.selected = true;
-        sel.appendChild(o);
-    });
+    if (a.locked) {
+        // Always the built-in text through the default sending profile: it carries what releases a
+        // person's encryption key, so it is not an administrator's to change.
+        sel.disabled = true;
+        sel.title = 'This email always uses its built-in text and the default sending profile';
+        const note = document.createElement('div'); note.className = 'ear-desc ear-locked';
+        note.textContent = 'Locked: always the built-in text, sent through the default sending profile.';
+        row.appendChild(note);
+    } else {
+        templates.forEach(t => {
+            const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
+            if (a.template_id === t.id) o.selected = true;
+            sel.appendChild(o);
+        });
+    }
     sel.addEventListener('change', () => {
         const picked = sel.value || null;
         // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.

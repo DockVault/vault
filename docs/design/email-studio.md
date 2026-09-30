@@ -149,6 +149,12 @@ categories:
 - **System** (`email_change`, `password_reset`, `account_invite`): the email *is* the mechanism for a
   flow the user asked for, so it is always on and cannot be switched off. Its built-in body carries a
   required dynamic token (`{{action.code}}` or `{{action.link}}`).
+- **Locked** system actions (`encryption_key_release_code`, `encryption_key_notice`; `LOCKED` in
+  `email_actions.py`): always the built-in subject and body, through the default sending profile. A
+  template bound to one is ignored, and so is its profile; `PUT /email/actions/{key}` refuses to bind
+  one (400), and the Automated emails list shows it without a template choice. They carry what concerns
+  a person's encryption key, the code that releases it above all, and administrators are who that code
+  guards against (docs/design/vault-zk-key-proof-v1.md, §13.2).
 - **Optional** (`account_welcome`, `login_alert`, `share_created`, `vault_member_added`,
   `temp_credential_issued`): courtesy notices. Each is **off by default** and an admin turns it on
   per action — but only once a template is bound (§7.2).

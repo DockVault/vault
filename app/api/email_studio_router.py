@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, defer, joinedload
 from app.core.database import get_db
 from app.core.models import EmailAction, EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
+from app.core.email_actions import LOCKED as LOCKED_ACTIONS
 from app.core.security import decrypt_secret, encrypt_secret
 from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable, retry_after_seconds
 from app.services.audit_logger import AuditLogger
@@ -701,6 +702,8 @@ def _action_out(a: EmailAction) -> dict:
         "description": a.description,
         "category": a.category,
         "enabled": bool(a.enabled),
+        # Always the built-in email through the default sending profile (email_actions.LOCKED).
+        "locked": a.key in LOCKED_ACTIONS,
         "template_id": str(a.template_id) if a.template_id else None,
         "template": ({"id": str(tpl.id), "name": tpl.name, "subject": tpl.subject} if tpl else None),
     }
@@ -728,6 +731,10 @@ async def update_action(key: str, payload: ActionUpdateIn, request: Request,
     if action is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")
 
+    if payload.template_id is not None and key in LOCKED_ACTIONS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="This email always sends its built-in text through the default sending "
+                                   "profile, so it cannot be given a template.")
     if payload.template_id is not None:
         tpl = db.get(EmailTemplate, payload.template_id)
         if tpl is None:

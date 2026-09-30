@@ -25,6 +25,15 @@ from sqlalchemy.orm import Session
 SYSTEM = "system"
 OPTIONAL = "optional"
 
+# System actions whose email is LOCKED: always the built-in subject and body, through the default sending
+# profile. A template bound to one is ignored, and so is that template's sending profile, and Email Studio
+# refuses to bind one. They carry what concerns a person's encryption key, the code that releases it above
+# all, and administrators are the very people these emails guard against: one who could choose the template
+# or its profile could route every code through a relay of their own, or carry it in a link. What remains is
+# stated in the design (docs/design/vault-zk-key-proof-v1.md, 13.2): an administrator who repoints the
+# deployment's default sending profile can read them.
+LOCKED = frozenset({"encryption_key_release_code", "encryption_key_notice"})
+
 # --------------------------------------------------------------------------------------------------
 # Built-in default templates. `name`/`subject`/`body_html` seed a real EmailTemplate row per action
 # (seed_default_templates) AND are the send-time fallback body when an action is left unbound. Bodies
@@ -280,6 +289,7 @@ ACTION_CATALOG: tuple[dict, ...] = tuple(
         "default_subject": DEFAULT_TEMPLATES[key]["subject"],
         "default_body_html": DEFAULT_TEMPLATES[key]["body_html"],
         "default_template_name": DEFAULT_TEMPLATES[key]["name"],
+        "locked": key in LOCKED,
     }
     for (key, name, description, category) in _ACTION_META
 )
@@ -496,7 +506,8 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
     if category == OPTIONAL and not enabled and not force:
         return False
 
-    template = action.template if action is not None else None
+    # A locked action sends its built-in email through the default profile, whatever is bound to it.
+    template = action.template if action is not None and key not in LOCKED else None
     # Defense in depth: an optional action with no bound template has nothing to send. The write paths
     # (update_action's force-off + the delete guard) already prevent enabling one, but guard at the point
     # of use too — so even a direct DB write that left (enabled=True, template_id=NULL) can't cause an

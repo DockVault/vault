@@ -134,3 +134,21 @@ def test_send_test_opens_a_styled_modal_with_user_search(admin_page: Page, admin
         expect(page.locator("#et-test-selected")).to_be_hidden()
     finally:
         admin.delete_user(u["id"])
+
+
+@pytest.mark.parametrize("key", ["encryption_key_release_code", "encryption_key_notice"])
+def test_an_encryption_key_email_is_shown_locked_with_no_template_to_choose(admin_page: Page, admin, key):
+    """It always sends its built-in text through the default sending profile: the list offers no template
+    for it, and a template made meanwhile does not appear as a choice."""
+    admin.post("/email/templates", json={"name": unique("Not for keys"), "subject": "s",
+                                         "body_html": "<p>{{action.code}}</p>"})
+    page = admin_page
+    _open_email_tab(page)
+    row = page.locator(f'.email-action-row[data-action-key="{key}"]')
+    expect(row).to_be_visible()
+    expect(row.locator(".ear-template")).to_be_disabled()
+    expect(row.locator(".ear-template option")).to_have_count(1)
+    expect(row.locator(".ear-locked")).to_contain_text("always the built-in text")
+    # An action that is not locked still offers the templates.
+    other = page.locator('.email-action-row[data-action-key="password_reset"] .ear-template option')
+    expect(other).not_to_have_count(1)
