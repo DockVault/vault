@@ -111,6 +111,13 @@ ID_ONLY_REFERENCES_BELOW = "0.27.0"
 # upgrading; it is required when there is no fix.
 _ADVISORY_KEYS = {"title", "description", "impact", "remediation", "mitigation",
                   "severity", "cvss", "id", "fixed_in", "published"}
+# Optional. Once two release lines are supported, one vulnerability can be fixed in a release of
+# each: `fixed_in_lines` lists those releases, one per line, lowest first, and `fixed_in` stays the
+# lowest of them, because every deployed reader expects a single value there. Missing, it means
+# [fixed_in]. Which versions the advisory affects then follows from the lines (see `_affected`), and
+# each version's reference names the fix for its own line (see `_fix_for`), which is what the
+# readers that predate this field print.
+_ADVISORY_OPTIONAL_KEYS = {"fixed_in_lines"}
 _SEVERITIES = ("low", "medium", "high", "critical")
 # The secure/vulnerabilities consistency below is enforced only from this version on. Releases before
 # it predate the vulnerability-list feature; the owner's decision is to leave their (end-of-life)
@@ -128,6 +135,49 @@ class UpgradeMatrixError(ValueError):
 
 def _sort_key(version: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in version.split("."))
+
+
+def _line(version: str) -> str:
+    """The release line a version belongs to: 0.33 for 0.33.2."""
+    return version.rsplit(".", 1)[0]
+
+
+def _fixes(advisory: dict) -> list[str]:
+    """Every release that fixes the advisory, lowest first; [] when nothing fixes it yet."""
+    if advisory.get("fixed_in") is None:
+        return []
+    return list(advisory.get("fixed_in_lines") or [advisory["fixed_in"]])
+
+
+def _fix_for(version: str, fixes: list[str]) -> str | None:
+    """The fix a reference on `version` names: its own line's, else the lowest fix above it.
+
+    None when neither exists: `version` is then not affected, or the advisory is not fixed yet.
+    """
+    for fix in fixes:
+        if _line(fix) == _line(version):
+            return fix
+    above = [fix for fix in fixes if _sort_key(fix) > _sort_key(version)]
+    return min(above, key=_sort_key) if above else None
+
+
+def _affected(version: str, first: str, fixes: list[str]) -> bool:
+    """Whether an advisory first listed on `first`, with these fixes, affects `version`.
+
+    Nothing below the first affected release is affected. A version whose line has a fix is affected
+    until that fix. A version on a line with no fix is affected when it is below the highest fix:
+    an older or unsupported line that never got one. Above every fix, on a line with no fix, it is
+    not affected; `_validate_advisory_coverage` checks that such a line started after the fix.
+    With no fix at all, every release from the first on is affected.
+    """
+    if _sort_key(version) < _sort_key(first):
+        return False
+    if not fixes:
+        return True
+    for fix in fixes:
+        if _line(fix) == _line(version):
+            return _sort_key(version) < _sort_key(fix)
+    return _sort_key(version) < _sort_key(max(fixes, key=_sort_key))
 
 
 def _inbound_edge(data: dict, version: str) -> dict | None:
@@ -261,7 +311,7 @@ def _validate_advisories(data: dict, versions: dict, released_ceiling: str | Non
         _string(slug, "advisory key", pattern=_ID_RE)
         where = f"advisories[{slug}]"
         _require(isinstance(advisory, dict), f"{where} must be an object")
-        _no_unknown_keys(advisory, _ADVISORY_KEYS, where)
+        _no_unknown_keys(advisory, _ADVISORY_KEYS | _ADVISORY_OPTIONAL_KEYS, where)
         missing = sorted(_ADVISORY_KEYS - set(advisory))
         _require(not missing, f"{where} is missing required key(s): {', '.join(missing)}")
         for field in ("title", "description", "impact", "remediation"):
@@ -303,7 +353,34 @@ def _validate_advisories(data: dict, versions: dict, released_ceiling: str | Non
                 _require(_sort_key(fixed_in) <= _sort_key(released_ceiling),
                          f"{where} names {fixed_in} as the fix but the newest released version is "
                          f"{released_ceiling}; an unreleased fix is an unpatched disclosure")
+        if "fixed_in_lines" in advisory:
+            _validate_fixed_in_lines(advisory, versions, released_ceiling, where)
     return advisories
+
+
+def _validate_fixed_in_lines(advisory: dict, versions: dict, released_ceiling: str | None,
+                             where: str) -> None:
+    """An advisory's fixes on several release lines: one per line, lowest first, each released."""
+    fixes = advisory["fixed_in_lines"]
+    spot = f"{where}.fixed_in_lines"
+    _require(advisory["fixed_in"] is not None,
+             f"{spot} lists fixes, but fixed_in is null; an advisory fixed nowhere has no fixes")
+    _require(isinstance(fixes, list) and fixes, f"{spot} must be a non-empty list")
+    for position, fix in enumerate(fixes):
+        _string(fix, f"{spot}[{position}]", pattern=_VERSION_RE)
+        _require(fix in versions, f"{spot}[{position}] is not a declared version: {fix}")
+        if released_ceiling is not None:
+            _require(_sort_key(fix) <= _sort_key(released_ceiling),
+                     f"{spot} names {fix} as a fix but the newest released version is "
+                     f"{released_ceiling}; an unreleased fix is an unpatched disclosure")
+    lines = [_line(fix) for fix in fixes]
+    repeated = sorted({line for line in lines if lines.count(line) > 1})
+    _require(not repeated, f"{spot} names more than one fix on the {', '.join(repeated)} line; "
+                           "a line is fixed once, by its first release that contains the fix")
+    _require(fixes == sorted(fixes, key=_sort_key), f"{spot} must be in version order")
+    _require(advisory["fixed_in"] == fixes[0],
+             f"{where}.fixed_in must be the lowest of fixed_in_lines, {fixes[0]} (got "
+             f"{advisory['fixed_in']}); it is the one fix every reader can read")
 
 
 def _validate_vulnerabilities(meta: dict, version: str, advisories: dict, where: str) -> None:
@@ -335,17 +412,36 @@ def _validate_vulnerabilities(meta: dict, version: str, advisories: dict, where:
         _require(slug not in seen, f"{spot} lists advisory {slug} a second time")
         seen.add(slug)
         advisory = advisories[slug]
-        for field in ("title", "fixed_in") if not id_only else ():
-            _require(ref[field] == advisory[field],
-                     f"{spot}.{field} must repeat advisories[{slug}].{field} exactly; it is what a "
-                     f"reader that predates advisories shows (got {ref[field]!r}, "
-                     f"expected {advisory[field]!r})")
-        fixed_in = advisory["fixed_in"]
-        if fixed_in is not None:
-            _require(_sort_key(fixed_in) > _sort_key(version),
-                     f"{spot} names advisory {slug}, fixed_in ({fixed_in}), which must be a version "
+        fixes = _fixes(advisory)
+        fix = _fix_for(version, fixes)
+        if fixes:
+            _require(fix is not None,
+                     f"{spot} names advisory {slug}, fixed in {' and '.join(fixes)}; {version} is "
+                     "above every fix, on a line that has none, so it is not affected")
+            _require(_sort_key(fix) > _sort_key(version),
+                     f"{spot} names advisory {slug}, fixed_in ({fix}), which must be a version "
                      f"later than {version}; a release cannot be affected by an issue fixed in it or "
                      "an earlier one")
+        if id_only:
+            # Every reader that takes a short reference's fix from its advisory reads `fixed_in`.
+            _require(fix == advisory["fixed_in"],
+                     f"{spot} carries only the advisory id, but the fix for {version} is {fix}, "
+                     f"not the advisory's fixed_in {advisory['fixed_in']}; write it in full")
+            continue
+        _require(ref["title"] == advisory["title"],
+                 f"{spot}.title must repeat advisories[{slug}].title exactly; it is what a "
+                 f"reader that predates advisories shows (got {ref['title']!r}, "
+                 f"expected {advisory['title']!r})")
+        if "fixed_in_lines" in advisory:
+            _require(ref["fixed_in"] == fix,
+                     f"{spot}.fixed_in must name the fix on the {_line(version)} line, or the lowest "
+                     f"fix above {version}: {fix} (got {ref['fixed_in']!r}); it is the release a "
+                     "reader that predates fixed_in_lines tells this version to move to")
+        else:
+            _require(ref["fixed_in"] == advisory["fixed_in"],
+                     f"{spot}.fixed_in must repeat advisories[{slug}].fixed_in exactly; it is what a "
+                     f"reader that predates advisories shows (got {ref['fixed_in']!r}, "
+                     f"expected {advisory['fixed_in']!r})")
 
 
 def _validate_advisory_coverage(advisories: dict, versions: dict) -> None:
@@ -364,13 +460,28 @@ def _validate_advisory_coverage(advisories: dict, versions: dict) -> None:
         where = f"advisories[{slug}]"
         listed = affected[slug]
         _require(bool(listed), f"{where} is listed by no version; an advisory affects at least one release")
-        first, fixed_in = listed[0], advisory["fixed_in"]
-        expected = [v for v in ordered if _sort_key(v) >= _sort_key(first)
-                    and (fixed_in is None or _sort_key(v) < _sort_key(fixed_in))]
+        first, fixes = listed[0], _fixes(advisory)
+        expected = [v for v in ordered if _affected(v, first, fixes)]
         gaps = [v for v in expected if v not in listed]
         _require(not gaps,
-                 f"{where} affects {first} and is fixed in {fixed_in or 'no release yet'}, so every "
-                 f"release in between is affected too; not listed on: {', '.join(gaps)}")
+                 f"{where} affects {first} and is fixed in {' and '.join(fixes) or 'no release yet'}, "
+                 f"so every release in between is affected too; not listed on: {', '.join(gaps)}")
+        if not fixes:
+            continue
+        # Above every fix, a line with no fix of its own is unaffected only if it began after the
+        # highest fix was released, and so contains it. A line that began earlier (0.34.0 released
+        # before the fix in 0.33.2) was forked without the fix: it needs its own, or its X.Y.0 when
+        # it was never affected. So the newest line is always fixed, never left out.
+        highest = max(fixes, key=_sort_key)
+        fixed_lines = {_line(fix) for fix in fixes}
+        later_lines = {_line(v) for v in ordered if _sort_key(v) > _sort_key(highest)}
+        for line in sorted(later_lines - fixed_lines, key=lambda name: _sort_key(name + ".0")):
+            start = min((v for v in ordered if _line(v) == line), key=_sort_key)
+            _require(versions[start]["released"] >= versions[highest]["released"],
+                     f"{where} is fixed in {' and '.join(fixes)}, but the {line} line began with "
+                     f"{start} on {versions[start]['released']}, before {highest} was released; "
+                     f"name the {line} line's own fix in fixed_in_lines, or {line}.0 if it was never "
+                     "affected")
 
 
 def load_matrix(path: Path) -> dict:

@@ -137,7 +137,7 @@ def _older_line_advisory(branch: dict, version: str) -> None:
     branch["advisories"]["older-line-only"] = {
         "title": "Older line only", "description": "d", "impact": "i", "remediation": "r",
         "mitigation": None, "severity": None, "cvss": None, "id": None, "fixed_in": "0.33.2",
-        "published": "2026-12-20"}
+        "fixed_in_lines": ["0.33.2", "0.34.0"], "published": "2026-12-20"}
     branch["versions"][version]["vulnerabilities"] = [reference]
 
 
@@ -155,14 +155,18 @@ def test_an_affected_version_without_a_support_block_is_refused_not_a_crash(side
 
 
 def test_a_fix_only_the_older_line_needs_brings_its_advisory_to_main():
-    """The advisory, each affected version's reference to it, and those versions' secure flag."""
+    """The advisory, each affected version's reference to it, and those versions' secure flag.
+
+    0.34.0 shipped before the fix and was never affected, so the advisory names it as the 0.34
+    line's fix: a line that began before the fix must say how it stands.
+    """
     main = _main()
     branch = _branch_release(main)
     reference = {"advisory": "older-line-only", "title": "Older line only", "fixed_in": "0.33.2"}
     branch["advisories"]["older-line-only"] = {
         "title": "Older line only", "description": "d", "impact": "i", "remediation": "r",
         "mitigation": None, "severity": None, "cvss": None, "id": None, "fixed_in": "0.33.2",
-        "published": "2026-12-20"}
+        "fixed_in_lines": ["0.33.2", "0.34.0"], "published": "2026-12-20"}
     for version in ("0.33.0", "0.33.1"):
         branch["versions"][version]["support"]["secure"] = False
         branch["versions"][version]["vulnerabilities"] = [dict(reference)]

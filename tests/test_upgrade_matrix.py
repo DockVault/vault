@@ -12,6 +12,7 @@ what it does.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
@@ -662,6 +663,221 @@ def test_an_id_only_reference_cannot_name_an_advisory_fixed_in_its_own_release()
     _reject(data, "must be a version later than 0.26.0")
 
 
+# --- a fix released on several lines (fixed_in_lines) ---------------------------------------------
+
+def _two_lines(fixes=("0.33.2", "0.34.1")):
+    """0.32.6 .. 0.34.1 after the first fix released on two lines.
+
+    0.34.0 shipped before the fix; the fix then went out as 0.33.2 (on the 0.33 line) and 0.34.1 the
+    same day. The advisory reaches back to 0.32.6. Each version's reference names the fix on its own
+    line, or, on the unsupported 0.32 line, the lowest fix above it.
+    """
+    dates = {"0.32.6": "2026-09-27", "0.33.0": "2026-09-29", "0.33.1": "2026-10-28",
+             "0.34.0": "2026-12-10", "0.33.2": "2027-01-11", "0.34.1": "2027-01-11"}
+    data = _valid()
+    data["versions"] = {ver: {"released": day, "notes": ver, "support": _support(secure=True)}
+                        for ver, day in sorted(dates.items(), key=lambda item: um._sort_key(item[0]))}
+    data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
+                      "requires_backup": False}
+                     for a, b in (("0.32.6", "0.33.0"), ("0.33.0", "0.33.1"), ("0.33.1", "0.33.2"),
+                                  ("0.33.1", "0.34.0"), ("0.34.0", "0.34.1"), ("0.33.2", "0.34.1"))]
+    data["advisories"] = {"on-two-lines": _advisory(title="On two lines", fixed_in=fixes[0],
+                                                    fixed_in_lines=list(fixes))}
+    for ver, fix in (("0.32.6", "0.33.2"), ("0.33.0", "0.33.2"), ("0.33.1", "0.33.2"),
+                     ("0.34.0", "0.34.1")):
+        data["versions"][ver]["support"] = _support(secure=False)
+        data["versions"][ver]["vulnerabilities"] = [
+            _ref(slug="on-two-lines", title="On two lines", fixed_in=fix)]
+    return data
+
+
+def test_a_fix_on_two_lines_is_accepted():
+    um.validate_matrix(_two_lines(), released_ceiling="0.34.1")
+
+
+@pytest.mark.parametrize("version, fix", [("0.33.1", "0.33.2"), ("0.34.0", "0.34.1"),
+                                          ("0.32.6", "0.33.2")])
+def test_each_reference_names_the_fix_for_its_own_line(version, fix):
+    assert um._fix_for(version, ["0.33.2", "0.34.1"]) == fix
+    # Any other released fix is refused, including the advisory's own fixed_in on the 0.34 line.
+    for other in {"0.33.2", "0.34.1"} - {fix}:
+        data = _two_lines()
+        data["versions"][version]["vulnerabilities"][0]["fixed_in"] = other
+        _reject(data, f"versions[{version}].vulnerabilities[0].fixed_in must name the fix on the "
+                      f"{version.rsplit('.', 1)[0]} line, or the lowest fix above {version}: {fix} "
+                      f"(got '{other}')")
+
+
+def test_a_version_the_fix_leaves_affected_must_list_it():
+    data = _two_lines()
+    del data["versions"]["0.34.0"]["vulnerabilities"]
+    data["versions"]["0.34.0"]["support"] = _support(secure=True)
+    _reject(data, "advisories[on-two-lines] affects 0.32.6 and is fixed in 0.33.2 and 0.34.1, so every "
+                  "release in between is affected too; not listed on: 0.34.0")
+
+
+@pytest.mark.parametrize("fixed", ["0.33.2", "0.34.1"])
+def test_a_release_that_contains_the_fix_on_its_line_cannot_list_it(fixed):
+    data = _two_lines()
+    data["versions"][fixed]["support"] = _support(secure=False)
+    data["versions"][fixed]["vulnerabilities"] = [
+        _ref(slug="on-two-lines", title="On two lines", fixed_in=fixed)]
+    _reject(data, f"fixed_in ({fixed}), which must be a version later than {fixed}")
+
+
+def test_a_release_above_every_fix_on_a_later_line_cannot_list_it():
+    data = _two_lines()
+    data["versions"]["0.35.0"] = {"released": "2027-02-01", "notes": "0.35.0",
+                                  "support": _support(secure=False),
+                                  "vulnerabilities": [_ref(slug="on-two-lines", title="On two lines",
+                                                           fixed_in="0.34.1")]}
+    data["edges"].append({"from": "0.34.1", "to": "0.35.0", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
+    _reject(data, "versions[0.35.0].vulnerabilities[0] names advisory on-two-lines, fixed in 0.33.2 "
+                  "and 0.34.1; 0.35.0 is above every fix, on a line that has none, so it is not "
+                  "affected")
+    # Unlisted, it is fine: the 0.35 line began after both fixes.
+    data["versions"]["0.35.0"]["support"] = _support(secure=True)
+    del data["versions"]["0.35.0"]["vulnerabilities"]
+    um.validate_matrix(data, released_ceiling=None)
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    (lambda a: a.update({"fixed_in_lines": ["0.33.2", "0.34.0", "0.34.1"]}),
+     "names more than one fix on the 0.34 line"),
+    (lambda a: a.update({"fixed_in": "0.34.1"}),
+     "fixed_in must be the lowest of fixed_in_lines, 0.33.2 (got 0.34.1)"),
+    (lambda a: a.update({"fixed_in_lines": ["0.34.1", "0.33.2"]}), "must be in version order"),
+    (lambda a: a.update({"fixed_in_lines": ["0.33.2", "0.34.9"]}),
+     "fixed_in_lines[1] is not a declared version: 0.34.9"),
+    (lambda a: a.update({"fixed_in_lines": []}), "must be a non-empty list"),
+    (lambda a: a.update({"fixed_in_lines": "0.33.2"}), "must be a non-empty list"),
+    (lambda a: a.update({"fixed_in_lines": ["0.33.2", "0.34.01"]}), "malformed"),
+    (lambda a: a.update({"fixed_in": None, "mitigation": "Turn it off."}),
+     "lists fixes, but fixed_in is null"),
+])
+def test_the_validator_rejects_a_bad_fixed_in_lines(mutate, expected):
+    data = _two_lines()
+    mutate(data["advisories"]["on-two-lines"])
+    _reject(data, expected)
+
+
+def test_a_fix_on_a_line_is_bounded_by_the_released_ceiling():
+    # 0.34.1 is not released yet: naming it would disclose an unpatched issue on the 0.34 line.
+    _reject(_two_lines(), "fixed_in_lines names 0.34.1 as a fix but the newest released version is "
+                          "0.34.0", ceiling="0.34.0")
+
+
+def test_a_line_that_began_before_the_fix_needs_its_own():
+    # The fix went out only as 0.33.2, a month after 0.34.0 shipped without it: 0.34.0 is affected,
+    # and nothing tells a 0.34 install what to move to. The newest line is never left out.
+    data = _two_lines(fixes=("0.33.2",))
+    del data["advisories"]["on-two-lines"]["fixed_in_lines"]
+    del data["versions"]["0.34.0"]["vulnerabilities"]
+    data["versions"]["0.34.0"]["support"] = _support(secure=True)
+    _reject(data, "advisories[on-two-lines] is fixed in 0.33.2, but the 0.34 line began with 0.34.0 "
+                  "on 2026-12-10, before 0.33.2 was released; name the 0.34 line's own fix in "
+                  "fixed_in_lines, or 0.34.0 if it was never affected")
+
+
+def test_a_line_that_was_never_affected_names_its_first_release():
+    # The same issue, but 0.34.0 already had the fix when it shipped: its line's fix is 0.34.0.
+    data = _two_lines(fixes=("0.33.2", "0.34.0"))
+    del data["versions"]["0.34.0"]["vulnerabilities"]
+    data["versions"]["0.34.0"]["support"] = _support(secure=True)
+    um.validate_matrix(data, released_ceiling=None)
+
+
+def _three_lines():
+    """_two_lines() with a 0.35 line that began on 2027-01-08, between the two fixes' releases.
+
+    0.33.2 is released on 2027-01-04 and 0.34.1 on 2027-01-11 here.
+    """
+    data = _two_lines()
+    data["versions"]["0.33.2"]["released"] = "2027-01-04"
+    data["versions"]["0.35.0"] = {"released": "2027-01-08", "notes": "0.35.0", "support": _support()}
+    data["edges"].append({"from": "0.34.0", "to": "0.35.0", "kind": "direct", "reversible": True,
+                          "requires_backup": False})
+    return data
+
+
+def test_a_later_line_is_checked_against_the_highest_fix_not_the_lowest():
+    # 0.35.0 began after 0.33.2 but before 0.34.1, so it was cut without the 0.34 fix.
+    _reject(_three_lines(), "the 0.35 line began with 0.35.0 on 2027-01-08, before 0.34.1 was released")
+
+
+def test_a_line_between_two_fixes_with_none_of_its_own_stays_affected():
+    # Fixed on 0.33 and 0.35; the 0.34 line in between got no fix and is affected throughout.
+    data = _three_lines()
+    data["versions"]["0.35.0"]["released"] = "2027-01-12"
+    data["versions"]["0.35.1"] = {"released": "2027-01-13", "notes": "0.35.1", "support": _support()}
+    data["edges"] += [{"from": a, "to": b, "kind": "direct", "reversible": True,
+                       "requires_backup": False} for a, b in (("0.34.1", "0.35.0"), ("0.35.0", "0.35.1"))]
+    advisory = data["advisories"]["on-two-lines"]
+    advisory["fixed_in_lines"] = ["0.33.2", "0.35.1"]
+    data["versions"]["0.35.0"]["support"] = _support(secure=False)
+    data["versions"]["0.35.0"]["vulnerabilities"] = [
+        _ref(slug="on-two-lines", title="On two lines", fixed_in="0.35.1")]
+    data["versions"]["0.34.0"]["vulnerabilities"][0]["fixed_in"] = "0.35.1"
+    data["versions"]["0.34.1"]["support"] = _support(secure=False)
+    data["versions"]["0.34.1"]["vulnerabilities"] = [
+        _ref(slug="on-two-lines", title="On two lines", fixed_in="0.35.1")]
+    um.validate_matrix(data, released_ceiling=None)
+    del data["versions"]["0.34.1"]["vulnerabilities"]
+    data["versions"]["0.34.1"]["support"] = _support(secure=True)
+    _reject(data, "not listed on: 0.34.1")
+
+
+def test_a_fix_released_the_same_day_as_the_next_line_needs_no_second_fix():
+    # 0.33.1 carries the fix and 0.34.0, built on it, ships the same day: one fixed_in is exact.
+    data = _valid()
+    data["versions"] = {
+        "0.33.0": {"released": "2026-09-29", "notes": "a", "support": _support(secure=False),
+                   "vulnerabilities": [_ref(slug="same-day", title="Same day", fixed_in="0.33.1")]},
+        "0.33.1": {"released": "2026-12-20", "notes": "b", "support": _support()},
+        "0.34.0": {"released": "2026-12-20", "notes": "c", "support": _support()},
+    }
+    data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
+                      "requires_backup": False} for a, b in (("0.33.0", "0.33.1"), ("0.33.1", "0.34.0"))]
+    data["advisories"] = {"same-day": _advisory(title="Same day", fixed_in="0.33.1")}
+    um.validate_matrix(data, released_ceiling="0.34.0")
+    # One day later, 0.34.0 would have been cut before the fix and need its own.
+    data["versions"]["0.34.0"]["released"] = "2026-12-19"
+    _reject(data, "the 0.34 line began with 0.34.0 on 2026-12-19, before 0.33.1 was released")
+
+
+def test_a_short_reference_is_refused_where_its_line_has_another_fix():
+    # Readers take a short reference's fix from the advisory's fixed_in, the lowest fix. Below the
+    # id-only boundary that is right for every line but one with its own, later fix.
+    data = _valid()
+    days = {"0.25.0": "2026-01-01", "0.26.0": "2026-01-02", "0.25.1": "2026-01-03",
+            "0.26.1": "2026-01-03"}
+    data["versions"] = {ver: {"released": day, "notes": ver, "support": _support()}
+                        for ver, day in sorted(days.items(), key=lambda item: um._sort_key(item[0]))}
+    data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
+                      "requires_backup": False}
+                     for a, b in (("0.25.0", "0.25.1"), ("0.25.0", "0.26.0"), ("0.26.0", "0.26.1"))]
+    data["advisories"] = {"two": _advisory(title="Two", fixed_in="0.25.1",
+                                           fixed_in_lines=["0.25.1", "0.26.1"])}
+    for ver in ("0.25.0", "0.26.0"):
+        data["versions"][ver]["support"] = _support(secure=False)
+    data["versions"]["0.25.0"]["vulnerabilities"] = [{"advisory": "two"}]
+    data["versions"]["0.26.0"]["vulnerabilities"] = [_ref(slug="two", title="Two", fixed_in="0.26.1")]
+    um.validate_matrix(data, released_ceiling=None)
+    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "two"}]
+    _reject(data, "versions[0.26.0].vulnerabilities[0] carries only the advisory id, but the fix for "
+                  "0.26.0 is 0.26.1, not the advisory's fixed_in 0.25.1; write it in full")
+
+
+def test_an_advisory_without_fixed_in_lines_reads_as_fixed_on_its_one_line():
+    data = _two_lines(fixes=("0.33.2", "0.34.1"))
+    single = copy.deepcopy(data["advisories"]["on-two-lines"])
+    del single["fixed_in_lines"]
+    assert um._fixes(single) == ["0.33.2"]
+    assert um._fixes(data["advisories"]["on-two-lines"]) == ["0.33.2", "0.34.1"]
+    assert um._fixes(_advisory(fixed_in=None, mitigation="m")) == []
+
+
 # --- coverage: an advisory affects an unbroken run of releases ------------------------------------
 
 def test_an_advisory_affects_every_release_up_to_its_fix():
@@ -840,7 +1056,9 @@ def test_the_committed_matrix_holds_its_vulnerability_invariants():
                 assert um._sort_key(ver) < um._sort_key(um.ID_ONLY_REFERENCES_BELOW), (
                     f"{ver}:{v['advisory']} carries only the advisory id")
                 continue
-            assert (v["title"], v["fixed_in"]) == (advisory["title"], advisory["fixed_in"]), (
+            # A fix released on several lines: each version names its own line's.
+            fix = um._fix_for(ver, um._fixes(advisory))
+            assert (v["title"], v["fixed_in"]) == (advisory["title"], fix), (
                 f"{ver}:{v['advisory']} disagrees with its advisory")
 
 

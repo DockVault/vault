@@ -406,7 +406,9 @@ top-level `advisories`: a title and description, its **impact** (what it let som
 **remediation** (usually the release that fixes it, and anything to do after upgrading), an optional
 **mitigation** (what to do before, or instead of, upgrading), a **CVSS v4.0 base vector** with the
 severity band it scores to, an optional advisory id, the release that fixes it (`fixed_in`) and the
-date it was published. Each affected version lists the advisories that apply to it. **A version
+date it was published. When a fix is released on more than one release line, `fixed_in_lines` lists
+one release per line and `fixed_in` is the lowest of them. Each affected version lists the advisories
+that apply to it, and each entry names the fix for that version's own line. **A version
 affected by even one advisory, of any severity, is not secure.** Each entry in that list repeats its
 advisory's title and `fixed_in`, which is all that `dockvault.py` and the in-app check read before
 0.33.0; from 0.33.0 they also accept an entry that carries only the advisory's id and take the rest
