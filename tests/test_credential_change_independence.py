@@ -297,11 +297,13 @@ def _functions_calling(tree, name):
 @pytest.mark.parametrize("path", ["api/api_server.py", "api/user_management_api.py"])
 def test_every_route_that_can_take_an_administrator_away_withdraws_their_requests(path):
     # A route that demotes, deactivates, locks or deletes an administrator checks that one who can act
-    # remains (removes_last_admin). Each such route must withdraw the leaver's requests and tell of it.
+    # remains (removes_last_admin). Each such route must withdraw the leaver's requests and tell of it:
+    # through _account_lost_standing, the one caller of the withdrawal (test_account_standing.py).
     tree = ast.parse((APP / path).read_text(encoding="utf-8"))
     removing = _functions_calling(tree, "removes_last_admin")
     assert removing, "no route found: the check moved"
-    assert _functions_calling(tree, "_withdraw_requests_of") - {"_withdraw_requests_of"} == removing
+    assert _functions_calling(tree, "_account_lost_standing") - {"_account_lost_standing"} == removing
+    assert _functions_calling(tree, "_withdraw_requests_of") - {"_withdraw_requests_of"} <= {"_account_lost_standing"}
     assert _functions_calling(tree, "_announce_withdrawn_requests") - {"_announce_withdrawn_requests"} == removing
 
 

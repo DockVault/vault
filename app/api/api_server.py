@@ -6241,6 +6241,17 @@ def _withdraw_requests_of(db, user, *, actor, because) -> list:
     return out
 
 
+def _account_lost_standing(db, user, *, actor, because) -> list:
+    """``user`` is about to lose their standing: demoted from administrator, deactivated, locked by an
+    administrator, or deleted (``because``: demoted, deactivated, locked or deleted), by ``actor``. Every
+    route that does one of those calls this, and nothing else calls _withdraw_requests_of, so whatever
+    follows from an account losing its standing follows on every route. Call it BEFORE the change to
+    ``user`` is made in the session, in the same transaction. What follows today: their open requests are
+    withdrawn and their pending administrator invitations revoked (_withdraw_requests_of). Returns what
+    _announce_withdrawn_requests tells after the commit."""
+    return _withdraw_requests_of(db, user, actor=actor, because=because)
+
+
 def _announce_withdrawn_requests(db, withdrawn) -> None:
     """Tell the user and the administrators who were asked to approve, for each request
     _withdraw_requests_of withdrew. After the commit; best-effort."""
@@ -10499,7 +10510,7 @@ async def update_user(
                                 ("deactivated", user_update.is_active is False and user.is_active),
                                 ("locked", user_update.is_locked is True and not admin_locked(user))):
             if leaves:
-                withdrawn = _withdraw_requests_of(db, user, actor=current_user, because=because)
+                withdrawn = _account_lost_standing(db, user, actor=current_user, because=because)
                 break
         if user_update.role is not None:
             changes['role'] = {'old': user.role.value, 'new': user_update.role.value}
@@ -10989,7 +11000,7 @@ async def delete_user(
 
     username = user.username
     # Their open requests are withdrawn first: deleting the account would leave them with no asker.
-    withdrawn = _withdraw_requests_of(db, user, actor=current_user, because="deleted")
+    withdrawn = _account_lost_standing(db, user, actor=current_user, because="deleted")
     db.delete(user)
     db.commit()
     

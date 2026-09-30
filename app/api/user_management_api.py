@@ -611,11 +611,11 @@ async def update_user(
     # An administrator demoted or deactivated here has their open requests withdrawn, before either is
     # set: who was asked to approve them is read as it stands.
     withdrawn = []
-    from app.api.api_server import _withdraw_requests_of, _announce_withdrawn_requests
+    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
     if user.role == RoleEnum.ADMIN and update_data.role is not None and update_data.role != RoleEnum.ADMIN:
-        withdrawn = _withdraw_requests_of(db, user, actor=current_user, because="demoted")
+        withdrawn = _account_lost_standing(db, user, actor=current_user, because="demoted")
     elif update_data.is_active is False and user.is_active:
-        withdrawn = _withdraw_requests_of(db, user, actor=current_user, because="deactivated")
+        withdrawn = _account_lost_standing(db, user, actor=current_user, because="deactivated")
     if update_data.role is not None:
         # Who made an administrator one is recorded with the change, for the two-administrator rule;
         # a demotion drops the record (app/core/admin_grants.py).
@@ -727,8 +727,8 @@ async def toggle_user_active(
         _enforce_user_cap(db)
 
     # An administrator deactivated here has their open requests withdrawn, before it is set.
-    from app.api.api_server import _withdraw_requests_of, _announce_withdrawn_requests
-    withdrawn = (_withdraw_requests_of(db, user, actor=current_user, because="deactivated")
+    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
+    withdrawn = (_account_lost_standing(db, user, actor=current_user, because="deactivated")
                  if user.is_active else [])
     user.is_active = not user.is_active
     if not user.is_active:
@@ -785,8 +785,8 @@ async def toggle_user_locked(
 
     new_locked = not user.is_locked
     # An administrator locked here has their open requests withdrawn, before the lock is set.
-    from app.api.api_server import _withdraw_requests_of, _announce_withdrawn_requests
-    withdrawn = _withdraw_requests_of(db, user, actor=current_user, because="locked") if new_locked else []
+    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
+    withdrawn = _account_lost_standing(db, user, actor=current_user, because="locked") if new_locked else []
     user.is_locked = new_locked
     user.updated_at = datetime.now(timezone.utc)
 
@@ -1270,8 +1270,8 @@ async def change_user_role(
     # two-administrator rule; a demotion drops the record (app/core/admin_grants.py).
     admin_granted = request.new_role == RoleEnum.ADMIN
     # An administrator demoted here has their open requests withdrawn, before the role is set.
-    from app.api.api_server import _withdraw_requests_of, _announce_withdrawn_requests
-    withdrawn = (_withdraw_requests_of(db, target_user, actor=current_user, because="demoted")
+    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
+    withdrawn = (_account_lost_standing(db, target_user, actor=current_user, because="demoted")
                  if old_role == RoleEnum.ADMIN.value and not admin_granted else [])
     if admin_granted:
         from app.api.api_server import _record_admin_grant
