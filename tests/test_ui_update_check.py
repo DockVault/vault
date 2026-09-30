@@ -179,11 +179,23 @@ def _line_payload(**extra):
     return payload
 
 
+def _reopen_general(page):
+    # After a reload the session is kept; the banners render when Settings loads the status.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator("#settings-tab-general")).to_be_visible(timeout=10000)
+    # The update banner is drawn in the same pass as the line banner, so once it shows, the line
+    # banner is as this status leaves it.
+    expect(page.locator("#update-banner-text")).to_contain_text("0.34.1")
+
+
 def test_an_install_on_an_older_line_is_told_about_its_lines_newest_release(page: Page, admin_creds):
-    _mock_status(page, _line_payload(
+    status = _line_payload(
         line_update={"version": "0.33.2", "line": "0.33", "fixes_vulnerability": True,
                      "security_fixes_until": "2027-06-10"},
-        line={"line": "0.33", "security_fixes_until": "2027-06-10", "ended": False}))
+        line={"line": "0.33", "security_fixes_until": "2027-06-10", "ended": False})
+    _mock_status(page, status)          # serves the dict as it is when asked, so it can change below
     _open_general(page, admin_creds)
     expect(page.locator("#line-banner")).to_be_visible()
     expect(page.locator("#line-banner-text")).to_have_text(
@@ -195,6 +207,19 @@ def test_an_install_on_an_older_line_is_told_about_its_lines_newest_release(page
     expect(page.locator("#update-banner")).to_be_visible()
     assert page.evaluate("localStorage.getItem('dv-line-banner-dismissed')") == "0.33.2|"
     assert page.evaluate("localStorage.getItem('dv-update-dismissed')") is None
+
+    # The dismissal outlasts a reload: the line banner stays hidden, the update banner still shows.
+    _reopen_general(page)
+    expect(page.locator("#update-banner")).to_be_visible()
+    expect(page.locator("#line-banner")).to_be_hidden()
+
+    # A newer release on the line shows it again.
+    status["line_update"] = dict(status["line_update"], version="0.33.3")
+    _reopen_general(page)
+    expect(page.locator("#line-banner")).to_be_visible()
+    expect(page.locator("#line-banner-text")).to_have_text(
+        "Security update v0.33.3 is available for your release line (0.33, security fixes until "
+        "10 June 2027). The newest release is v0.34.1.")
 
 
 def test_an_install_on_the_newest_line_gets_no_line_banner(page: Page, admin_creds):
