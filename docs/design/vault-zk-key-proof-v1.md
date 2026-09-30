@@ -7,6 +7,9 @@ them. The server's side is `app/services/zk_key_proof.py` and the routes in `app
 browser's side is `static/js/ecc_crypto.js` (the cryptography) and `static/js/app.js` (the requests); the
 test suite's reference implementation is `tests/zk_key_proof_reference.py`.
 
+0.34.0 adds what members' browsers check with the stored material (§11), who is told about key events (§12), and
+two measures against guessing the passphrase (§13). None of them changes the protocol above.
+
 Advisory: `zero-knowledge-key-changed-through-a-taken-over-account`, in `docs/upgrade-matrix.json`.
 
 ---
@@ -55,7 +58,7 @@ closes a hole inside it.
 | **An insider**: a manager who really holds the key and acts maliciously | everything a holder has | - | cannot make things worse than before; the owner can repair (§4.4) |
 | **A database reader** (a backup, a read-only hole), alone or with a session | database rows | `.env`, live keys | cannot forge a proof: the one secret a proof is checked with is sealed with `ENCRYPTION_KEY` |
 | **A downgrade**: an old client, a request without a proof, a rollback, the enforcement switch | - | - | fails safe; never silently lowers the requirement (§3.8, §9) |
-| **A database writer** who is not the code | row writes | the JavaScript | server checks cannot stop it; the stored key check and lineage tag let members' clients detect a substituted key (§3.5, §3.6) |
+| **A database writer** who is not the code | row writes | the JavaScript | server checks cannot stop it; the stored key check and lineage tag let members' clients detect a substituted key (§3.5, §3.6), which the web app does from 0.34.0 (§11) |
 | **A host operator** who serves the code | everything | - | out of reach in the browser, as before |
 
 Out of scope: script injection on the vault's origin; a member whose passphrase is compromised (they *are* that
@@ -74,15 +77,24 @@ member); retroactive secrecy for content a removed member could already read.
 
 ### 2.3 What this does not remove
 
-- **A weak passphrase.** A session can download the passphrase-encrypted envelope and guess offline. A
-  guessed passphrase makes the attacker that member. This bounds every zero-knowledge guarantee, this one
-  included. Choose a long passphrase.
+- **A weak passphrase. This is the residual that bounds every zero-knowledge guarantee, this one included.** A
+  session for the account can download the passphrase-encrypted envelope and guess the passphrase offline, at
+  thousands of guesses a second on one GPU against PBKDF2-SHA256 at 600,000 iterations; a guessed passphrase
+  makes the guesser that member, and every proof above then passes for them. From 0.34.0 a new passphrase must
+  be at least 12 characters and not a common one, and for up to 14 days after an administrator changed the
+  account's sign-in details the envelope goes only to a session that entered a code sent by email (§13).
+  Neither helps against a weak passphrase set before 0.34.0 and never changed, a stolen session outside the
+  hold, a hold switched off (`ZK_ENVELOPE_HOLD_DAYS=0`), or someone who can read the person's email. Choose a
+  long passphrase.
 - **An account with no identity key yet.** Whoever registers first owns the account's identity. If someone
   signs in as a person before that person has registered a key, and an honest manager then shares a vault to
-  that account, the key goes to the attacker's key.
+  that account, the key goes to the attacker's key. From 0.34.0 the person is told, in the app and by email,
+  when a key is set up for their account, and the share dialog shows the recipient's key fingerprint and flags
+  a key set up within 14 days after an administrator changed that account's sign-in details (§12); it does not
+  stop the share.
 - **An account that wrongly holds a current key row** (a bug, a database edit) passes the setup of a direct
-  epoch that has no proof key yet (§4). Members' clients can detect it with the key check (§3.5); the owner
-  repairs it with an owner reset (§4.4).
+  epoch that has no proof key yet (§4). Members' clients detect it with the key check (§3.5), and from 0.34.0
+  the web app refuses to write under a key that fails it (§11); the owner repairs it with an owner reset (§4.4).
 - **The switch set to false, or a rollback below 0.33.2,** accepts changes without a proof again (§3.8, §9).
 - **History.** A vault whose key someone else chose before 0.33.2 keeps that key. Nothing can detect that after
   the fact: check the audit entries made after an administrator changed a member's sign-in details
@@ -490,9 +502,11 @@ require is ignored.
 
 - direct with a row: `{state: "set", source, created_at, public_key, dek_check, lineage_tag}`, plus
   `sealed_private_key` **only for someone who may manage the vault** (only managers make the guarded changes;
-  plain members verify with the key check);
+  plain members verify with the key check), and from 0.34.0 `created_by`, who set the material up, also only for
+  them;
 - direct without a row: `{state: "missing"}`;
-- hierarchical: `{state: "team", source, lineage_tag}` when a row exists, else `{state: "team"}`.
+- hierarchical: `{state: "team", source, lineage_tag, created_at}` when a row exists (and `created_by` for someone
+  who may manage the vault), else `{state: "team"}`.
 
 `/keys?key_version=p` is how a member fetches an older epoch's tag and check. No read of files, names or keys
 consults `vault_key_proofs`.
@@ -574,6 +588,10 @@ reset's step-up keeps the existing step-up 403, which the web app answers with i
 | `zk_key_proof_absent` | warning | a change accepted without a proof while enforcement is off |
 | `zk_key_proof_bootstrapped` | notice | an epoch's key check was set up |
 | `zk_owner_key_reset` | warning | the owner reset the vault's key |
+| `zk_key_check_mismatch` | warning | a member's app reported a key that does not match (0.34.0, §11); details: the epoch, the finding, the mode |
+| `zk_envelope_release_code_sent` | info | a code that releases the key envelope was sent (0.34.0, §13.2) |
+| `zk_envelope_release_failed` | warning | a wrong or expired code, or no session to release (0.34.0); details: the reason |
+| `zk_envelope_released` | notice | the envelope was released, by a code or by the host operator (0.34.0); details: `by` |
 
 `zk_vault_rekeyed`, `zk_member_key_granted` and `zk_index_key_wrapped` carry `proof`: `key`, `owner_reset` or
 `absent`. The key-proof details are `op`, `reason`, `mode`, the epochs and `proof`; no entry holds a MAC, a nonce,
@@ -687,6 +705,10 @@ nginx, nginx with TLS, two nginx in a chain, and HAProxy. A proxy that strips th
 - **Upgrading again:** a direct epoch rotated while rolled back has no row; it reads `state: missing` and is set up
   the next time a manager changes it. Changes without a proof are refused again. This is tested with real Docker
   (`tests/test_zk_key_proof_rollback_drill.py`).
+- **0.34.0** adds nullable columns only (a vault's owed rotation, whether a key was set up after an administrator's
+  change, and the envelope hold's release times) and changes no format. Rolled back to 0.33.2, the member-side
+  checks, the notices and the envelope hold stop; a registration or envelope challenge 0.34.0 issued fails once on
+  the older server and the web app asks for a new one; nothing becomes unreadable.
 
 ---
 
@@ -704,9 +726,97 @@ nginx, nginx with TLS, two nginx in a chain, and HAProxy. A proxy that strips th
 | Live: a session without the identity key changes nothing; knowing the key is not enough; replay and body binding; races under the lock; rotations; create; setup; owner reset; the read side; retire; audit rows hold no proof | `tests/test_zk_key_proof_live.py` |
 | The web app: every guarded request goes through the helper; the string proved is the string sent; an older server is recognised | `tests/test_zk_key_proof_client.py`, `tests/test_ui_zk_key_proof.py` |
 | The v0.27.0 web app against an enforcing server | `tests/test_ui_zk_key_proof_old_bundle.py` |
+| 0.34.0: what the member-side checks conclude, on real keys, including every case that must not block; the team key compared as it is unwrapped | `tests/test_zk_key_checks.py`, `tests/js/zk_key_checks.js` |
+| 0.34.0: every encryption under a vault's key goes through the checked path; the checks never ask for the passphrase | `tests/test_zk_member_checks_client.py` |
+| 0.34.0: a member's report, and who is told | `tests/test_zk_key_proof_handler.py`, `tests/test_zk_key_check_report_live.py`, `tests/test_zk_notices.py`, `tests/test_zk_notices_live.py` |
+| 0.34.0: the checks, the key details, the owner's reset, the share dialog in a browser | `tests/test_ui_zk_member_checks.py` |
+| 0.34.0: the passphrase rule and the envelope hold | `tests/test_zk_envelope_hold.py`, `tests/js/zk_passphrase.js`, `tests/test_zk_envelope_hold_live.py`, `tests/test_ui_zk_passphrase_and_hold.py` |
+| 0.34.0: a share never replaces a key holder's copy; a deleted holder leaves a rotation owed; sealed registration and envelope challenges | `tests/test_zk_grant_keeps_holders_copy_live.py`, `tests/test_zk_rotation_owed_after_delete.py`, `tests/test_possession_challenges_sealed.py` |
 | A rollback and a return, with real Docker | `tests/test_zk_key_proof_rollback_drill.py` |
 | Behind each proxy | `.github/scripts/proxy_matrix.py` |
 | This document against the code: the labels, bytes, bounds, limits, refusals, audit actions and switch it states | `tests/test_zk_key_proof_doc.py` |
+
+---
+
+## 11. What members check (0.34.0)
+
+The server cannot tell a member whether the key they were given is the vault's: it never sees a key. The key check
+(§3.5), the team public key (§3.3) and the lineage tag (§3.6), written since 0.33.2, let the member's browser tell
+for itself. From 0.34.0 the web app uses them. What each check concludes is decided in `static/js/zk_key_checks.js`.
+
+### 11.1 The write path
+
+Every write under a vault's key -- an upload, a resumed upload, a rename, a new folder, a vault's name, the sealing
+of an old name -- takes its key through one checked path, which asks, once per key epoch and session:
+
+- **direct:** does the member's DEK reproduce the epoch's key check?
+- **hierarchical:** at the vault's current epoch, is the team private key the member unwrapped the pair of the
+  vault's team public key? It is compared while it is unwrapped (`unwrapTeamPrivateKeyWithCheck` in
+  `static/js/ecc_crypto.js`), since it is non-extractable afterwards.
+
+A key that does not match is refused: nothing is written with it, the person is told "The key you were given for
+this vault does not match it", and the vault's owner is told (§11.3). **Only a positive mismatch blocks.** An epoch
+with no stored material (made before 0.33.2, while the server was rolled back, or by a change accepted without a
+proof), an older team epoch, an answer from an older server, or a check that cannot run for any other reason
+writes as before. Reading is never affected.
+
+### 11.2 When a vault is opened
+
+When a vault is opened, or its Info tab shown, and the account key is already unlocked (the checks never ask for
+the passphrase), the browser checks its key as above, a manager also opens the epoch's sealed key check (§3.2),
+and the current epoch's lineage is verified. The vault's key details show one of:
+
+| State | When |
+|---|---|
+| verified | the current epoch's tag checks out against the previous epoch's key |
+| not verifiable | the member never held the previous key, or the epoch has no row, or was set up afterwards |
+| reset by the owner | an owner reset without the previous key (no tag) |
+| failed | a tag that does not check out, or none where a rotation should have left one |
+| first | the vault's first epoch |
+
+A failure is shown on the vault and filed as a report. A failed lineage tag warns and never blocks writing: the
+server serves the web app, so a block there would defend against nothing it could not also remove. The owner can
+reset the vault's key from its key details (§4.4), and when the current key's material was set up by someone else
+and something about it failed, is offered to remove that person in the same step.
+
+### 11.3 The report
+
+`POST /ecc/vaults/{id}/key-proof/report` with `{"dek_epoch": n, "finding": "dek_check" | "seal" | "team_key" |
+"lineage"}` records what a member's check found (`zk_key_check_mismatch`) and tells the vault's owner in the app,
+once a day for each vault. It is open to anyone who holds a key of the vault at any epoch (everyone else gets the
+same 403 whether or not the vault exists), is rate-limited, and changes nothing else: filing one gives a member
+nothing.
+
+### 11.4 Hardening in the same release
+
+- **A share never replaces the copy of someone who already holds the current key.** The server cannot tell a
+  correct wrap from one of another key; a share to a member with an active copy at the current epoch answers 200
+  with `unchanged` and changes nothing. A first share, a copy that was switched off, and a person's own copy go
+  ahead.
+- **Deleting an account that held a vault's current key leaves the vault owing a rotation.** The account's key rows
+  go with it, so the epoch is recorded on the vault (`rotation_owed_epoch`) until a rotation moves past it; a
+  hierarchical vault then refuses a rotation of its DEK alone.
+- **The challenges of key registration and envelope replacement keep their one-time key sealed** with
+  `ENCRYPTION_KEY`, as the key-proof challenges do, and the periodic cleanup deletes them once they expire.
+
+---
+
+## 12. Who is told (0.34.0)
+
+Each notice is in the app and, where it says so, by email through the system email "Encryption key notice".
+None names a vault: a zero-knowledge vault's name is sealed, and the server does not know it.
+
+| What happened | Who is told | How often |
+|---|---|---|
+| A key change was refused because it did not come with the account's own encryption key (a failed identity proof: a session for the account without its key) | the account's user, in the app and by email | at most once an hour |
+| A vault's owner reset its key | every other manager of the vault, in the app and by email | each time |
+| An encryption key was set up for an account | the account's user, in the app and by email | each time |
+| A member's app reported a key that does not match | the vault's owner, in the app | once a day for each vault |
+
+The share dialog of a zero-knowledge vault shows, for each person ticked, their key's fingerprint (the one they
+see for their own key) and when it was set up, and flags a key set up within 14 days after an administrator
+changed that account's sign-in details. Whether it was is decided when the key is set up, while the record of the
+change still exists.
 
 ---
 

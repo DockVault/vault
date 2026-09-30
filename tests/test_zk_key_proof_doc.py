@@ -107,7 +107,8 @@ def test_the_audit_actions_and_their_levels_are_the_catalogs():
     table = _section(_doc(), "### 6.3 Audit")
     documented = dict(re.findall(r"^\| `(zk_[a-z_]+)` \| (\w+) \|", table, re.M))
     catalogued = {a.name: a.severity for a in audit_catalog.ACTIONS
-                  if a.name.startswith("zk_key_proof_") or a.name == "zk_owner_key_reset"}
+                  if a.name.startswith(("zk_key_proof_", "zk_envelope_"))
+                  or a.name in ("zk_owner_key_reset", "zk_key_check_mismatch")}
     assert documented == catalogued
     for action in ("zk_vault_rekeyed", "zk_member_key_granted", "zk_index_key_wrapped"):
         assert f"`{action}`" in table and audit_catalog.lookup(action) is not None
@@ -182,3 +183,71 @@ def test_both_documents_name_every_audit_entry_a_key_change_before_the_upgrade_l
     func, call = calls[-1]
     assert any(isinstance(stmt, ast.Expr) and stmt.value is call for stmt in func.body), \
         "the create's vault_created entry is no longer a plain statement of the create"
+
+
+# ------------------------------------------------------------------------------------ what 0.34.0 added
+
+def test_the_member_checks_section_is_the_codes():
+    from app.api import ecc_router
+    section = _section(_doc(), "## 11. What members check (0.34.0)")
+    report = _section(section, "### 11.3 The report")
+    findings = re.search(r'"finding": ([^}]+)\}', report).group(1)
+    assert re.findall(r'"([a-z_]+)"', findings) == list(ecc_router.KEY_CHECK_FINDINGS)
+    assert "`POST /ecc/vaults/{id}/key-proof/report`" in report and "once a day for each vault" in report
+    states = _section(section, "### 11.2 When a vault is opened")
+    js = (ROOT / "static" / "js" / "zk_key_checks.js").read_text(encoding="utf-8")
+    shown = {"verified": "verified", "not-verifiable": "not verifiable", "reset-by-owner": "reset by the owner",
+             "failed": "failed", "first": "first"}
+    for const in ("LINEAGE_VERIFIED", "LINEAGE_UNVERIFIABLE", "LINEAGE_RESET", "LINEAGE_FAILED", "LINEAGE_FIRST"):
+        value = re.search(r"const %s = '([a-z-]+)';" % const, js).group(1)
+        assert f"| {shown[value]} |" in states, value
+    assert "`unwrapTeamPrivateKeyWithCheck`" in section and "**Only a positive mismatch blocks.**" in section
+
+
+def test_the_notices_section_is_the_codes():
+    from datetime import timedelta
+    from app.core import email_actions
+    from app.services import zk_notices
+    section = _section(_doc(), "## 12. Who is told (0.34.0)")
+    assert zk_notices.FAILED_PROOF_EVERY == timedelta(hours=1) and "at most once an hour" in section
+    assert email_actions.SPEC_BY_KEY[zk_notices.EMAIL_ACTION]["name"] == "Encryption key notice"
+    assert '"Encryption key notice"' in section and "once a day for each vault" in section
+
+
+def test_the_passphrase_section_is_the_codes():
+    from app.core import envelope_hold
+    from app.core.config import Settings
+    section = _section(_doc(), "## 13. The passphrase and its envelope (0.34.0)")
+    js = (ROOT / "static" / "js" / "zk_passphrase.js").read_text(encoding="utf-8")
+    minimum = int(re.search(r"const MIN_LENGTH = (\d+);", js).group(1))
+    assert f"must be at least {minimum} characters" in section
+    assert Settings.model_fields["zk_envelope_hold_days"].default == 14 == envelope_hold.MAX_DAYS
+    assert "`ZK_ENVELOPE_HOLD_DAYS` days (in `.env` only, default 14, 0 turns it off, at most 14)" in section
+    assert f"(it lives {envelope_hold.CODE_TTL_MINUTES} minutes" in section
+    router = (ROOT / "app" / "api" / "ecc_router.py").read_text(encoding="utf-8")
+    for route in ("/keys/private/hold/code", "/keys/private/hold/release"):
+        assert f'@router.post("{route}")' in router and f"`POST /ecc{route}`" in section
+    assert "`python dockvault.py accounts --action" in section and "release-key-hold`" in section
+
+
+# What a public document must not carry: a work-item or decision label (capitals then a number, such as
+# "AB12", "AB-1" or "X-Y3"; the format names the document uses are allowed), a path on someone's machine,
+# or a commit trailer.
+_PRIVATE = (r"\b(?!(?:V2|DVZ2|UTF-8)\b)[A-Z]{1,3}-?[0-9]{1,2}[a-z]?\b",
+            r"\b[A-Z]-[A-Z]{1,3}[0-9]", r"(?i)\b[a-z]:[\\/]", r"(?:^|[\s(`])/tmp/", r"(?i)co-authored-by")
+
+
+def test_the_public_documents_name_nothing_private():
+    policy = _section((ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8"),
+                      "## Zero-knowledge key changes need proof of the key")
+    for name, text in (("specification", _doc()), ("SECURITY.md", policy)):
+        for pattern in _PRIVATE:
+            hit = re.search(pattern, text)
+            assert not hit, (name, pattern, text[max(0, hit.start() - 40):hit.end() + 40])
+
+
+def test_the_leak_check_sees_a_leak():
+    """Guards the guard."""
+    for sample in ("as QX4 says", "see K-QW2", "item W-12", "C:\\work\\notes", "in /tmp/scratch",
+                   "Co-Authored-By: someone"):
+        assert any(re.search(pattern, sample) for pattern in _PRIVATE), sample
