@@ -5,7 +5,8 @@ With a lockout duration of 0 (ACCOUNT_LOCKOUT_MINUTES=0, settable only in .env) 
 end: it lasts until an administrator clears it. Wrong passwords for every administrator's name (about
 twenty each, from anywhere) then locked every administrator out for good, and the only documented way
 back, an administrator's unlock, needed an administrator who could sign in. Now an administrator's
-automatic lock ends after 15 minutes when the duration is 0, a lock with no end that an administrator
+automatic lock has an end when the duration is 0 (15 minutes from one address; the account-wide pause
+once its count has lost a failure, 72 minutes by default), a lock with no end that an administrator
 already holds is given one, and `python dockvault.py accounts --action unlock` clears any account's
 locks from the host. Other accounts, and names that are no account, keep a lock with no end.
 test_administrator_lock_ends_live.py drives the host unlock on a running stack.
@@ -385,6 +386,22 @@ def test_the_update_pre_check_names_a_lockout_duration_of_0_and_nothing_else(env
         (note,) = notes
         assert "ACCOUNT_LOCKOUT_MINUTES=0" in note and "15 minutes" in note
         assert "accounts --action unlock" in note
+        assert "72 minutes" in note, "the pause from every address ends later than the 15 minutes"
+        assert "before 0.33.0" in note, "a lock an older release armed stays, like an administrator's"
+
+
+def test_the_documented_end_of_an_administrators_lock_names_both_locks():
+    # With a duration of 0 a lock from one address ends after 15 minutes, and the account-wide pause
+    # no sooner than its count has lost a failure (72 minutes with the defaults), not after 15.
+    root = Path(__file__).resolve().parent.parent
+    example = (root / ".env.example").read_text(encoding="utf-8")
+    example = example[example.index("# Failed sign-ins lock an account against new sign-ins"):
+                      example.index("\nACCOUNT_LOCKOUT_MINUTES=")]
+    config = (root / "app" / "core" / "config.py").read_text(encoding="utf-8")
+    config = config[config.index("# How long (minutes) new sign-ins stay refused"):
+                    config.index("account_lockout_minutes: int")]
+    for text in (example, config):
+        assert text.count("15 minutes") == 1 and text.count("72 minutes") == 1, text
 
 
 def test_the_host_tool_offers_the_unlock():

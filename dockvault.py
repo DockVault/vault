@@ -1877,9 +1877,12 @@ def env_upgrade_notes(env, current, target):
         if minutes == 0:
             notes.append(
                 "ACCOUNT_LOCKOUT_MINUTES=0 in .env: from 0.33.1 an administrator's automatic lock (after "
-                "failed sign-ins) ends after 15 minutes instead of lasting until another administrator "
-                "clears it; other accounts' automatic locks still last until cleared. From the host, "
-                "python dockvault.py accounts --action unlock clears any account's locks.")
+                "failed sign-ins) has an end instead of lasting until another administrator clears it: a "
+                "lock on sign-ins from one address ends after 15 minutes, a pause on sign-ins from every "
+                "address once its count has also lost a failure (72 minutes with the default settings). "
+                "Other accounts' automatic locks still last until cleared, and so does a lock with no end "
+                "that a release before 0.33.0 armed, which is recorded like one an administrator set. "
+                "From the host, python dockvault.py accounts --action unlock clears any account's locks.")
     return notes
 
 
