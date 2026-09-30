@@ -706,6 +706,10 @@ class ActiveSession(Base):
     # NULL: written by an earlier release, and treated as a web session. Nullable and added by the boot
     # DDL, so an earlier release reads the table without it.
     channel = Column(String(8), nullable=True)
+    # When this session entered the emailed code that releases the account's zero-knowledge key envelope
+    # during the hold after an administrator changed the account's sign-in details (app/core/envelope_hold.py).
+    # It releases this session only, and only for changes made before it. NULL: never released.
+    zk_envelope_released_at = Column(DateTime, nullable=True)
     
     # Relationships
     user = relationship('User', back_populates='active_sessions')
@@ -3030,6 +3034,9 @@ class CredentialChange(Base):
     # asked cannot clear the way for their maker (credential_changes.snapshot). NULL for a change
     # made at once.
     approval_snapshot = Column(JSON(none_as_null=True), nullable=True)
+    # When the host operator released the hold this change put on the account's zero-knowledge key envelope
+    # (`dockvault.py accounts`, for an account with no email to send the code to). NULL: not released.
+    envelope_released_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         Index('idx_credential_change_target', 'target_user_id', 'applied_at'),

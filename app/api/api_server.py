@@ -1804,6 +1804,10 @@ async def get_current_user(
             headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
         )
 
+    # Which session this request came in on: what the hold on the zero-knowledge key envelope is released
+    # for (app/core/envelope_hold.py, which compares it hashed, as every lookup of a session row does).
+    user._session_token = session_token or None
+
     # Surface the temp-session context (scope, vault mode, per-vault caps) so the
     # permission decorator and the data layer can enforce least privilege.
     # NULL scope = legacy credential = unrestricted (handled inside the helpers).
@@ -3893,7 +3897,7 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             )
     # Switches only the host operator may set, in the environment. Nothing reads them from here; the
     # refusal (whatever the key's case) keeps a settings save from appearing to change one.
-    for env_only_key in ("zk_key_proof_enforce",):
+    for env_only_key in ("zk_key_proof_enforce", "zk_envelope_hold_days"):
         if any(isinstance(key, str) and key.lower() == env_only_key for key in payload):
             raise HTTPException(
                 status_code=400,
@@ -24829,6 +24833,11 @@ END $$;""",
             # its sign-in details, shown beside the key when a vault is shared with the account. Nullable,
             # no default: unknown for a key set up before, and an older release ignores the column.
             "ALTER TABLE user_keypairs ADD COLUMN IF NOT EXISTS registered_after_admin_change BOOLEAN",
+            # The hold on an account's zero-knowledge key envelope after an administrator changed its
+            # sign-in details: when a session entered the emailed code, and when the host operator released
+            # a change's hold. Nullable, no default; an older release ignores both.
+            "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS zk_envelope_released_at TIMESTAMP",
+            "ALTER TABLE credential_changes ADD COLUMN IF NOT EXISTS envelope_released_at TIMESTAMP",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
@@ -25364,6 +25373,9 @@ async def lifespan(app: FastAPI):
     # Say so when requests that change zero-knowledge keys are accepted without a key proof.
     from app.services import zk_key_proof
     zk_key_proof.report_at_startup()
+    # And when the encryption-key envelope is not held after an administrator changes an account.
+    from app.core import envelope_hold
+    envelope_hold.report_at_startup()
 
     # The pruner: every timed deletion of records (finished sessions, expired key challenges, the
     # records of credential changes, the sign-in throttle's fallback rows, resolved alerts, audit rows) and

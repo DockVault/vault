@@ -59,6 +59,10 @@ def test_the_table_is_the_designed_one():
         "zk-key-proof-stale": 409,
         "zk-key-proof-exists": 409,
         "zk-key-proof-verifier-unusable": 409,
+        # The hold on the account's key envelope after an administrator's change, on the same contract.
+        "zk-envelope-hold": 403,
+        "zk-envelope-hold-no-mail": 409,
+        "zk-envelope-hold-code-failed": 403,
     }
     assert kp.REFUSALS["zk-key-proof-failed"][1] == (
         "The proof that you hold this vault's key did not check out. Try again.")
@@ -71,7 +75,7 @@ def test_every_refusal_is_a_plain_sentence_without_a_word_a_client_acts_on(slug)
     assert status != 401 and 400 <= status < 500
     assert isinstance(sentence, str) and sentence.endswith(".")
     assert not _forbidden(sentence), (slug, _forbidden(sentence))
-    assert slug.startswith("zk-key-proof-") and re.fullmatch(r"[a-z-]+", slug)
+    assert slug.startswith(("zk-key-proof-", "zk-envelope-hold")) and re.fullmatch(r"[a-z-]+", slug)
 
 
 def test_every_shape_message_is_clean_too():

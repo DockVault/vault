@@ -11,6 +11,7 @@ network::
     python -m app.core.host_operator approve --request-id <id> --confirm-username alice
     python -m app.core.host_operator user-managers
     python -m app.core.host_operator regranted-defaults
+    python -m app.core.host_operator release-key-hold --username alice --confirm-username alice
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
@@ -36,7 +37,7 @@ import string
 import sys
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
-           "regranted-defaults", "unlock")
+           "regranted-defaults", "unlock", "release-key-hold")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -356,6 +357,20 @@ def _run(args, api) -> int:
                                                locked=(was_locked, False), sign_in_locks_cleared=cleared)
             return _answer({"ok": True, "account": user.username, "was_locked": was_locked,
                             "sign_in_locks_cleared": cleared})
+        if args.action == "release-key-hold":
+            # For an account the emailed code cannot reach (no mail, or no address): the hold on its
+            # encryption-key envelope after an administrator's change ends now (app/core/envelope_hold.py).
+            from app.core import envelope_hold
+            released = envelope_hold.release_by_host(db, user.id)
+            db.commit()
+            if released:
+                AuditLogger(db).log_action(
+                    action="zk_envelope_released", status="success", username=cc.HOST_OPERATOR,
+                    resource_type="user", resource_id=str(user.id),
+                    details={"target_username": user.username, "by": "host operator"})
+                from app.services import zk_notices
+                zk_notices.envelope_released_by_host(db, user)
+            return _answer({"ok": True, "account": user.username, "released": released})
 
         if args.action == "reset-second-factor":
             outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,

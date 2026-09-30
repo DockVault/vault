@@ -338,6 +338,12 @@ class Settings(BaseSettings):
     # log, while a request that does carry a proof is still checked in full. Environment only: the
     # settings page refuses it, so only the host operator can turn it off.
     zk_key_proof_enforce: bool = Field(default=True)
+    # For how many days after an administrator (or the host operator) changed an account's sign-in details
+    # the account's zero-knowledge key envelope is released to a session only once that session has entered
+    # a code sent by email (to the address the account had before, after an email change; see
+    # app/core/envelope_hold.py). 0 turns this off. At most 14: the records of those changes are kept for 14
+    # days, so a longer hold would have nothing to read. Environment only, like the switch above.
+    zk_envelope_hold_days: int = Field(default=14)
     
     # Rate Limiting
     rate_limit_login_attempts: int = Field(default=5)
@@ -508,6 +514,13 @@ class Settings(BaseSettings):
             raise ValueError(f'Log level must be one of {allowed_levels}')
         return v.upper()
     
+    @validator('zk_envelope_hold_days')
+    def validate_envelope_hold_days(cls, v):
+        """0 to 14: refused at start otherwise (see zk_envelope_hold_days)."""
+        if not 0 <= int(v) <= 14:
+            raise ValueError('ZK_ENVELOPE_HOLD_DAYS must be between 0 and 14')
+        return int(v)
+
     @validator('temp_cred_validity_minutes', 'temp_cred_session_grace_minutes', 'temp_cred_total_lifetime_minutes')
     def validate_positive_minutes(cls, v):
         """Validate that minute values are positive."""

@@ -515,6 +515,9 @@ containing `password`, `Password`, `Unauthorized` or `401` as a sign-in problem.
 | 409 | the vault's key state moved since the challenge | "This vault's key changed while the change was being prepared. Try again." | `zk-key-proof-stale` |
 | 409 | setting up an epoch that has a row | "This vault's key check was just set up by someone else. Try again." | `zk-key-proof-exists` |
 | 409 | a team public key that is not a usable P-384 key | "This vault's key record is inconsistent. Its owner can reset the key." | `zk-key-proof-verifier-unusable` |
+| 403 | the account's key envelope, for a while after an administrator changed its sign-in details, to a session that has not entered the emailed code (§13.2) | "Your sign-in details were changed by an administrator recently, so your encryption key is released only after you enter a code sent to your email. Ask for the code, then enter it." | `zk-envelope-hold` |
+| 409 | that code, when it cannot be sent by email | "No code can be sent to this account by email. Ask the person who runs the server to release your encryption key." | `zk-envelope-hold-no-mail` |
+| 403 | a wrong or expired code | "That code is not right, or it has expired. Ask for a new one." | `zk-envelope-hold-code-failed` |
 
 One sentence covers every failed proof: telling a caller which part failed helps only an attacker. The owner
 reset's step-up keeps the existing step-up 403, which the web app answers with its prompt and a retry.
@@ -704,3 +707,45 @@ nginx, nginx with TLS, two nginx in a chain, and HAProxy. A proxy that strips th
 | A rollback and a return, with real Docker | `tests/test_zk_key_proof_rollback_drill.py` |
 | Behind each proxy | `.github/scripts/proxy_matrix.py` |
 | This document against the code: the labels, bytes, bounds, limits, refusals, audit actions and switch it states | `tests/test_zk_key_proof_doc.py` |
+
+---
+
+## 13. The passphrase and its envelope (0.34.0)
+
+The zero-knowledge passphrase is the one low-entropy secret here. The account's identity private key is on the
+server only as an envelope sealed under it (PBKDF2-SHA256 with 600,000 iterations, then AES-GCM), and
+`GET /ecc/keys/private` hands the envelope to the account's sessions so a browser can unlock it. Whoever can act as
+the account -- an administrator who reset its password, a stolen session -- can take the envelope away and guess
+the passphrase offline, and a guessed passphrase makes them that member: every proof above then passes. Two
+measures narrow this; neither changes any format, so a rollback strands nothing.
+
+### 13.1 The rule for a new passphrase
+
+A new or changed passphrase, and a recovery kit's, must be at least 12 characters and not a common one: not a
+listed common passphrase, not a common word with only digits or symbols around it (`p@ssw0rd` counts as
+`password`), not one character or a short run repeated, not a run of the alphabet, the digits or a keyboard row,
+not only digits and symbols, and not mostly the account's own name. The rule is in `static/js/zk_passphrase.js`
+and runs in the browser, the only place the passphrase exists. A passphrase set before the rule still unlocks;
+the web app then suggests changing it, once a session, and never stops the unlock.
+
+### 13.2 The envelope hold
+
+For `ZK_ENVELOPE_HOLD_DAYS` days (in `.env` only, default 14, 0 turns it off, at most 14) after an administrator or
+the server's operator changed an account's sign-in details -- a password, a reset link, a second factor, an email
+address, an SSH key -- `GET /ecc/keys/private` gives the envelope only to a session that has entered a code sent
+by email:
+
+1. Refused session: 403 `zk-envelope-hold`.
+2. `POST /ecc/keys/private/hold/code` sends a code (it lives 15 minutes, and three wrong guesses end it) to the
+   account's address; within 14 days of an email change an administrator made, to the address before it, as a
+   password reset link does, so it reaches the person rather than whoever changed the address. No mail, or no
+   address to send to: 409 `zk-envelope-hold-no-mail`.
+3. `POST /ecc/keys/private/hold/release` with the code releases the envelope to that session, for the changes made
+   so far; a later change holds it again. A wrong or expired code: 403 `zk-envelope-hold-code-failed`.
+
+The person's own sessions are held too: the server cannot tell them from the administrator's, and the mailbox is
+what does. Without mail, the server's operator releases an account with `python dockvault.py accounts --action
+release-key-hold`, and the person is told. The records the hold reads (`credential_changes`) are kept for 14 days
+after a change, which is why the hold cannot be longer; `app/core/envelope_hold.py` has the rest. Audit entries:
+`zk_envelope_release_code_sent` (info), `zk_envelope_release_failed` (warning), `zk_envelope_released` (notice).
+A release before 0.34.0 does not hold the envelope, so a rollback lifts the hold.

@@ -128,6 +128,23 @@ def key_registered(db, user) -> None:
         print(f"⚠ key-registration notice skipped: {type(exc).__name__}")
 
 
+ENVELOPE_RELEASED_TITLE = "Your encryption key can be opened again"
+ENVELOPE_RELEASED_TEXT = (
+    "The person who runs the server let your encryption key be opened without the code that is sent by email "
+    "for a while after an administrator changes your sign-in details. If you did not ask for this, contact "
+    "your administrators at once."
+)
+
+
+def envelope_released_by_host(db, user) -> None:
+    """Tell an account's user that the host operator released the hold on their encryption key. Never
+    raises."""
+    try:
+        _tell(db, [user], title=ENVELOPE_RELEASED_TITLE, text=ENVELOPE_RELEASED_TEXT, target="#profile")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠ key-release notice skipped: {type(exc).__name__}")
+
+
 def key_check_mismatch(db, vault, finding: str) -> None:
     """Tell a vault's owner that a member's app found a key that does not match: in the app, at most once
     a day for each vault. Never raises."""

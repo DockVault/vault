@@ -52,7 +52,8 @@ MENU = [
     ("reset",   "Reset - tear down (optionally destroy data)"),
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
-    ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
+    ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change, "
+                 "release a held encryption key"),
 ]
 
 
@@ -553,6 +554,12 @@ def build_env_lines(cfg):
     # only when the operator has postponed it, so a fresh volume set does not switch it back on.
     if str(cfg.get("zk_key_proof_enforce") or "").strip().lower() in ("false", "0", "no", "off"):
         bare("ZK_KEY_PROOF_ENFORCE", "false")
+    # The hold on the zero-knowledge key envelope after an administrator changes an account: 14 days by
+    # default and never mentioned, written only when the operator chose another number of days (0 to 14;
+    # 0 turns it off), so that choice survives a fresh volume set.
+    hold = parse_envelope_hold_days(cfg.get("zk_envelope_hold_days"))
+    if hold is not None and hold != ENVELOPE_HOLD_DAYS_DEFAULT:
+        bare("ZK_ENVELOPE_HOLD_DAYS", str(hold))
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -1293,6 +1300,24 @@ def group_volumes_by_prefix(records):
     return [(k, groups[k]) for k in order]
 
 
+# ZK_ENVELOPE_HOLD_DAYS: how long the zero-knowledge key envelope stays held after an administrator changes
+# an account's sign-in details. The app refuses to start with a value outside 0..14.
+ENVELOPE_HOLD_DAYS_DEFAULT = 14
+
+
+def parse_envelope_hold_days(raw):
+    """A ZK_ENVELOPE_HOLD_DAYS value as an int 0..14, or None when it is unset or not one (the app's
+    default then applies, and the app itself refuses a value it cannot use at start)."""
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if 0 <= value <= 14 else None
+
+
 def new_set_config(current_env, new_prefix, new_id):
     """Config for a FRESH set (born together with its own .env): keep the current .env's NON-secret
     settings (server, admin, ports, mode, flags) but generate BRAND-NEW secrets - a new set is new
@@ -1369,6 +1394,8 @@ def new_set_config(current_env, new_prefix, new_id):
         "enforce_file_expiry": (current_env.get("ENFORCE_FILE_EXPIRY") or "").strip() or None,
         # And a postponed key proof on zero-knowledge key changes, for the same reason.
         "zk_key_proof_enforce": (current_env.get("ZK_KEY_PROOF_ENFORCE") or "").strip() or None,
+        # And a changed hold on the zero-knowledge key envelope after an administrator's change.
+        "zk_envelope_hold_days": (current_env.get("ZK_ENVELOPE_HOLD_DAYS") or "").strip() or None,
     }
     return cfg
 
@@ -2968,6 +2995,8 @@ ACCOUNT_ACTIONS = (
     ("user-managers", "List who may manage users without being an administrator"),
     ("regranted-defaults", "List revoked permissions that a restart granted again (before 0.33.1)"),
     ("unlock", "Unlock an account: its automatic locks and an administrator's lock"),
+    ("release-key-hold", "Let a user open their encryption key without the emailed code (after an "
+                         "administrator's change)"),
 )
 
 
@@ -5920,7 +5949,7 @@ class DockVault:
                               % server_text(req.get("target_username")), "yellow")]))
             return
 
-        if action not in ("reset-password", "reset-second-factor", "unlock"):
+        if action not in ("reset-password", "reset-second-factor", "unlock", "release-key-hold"):
             self._fail("unknown action: %s" % action)
         username = (getattr(args, "username", None) if args else None) or (
             ask("Username", pal) if interactive else None)
@@ -5945,6 +5974,13 @@ class DockVault:
                             "change, and the account was told." % (
                                 username, "the administrator's lock removed, " if answer.get("was_locked") else "",
                                 int(answer.get("sign_in_locks_cleared") or 0)), "green"))
+            return
+        if action == "release-key-hold":
+            if answer.get("released"):
+                print(pal.paint("  %s can open their encryption key again without the emailed code. They were "
+                                "told, and it is recorded as the host operator's." % username, "green"))
+            else:
+                print(pal.paint("  %s's encryption key is not held: nothing to release." % username, "yellow"))
             return
         if action == "reset-second-factor":
             print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
@@ -6132,7 +6168,7 @@ def build_parser():
     ac = parsers["accounts"]
     ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
                     help="reset-password | reset-second-factor | approve | list | user-managers | "
-                         "regranted-defaults | unlock")
+                         "regranted-defaults | unlock | release-key-hold")
     ac.add_argument("--username", dest="username", help="the account to act on")
     ac.add_argument("--confirm-username", dest="confirm_username",
                     help="the account's username typed again; nothing changes unless it matches")

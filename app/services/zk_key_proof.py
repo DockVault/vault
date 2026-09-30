@@ -126,6 +126,15 @@ REFUSALS = {
     "zk-key-proof-exists": (409, "This vault's key check was just set up by someone else. Try again."),
     "zk-key-proof-verifier-unusable": (
         409, "This vault's key record is inconsistent. Its owner can reset the key."),
+    # The hold on the account's encryption-key envelope after an administrator changed its sign-in details
+    # (app/core/envelope_hold.py). The same contract: the web app acts on the reason.
+    "zk-envelope-hold": (
+        403, "Your sign-in details were changed by an administrator recently, so your encryption key is "
+             "released only after you enter a code sent to your email. Ask for the code, then enter it."),
+    "zk-envelope-hold-no-mail": (
+        409, "No code can be sent to this account by email. Ask the person who runs the server to release "
+             "your encryption key."),
+    "zk-envelope-hold-code-failed": (403, "That code is not right, or it has expired. Ask for a new one."),
 }
 
 # What no refusal sentence may contain (see above).

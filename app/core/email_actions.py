@@ -198,6 +198,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "encryption_key_release_code": {
+        "name": "Encryption key release code",
+        "subject": "Your code to open your encryption key on {{vault.name}}",
+        "body_html": (
+            "<h2>Your code</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>An administrator changed your account's sign-in details recently, so your encryption key is "
+            "released to a browser only after it enters this code:</p>"
+            "<h1>{{action.code}}</h1>"
+            "<p>This code expires {{action.expires}}. If you did not ask for it, someone else may be signed "
+            "in as you: do not give this code to anyone, and contact your administrators at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "encryption_key_notice": {
         "name": "Encryption key notice",
         "subject": "About the encryption keys of your {{vault.name}} account",
@@ -245,6 +260,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("retention_change", "How long records are kept",
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
+     SYSTEM),
+    ("encryption_key_release_code", "Encryption key release code",
+     "Sent to a user whose sign-in details an administrator changed recently, when a browser asks to open "
+     "their encryption key — carries the code that releases it (to the address before an email change).",
      SYSTEM),
     ("encryption_key_notice", "Encryption key notice",
      "Sent to a user when a change to a zero-knowledge vault's key was refused because it did not come with "

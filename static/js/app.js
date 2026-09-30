@@ -12158,8 +12158,69 @@ async function zkEnsureUnlocked() {
     return _zkUnlockInFlight;
 }
 
+// The account's key envelope (GET /ecc/keys/private). For a while after an administrator changed the account's
+// sign-in details, the server releases it only to a session that has entered a code sent by email (reason
+// zk-envelope-hold): the person is asked, the code is sent and entered, and the envelope is fetched again.
+async function zkFetchPrivateEnvelope() {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await apiRequest('/ecc/keys/private', { silent: true });
+        } catch (e) {
+            if (!e || e.reason !== 'zk-envelope-hold' || attempt > 0) throw e;
+            await zkReleaseEnvelopeHold();   // throws when cancelled or refused
+        }
+    }
+}
+
+// Ask for the emailed code that releases the envelope to this session, and enter it. The code goes to the
+// account's address (the one before, after an email change), so it reaches the person rather than whoever
+// changed the sign-in details. Without mail the server says so; the person who runs the server can release it.
+async function zkReleaseEnvelopeHold() {
+    const go = await showConfirm(
+        "An administrator changed your account's sign-in details recently, so your encryption key opens only "
+        + 'after you enter a code sent to your email. Send the code now?', 'Confirm it is you', null, 'Send the code');
+    if (!go) throw new Error('Unlock cancelled.');
+    const sent = await apiRequest('/ecc/keys/private/hold/code', { method: 'POST', silent: true });
+    if (sent && sent.held === false) return;
+    for (let tries = 1; ; tries++) {
+        const code = await showPrompt(
+            `Enter the code sent to ${sent.sent_to}. It expires in ${sent.expires_in_minutes} minutes.`,
+            'Enter the code', {});
+        if (code === null) throw new Error('Unlock cancelled.');
+        try {
+            await apiRequest('/ecc/keys/private/hold/release', {
+                method: 'POST', silent: true, body: JSON.stringify({ code: String(code).trim() }),
+            });
+            return;
+        } catch (e) {
+            if (e && e.reason === 'zk-envelope-hold-code-failed' && tries < 3) {
+                showError(e.message);
+                continue;
+            }
+            throw e;
+        }
+    }
+}
+
+// The rule for a new passphrase (static/js/zk_passphrase.js), for this account: why it is refused, or null.
+function zkPassphraseProblem(pass) {
+    return ZkPassphrase.problem(pass, {
+        username: currentUser && currentUser.username, email: currentUser && currentUser.email,
+    });
+}
+
+// A passphrase that unlocked the key but would be refused as a new one: the person is told once per
+// session, and nothing stops the unlock.
+let _zkWeakPassphraseTold = false;
+function zkNudgeWeakPassphrase(pass) {
+    if (_zkWeakPassphraseTold || !zkPassphraseProblem(pass)) return;
+    _zkWeakPassphraseTold = true;
+    showWarning(`Your encryption passphrase is weaker than new ones may be: at least ${ZkPassphrase.MIN_LENGTH} `
+        + "characters, and not a common one. Change it under Your account, Encryption key.");
+}
+
 async function _zkUnlockOnce() {
-    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
@@ -12205,6 +12266,7 @@ async function _zkUnlockOnce() {
     }
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
     zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
+    zkNudgeWeakPassphrase(pass);
     return zkState.privateKey;
 }
 
@@ -12228,11 +12290,12 @@ async function zkRegisterNewKeypair() {
     );
     if (!acknowledged) throw new Error('Setup cancelled.');
     const pass = await showPrompt(
-        'Create a passphrase to protect your encryption key. You will need it to open zero-knowledge vaults — it CANNOT be recovered if lost.',
+        'Create a passphrase to protect your encryption key: at least 12 characters, and not a common one. You will need it to open zero-knowledge vaults — it CANNOT be recovered if lost.',
         'Set up encryption key', { password: true }
     );
     if (pass === null) throw new Error('Setup cancelled.');
-    if (!pass || pass.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const passProblem = zkPassphraseProblem(pass);
+    if (passProblem) throw new Error(passProblem);
     const confirm = await showPrompt('Re-enter your passphrase to confirm.', 'Confirm passphrase', { password: true });
     if (confirm === null) throw new Error('Setup cancelled.');
     if (confirm !== pass) throw new Error('Passphrases do not match.');
@@ -12278,7 +12341,7 @@ async function zkRegisterNewKeypair() {
 // from now on (this is a passphrase change, not a key rotation). Throws Error('Cancelled.')
 // if the user backs out of any prompt.
 async function zkChangePassphrase() {
-    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
@@ -12303,7 +12366,8 @@ async function zkChangePassphrase() {
     }
     const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
-    if (!next || next.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const nextProblem = zkPassphraseProblem(next);
+    if (nextProblem) throw new Error(nextProblem);
     const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
@@ -12325,7 +12389,7 @@ async function zkChangePassphrase() {
 // browser — the kit holds only ciphertext the server never sees. Throws Error('Cancelled.') on
 // back-out.
 async function zkExportRecoveryKey() {
-    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
     try {
         eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
@@ -12347,7 +12411,8 @@ async function zkExportRecoveryKey() {
     }
     const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
     if (rec === null) throw new Error('Cancelled.');
-    if (!rec || rec.length < 8) throw new Error('Recovery passphrase must be at least 8 characters.');
+    const recProblem = zkPassphraseProblem(rec);
+    if (recProblem) throw new Error(recProblem.replace('The passphrase', 'The recovery passphrase'));
     const confirm = await showPrompt('Re-enter your RECOVERY passphrase to confirm.', 'Confirm recovery passphrase', { password: true });
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== rec) throw new Error('Passphrases do not match.');
@@ -12424,7 +12489,8 @@ async function zkRestoreFromRecoveryKey(kitText) {
     }
     const next = await showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
-    if (!next || next.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const nextProblem = zkPassphraseProblem(next);
+    if (nextProblem) throw new Error(nextProblem);
     const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');

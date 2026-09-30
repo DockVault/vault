@@ -24,6 +24,7 @@ from app.services import zk_key_proof
 from app.core import fixed_step_up
 from app.core.second_factor_actions import OWNER_KEY_RESET
 from app.services import zk_notices
+from app.core import envelope_hold
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
 from app.core.rate_limiter import rate_limiter as _rate_limiter, retry_after_seconds
@@ -327,6 +328,9 @@ _ECC_RATELIMIT = {
     # bulk share asks for one per person, in parallel. Each attempt at a proof needs a fresh challenge,
     # and every attempt is recorded, so this bounds guessing even when the limiter fails open.
     "key_proof_challenge": (400, 60),
+    # Asking for, and entering, the code that releases the encryption-key envelope during the hold after an
+    # administrator changed the account's sign-in details. Each code also dies after three wrong guesses.
+    "envelope_hold": (10, 900),
 }
 
 
@@ -739,7 +743,83 @@ async def get_private_key(
     keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
     if not keypair or not keypair.encrypted_private_key:
         return {"has_keypair": False, "encrypted_private_key": None}
+    # For a while after an administrator changed the account's sign-in details, the envelope goes only to a
+    # session that entered a code sent by email (app/core/envelope_hold.py). Whoever made the change may be
+    # the one asking, and would otherwise take the envelope away to guess its passphrase.
+    if envelope_hold.held_until(db, current_user) is not None:
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold")
     return {"has_keypair": True, "encrypted_private_key": keypair.encrypted_private_key}
+
+
+class EnvelopeReleaseRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=64)
+
+
+@router.post("/keys/private/hold/code")
+async def send_envelope_release_code(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send the code that releases the account's encryption-key envelope to this session, during the hold
+    after an administrator changed the account's sign-in details (app/core/envelope_hold.py).
+
+    It goes by email, to the account's address -- after an email change, to the address before it, as a
+    password reset link does in those days -- so it reaches the person and not whoever made the change.
+    Without mail, or an address to send to: 409, and the host operator can release the hold instead. Not
+    held: nothing is sent."""
+    _ecc_rate_limit(current_user, "envelope_hold")
+    if envelope_hold.held_until(db, current_user) is None:
+        return {"held": False}
+    from app.api.api_server import _mask_email, _self_service_reset_destination, _smtp_configured
+    from app.core import email_send, otp_service
+    from app.core.config import settings as _settings
+    from app.core.email_actions import send_action_email
+    destination = _self_service_reset_destination(db, current_user)
+    address = ((destination[0] if destination else "") or "").strip()
+    if not address or not _smtp_configured(db):
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-no-mail")
+    code = otp_service.issue(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id, destination=address,
+                             ttl_minutes=envelope_hold.CODE_TTL_MINUTES, pepper=_settings.jwt_secret_key)
+    try:
+        sent = send_action_email(
+            db, envelope_hold.EMAIL_ACTION, recipient={"email": address, "username": current_user.username},
+            action_context={"code": code, "expires": f"in {envelope_hold.CODE_TTL_MINUTES} minutes"},
+            raise_errors=True)
+    except email_send.EmailSendError:
+        sent = False
+    if not sent:
+        otp_service.invalidate(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id)
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-no-mail")
+    _audit_zk(db, current_user, "zk_envelope_release_code_sent", resource_id=current_user.id,
+              resource_type="user")
+    return {"held": True, "sent_to": _mask_email(address), "expires_in_minutes": envelope_hold.CODE_TTL_MINUTES}
+
+
+@router.post("/keys/private/hold/release")
+async def release_envelope_hold(
+    request: EnvelopeReleaseRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Enter the emailed code, which releases the envelope to this session for the changes made so far. A
+    wrong or expired code: 403 (a code dies after three wrong guesses). Not held: nothing to release."""
+    _ecc_rate_limit(current_user, "envelope_hold")
+    if envelope_hold.held_until(db, current_user) is None:
+        return {"released": True}
+    from app.core import otp_service
+    from app.core.config import settings as _settings
+    result = otp_service.verify(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id,
+                                code=request.code.strip().lower(), pepper=_settings.jwt_secret_key)
+    if not result.ok or not envelope_hold.release_session(db, current_user):
+        db.rollback()
+        _audit_zk(db, current_user, "zk_envelope_release_failed", resource_id=current_user.id,
+                  resource_type="user", details={"reason": result.reason if not result.ok else "no_session"},
+                  status="failure")
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-code-failed")
+    db.commit()
+    _audit_zk(db, current_user, "zk_envelope_released", resource_id=current_user.id, resource_type="user",
+              details={"by": "code"})
+    return {"released": True}
 
 
 class KeyUpdatePoP(BaseModel):
