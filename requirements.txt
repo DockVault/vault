@@ -40,7 +40,7 @@ bcrypt==5.0.0
 # not reachable here since decode pins a single-element algorithms allowlist and the app is JWS-only)
 # to the maintained PyJWT. app/core/config.py rejects a non-HMAC jwt_algorithm at startup, defeating any
 # alg-confusion regardless of library.
-PyJWT==2.13.0
+PyJWT==2.15.0
 keyring==25.7.0
 
 # HTML sanitization for admin-authored email templates. nh3 is a Rust ammonia binding: an
