@@ -120,3 +120,16 @@ def test_the_recorded_values_are_indexed_after_start():
         "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
         f"WHERE c.relname IN {names} AND i.indisvalid") == "2", timeout=120, step=2)
     assert found
+
+
+def test_a_row_whose_details_come_from_a_helper_keeps_them(admin):
+    """The clean-up of unfinished uploads records what its helper counted: every key is classified, none
+    dropped."""
+    r = admin.post("/api/maintenance/upload-sessions/cleanup")
+    assert r.status_code == 200, r.text[:200]
+    row = wait_for(lambda: psql("SELECT details::text, coalesce(recorded::text, '') FROM audit_logs WHERE "
+                                "action = 'upload_sessions_cleanup' ORDER BY timestamp DESC LIMIT 1"))
+    details, recorded = row.split("|", 1)
+    for key in ("scanned_dirs", "dirs_removed", "bytes_reclaimed", "rows_pruned", "active_sessions_kept"):
+        assert f'"{key}"' in details, (key, details)
+    assert "dropped" not in recorded

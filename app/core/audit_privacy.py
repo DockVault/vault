@@ -170,6 +170,8 @@ _IDENTIFIER_KEYS = (
     "from_version", "to_version", "retired_below_version", "retired_dek_below", "retired_team_below",
     "expires_at", "locked_until", "effective_at", "requested_at", "oldest", "newest", "timestamp",
     "repeat_count", "last_repeat", "change",
+    # an administrator's clean-up of unfinished uploads
+    "scanned_dirs", "dirs_removed", "bytes_reclaimed", "rows_pruned", "active_sessions_kept", "idle_minutes",
     # a settings value before and after a change, and a recording policy
     "old", "new", "version", "previous_version", "levels", "limits",
 )

@@ -79,32 +79,41 @@ def _trees():
 
 
 def _wrappers(trees):
-    """Functions with a ``details`` parameter that hand it on to an audit write (directly or through another
-    such function), with the position of that parameter among a call's positional arguments."""
-    found = {name: None for name in AUDIT_FUNCTIONS}
-    changed = True
-    while changed:
-        changed = False
-        for tree in trees.values():
-            for fn in ast.walk(tree):
-                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name in found:
-                    continue
-                names = [a.arg for a in fn.args.args]
-                if "details" not in names:
-                    continue
-                for call in ast.walk(fn):
-                    if not isinstance(call, ast.Call):
-                        continue
-                    callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
-                    if callee not in found:
-                        continue
-                    passed = [kw.value for kw in call.keywords if kw.arg == "details"] + list(call.args)
-                    if any(isinstance(v, ast.Name) and v.id == "details" for v in passed):
-                        index = names.index("details") - (1 if names and names[0] in ("self", "cls") else 0)
-                        found[fn.name] = index
-                        changed = True
-                        break
+    """Every function with a parameter named ``details`` (positional or keyword-only): the audit writes and every
+    helper a caller hands its details to. Reaching too far is harmless: it only asks that more keys be
+    classified. For each, the positions that parameter can take among a call's positional arguments."""
+    found = {name: set() for name in AUDIT_FUNCTIONS}
+    for tree in trees.values():
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            positional = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+            if "details" in positional:
+                skip = 1 if positional and positional[0] in ("self", "cls") else 0
+                found.setdefault(fn.name, set()).add(positional.index("details") - skip)
+            elif "details" in [a.arg for a in fn.args.kwonlyargs]:
+                found.setdefault(fn.name, set())
     return found
+
+
+def _returned_dicts(trees):
+    """function name -> the dict expressions it returns (directly, or through a name it assigned one to)."""
+    out = collections.defaultdict(list)
+    for tree in trees.values():
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            assigned = collections.defaultdict(list)
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            assigned[target.id].append(node.value)
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Return) and node.value is not None:
+                    value = node.value
+                    out[fn.name] += assigned.get(value.id, []) if isinstance(value, ast.Name) else [value]
+    return out
 
 
 def _paths(node, prefix=""):
@@ -132,6 +141,7 @@ def detail_paths(trees, root=ROOT):
     """path -> where it is written, for every literal detail key reachable from an audit write: a dict passed
     as details, or assigned (or subscript-assigned) to the name passed, in the same function."""
     wrappers = _wrappers(trees)
+    returned = _returned_dicts(trees)
     found = collections.defaultdict(set)
     for path, tree in trees.items():
         for fn in ast.walk(tree):
@@ -153,9 +163,7 @@ def detail_paths(trees, root=ROOT):
                 if callee not in wrappers:
                     continue
                 given = [kw.value for kw in call.keywords if kw.arg == "details"]
-                index = wrappers[callee]
-                if index is not None and index < len(call.args):
-                    given.append(call.args[index])
+                given += [call.args[i] for i in wrappers[callee] if i < len(call.args)]
                 todo, seen = list(given), 0
                 while todo and seen < 50:
                     node = todo.pop()
@@ -166,6 +174,9 @@ def detail_paths(trees, root=ROOT):
                         todo += node.values
                     elif isinstance(node, ast.IfExp):
                         todo += [node.body, node.orelse]
+                    elif isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) in returned:
+                        # A helper's result passed as the details: the dicts it returns.
+                        todo += returned[getattr(node.func, "id", None) or node.func.attr]
                     else:
                         if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict":
                             todo += node.args
