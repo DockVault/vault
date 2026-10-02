@@ -258,6 +258,9 @@ RETENTION_ENV_KEYS = (
     ("audit_log_max_mb", "AUDIT_LOG_MAX_MB", "0"),
     ("plan_log_max_days", "PLAN_LOG_MAX_DAYS", "-1"),
     ("plan_log_max_mb", "PLAN_LOG_MAX_MB", "-1"),
+    ("security_record_days", "SECURITY_RECORD_DAYS", "30"),
+    ("security_record_min_days", "SECURITY_RECORD_MIN_DAYS", "7"),
+    ("security_record_max_days", "SECURITY_RECORD_MAX_DAYS", "365"),
 )
 
 # Admin-password rules mirror the app's startup guard (app/core/config.py): the shipped placeholder

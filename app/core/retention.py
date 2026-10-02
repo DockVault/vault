@@ -256,12 +256,25 @@ def prune_rate_limit_records(p: Pass) -> JobResult:
 
 def prune_resolved_alerts(p: Pass) -> JobResult:
     """Security alerts resolved more than SECURITY_ALERT_RETENTION_DAYS ago. Unresolved alerts stay."""
+    from app.core import security_records
     from app.core.models import SecurityAlert
-    days = int(getattr(_settings(), "security_alert_retention_days", 90))
+    days = int(registry.resolve(security_records.ALERT_RETENTION_KEY))
     return p.delete_in_batches(
         SecurityAlert, deletable(SecurityAlert, p.now, SecurityAlert.resolved.is_(True),
                                  SecurityAlert.timestamp < p.now - timedelta(days=days)),
         SecurityAlert.timestamp)
+
+
+def prune_security_records(p: Pass) -> JobResult:
+    """Failed sign-ins kept in full past the security record's window (app/core/security_records.py)."""
+    from app.core import security_records
+    return security_records.prune_records(p)
+
+
+def clear_alert_values(p: Pass) -> JobResult:
+    """The names and addresses of security alerts older than the security record's window, resolved or not."""
+    from app.core import security_records
+    return security_records.clear_alert_values(p)
 
 
 def schedule_env_audit_retention(p: Pass) -> JobResult:
@@ -283,6 +296,8 @@ JOBS: list[Job] = [
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
+    Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),
+    Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),
     Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
 ]

@@ -94,7 +94,8 @@ Visits to a link and uploads through one are also in the audit log.
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
 | `audit_logs` | See [The audit log](#the-audit-log). | Accountability and security. | **For ever by default** (`AUDIT_LOG_RETENTION_DAYS=0`). | The pruner, by the maximum days (`AUDIT_LOG_RETENTION_DAYS`, or the panel) and the size cap (`AUDIT_LOG_MAX_MB`, or the panel), never below the protected minimums (`AUDIT_MIN_RETENTION_DAYS`; `AUDIT_PROTECTED_MIN_DAYS`, 365 days, for administration and security rows, which the size cap never deletes), and not while the hold switch (`RETENTION_HOLD`, or the panel) is on. **Not** deleted with the account. |
-| `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. | The pruner deletes old resolved alerts, unless the hold switch is on. **Not** deleted with the account. |
+| `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. **Changed in 0.34.0:** the message no longer spells out the name and the address (it is completed from the alert's own fields when shown). | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. **New in 0.34.0:** the name and the address are cleared once the alert is older than the security record's window (`SECURITY_RECORD_DAYS`), resolved or not. | The pruner deletes old resolved alerts and clears the names and addresses, unless the hold switch is on. **Not** deleted with the account. |
+| `security_records` **New in 0.34.0** | Each failed sign-in (a web password, a second-factor code, an SFTP password): the time, what failed, the account the name matched, the name exactly as typed (which can be a password typed into the wrong box), the address, the way in, the reason, and the alert it raised. Kept in full whatever the audit log keeps. | Blocking addresses, counting failures and investigating attacks. | `SECURITY_RECORD_DAYS` (30 by default; the panel can change it between `SECURITY_RECORD_MIN_DAYS` and `SECURITY_RECORD_MAX_DAYS`). | The pruner, unless the hold switch is on. The account id is cleared when the account is deleted. |
 | `rate_limit_records` | An address; for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The pruner. |
 | `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key), and the ids of the administrator who asked, of the administrators that administrator's grant descends from, and of those who had changed the account in the 14 days before; and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
 | `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | Who may approve a held change: neither the administrator who asked nor the approver may have made the other one, directly or through administrators they made, and the approver must have been one for 14 days before the request. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
@@ -261,6 +262,8 @@ and the unlock state.
    - their rows in `audit_logs` (username, addresses, user agents, details), and the row recording
      the deletion;
    - `security_alerts` naming them (resolved ones age out after `SECURITY_ALERT_RETENTION_DAYS`);
+   - `security_records` of failed sign-ins with their name (deleted after `SECURITY_RECORD_DAYS`; the account
+     id on them is cleared);
    - their username on other accounts' `credential_changes` rows, as the requesting or deciding
      administrator, and their id in a request's kept approval record, until those rows are deleted 14
      days after the change or decision (a request they had open is withdrawn when they are deleted);
@@ -284,6 +287,7 @@ and the unlock state.
    -- Back up first. These deletions are not themselves audited.
    DELETE FROM audit_logs WHERE username = 'the-username';
    DELETE FROM security_alerts WHERE username = 'the-username';
+   DELETE FROM security_records WHERE name = 'the-username';
    DELETE FROM account_invitations WHERE username = 'the-username';
    ```
 
@@ -306,6 +310,7 @@ There is no built-in per-person erasure yet.
 | `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
 | `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |
+| `SECURITY_RECORD_DAYS` | `30` | Failed sign-ins kept in full, and the names and addresses in security alerts (between `SECURITY_RECORD_MIN_DAYS`, 7, and `SECURITY_RECORD_MAX_DAYS`, 365). |
 | `ACCOUNT_LOCKOUT_MINUTES` | `15` | Automatic locks, and the phantom-name counters in Redis. |
 | `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `300` | Sign-in counters. |
 | `ENFORCE_FILE_EXPIRY` | `true` | Whether vault and upload-link expiry deletes files. |

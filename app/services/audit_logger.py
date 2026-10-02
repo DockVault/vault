@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 REDACTED_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
 
 
+def _request_address():
+    """The address the middleware resolved for this request, or None outside one."""
+    from app.core.net_utils import current_client_ip
+    return current_client_ip()
+
+
 class AuditLogger:
     """Service for audit logging."""
     
@@ -247,8 +253,10 @@ class AuditLogger:
         ip_address: str,
         reason: str
     ):
-        """Log failed login attempt."""
-        self.log_action(
+        """Log failed login attempt, and its security record in the same commit (the name and address in
+        full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id."""
+        from app.core import security_records
+        row = self.build_row(
             action="login_failure",
             status="failure",
             username=username,
@@ -256,6 +264,26 @@ class AuditLogger:
             details={'reason': reason},
             error_message=reason
         )
+        self.db.add(row)
+        record = security_records.record(self.db, kind=security_records.LOGIN, name=username,
+                                         address=ip_address or _request_address(), channel=row.channel,
+                                         reason=reason)
+        record_id = record.id
+        self.db.commit()
+        return record_id
+
+    def log_second_factor_failure(self, user: User, ip_address: Optional[str] = None,
+                                  details: Optional[Dict[str, Any]] = None):
+        """Log a rejected second-factor code, and its security record in the same commit."""
+        from app.core import security_records
+        row = self.build_row(action="second_factor_failed", status="failed", user=user, ip_address=ip_address,
+                             details=details)
+        self.db.add(row)
+        method = (details or {}).get("method")
+        security_records.record(self.db, kind=security_records.SECOND_FACTOR, name=user.username,
+                                account_id=user.id, address=ip_address or _request_address(), channel=row.channel,
+                                reason=f"second factor ({method})" if method else "second factor")
+        self.db.commit()
     
     def log_logout(self, user: User, ip_address: str):
         """Log logout."""

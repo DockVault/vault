@@ -424,6 +424,12 @@ class Settings(BaseSettings):
     security_bulk_deletion_threshold: int = Field(default=10)  # Files deleted in time window
     security_bulk_deletion_window: int = Field(default=60)  # Time window in seconds
     security_alert_retention_days: int = Field(default=90)  # How long to keep resolved alerts
+    # The security record (app/core/security_records.py): each failed sign-in in full, with the name typed and
+    # the address, for this many days (the panel may change it between the two bounds); alerts lose their
+    # names and addresses after the same time.
+    security_record_days: int = Field(default=30)
+    security_record_min_days: int = Field(default=7)
+    security_record_max_days: int = Field(default=365)
     # Audit-log retention in days. 0 (the default) keeps every audit row: a deleted record of what
     # happened cannot be brought back, so deleting them is left to the operator. A positive value
     # deletes rows older than that many days; the pruner (app/core/retention.py) does it on a timer.

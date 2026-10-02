@@ -102,7 +102,7 @@ def test_a_failed_login_records_off_loop_and_before_the_response(raiser_name, ex
     events = []
 
     class _Monitor:
-        def record_failed_login(self, username, ip_address, reason):
+        def record_failed_login(self, username, ip_address, reason, record_id=None):
             events.append(("record", threading.current_thread().name))
 
     def _fake_db():
@@ -242,7 +242,7 @@ def test_record_failed_login_bg_records_through_the_monitor(monkeypatch):
     seen = []
 
     class _Monitor:
-        def record_failed_login(self, username, ip_address, reason):
+        def record_failed_login(self, username, ip_address, reason, record_id=None):
             seen.append((username, ip_address, reason))
 
     S = _api()

@@ -1998,6 +1998,27 @@ class UserEndpointPermission(Base):
     )
 
 
+class SecurityRecord(Base):
+    """A failed sign-in, kept in full for the security record's window (app/core/security_records.py): when,
+    what failed (``kind``), the account the name matched, the name exactly as typed, the address, how the
+    address was learned (``ip_via``, NULL for now), the way in, the reason, and the alert it raised. Written
+    in the transaction of the failure's audit row. Created by create_all; an older release ignores it."""
+    __tablename__ = 'security_records'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    at = Column(DateTime, nullable=False, index=True)
+    kind = Column(String(32), nullable=False)
+    account_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    name = Column(String(255), nullable=True)
+    address = Column(String(45), nullable=True, index=True)
+    ip_via = Column(String(24), nullable=True)
+    channel = Column(String(20), nullable=True)
+    reason = Column(String(255), nullable=True)
+    # Indexed: deleting an alert sets this to NULL, which would otherwise scan the table once per alert.
+    alert_id = Column(UUID(as_uuid=True), ForeignKey('security_alerts.id', ondelete='SET NULL'), nullable=True,
+                      index=True)
+
+
 class SecurityAlert(Base):
     """
     Security alert model for monitoring and threat detection.

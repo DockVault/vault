@@ -21,7 +21,8 @@ import json
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, desc
 
-from app.core.models import AuditLog, User, SecurityAlert
+from app.core.models import AuditLog, User, SecurityAlert, SecurityRecord
+from app.core.security_records import ADDRESS_TOKEN, LOGIN, NAME_TOKEN, render_message
 from app.core.database import redis_client
 from app.core.config import settings
 
@@ -107,14 +108,15 @@ class SecurityMonitor:
     # Event Recording
     # ========================================================================
     
-    def record_failed_login(self, username: str, ip_address: str, reason: str):
+    def record_failed_login(self, username: str, ip_address: str, reason: str, record_id=None):
         """
         Record a failed login attempt and check for suspicious patterns.
-        
+
         Args:
             username: Username attempted
             ip_address: Source IP address
             reason: Failure reason
+            record_id: the failure's security record, linked to the alert it raises
         """
         now = time.time()
         # The counter's key carries the name's keyed stand-in, never the name as typed, which can be a
@@ -139,8 +141,12 @@ class SecurityMonitor:
         username = _sanitize_for_log(username)
         ip_address = _sanitize_for_log(ip_address)
 
+        # The alert's message holds placeholders where the name and the address belong: they are kept in
+        # the alert's own fields, cleared after the security record's window, and put back into the text
+        # only when it is shown (app/core/security_records.py).
+        alert = None
         if recent_attempts >= self.failed_login_threshold_critical:
-            self._raise_alert(
+            alert = self._raise_alert(
                 event_type=SecurityEventType.BRUTE_FORCE_ATTEMPT,
                 severity=SecurityAlertLevel.CRITICAL,
                 username=username,
@@ -150,10 +156,11 @@ class SecurityMonitor:
                     'window_minutes': self.failed_login_window_minutes,
                     'reason': reason
                 },
-                message=f"CRITICAL: Brute force attack detected - {recent_attempts} failed login attempts for {username} from {ip_address} in {self.failed_login_window_minutes} minutes"
+                message=(f"CRITICAL: Brute force attack detected - {recent_attempts} failed login attempts for "
+                         f"{NAME_TOKEN} from {ADDRESS_TOKEN} in {self.failed_login_window_minutes} minutes")
             )
         elif recent_attempts >= self.failed_login_threshold_warning:
-            self._raise_alert(
+            alert = self._raise_alert(
                 event_type=SecurityEventType.MULTIPLE_FAILED_LOGINS,
                 severity=SecurityAlertLevel.WARNING,
                 username=username,
@@ -163,8 +170,17 @@ class SecurityMonitor:
                     'window_minutes': self.failed_login_window_minutes,
                     'reason': reason
                 },
-                message=f"WARNING: Multiple failed login attempts - {recent_attempts} failures for {username} from {ip_address}"
+                message=(f"WARNING: Multiple failed login attempts - {recent_attempts} failures for {NAME_TOKEN} "
+                         f"from {ADDRESS_TOKEN}")
             )
+        if alert is not None and record_id is not None:
+            try:
+                from app.core.models import SecurityRecord
+                self.db.query(SecurityRecord).filter(SecurityRecord.id == record_id).update(
+                    {"alert_id": alert.id}, synchronize_session=False)
+                self.db.commit()
+            except Exception:  # noqa: BLE001 -- the record stands without its link
+                self.db.rollback()
         
         logger.info(f"Failed login recorded: {username} from {ip_address} ({recent_attempts} recent attempts)")
     
@@ -224,7 +240,7 @@ class SecurityMonitor:
                 ip_address=ip_address,
                 details={"surface": surface, "reasons": reasons},
                 message=(f"WARNING: Malicious content blocked in {surface} from "
-                         f"{username or user_id or 'unknown user'}: "
+                         f"{NAME_TOKEN if username else (user_id or 'unknown user')}: "
                          f"{', '.join(reasons) or 'unspecified'}"),
             )
         except Exception:
@@ -388,13 +404,11 @@ class SecurityMonitor:
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         
-        # Query recent security events from audit log
-        failed_logins = self.db.query(AuditLog).filter(
-            and_(
-                AuditLog.action == 'login_failure',
-                AuditLog.timestamp >= cutoff
-            )
-        ).count()
+        # Failed sign-ins come from the security record, which keeps each one in full whatever the audit
+        # log keeps of it (app/core/security_records.py).
+        naive_cutoff = cutoff.replace(tzinfo=None)
+        failed_logins = self.db.query(SecurityRecord).filter(
+            SecurityRecord.kind == LOGIN, SecurityRecord.at >= naive_cutoff).count()
         
         successful_logins = self.db.query(AuditLog).filter(
             and_(
@@ -420,18 +434,12 @@ class SecurityMonitor:
             )
         ).count()
         
-        # Get top failed login IPs
-        failed_login_logs = self.db.query(AuditLog).filter(
-            and_(
-                AuditLog.action == 'login_failure',
-                AuditLog.timestamp >= cutoff
-            )
-        ).all()
-        
+        # Top addresses of failed sign-ins
         ip_failures = defaultdict(int)
-        for log in failed_login_logs:
-            if log.ip_address:
-                ip_failures[log.ip_address] += 1
+        for (address,) in self.db.query(SecurityRecord.address).filter(
+                SecurityRecord.kind == LOGIN, SecurityRecord.at >= naive_cutoff).all():
+            if address:
+                ip_failures[address] += 1
         
         top_failed_ips = sorted(
             ip_failures.items(),
@@ -613,7 +621,7 @@ class SecurityMonitor:
                 'id': str(alert.id),
                 'event_type': alert.event_type,
                 'severity': alert.severity,
-                'message': alert.message,
+                'message': render_message(alert),
                 'username': alert.username,
                 'ip_address': alert.ip_address,
                 'timestamp': alert.timestamp.isoformat(),

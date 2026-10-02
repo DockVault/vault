@@ -2137,7 +2137,7 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
     task.add_done_callback(_BG_TASKS.discard)
 
 
-def _record_failed_login_bg(username, ip_address, reason) -> None:
+def _record_failed_login_bg(username, ip_address, reason, record_id=None) -> None:
     """Record a failed login in the security monitor on its OWN short-lived DB session. Both login
     except branches call it via `await run_offloaded(...)`: the brute-force counter must advance on
     every failed login, so it is AWAITED (the record lands before the response, never shed under a
@@ -2151,7 +2151,7 @@ def _record_failed_login_bg(username, ip_address, reason) -> None:
         from app.core.database import get_db_context
         from app.services.security_monitor import get_security_monitor
         with get_db_context() as bg_db:
-            get_security_monitor(bg_db).record_failed_login(username, ip_address, reason)
+            get_security_monitor(bg_db).record_failed_login(username, ip_address, reason, record_id=record_id)
     except Exception as e:  # noqa: BLE001 — best-effort threat telemetry; never fails the response
         # The class only: the write carries the name typed at sign-in, which a database error's
         # message would repeat into the log.
@@ -7415,9 +7415,8 @@ async def second_factor_login_verify(
         # A wrong login second factor was previously invisible in both the audit log and the live
         # monitor. Record it as a failed action and push it to the monitor as a security event.
         try:
-            AuditLogger(db).log_action(action="second_factor_failed", status="failed", user=user,
-                                       ip_address=client_ip,
-                                       details={"method": _sf_method_name(body.method)})
+            AuditLogger(db).log_second_factor_failure(user, ip_address=client_ip,
+                                                      details={"method": _sf_method_name(body.method)})
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -7548,8 +7547,12 @@ async def second_factor_step_up(
         otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if m != "password"}
         if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
                 db, user=current_user, action=body.action, method=body.method, code=body.code):
-            _audit_change(db, current_user, "second_factor_failed", "user", current_user.id,
-                          {"method": _sf_method_name(body.method), "step_up": body.action}, status="failed")
+            try:
+                AuditLogger(db).log_second_factor_failure(
+                    current_user, details={"method": _sf_method_name(body.method), "step_up": body.action})
+            except Exception as audit_err:  # noqa: BLE001 -- the refusal stands without its row
+                print(f"⚠ audit write skipped for second_factor_failed: {type(audit_err).__name__}")
+                db.rollback()
             raise HTTPException(status_code=403, detail="That code is not valid.")
     if req["password"]:
         pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
@@ -7693,14 +7696,14 @@ async def login(
         # door is a "this credential is live and in use" oracle. Only AccountLockedError branches to a
         # 403 below; SessionLimitExceededError falls through to the uniform "Invalid username or
         # password" like InvalidCredentialsError, and is recorded as a failed login like it.
-        audit_logger.log_login_failure(login_request.username, client_ip, str(e))
+        record_id = audit_logger.log_login_failure(login_request.username, client_ip, str(e))
         
         # AWAITED in the offload pool: the brute-force counter must advance on every failed login
         # (never shed), so it is awaited — the record lands before the response — but OFF the loop.
         # The guard skips the socket while open; the one re-probe per cooldown boundary that does
         # reach the socket runs in the offload pool, so it never stalls the event loop. The request
         # already holds its slot, so this adds no new pool pressure.
-        await run_offloaded(_record_failed_login_bg, login_request.username, client_ip, str(e))
+        await run_offloaded(_record_failed_login_bg, login_request.username, client_ip, str(e), record_id)
 
         # An administrator's lock is raised only AFTER the password verified (verify-first ordering
         # in authenticate_user), so the caller has already proven they know the credential. An
@@ -7721,7 +7724,7 @@ async def login(
 
     except AuthRateLimitExceededError as e:
         # Log the rate limit event
-        audit_logger.log_login_failure(
+        record_id = audit_logger.log_login_failure(
             login_request.username,
             client_ip,
             f"Rate limit exceeded: {str(e)}"
@@ -7730,7 +7733,7 @@ async def login(
         # Awaited in the offload pool, same as the 401 branch — the counter must not be shed, and its
         # boundary re-probe must not stall the loop.
         await run_offloaded(_record_failed_login_bg, login_request.username, client_ip,
-                            f"Rate limit exceeded: {str(e)}")
+                            f"Rate limit exceeded: {str(e)}", record_id)
         
         detail, headers = _login_429_detail_and_headers(login_request.username, e)
         raise HTTPException(
@@ -23079,6 +23082,7 @@ async def get_security_alerts(
     try:
         from app.services.security_monitor import get_security_monitor
         
+        from app.core.security_records import render_message as render_alert_message
         monitor = get_security_monitor(db)
         alerts = monitor.get_recent_alerts(limit=limit, severity=severity)
 
@@ -23089,7 +23093,7 @@ async def get_security_alerts(
                     "id": str(alert.id),
                     "event_type": alert.event_type,
                     "severity": alert.severity,
-                    "message": alert.message,
+                    "message": render_alert_message(alert),
                     "username": alert.username,
                     "ip_address": alert.ip_address,
                     "timestamp": alert.timestamp.isoformat(),
