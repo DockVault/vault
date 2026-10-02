@@ -38,6 +38,9 @@ KEY_B = "b" * 64
 
 @pytest.fixture(autouse=True)
 def _keys(monkeypatch):
+    # The runtime first: an earlier test may have left it to be set up again, and setting it up installs every
+    # setting afresh, which would undo what this test sets below.
+    _runtime_settings()
     monkeypatch.setattr(settings, "audit_fingerprint_key", KEY_A)
     for key in ap.POLICY_KEYS:
         monkeypatch.setattr(settings, ap.env_field(key), "full")

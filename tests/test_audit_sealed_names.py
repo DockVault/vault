@@ -33,6 +33,7 @@ _runtime_settings()          # the runtime the sealing reads its key from, set u
 
 @pytest.fixture(autouse=True)
 def _full_names(monkeypatch):
+    _runtime_settings()      # set up again if an earlier test left it to be, before anything is set below
     for key in ap.POLICY_KEYS:
         monkeypatch.setattr(settings, ap.env_field(key), "full")
     monkeypatch.setattr(settings, "settings_locked_keys", "")
