@@ -119,16 +119,23 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
         wanted = statuses_for(statuses)
         q = q.filter(AuditLog.status.in_(wanted) if wanted else false())
 
-    if username and user_exact:
-        from sqlalchemy import func
-        q = q.filter(func.lower(AuditLog.username) == username[:MAX_TEXT].lower())
-    elif username:
-        q = q.filter(AuditLog.username.ilike(f"%{like_escape(username[:MAX_TEXT])}%", escape="\\"))
+    if username:
+        # A name typed at a failed sign-in may be recorded as its fingerprint (app/core/audit_fingerprints.py):
+        # the typed text matches it exactly, and a fingerprint (a saved search keeps one) matches that.
+        by_fingerprint = signin_fingerprint_match(AuditLog, username[:MAX_TEXT])
+        if user_exact:
+            from sqlalchemy import func
+            q = q.filter(or_(func.lower(AuditLog.username) == username[:MAX_TEXT].lower(), by_fingerprint))
+        else:
+            q = q.filter(or_(AuditLog.username.ilike(f"%{like_escape(username[:MAX_TEXT])}%", escape="\\"),
+                             by_fingerprint))
 
     if no_account:
         # A name no account had: typed at a failed sign-in, an account deleted since, or the server's
-        # operator acting from the host (credential_changes.HOST_OPERATOR, which no account may take).
-        q = q.filter(AuditLog.user_id.is_(None), AuditLog.username.isnot(None))
+        # operator acting from the host (credential_changes.HOST_OPERATOR, which no account may take). A typed
+        # name recorded as its fingerprint is one too.
+        q = q.filter(or_(and_(AuditLog.user_id.is_(None), AuditLog.username.isnot(None)),
+                         AuditLog.recorded["signin_name"].as_string().isnot(None)))
 
     if actions:
         wanted = stored_action_names(actions)
@@ -171,6 +178,7 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
             AuditLog.resource_id.ilike(like, escape="\\"),
             AuditLog.error_message.ilike(like, escape="\\"),
             cast(AuditLog.details, String).ilike(like, escape="\\"),
+            signin_fingerprint_match(AuditLog, text[:MAX_TEXT]),
         ))
 
     if temp_credential_id:
@@ -200,6 +208,26 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
     if end is not None:
         q = q.filter(AuditLog.timestamp < end)
     return q
+
+
+def is_fingerprint(text) -> bool:
+    from app.core.audit_fingerprints import is_fingerprint as check
+    return check((text or "").strip())
+
+
+def signin_fingerprint_match(AuditLog, text: str):
+    """Rows whose typed name was recorded as the fingerprint of ``text`` (or as ``text``, when it is a
+    fingerprint). Matches nothing when no fingerprint can be made."""
+    from sqlalchemy import false
+    from app.core.audit_fingerprints import SIGNIN, fingerprint
+    text = (text or "").strip()
+    if not text:
+        return false()
+    try:
+        wanted = text if is_fingerprint(text) else fingerprint(SIGNIN, text)
+    except Exception:  # noqa: BLE001 -- no key: the full-value filters still apply
+        return false()
+    return AuditLog.recorded["signin_name"].as_string() == wanted
 
 
 def shortened_match(AuditLog, net):

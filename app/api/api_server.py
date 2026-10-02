@@ -738,6 +738,9 @@ app.include_router(recording_levels_router)
 # What users are told the audit log records: the public notice, its page, and the banner after a change.
 from app.api.recording_notice_router import router as recording_notice_router  # noqa: E402
 app.include_router(recording_notice_router)
+# The Activity page's searches with the filters in the body, so what was typed reaches no request line.
+from app.api.activity_search_router import router as activity_search_router  # noqa: E402
+app.include_router(activity_search_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():

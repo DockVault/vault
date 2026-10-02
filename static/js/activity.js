@@ -254,10 +254,41 @@
         constructor(message, status, detail) { super(message); this.status = status; this.detail = detail; }
     }
 
+    // A read whose filters hold something typed (a name, an address, free text) is posted, with the filters in
+    // the body, so what was typed reaches no request line: /activity/events?... and /activity/summary?... go to
+    // their /search form, which answers the same. The export always is.
+    const SEARCHES = { '/activity/events': '/activity/events/search', '/activity/summary': '/activity/summary/search' };
+    const LIST_FILTERS = new Set(['category', 'channel', 'status', 'action', 'ids']);
+    const TYPED_FILTERS = ['user', 'q', 'ip', 'temp_credential'];
+
+    function typedIn(params) {
+        return TYPED_FILTERS.some((key) => (params.get(key) || '').trim() !== '');
+    }
+
+    function bodyOf(params) {
+        const out = {};
+        params.forEach((value, key) => {
+            if (LIST_FILTERS.has(key)) (out[key] = out[key] || []).push(value);
+            else out[key] = value;
+        });
+        return out;
+    }
+
+    function post(path, params) {
+        return fetch(API_BASE + path, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(bodyOf(params)),
+        });
+    }
+
     // A GET under /activity (or the session probe). A 401 is handed to the app's own sign-in handling;
     // a refusal for a temporary credential stops the page (see blockAsTemporary).
     async function get(path) {
-        const resp = await fetch(API_BASE + path, { headers: { Authorization: `Bearer ${authToken}` } });
+        const [base, query] = path.split('?');
+        const params = new URLSearchParams(query || '');
+        const resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
+            : await fetch(API_BASE + path, { headers: { Authorization: `Bearer ${authToken}` } });
         if (resp.status === 401) {
             await apiRequest(path, { silent: true });          // the app signs out
             throw new RequestError('Your session has ended.', 401, null);
@@ -679,9 +710,7 @@
         p.set('format', fmt);
         btn.setAttribute('aria-busy', 'true');
         try {
-            const resp = await fetch(`${API_BASE}/activity/export?${p.toString()}`, {
-                headers: { Authorization: `Bearer ${authToken}` },
-            });
+            const resp = await post('/activity/export', p);
             if (resp.status === 403) {
                 let data = null;
                 try { data = await resp.json(); } catch (_) { /* no body */ }

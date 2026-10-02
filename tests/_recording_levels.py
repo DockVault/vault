@@ -31,10 +31,17 @@ def store(levels, by="live test"):
 
 @pytest.fixture
 def levels_restored():
-    """The levels in force when the test starts; stored again as a newer version when it ends."""
+    """The levels in force when the test starts; stored again as a newer version when it ends. Every account is
+    then marked as having read the notice, so the banner a change shows does not stay over other tests' pages."""
     _, before = latest()
     yield before
-    store(before, by="live test, restoring")
+    version = store(before, by="live test, restoring")
+    mark_all_read(version)
+
+
+def mark_all_read(version=None):
+    version = version if version is not None else latest()[0]
+    psql(f"UPDATE users SET privacy_seen_version = {int(version)}")
 
 
 def wait_for(check, timeout=20.0, step=0.5):

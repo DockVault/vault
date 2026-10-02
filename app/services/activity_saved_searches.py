@@ -26,7 +26,7 @@ FIELDS = {
     "channel": ("choices", None),
     "status": ("choices", None),
     "action": ("choices", None),
-    "user": ("text", 128),
+    "user": ("text", 128),       # a typed name, kept as its fingerprint while those are (typed_as_recorded)
     "user_match": ("choice", None),
     "no_account": ("flag", None),
     "ip": ("text", 64),
@@ -123,6 +123,31 @@ def clean_filters(raw: Any) -> Dict[str, Any]:
                 out[key] = value
     if "range" in out and ("from_date" in out or "to_date" in out):
         raise InvalidSearch("A search has either a range or dates, not both.")
+    return typed_as_recorded(out)
+
+
+# The filter whose value is a name someone typed, which the recording levels may keep only as a fingerprint.
+# The free-text search (q) is kept as typed: it mostly names an event, and its fingerprint would match no label.
+TYPED = ("user",)
+
+
+def typed_as_recorded(filters: Dict[str, Any]) -> Dict[str, Any]:
+    """``filters`` with each typed name kept the way the audit log keeps it: while names typed at a failed
+    sign-in are recorded as fingerprints (app/core/audit_privacy.py), a saved search keeps the fingerprint,
+    not the text, which matches the same rows. A value that is already a fingerprint is kept as it is."""
+    from app.core import audit_privacy as ap
+    from app.core.audit_fingerprints import SIGNIN, fingerprint, is_fingerprint
+    try:
+        level = ap.effective(ap.current().levels)[ap.SIGNIN_NAMES]
+    except Exception:  # noqa: BLE001 -- unknown: keep no typed text
+        level = ap.FINGERPRINT
+    if level != ap.FINGERPRINT:
+        return filters
+    out = dict(filters)
+    for key in TYPED:
+        value = out.get(key)
+        if isinstance(value, str) and value and not is_fingerprint(value):
+            out[key] = fingerprint(SIGNIN, value)
     return out
 
 

@@ -23,6 +23,12 @@ MUTATING = {"post", "put", "patch", "delete"}
 
 # (file, "METHOD path") -> why the route writes no audit row.
 NOT_RECORDED = {
+    ("app/api/activity_search_router.py", "POST /activity/events/search"):
+        "a read of the Events list, posted so what was typed stays out of the request line",
+    ("app/api/activity_search_router.py", "POST /activity/summary/search"):
+        "a read of the summary band, posted so what was typed stays out of the request line",
+    ("app/api/activity_search_router.py", "POST /activity/export"):
+        "the export, posted so what was typed stays out of the request line; its handler records it",
     ("app/api/api_server.py", "POST /auth/second-factor/cancel"):
         "abandons a pending sign-in; no session was made",
     ("app/api/api_server.py", "POST /auth/second-factor/challenge"):
