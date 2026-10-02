@@ -99,7 +99,7 @@ def test_changing_a_managed_setting_asks_for_the_password(admin):
 
 
 def test_the_hold_goes_on_at_once_and_off_only_after_the_wait_unless_cancelled(admin):
-    before_notices = len(notifications(admin, "retention_change"))
+    seen = {n["id"] for n in notifications(admin, "retention_change")}
     try:
         with second_admin(admin) as (account, client):
             r = _put(client, account["_password"], "logs_hold", True)
@@ -118,7 +118,7 @@ def test_the_hold_goes_on_at_once_and_off_only_after_the_wait_unless_cancelled(a
             pending = admin.get("/settings/managed").json()["pending"]
             assert [p["id"] for p in pending if p["key"] == "logs_hold"] == [change["id"]]
 
-            told = _wait_for(lambda: [n for n in notifications(admin, "retention_change")][before_notices:])
+            told = _wait_for(lambda: [n for n in notifications(admin, "retention_change") if n["id"] not in seen])
             titles = [n["title"] for n in told]
             assert "A change that deletes records sooner is waiting" in titles, titles
 
