@@ -391,6 +391,18 @@ def is_host_operator(r) -> bool:
             and r.action in HOST_OPERATOR_ACTIONS)
 
 
+def recorded_by_earlier_release(r) -> bool:
+    """Whether a row was written by a release without the recording levels after they began on this vault."""
+    from app.core.audit_privacy import levels_began
+    began = levels_began()
+    ts = getattr(r, "timestamp", None)
+    if began is None or ts is None or getattr(r, "privacy_version", None) is not None:
+        return False
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts > began
+
+
 def recorded_value(r, key: str):
     """A value the row's recording policy kept in another form (recorded[key]), or None."""
     recorded = getattr(r, "recorded", None)
@@ -429,6 +441,9 @@ def row_view(r) -> dict:
         # The recording policy the row was written under (app/core/audit_privacy.py): None for a row from an
         # earlier release, -1 for one recorded without its personal values.
         "privacy_version": getattr(r, "privacy_version", None),
+        # Written with no version after the levels began: by an earlier release, rolled back to, which records
+        # everything in full whatever the levels say.
+        "recorded_by_earlier_release": recorded_by_earlier_release(r),
         "method": r.method,
         "endpoint": r.endpoint,
         "user_agent": r.user_agent,

@@ -37,6 +37,10 @@ def levels_restored():
     yield before
     version = store(before, by="live test, restoring")
     mark_all_read(version)
+    # A version stored here, as the panel stores one, does not keep the rollback marker the way a save does.
+    if all(before[k] == POLICY_ONE[k] or k == "names" for k in KEYS):
+        psql("DO $$ BEGIN IF to_regclass('data_requirements') IS NOT NULL THEN "
+             "DELETE FROM data_requirements WHERE key = 'recording-levels'; END IF; END $$")
 
 
 def mark_all_read(version=None):

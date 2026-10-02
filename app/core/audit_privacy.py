@@ -292,18 +292,24 @@ class PolicyUnavailable(RuntimeError):
 class _Cache:
     def __init__(self):
         self.policy: Optional[Policy] = None
+        # When version 1 was written: the first row an earlier release wrote after it is one recorded behind the
+        # notice (a rollback), and the Activity page says so.
+        self.began = None
         self._lock = threading.Lock()
 
     def load(self, session_factory) -> Policy:
+        from app.core.models import AuditPrivacyPolicy
         with self._lock:
             db = session_factory()
             try:
                 _statement_timeout(db)
                 policy = read_latest(db) or DEFAULT_POLICY
+                began = db.query(AuditPrivacyPolicy.created_at).filter(AuditPrivacyPolicy.version == 1).scalar()
                 db.rollback()
             finally:
                 db.close()
             self.policy = policy
+            self.began = began
             return policy
 
 
@@ -342,6 +348,11 @@ def load(session_factory=None) -> Policy:
 def use(policy: Optional[Policy]) -> None:
     """Hold ``policy`` as the one in force (a process that has just written it, and tests)."""
     _cache.policy = policy
+
+
+def levels_began():
+    """When version 1 was written (naive UTC), as this process last read it; None before."""
+    return _cache.began
 
 
 # Whether this process writes audit rows of a running deployment (the web app, the SFTP server, the host
@@ -408,6 +419,8 @@ def start(session_factory=None, *, interval: float = REFRESH_SECONDS, load_now: 
         while True:
             refresh(factory)
             _flush_alerts(factory)
+            from app.core import recording_marker
+            recording_marker.check_daily(factory)
             if stopping.wait(interval):
                 return
 
@@ -461,6 +474,10 @@ def write_version(db, levels: Mapping[str, str], *, previous: Optional[Policy], 
                                      username=None if user is not None else by_name,
                                      resource_type="audit_privacy_policy", resource_id=str(version),
                                      details=details))
+    # While the levels record less than earlier releases, an earlier release must not start on this data
+    # (app/core/recording_marker.py): the marker goes with the version, in its transaction.
+    from app.core import recording_marker
+    recording_marker.sync(db, levels)
     return Policy(version, {key: levels[key] for key in POLICY_KEYS})
 
 
@@ -488,6 +505,15 @@ def prepare(session_factory=None) -> Policy:
             reason = "locked" if locked() else "limit"
             latest = write_version(db, wanted, previous=latest, reason=reason, by_name=SERVER_CONFIGURATION)
             changed = True
+        else:
+            # Checked at every start too: a database restored from a backup, or a marker an operator removed.
+            from app.core import recording_marker
+            try:
+                with db.begin_nested():
+                    recording_marker.sync(db)
+            except Exception as exc:  # noqa: BLE001 -- the start goes on; the daily check tries again
+                _say(f"Warning: the marker that keeps an earlier release from starting on these recording levels "
+                     f"could not be checked ({type(exc).__name__})")
         db.commit()
     except Exception:
         db.rollback()
@@ -495,6 +521,10 @@ def prepare(session_factory=None) -> Policy:
     finally:
         db.close()
     use(latest)
+    try:
+        load(factory)          # and when the levels began
+    except Exception:  # noqa: BLE001 -- the refresher reads it at its next turn
+        pass
     if changed:
         # Every user is told, as after a save in the panel (app/core/recording_notice.py).
         from app.core import recording_notice
@@ -831,6 +861,7 @@ def _reset_for_tests() -> None:
         _alerts_pending.clear()
         _alerts_sent.clear()
     _cache.policy = None
+    _cache.began = None
     _required = False
 
 

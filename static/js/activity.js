@@ -966,7 +966,8 @@
         if (ev.temp_credential_id) whoWrap.appendChild(tempBadge(ev));
         const under = recordedUnder(ev);
         if (under) {
-            const badge = el('span', 'badge badge-secondary act-temp act-recorded', ev.privacy_version === -1 ? 'stripped' : `levels v${ev.privacy_version}`);
+            const badge = el('span', 'badge badge-secondary act-temp act-recorded', ev.recorded_by_earlier_release
+                ? 'earlier release' : (ev.privacy_version === -1 ? 'stripped' : `levels v${ev.privacy_version}`));
             badge.title = under;
             whoWrap.appendChild(badge);
         }
@@ -1575,6 +1576,7 @@
     // recorded under the current levels, or by a release before them.
     function recordedUnder(ev) {
         const v = ev.privacy_version;
+        if (ev.recorded_by_earlier_release) return 'By an earlier release, after the recording levels began: recorded in full';
         if (v == null) return null;
         if (v === -1) return 'Without its personal values: deciding what to record failed';
         if (S.recordingVersion != null && v !== S.recordingVersion) return `Under recording levels version ${v}`;
