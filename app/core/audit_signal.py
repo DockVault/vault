@@ -33,6 +33,8 @@ MAX_QUEUE = 2000
 MAX_BATCH = 200
 
 _INFO_KEY = "_audit_signal_rows"
+# Set on a factory once install() has added the listeners to it.
+_INSTALLED = "_audit_signal_installed"
 
 _queue: "queue.Queue[Tuple[str, str]]" = queue.Queue(maxsize=MAX_QUEUE)
 _worker_lock = threading.Lock()
@@ -79,15 +81,21 @@ def _after_transaction_end(session, transaction):
 
 def install(target) -> bool:
     """Listen on a session factory (or a Session class) for committed audit rows. Idempotent. Returns
-    False, and listens to nothing, for anything else (a stand-in factory in a test)."""
+    False, and listens to nothing, for anything else (a stand-in factory in a test).
+
+    Whether a factory already listens is marked on the factory itself. SQLAlchemy's own record
+    (event.contains) is keyed by the target's address, so a new factory that takes the address of a
+    freed one would be reported as already listening, and would never get the listeners."""
     from sqlalchemy import event
     from sqlalchemy.orm import Session, sessionmaker
     if not (isinstance(target, sessionmaker) or (isinstance(target, type) and issubclass(target, Session))):
         return False
+    if getattr(target, _INSTALLED, False):
+        return True
     for name, fn in (("after_flush", _after_flush), ("after_commit", _after_commit),
                      ("after_transaction_end", _after_transaction_end)):
-        if not event.contains(target, name, fn):
-            event.listen(target, name, fn)
+        event.listen(target, name, fn)
+    setattr(target, _INSTALLED, True)
     return True
 
 
