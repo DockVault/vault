@@ -583,13 +583,17 @@ class _Recorder:
         return out
 
     def name(self, path: str, value) -> None:
-        """A vault, file or folder name: never in the details; at the fingerprint level, its fingerprint
-        under its vault's key in recorded.names. A name whose vault the row does not say is not recorded."""
+        """A vault, file or folder name: never in the details. At the fingerprint level, its fingerprint under
+        its vault's key goes into recorded.names; in full, the name too, sealed (seal_name). A name whose vault
+        the row does not say is not recorded."""
         if self.level(NAME) == NONE or self.vault_id is None or not isinstance(value, str):
             return
         from app.core.audit_fingerprints import NAME as NAME_KEY, fingerprint
+        kept = {"fp": fingerprint(NAME_KEY, value, self.vault_id)}
+        if self.level(NAME) == FULL:
+            kept["sealed"] = seal_name(self.vault_id, self.row.id, path, value)
         names = self.recorded.setdefault("names", {"vault": str(self.vault_id), "values": {}})
-        names["values"][path] = {"fp": fingerprint(NAME_KEY, value, self.vault_id)}
+        names["values"][path] = kept
 
     def columns(self) -> None:
         row = self.row
@@ -605,6 +609,27 @@ class _Recorder:
                 self.recorded["ip"] = other
         if getattr(row, "user_agent", None):
             row.user_agent, _ = self.personal(AGENT, row.user_agent)
+
+
+def _name_field(key: str) -> str:
+    return "audit-name:" + key
+
+
+def seal_name(vault_id, row_id, key: str, name: str) -> str:
+    """A name recorded in full, sealed under a key derived for its vault and its audit row, with the detail
+    key it was recorded under bound in: it opens only for that row and that key, and the database holds no
+    plaintext copy. The row's id is the one build_row gives it before any hook runs."""
+    if row_id is None:
+        raise ValueError("a row's name is sealed under its id, and this row has none yet")
+    from app.core.security import encrypt_object_field
+    return encrypt_object_field(vault_id, row_id, name, _name_field(key))
+
+
+def open_name(vault_id, row_id, key: str, sealed: str) -> str:
+    """The name seal_name sealed. Raises when the vault, the row or the key is not the one it was sealed
+    under, or the value was changed."""
+    from app.core.security import decrypt_object_field
+    return decrypt_object_field(vault_id, row_id, sealed, _name_field(key))
 
 
 def names_vault(row, raw_details):

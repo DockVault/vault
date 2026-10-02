@@ -22,11 +22,14 @@ set_bare_api_env()
 from app.core import audit_fingerprints as fp  # noqa: E402
 from app.core import audit_privacy as ap  # noqa: E402
 from app.core.config import settings  # noqa: E402
-from app.core.models import AuditLog, User  # noqa: E402
+from app.core.models import AuditLog, User, Vault  # noqa: E402
+from app.core.security import _runtime_settings  # noqa: E402
 from app.services import activity_names  # noqa: E402
 from app.services.audit_logger import AuditLogger  # noqa: E402
 
 pytestmark = pytest.mark.unit
+
+_runtime_settings()          # set up before any test changes a setting: a name sealed at the full level reads it
 
 ROOT = Path(__file__).resolve().parent.parent
 KEY_A = "a" * 64
@@ -46,7 +49,7 @@ def _keys(monkeypatch):
 def db():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'fp.db'}")
-        for model in (User, AuditLog):
+        for model in (User, AuditLog, Vault):
             model.__table__.create(engine)
         session = sessionmaker(bind=engine)()
         yield session
@@ -152,7 +155,7 @@ def _row(vault, values=None, signin=None):
     return SimpleNamespace(recorded=recorded or None)
 
 
-def test_name_fingerprints_are_given_only_for_a_vault_the_viewer_can_read(monkeypatch):
+def test_name_fingerprints_are_given_only_for_a_vault_the_viewer_can_read(db, monkeypatch):
     mine, theirs = uuid.uuid4(), uuid.uuid4()
     asked = []
 
@@ -161,7 +164,7 @@ def test_name_fingerprints_are_given_only_for_a_vault_the_viewer_can_read(monkey
         return {mine}
 
     monkeypatch.setattr(activity_names, "readable_vault_ids", readable)
-    out = activity_names.recorded_names_for(None, object(), [_row(mine), _row(theirs), _row(None), SimpleNamespace(recorded=None)])
+    out = activity_names.recorded_names_for(db, object(), [_row(mine), _row(theirs), _row(None), SimpleNamespace(recorded=None)])
     assert out == [{"file_name": {"fingerprint": "fp1:x:y"}}, None, None, None]
     assert asked == [{mine, theirs}]
 

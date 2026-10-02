@@ -113,22 +113,45 @@ def _recorded_names(row) -> Optional[dict]:
     return names
 
 
+# The name a vault event records: the vault's own. Every other recorded name is a file's or a folder's.
+VAULT_NAME_KEY = "vault_name"
+SEALED_UNREADABLE = "Recorded, but it cannot be opened"
+
+
 def recorded_names_for(db, viewer, rows) -> List[Optional[dict]]:
-    """For each audit row, the names its recording levels kept (recorded.names: each key's fingerprint), or
-    None. Only for a vault the viewer can read, by the same rule as the names above: a fingerprint of a name in
-    a vault the viewer is not in would let them test guesses of what is in it."""
+    """For each audit row, the names its recording levels kept (recorded.names), or None. Only for a vault the
+    viewer can read, by the same rules as the names above: a fingerprint of a name in a vault the viewer is not
+    in would let them test guesses of what is in it. Each key gives its fingerprint, and a name recorded in
+    full opened where the viewer may see it: the vault's name in a vault they can read; a file's or a folder's
+    name only when, in addition, the vault has no vault password and is not zero-knowledge."""
+    from app.core.audit_privacy import open_name
+    from app.core.models import Vault
     kept = [_recorded_names(r) for r in rows]
     vaults = {_uuid(n.get("vault")) for n in kept if n}
     vaults.discard(None)
     readable = readable_vault_ids(db, viewer, vaults) if vaults else set()
+    facts = {r[0]: (r[1], bool(r[2])) for r in db.query(Vault.id, Vault.type, Vault.password_hash)
+             .filter(Vault.id.in_(readable)).all()} if readable else {}
     out = []
-    for names in kept:
+    for row, names in zip(rows, kept):
         vault = _uuid(names.get("vault")) if names else None
         if vault is None or vault not in readable:
             out.append(None)
             continue
-        out.append({key: {"fingerprint": value.get("fp")} for key, value in names["values"].items()
-                    if isinstance(value, dict)})
+        kind, has_password = facts.get(vault, (None, False))
+        items_open = kind != "zero_knowledge" and not has_password
+        shown = {}
+        for key, value in names["values"].items():
+            if not isinstance(value, dict):
+                continue
+            entry = {"fingerprint": value.get("fp")}
+            if value.get("sealed") and (key == VAULT_NAME_KEY or items_open):
+                try:
+                    entry["name"] = open_name(vault, row.id, key, value["sealed"])
+                except Exception:  # noqa: BLE001 -- a value that does not open is said to, never guessed at
+                    entry["name"] = SEALED_UNREADABLE
+            shown[key] = entry
+        out.append(shown)
     return out
 
 

@@ -1663,8 +1663,13 @@
         const kept = ev.recorded_names || {};
         Object.keys(kept).sort().forEach((key) => {
             const value = kept[key] || {};
-            if (value.fingerprint) {
-                field(what.dl, `${NAME_KEY_LABELS[key] || key} (fingerprint)`, el('span', 'act-d-value act-mono', value.fingerprint));
+            const label = NAME_KEY_LABELS[key] || key;
+            if (value.name) {
+                const shown = el('span', 'act-d-value', value.name);
+                if (value.fingerprint) shown.title = `Fingerprint: ${value.fingerprint}`;
+                field(what.dl, `${label} (as recorded)`, shown);
+            } else if (value.fingerprint) {
+                field(what.dl, `${label} (fingerprint)`, el('span', 'act-d-value act-mono', value.fingerprint));
             }
         });
         const names = ev.names || {};
