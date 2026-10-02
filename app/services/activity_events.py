@@ -149,15 +149,17 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
         q = q.filter(false())                      # an unreadable IP filter matches nothing
     elif net is not None:
         if net.num_addresses == 1:
-            q = q.filter(AuditLog.ip_address == str(net.network_address))
+            full = AuditLog.ip_address == str(net.network_address)
         else:
             # Only rows whose stored value is a plain address are cast; anything else never matches.
             # CASE keeps the cast from being evaluated on the rest.
             pattern = r"^[0-9.]+$" if net.version == 4 else r"^[0-9a-fA-F:]+$"
-            q = q.filter(case(
+            full = case(
                 (AuditLog.ip_address.op("~")(pattern),
                  cast(AuditLog.ip_address, _inet()).op("<<=")(cast(literal(str(net)), _inet()))),
-                else_=False))
+                else_=False)
+        # A row recorded with a shortened address keeps the network it is in (recorded.ip), not the address.
+        q = q.filter(or_(full, shortened_match(AuditLog, net)))
 
     if text:
         like = f"%{like_escape(text[:MAX_TEXT])}%"
@@ -198,6 +200,23 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
     if end is not None:
         q = q.filter(AuditLog.timestamp < end)
     return q
+
+
+def shortened_match(AuditLog, net):
+    """Rows whose shortened address (recorded.ip, app/core/audit_privacy.py) is in ``net`` or holds it:
+    for an address, or a block inside one shortened network, the one network it is in (an equality the
+    index on recorded.ip serves); for a wider block, every network inside it."""
+    from sqlalchemy import case, cast, literal
+    from app.core.audit_privacy import SHORT_PREFIX, shorten
+    prefix = SHORT_PREFIX[net.version]
+    recorded_ip = AuditLog.recorded["ip"].as_string()
+    if net.prefixlen >= prefix:
+        network = shorten(net.network_address)
+        return recorded_ip == network
+    pattern = r"^[0-9.]+/[0-9]+$" if net.version == 4 else r"^[0-9a-fA-F:]+/[0-9]+$"
+    return case((recorded_ip.op("~")(pattern),
+                 cast(recorded_ip, _inet()).op("<<=")(cast(literal(str(net)), _inet()))),
+                else_=False)
 
 
 def _inet():
@@ -344,6 +363,13 @@ def is_host_operator(r) -> bool:
             and r.action in HOST_OPERATOR_ACTIONS)
 
 
+def recorded_value(r, key: str):
+    """A value the row's recording policy kept in another form (recorded[key]), or None."""
+    recorded = getattr(r, "recorded", None)
+    value = recorded.get(key) if isinstance(recorded, dict) else None
+    return value if isinstance(value, str) else None
+
+
 def row_view(r) -> dict:
     entry = audit_catalog.lookup(r.action or "")
     ts = r.timestamp
@@ -368,7 +394,11 @@ def row_view(r) -> dict:
         "automatic": bool(entry and entry.automatic),
         "status": r.status,
         "channel": r.channel,
-        "ip_address": r.ip_address,
+        # The address in full, or the network a shortened one is in (recorded.ip).
+        "ip_address": r.ip_address or recorded_value(r, "ip"),
+        # The recording policy the row was written under (app/core/audit_privacy.py): None for a row from an
+        # earlier release, -1 for one recorded without its personal values.
+        "privacy_version": getattr(r, "privacy_version", None),
         "method": r.method,
         "endpoint": r.endpoint,
         "user_agent": r.user_agent,

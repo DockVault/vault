@@ -182,7 +182,11 @@ class SecurityMonitor:
             except Exception:  # noqa: BLE001 -- the record stands without its link
                 self.db.rollback()
         
-        logger.info(f"Failed login recorded: {username} from {ip_address} ({recent_attempts} recent attempts)")
+        # The container's output shows the name and the address only as far as the recording levels record
+        # them (app/core/audit_privacy.py).
+        from app.core.audit_privacy import ADDRESS, SIGNIN_NAME, for_output
+        logger.info(f"Failed login recorded: {for_output(SIGNIN_NAME, username)} from "
+                    f"{for_output(ADDRESS, ip_address)} ({recent_attempts} recent attempts)")
     
     def record_file_deletion(self, user_id: str, vault_id: str, file_count: int = 1):
         """

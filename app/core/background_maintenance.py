@@ -98,6 +98,15 @@ STEPS: list[Step] = [
               "'autovacuum_analyze_scale_factor=0.02']::text[], false) FROM pg_class c "
               "JOIN pg_namespace n ON n.oid = c.relnamespace "
               "WHERE c.relname = 'audit_logs' AND n.nspname = current_schema()"),
+    # The recording levels keep a shortened address, and the fingerprint of a name typed at a failed sign-in,
+    # in audit_logs.recorded (app/core/audit_privacy.py); the Events filters and the most active addresses
+    # look them up by value. Only rows recorded in another form than the value have the column set.
+    create_index("ix_audit_logs_recorded_ip",
+                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_recorded_ip ON audit_logs "
+                 "((recorded->>'ip')) WHERE recorded IS NOT NULL"),
+    create_index("ix_audit_logs_recorded_signin_name",
+                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_recorded_signin_name ON audit_logs "
+                 "((recorded->>'signin_name')) WHERE recorded IS NOT NULL"),
 ]
 
 _STATE_SQL = text(

@@ -538,6 +538,19 @@ def _require_running_container(request):
     return health
 
 
+@pytest.fixture(autouse=True)
+def _recording_levels_start_afresh():
+    """An offline test that builds audit rows in this process holds the recording levels' process state
+    (app/core/audit_privacy.py: the policy it holds, whether it must read one, the alerts it queued). Each
+    test starts without any, whatever an earlier one did. Nothing is imported here: a test that never
+    loaded the module has none to clear."""
+    yield
+    import sys
+    module = sys.modules.get("app.core.audit_privacy")
+    if module is not None:
+        module._reset_for_tests()
+
+
 def pytest_collection_modifyitems(items):
     """Give every test exactly one execution-environment classification."""
     for item in items:

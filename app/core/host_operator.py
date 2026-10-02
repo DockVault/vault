@@ -174,6 +174,9 @@ def run(argv=None) -> int:
 
 
 def _run(args, api) -> int:
+    # The rows this tool writes are the deployment's own: they follow the recording levels in force.
+    from app.core import audit_privacy
+    audit_privacy.require()
     from app.core import credential_changes as cc
     from app.core.database import get_db_context
     from app.services.audit_logger import AuditLogger

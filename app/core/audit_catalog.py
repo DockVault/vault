@@ -210,6 +210,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("device_sync_cred_mint", "devices", "Sync login issued to a device", "info"),
     # Administration
     AuditAction("audit_exported", "administration", "Audit log exported", "notice"),
+    # A new version of the recording levels (app/core/audit_privacy.py): by an administrator, or by the server
+    # bringing a level within a lowered .env limit (then the row has no account and says so).
+    AuditAction("audit_privacy_changed", "administration", "Recording levels changed", "warning"),
     AuditAction("brand_asset_reset", "administration", "Logo or icon reset to default", "info"),
     AuditAction("brand_asset_uploaded", "administration", "Logo or icon uploaded", "info"),
     AuditAction("email_action_test_sent", "administration", "Test automatic email sent", "info"),

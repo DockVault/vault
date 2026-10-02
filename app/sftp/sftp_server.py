@@ -2580,6 +2580,10 @@ def start_sftp_server():
     # (app/core/settings_registry.py).
     from app.core import settings_registry
     settings_registry.start(load_now=False)
+    # The recording levels the same way: brought within .env and read on a thread of their own; an audit
+    # row written before that reads the policy itself (app/core/audit_privacy.py).
+    from app.core import audit_privacy
+    audit_privacy.start(load_now=False)
 
     # Which version this process runs, recorded in the database now and while it runs, on a thread of its
     # own, so the web app can tell whether every SFTP process runs its version (app/core/sftp_versions.py).

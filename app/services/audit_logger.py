@@ -18,13 +18,14 @@ from app.services import audit_row_hooks
 logger = logging.getLogger(__name__)
 
 # At-rest privacy: these keys hold plaintext names that are ENCRYPTED in the files/folders/vaults
-# tables (and, for a zero-knowledge vault, the residual plaintext label), so they must never be
-# persisted in an audit row's `details` JSON. log_action() strips them on every write, and the boot
-# migration app/core/audit_migrations.py purges them from legacy rows -- both read THIS ONE list, so
-# adding a key here covers both surfaces at once. A row that must commit with the caller's own
-# transaction is built with AuditLogger.build_row, which strips them too; nothing else constructs an
-# AuditLog (tests/test_audit_route_coverage.py holds that).
-REDACTED_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
+# tables (and, for a zero-knowledge vault, the residual plaintext label), so their plaintext is never
+# persisted in an audit row's `details` JSON. The recording levels decide every row's details as it is
+# written (app/core/audit_privacy.py, through build_row's privacy hook, which nothing else bypasses:
+# tests/test_audit_route_coverage.py holds that nothing else constructs an AuditLog), and the boot
+# migration app/core/audit_migrations.py purges them from legacy rows. Both read the names' kind from
+# audit_privacy.DETAIL_KEYS, so this list is the same one.
+from app.core.audit_privacy import DETAIL_KEYS as _DETAIL_KEYS, NAME as _NAME_KIND  # noqa: E402
+REDACTED_NAME_KEYS = tuple(sorted(k for k, kind in _DETAIL_KEYS.items() if kind == _NAME_KIND and "." not in k))
 
 
 def _request_address():
@@ -112,7 +113,7 @@ class AuditLogger:
         (an automatic account lock, the file-expiry sweep): it adds the row to its own session, so
         its commit writes both and its rollback drops both. log_action cannot give that, because it
         commits on its own. log_action is this method plus the add and the commit, so a row built
-        here gets everything log_action applies: the name redaction, the acting user's name and
+        here gets everything log_action applies: the recording levels, the acting user's name and
         temporary credential, and the request's channel, method, route, user agent and address
         where they are known.
 
@@ -136,26 +137,14 @@ class AuditLogger:
             except Exception:  # noqa: BLE001 -- a missing name never stops the row
                 username = None
 
-        # What the caller passed, before anything is taken out, for the privacy hook below. A deep copy, so a
-        # hook cannot change the caller's dict or a value inside it, which the row's details share. Details
-        # are JSON values (the column stores nothing else), so they always copy.
+        # What the caller passed, for the privacy hook below, which decides what the row's details keep
+        # (app/core/audit_privacy.py: names, addresses and email addresses at their recording levels,
+        # secrets never, an unclassified key never). A deep copy, so a hook cannot change the caller's dict
+        # or a value inside it: a caller may also use its dict for a live broadcast that keeps the name.
+        # Details are JSON values (the column stores nothing else), so they always copy. The row itself is
+        # built without details: only the hook gives it any.
         raw_details = copy.deepcopy(details) if isinstance(details, dict) else details
-
-        # At-rest privacy: file/folder names are encrypted in the files/folders tables,
-        # so we must not persist their plaintext in the audit details JSON (that would
-        # leave the very names one table over, recoverable from a DB/backup read).
-        # resource_id still identifies the affected file/folder by UUID. Redact on a COPY
-        # so a details dict the caller also uses for a transient SSE broadcast is untouched.
-        if isinstance(details, dict):
-            # old_name/new_name are the rename before/after names — just as sensitive as file_name,
-            # so redact them too (they otherwise persist in cleartext for Standard-vault renames).
-            # vault_name is redacted for the same reason: resource_id already identifies the vault by
-            # UUID, and for a zero-knowledge vault the name is the residual plaintext label. The
-            # transient SSE/monitor broadcast keeps the name because this redacts a COPY (below).
-            # The key set is the module-level REDACTED_NAME_KEYS so the boot purge migration stays in
-            # lockstep with what is redacted on write.
-            if any(k in details for k in REDACTED_NAME_KEYS):
-                details = {k: v for k, v in details.items() if k not in REDACTED_NAME_KEYS}
+        details = None
 
         # Where the request came from and what it was, when the caller did not say: the request
         # context (a web request) or the process default (the SFTP server).

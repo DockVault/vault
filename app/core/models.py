@@ -1222,13 +1222,15 @@ class AuditLog(Base):
     details = Column(JSON, nullable=True)  # Additional context
     error_message = Column(Text, nullable=True)
 
-    # Set through AuditLogger.build_row's hooks (app/services/audit_row_hooks.py), which leave them NULL
-    # for now. Nullable with no default: adding them to an existing table rewrites no row, and a release
-    # that does not know them writes NULL and never reads them.
+    # Set through AuditLogger.build_row's hooks (app/services/audit_row_hooks.py). Nullable with no
+    # default: adding them to an existing table rewrites no row, and a release that does not know them
+    # writes NULL and never reads them.
     #   seal_nonce      -- a random value per row, under which the log's integrity chain commits to the
     #                      row's personal values;
-    #   privacy_version -- the recording policy the row was written under;
-    #   recorded        -- what that policy kept of the row's personal values;
+    #   privacy_version -- the recording policy the row was written under (app/core/audit_privacy.py;
+    #                      -1: recorded without its personal values because deciding failed);
+    #   recorded        -- what that policy kept of the row's personal values in another form than the
+    #                      value itself, and the detail keys it dropped as unclassified;
     #   ip_via          -- how the recorded address was learned;
     #   case_id         -- the compliance case the row was written under.
     seal_nonce = Column(LargeBinary, nullable=True)
@@ -1258,6 +1260,31 @@ class SystemSetting(Base):
     key = Column(String(100), primary_key=True)
     value = Column(JSON, nullable=False, default=dict)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AuditPrivacyPolicy(Base):
+    """One version of the recording levels: what the audit log records of each kind of personal data
+    (app/core/audit_privacy.py), within the limits the deployment's .env sets.
+
+    The table only grows: a change adds the next version, and nothing updates or deletes a row (on Postgres
+    a trigger refuses it). Version 1 is what earlier releases recorded. Each audit row stamps the version it
+    was recorded under in ``audit_logs.privacy_version``. ``created_by_name`` is the account's username, or
+    "server configuration" for a version the server wrote itself to bring a level within a lowered limit.
+    Created by create_all; an older release ignores it.
+    """
+    __tablename__ = 'audit_privacy_policies'
+
+    version = Column(Integer, primary_key=True, autoincrement=False)
+    names = Column(String(16), nullable=False)
+    signin_names = Column(String(16), nullable=False)
+    emails = Column(String(16), nullable=False)
+    ip = Column(String(16), nullable=False)
+    user_agent = Column(String(16), nullable=False)
+    # initial, admin, limit (brought within a lowered .env limit) or locked (set to the limit while locked)
+    reason = Column(String(16), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_by_name = Column(String(255), nullable=True)
 
 
 class ManagedSetting(Base):

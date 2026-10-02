@@ -2,7 +2,8 @@
 
 audit_logs has seal_nonce, privacy_version, recorded, ip_via and case_id, and security_alerts has ip_via,
 each nullable with no default, and the statements that add them were recorded as applied at start. A row
-written now keeps them empty. test_audit_row_columns.py checks the model, the statements and the hooks
+written now keeps them empty, but for the recording levels' version (test_audit_privacy_live.py).
+test_audit_row_columns.py checks the model, the statements and the hooks
 offline.
 """
 import uuid
@@ -47,16 +48,19 @@ def test_the_statements_that_add_them_were_recorded_as_applied():
     assert all(line.endswith("|applied") for line in lines), rows
 
 
-def test_a_row_written_now_has_its_id_and_leaves_them_empty():
+def test_a_row_written_now_has_its_id_and_the_policy_and_leaves_the_rest_empty():
     name = f"nobody-{uuid.uuid4().hex[:10]}"
     r = requests.post(f"{BASE_URL}/auth/login", json={"username": name, "password": "not-the-password"},
                       timeout=30)
     assert r.status_code in (401, 429), r.status_code
-    out = psql("SELECT id, seal_nonce IS NULL, privacy_version IS NULL, recorded IS NULL, ip_via IS NULL, "
-               f"case_id IS NULL FROM audit_logs WHERE username = '{name}'")
+    out = psql("SELECT id, seal_nonce IS NULL, ip_via IS NULL, case_id IS NULL, recorded IS NULL, "
+               "privacy_version = (SELECT max(version) FROM audit_privacy_policies) "
+               f"FROM audit_logs WHERE username = '{name}'")
     lines = out.splitlines()
     assert lines, "the failed sign-in wrote no audit row"
     for line in lines:
         row_id, *empty = line.split("|")
         assert uuid.UUID(row_id).version == 4
+        # The recording levels stamp the version they recorded it under; at the stack's levels (a typed name
+        # and an address in full) nothing is kept in another form.
         assert empty == ["t"] * 5, line

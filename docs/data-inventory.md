@@ -119,6 +119,11 @@ account and group ids that may use a tag.
 manages within the deployment's limits, one row per setting, with the id and username of whoever set
 each one last and when. A row is overwritten by the next change and never deleted.
 
+`audit_privacy_policies` (new in 0.34.0) holds each version of the recording levels (what the audit log
+records of each kind of personal data), with the id and username of the administrator who saved it, or
+"server configuration" for a version the server wrote to bring a level within a lowered `.env` limit, and
+when. Rows are never changed or deleted: each change adds a version.
+
 `sftp_processes` (new in 0.34.0) holds each running SFTP server process's version and its container's
 host name, refreshed every 30 seconds; it holds no personal data. A process removes its row when it
 stops, and rows not refreshed for 7 days are removed.
@@ -140,12 +145,22 @@ Each row of `audit_logs` holds:
   agent. Before 0.33.0 no row carried a user agent;
 - details, which depend on the action: for example the account a change was made to, an email
   address before and after a change, who a share went to, or the filters of an export. Vault, file
-  and folder names are never stored: they are removed from the details as each row is written;
+  and folder names are never stored in the details; nor are session tokens, passwords or link tokens,
+  and of an error only its type is. **New in 0.34.0:** a detail whose key the application does not
+  classify is not stored (its key is noted in `recorded`, and an alert is raised);
 - an error message for a failure;
-- **New in 0.34.0, and empty on every row so far:** `recorded` (what the recording policy keeps of the
-  row's personal values), `privacy_version` (which policy that was), `seal_nonce` (a random value per
-  row for the log's integrity chain), `ip_via` (how the address was learned) and `case_id` (a
-  compliance case). `security_alerts` gains the same `ip_via`, also empty.
+- **New in 0.34.0: the recording levels.** What a row keeps of the name typed at a failed sign-in, of email
+  addresses, of the address and of the user agent follows the levels an administrator chooses, within the
+  limits `.env` sets (`AUDIT_MAX_NAMES`, `AUDIT_MAX_SIGNIN_NAMES`, `AUDIT_MAX_EMAILS`, `AUDIT_MAX_IP`,
+  `AUDIT_MAX_USER_AGENT`). Version 1, the default, records what earlier releases did. A value recorded at
+  a lower level is either not stored or stored in another form in `recorded` (a shortened address keeps
+  the /24 or /48 it is in); the row's own columns and details hold only values recorded in full.
+  `privacy_version` says which version of the levels a row was recorded under (none: an earlier release;
+  -1: recorded without its personal values because deciding failed, with an alert). Changing the levels
+  never rewrites older rows;
+- **New in 0.34.0, and empty on every row so far:** `seal_nonce` (a random value per row for the log's
+  integrity chain), `ip_via` (how the address was learned) and `case_id` (a compliance case).
+  `security_alerts` gains the same `ip_via`, also empty.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is

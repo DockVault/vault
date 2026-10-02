@@ -931,6 +931,12 @@
         name.title = who.title || who.text;
         whoWrap.appendChild(name);
         if (ev.temp_credential_id) whoWrap.appendChild(tempBadge(ev));
+        const under = recordedUnder(ev);
+        if (under) {
+            const badge = el('span', 'badge badge-secondary act-temp act-recorded', ev.privacy_version === -1 ? 'stripped' : `levels v${ev.privacy_version}`);
+            badge.title = under;
+            whoWrap.appendChild(badge);
+        }
         whoTd.appendChild(whoWrap);
         const ch = el('td', 'act-c-ch');
         if (ev.channel) ch.textContent = channelLabel(ev.channel);
@@ -1244,6 +1250,7 @@
                 return;
             }
             S.rows = data.events || [];
+            if (data.recording_version != null) S.recordingVersion = data.recording_version;
             S.total = data.total;
             S.pages = all ? null : (data.pages || 1);
             if (all) { S.allCursor = data.next_cursor || null; S.allDone = !data.next_cursor; S.allCap = ALL_CAP; }
@@ -1525,6 +1532,16 @@
         return d && typeof d === 'object' && d.vault_id ? String(d.vault_id) : null;
     }
 
+    // Which recording levels a row was recorded under, when it is not the version in force: null for a row
+    // recorded under the current levels, or by a release before them.
+    function recordedUnder(ev) {
+        const v = ev.privacy_version;
+        if (v == null) return null;
+        if (v === -1) return 'Without its personal values: deciding what to record failed';
+        if (S.recordingVersion != null && v !== S.recordingVersion) return `Under recording levels version ${v}`;
+        return null;
+    }
+
     function cidrOf(ip) {
         if (!ip) return null;
         if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip.split('.').slice(0, 3).join('.') + '.0/24';
@@ -1628,6 +1645,8 @@
         if (ev.error_message) st.appendChild(el('span', 'act-d-error', ev.error_message));
         const group = statusGroup(ev.status);
         field(what.dl, 'Status', st, [group ? detailFilter('Show events with this status', { status: [group] }) : null]);
+        const recorded = recordedUnder(ev);
+        if (recorded) field(what.dl, 'Recorded', el('span', 'act-d-value act-d-recorded', recorded));
         const names = ev.names || {};
         const vid = vaultIdOf(ev);
         if (names.vault || vid) {

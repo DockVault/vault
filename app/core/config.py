@@ -430,6 +430,16 @@ class Settings(BaseSettings):
     security_record_days: int = Field(default=30)
     security_record_min_days: int = Field(default=7)
     security_record_max_days: int = Field(default=365)
+    # The most the audit log may record of each kind of personal data (app/core/audit_privacy.py): the
+    # panel's recording levels stay at or below these. Names (vault, file and folder): none, fingerprint or
+    # full. Names typed at a failed sign-in: none, fingerprint or full. Email addresses: none or full. IP
+    # addresses: none, shortened or full. Browser descriptions: none or full. A value that is none of these
+    # refuses to start. With audit_levels in SETTINGS_LOCKED_KEYS each limit is also the level.
+    audit_max_names: str = Field(default="full")
+    audit_max_signin_names: str = Field(default="full")
+    audit_max_emails: str = Field(default="full")
+    audit_max_ip: str = Field(default="full")
+    audit_max_user_agent: str = Field(default="full")
     # Audit-log retention in days. 0 (the default) keeps every audit row: a deleted record of what
     # happened cannot be brought back, so deleting them is left to the operator. A positive value
     # deletes rows older than that many days; the pruner (app/core/retention.py) does it on a timer.
@@ -598,6 +608,15 @@ def _validate_runtime_settings(candidate: Settings) -> None:
         raise RuntimeBootstrapError(
             "jwt-secret-weak",
             "The JWT signing secret is missing, too short, or a known placeholder.",
+        )
+
+    from app.core.audit_privacy import env_problems
+    unreadable = env_problems(candidate)
+    if unreadable:
+        raise RuntimeBootstrapError(
+            "audit-recording-limit-invalid",
+            "A recording limit in .env cannot be read: " + "; ".join(unreadable)
+            + ". Fix the line in .env, then run docker compose up -d.",
         )
 
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:

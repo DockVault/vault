@@ -2414,6 +2414,11 @@ def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, t
     return q
 
 
+def _recorded_value(r, key):
+    from app.services.activity_events import recorded_value
+    return recorded_value(r, key)
+
+
 def _audit_row_to_dict(r):
     return {
         "timestamp": r.timestamp.isoformat() if r.timestamp else None,
@@ -2425,7 +2430,8 @@ def _audit_row_to_dict(r):
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
         "action": r.action,
         "status": r.status,
-        "ip_address": r.ip_address,
+        # In full, or the network a shortened address is in (app/core/audit_privacy.py).
+        "ip_address": r.ip_address or _recorded_value(r, "ip"),
         "resource_type": r.resource_type,
         "resource_id": r.resource_id,
         "details": r.details,
@@ -2593,6 +2599,12 @@ def activity_events(
         event["names"] = names
     temp_credential_names(db, events)
     out["events"] = events
+    # The recording levels in force, so the page can mark a row recorded under other ones.
+    from app.core import audit_privacy
+    try:
+        out["recording_version"] = audit_privacy.current().version
+    except audit_privacy.PolicyUnavailable:
+        out["recording_version"] = None
     newest = max(rows, key=lambda r: (r.timestamp, r.id)) if rows else None
     out["head_cursor"] = ev.encode_cursor(newest.timestamp, newest.id) if newest else None
     return out
@@ -8929,8 +8941,6 @@ async def terminate_temp_credential_sessions(
             details={
                 "temp_username": temp_username,
                 "session_id": str(session.id),
-                "session_token": session.session_token,
-                "ip_address": session.ip_address
             }
         )
 
@@ -9672,7 +9682,7 @@ async def confirm_email_change(
     try:
         AuditLogger(db).log_action(action="email_change_confirmed", status="success", user=user,
                                    ip_address=get_client_ip(request),
-                                   details={"old": old_email, "new": new_email})
+                                   details={"old_email": old_email, "new_email": new_email})
     except Exception:  # noqa: BLE001
         pass
     return UserResponse.model_validate(user)
@@ -11099,7 +11109,6 @@ async def terminate_user_sessions(
         details={
             "username": user.username,
             "terminated_count": terminated_count,
-            "ip_address": get_client_ip(request),
         }
     )
 
@@ -19308,7 +19317,7 @@ async def upload_file(
                     user=current_user,
                     resource_type='vault',
                     resource_id=str(vault_id),
-                    details={'error': str(e), 'file_name': upload_file.filename},
+                    details={'error': type(e).__name__, 'file_name': upload_file.filename},
                     ip_address=get_client_ip(request)
                 )
                 raise HTTPException(
@@ -23908,6 +23917,17 @@ AUDIT_ROW_COLUMNS_DDL = (
 )
 
 
+AUDIT_PRIVACY_POLICIES_DDL = (
+    "CREATE OR REPLACE FUNCTION dv_audit_privacy_policies_only_grow() RETURNS trigger LANGUAGE plpgsql AS $dv$ "
+    "BEGIN RAISE EXCEPTION 'audit_privacy_policies only grows: a change of the recording levels adds a version'; "
+    "END $dv$",
+    "CREATE OR REPLACE TRIGGER trg_audit_privacy_policies_only_grow BEFORE UPDATE OR DELETE ON audit_privacy_policies "
+    "FOR EACH ROW EXECUTE FUNCTION dv_audit_privacy_policies_only_grow()",
+    "CREATE OR REPLACE TRIGGER trg_audit_privacy_policies_no_truncate BEFORE TRUNCATE ON audit_privacy_policies "
+    "FOR EACH STATEMENT EXECUTE FUNCTION dv_audit_privacy_policies_only_grow()",
+)
+
+
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
@@ -23995,6 +24015,9 @@ def _run_lightweight_migrations():
             # rewriting a row, however large the log, and an older release ignores them.
             AUDIT_ROW_COLUMNS_DDL,
             "ALTER TABLE security_alerts ADD COLUMN IF NOT EXISTS ip_via VARCHAR(24)",
+            # The recording levels' versions only grow (app/core/audit_privacy.py): a change adds one, and
+            # the database refuses to change or delete one (create_all builds the table).
+            *AUDIT_PRIVACY_POLICIES_DDL,
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
@@ -24825,6 +24848,11 @@ async def lifespan(app: FastAPI):
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state
     print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
+    # The recording levels, before anything below writes an audit row: version 1 written on a new database,
+    # the stored levels brought within the .env limits, the policy in force read and kept fresh in the
+    # background (app/core/audit_privacy.py).
+    from app.core import audit_privacy
+    audit_privacy.start()
     _verify_encryption_key_canary()     # refuse to boot under a mismatched ENCRYPTION_KEY, BEFORE any seal migration
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest
@@ -24925,6 +24953,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     settings_registry.stop()
+    audit_privacy.stop()
 
 # Update app initialization
 app.router.lifespan_context = lifespan

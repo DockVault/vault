@@ -246,8 +246,9 @@ import tempfile # noqa: E402
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
 REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
 
-# The .env limits on how long records are kept, as (config key, .env name, the app's default): written
-# only when they differ from the default, and kept across a fresh volume set (see .env.example).
+# The .env limits on how long records are kept, and on what the audit log records, as (config key, .env
+# name, the app's default): written only when they differ from the default, and kept across a fresh volume
+# set (see .env.example).
 RETENTION_ENV_KEYS = (
     ("retention_reduction_delay_days", "RETENTION_REDUCTION_DELAY_DAYS", "7"),
     ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
@@ -261,6 +262,12 @@ RETENTION_ENV_KEYS = (
     ("security_record_days", "SECURITY_RECORD_DAYS", "30"),
     ("security_record_min_days", "SECURITY_RECORD_MIN_DAYS", "7"),
     ("security_record_max_days", "SECURITY_RECORD_MAX_DAYS", "365"),
+    # The most the audit log may record of each kind of personal data (the recording levels' limits).
+    ("audit_max_names", "AUDIT_MAX_NAMES", "full"),
+    ("audit_max_signin_names", "AUDIT_MAX_SIGNIN_NAMES", "full"),
+    ("audit_max_emails", "AUDIT_MAX_EMAILS", "full"),
+    ("audit_max_ip", "AUDIT_MAX_IP", "full"),
+    ("audit_max_user_agent", "AUDIT_MAX_USER_AGENT", "full"),
 )
 
 # Admin-password rules mirror the app's startup guard (app/core/config.py): the shipped placeholder

@@ -344,7 +344,8 @@ def summarize(db, AuditLog, win: Window, filters: dict, since: Optional[datetime
                 .group_by(col).order_by(count.desc(), col).limit(TOP).all())
 
     return shape(win, grouped, top("people", AuditLog.username, AuditLog.user_id.isnot(None)),
-                 top("addresses", AuditLog.ip_address), apart, from_ or since)
+                 top("addresses", func.coalesce(AuditLog.ip_address, AuditLog.recorded["ip"].as_string())),
+                 apart, from_ or since)
 
 
 def cached(key: tuple, range_key: str, compute):
