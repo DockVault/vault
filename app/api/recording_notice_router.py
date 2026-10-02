@@ -92,7 +92,17 @@ def recording_status(current_user: User = Depends(get_current_user), db: Session
     if getattr(current_user, "_is_temp_session", False):
         return {"version": None, "seen": None, "show": False, "text": None}
     latest = ap.read_latest(db) or ap.DEFAULT_POLICY
-    return rn.banner(current_user, latest.version)
+    return rn.banner(current_user, latest.version, known=known_at_creation(db, current_user))
+
+
+def known_at_creation(db: Session, user: User) -> int:
+    """The version of the levels in force when the account was made (1 when it is older than them)."""
+    from sqlalchemy import func
+    created = getattr(user, "created_at", None)
+    if created is None:
+        return 1
+    return db.query(func.max(AuditPrivacyPolicy.version)).filter(
+        AuditPrivacyPolicy.created_at <= created).scalar() or 1
 
 
 class Seen(BaseModel):
@@ -108,8 +118,9 @@ def recording_seen(body: Seen, current_user: User = Depends(get_current_user), d
     if body.version < 1 or body.version > latest.version:
         raise HTTPException(status_code=400, detail="There is no such version of the recording levels.")
     account = db.get(User, user.id)
-    if (account.privacy_seen_version or 1) >= body.version:
-        return rn.banner(account, latest.version)
+    known = known_at_creation(db, account)
+    if max(account.privacy_seen_version or 1, known) >= body.version:
+        return rn.banner(account, latest.version, known=known)
     from app.services.audit_logger import AuditLogger
     try:
         account.privacy_seen_version = body.version
@@ -120,4 +131,4 @@ def recording_seen(body: Seen, current_user: User = Depends(get_current_user), d
     except Exception:  # noqa: BLE001 -- not recorded as read without its audit row
         db.rollback()
         raise HTTPException(status_code=503, detail="It could not be recorded; try again shortly.")
-    return rn.banner(account, latest.version)
+    return rn.banner(account, latest.version, known=known)

@@ -207,9 +207,9 @@ def _seen(db, user, version):
 def test_marking_the_notice_read_records_it_with_an_audit_row(factory):
     ap.prepare(factory)
     db = factory()
+    ada = _user(db, "ada")
     db.add(AuditPrivacyPolicy(version=2, reason="admin", **{**ap.POLICY_ONE, "ip": "none"}))
     db.commit()
-    ada = _user(db, "ada")
     assert routes.recording_status(current_user=ada, db=db)["show"] is True
     for wrong in (3, 0):
         with pytest.raises(HTTPException) as caught:
@@ -226,12 +226,30 @@ def test_marking_the_notice_read_records_it_with_an_audit_row(factory):
     assert db.query(AuditLog).filter(AuditLog.action == "privacy_notice_seen").count() == 1
 
 
+def test_an_account_made_after_a_change_is_not_shown_it(factory):
+    ap.prepare(factory)
+    db = factory()
+    ada = _user(db, "ada")
+    db.add(AuditPrivacyPolicy(version=2, reason="admin", **dict(ap.POLICY_ONE)))
+    db.commit()
+    bob = _user(db, "bob")
+    assert routes.known_at_creation(db, ada) == 1 and routes.known_at_creation(db, bob) == 2
+    assert routes.recording_status(current_user=ada, db=db)["show"] is True
+    assert routes.recording_status(current_user=bob, db=db)["show"] is False
+    assert routes.recording_seen(routes.Seen(version=2), current_user=bob, db=db)["show"] is False
+    assert db.query(AuditLog).filter(AuditLog.action == "privacy_notice_seen").count() == 0
+    db.add(AuditPrivacyPolicy(version=3, reason="admin", **dict(ap.POLICY_ONE)))
+    db.commit()
+    assert routes.recording_status(current_user=bob, db=db)["show"] is True
+    assert rn.banner(SimpleNamespace(privacy_seen_version=None), 3, known=3)["show"] is False
+
+
 def test_a_temporary_credential_has_no_banner_and_cannot_mark_it_read(factory):
     ap.prepare(factory)
     db = factory()
+    ada = _user(db, "ada")
     db.add(AuditPrivacyPolicy(version=2, reason="admin", **dict(ap.POLICY_ONE)))
     db.commit()
-    ada = _user(db, "ada")
     assert routes.recording_status(current_user=ada, db=db)["show"] is True
     ada._is_temp_session = True
     assert routes.recording_status(current_user=ada, db=db)["show"] is False
@@ -244,9 +262,9 @@ def test_when_the_audit_row_cannot_be_written_it_is_not_marked_read(factory, mon
     from app.services.audit_logger import AuditLogger
     ap.prepare(factory)
     db = factory()
+    ada = _user(db, "ada")
     db.add(AuditPrivacyPolicy(version=2, reason="admin", **dict(ap.POLICY_ONE)))
     db.commit()
-    ada = _user(db, "ada")
 
     def broken(self, **kwargs):
         raise RuntimeError("refused")

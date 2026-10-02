@@ -215,10 +215,12 @@ NOTIFICATION_TYPE = "recording_levels_changed"
 NOTIFICATION_TARGET = "#recording"
 
 
-def banner(user, version: int) -> dict:
-    """What the page shows a signed-in user: whether the levels changed since they last read the notice. Version
-    1 is what the vault recorded before the levels existed, so it is never a change."""
-    seen = getattr(user, "privacy_seen_version", None) or 1
+def banner(user, version: int, *, known: int = 1) -> dict:
+    """What the page shows a signed-in user: whether the levels changed since they last read the notice, or since
+    their account was made (``known``, the version in force then: an account made later was never told
+    otherwise, so nothing changed for it). Version 1 is what the vault recorded before the levels existed, so it
+    is never a change."""
+    seen = max(getattr(user, "privacy_seen_version", None) or 1, known or 1)
     return {"version": version, "seen": seen, "show": version > seen,
             "text": "What this vault records has changed. See what is recorded and how long it is kept."}
 
