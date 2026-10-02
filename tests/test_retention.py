@@ -11,6 +11,7 @@ These run on a throwaway SQLite database.
 """
 import ast
 import inspect
+import re
 import tempfile
 import threading
 import time
@@ -218,9 +219,11 @@ def test_finished_sessions_and_sign_ins_go_after_their_window(env, factory):
     result = _pass(factory)["sessions"]
     assert result.deleted == 2
     assert _count(factory, ActiveSession) == 2 and _count(factory, PendingLogin) == 1
-    (row,) = _pruned(factory, "sessions")
-    assert (row["job"], row["deleted"], row["oldest"], row["newest"]) == (
-        "sessions", 2, OLD.isoformat() + "Z", OLD.isoformat() + "Z")
+    # One record for each transaction that deleted: here one batch from each table.
+    rows = sorted(_pruned(factory, "sessions"), key=lambda r: r["table"])
+    assert [(r["job"], r["table"], r["deleted"], r["oldest"], r["newest"]) for r in rows] == [
+        ("sessions", table, 1, OLD.isoformat() + "Z", OLD.isoformat() + "Z")
+        for table in sorted((ActiveSession.__tablename__, PendingLogin.__tablename__))]
 
 
 def test_credential_change_records_go_fourteen_days_after_they_end(env, factory):
@@ -235,6 +238,8 @@ def test_credential_change_records_go_fourteen_days_after_they_end(env, factory)
     db.commit()
     assert _pass(factory)["credential_changes"].deleted == 2
     assert sorted(c.status for c in factory().query(CredentialChange).all()) == sorted([cc.HELD, cc.APPLIED[0]])
+    (row,) = _pruned(factory, "credential_changes")
+    assert (row["table"], row["deleted"]) == (CredentialChange.__tablename__, 2)
 
 
 def test_throttle_records_go_an_hour_after_their_window(env, factory):
@@ -279,10 +284,11 @@ def test_a_job_deletes_in_batches_one_transaction_each(env, factory, monkeypatch
     _audit(db, OLD, n=rows)
     before = len(factory.made)
     assert _pass(factory, batch_rows=2)["audit_logs"].deleted == rows
-    # One session to read the settings, one per batch (5 rows in twos: 2, 2, 1; 4 rows: 2, 2, then an
-    # empty one), and one for the record when something was deleted.
-    assert len(factory.made) - before == 1 + transactions + (1 if rows else 0)
+    # One session to read the settings, one to see the first pass after an upgrade is done, and one per
+    # batch (5 rows in twos: 2, 2, 1; 4 rows: 2, 2, then an empty one), each batch writing its own record.
+    assert len(factory.made) - before == 2 + transactions
     assert _count(factory, AuditLog, AuditLog.action == "file_upload") == 0
+    assert [r["deleted"] for r in _pruned(factory, "audit_logs")] == [2] * (rows // 2) + [1] * (rows % 2)
 
 
 def test_every_batch_statement_is_bounded(env, factory, monkeypatch):
@@ -326,6 +332,31 @@ def test_a_job_that_fails_never_stops_the_others(env, factory, monkeypatch, caps
     done = _pass(factory)
     assert done["broken"] is None and done["audit_logs"].deleted == 2
     assert "the pruner's broken job failed (RuntimeError)" in capsys.readouterr().out
+
+
+def test_every_batch_commits_with_its_record_or_not_at_all(env, factory, monkeypatch, capsys):
+    """A pass stopped part way leaves a record of each batch it committed, and a batch whose record cannot
+    be written deletes nothing."""
+    env.audit_log_retention_days = 30
+    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name == "audit_logs"])
+    _audit(factory(), OLD, n=5)
+    real, calls = retention.Pass.record, []
+
+    def second_fails(self, db, done, table=None):
+        calls.append(done.deleted)
+        if len(calls) == 2:
+            raise RuntimeError("no")
+        return real(self, db, done, table)
+
+    monkeypatch.setattr(retention.Pass, "record", second_fails)
+    assert _pass(factory, batch_rows=2)["audit_logs"] is None
+    assert "the pruner's audit_logs job failed (RuntimeError)" in capsys.readouterr().out
+    assert _count(factory, AuditLog, AuditLog.action == "file_upload") == 3
+    (row,) = _pruned(factory, "audit_logs")
+    assert (row["job"], row["table"], row["deleted"]) == ("audit_logs", AuditLog.__tablename__, 2)
+    monkeypatch.setattr(retention.Pass, "record", real)
+    assert _pass(factory, batch_rows=2)["audit_logs"].deleted == 3
+    assert sorted(r["deleted"] for r in _pruned(factory, "audit_logs")) == [1, 2, 2]
 
 
 def test_a_job_that_deleted_nothing_writes_no_row(env, factory):
@@ -509,57 +540,162 @@ def test_only_the_web_process_starts_the_pruner():
 
 # --------------------------------------------------------------------------- nothing else prunes
 
-# What the pruner owns: the functions its jobs run and the models they delete from.
-OWNED_FUNCTIONS = {"purge_old_session_data", "prune_done", "cleanup_old_audit_logs", "cleanup_old_alerts",
-                   "apply_due", "run_pass", "prune_sessions", "prune_credential_changes",
-                   "prune_rate_limit_records", "prune_resolved_alerts", "prune_audit_logs"}
-OWNED_MODELS = {"AuditLog", "SecurityAlert", "RateLimitRecord", "CredentialChange", "PendingLogin",
-                "ManagedSettingChange"}
+def _handed_the_pass(fn) -> set:
+    """The functions ``fn`` hands its pass, or a part of it, to: calls with ``p`` or ``p.<x>`` among their
+    arguments."""
+    names = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        args = list(node.args) + [k.value for k in node.keywords]
+        if any(isinstance(a, ast.Name) and a.id == "p"
+               or isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name) and a.value.id == "p"
+               for a in args):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if name:
+                names.add(name)
+    return names
 
 
-def _problems(fn):
-    """Calls in ``fn`` of a function the pruner owns, and deletes from a model it owns."""
+def _job_functions() -> set:
+    """Every job's function, and every function a job hands its pass to, followed into other modules."""
+    import importlib
+    found, todo = set(), [job.run for job in retention.JOBS]
+    while todo:
+        fn = todo.pop()
+        if fn.__name__ in found:
+            continue
+        found.add(fn.__name__)
+        for name in _handed_the_pass(ast.parse(inspect.getsource(fn).lstrip())):
+            for module in ("app.core.retention", "app.core.audit_retention", "app.core.security_records",
+                           "app.core.setting_changes", "app.core.credential_changes",
+                           "app.core.session_retention"):
+                target = getattr(importlib.import_module(module), name, None)
+                if inspect.isfunction(target):
+                    todo.append(target)
+    return found
+
+
+# What the pruner owns: the functions its jobs run (followed into the modules they hand their pass to), the
+# pass itself, the functions it replaced, and the models its jobs delete from.
+OWNED_FUNCTIONS = _job_functions() | {"Pass", "delete_in_batches", "run_pass", "prune_done", "apply_due",
+                                      "purge_old_session_data", "cleanup_old_audit_logs", "cleanup_old_alerts"}
+OWNED_MODELS = {"AuditLog", "SecurityAlert", "SecurityRecord", "RateLimitRecord", "CredentialChange",
+                "ActiveSession", "PendingLogin", "ManagedSettingChange"}
+# Timed deletions the periodic loop keeps, each for a reason. Any other call there whose name starts with
+# prune or purge is a deletion that belongs in a job.
+LOOP_DELETIONS = {
+    # The sign-in lockout's working counts that hold no lock: a few rows, deleted by an indexed statement.
+    "prune_stale",
+}
+
+
+def _owned_tables() -> set:
+    from app.core import models
+    return {getattr(models, name).__tablename__ for name in OWNED_MODELS}
+
+
+def _aliases(tree) -> dict:
+    """Names imported under another name anywhere in ``tree`` (``from x import Model as M``): M -> Model."""
+    return {a.asname: a.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+            for a in node.names if a.asname}
+
+
+def _problems(fn, aliases=None):
+    """Calls in ``fn`` of a function the pruner owns, and deletes from a model or table it owns: an ORM
+    query's delete, a Core delete(Model), or a DELETE in SQL text. Names imported under another name, in
+    ``fn`` or in ``aliases`` (the module's), are read as the names they stand for."""
+    aliases = {**(aliases or {}), **_aliases(fn)}
+    tables = _owned_tables()
     found = []
     for node in ast.walk(fn):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for table in re.findall(r"delete\s+from\s+\"?(\w+)", node.value, re.IGNORECASE):
+                if table in tables:
+                    found.append(f"deletes from {table}")
         if not isinstance(node, ast.Call):
             continue
         name = node.func.id if isinstance(node.func, ast.Name) else (
             node.func.attr if isinstance(node.func, ast.Attribute) else None)
+        name = aliases.get(name, name)
         if name in OWNED_FUNCTIONS:
             found.append(f"calls {name}")
-        if name == "delete" and isinstance(node.func, ast.Attribute):
-            receiver = {n.id for n in ast.walk(node.func.value) if isinstance(n, ast.Name)}
-            if receiver & OWNED_MODELS:
-                found.append(f"deletes {sorted(receiver & OWNED_MODELS)}")
+        if name == "delete":
+            parts = ([node.func.value] if isinstance(node.func, ast.Attribute) else []) + list(node.args)
+            named = set()
+            for part in parts:
+                for n in ast.walk(part):
+                    if isinstance(n, ast.Name):
+                        named.add(aliases.get(n.id, n.id))
+                    elif isinstance(n, ast.Attribute):
+                        named.add(n.attr)
+            if named & OWNED_MODELS:
+                found.append(f"deletes {sorted(named & OWNED_MODELS)}")
     return found
 
 
 def _route_handlers():
     for path in sorted((ROOT / "app").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        aliases = _aliases(tree)
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
                     isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
                     and d.func.attr in {"get", "post", "put", "patch", "delete", "websocket"}
                     for d in fn.decorator_list):
-                yield path.relative_to(ROOT).as_posix(), fn
+                yield path.relative_to(ROOT).as_posix(), fn, aliases
 
 
 def test_no_request_handler_prunes():
     handlers = list(_route_handlers())
     assert len(handlers) > 200
-    found = [(path, fn.name, p) for path, fn in handlers for p in _problems(fn)]
+    found = [(path, fn.name, p) for path, fn, aliases in handlers for p in _problems(fn, aliases)]
     assert not found, found
+
+
+def _loop_deletions(tree):
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            if name.startswith(("prune", "purge")) and name not in LOOP_DELETIONS:
+                found.append(f"calls {name}")
+    return found
 
 
 def test_the_periodic_loop_does_none_of_the_pruners_work():
     tree = ast.parse(inspect.getsource(api.cleanup_expired_sessions))
-    assert _problems(tree) == []
+    assert _problems(tree, _aliases(ast.parse(inspect.getsource(api)))) == []
+    assert _loop_deletions(tree) == []
+    # The kept deletions are still there: a name that went away leaves the list.
+    names = {getattr(n.func, "attr", getattr(n.func, "id", None)) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert LOOP_DELETIONS <= names
+
+
+def test_the_owned_functions_follow_the_jobs():
+    for job in retention.JOBS:
+        assert job.run.__name__ in OWNED_FUNCTIONS
+    for name in ("prune_records", "clear_alert_values", "schedule_env_retention_once", "env_retention_decided",
+                 "prune", "apply_due", "prune_done", "delete_in_batches"):
+        assert name in OWNED_FUNCTIONS, name
 
 
 def test_the_scan_finds_what_it_looks_for():
     source = "def f(db):\n    db.query(AuditLog).filter(x).delete()\n    prune_done(db)\n    run_pass()\n"
     assert _problems(ast.parse(source)) == ["deletes ['AuditLog']", "calls prune_done", "calls run_pass"]
+    source = ("def f(db):\n    db.query(SecurityRecord).delete()\n    db.query(ActiveSession).filter(x).delete()\n"
+              "    prune_security_records(p)\n    Pass(factory)\n")
+    assert _problems(ast.parse(source)) == ["deletes ['SecurityRecord']", "deletes ['ActiveSession']",
+                                            "calls prune_security_records", "calls Pass"]
+    source = ("def f(db):\n    from app.core.models import SecurityRecord as R\n    db.query(R).filter(R.at < 1).delete()\n"
+              "    db.execute(sa.delete(models.AuditLog))\n    db.execute(delete(PendingLogin))\n"
+              "    db.execute(text('DELETE FROM security_alerts WHERE 1 = 1'))\n    db.delete(row)\n")
+    assert _problems(ast.parse(source)) == ["deletes ['SecurityRecord']", "deletes ['AuditLog']",
+                                            "deletes ['PendingLogin']", "deletes from security_alerts"]
+    source = "from app.core.retention import run_pass as go\ndef f():\n    go()\n"
+    assert _problems(ast.parse(source).body[1], _aliases(ast.parse(source))) == ["calls run_pass"]
+    source = "async def f():\n    prune_stale(db)\n    purge_expired_things(db)\n    prune_x(db)\n"
+    assert _loop_deletions(ast.parse(source)) == ["calls purge_expired_things", "calls prune_x"]
 
 
 def test_the_prunes_made_on_read_are_gone():

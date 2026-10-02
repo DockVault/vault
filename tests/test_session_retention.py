@@ -23,7 +23,7 @@ set_bare_api_env()
 
 from app.core import retention  # noqa: E402
 from app.core import session_retention as R  # noqa: E402
-from app.core.models import ActiveSession  # noqa: E402
+from app.core.models import ActiveSession, AuditLog  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -50,6 +50,7 @@ def db():
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'retention.db'}")
         ActiveSession.__table__.create(engine)
+        AuditLog.__table__.create(engine)     # the pruner's records
         _Probe.metadata.create_all(engine)
         s = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
         yield s
@@ -122,6 +123,9 @@ def test_finished_sessions_older_than_the_retention_are_deleted(db):
     }
     assert _purge(db) == (len(gone), 0)
     assert _left(db, ActiveSession) == kept
+    # Each batch (of two here) wrote its record in its own transaction.
+    records = db.query(AuditLog).filter(AuditLog.action == "retention_pruned").all()
+    assert sorted(r.details["deleted"] for r in records) == [1, 2]
 
 
 def test_finished_pending_sign_ins_older_than_the_retention_are_deleted(db):

@@ -32,7 +32,9 @@ The first pass after an upgrade from a release that pruned on read: an AUDIT_LOG
 positive, with rows older than it, is not applied at once. The pass keeps the rows (the maximum is stored as
 "for ever") and schedules the change to the .env value as a waiting change, with the notice to every
 administrator, so it takes effect only after the delay, unless an administrator cancels it. Months of
-dashboards nobody opened never deleted those rows, and a timer must not suddenly do so.
+dashboards nobody opened never deleted those rows, and a timer must not suddenly do so. Until that pass has
+stored its marker, the audit job deletes nothing, so a failure of that pass never lets the .env value apply
+at once.
 """
 from __future__ import annotations
 
@@ -191,6 +193,7 @@ class SizePlan:
     protected_bytes: int = 0        # of those, rows the cap may never delete
     cutoff: Optional[datetime] = None   # delete the unprotected counted rows older than this
     met: bool = True                # whether what is left fits under the cap
+    counted_before: Optional[datetime] = None   # the cap counts and deletes only rows older than this
 
 
 def size_plan(db, model, now: datetime, numbers: Numbers, delay: timedelta) -> SizePlan:
@@ -202,7 +205,8 @@ def size_plan(db, model, now: datetime, numbers: Numbers, delay: timedelta) -> S
         return plan
     dialect = db.get_bind().dialect.name
     from app.core import retention
-    counted = [model.timestamp < now - delay]
+    plan.counted_before = now - delay
+    counted = [model.timestamp < plan.counted_before]
     aged = by_age(model, now, numbers)
     if aged:
         counted.append(not_(and_(*retention.deletable(model, now, *aged))))
@@ -230,10 +234,13 @@ def size_plan(db, model, now: datetime, numbers: Numbers, delay: timedelta) -> S
 
 
 def by_size(model, now: datetime, numbers: Numbers, plan: SizePlan) -> Optional[list]:
-    """Conditions for the rows the size cap deletes under ``plan``, or None when it deletes none."""
+    """Conditions for the rows the size cap deletes under ``plan``, or None when it deletes none. The cutoff
+    is the end of an hour, which can be later than the start of the delay: a row younger than the delay is
+    still never deleted."""
     if plan.cutoff is None:
         return None
-    return [model.timestamp < plan.cutoff, not_(_size_protected(model, now, numbers))]
+    return [model.timestamp < plan.cutoff, model.timestamp < plan.counted_before,
+            not_(_size_protected(model, now, numbers))]
 
 
 # --------------------------------------------------------------------------- the job and the preview
@@ -309,6 +316,13 @@ def warn_cap_unmet(numbers: Numbers, plan: SizePlan, now: datetime) -> None:
 
 
 # --------------------------------------------------------------------------- the first pass after an upgrade
+
+def env_retention_decided(p) -> bool:
+    """Whether the first pass after an upgrade has looked at AUDIT_LOG_RETENTION_DAYS (its marker is stored)."""
+    from app.core.models import SystemSetting
+    with p.transaction() as db:
+        return db.get(SystemSetting, MARKER) is not None
+
 
 def schedule_env_retention_once(p):
     """Once per deployment: a positive AUDIT_LOG_RETENTION_DAYS with rows older than it becomes a waiting

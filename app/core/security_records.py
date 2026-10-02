@@ -6,7 +6,10 @@ named (when the name is an account), the name exactly as typed, the address, the
 keeps those values in full whatever the audit log's recording levels keep, because blocking an address,
 counting failures and investigating an attack need them; and it keeps them only for the window,
 ``security_record_days`` (30 days by default, within SECURITY_RECORD_MIN_DAYS and SECURITY_RECORD_MAX_DAYS
-from .env). Shortening the window deletes sooner, so it waits (app/core/setting_changes.py).
+from .env). Shortening the window deletes sooner, so it waits (app/core/setting_changes.py). An SFTP key the
+server turns down writes no record, as it writes no audit row: a client offers its keys one after another
+until one is taken, so a key turned down is routine rather than a failed sign-in, and the SFTP key throttle
+bounds a flood of them.
 
 The pruner (app/core/retention.py) deletes records older than the window, and at the same window clears the
 name and the address from security alerts, resolved or not: an unresolved alert no longer holds personal
@@ -126,6 +129,7 @@ def clear_alert_values(p):
                 alert.message = _scrubbed(alert.message, alert.username, alert.ip_address)
                 alert.username = None
                 alert.ip_address = None
+            p.record(db, retention.JobResult(cleared=len(alerts)), SecurityAlert.__tablename__)
             result.cleared += len(alerts)
         if len(alerts) < p.batch_rows:
             break

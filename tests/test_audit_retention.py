@@ -273,6 +273,21 @@ def test_rows_younger_than_the_delay_neither_count_nor_go(env, factory):
     assert len(set(fresh + old) & _left(factory)) == 4       # newest 1 MB of the counted rows
 
 
+def test_the_hour_the_cap_cuts_through_keeps_its_rows_younger_than_the_delay(env, factory):
+    # The delay ends at 12:14 seven days ago. The rows of 12:00 to 12:14 that day are counted and overflow
+    # the cap, so their hour goes; a row of 12:59 in that hour is younger than the delay, and stays.
+    now = NOW + timedelta(minutes=14)
+    db = factory()
+    counted = [_big(db, 7, hours=-(4 + n) / 60) for n in range(5)]
+    young = _row(db, 7, hours=-59 / 60)
+    shown = ar.preview(factory(), now, _numbers(max_mb=1))
+    assert shown["by_size"]["rows"] == 5
+    assert shown["by_size"]["newest"] <= (now - timedelta(days=7)).isoformat() + "Z"
+    ar.prune(retention.Pass(factory, now=now), _numbers(max_mb=1))
+    left = _left(factory)
+    assert young in left and not set(counted) & left
+
+
 def test_rows_younger_than_the_minimum_are_never_deleted_by_size(env, factory):
     db = factory()
     rows = [_big(db, 30 + n) for n in range(8)]
@@ -381,6 +396,26 @@ def test_a_retention_set_in_env_before_the_upgrade_waits_with_notice(env, factor
     retention.run_pass(factory, now=NOW + timedelta(days=7))
     assert factory().query(ManagedSettingChange).one().status == sc.APPLIED
     assert ids["plain_400"] not in _left(factory) and ids["plain_10"] in _left(factory)
+
+
+def test_the_audit_job_deletes_nothing_until_the_first_pass_has_decided(env, factory, monkeypatch, capsys):
+    env.audit_log_retention_days = 90
+    ids = _seed_ages(factory)
+
+    def broken(p):
+        raise RuntimeError("no")
+
+    real = ar.schedule_env_retention_once
+    monkeypatch.setattr(ar, "schedule_env_retention_once", broken)
+    done = dict(retention.run_pass(factory, now=NOW))
+    assert done["audit_env_retention"] is None and done["audit_logs"].deleted == 0
+    assert _left(factory) == set(ids.values())
+    assert factory().get(SystemSetting, ar.MARKER) is None
+    assert "the audit_env_retention job has not run yet" in capsys.readouterr().out
+    monkeypatch.setattr(ar, "schedule_env_retention_once", real)
+    done = dict(retention.run_pass(factory, now=NOW))
+    assert done["audit_logs"].deleted == 0 and _left(factory) == set(ids.values())
+    assert factory().query(ManagedSettingChange).one().new_value == 90
 
 
 @pytest.mark.parametrize("case", ["no_older_rows", "admin_value_stored", "locked", "keep_for_ever"])

@@ -3,9 +3,11 @@
 JOBS lists what is deleted, in order. Each job over a table that can grow large deletes in batches of
 LOG_PRUNE_BATCH_ROWS rows, one batch per transaction (the records of credential changes, which are few, go in
 one statement), each transaction bounded by a statement timeout, and every pass has a time budget
-(PASS_SECONDS): a job that runs out of time stops where it is, and the next pass goes on. A job that deleted
-something writes one ``retention_pruned`` audit row for the pass, with how many rows went and the times of
-the oldest and newest of them.
+(PASS_SECONDS): a job that runs out of time stops where it is, and the next pass goes on. Every transaction
+that deletes or clears something adds a ``retention_pruned`` audit row to itself, with the job, the table, how
+many rows went and the times of the oldest and newest of them. So a pass stopped part way (a crash, a
+restart) leaves a record of every batch it committed, and a batch whose record cannot be written deletes
+nothing.
 
 Where it runs. run_forever() is started by the web process only, so a split deployment's SFTP container
 never runs a second pruner. Its passes run on a thread of their own (a single-thread executor), never on the
@@ -161,6 +163,8 @@ class Pass:
         self.now = now or utcnow()
         self.batch_rows = int(batch_rows if batch_rows is not None else registry.resolve(BATCH_KEY))
         self.deadline = time.monotonic() + budget_seconds
+        # The job running now (run_pass sets it), which names the records its transactions write.
+        self.job_name: Optional[str] = None
 
     def time_left(self) -> bool:
         return time.monotonic() < self.deadline
@@ -179,20 +183,39 @@ class Pass:
         finally:
             db.close()
 
+    def record(self, db, done: JobResult, table: Optional[str] = None) -> None:
+        """Add to ``db``'s transaction the retention_pruned audit row for what that transaction deleted or
+        cleared (``done``), so the two commit together or not at all. Nothing done, no row."""
+        if not (done.deleted or done.cleared):
+            return
+        from app.services.audit_logger import AuditLogger
+        iso = (lambda v: v.isoformat() + "Z" if v is not None else None)
+        job = self.job_name or table
+        details = {"job": job, "table": table, "deleted": done.deleted, "oldest": iso(done.oldest),
+                   "newest": iso(done.newest)}
+        if done.cleared:
+            details["cleared"] = done.cleared
+        db.add(AuditLogger(db).build_row(action="retention_pruned", status="success", resource_type="table",
+                                         resource_id=job, details=details))
+
     def delete_in_batches(self, model, conditions, time_column) -> JobResult:
         """Delete the rows of ``model`` meeting ``conditions``, oldest first, one batch per transaction,
-        while the pass has time. Rows another transaction holds are skipped, not waited for."""
+        while the pass has time, each batch's record written in that batch's transaction. Rows another
+        transaction holds are skipped, not waited for."""
         result = JobResult()
         id_column = model.__mapper__.primary_key[0]
         while self.time_left():
             with self.transaction() as db:
                 rows = (db.query(id_column, time_column).filter(*conditions).order_by(time_column)
                         .limit(self.batch_rows).with_for_update(skip_locked=True).all())
+                batch = JobResult()
                 if rows:
                     db.query(model).filter(id_column.in_([r[0] for r in rows])).delete(
                         synchronize_session=False)
                     times = [r[1] for r in rows if r[1] is not None]
-                    result.add(len(rows), min(times) if times else None, max(times) if times else None)
+                    batch.add(len(rows), min(times) if times else None, max(times) if times else None)
+                    self.record(db, batch, model.__tablename__)
+            result.add(batch.deleted, batch.oldest, batch.newest)
             if len(rows) < self.batch_rows:
                 break
         return result
@@ -242,8 +265,11 @@ def prune_credential_changes(p: Pass) -> JobResult:
     """Records of credential changes applied, or requests decided, 14 days ago (credential_changes.prune_done).
     They are few, so they go in one statement, bounded like every other."""
     from app.core import credential_changes as cc
+    from app.core.models import CredentialChange
     with p.transaction() as db:
-        return JobResult(deleted=cc.prune_done(db, p.now))
+        done = JobResult(deleted=cc.prune_done(db, p.now))
+        p.record(db, done, CredentialChange.__tablename__)
+    return done
 
 
 def prune_rate_limit_records(p: Pass) -> JobResult:
@@ -285,8 +311,13 @@ def schedule_env_audit_retention(p: Pass) -> JobResult:
 
 
 def prune_audit_logs(p: Pass) -> JobResult:
-    """Audit rows past the maximum, and the oldest the size cap has no room for (app/core/audit_retention.py)."""
+    """Audit rows past the maximum, and the oldest the size cap has no room for (app/core/audit_retention.py).
+    Nothing until the job before it has made its once-only decision about AUDIT_LOG_RETENTION_DAYS: had that
+    job failed, this one would otherwise apply the .env maximum at once."""
     from app.core import audit_retention
+    if not audit_retention.env_retention_decided(p):
+        _say("The pruner's audit_logs job waits: the audit_env_retention job has not run yet")
+        return JobResult()
     return audit_retention.prune(p)
 
 
@@ -301,19 +332,6 @@ JOBS: list[Job] = [
     Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
 ]
-
-
-def _record(p: Pass, job: Job, result: JobResult) -> None:
-    """One retention_pruned audit row for a job that deleted or cleared something in this pass."""
-    from app.services.audit_logger import AuditLogger
-    iso = (lambda v: v.isoformat() + "Z" if v is not None else None)
-    details = {"job": job.name, "deleted": result.deleted, "oldest": iso(result.oldest),
-               "newest": iso(result.newest)}
-    if result.cleared:
-        details["cleared"] = result.cleared
-    with p.transaction() as db:
-        db.add(AuditLogger(db).build_row(action="retention_pruned", status="success", resource_type="table",
-                                         resource_id=job.name, details=details))
 
 
 @contextmanager
@@ -373,17 +391,13 @@ def run_pass(session_factory: Optional[Callable] = None, *, engine=None, now: Op
             if job.held and hold:
                 done.append((job.name, None))
                 continue
+            p.job_name = job.name
             try:
                 result = job.run(p)
             except Exception as exc:  # noqa: BLE001 -- one job's failure never stops the others
                 _say(f"Warning: the pruner's {job.name} job failed ({type(exc).__name__}); the next pass tries again")
                 done.append((job.name, None))
                 continue
-            if result.deleted or result.cleared:
-                try:
-                    _record(p, job, result)
-                except Exception as exc:  # noqa: BLE001
-                    _say(f"Warning: the pruner could not record its {job.name} job ({type(exc).__name__})")
             done.append((job.name, result))
         return done
 
