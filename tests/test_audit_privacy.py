@@ -123,18 +123,23 @@ def _paths(node, prefix=""):
             if isinstance(k, ast.Constant) and isinstance(k.value, str):
                 yield prefix + k.value
                 yield from _paths(v, prefix + k.value + ".")
+            elif k is None:
+                yield from _paths(v, prefix)              # **{...}: the keys it spreads in
     elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict":
         for kw in node.keywords:
             if kw.arg:
                 yield prefix + kw.arg
     elif isinstance(node, ast.DictComp) and len(node.generators) == 1:
-        # {k: v for k, v in (("key", value), ...)}: the keys are the pairs' first items.
+        # {k: v for k, v in (("key", value), ...)}: the pairs' first items; {k: f(k) for k in ("key", ...)}: the
+        # names it iterates.
         source = node.generators[0].iter
         if isinstance(source, (ast.Tuple, ast.List)):
             for pair in source.elts:
                 if (isinstance(pair, ast.Tuple) and pair.elts and isinstance(pair.elts[0], ast.Constant)
                         and isinstance(pair.elts[0].value, str)):
                     yield prefix + pair.elts[0].value
+                elif isinstance(pair, ast.Constant) and isinstance(pair.value, str):
+                    yield prefix + pair.value
 
 
 def detail_paths(trees, root=ROOT):

@@ -83,8 +83,10 @@ def test_newer_rows_are_the_ones_after_the_row_the_list_shows(admin):
     assert [e["username"] for e in step["events"]] == [f"{prefix}-n-1"]
     # The newest row has nothing after it.
     newest = body["events"][-1]["id"]
-    assert _events(admin, user=prefix, after=newest) == {"events": [], "next_cursor": None, "total": None,
-                                                        "more": False, "head_cursor": None}
+    newer = _events(admin, user=prefix, after=newest)
+    # Each read also says which version of the recording levels is in force (it marks rows recorded under others).
+    assert isinstance(newer.pop("recording_version"), int)
+    assert newer == {"events": [], "next_cursor": None, "total": None, "more": False, "head_cursor": None}
     # A safety poll reaching back two minutes also returns the rows just before its starting point.
     polled = _events(admin, user=prefix, after=newest, overlap=120)
     assert {e["username"] for e in polled["events"]} == {prefix + "-0", f"{prefix}-n-0", f"{prefix}-n-1"}

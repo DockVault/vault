@@ -172,6 +172,8 @@ _IDENTIFIER_KEYS = (
     "repeat_count", "last_repeat", "change",
     # an administrator's clean-up of unfinished uploads
     "scanned_dirs", "dirs_removed", "bytes_reclaimed", "rows_pruned", "active_sessions_kept", "idle_minutes",
+    # a vault's settings after a change
+    "expire_files_after_days", "expire_files_unit", "unlock_remember_minutes",
     # a settings value before and after a change, and a recording policy
     "old", "new", "version", "previous_version", "levels", "limits",
 )
