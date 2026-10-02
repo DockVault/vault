@@ -1,0 +1,34 @@
+/* The page /recording (static/recording.html): what this vault records. Light and dark, and a phone's width. */
+:root {
+    --bg: #f1f5f9; --card: #ffffff; --border: #e2e8f0; --text: #0f172a; --muted: #64748b; --accent: #2563eb;
+}
+@media (prefers-color-scheme: dark) {
+    :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #e2e8f0; --muted: #94a3b8; --accent: #60a5fa; }
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+.head { margin-bottom: 16px; }
+.brand { margin: 0 0 4px; color: var(--muted); font-weight: 600; }
+h1 { margin: 0 0 8px; font-size: 1.6rem; line-height: 1.25; }
+h2 { font-size: 1.15rem; margin: 28px 0 8px; }
+section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 4px 16px 12px; margin-top: 16px; }
+.lead { margin: 0; }
+.muted { color: var(--muted); }
+.notice { border-left: 4px solid #dc2626; padding: 8px 12px; background: var(--card); }
+.levels { display: grid; grid-template-columns: minmax(10rem, 1fr) 2fr; gap: 6px 16px; margin: 0; }
+.levels dt { font-weight: 600; }
+.levels dd { margin: 0; }
+.stores, .history { padding-left: 1.2rem; }
+.stores li, .history > li { margin-bottom: 8px; }
+.stores .kept { color: var(--muted); }
+a { color: var(--accent); }
+.back { margin-top: 24px; }
+@media (max-width: 540px) {
+    .levels { grid-template-columns: 1fr; }
+    .levels dd { margin-bottom: 8px; }
+    h1 { font-size: 1.35rem; }
+}

@@ -153,6 +153,29 @@
         } catch (e) {
             showToast(`The recording levels could not be read: ${e.message}`, 'error');
         }
+        loadNotice();
+    }
+
+    // The legal basis and the contact the public notice states (general settings, saved on their own).
+    async function loadNotice() {
+        try {
+            const all = await apiRequest('/settings', { silent: true });
+            byId('recording-notice-basis').value = all.recording_notice_legal_basis || '';
+            byId('recording-notice-contact').value = all.recording_notice_contact || '';
+        } catch (_) { /* left empty */ }
+    }
+
+    async function saveNotice() {
+        const body = {
+            recording_notice_legal_basis: byId('recording-notice-basis').value.trim(),
+            recording_notice_contact: byId('recording-notice-contact').value.trim(),
+        };
+        try {
+            await apiRequest('/settings', { method: 'PUT', body: JSON.stringify(body), silent: true });
+            showToast('The notice is saved', 'success');
+        } catch (e) {
+            showToast(e.message || 'The notice was not saved', 'error');
+        }
     }
 
     async function save() {
@@ -178,6 +201,7 @@
         const tab = e.target.closest && e.target.closest('.tab-btn[data-tab="records"]');
         if (tab) load();
         if (e.target.closest && e.target.closest('#recording-levels-save')) save();
+        if (e.target.closest && e.target.closest('#recording-notice-save')) saveNotice();
     });
 
     window.RecordingLevels = { load, save };

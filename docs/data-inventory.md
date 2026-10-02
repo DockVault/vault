@@ -49,7 +49,7 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
-| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. | The account. | Life of the account. | Deleting the account. |
+| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.34.0:** `privacy_seen_version`, the version of the recording notice the person last said they had read. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. | The account. | Life of the account. | Deleting the account. |
 | `user_ssh_keys` | Key name, public key, fingerprint, created, last used. | SFTP sign-in by key. | Until removed. | The person or an administrator removing it; deleted with the account. |
 | `second_factor_enrollments`, `second_factor_recovery_codes` | Method, the authenticator seed (encrypted), times; recovery-code hashes. | Second factor. | Until reset or removed. | Resetting the second factor; deleted with the account. |
 | `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the account. |
@@ -118,6 +118,10 @@ account and group ids that may use a tag.
 `managed_settings` (new in 0.34.0) holds the values administrators set for the settings the panel
 manages within the deployment's limits, one row per setting, with the id and username of whoever set
 each one last and when. A row is overwritten by the next change and never deleted.
+
+Everyone can read what the audit log records, how long each store keeps data and who can see it at
+`/recording` (new in 0.34.0), linked from the sign-in, invitation and link pages and the account menu; the
+operator states the legal basis and a contact in Settings, Activity and records.
 
 `audit_privacy_policies` (new in 0.34.0) holds each version of the recording levels (what the audit log
 records of each kind of personal data), with the id and username of the administrator who saved it, or

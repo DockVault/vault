@@ -735,6 +735,9 @@ app.include_router(managed_settings_router)
 # What the audit log records of personal data (Settings -> Activity and records).
 from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
 app.include_router(recording_levels_router)
+# What users are told the audit log records: the public notice, its page, and the banner after a change.
+from app.api.recording_notice_router import router as recording_notice_router  # noqa: E402
+app.include_router(recording_notice_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -3826,6 +3829,13 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     # The recording levels keep a table of their own and are saved in Settings -> Activity and records, with
     # the password every time (app/api/recording_levels_router.py): the general settings never hold a copy,
     # which would look as if it had changed what the audit log records.
+    # The notice's legal basis and contact, as the operator states them: plain text, bounded.
+    from app.core.recording_notice import NOTICE_KEYS as _notice_keys, NOTICE_MAX_LENGTH as _notice_max
+    for _key in _notice_keys:
+        if _key in payload and payload[_key] is not None and (
+                not isinstance(payload[_key], str) or len(payload[_key]) > _notice_max):
+            raise HTTPException(status_code=400,
+                                detail=f"{_key} is text of at most {_notice_max} characters")
     from app.core.audit_privacy import SETTINGS_KEYS_REFUSED as _levels_refused
     for _key in payload:
         if isinstance(_key, str) and _key.lower() in _levels_refused:
@@ -24037,6 +24047,8 @@ def _run_lightweight_migrations():
             # The recording levels' versions only grow (app/core/audit_privacy.py): a change adds one, and
             # the database refuses to change or delete one (create_all builds the table).
             *AUDIT_PRIVACY_POLICIES_DDL,
+            # The recording notice an account last said it had read (see User in models.py). Nullable.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS privacy_seen_version INTEGER",
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",

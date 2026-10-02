@@ -696,3 +696,13 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     #recording-levels-table tr { display: block; padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); }
     #recording-levels-table th, #recording-levels-table td { display: block; border: 0; padding: .125rem 0; }
 }
+
+/* A notice the signed-in user has to read, across the top of the app (static/js/notice-banner.js). */
+.notice-banners { position: sticky; top: 0; z-index: 900; }
+.notice-banner {
+    display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; padding: .6rem 1rem;
+    background: var(--color-info-bg, #eff6ff); color: var(--color-text, inherit);
+    border-bottom: 1px solid var(--color-border, #bfdbfe);
+}
+.notice-banner-text { flex: 1 1 16rem; }
+.notice-banner-link { white-space: nowrap; }

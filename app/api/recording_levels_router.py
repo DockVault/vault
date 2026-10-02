@@ -201,5 +201,18 @@ def put_recording_levels(body: RecordingLevels, request: Request,
         raise HTTPException(status_code=503, detail="The recording levels were not saved: their audit record "
                                                     "could not be written. Nothing was changed.")
     ap.use(saved)
+    # Every user is told, and a signed-in user's page at once (app/core/recording_notice.py).
+    from app.core import recording_notice
+    recording_notice.forget_notice()
+    recording_notice.announce(saved.version, nudge=_nudge)
     limit_statements(db)
     return {"status": "saved", **describe(db)}
+
+
+def _nudge(user_id: str) -> None:
+    """Tell a signed-in user's page that a notification arrived (it carries no content)."""
+    from app.api.api_server import _fire_offloop, broadcast_event
+    from app.core.recording_notice import NOTIFICATION_TARGET, NOTIFICATION_TYPE
+    _fire_offloop(broadcast_event, {"event": {"type": "notification", "notification_type": NOTIFICATION_TYPE,
+                                              "target": NOTIFICATION_TARGET, "owner_user_id": user_id}},
+                  include_metrics=False)

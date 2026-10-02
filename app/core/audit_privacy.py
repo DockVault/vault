@@ -477,6 +477,7 @@ def prepare(session_factory=None) -> Policy:
     starting together write each version once."""
     factory = session_factory or _default_session_factory
     db = factory()
+    changed = False
     try:
         lock_policies(db)
         latest = read_latest(db)
@@ -486,6 +487,7 @@ def prepare(session_factory=None) -> Policy:
         if wanted != dict(latest.levels):
             reason = "locked" if locked() else "limit"
             latest = write_version(db, wanted, previous=latest, reason=reason, by_name=SERVER_CONFIGURATION)
+            changed = True
         db.commit()
     except Exception:
         db.rollback()
@@ -493,6 +495,10 @@ def prepare(session_factory=None) -> Policy:
     finally:
         db.close()
     use(latest)
+    if changed:
+        # Every user is told, as after a save in the panel (app/core/recording_notice.py).
+        from app.core import recording_notice
+        recording_notice.announce(latest.version, session_factory=factory)
     return latest
 
 

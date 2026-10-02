@@ -176,6 +176,10 @@ class User(Base):
     # email-less accounts coexist. See app/core/email_identity.py.
     email = Column(String(255), unique=True, nullable=True, index=True)
     password_hash = Column(String(255), nullable=False)
+    # The version of the recording levels (app/core/audit_privacy.py) whose notice this account last said it
+    # had read; NULL is version 1, what the vault recorded before the levels existed. A newer version shows a
+    # banner after sign-in until it is read (app/core/recording_notice.py). Nullable: an older release ignores it.
+    privacy_seen_version = Column(Integer, nullable=True)
     role = Column(Enum(RoleEnum), nullable=False, default=RoleEnum.USER)
     
     is_active = Column(Boolean, default=True)
