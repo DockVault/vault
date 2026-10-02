@@ -32,8 +32,8 @@ import uuid
 import pytest
 
 from conftest import ApiClient, BASE_URL, unique
-from _account_change_helpers import (in_api_container, mail_sink, make_independent, notifications, psql,
-                                     second_admin, signed_in)
+from _account_change_helpers import (in_api_container, mail_sink, make_independent, notifications, own_password,
+                                     psql, second_admin, signed_in)
 from _sf_helpers import enroll_totp
 
 pytestmark = pytest.mark.integration
@@ -485,7 +485,7 @@ def test_an_administrator_made_after_the_request_cannot_approve_it(admin, temp_u
     held = other_client.post(f"/users/{temp_user['id']}/reset-link")
     assert held.status_code == 202, held.text
     req_id = held.json()["request"]["id"]
-    promoted = admin.create_user(role="user")
+    promoted = own_password(admin.create_user(role="user"))
     try:
         assert admin.patch(f"/users/{promoted['id']}", json={"role": "admin"}).status_code == 200
         late = signed_in(promoted)

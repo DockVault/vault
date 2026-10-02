@@ -191,6 +191,14 @@ class User(Base):
     # password, whatever the deployment's second-factor policy; enrolling clears it. Nullable and
     # added by the boot DDL, so an earlier release reads the table without it.
     second_factor_reset_at = Column(DateTime, nullable=True)
+    # When the current password was set by someone other than the person (an administrator, a user who
+    # manages users, the server's operator on the host, or the maker of a reset link someone else made),
+    # and by which account (NULL for the host operator, or once that account is deleted). NULL when it is
+    # the person's own. Read when the account is made an administrator and when it approves a held change
+    # (app/core/password_origin.py). Nullable and added by the boot DDL, which fills them from the audit
+    # log once; an earlier release reads the table without them.
+    password_set_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    password_set_by_other_at = Column(DateTime, nullable=True)
 
     # SFTP access controls (per account). sftp_enabled gates ALL direct SFTP login
     # for this user; sftp_password_auth allows password-based SFTP (key auth via

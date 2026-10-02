@@ -71,12 +71,15 @@ def make_independent(admin_id, *, days=15):
     may approve the other's changes), and it was made a moment ago (an approver must have been one for
     14 days before the request). So its record is rewritten in the database, as if the server's
     operator had made it an administrator ``days`` ago with the host tool: no maker among the
-    administrators, no lineage."""
+    administrators, no lineage. And an approver must hold a password of their own, while the account's
+    was chosen by the administrator who created it (app/core/password_origin.py): it is recorded as the
+    account's own, as if its holder had changed it."""
     psql(f"UPDATE admin_grants SET granted_by_id = NULL, granted_by_name = 'operator@host', "
          f"granted_at = (now() AT TIME ZONE 'utc') - interval '{int(days)} days', lineage = '[]' "
          f"WHERE user_id = '{admin_id}'")
     assert psql(f"SELECT granted_by_id IS NULL, lineage::text FROM admin_grants "
                 f"WHERE user_id = '{admin_id}'") == "t|[]", "no record to rewrite"
+    psql(f"UPDATE users SET password_set_by = NULL, password_set_by_other_at = NULL WHERE id = '{admin_id}'")
 
 
 def notifications(client, ntype=None):
@@ -90,6 +93,18 @@ def signed_in(user):
     client = ApiClient(BASE_URL)
     client.login(user["_username"], user["_password"])
     return client
+
+
+def own_password(user):
+    """Make an account's password its own, as its holder would: sign in and change it (PATCH /users/me).
+    An account a test creates holds the password the administrator chose, which making it an
+    administrator takes back (app/core/password_origin.py); one its holder changed is kept. Returns the
+    account, with its new password."""
+    new = user["_password"] + "-own"
+    r = signed_in(user).patch("/users/me", json={"current_password": user["_password"], "new_password": new})
+    assert r.status_code == 200, r.text
+    user["_password"] = new
+    return user
 
 
 @contextmanager

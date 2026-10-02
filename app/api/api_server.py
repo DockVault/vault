@@ -967,6 +967,12 @@ class UserResponse(BaseModel):
     # ({kind, label, by, at, window_ends}), or None. Until window_ends, a further change needs a
     # second administrator's approval. Filled in by the admin users list.
     credential_change: Optional[Dict[str, Any]] = None
+    # The account's current password was set by someone else ({by: their username or None, at}), or None
+    # (app/core/password_origin.py). Filled in by the admin users list, for the promote dialog's warning.
+    password_set_by_other: Optional[Dict[str, Any]] = None
+    # A promotion took back a password someone else had set: {emailed, reset_link, expires_in_minutes}
+    # (_hand_over_promotion_reset). Only in the answer to the change that made the account an administrator.
+    promotion_password_reset: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -5401,6 +5407,14 @@ def _resolve_valid_reset_token(db: Session, token: str):
     return None
 
 
+def _reset_link_made_by_other(r) -> bool:
+    """Whether another account made reset link ``r`` for the account (not the person asking for it, nor
+    the server's operator on the host). A link from before the made_by_other column: when one is named."""
+    if r.made_by_other is not None:
+        return bool(r.made_by_other)
+    return r.created_by is not None and r.created_by != r.user_id
+
+
 def _reset_link_refusal(db: Session, r, target, *, lock: bool = False) -> Optional[str]:
     """Why reset link ``r``, for ``target``'s account, may not be used now, or None when it may.
 
@@ -5417,10 +5431,7 @@ def _reset_link_refusal(db: Session, r, target, *, lock: bool = False) -> Option
     they are read, and one that starts later waits until the link has been used."""
     from app.core import account_authority
     from app.core.endpoint_permissions import endpoint_permission_denial
-    made_by_other = r.made_by_other
-    if made_by_other is None:        # a link from before the column: another account made it if one is named
-        made_by_other = r.created_by is not None and r.created_by != r.user_id
-    if not made_by_other:
+    if not _reset_link_made_by_other(r):
         return None
     if lock:
         ids = [i for i in (r.created_by, target.id) if i is not None]
@@ -5583,8 +5594,15 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     from app.core import credential_changes as cc
     payload = payload or {}
     if kind == cc.PASSWORD:
+        from app.core import password_origin
         target.password_hash = payload["password_hash"]
         target.updated_at = datetime.now(timezone.utc)
+        # Someone else chose it (the one who asked, for an approved request; None: the host operator),
+        # unless an administrator set their own through an administrator's route.
+        if for_someone_else:
+            password_origin.set_by_other(target, actor_id)
+        else:
+            password_origin.set_by_self(target)
         # A stolen session must not outlive the response to a suspected compromise.
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
         return {}
@@ -5786,6 +5804,12 @@ def _approval_refusal_text(reason, requester, *, short=False) -> str:
         return ("You had been an administrator for less than 14 days when this request was made, so you "
                 "cannot approve it. An administrator of longer standing, or the person who runs the "
                 "server (python dockvault.py accounts), can.")
+    if reason == cc.PASSWORD_NOT_OWN:
+        if short:
+            return "You cannot approve this: your password was set by someone else."
+        return ("Your current password was set by someone else, who may still know it, so you cannot approve "
+                "changes to other people's sign-in details. Set a password of your own first: in Your "
+                f"account, or with a reset link from the sign-in page. {_OTHERS_CAN}")
     return "A change you asked for needs another administrator's approval. You can withdraw it."
 
 
@@ -5823,6 +5847,10 @@ def _no_approver_text(refusals, target_name) -> str:
     recent = by_reason.get(cc.NEW_ADMIN, []) + by_reason.get(cc.BECAME_ADMIN_AFTER, [])
     if recent:
         clauses.append(f"{_names_text(recent)} became {admins(recent)} less than 14 days ago")
+    not_own = by_reason.get(cc.PASSWORD_NOT_OWN)
+    if not_own:
+        clauses.append(f"{_names_text(not_own)} {'holds a password' if len(not_own) == 1 else 'hold passwords'} "
+                       "someone else set")
     return "; ".join(clauses)
 
 
@@ -6055,6 +6083,89 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     # Open reset links for them that a user who manages users made would be refused when used; they are
     # revoked now (_revoke_reset_links_outranked_by).
     _revoke_reset_links_outranked_by(db, user, actor=by)
+
+
+def _take_back_password_at_promotion(db, user, *, by) -> Optional[dict]:
+    """``user`` is being made an administrator by ``by`` (a User; None for the host operator): call it with
+    _record_admin_grant, on a promotion, in the caller's transaction. When their current password was set
+    by someone else (app/core/password_origin.py), whoever set it still knows it and could sign in as the
+    new administrator: make it unusable, end their sessions, record it, and return what
+    _hand_over_promotion_reset does after the commit. None when the password is their own.
+
+    Only the person's inbox cuts the one who knows it out, so after the commit they get a reset link there
+    (the promoting administrator gets one to hand over when no email can go). The account stays marked
+    until they set a password of their own, so until then it may not approve a held change either."""
+    import secrets as _secrets
+    from app.core import credential_changes as cc
+    from app.core import password_origin
+    from app.core.security import hash_password
+    if not password_origin.is_set_by_other(user):
+        return None
+    set_by = (db.query(User.username).filter(User.id == user.password_set_by).scalar()
+              if user.password_set_by is not None else None)
+    user.password_hash = hash_password(_secrets.token_urlsafe(32))   # nobody knows it
+    user.updated_at = datetime.now(timezone.utc)
+    _revoke_sessions(db, user_id=user.id, actor_username=by.username if by is not None else cc.HOST_OPERATOR)
+    db.add(AuditLogger(db).build_row(
+        action="password_reset_at_promotion", status="success", user=by,
+        username=None if by is not None else cc.HOST_OPERATOR,
+        resource_type="user", resource_id=str(user.id),
+        details={"target_username": user.username, "password_set_by": set_by,
+                 "password_set_at": user.password_set_by_other_at.isoformat() + "Z"}))
+    return {"user_id": user.id}
+
+
+def _hand_over_promotion_reset(db, taken, *, by, request=None) -> Optional[dict]:
+    """After the commit of a promotion whose password was taken back (``taken``, from
+    _take_back_password_at_promotion; None: nothing to do). Send the person a reset link the way a
+    self-service one goes (_self_service_reset_destination: their address, or for 14 days after an
+    administrator changed it, the one before), so only their inbox chooses the new password. When no email
+    can go (email not set up, no address to send to, the send failed), ``by`` gets a link to hand over,
+    which is judged again when it is used (_reset_link_refusal); the password it sets then counts as set by
+    them. Tells the person either way. Returns what the promoting route answers under
+    ``promotion_password_reset``: {"emailed", "reset_link", "expires_in_minutes"}."""
+    if not taken:
+        return None
+    from app.core.email_actions import public_base_url
+    user = db.get(User, taken["user_id"])
+    if user is None:
+        return None
+    base_url = _public_base_url(request) if request is not None else public_base_url(None)
+    by_name = by.username if by is not None else None
+    destination = _self_service_reset_destination(db, user)
+    if destination is not None and destination[0] and _smtp_configured(db):
+        note = ("<p><small>You were made an administrator. Your password had been set by someone else, so it "
+                "was reset: choose a new one with this link.</small></p>") + destination[1]
+        if _mint_and_send_reset(db, user, base_url, created_by_id=None, to=destination[0], note_html=note):
+            try:
+                AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=None,
+                                           details={"target_user_id": str(user.id), "email_sent": True,
+                                                    "at_promotion": True})
+            except Exception:  # noqa: BLE001
+                pass
+            _notify_account_change(
+                db, user, ntype="account_changed", title="Your password was reset",
+                change=("You were made an administrator. Your password had been set by someone else, so it was "
+                        "reset and you were signed out everywhere. A link to choose a new one was sent to your "
+                        "email address."), by=_actor_text(by_name))
+            return {"emailed": True, "reset_link": None, "expires_in_minutes": None}
+    link = _mint_reset_link(db, user, base_url, created_by_id=by.id if by is not None else None,
+                            made_by_other=by is not None)
+    _, ttl = _password_reset_policy(db)
+    if link:
+        try:
+            AuditLogger(db).log_action(action="password_reset_link_minted", status="success", user=by,
+                                       details={"target_user_id": str(user.id), "ttl_minutes": ttl,
+                                                "at_promotion": True})
+        except Exception:  # noqa: BLE001
+            pass
+    _notify_account_change(
+        db, user, ntype="account_changed", title="Your password was reset",
+        change=("You were made an administrator. Your password had been set by someone else, so it was reset "
+                "and you were signed out everywhere. " + (
+                    "The administrator who made you one has a link for you to choose a new one."
+                    if link else "Ask an administrator to set a new one.")), by=_actor_text(by_name))
+    return {"emailed": False, "reset_link": link, "expires_in_minutes": ttl if link else None}
 
 
 def _announce_admin_granted(db, user, *, by_name, how) -> None:
@@ -6601,6 +6712,14 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
         db.rollback()
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     user.password_hash = hash_password(body.new_password)
+    # Whose password it now is: a link another account made could have been used by its maker, so the
+    # password counts as theirs; one the person asked for (or the host operator made) is the person's own.
+    from app.core import password_origin
+    made_by_other = _reset_link_made_by_other(r)
+    if made_by_other:
+        password_origin.set_by_other(user, r.created_by)
+    else:
+        password_origin.set_by_self(user)
     db.commit()
     try:
         # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
@@ -6614,7 +6733,7 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
             pass
     try:
         AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
-                                   ip_address=ip, details={})
+                                   ip_address=ip, details={"link_made_by_other": bool(made_by_other)})
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True}
@@ -9427,6 +9546,16 @@ async def create_user(
     _validate_password_policy(db, user_create.password)
 
     is_admin_role = user_create.role == RoleEnum.ADMIN
+
+    def _before_commit(u):
+        # The administrator chose its password (app/core/password_origin.py). An administrator account
+        # also records who made it one, in the same commit: the two-administrator rule refuses that
+        # administrator's approval of its maker's changes.
+        from app.core import password_origin
+        password_origin.set_by_other(u, current_user.id)
+        if is_admin_role:
+            _record_admin_grant(db, u, by=current_user)
+
     try:
         new_user = auth_service.create_user(
             username=user_create.username,
@@ -9434,9 +9563,7 @@ async def create_user(
             password=user_create.password,
             role=user_create.role,
             created_by=current_user.id,
-            # An administrator account records who made it one, in the same commit: the
-            # two-administrator rule refuses that administrator's approval of its maker's changes.
-            before_commit=(lambda u: _record_admin_grant(db, u, by=current_user)) if is_admin_role else None,
+            before_commit=_before_commit,
         )
         
         # Grant default permissions based on role
@@ -9484,6 +9611,8 @@ async def list_users(
     recent = cc.recent_by_account(db, [u.id for u in users])
     from app.core import sign_in_lockout
     blocks = sign_in_lockout.blocks_by_user(db, [u.id for u in users])
+    setters = dict(db.query(User.id, User.username).filter(
+        User.id.in_({u.password_set_by for u in users if u.password_set_by is not None})).all())
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
@@ -9500,6 +9629,9 @@ async def list_users(
                 "at": change.applied_at.isoformat() + "Z",
                 "window_ends": cc.window_ends(change).isoformat() + "Z",
             }
+        if user.password_set_by_other_at is not None:
+            item.password_set_by_other = {"by": setters.get(user.password_set_by),
+                                          "at": user.password_set_by_other_at.isoformat() + "Z"}
         result.append(item)
     return result
 
@@ -9558,6 +9690,10 @@ async def update_own_account(
         _validate_password_policy(db, body.new_password)
         user.password_hash = hash_password(body.new_password)
         changes.append("password")
+        # Now the person's own, unless it is the same password again: whoever set that one still knows it.
+        if body.new_password != body.current_password:
+            from app.core import password_origin
+            password_origin.set_by_self(user)
     if changing_email:
         # When the organization requires it, a self email CHANGE must be proved with a code sent to
         # the new address (request-email-change / confirm-email-change below). A direct change here is
@@ -10608,6 +10744,7 @@ async def update_user(
 
     # Admin-only fields
     admin_granted = False
+    taken_back = None
     lost = []
     permissions_removed = []
     if is_admin:
@@ -10627,6 +10764,7 @@ async def update_user(
             # rule; a demotion drops the record (app/core/admin_grants.py).
             if user_update.role == RoleEnum.ADMIN and user.role != RoleEnum.ADMIN:
                 _record_admin_grant(db, user, by=current_user)
+                taken_back = _take_back_password_at_promotion(db, user, by=current_user)
                 admin_granted = True
             elif user_update.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
                 from app.core import admin_grants as _grants
@@ -10710,17 +10848,22 @@ async def update_user(
     if admin_granted:
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
     _announce_lost_standing(db, lost, request)
+    handed_over = _hand_over_promotion_reset(db, taken_back, by=current_user, request=request)
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
         # account as it now stands, plus what is waiting and why.
         for outcome in held:
             _announce_held_change(db, outcome.change, user)
-        body = UserResponse.model_validate(user).model_dump(mode="json")
+        answer = UserResponse.model_validate(user)
+        answer.promotion_password_reset = handed_over
+        body = answer.model_dump(mode="json")
         body["held_changes"] = [_held_body(o, user, current_user.id) for o in held]
         body["message"] = " ".join(h["message"] for h in body["held_changes"])
         return JSONResponse(status_code=202, content=body)
-    return UserResponse.model_validate(user)
+    answer = UserResponse.model_validate(user)
+    answer.promotion_password_reset = handed_over
+    return answer
 
 
 def _parse_ssh_public_key(line: str):
@@ -24535,6 +24678,25 @@ END $$;""",
                     # /health has nothing to consult, and a deployment missing a column reports
                     # itself well until an endpoint that needed the column returns a 500.
                     recorder.record(stmt, SchemaStep.OUTCOME_FAILED, str(e))
+
+            # Whose password each account holds (app/core/password_origin.py): the two columns are added,
+            # and filled from the audit log, once, in one transaction. Deliberately NOT a string in the
+            # list above, because the filling must run only when the columns are new: afterwards the app
+            # keeps them, and a later start must not overwrite that from the log.
+            origin_step = "conditional: users.password_set_by columns, filled from the audit log once"
+            try:
+                from app.core import password_origin
+                db.execute(text("SET LOCAL lock_timeout = 0"))
+                marked = password_origin.add_columns_once(db)
+                db.commit()
+                recorder.record(origin_step, SchemaStep.OUTCOME_APPLIED)
+                if marked is not None:
+                    print(f"[OK] Password origin: {marked} account(s) hold a password someone else set, "
+                          "from the audit log")
+            except Exception as e:
+                db.rollback()
+                print(f"⚠ users.password_set_by columns skipped: {e}")
+                recorder.record(origin_step, SchemaStep.OUTCOME_FAILED, str(e))
 
             # Case-insensitive uniqueness on users.email. Deliberately NOT a string in the list
             # above, because it is conditional: a deployment that already holds two addresses

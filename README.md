@@ -221,10 +221,15 @@ factor, the email address, an SSH key) once in 14 days; a second change waits un
 administrator approves it. The approver must be independent of it: not one who made or approved a
 change to that account within 14 days of the request; neither the approver nor the one who asked may
 have made the other an administrator (directly, or through administrators they made, an invitation
-included); and the approver must have been an administrator for 14 days when the request was made
-(administrators from before 0.33.0, and the first one, count as long-standing). A refusal says which
-of these applied. Every administrator is told when an administrator is created or promoted, and the
-user of every change to their sign-in details. An SSH key shows who added it; when an administrator who
+included); the approver must have been an administrator for 14 days when the request was made
+(administrators from before 0.33.0, and the first one, count as long-standing); and the approver's
+current password must be one they set themselves, not one an administrator, a user who manages users,
+the host operator or someone else's reset link set. A refusal says which of these applied. When an
+account holding a password someone else set is made an administrator, that password stops working,
+its sessions end, and the person chooses a new one with a reset link sent to their own address (the
+promoting administrator gets the link to hand over when no email can be sent). Every administrator is
+told when an administrator is created or promoted, and the user of every change to their sign-in
+details. An SSH key shows who added it; when an administrator who
 added keys to other people's accounts is demoted, deactivated, locked or deleted, each such account's
 owner is told again, by email too, with the way to remove the key, and so are the other administrators.
 The keys keep working until someone removes them. What remains, and is accepted: someone who creates

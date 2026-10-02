@@ -10,7 +10,7 @@ import pytest
 import requests
 
 from conftest import ApiClient, BASE_URL
-from _account_change_helpers import psql
+from _account_change_helpers import own_password, psql
 
 pytestmark = pytest.mark.integration
 
@@ -34,8 +34,8 @@ def delegate(admin):
 
 @pytest.fixture
 def dave(admin):
-    """An ordinary user, deleted afterwards (whatever role it ends with)."""
-    account = admin.create_user(role="user")
+    """An ordinary user holding a password of their own, deleted afterwards (whatever role it ends with)."""
+    account = own_password(admin.create_user(role="user"))
     try:
         yield account
     finally:

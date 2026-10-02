@@ -21525,6 +21525,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const u = (usersView.users || []).find(x => x.id === userId);
             if (u && (email.trim() || null) !== (u.email || null) && pendingApproval(u)
                 && !await confirmCredentialChange(u, 'The new address is saved', null, null, 'Your other changes are saved now.')) return;
+            // Making an account an administrator takes back a password someone else set: say so first.
+            if (u && role === 'admin' && u.role !== 'admin' && u.password_set_by_other) {
+                const setBy = u.password_set_by_other.by || 'someone else';
+                const ok = await showConfirm(
+                    `${u.username}'s password was set by ${setBy}, who may still know it. Making ${u.username} an `
+                    + 'administrator makes that password unusable and signs them out everywhere. They choose a new '
+                    + 'one with a reset link sent to their email address; when no email can go, you get the link to '
+                    + 'give them.',
+                    'Make an administrator?');
+                if (!ok) return;
+            }
 
             // Storage quota: 'inherit' clears the override (null), 'unlimited' exempts the
             // account, a number sets an exact budget. A blank custom box is treated as
@@ -21556,6 +21567,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (r && r.held_changes) showHeldChange(r);
                 else showSuccess('User updated successfully');
                 closeModal();
+                // A promotion that took back a password someone else set: the link, when none was emailed.
+                const taken = r && r.promotion_password_reset;
+                if (taken && taken.reset_link) _showResetLinkModal(taken.reset_link, r.username, taken.expires_in_minutes);
+                else if (taken && taken.emailed) showSuccess('Their password was reset: a link to choose a new one was emailed to them');
+                else if (taken) showError('Their password was reset, and no reset link could be made: set a new password for them');
                 loadUsers();
             } catch (error) {
                 showError('Failed to update user: ' + error.message);
