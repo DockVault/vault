@@ -706,3 +706,8 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 }
 .notice-banner-text { flex: 1 1 16rem; }
 .notice-banner-link { white-space: nowrap; }
+
+/* The details' unlock of a password-protected vault's names (static/js/activity.js unlockForm). */
+.act-unlock { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+.act-unlock-password { max-width: 14rem; }
+.act-unlock-msg { flex-basis: 100%; font-size: .85em; }

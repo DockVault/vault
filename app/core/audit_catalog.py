@@ -190,6 +190,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("vault_permission_revoked", "vaults", "Vault access removed", "notice"),
     AuditAction("vault_storage_allocated", "vaults", "Vault storage allocation changed", "info"),
     AuditAction("vault_settings_updated", "vaults", "Vault settings changed", "notice"),
+    # An administrator gave a vault's password to see its names on the Activity page (or gave a wrong one).
+    AuditAction("activity_vault_unlocked", "vaults", "Vault names unlocked on the Activity page", "notice"),
     # Zero-knowledge keys
     AuditAction("zk_index_key_wrapped", "zero_knowledge", "Name-index key given to members", "notice"),
     AuditAction("zk_key_update_pop_failed", "zero_knowledge", "Encryption key change refused", "warning"),

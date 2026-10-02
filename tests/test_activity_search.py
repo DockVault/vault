@@ -57,7 +57,7 @@ def factory():
 # --------------------------------------------------------------------------- the routes
 
 def _get_params(fn):
-    return {n: p for n, p in inspect.signature(fn).parameters.items() if n not in ("current_user", "db")}
+    return {n: p for n, p in inspect.signature(fn).parameters.items() if n not in ("current_user", "db", "request")}
 
 
 @pytest.mark.parametrize("model,handler", [
@@ -85,9 +85,15 @@ def test_each_post_takes_the_get_forms_filters_with_the_same_bounds(model, handl
     ("export_events", "activity_export", routes.ExportSearch(user="eve", format="ndjson"))])
 def test_each_post_runs_its_get_forms_handler_with_every_filter(monkeypatch, route, handler, body):
     expected = set(_get_params(getattr(api, handler))) | {"current_user", "db"}
+    if "request" in inspect.signature(getattr(api, handler)).parameters:
+        expected.add("request")
     seen = {}
     monkeypatch.setattr(api, handler, lambda **kw: seen.update(kw) or "answer")
-    assert getattr(routes, route)(body, current_user="admin", db="db") == "answer"
+    call = getattr(routes, route)
+    extra = {"request": "the request"} if "request" in inspect.signature(call).parameters else {}
+    assert call(body, current_user="admin", db="db", **extra) == "answer"
+    if extra:
+        assert seen["request"] == "the request"
     assert set(seen) == expected
     assert seen["user"] == "eve" and seen["current_user"] == "admin" and seen["db"] == "db"
     for name, value in body.model_dump().items():

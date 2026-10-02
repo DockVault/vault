@@ -741,6 +741,9 @@ app.include_router(recording_notice_router)
 # The Activity page's searches with the filters in the body, so what was typed reaches no request line.
 from app.api.activity_search_router import router as activity_search_router  # noqa: E402
 app.include_router(activity_search_router)
+# Unlocking a password-protected vault's names on the Activity page, with the vault password once.
+from app.api.activity_unlock_router import router as activity_unlock_router  # noqa: E402
+app.include_router(activity_unlock_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -2515,6 +2518,7 @@ def activity_events(
     ids: List[str] = Query([], max_length=8000),
     count_only: bool = False,
     limit: int = 50,
+    request: Request = None,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
@@ -2603,11 +2607,15 @@ def activity_events(
             out["prev_cursor"] = ev.encode_cursor(rows[0].timestamp, rows[0].id)
 
     events = [ev.row_view(r) for r in rows]
-    from app.services.activity_names import names_for, recorded_names_for, temp_credential_names
+    from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
+                                             unlocked_vaults)
+    # Vaults whose names this administrator unlocked with the vault password (a receipt for each).
+    unlocked = unlocked_vaults(db, current_user, request)
     for event, names in zip(events, names_for(db, current_user, events)):
         event["names"] = names
-    for event, recorded in zip(events, recorded_names_for(db, current_user, rows)):
+    for event, recorded in zip(events, recorded_names_for(db, current_user, rows, unlocked)):
         event["recorded_names"] = recorded
+    show_unlocked(events, unlocked)
     temp_credential_names(db, events)
     out["events"] = events
     # The recording levels in force, so the page can mark a row recorded under other ones.
@@ -2623,12 +2631,14 @@ def activity_events(
 
 @app.get("/activity/events/{event_id}")
 def activity_event(event_id: str,
+                   request: Request = None,
                    current_user: User = Depends(require_interactive_admin),
                    db: Session = Depends(get_db)):
     """One event, as the Events list shows it (admin only): for a copied link to an event."""
     from app.core.models import AuditLog
     from app.services import activity_events as ev
-    from app.services.activity_names import names_for, recorded_names_for, temp_credential_names
+    from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
+                                             unlocked_vaults)
     try:
         row = db.query(AuditLog).filter(AuditLog.id == uuid.UUID(event_id)).first()
     except ValueError:
@@ -2636,8 +2646,10 @@ def activity_event(event_id: str,
     if row is None:
         raise HTTPException(status_code=404, detail="That event is not in the log.")
     event = ev.row_view(row)
+    unlocked = unlocked_vaults(db, current_user, request)
     event["names"] = names_for(db, current_user, [event])[0]
-    event["recorded_names"] = recorded_names_for(db, current_user, [row])[0]
+    event["recorded_names"] = recorded_names_for(db, current_user, [row], unlocked)[0]
+    show_unlocked([event], unlocked)
     temp_credential_names(db, [event])
     return event
 
@@ -2970,6 +2982,7 @@ def activity_export(
     vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
+    request: Request = None,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
@@ -2983,7 +2996,8 @@ def activity_export(
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
     from app.services import activity_events as ev
-    from app.services.activity_names import recorded_names_for, temp_credential_names
+    from app.services.activity_names import recorded_names_for, show_unlocked, temp_credential_names, unlocked_vaults
+    unlocked = unlocked_vaults(db, current_user, request)
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
@@ -3025,7 +3039,8 @@ def activity_export(
             views = [ev.row_view(r) for r in got]
             temp_credential_names(s, views)
             viewer = s.get(User, current_user.id)
-            for view, recorded in zip(views, recorded_names_for(s, viewer, got) if viewer else [None] * len(views)):
+            for view, recorded in zip(views, recorded_names_for(s, viewer, got, unlocked) if viewer
+                                      else [None] * len(views)):
                 view["recorded_names"] = recorded
             return views, nxt
         finally:

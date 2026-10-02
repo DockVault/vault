@@ -277,9 +277,54 @@
     function post(path, params) {
         return fetch(API_BASE + path, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+            headers: Object.assign({ Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, unlockHeader()),
             body: JSON.stringify(bodyOf(params)),
         });
+    }
+
+    // Vaults whose names were unlocked with the vault password: a receipt each, good for 15 minutes, sent with
+    // every read (POST /activity/vaults/{id}/unlock). Kept in memory only.
+    const UNLOCKS = new Map();
+
+    function unlockHeader() {
+        const now = Date.now();
+        const parts = [];
+        UNLOCKS.forEach((u, vid) => { if (u.expires > now) parts.push(`${vid}:${u.receipt}`); else UNLOCKS.delete(vid); });
+        return parts.length ? { 'X-Activity-Unlock': parts.join(',') } : {};
+    }
+
+    async function unlockVault(vid, password) {
+        const out = await apiRequest(`/activity/vaults/${encodeURIComponent(vid)}/unlock`,
+            { method: 'POST', body: JSON.stringify({ password }), silent: true });
+        UNLOCKS.set(vid, { receipt: out.receipt, expires: Date.parse(out.expires_at) || (Date.now() + 15 * 60000) });
+        await reloadList({ keepSelection: true });
+        renderDetail();
+    }
+
+    // In the details: a vault whose item names are hidden by its vault password can be unlocked here.
+    function unlockForm(vid) {
+        const wrap = el('form', 'act-unlock');
+        const input = el('input', 'form-control act-unlock-password');
+        input.type = 'password';
+        input.autocomplete = 'off';
+        input.setAttribute('aria-label', 'Vault password');
+        input.placeholder = 'Vault password';
+        const go = button('btn btn-sm btn-primary', 'Show names');
+        go.type = 'submit';
+        const msg = el('span', 'act-unlock-msg text-secondary', 'Names as recorded, for 15 minutes.');
+        wrap.append(input, go, msg);
+        wrap.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            go.disabled = true;
+            try {
+                await unlockVault(vid, input.value);
+            } catch (err) {
+                msg.textContent = err.message || 'The names could not be unlocked.';
+                go.disabled = false;
+            }
+            input.value = '';
+        });
+        return wrap;
     }
 
     // A GET under /activity (or the session probe). A 401 is handed to the app's own sign-in handling;
@@ -288,7 +333,7 @@
         const [base, query] = path.split('?');
         const params = new URLSearchParams(query || '');
         const resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
-            : await fetch(API_BASE + path, { headers: { Authorization: `Bearer ${authToken}` } });
+            : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader()) });
         if (resp.status === 401) {
             await apiRequest(path, { silent: true });          // the app signs out
             throw new RequestError('Your session has ended.', 401, null);
@@ -1710,6 +1755,9 @@
                 [vid ? detailFilter('Show events for this vault', { vault: vid }) : null]);
         }
         if (names.item) field(what.dl, ev.resource_type === 'folder' ? 'Folder' : 'File', names.item);
+        if (vid && names.item === 'Name hidden: the vault has a password' && !UNLOCKS.has(vid)) {
+            field(what.dl, 'Names', unlockForm(vid));
+        }
         if (ev.resource_type) {
             const text = `${ev.resource_type} ${ev.resource_id || ''}`.trim();
             const copy = button('act-d-filter', null, { 'aria-label': 'Copy', title: 'Copy' });

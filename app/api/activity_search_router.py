@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -65,11 +65,11 @@ class ExportSearch(Filters):
 
 
 @router.post("/activity/events/search")
-def search_events(body: EventsSearch, current_user: User = Depends(require_interactive_admin),
+def search_events(body: EventsSearch, request: Request, current_user: User = Depends(require_interactive_admin),
                   db: Session = Depends(get_db)):
     """The Events list for the filters in the body."""
     from app.api.api_server import activity_events
-    return activity_events(**body.model_dump(), current_user=current_user, db=db)
+    return activity_events(**body.model_dump(), request=request, current_user=current_user, db=db)
 
 
 @router.post("/activity/summary/search")
@@ -83,8 +83,8 @@ def search_summary(body: SummarySearch, current_user: User = Depends(require_int
 
 
 @router.post("/activity/export")
-def export_events(body: ExportSearch, current_user: User = Depends(require_interactive_admin),
+def export_events(body: ExportSearch, request: Request, current_user: User = Depends(require_interactive_admin),
                   db: Session = Depends(get_db)):
     """The export for the filters in the body."""
     from app.api.api_server import activity_export
-    return activity_export(**body.model_dump(), current_user=current_user, db=db)
+    return activity_export(**body.model_dump(), request=request, current_user=current_user, db=db)
