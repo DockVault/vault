@@ -440,6 +440,9 @@ class Settings(BaseSettings):
     audit_max_emails: str = Field(default="full")
     audit_max_ip: str = Field(default="full")
     audit_max_user_agent: str = Field(default="full")
+    # The key of the fingerprints the audit log keeps of names recorded at the fingerprint level
+    # (app/core/audit_fingerprints.py): at least 32 characters. Empty derives one from ENCRYPTION_KEY.
+    audit_fingerprint_key: str = Field(default="")
     # Audit-log retention in days. 0 (the default) keeps every audit row: a deleted record of what
     # happened cannot be brought back, so deleting them is left to the operator. A positive value
     # deletes rows older than that many days; the pruner (app/core/retention.py) does it on a timer.
@@ -618,6 +621,11 @@ def _validate_runtime_settings(candidate: Settings) -> None:
             "A recording limit in .env cannot be read: " + "; ".join(unreadable)
             + ". Fix the line in .env, then run docker compose up -d.",
         )
+
+    from app.core.audit_fingerprints import key_problem
+    weak = key_problem(candidate)
+    if weak:
+        raise RuntimeBootstrapError("audit-fingerprint-key-weak", weak + ".")
 
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
         raise RuntimeBootstrapError(

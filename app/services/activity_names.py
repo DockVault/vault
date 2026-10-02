@@ -105,6 +105,33 @@ def names_for(db, viewer, events: List[dict]) -> List[Dict[str, Optional[str]]]:
     return out
 
 
+def _recorded_names(row) -> Optional[dict]:
+    recorded = getattr(row, "recorded", None)
+    names = recorded.get("names") if isinstance(recorded, dict) else None
+    if not isinstance(names, dict) or not isinstance(names.get("values"), dict):
+        return None
+    return names
+
+
+def recorded_names_for(db, viewer, rows) -> List[Optional[dict]]:
+    """For each audit row, the names its recording levels kept (recorded.names: each key's fingerprint), or
+    None. Only for a vault the viewer can read, by the same rule as the names above: a fingerprint of a name in
+    a vault the viewer is not in would let them test guesses of what is in it."""
+    kept = [_recorded_names(r) for r in rows]
+    vaults = {_uuid(n.get("vault")) for n in kept if n}
+    vaults.discard(None)
+    readable = readable_vault_ids(db, viewer, vaults) if vaults else set()
+    out = []
+    for names in kept:
+        vault = _uuid(names.get("vault")) if names else None
+        if vault is None or vault not in readable:
+            out.append(None)
+            continue
+        out.append({key: {"fingerprint": value.get("fp")} for key, value in names["values"].items()
+                    if isinstance(value, dict)})
+    return out
+
+
 def temp_credential_names(db, events: List[dict]) -> None:
     """Fill in the temporary credential's name on events that record only its id (rows written before
     0.33.0 kept the id alone), while that credential still exists. Changes the events in place."""

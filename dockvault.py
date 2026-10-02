@@ -396,7 +396,8 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written),
+    invite_token_pepper (str), audit_fingerprint_key (str; written only when set), enforce_file_expiry
+    (raw string; only a false value is written),
     max_single_request_upload_mb (int or None; written only when set), settings_locked_keys (str;
     written only when set)."""
     lines = []
@@ -533,6 +534,10 @@ def build_env_lines(cfg):
     # decoupled from the JWT secret (the app falls back to the JWT secret only when this is absent).
     if cfg.get("invite_token_pepper"):
         bare("INVITE_TOKEN_PEPPER", "'%s'" % cfg["invite_token_pepper"])
+    # The key of the audit log's fingerprints. Written when there is one: an install set up before it was
+    # generated derives one from ENCRYPTION_KEY, and keeps doing so until a key is added here.
+    if cfg.get("audit_fingerprint_key"):
+        bare("AUDIT_FINGERPRINT_KEY", "'%s'" % cfg["audit_fingerprint_key"])
     return lines
 
 
@@ -1306,6 +1311,8 @@ def new_set_config(current_env, new_prefix, new_id):
         **{cfg_key: (current_env.get(env_name) or "").strip() or None
            for cfg_key, env_name, _default in RETENTION_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
+        # A new set is new data: its audit fingerprints get a key of their own.
+        "audit_fingerprint_key": gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
@@ -3418,6 +3425,7 @@ class DockVault:
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "invite_token_pepper": gen_hex(32),
+            "audit_fingerprint_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.

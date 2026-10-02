@@ -2594,9 +2594,11 @@ def activity_events(
             out["prev_cursor"] = ev.encode_cursor(rows[0].timestamp, rows[0].id)
 
     events = [ev.row_view(r) for r in rows]
-    from app.services.activity_names import names_for, temp_credential_names
+    from app.services.activity_names import names_for, recorded_names_for, temp_credential_names
     for event, names in zip(events, names_for(db, current_user, events)):
         event["names"] = names
+    for event, recorded in zip(events, recorded_names_for(db, current_user, rows)):
+        event["recorded_names"] = recorded
     temp_credential_names(db, events)
     out["events"] = events
     # The recording levels in force, so the page can mark a row recorded under other ones.
@@ -2617,7 +2619,7 @@ def activity_event(event_id: str,
     """One event, as the Events list shows it (admin only): for a copied link to an event."""
     from app.core.models import AuditLog
     from app.services import activity_events as ev
-    from app.services.activity_names import names_for, temp_credential_names
+    from app.services.activity_names import names_for, recorded_names_for, temp_credential_names
     try:
         row = db.query(AuditLog).filter(AuditLog.id == uuid.UUID(event_id)).first()
     except ValueError:
@@ -2626,6 +2628,7 @@ def activity_event(event_id: str,
         raise HTTPException(status_code=404, detail="That event is not in the log.")
     event = ev.row_view(row)
     event["names"] = names_for(db, current_user, [event])[0]
+    event["recorded_names"] = recorded_names_for(db, current_user, [row])[0]
     temp_credential_names(db, [event])
     return event
 
@@ -2971,7 +2974,7 @@ def activity_export(
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
     from app.services import activity_events as ev
-    from app.services.activity_names import temp_credential_names
+    from app.services.activity_names import recorded_names_for, temp_credential_names
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
@@ -3012,6 +3015,9 @@ def activity_export(
             nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
             views = [ev.row_view(r) for r in got]
             temp_credential_names(s, views)
+            viewer = s.get(User, current_user.id)
+            for view, recorded in zip(views, recorded_names_for(s, viewer, got) if viewer else [None] * len(views)):
+                view["recorded_names"] = recorded
             return views, nxt
         finally:
             s.close()

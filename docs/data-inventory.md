@@ -154,7 +154,12 @@ Each row of `audit_logs` holds:
   limits `.env` sets (`AUDIT_MAX_NAMES`, `AUDIT_MAX_SIGNIN_NAMES`, `AUDIT_MAX_EMAILS`, `AUDIT_MAX_IP`,
   `AUDIT_MAX_USER_AGENT`). Version 1, the default, records what earlier releases did. A value recorded at
   a lower level is either not stored or stored in another form in `recorded` (a shortened address keeps
-  the /24 or /48 it is in); the row's own columns and details hold only values recorded in full.
+  the /24 or /48 it is in; a name at the fingerprint level keeps a keyed fingerprint, under a key of its
+  own for each vault's names); the row's own columns and details hold only values recorded in full. A
+  fingerprint is made with `AUDIT_FINGERPRINT_KEY` (or a key derived from `ENCRYPTION_KEY`): it hides a
+  name from someone who reads the database without `.env`, but anyone who holds `.env` (it is in the
+  backups) can test guesses, and finds a short or common name quickly. Name fingerprints are shown and
+  exported only to administrators who can read the vault.
   `privacy_version` says which version of the levels a row was recorded under (none: an earlier release;
   -1: recorded without its personal values because deciding failed, with an alert). Changing the levels
   never rewrites older rows;

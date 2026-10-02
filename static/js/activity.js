@@ -864,6 +864,10 @@
             return { text: 'Server operator', quiet: true, title: `The server's operator, working on the host (${ev.username})` };
         }
         if (ev.username) return { text: ev.username, quiet: false };
+        if (ev.signin_fingerprint) {
+            return { text: 'Name typed (fingerprint)', quiet: true,
+                title: `Recorded as a fingerprint: ${ev.signin_fingerprint}` };
+        }
         if (anonymous) return { text: 'Someone with the link', quiet: true };
         if (ev.automatic) return { text: 'System', quiet: true };
         return { text: 'Unknown', quiet: true };
@@ -1532,6 +1536,12 @@
         return d && typeof d === 'object' && d.vault_id ? String(d.vault_id) : null;
     }
 
+    // The names a row can carry, as the details drawer labels them.
+    const NAME_KEY_LABELS = {
+        vault_name: 'Vault name', file_name: 'File name', folder_name: 'Folder name',
+        old_name: 'Name before', new_name: 'Name after',
+    };
+
     // Which recording levels a row was recorded under, when it is not the version in force: null for a row
     // recorded under the current levels, or by a release before them.
     function recordedUnder(ev) {
@@ -1647,6 +1657,16 @@
         field(what.dl, 'Status', st, [group ? detailFilter('Show events with this status', { status: [group] }) : null]);
         const recorded = recordedUnder(ev);
         if (recorded) field(what.dl, 'Recorded', el('span', 'act-d-value act-d-recorded', recorded));
+        if (ev.signin_fingerprint) {
+            field(what.dl, 'Name typed', el('span', 'act-d-value act-mono', ev.signin_fingerprint));
+        }
+        const kept = ev.recorded_names || {};
+        Object.keys(kept).sort().forEach((key) => {
+            const value = kept[key] || {};
+            if (value.fingerprint) {
+                field(what.dl, `${NAME_KEY_LABELS[key] || key} (fingerprint)`, el('span', 'act-d-value act-mono', value.fingerprint));
+            }
+        });
         const names = ev.names || {};
         const vid = vaultIdOf(ev);
         if (names.vault || vid) {

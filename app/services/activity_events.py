@@ -382,6 +382,8 @@ def row_view(r) -> dict:
         "cursor": encode_cursor(r.timestamp, r.id) if r.timestamp is not None else None,
         "timestamp": ts.isoformat() if ts else None,
         "username": r.username,
+        # A name typed at a failed sign-in, recorded as its fingerprint (app/core/audit_fingerprints.py).
+        "signin_fingerprint": recorded_value(r, "signin_name"),
         # Shown as "Server operator", not as its internal name.
         "host_operator": is_host_operator(r),
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
@@ -474,7 +476,11 @@ EXPORT_COLUMNS = (
     ("Status", "status"), ("User", "username"), ("Temporary credential", "temp_credential_name"),
     ("Channel", "channel"), ("IP address", "ip_address"), ("Method", "method"), ("Route", "endpoint"),
     ("User agent", "user_agent"), ("Resource type", "resource_type"), ("Resource ID", "resource_id"),
-    ("Details", "details"), ("Error", "error_message"), ("Temporary credential ID", "temp_credential_id"),
+    ("Details", "details"), ("Error", "error_message"),
+    # What the recording levels kept in another form: a typed name's fingerprint, and the names' fingerprints
+    # of a vault the exporting administrator can read.
+    ("Typed name (fingerprint)", "signin_fingerprint"), ("Recorded names", "recorded_names"),
+    ("Temporary credential ID", "temp_credential_id"),
 )
 
 

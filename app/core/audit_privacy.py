@@ -526,9 +526,11 @@ def username_is_typed(row) -> bool:
 class _Recorder:
     """What one row keeps, as it is decided."""
 
-    def __init__(self, row, levels: Mapping[str, str]):
+    def __init__(self, row, levels: Mapping[str, str], vault_id=None):
         self.row = row
         self.levels = levels
+        # The vault the row's names are in, which keys their fingerprints (None: names are not recorded).
+        self.vault_id = vault_id
         self.recorded: Dict[str, Any] = {}
         self.dropped: list = []
 
@@ -536,13 +538,16 @@ class _Recorder:
         return self.levels[KIND_POLICY[kind]]
 
     # A value of a personal kind at its level: (value kept in place, value recorded in another form). Either
-    # may be None; names are decided by names(), never kept in place.
+    # may be None; names are decided by name(), never kept in place.
     def personal(self, kind: str, value) -> Tuple[Any, Any]:
         level = self.level(kind)
         if level == FULL:
             return value, None
         if level == SHORTENED and kind == ADDRESS:
             return None, shorten(value)
+        if level == FINGERPRINT and kind == SIGNIN_NAME:
+            from app.core.audit_fingerprints import SIGNIN, fingerprint
+            return None, fingerprint(SIGNIN, value)
         return None, None
 
     def detail(self, path: str, value):
@@ -578,7 +583,13 @@ class _Recorder:
         return out
 
     def name(self, path: str, value) -> None:
-        """A vault, file or folder name. Not recorded at any level by this release's writer."""
+        """A vault, file or folder name: never in the details; at the fingerprint level, its fingerprint
+        under its vault's key in recorded.names. A name whose vault the row does not say is not recorded."""
+        if self.level(NAME) == NONE or self.vault_id is None or not isinstance(value, str):
+            return
+        from app.core.audit_fingerprints import NAME as NAME_KEY, fingerprint
+        names = self.recorded.setdefault("names", {"vault": str(self.vault_id), "values": {}})
+        names["values"][path] = {"fp": fingerprint(NAME_KEY, value, self.vault_id)}
 
     def columns(self) -> None:
         row = self.row
@@ -596,13 +607,25 @@ class _Recorder:
             row.user_agent, _ = self.personal(AGENT, row.user_agent)
 
 
+def names_vault(row, raw_details):
+    """The vault a row's names are in: the vault itself for a vault event, else the vault its details name.
+    The same rule the Activity page uses to decide whose names a viewer may see."""
+    import uuid as _uuid
+    raw = getattr(row, "resource_id", None) if getattr(row, "resource_type", None) == "vault" else (
+        raw_details.get("vault_id") if isinstance(raw_details, dict) else None)
+    try:
+        return _uuid.UUID(str(raw)) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
 def apply(row, raw_details) -> None:
     """Decide what ``row`` records of its personal values, in place: its username, address and user agent,
     its details (from ``raw_details``, the caller's details as given), ``recorded`` and ``privacy_version``.
     Never raises."""
     try:
         policy = current()
-        recorder = _Recorder(row, effective(policy.levels))
+        recorder = _Recorder(row, effective(policy.levels), names_vault(row, raw_details))
         recorder.columns()
         if isinstance(raw_details, dict):
             row.details = recorder.details(raw_details)
@@ -674,6 +697,9 @@ def for_output(kind: str, value) -> str:
             return str(value)
         if level == SHORTENED and kind == ADDRESS:
             return shorten(value) or "(not recorded)"
+        if level == FINGERPRINT and kind == SIGNIN_NAME:
+            from app.core.audit_fingerprints import SIGNIN, fingerprint
+            return fingerprint(SIGNIN, value) or "(not recorded)"
         return "(not recorded)"
     except Exception:  # noqa: BLE001
         return "(not recorded)"

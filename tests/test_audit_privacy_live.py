@@ -9,7 +9,6 @@ version. test_audit_privacy.py covers the rules offline.
 """
 import os
 import subprocess
-import time
 import uuid
 
 import paramiko
@@ -18,6 +17,7 @@ import requests
 
 from conftest import BASE_URL, unique
 from _account_change_helpers import DB, psql, reset_sign_in_throttle
+from _recording_levels import latest, levels_restored, store, wait_for  # noqa: F401 -- a fixture
 
 pytestmark = pytest.mark.integration
 
@@ -25,8 +25,6 @@ SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
 KEYS = ("names", "signin_names", "emails", "ip", "user_agent")
 POLICY_ONE = {"names": "none", "signin_names": "full", "emails": "full", "ip": "full", "user_agent": "full"}
-# The processes read the table again every few seconds (audit_privacy.REFRESH_SECONDS is 5).
-SETTLE_SECONDS = 8
 
 
 def _psql_fails(sql):
@@ -35,37 +33,9 @@ def _psql_fails(sql):
     return r.returncode != 0, r.stderr
 
 
-def _latest():
-    line = psql("SELECT version, " + ", ".join(KEYS) + " FROM audit_privacy_policies ORDER BY version DESC LIMIT 1")
-    version, *levels = line.split("|")
-    return int(version), dict(zip(KEYS, levels))
-
-
-def _store(levels, by="live test"):
-    """Add the next version with ``levels``, as the panel would, and wait for the processes to read it."""
-    version, _ = _latest()
-    psql("INSERT INTO audit_privacy_policies (version, " + ", ".join(KEYS) + ", reason, created_at, created_by_name) "
-         f"VALUES ({version + 1}, " + ", ".join(f"'{levels[k]}'" for k in KEYS)
-         + f", 'admin', now() AT TIME ZONE 'utc', '{by}')")
-    time.sleep(SETTLE_SECONDS)
-    return version + 1
-
-
-@pytest.fixture
-def levels_restored():
-    _, before = _latest()
-    yield before
-    _store(before, by="live test, restoring")
-
-
-def _wait_for(check, timeout=20.0, step=0.5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = check()
-        if value:
-            return value
-        time.sleep(step)
-    return check()
+_latest = latest
+_store = store
+_wait_for = wait_for
 
 
 def test_the_table_starts_at_policy_one_and_only_grows():
