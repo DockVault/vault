@@ -180,6 +180,7 @@ def _use(db, token):
     ("by another account since deleted", "nobody named"),
     ("by the person", None),
     ("by the person, before the column", None),
+    ("by the person, named, before the column", None),
     ("on the host", None),
 ])
 def test_a_reset_link_used_marks_the_password_as_its_makers_or_the_persons(db, world, made, expected):
@@ -190,6 +191,7 @@ def test_a_reset_link_used_marks_the_password_as_its_makers_or_the_persons(db, w
                                  "by another account, before the column": (ada.id, None),
                                  "by another account since deleted": (None, True),
                                  "by the person": (None, False), "by the person, before the column": (None, None),
+                                 "by the person, named, before the column": (bob.id, None),
                                  "on the host": (None, False)}[made]
     monkey = pytest.MonkeyPatch()
     monkey.setattr(api, "_reset_link_refusal", lambda *a, **k: None)
@@ -269,14 +271,15 @@ def test_a_promotion_takes_back_a_password_someone_else_set_and_emails_a_link(db
     assert world.revoked.count(bob.id) >= 1, "their sessions end"
     assert _marked(db, bob) == (ada.id, True), "marked until they set their own"
     (row,) = _audit(db, "password_reset_at_promotion")
-    assert (row.user_id, row.resource_id) == (carol.id, str(bob.id))
+    assert (row.user_id, row.resource_id, row.status) == (carol.id, str(bob.id), "success")
     assert row.details["target_username"] == "bob" and row.details["password_set_by"] == "ada"
     # A link of the self-service kind to their own address: only their inbox chooses the new password.
     ((who, created_by, to, note, made_by_other),) = world.sent
     assert (who, created_by, to, made_by_other) == ("bob", None, "bob@example.com", False)
     assert "You were made an administrator" in note
     assert answer == {"emailed": True, "reset_link": None, "expires_in_minutes": None}
-    assert ("bob", "Your password was reset") in [(n[0], n[1]) for n in world.notices]
+    (change,) = [n[2] for n in world.notices if n[:2] == ("bob", "Your password was reset")]
+    assert "A link to choose a new one was sent to your email address." in change
 
 
 @pytest.mark.parametrize("route", sorted(PROMOTE))
@@ -292,6 +295,28 @@ def test_without_email_the_promoting_administrator_gets_a_link_to_hand_over(db, 
     assert (link.created_by, link.made_by_other) == (carol.id, True), "judged again when used"
     (minted,) = _audit(db, "password_reset_link_minted")
     assert minted.user_id == carol.id and minted.details["at_promotion"] is True
+    (change,) = [n[2] for n in world.notices if n[:2] == ("bob", "Your password was reset")]
+    assert "The administrator who made you one has a link for you to choose a new one." in change
+
+
+@pytest.mark.parametrize("route", sorted(PROMOTE))
+def test_a_promotion_link_goes_to_the_address_before_an_administrators_recent_change(db, world, route):
+    ada, carol, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "carol", RoleEnum.ADMIN), _user(db, "bob")
+    po.set_by_other(bob, ada.id)
+    # Within 14 days an administrator moved the address: the link goes to the one before, as a self-service
+    # one would, so whoever controls the new address cannot choose the new administrator's password.
+    row = cc.record_made(db, kind=cc.EMAIL, target_id=bob.id, requester_id=ada.id, requester_name="ada",
+                         now=cc.utcnow() - timedelta(days=3))
+    row.payload = cc.applied_email_payload({"old_email": "bob@example.com", "new_email": "bob@new.example.org"})
+    bob.email = "bob@new.example.org"
+    db.commit()
+    world.smtp = True
+    answer = _answer(PROMOTE[route](db, carol, bob))
+    ((who, created_by, to, note, made_by_other),) = world.sent
+    assert (who, created_by, to, made_by_other) == ("bob", None, "bob@example.com", False)
+    assert "You were made an administrator" in note
+    assert "An administrator changed this account's email address" in note
+    assert answer == {"emailed": True, "reset_link": None, "expires_in_minutes": None}
 
 
 def test_a_link_goes_to_the_promoting_administrator_when_the_address_was_just_changed(db, world, monkeypatch):
