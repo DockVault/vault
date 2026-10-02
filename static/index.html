@@ -1572,6 +1572,7 @@
                         <button class="tab-btn" data-tab="uploadlinks">Upload Links</button>
                         <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
                         <button class="tab-btn" data-tab="logs">Log access</button>
+                        <button class="tab-btn" data-tab="records">Activity and records</button>
                     </div>
 
                     <!-- General Settings Tab -->
@@ -2920,6 +2921,36 @@
                             </div>
                         </div>
                     </div>
+                    <!-- Activity and records: what the audit log records (static/js/settings-records.js). Saved on its
+                         own, with the password, never by "Save All Changes". -->
+                    <div id="settings-tab-records" class="settings-tab-content">
+                        <div class="card mb-lg" id="recording-levels-card">
+                            <div class="card-header"><h3>What is recorded</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">
+                                    Every event is recorded: who acted, what happened, when and its outcome. These
+                                    levels decide what is kept of the personal data that comes with an event. The
+                                    deployment&apos;s <code>.env</code> sets the most each may record. A change applies to
+                                    events recorded from then on; rows already recorded keep what they recorded.
+                                </p>
+                                <div id="recording-levels-presets" class="flex gap-sm mb-md" role="group" aria-label="Presets"></div>
+                                <div class="table-wrap">
+                                    <table class="data-table" id="recording-levels-table" aria-label="Recording levels">
+                                        <thead><tr><th scope="col">Data</th><th scope="col">Level</th><th scope="col">Limit</th><th scope="col">Recorded as</th></tr></thead>
+                                        <tbody></tbody>
+                                    </table>
+                                </div>
+                                <p id="recording-levels-note" class="text-secondary text-sm mt-md" hidden></p>
+                                <div class="flex justify-end gap-sm mt-md">
+                                    <button id="recording-levels-save" class="btn btn-primary" type="button" disabled>Save recording levels</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <div class="card-header"><h3>Earlier versions</h3></div>
+                            <div class="p-lg"><ol id="recording-levels-history" class="recording-history"></ol></div>
+                        </div>
+                    </div>
                 </div>
             </main>
         </div>
@@ -3973,6 +4004,7 @@
     <script src="/static/js/ecc_crypto.js?v=20260923a"></script>
     <script src="/static/js/app.js?v=20260929a"></script>
     <script src="/static/js/activity.js?v=20260929a"></script>
+    <script src="/static/js/settings-records.js?v=20261002a"></script>
 </body>
 </html>
 

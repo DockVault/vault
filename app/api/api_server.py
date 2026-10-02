@@ -732,6 +732,9 @@ app.include_router(email_studio_router, prefix="/email")
 # The settings the panel manages through the settings registry (app/core/settings_registry.py)
 from app.api.managed_settings_router import router as managed_settings_router
 app.include_router(managed_settings_router)
+# What the audit log records of personal data (Settings -> Activity and records).
+from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
+app.include_router(recording_levels_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -3819,6 +3822,16 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         if isinstance(_key, str) and _key.lower() in _refused:
             raise HTTPException(status_code=400,
                                 detail=f"{_key.lower()} is not saved here: it is a managed setting")
+
+    # The recording levels keep a table of their own and are saved in Settings -> Activity and records, with
+    # the password every time (app/api/recording_levels_router.py): the general settings never hold a copy,
+    # which would look as if it had changed what the audit log records.
+    from app.core.audit_privacy import SETTINGS_KEYS_REFUSED as _levels_refused
+    for _key in payload:
+        if isinstance(_key, str) and _key.lower() in _levels_refused:
+            raise HTTPException(status_code=400,
+                                detail=f"{_key.lower()} is not saved here: the recording levels are saved in "
+                                       "Settings, Activity and records")
 
     # Deployment-managed / server-computed rate-limit fields are READ-ONLY: the deployment value comes
     # from the environment and the API must never write it (a client cannot edit it via a payload key).

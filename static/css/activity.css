@@ -683,3 +683,16 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     .act-progress::before { animation: none; width: 100%; }
     .act-col, .act-fp-disclose .icon, .act-d-raw-chev { transition: none; }
 }
+
+/* Settings -> Activity and records: the recording levels (static/js/settings-records.js). */
+.recording-choices { display: flex; flex-wrap: wrap; gap: .25rem 1rem; }
+.recording-choice { display: inline-flex; align-items: baseline; gap: .25rem; cursor: pointer; }
+.recording-choice.is-disabled { opacity: .6; cursor: not-allowed; }
+.recording-env-line { flex-basis: 100%; }
+.recording-history { margin: 0; padding-left: 1.25rem; }
+.recording-history-item { margin-bottom: .5rem; }
+@media (max-width: 640px) {
+    #recording-levels-table thead { display: none; }
+    #recording-levels-table tr { display: block; padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); }
+    #recording-levels-table th, #recording-levels-table td { display: block; border: 0; padding: .125rem 0; }
+}

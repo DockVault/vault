@@ -99,6 +99,9 @@ LOCK_GROUP = "audit_levels"
 SERVER_CONFIGURATION = "server configuration"
 # The action of the audit row each new version writes.
 CHANGED_ACTION = "audit_privacy_changed"
+# Keys PUT /settings refuses: the levels are never kept in the general settings.
+SETTINGS_KEYS_REFUSED = frozenset({"recording_levels", "audit_levels", "audit_privacy", "audit_privacy_policy",
+                                   *(name.lower() for name in ENV_NAMES.values())})
 
 # A shortened address keeps this many leading bits: the /24 an IPv4 address is in, the /48 of an IPv6 one.
 SHORT_PREFIX = {4: 24, 6: 48}

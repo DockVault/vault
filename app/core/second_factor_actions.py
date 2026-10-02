@@ -65,6 +65,9 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # factor the account has enrolled, so an install with one administrator and no second factor can still
     # manage it.
     "admin.retention.write": ("Change how long records are kept", "password_always"),
+    # What the audit log records of personal data (app/api/recording_levels_router.py): the same policy, since
+    # the levels decide what is kept about every user.
+    "admin.audit_privacy.write": ("Change what the audit log records", "password_always"),
 }
 
 
