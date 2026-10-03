@@ -29,8 +29,9 @@
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260929a">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
     <!-- Auth boot: picks the first-paint screen from whether a session token is
-         cached, so an expired/logged-out load never flashes the app shell. See
-         static/js/auth-boot.js. -->
+         cached, so an expired/logged-out load never flashes the app shell, and stops
+         the browser sending any form itself before app.js has bound the handlers. It
+         must stay in <head>, before the first form. See static/js/auth-boot.js. -->
     <script src="/static/js/auth-boot.js?v=20260822a"></script>
     <!-- Branding boot: applies effective /branding (name, logo, favicon, theme colours)
          to the shell, pre-paint after the skin boot. See static/js/brand.js. -->
@@ -110,7 +111,7 @@
                     </div>
                     <p class="text-secondary mb-lg" data-brand-tagline>Secure File Transfer Platform</p>
                     
-                    <form id="login-form">
+                    <form id="login-form" method="post">
                         <div class="form-group">
                             <label for="username" id="username-label">Username</label>
                             <input type="text" id="username" name="username" class="form-control" required autocomplete="username">
@@ -134,7 +135,7 @@
                     <div id="forgot-toggle" class="mt-sm" style="display: none;">
                         <a href="#" id="show-forgot-link" role="button" style="font-size: 0.9em;">Forgot your password?</a>
                     </div>
-                    <form id="forgot-form" style="display: none;">
+                    <form id="forgot-form" method="post" style="display: none;">
                         <div class="form-group">
                             <label for="forgot-identifier">Username or email</label>
                             <input type="text" id="forgot-identifier" class="form-control" autocomplete="username">
@@ -153,7 +154,7 @@
                         <a href="#" id="show-signup-link" role="button">Create an account</a>
                     </div>
 
-                    <form id="signup-form" style="display: none;">
+                    <form id="signup-form" method="post" style="display: none;">
                         <div class="form-group">
                             <label for="signup-username" id="signup-username-label">Username</label>
                             <input type="text" id="signup-username" name="username" class="form-control" autocomplete="username" minlength="3" maxlength="50">
@@ -2992,7 +2993,7 @@
                             <h3>Create New Vault</h3>
                             <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                         </div>
-                        <form id="create-vault-form">
+                        <form id="create-vault-form" method="post">
                             <div class="modal-body">
                                 <div class="form-group">
                                     <label for="vault-name" id="vault-name-label">Vault Name</label>
@@ -3109,7 +3110,7 @@
                             <h3>Generate Temporary Credentials</h3>
                             <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                         </div>
-                        <form id="generate-temp-creds-form">
+                        <form id="generate-temp-creds-form" method="post">
                             <div class="modal-body">
                                 <p class="text-secondary mb-md">
                                     Issue a temporary account credential — usable on the web, the API and SFTP. Choose how long it stays valid before it is deactivated.
@@ -3246,7 +3247,7 @@
                             <h3>Create New User</h3>
                             <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                         </div>
-                        <form id="create-user-form">
+                        <form id="create-user-form" method="post">
                             <div class="modal-body">
                                 <div class="form-group">
                                     <label for="new-username">Username</label>
@@ -3285,7 +3286,7 @@
                             <h3>Invite a user</h3>
                             <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                         </div>
-                        <form id="invite-user-form">
+                        <form id="invite-user-form" method="post">
                             <div class="modal-body" id="invite-user-fields">
                                 <div class="form-group">
                                     <label for="invite-username">Username</label>
@@ -3334,7 +3335,7 @@
                             <h3>Edit User</h3>
                             <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                         </div>
-                        <form id="edit-user-form">
+                        <form id="edit-user-form" method="post">
                             <div class="modal-body">
                                 <input type="hidden" id="edit-user-id">
                                 <div class="form-group">
@@ -3385,7 +3386,7 @@
                             <h3>Change User Password</h3>
                             <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                         </div>
-                        <form id="change-password-form">
+                        <form id="change-password-form" method="post">
                             <div class="modal-body">
                                 <input type="hidden" id="change-password-user-id">
                                 <div class="form-group">
@@ -3439,7 +3440,7 @@
                                 </div>
                             </div>
 
-                            <form id="us-password-form" class="us-section us-credential">
+                            <form id="us-password-form" method="post" class="us-section us-credential">
                                 <h4 class="us-section-title">Change password</h4>
                                 <div class="form-group">
                                     <label for="us-cur-pw">Current password</label>
@@ -3456,7 +3457,7 @@
                                 <button type="submit" class="btn btn-primary">Update password</button>
                             </form>
 
-                            <form id="us-email-form" class="us-section us-credential">
+                            <form id="us-email-form" method="post" class="us-section us-credential">
                                 <h4 class="us-section-title">Change email</h4>
                                 <div class="form-group">
                                     <label for="us-new-email">New email</label>
@@ -3532,7 +3533,7 @@
                         <button class="close-modal-btn" data-modal="edit-vault-info-modal">×</button>
                     </div>
                     <div class="modal-body">
-                        <form id="edit-vault-info-form">
+                        <form id="edit-vault-info-form" method="post">
                             <div class="form-group">
                                 <label for="edit-vault-name">Vault Name *</label>
                                 <input type="text" id="edit-vault-name" class="form-control" required minlength="1" maxlength="255">
@@ -3558,7 +3559,7 @@
                         <button class="close-modal-btn" data-modal="change-vault-password-modal">×</button>
                     </div>
                     <div class="modal-body">
-                        <form id="change-vault-password-form">
+                        <form id="change-vault-password-form" method="post">
                             <div class="form-group">
                                 <label for="current-vault-password">Current Password</label>
                                 <input type="password" id="current-vault-password" class="form-control" 
@@ -3591,7 +3592,7 @@
                         <button class="close-modal-btn modal-close" data-modal="set-expiry-modal" aria-label="Close">×</button>
                     </div>
                     <div class="modal-body">
-                        <form id="set-expiry-form">
+                        <form id="set-expiry-form" method="post">
                             <div class="form-group">
                                 <label for="expire-files-value">Expire files after</label>
                                 <div style="display: flex; gap: 8px;">
@@ -3633,7 +3634,7 @@
                         <button class="close-modal-btn" data-modal="add-permission-modal">×</button>
                     </div>
                     <div class="modal-body">
-                        <form id="add-permission-form">
+                        <form id="add-permission-form" method="post">
                             <div class="form-group">
                                 <label for="permission-user-select">Select User *</label>
                                 <select id="permission-user-select" class="form-control" required>
@@ -3702,7 +3703,7 @@
                         <h3 id="group-modal-title"><svg class="icon"><use href="#i-users"/></svg> New Group</h3>
                         <button class="close-modal-btn modal-close" aria-label="Close">×</button>
                     </div>
-                    <form id="group-form">
+                    <form id="group-form" method="post">
                         <div class="modal-body">
                             <input type="hidden" id="group-id">
                             <input type="hidden" id="group-color" value="">
@@ -3937,7 +3938,7 @@
             <!-- Activity: save the current search -->
             <div id="act-save-modal" class="modal act-activity-dialog" role="dialog" aria-modal="true" aria-labelledby="act-save-title">
                 <div class="modal-content act-save-dialog">
-                    <form id="act-save-form" novalidate>
+                    <form id="act-save-form" method="post" novalidate>
                         <div class="modal-header">
                             <h3 id="act-save-title">Save search</h3>
                             <button type="button" class="modal-close act-dlg-close" aria-label="Close">&times;</button>
