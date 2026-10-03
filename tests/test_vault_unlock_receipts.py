@@ -105,6 +105,16 @@ def test_a_changed_expiry_or_mac_or_prefix_is_refused():
     assert not _verify(f"{prefix}.{stamp}.{flipped}")
 
 
+def test_a_receipt_that_expires_more_than_its_lifetime_ahead_is_refused():
+    # Issued at the moment it is checked, it serves; issued a second later (a clock it could not have come from),
+    # its expiry lies more than the lifetime ahead and it does not.
+    checked_at = NOW + timedelta(minutes=1)
+    receipt, _ = _issue(now=checked_at)
+    assert _verify(receipt, now=checked_at)
+    receipt, _ = _issue(now=checked_at + timedelta(seconds=1))
+    assert not _verify(receipt, now=checked_at)
+
+
 def test_a_receipt_needs_a_session():
     with pytest.raises(ValueError):
         _issue(session_hash="")

@@ -174,6 +174,18 @@ def test_a_level_above_the_limit_is_refused_and_names_the_env_line(db, step_up, 
     assert step_up == [] and _versions(db) == [1]
 
 
+@pytest.mark.parametrize("field,limit,kind,asked,line", [
+    ("audit_max_ip", "shortened", "ip", "full", "AUDIT_MAX_IP=full"),
+    ("audit_max_signin_names", "none", "signin_names", "fingerprint", "AUDIT_MAX_SIGNIN_NAMES=fingerprint"),
+])
+def test_a_level_one_step_above_the_limit_is_refused_too(db, step_up, monkeypatch, field, limit, kind, asked, line):
+    monkeypatch.setattr(settings, field, limit)
+    user = _admin(db)
+    with refused(400, f"add {line} to .env"):
+        _put(db, user, **{kind: asked})
+    assert step_up == [] and _versions(db) == [1]
+
+
 def test_locked_levels_are_refused(db, step_up, monkeypatch):
     monkeypatch.setattr(settings, "settings_locked_keys", "audit_levels")
     user = _admin(db)
@@ -290,7 +302,12 @@ def test_while_locked_only_the_limit_may_be_chosen(db, monkeypatch):
         assert [c["level"] for c in kind["choices"] if c["allowed"]] == [kind["limit"]]
 
 
-@pytest.mark.parametrize("key", sorted(ap.SETTINGS_KEYS_REFUSED))
+# Spelled out here, so that a name dropped from the refused set is noticed.
+REFUSED = ("recording_levels", "audit_levels", "audit_privacy", "audit_privacy_policy", "audit_max_names",
+           "audit_max_signin_names", "audit_max_emails", "audit_max_ip", "audit_max_user_agent")
+
+
+@pytest.mark.parametrize("key", sorted(set(REFUSED) | ap.SETTINGS_KEYS_REFUSED))
 def test_put_settings_refuses_the_levels_whatever_the_case(key):
     for spelled in (key, key.upper()):
         with refused(400, "the recording levels are saved in Settings, Activity and records"):
