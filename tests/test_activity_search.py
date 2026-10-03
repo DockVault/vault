@@ -247,6 +247,31 @@ def test_the_check_matches_a_name_as_the_search_does(factory):
         db.close()
 
 
+def test_an_exact_filter_that_is_only_part_of_a_name_held_in_full_is_a_typed_name(factory):
+    # "lovelace" is part of an account's name, so a contains search for it is kept as typed; as an exact filter
+    # it names nobody the log holds, so the levels decide.
+    _account(factory, "ada.lovelace")
+    assert _saved(factory, {"user": "lovelace"}, "fingerprint") == {"user": "lovelace"}
+    kept = _saved(factory, {"user": "lovelace", "user_match": "exact"}, "fingerprint")
+    assert kept == {"user": fp.fingerprint(fp.SIGNIN, "lovelace"), "user_match": "exact"}
+    with pytest.raises(saved.InvalidSearch):
+        _saved(factory, {"user": "lovelace", "user_match": "exact"}, "none")
+
+
+def test_while_the_levels_cannot_be_read_a_typed_name_is_kept_as_its_fingerprint(factory, monkeypatch):
+    def unreadable():
+        raise ap.PolicyUnavailable("the policies table cannot be read")
+
+    ap.use(ap.Policy(9, dict(ap.POLICY_ONE)))           # typed names in full, were the levels readable
+    monkeypatch.setattr(ap, "current", unreadable)
+    db = factory()
+    try:
+        kept = saved.clean_filters({"user": "eve.smith"}, saved.held_in_full(db))
+    finally:
+        db.close()
+    assert kept == {"user": fp.fingerprint(fp.SIGNIN, "eve.smith")}
+
+
 def test_while_no_typed_name_is_recorded_a_saved_search_cannot_hold_one(factory):
     _account(factory, "ada.lovelace")
     _write(factory, "eve.smith", "fingerprint", "kept_fp")
