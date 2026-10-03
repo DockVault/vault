@@ -100,7 +100,7 @@ Visits to a link and uploads through one are also in the audit log.
 | `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key), and the ids of the administrator who asked, of the administrators that administrator's grant descends from, and of those who had changed the account in the 14 days before; and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
 | `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | Who may approve a held change: neither the administrator who asked nor the approver may have made the other one, directly or through administrators they made, and the approver must have been one for 14 days before the request. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
 | `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username; and to every other administrator, that an account became an administrator and who made it one. | Telling people what happened. | Until the person deletes it. | The person; deleted with the account. |
-| `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
+| `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. **Changed in 0.34.0:** the person filter keeps a name the audit log holds in full (an account's username, or a name recorded in full under earlier levels) as typed; any other name, one typed at a failed sign-in, is kept as the recording levels keep those: in full, as its fingerprint, or, at "not recorded", not at all (such a search cannot be saved). The free text and addresses are kept as typed. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
 | `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
@@ -153,17 +153,24 @@ Each row of `audit_logs` holds:
   and of an error only its type is. **New in 0.34.0:** a detail whose key the application does not
   classify is not stored (its key is noted in `recorded`, and an alert is raised);
 - an error message for a failure;
-- **New in 0.34.0: the recording levels.** What a row keeps of the name typed at a failed sign-in, of email
-  addresses, of the address and of the user agent follows the levels an administrator chooses, within the
+- **New in 0.34.0: the recording levels.** What a row keeps of vault, file and folder names, of the name typed
+  at a failed sign-in, of email addresses, of the address and of the user agent follows the levels an
+  administrator chooses, within the
   limits `.env` sets (`AUDIT_MAX_NAMES`, `AUDIT_MAX_SIGNIN_NAMES`, `AUDIT_MAX_EMAILS`, `AUDIT_MAX_IP`,
   `AUDIT_MAX_USER_AGENT`). Version 1, the default, records what earlier releases did. A value recorded at
   a lower level is either not stored or stored in another form in `recorded` (a shortened address keeps
   the /24 or /48 it is in; a name at the fingerprint level keeps a keyed fingerprint, under a key of its
-  own for each vault's names); the row's own columns and details hold only values recorded in full. A
-  fingerprint is made with `AUDIT_FINGERPRINT_KEY` (or a key derived from `ENCRYPTION_KEY`): it hides a
+  own for each vault's names); the row's own columns and details hold only values recorded in full. A row
+  never keeps a vault, file or folder name in plain text: at the full level a name is kept sealed in
+  `recorded`, encrypted under a key derived for its vault and its row, and is opened only for administrators
+  who can read the vault: the vault's own name always; a file's or a folder's name only in a vault that is not
+  zero-knowledge, and in a password-protected vault only once its password is given on the Activity page.
+  A fingerprint is made with `AUDIT_FINGERPRINT_KEY` (or a key derived from `ENCRYPTION_KEY`): it hides a
   name from someone who reads the database without `.env`, but anyone who holds `.env` (it is in the
-  backups) can test guesses, and finds a short or common name quickly. Name fingerprints are shown and
-  exported only to administrators who can read the vault.
+  backups) can test guesses, and finds a short or common name quickly. Any administrator can also test a
+  guess of a name typed at a failed sign-in, by searching the Activity page for it: the search fingerprints
+  what is typed and finds the rows that kept the same fingerprint. Name fingerprints, and names opened from
+  their seals, are shown and exported only to administrators who can read the vault.
   `privacy_version` says which version of the levels a row was recorded under (none: an earlier release;
   -1: recorded without its personal values because deciding failed, with an alert). Changing the levels
   never rewrites older rows;

@@ -83,6 +83,10 @@ STORES = (
           lambda: "An hour.", table="rate_limit_records"),
     Store("receiver_upload_sessions", "The address of someone uploading through an upload link.",
           lambda: "For the upload's life, then with the upload's own records.", table="receiver_upload_sessions"),
+    Store("activity_saved_searches", "Searches administrators saved on the Activity page: the account, address or "
+          "text they search for. A name typed at a failed sign-in is kept as the recording levels keep it.",
+          lambda: "Until the administrator deletes the search, or their account is deleted.",
+          table="activity_saved_searches"),
     Store("notifications", "Your notifications, including one telling you of a sign-in or a change to your account "
           "from an address.", lambda: "Until you dismiss them.", table="notifications"),
     Store("cache", "Counts of requests and failed sign-ins by address and by account, in the cache.",
@@ -124,7 +128,8 @@ WHO_CAN_SEE = (
 )
 FINGERPRINT_CAVEAT = ("A fingerprint hides a name from someone who reads the database without the server's "
                       "configuration file; anyone who holds that file (it is in the operator's backups) can test "
-                      "guesses, and finds a short or common name quickly.")
+                      "guesses, and finds a short or common name quickly. Any administrator can also test a guess "
+                      "of a name typed at a failed sign-in, by searching the Activity page for it.")
 LEVEL_WORDS = {
     ap.NONE: "Not recorded",
     ap.FINGERPRINT: "Recorded as a fingerprint (a keyed code, not the value)",

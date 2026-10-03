@@ -16,7 +16,8 @@ under another key say so instead of silently failing to match.
 
 A fingerprint protects a value from someone who reads the database without the key. Anyone who holds .env
 (it is in the backups dockvault.py makes) holds the key, and can test guesses: a short or common value is
-found quickly.
+found quickly. Any administrator can test a guess of a name typed at a failed sign-in too: the Activity page's
+search fingerprints what is typed (app/services/activity_events.py).
 """
 from __future__ import annotations
 

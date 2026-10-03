@@ -75,6 +75,7 @@ def test_the_notice_states_the_levels_in_force_and_no_earlier_version(factory, m
     assert out["version"] == 4
     assert "versions" not in out and "history" not in out
     assert "fingerprint" in out["fingerprints"] and "guesses" in out["fingerprints"]
+    assert "Any administrator can also test a guess of a name typed at a failed sign-in" in out["fingerprints"]
     assert all(set(item) == {"key", "label", "level", "words"} for item in out["levels"])
     ap.use(ap.Policy(5, dict(ap.POLICY_ONE)))
     assert rn.build_notice(db)["fingerprints"] is None
@@ -134,8 +135,10 @@ def test_every_table_with_an_address_column_is_a_listed_store_or_says_why_not():
     assert rn.unlisted_stores(Base.metadata) == []
     for store in rn.STORES:
         assert store.kept and store.what
-    assert {"audit_logs", "security_records", "active_sessions", "backups", "container_output"} <= {
-        s.key for s in rn.STORES}
+    assert {"audit_logs", "security_records", "active_sessions", "backups", "container_output",
+            "activity_saved_searches"} <= {s.key for s in rn.STORES}
+    saved = next(s for s in rn.STORES if s.key == "activity_saved_searches")
+    assert "typed at a failed sign-in" in saved.what and not saved.follows_levels
 
 
 def test_a_new_table_with_an_address_is_caught_until_it_is_listed():

@@ -115,7 +115,8 @@
             parts.push(`Levels that record less than earlier releases cannot be saved yet: ${S.data.sftp.explain}`);
         }
         parts.push('A fingerprint hides a name from someone who reads the database without the .env file; ' +
-            'anyone who holds that file (it is in the backups) can test guesses of a short or common name.');
+            'anyone who holds that file (it is in the backups) can test guesses of a short or common name. ' +
+            'Any administrator can also test a guess of a name typed at a failed sign-in, by searching for it.');
         note.textContent = parts.join(' ');
         note.hidden = false;
     }
