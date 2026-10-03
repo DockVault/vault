@@ -6,6 +6,7 @@ operation and mode bytes, the sealed key's header and bounds, the challenge's li
 refusal table, the audit actions and the switch -- so that changing one of them in the code without the
 document fails here.
 """
+import ast
 import re
 from pathlib import Path
 
@@ -172,3 +173,12 @@ def test_both_documents_name_every_audit_entry_a_key_change_before_the_upgrade_l
     create = server[server.index("zk_hierarchical = (vault_create.key_wrapping_mode == 'hierarchical')"):]
     create = create[:create.index("audit_logger.log_vault_created(")]
     assert "\n    if vault_type == 'zero_knowledge':" in create and not re.search(r"\n +return\b", create)
+    # ... as a statement of its own in the create's body, so no condition can decide whether it runs.
+    calls = [(func, node) for func in ast.walk(ast.parse(server))
+             if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(func)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "log_vault_created"]
+    assert len({id(node) for _, node in calls}) == 1, "the vault_created call is not the only one"
+    func, call = calls[-1]
+    assert any(isinstance(stmt, ast.Expr) and stmt.value is call for stmt in func.body), \
+        "the create's vault_created entry is no longer a plain statement of the create"
