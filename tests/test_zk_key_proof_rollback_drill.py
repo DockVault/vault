@@ -8,12 +8,14 @@ This walks one deployment through exactly that:
   1. on the code under test: create zero-knowledge vaults (each gets its first epoch's proof key), upload a
      file, rotate one vault (its new epoch gets a proof key), and set up the key check of a vault whose
      epoch has none;
-  2. on the previous release: the deployment starts, every file reads, a rotation works (the older server
+  2. on a previous release: the deployment starts, every file reads, a rotation works (the older server
      answers the challenge route with its plain 404, so the request goes without a proof), and deleting a
      vault still removes its proof rows, because their delete rule lives in the database;
   3. back on the code under test: the epoch rotated while rolled back has no proof key and says so, a
      change that needs one is refused until it is set up, it is set up on demand, the change then goes
      through, requests without a proof are refused again, and every file still reads.
+
+Steps 2 and 3 run once for each release in ROLLBACK_TAGS, in turn, on the same deployment.
 
 Owns its stack end to end, with the isolation of tests/_throwaway_stack.py: its own compose project,
 volume prefix, container names and ports, an explicit environment, and teardown in `finally` that
@@ -43,9 +45,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.docker, pytest.mark.slow, pyt
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE = "ghcr.io/dockvault/vault:%s"
-# The releases this one can be rolled back to that the drill checks: the newest published release before
-# key proofs. A later maintenance release of the same line joins here once it is published.
-ROLLBACK_TAGS = ("v0.33.0",)
+# The releases this one can be rolled back to that the drill checks: the published releases of the line
+# before key proofs. A later maintenance release of the same line joins here once it is published.
+ROLLBACK_TAGS = ("v0.33.0", "v0.33.1")
 PAYLOAD = bytes((i * 17 + 3) % 256 for i in range(4096))
 
 
@@ -169,11 +171,11 @@ def _vault(client):
     return r.json()["id"]
 
 
-def _rotate(client, vid, frm, owner_id):
+def _rotate(client, vid, frm, *member_ids):
     return post_zk(client, f"/ecc/vaults/{vid}/rekey", json={
         "from_version": frm, "to_version": frm + 1,
-        "member_keys": [{"user_id": owner_id, "wrapped_dek": ZK_WRAPPED_DEK_STUB,
-                         "ephemeral_public_key": ZK_EPHEMERAL_STUB}]})
+        "member_keys": [{"user_id": user_id, "wrapped_dek": ZK_WRAPPED_DEK_STUB,
+                         "ephemeral_public_key": ZK_EPHEMERAL_STUB} for user_id in member_ids]})
 
 
 def _share(client, vid, user_id):
@@ -188,7 +190,7 @@ def test_a_rollback_strands_nothing_and_the_proofs_take_up_again(stack):
     ensure_ecc_keypair(admin)
     owner_id = harness.client_user_id(admin)
     people = []
-    for _ in range(2):
+    for _ in range(2 * len(ROLLBACK_TAGS)):
         made = admin.create_user(username=f"zkrb_{uuid.uuid4().hex[:8]}")
         client = ApiClient(base_url=stack["base"])
         client.login(made["_username"], made["_password"])
@@ -196,7 +198,8 @@ def test_a_rollback_strands_nothing_and_the_proofs_take_up_again(stack):
         people.append(made["id"])
 
     # --- 1. On the code under test ---
-    rotated, legacy, doomed = _vault(admin), _vault(admin), _vault(admin)
+    rotated, legacy = _vault(admin), _vault(admin)
+    doomed = {tag: _vault(admin) for tag in ROLLBACK_TAGS}
     dek = secrets.token_bytes(32)
     file_id = zk_chunked_upload(admin, rotated, "drill.bin", PAYLOAD, dek)
     assert _rotate(admin, rotated, 1, owner_id).status_code == 200
@@ -205,7 +208,8 @@ def test_a_rollback_strands_nothing_and_the_proofs_take_up_again(stack):
     assert put_zk(admin, f"/ecc/vaults/{legacy}/key-proof", json=dict({"dek_epoch": 1}, **material)).status_code == 200
     rows = lambda vid: psql(f"SELECT coalesce(string_agg(dek_epoch || ':' || source, ',' ORDER BY dek_epoch), '') "
                             f"FROM vault_key_proofs WHERE vault_id = '{vid}'")
-    assert (rows(rotated), rows(legacy), rows(doomed)) == ("1:create,2:rotate", "1:bootstrap", "1:create")
+    assert (rows(rotated), rows(legacy)) == ("1:create,2:rotate", "1:bootstrap")
+    assert [rows(doomed[tag]) for tag in ROLLBACK_TAGS] == ["1:create"] * len(ROLLBACK_TAGS)
 
     def reads(where):
         got = admin.get(f"/vaults/{rotated}/files/{file_id}/download")
@@ -213,38 +217,46 @@ def test_a_rollback_strands_nothing_and_the_proofs_take_up_again(stack):
 
     reads("the uploads")
 
-    # --- 2. Rolled back ---
-    for tag in ROLLBACK_TAGS:
+    epoch, expected, members = 2, "1:create,2:rotate", [owner_id]
+    for round_number, tag in enumerate(ROLLBACK_TAGS):
+        sharer, legacy_sharer = people[2 * round_number], people[2 * round_number + 1]
+
+        # --- 2. Rolled back ---
         stack["switch_to"](IMAGE % tag, f"the rollback to {tag}")
         admin = _admin(stack)
         reads(f"the rollback to {tag}")
-        assert admin.get(f"/ecc/vaults/{rotated}/keys").json()["current_dek_version"] == 2
+        assert admin.get(f"/ecc/vaults/{rotated}/keys").json()["current_dek_version"] == epoch
         # An older server has no challenge route: the request goes without a proof and is taken.
-        r = _rotate(admin, rotated, 2, owner_id)
+        r = _rotate(admin, rotated, epoch, *members)
         assert r.zk_challenge_status == 404 and r.status_code == 200, r.text
+        epoch += 1
         # Its proof rows are gone with the vault, by the database's own delete rule.
-        assert admin.post(f"/vaults/{doomed}/delete").status_code == 200
-        assert rows(doomed) == ""
-        assert rows(rotated) == "1:create,2:rotate", "an older release changed proof rows it knows nothing of"
+        assert admin.post(f"/vaults/{doomed[tag]}/delete").status_code == 200
+        assert rows(doomed[tag]) == ""
+        assert rows(rotated) == expected, "an older release changed proof rows it knows nothing of"
 
-    # --- 3. Forward again ---
-    stack["switch_to"](stack["candidate"], "the return to the code under test")
-    admin = _admin(stack)
-    reads("the return to the code under test")
-    keys = admin.get(f"/ecc/vaults/{rotated}/keys").json()
-    assert keys["current_dek_version"] == 3 and keys["key_proof"] == {"state": "missing"}, keys
-    # A change that proves the current key needs the epoch set up first...
-    r = _share(admin, rotated, people[0])
-    assert r.status_code == 428 and r.json()["reason"] == "zk-key-proof-setup-required", r.text
-    _, material = harness.direct_proof_material(rotated, 3)
-    assert put_zk(admin, f"/ecc/vaults/{rotated}/key-proof", json=dict({"dek_epoch": 3}, **material)).status_code == 200
-    assert _share(admin, rotated, people[0]).status_code == 200
-    # ... the vault set up before the rollback still proves with its key ...
-    assert _share(admin, legacy, people[1]).status_code == 200
-    # ... and a request without a proof is refused again.
-    prepared = harness.prepare_zk(admin, f"/ecc/vaults/{legacy}/members", {
-        "user_id": people[0], "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB})
-    r = harness.send_prepared(admin, f"/ecc/vaults/{legacy}/members", prepared, header=None)
-    assert r.status_code == 428 and r.json()["reason"] == "zk-key-proof-required", r.text
-    assert rows(rotated) == "1:create,2:rotate,3:bootstrap"
+        # --- 3. Forward again ---
+        stack["switch_to"](stack["candidate"], f"the return from {tag} to the code under test")
+        admin = _admin(stack)
+        reads(f"the return from {tag} to the code under test")
+        keys = admin.get(f"/ecc/vaults/{rotated}/keys").json()
+        assert keys["current_dek_version"] == epoch and keys["key_proof"] == {"state": "missing"}, keys
+        # A change that proves the current key needs the epoch set up first...
+        r = _share(admin, rotated, sharer)
+        assert r.status_code == 428 and r.json()["reason"] == "zk-key-proof-setup-required", r.text
+        _, material = harness.direct_proof_material(rotated, epoch)
+        assert put_zk(admin, f"/ecc/vaults/{rotated}/key-proof",
+                      json=dict({"dek_epoch": epoch}, **material)).status_code == 200
+        assert _share(admin, rotated, sharer).status_code == 200
+        members.append(sharer)
+        # ... the vault set up before the rollback still proves with its key ...
+        assert _share(admin, legacy, legacy_sharer).status_code == 200
+        # ... and a request without a proof is refused again.
+        prepared = harness.prepare_zk(admin, f"/ecc/vaults/{legacy}/members", {
+            "user_id": sharer, "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB})
+        r = harness.send_prepared(admin, f"/ecc/vaults/{legacy}/members", prepared, header=None)
+        assert r.status_code == 428 and r.json()["reason"] == "zk-key-proof-required", r.text
+        expected += f",{epoch}:bootstrap"
+        assert rows(rotated) == expected
+    assert epoch == 2 + len(ROLLBACK_TAGS)
     reads("the whole walk")
