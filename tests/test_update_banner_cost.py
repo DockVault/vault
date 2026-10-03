@@ -28,6 +28,10 @@ def _fresh_module():
         "update_check_under_test", ROOT / "app" / "services" / "update_check.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # The status also reads main's copy of the matrix over the network. Nothing here may depend on
+    # what main holds today (its lines change what an install is offered), so that read answers
+    # nothing unless a test sets its own.
+    module.fetch_main_matrix = lambda opener=None: None
     return module
 
 
