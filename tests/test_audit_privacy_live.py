@@ -4,8 +4,9 @@ The policies table starts at version 1 and refuses to change or lose a version. 
 failed sign-in is recorded in full, stamped with the version. A version stored in the table (as the panel
 stores one) is read by the web app and the SFTP server within seconds: at a shortened address and no typed
 names, a failed web sign-in and a failed SFTP password keep only the network the address is in, and the
-Events filters find such a row by its address and by a block. The table is set back afterwards with a newer
-version. test_audit_privacy.py covers the rules offline.
+Events filters find such a row by its address and by a block. A failed sign-in for an account names the
+account at every level of typed names, on the web and over SFTP; only a name that is no account follows the
+level. The table is set back afterwards with a newer version. test_audit_privacy.py covers the rules offline.
 """
 import os
 import subprocess
@@ -98,7 +99,8 @@ def test_a_shortened_address_and_no_typed_name_on_web_and_sftp(admin, temp_user,
         f"WHERE action = 'login_failure' AND channel = 'sftp' AND timestamp >= '{started}' "
         f"AND privacy_version = {version}"))
     s_username, s_address, s_network, s_stamped = sftp.splitlines()[0].split("|")
-    assert (s_username, s_address, int(s_stamped)) == ("", "", version)
+    # A wrong password for an account: the account is named whatever the level of typed names.
+    assert (s_username, s_address, int(s_stamped)) == (temp_user["_username"], "", version)
     assert s_network.endswith("/24") or s_network.endswith("/48"), s_network
 
     # The Events filters find the web row by its full address, and by a block wider than the network.
@@ -133,3 +135,47 @@ def test_a_row_whose_details_come_from_a_helper_keeps_them(admin):
     for key in ("scanned_dirs", "dirs_removed", "bytes_reclaimed", "rows_pruned", "active_sessions_kept"):
         assert f'"{key}"' in details, (key, details)
     assert "dropped" not in recorded
+
+
+def _sftp_password_fails(username):
+    t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+    t.banner_timeout = 30
+    try:
+        with pytest.raises(paramiko.AuthenticationException):
+            t.connect(username=username, password="definitely-not-the-password")
+    finally:
+        t.close()
+
+
+@pytest.mark.parametrize("level", ["full", "fingerprint", "none"])
+def test_a_failed_sign_in_for_an_account_names_it_on_web_and_sftp_at_every_level(temp_user, levels_restored, level):
+    version = _store(dict(levels_restored, signin_names=level))
+    reset_sign_in_throttle()
+    account, typed = temp_user["_username"], unique("ghost")
+    agent = f"recording-levels-account/{uuid.uuid4().hex}"
+    started = psql("SELECT now() AT TIME ZONE 'utc'")
+    for name in (account, typed):
+        r = requests.post(f"{BASE_URL}/auth/login", json={"username": name, "password": "wrong-password"},
+                          headers={"User-Agent": agent}, timeout=30)
+        assert r.status_code in (401, 429), r.text[:200]
+        _sftp_password_fails(name)
+
+    def rows():
+        out = psql("SELECT channel, coalesce(username, ''), user_id IS NULL, coalesce(recorded->>'signin_name', '') "
+                   f"FROM audit_logs WHERE action = 'login_failure' AND privacy_version = {version} "
+                   f"AND timestamp >= '{started}' AND (user_agent = '{agent}' OR channel = 'sftp') ORDER BY timestamp")
+        found = [line.split("|") for line in out.splitlines() if line]
+        return found if len(found) >= 4 else None
+
+    found = _wait_for(rows)
+    assert found and len(found) == 4, found
+    by_channel = {}
+    for channel, username, no_user_id, signin_name in found:
+        by_channel.setdefault(channel, []).append((username, no_user_id, signin_name))
+    for channel in ("web", "sftp"):
+        (a_name, a_none, a_fp), (t_name, t_none, t_fp) = by_channel[channel]
+        assert (a_name, a_none, a_fp) == (account, "t", ""), channel
+        assert t_name == (typed if level == "full" else ""), channel
+        assert t_fp.startswith("fp1:") if level == "fingerprint" else t_fp == "", channel
+        assert typed not in t_fp
+    reset_sign_in_throttle()

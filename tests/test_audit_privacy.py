@@ -422,6 +422,84 @@ def test_an_accounts_own_username_is_always_recorded(factory):
     assert host.username == "operator@host"
 
 
+def _failed_sign_in(factory, channel, level, typed, **kwargs):
+    """A failed sign-in written as the web app and the SFTP server write one (log_login_failure)."""
+    from app.core import request_context
+    from app.core.models import SecurityRecord
+    request_context.set_process_default_channel(channel)
+    ap.use(ap.Policy(7, _levels(signin_names=level)))
+    db = factory()
+    SecurityRecord.__table__.create(db.get_bind(), checkfirst=True)
+    try:
+        AuditLogger(db).log_login_failure(typed, "198.51.100.77", "Invalid username or password", **kwargs)
+    finally:
+        db.close()
+        request_context.set_process_default_channel(None)
+    return _stored(factory)
+
+
+def _accounts(factory, *pairs):
+    db = factory()
+    for username, email in pairs:
+        db.add(User(username=username, email=email, password_hash="x"))
+    db.commit()
+    db.close()
+
+
+@pytest.mark.parametrize("channel", ["web", "sftp"])
+@pytest.mark.parametrize("level", ["full", "fingerprint", "none"])
+def test_a_failed_sign_in_for_an_account_names_the_account_at_every_level(factory, channel, level):
+    _accounts(factory, ("ada", "ada@example.test"), ("grace", "grace@example.test"))
+    row = _failed_sign_in(factory, channel, level, "ada")
+    assert (row.username, row.user_id, row.channel, row.privacy_version) == ("ada", None, channel, 7)
+    assert "signin_name" not in (row.recorded or {})
+    # By its email address, the account's username, never the address.
+    row = _failed_sign_in(factory, channel, level, "Grace@Example.test")
+    assert row.username == "grace" and "signin_name" not in (row.recorded or {})
+    # The account the server already found (the SFTP door refusing an account its settings shut out).
+    db = factory()
+    ada = db.query(User).filter(User.username == "ada").one()
+    db.expunge(ada)
+    db.close()
+    row = _failed_sign_in(factory, channel, level, "whatever was typed", account=ada)
+    assert row.username == "ada" and "signin_name" not in (row.recorded or {})
+    # A name that is no account follows the level, and so does one that differs from an account's only in case.
+    for typed in ("nobody-here", "ADA"):
+        row = _failed_sign_in(factory, channel, level, typed)
+        assert row.username == (typed if level == "full" else None), typed
+        kept = fp.fingerprint(fp.SIGNIN, typed) if level == "fingerprint" else None
+        assert (row.recorded or {}).get("signin_name") == kept
+
+
+def test_an_address_two_accounts_share_names_neither(factory):
+    _accounts(factory, ("bob", "Bob@example.test"), ("rob", "bob@example.test"), ("ada", "ada@example.test"))
+    db = factory()
+    try:
+        assert audit_logger.account_named(db, "bob@example.test") is None
+        assert audit_logger.account_named(db, "ada@EXAMPLE.test").username == "ada"
+        assert audit_logger.account_named(db, "rob").username == "rob"
+        assert audit_logger.account_named(db, "") is None and audit_logger.account_named(db, None) is None
+        # An address-shaped username is found by its username first.
+        db.add(User(username="ada@example.test", email="other@example.test", password_hash="x"))
+        db.commit()
+        assert audit_logger.account_named(db, "ada@example.test").username == "ada@example.test"
+    finally:
+        db.close()
+
+
+def test_a_row_written_without_the_levels_keeps_an_accounts_name_and_drops_a_typed_one(factory, monkeypatch):
+    _accounts(factory, ("ada", "ada@example.test"))
+
+    def broken(stored, settings=None):
+        raise KeyError("boom")
+
+    monkeypatch.setattr(ap, "effective", broken)
+    row = _failed_sign_in(factory, "web", "full", "ada")
+    assert (row.privacy_version, row.username, row.ip_address) == (ap.FALLBACK_VERSION, "ada", None)
+    row = _failed_sign_in(factory, "sftp", "full", "nobody-here")
+    assert (row.privacy_version, row.username) == (ap.FALLBACK_VERSION, None)
+
+
 @pytest.mark.parametrize("channel", CHANNEL_NAMES)
 @pytest.mark.parametrize("level", ["full", "none"])
 def test_the_user_agent_and_email_addresses_at_each_level(factory, channel, level):

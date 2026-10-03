@@ -79,18 +79,26 @@ def test_a_save_with_the_password_writes_a_version_the_sftp_server_records_under
     # The SFTP server reads the new version and records under it.
     started = psql("SELECT now() AT TIME ZONE 'utc'")
     time.sleep(8)
-    t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-    t.banner_timeout = 30
-    try:
-        with pytest.raises(paramiko.AuthenticationException):
-            t.connect(username=temp_user["_username"], password="definitely-not-the-password")
-    finally:
-        t.close()
-    sftp = wait_for(lambda: psql(
-        "SELECT privacy_version, coalesce(ip_address, ''), recorded->>'signin_name' FROM audit_logs "
-        f"WHERE action = 'login_failure' AND channel = 'sftp' AND timestamp >= '{started}'"))
-    version, address, fingerprint = sftp.splitlines()[0].split("|")
-    assert (int(version), address) == (before + 1, "") and fingerprint.startswith("fp1:")
+    ghost = f"ghost-{uuid.uuid4().hex[:12]}"
+    for name in (ghost, temp_user["_username"]):
+        t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        t.banner_timeout = 30
+        try:
+            with pytest.raises(paramiko.AuthenticationException):
+                t.connect(username=name, password="definitely-not-the-password")
+        finally:
+            t.close()
+
+    def both():
+        out = psql("SELECT privacy_version, coalesce(ip_address, ''), coalesce(recorded->>'signin_name', ''), "
+                   "coalesce(username, '') FROM audit_logs WHERE action = 'login_failure' AND channel = 'sftp' "
+                   f"AND timestamp >= '{started}' ORDER BY timestamp")
+        return out if len(out.splitlines()) >= 2 else ""
+
+    typed, account = [line.split("|") for line in wait_for(both).splitlines()[:2]]
+    assert (int(typed[0]), typed[1], typed[3]) == (before + 1, "", "") and typed[2].startswith("fp1:")
+    # A wrong password for an account names the account, whatever the level of typed names.
+    assert (int(account[0]), account[1], account[2], account[3]) == (before + 1, "", "", temp_user["_username"])
 
 
 def test_put_settings_refuses_the_levels(admin):

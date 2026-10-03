@@ -568,9 +568,11 @@ def _host_operator() -> str:
 
 def username_is_typed(row) -> bool:
     """Whether the row's username is a name someone typed rather than an account's: a row with no account
-    names one only for a failed sign-in. The server's operator acting from the host and the server's own
-    configuration (a version of the levels the start signs) are neither."""
+    names one only for a failed sign-in, and then only when the name is no account's (a failed sign-in for an
+    account says so: AuditLogger.build_row's names_account). The server's operator acting from the host and the
+    server's own configuration (a version of the levels the start signs) are neither."""
     return (getattr(row, "user_id", None) is None and bool(getattr(row, "username", None))
+            and not getattr(row, "_names_account", False)
             and row.username not in (_host_operator(), SERVER_CONFIGURATION))
 
 
@@ -744,7 +746,7 @@ def fallback(row, raw_details, exc) -> None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        if getattr(row, "user_id", None) is None and getattr(row, "username", None) != _host_operator():
+        if username_is_typed(row):
             row.username = None
     except Exception:  # noqa: BLE001
         try:

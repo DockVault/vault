@@ -2317,7 +2317,8 @@ class SFTPServer(paramiko.ServerInterface):
                                 ActiveSession.session_token == hash_session_token(session_token)
                             ).update({"is_active": False})
                             db.commit()
-                            audit_logger.log_login_failure(username, self.client_address, deny)
+                            audit_logger.log_login_failure(username, self.client_address, deny,
+                                                           account=user)
                             return paramiko.AUTH_FAILED
 
                         self.user = user

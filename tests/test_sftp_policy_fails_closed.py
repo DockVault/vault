@@ -89,7 +89,7 @@ class _Audit:
     def __init__(self, db):
         pass
 
-    def log_login_failure(self, username, ip, reason):
+    def log_login_failure(self, username, ip, reason, *, account=None):
         _Audit.calls.append(("failure", username, reason))
 
     def log_login_success(self, user, ip, is_temporary=False):

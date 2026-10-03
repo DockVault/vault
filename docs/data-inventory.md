@@ -21,7 +21,7 @@ retention period suits your organisation, are yours to decide.
 | Holders of a temporary credential | Someone an account holder gave a temporary credential to. They act under that account; the audit log records the credential's name. |
 | Recipients of a public link (a file, folder or note) | No account. Each visit is audited with their address and browser's user agent. |
 | Senders to an upload link | No account. Their address is kept with the upload for about a day, and each upload is audited with their address and user agent. |
-| Anyone who types a name at the sign-in page | A failed sign-in is audited with the name exactly as typed, whether or not it is an account (a password typed into the username box included), with the address and, on the web, the user agent. The sign-in throttles count it under a keyed stand-in, not the name. |
+| Anyone who types a name at the sign-in page | A failed sign-in is audited with the address and, on the web, the user agent. A name that is an account's username or email address is recorded as the account's username; any other name (a password typed into the username box included) exactly as typed, or as the recording levels keep a name typed at a failed sign-in (**new in 0.34.0**). The sign-in throttles count it under a keyed stand-in, not the name. |
 | People invited by email | Their username, email address and role, from the invitation. |
 | Administrators acting on others | Their username appears in the records of the people they changed, and in the record of each administrator they made. |
 
@@ -136,8 +136,9 @@ stops, and rows not refreshed for 7 days are removed.
 
 Each row of `audit_logs` holds:
 
-- the account's id and username. For a failed sign-in with a name that is no account, the name
-  exactly as it was typed, with no account id;
+- the account's id and username. For a failed sign-in, no account id: the account's username when the
+  name typed is an account's username or **(new in 0.34.0)** email address, and otherwise the name as it
+  was typed, as the recording levels keep it;
 - for a temporary credential, its id and **(new in 0.33.0)** its name, kept after the credential is
   deleted;
 - what happened (the action), its outcome, the resource's type and id, and the time;
@@ -189,8 +190,8 @@ every administrator is told. After an upgrade from a release that deleted only w
 dashboard loaded, a positive `AUDIT_LOG_RETENTION_DAYS` first waits in the same way. The application only
 adds rows and deletes old ones; anyone with database access can change the table.
 
-Names typed at failed sign-ins appear on the Activity page (filtered as "no account") and in its
-exports. The summary charts' "most active people" leaves them out, and the page's username search
+Names typed at failed sign-ins appear on the Activity page (filtered as "no account", which also lists a
+failed sign-in for an account, as its row has no account id) and in its exports. The summary charts' "most active people" leaves them out, and the page's username search
 suggests only accounts: it does not read the log for its suggestions, whatever it is asked.
 
 ## Cache (Redis)

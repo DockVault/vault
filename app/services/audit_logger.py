@@ -34,6 +34,27 @@ def _request_address():
     return current_client_ip()
 
 
+def account_named(db, typed) -> Optional[User]:
+    """The account a name typed at a failed sign-in names, or None: the account with that username, or for an
+    email address, the one account with that address (two accounts sharing it name neither, as at sign-in).
+    The rule security_records.record follows. One query whether or not one matches, so the failure's write
+    takes no longer for a name that is an account than for one that is not."""
+    if not isinstance(typed, str) or not typed:
+        return None
+    from sqlalchemy import func, or_
+    match = [User.username == typed]
+    if "@" in typed:
+        match.append(func.lower(User.email) == typed.strip().lower())
+    try:
+        rows = db.query(User).filter(or_(*match)).limit(3).all()
+    except Exception:  # noqa: BLE001 -- the row is still written, as a typed name
+        return None
+    by_name = [u for u in rows if u.username == typed]
+    if by_name:
+        return by_name[0]
+    return rows[0] if len(rows) == 1 else None
+
+
 class AuditLogger:
     """Service for audit logging."""
     
@@ -106,6 +127,7 @@ class AuditLogger:
         error_message: Optional[str] = None,
         channel: Optional[str] = None,
         timestamp: Optional[datetime] = None,
+        names_account: bool = False,
     ) -> AuditLog:
         """The row log_action writes for these arguments, neither added to a session nor committed.
 
@@ -117,7 +139,9 @@ class AuditLogger:
         temporary credential, and the request's channel, method, route, user agent and address
         where they are known.
 
-        ``timestamp`` is the row's time, now by default, which is what log_action stores.
+        ``timestamp`` is the row's time, now by default, which is what log_action stores. ``names_account``
+        says that ``username``, given without a user, is an account's username rather than a name someone
+        typed, so the level of typed names does not apply to it (a failed sign-in for an account).
         """
         temp_credential_id = None
         temp_credential_name = None
@@ -184,6 +208,8 @@ class AuditLogger:
             details=details,
             error_message=error_message
         )
+        if names_account:
+            audit_log._names_account = True
         # Then what other modules decide about the row, in this order (app/services/audit_row_hooks.py).
         audit_row_hooks.provenance(audit_log)
         audit_row_hooks.case(audit_log)
@@ -240,18 +266,27 @@ class AuditLogger:
         self,
         username: str,
         ip_address: str,
-        reason: str
+        reason: str,
+        *,
+        account: Optional[User] = None,
     ):
         """Log failed login attempt, and its security record in the same commit (the name and address in
-        full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id."""
+        full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id.
+
+        A name that is an account's (``account``, or the account the typed name names: account_named) is
+        recorded as that account's username, as every account's is, whatever the level of typed names; only a
+        name that is no account follows that level."""
         from app.core import security_records
+        if account is None:
+            account = account_named(self.db, username)
         row = self.build_row(
             action="login_failure",
             status="failure",
-            username=username,
+            username=account.username if account is not None else username,
             ip_address=ip_address,
             details={'reason': reason},
-            error_message=reason
+            error_message=reason,
+            names_account=account is not None,
         )
         self.db.add(row)
         record = security_records.record(self.db, kind=security_records.LOGIN, name=username,
