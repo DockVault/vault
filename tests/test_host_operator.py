@@ -123,3 +123,32 @@ def test_the_host_tool_lists_who_may_manage_users_without_being_an_administrator
         ("USER_MANAGE", "ada"), ("USER_VIEW", "ada")]
     assert (listed["xena"]["role"], listed["xena"]["active"]) == ("external", True)
     assert all(p["granted_at"].endswith("Z") for p in listed["bob"]["permissions"])
+
+
+def test_the_host_tool_writes_the_recording_alerts_its_rows_raised_before_it_exits(monkeypatch, tmp_path):
+    # A server writes the recording levels' alerts from the thread that refreshes the levels; this tool never
+    # starts it. A row it wrote while the levels could not be read raised an alert that stayed queued and was
+    # lost at exit, so nobody learned that the row had been written without them.
+    import threading
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from app.core import audit_privacy as ap
+    from app.core.host_operator import _wait_for_background_work
+    from app.core.models import SecurityAlert
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'alerts.db'}")
+    SecurityAlert.__table__.create(engine)
+    monkeypatch.setattr(ap, "_default_session_factory", sessionmaker(bind=engine))
+    ap._reset_for_tests()
+    try:
+        started_before = set(threading.enumerate())
+        assert ap.raise_alert(ap.FAILED, "PolicyUnavailable", "second_factor_admin_reset") is True
+        _wait_for_background_work(started_before, timeout=3.0)
+        assert ap.pending_alerts() == []
+        db = sessionmaker(bind=engine)()
+        alerts = db.query(SecurityAlert).all()
+        assert [(a.event_type, a.details["action"]) for a in alerts] == [
+            (ap.ALERT_EVENT, "second_factor_admin_reset")]
+        db.close()
+    finally:
+        ap._reset_for_tests()
+        engine.dispose()
