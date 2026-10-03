@@ -561,9 +561,10 @@ def _host_operator() -> str:
 
 def username_is_typed(row) -> bool:
     """Whether the row's username is a name someone typed rather than an account's: a row with no account
-    names one only for a failed sign-in, and the server's operator acting from the host is neither."""
+    names one only for a failed sign-in. The server's operator acting from the host and the server's own
+    configuration (a version of the levels the start signs) are neither."""
     return (getattr(row, "user_id", None) is None and bool(getattr(row, "username", None))
-            and row.username != _host_operator())
+            and row.username not in (_host_operator(), SERVER_CONFIGURATION))
 
 
 class _Recorder:

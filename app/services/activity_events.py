@@ -131,8 +131,9 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
                              by_fingerprint))
 
     if no_account:
-        # A name no account had: typed at a failed sign-in, an account deleted since, or the server's
-        # operator acting from the host (credential_changes.HOST_OPERATOR, which no account may take). A typed
+        # A name no account had: typed at a failed sign-in, an account deleted since, the server's operator
+        # acting from the host (credential_changes.HOST_OPERATOR, which no account may take) or the server's
+        # configuration signing a version of the recording levels (audit_privacy.SERVER_CONFIGURATION). A typed
         # name recorded as its fingerprint is one too.
         q = q.filter(or_(and_(AuditLog.user_id.is_(None), AuditLog.username.isnot(None)),
                          AuditLog.recorded["signin_name"].as_string().isnot(None)))

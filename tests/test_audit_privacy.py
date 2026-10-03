@@ -12,6 +12,7 @@ import inspect
 import re
 import tempfile
 import textwrap
+import uuid
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
 
+from app.core import audit_fingerprints as fp  # noqa: E402
 from app.core import audit_privacy as ap  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.models import AuditLog, AuditPrivacyPolicy, SecurityAlert, User  # noqa: E402
@@ -41,6 +43,9 @@ def _fresh(monkeypatch):
     for key in ap.POLICY_KEYS:
         monkeypatch.setattr(settings, ap.env_field(key), "full")
     monkeypatch.setattr(settings, "settings_locked_keys", "")
+    # A key of its own: without one a fingerprint cannot be made, and a row at the fingerprint level would be
+    # written by the fallback (version -1, nothing recorded) and still pass a test that reads only what it lacks.
+    monkeypatch.setattr(settings, "audit_fingerprint_key", "k" * 64)
     yield
     ap._reset_for_tests()
 
@@ -263,7 +268,10 @@ def test_the_address_at_each_level_on_each_channel(factory, channel, level, colu
 @pytest.mark.parametrize("level", ["full", "fingerprint", "none"])
 def test_a_name_typed_at_a_failed_sign_in_at_each_level(factory, channel, level):
     row = _write(factory, channel, levels=_levels(signin_names=level))
+    assert row.privacy_version == 7
     assert row.username == ("typed name" if level == "full" else None)
+    kept = fp.fingerprint(fp.SIGNIN, "typed name") if level == "fingerprint" else None
+    assert (row.recorded or {}).get("signin_name") == kept
     assert "typed name" not in repr(row.recorded)
 
 
@@ -490,6 +498,28 @@ def test_a_lowered_limit_is_written_as_a_new_version_signed_by_the_server(factor
     assert ap.prepare(factory).version == 2                    # nothing more to bring down
     monkeypatch.setattr(settings, "audit_max_ip", "full")
     assert ap.prepare(factory).version == 2                    # a raised limit raises no level
+
+
+def test_a_version_the_server_signs_keeps_its_name_whatever_the_level_of_typed_names(factory, monkeypatch):
+    ap.prepare(factory)
+    monkeypatch.setattr(settings, "audit_max_signin_names", "fingerprint")
+    assert ap.prepare(factory).version == 2
+    monkeypatch.setattr(settings, "audit_max_signin_names", "none")
+    assert ap.prepare(factory).version == 3
+    db = factory()
+    rows = db.query(AuditLog).filter(AuditLog.action == ap.CHANGED_ACTION).order_by(AuditLog.resource_id).all()
+    db.close()
+    assert [r.resource_id for r in rows] == ["1", "2", "3"]
+    for row in rows:
+        assert (row.username, row.user_id) == ("server configuration", None)
+        assert row.privacy_version >= 1 and "signin_name" not in (row.recorded or {})
+
+
+def test_only_a_name_with_no_account_that_is_not_the_servers_own_counts_as_typed():
+    assert not ap.username_is_typed(AuditLog(username=ap.SERVER_CONFIGURATION))
+    assert not ap.username_is_typed(AuditLog(username="operator@host"))
+    assert ap.username_is_typed(AuditLog(username="server configuration2"))
+    assert not ap.username_is_typed(AuditLog(username="typed name", user_id=uuid.uuid4()))
 
 
 def test_with_the_lock_the_start_sets_each_level_to_its_limit(factory, monkeypatch):
