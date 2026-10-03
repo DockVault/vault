@@ -248,6 +248,11 @@ def test_a_rollback_strands_nothing_and_the_proofs_take_up_again(stack):
         assert put_zk(admin, f"/ecc/vaults/{rotated}/key-proof",
                       json=dict({"dek_epoch": epoch}, **material)).status_code == 200
         assert _share(admin, rotated, sharer).status_code == 200
+        # The key alone is half a share: until the access row exists, a rotation treats the key as left
+        # over from an unfinished share and leaves its holder out. Finish it, so the next rollback rotates
+        # the vault for a member added by the code under test.
+        granted = admin.post(f"/vaults/{rotated}/permissions", json={"user_id": sharer, "level": "read"})
+        assert granted.status_code in (200, 201), granted.text
         members.append(sharer)
         # ... the vault set up before the rollback still proves with its key ...
         assert _share(admin, legacy, legacy_sharer).status_code == 200
