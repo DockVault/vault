@@ -26,7 +26,7 @@ FIELDS = {
     "channel": ("choices", None),
     "status": ("choices", None),
     "action": ("choices", None),
-    "user": ("text", 128),       # a typed name, kept as its fingerprint while those are (typed_as_recorded)
+    "user": ("text", 128),       # a name; one typed at a failed sign-in is kept as typed_as_recorded says
     "user_match": ("choice", None),
     "no_account": ("flag", None),
     "ip": ("text", 64),
@@ -74,8 +74,9 @@ def clean_name(name: Any) -> str:
     return name
 
 
-def clean_filters(raw: Any) -> Dict[str, Any]:
-    """The filters to store: only the listed keys, each checked; empty values left out."""
+def clean_filters(raw: Any, held_in_full=None) -> Dict[str, Any]:
+    """The filters to store: only the listed keys, each checked; empty values left out. A typed name is kept
+    as typed_as_recorded says (``held_in_full``: see there)."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -123,32 +124,70 @@ def clean_filters(raw: Any) -> Dict[str, Any]:
                 out[key] = value
     if "range" in out and ("from_date" in out or "to_date" in out):
         raise InvalidSearch("A search has either a range or dates, not both.")
-    return typed_as_recorded(out)
+    return typed_as_recorded(out, held_in_full)
 
 
 # The filter whose value is a name someone typed, which the recording levels may keep only as a fingerprint.
 # The free-text search (q) is kept as typed: it mostly names an event, and its fingerprint would match no label.
 TYPED = ("user",)
 
+# Why a saved search cannot hold a typed name while the levels record none of them.
+NOT_RECORDED = ("Names typed at a failed sign-in are not recorded at the current recording levels, so a saved "
+                "search cannot keep one. Save the search without the person, or with the name of an account.")
 
-def typed_as_recorded(filters: Dict[str, Any]) -> Dict[str, Any]:
-    """``filters`` with each typed name kept the way the audit log keeps it: while names typed at a failed
-    sign-in are recorded as fingerprints (app/core/audit_privacy.py), a saved search keeps the fingerprint,
-    not the text, which matches the same rows. A value that is already a fingerprint is kept as it is."""
+
+def typed_as_recorded(filters: Dict[str, Any], held_in_full=None) -> Dict[str, Any]:
+    """``filters`` with each typed name kept the way the audit log keeps it.
+
+    A name the audit log holds in full (an account's username, which every level records, or a name recorded in
+    full under earlier levels) is kept as typed: the saved search then finds what the plain search finds.
+    ``held_in_full(value, exact)`` says whether the log holds one, for an exact or a contains match; without it
+    no name counts as held. Any other name is one typed at a failed sign-in, and is kept as the levels keep those
+    (app/core/audit_privacy.py): in full, as its fingerprint, which matches the same rows, or, while none are
+    recorded, not at all, and the search is refused. A value that is already a fingerprint is kept as it is."""
     from app.core import audit_privacy as ap
     from app.core.audit_fingerprints import SIGNIN, fingerprint, is_fingerprint
     try:
         level = ap.effective(ap.current().levels)[ap.SIGNIN_NAMES]
     except Exception:  # noqa: BLE001 -- unknown: keep no typed text
         level = ap.FINGERPRINT
-    if level != ap.FINGERPRINT:
+    if level == ap.FULL:
         return filters
     out = dict(filters)
+    exact = out.get("user_match") == "exact"
     for key in TYPED:
         value = out.get(key)
-        if isinstance(value, str) and value and not is_fingerprint(value):
-            out[key] = fingerprint(SIGNIN, value)
+        if not isinstance(value, str) or not value or is_fingerprint(value):
+            continue
+        if held_in_full is not None and held_in_full(value, exact):
+            continue
+        kept = None
+        if level == ap.FINGERPRINT:
+            try:
+                kept = fingerprint(SIGNIN, value)
+            except Exception:  # noqa: BLE001 -- no key: nothing to keep in its place
+                kept = None
+        if kept is None:
+            raise InvalidSearch(NOT_RECORDED)
+        out[key] = kept
     return out
+
+
+def held_in_full(db):
+    """For typed_as_recorded: whether a name is an account's username or is held in full by an audit row's
+    username, matched as the Events search matches it (exactly, ignoring case, or as a part)."""
+    def check(value: str, exact: bool) -> bool:
+        from sqlalchemy import exists, func
+        from app.core.models import AuditLog, User
+        value = value[:ev.MAX_TEXT]
+        found = []
+        for column in (User.username, AuditLog.username):
+            if exact:
+                found.append(func.lower(column) == value.lower())
+            else:
+                found.append(column.ilike(f"%{ev.like_escape(value)}%", escape="\\"))
+        return any(db.query(exists().where(cond)).scalar() for cond in found)
+    return check
 
 
 def view(row) -> dict:

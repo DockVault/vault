@@ -2,7 +2,8 @@
 
 With names typed at sign-in recorded as fingerprints, a failed sign-in's row is found by a posted search for the
 name, and by its fingerprint. What the search typed reaches neither the server's output, nor the log-access copy
-of it, nor the export's audit row, nor a saved search. The levels are set back afterwards.
+of it, nor the export's audit row, nor a saved search; a saved search for an account keeps its name and finds its
+events, and one for a typed name is refused while no typed name is recorded. The levels are set back afterwards.
 test_activity_search.py covers the rules offline.
 """
 import subprocess
@@ -72,3 +73,37 @@ def test_what_a_search_typed_reaches_no_log_no_export_row_and_no_saved_search(ad
     finally:
         admin.delete(f"/activity/saved-searches/{saved_id}")
     reset_sign_in_throttle()
+
+
+def _save(admin, filters):
+    return admin.post("/activity/saved-searches", json={"name": f"probe {uuid.uuid4().hex[:6]}", "filters": filters})
+
+
+def test_a_saved_search_for_an_account_keeps_its_name_and_finds_its_events_at_every_level(admin, admin_creds,
+                                                                                          levels_restored):
+    account = admin_creds["username"]
+    filters = {"user": account, "user_match": "exact"}
+    for level in ("fingerprint", "none"):
+        store(dict(levels_restored, signin_names=level))
+        plain = admin.post("/activity/events/search", json=filters)
+        assert plain.status_code == 200, plain.text[:200]
+        plain_ids = {e["id"] for e in plain.json()["events"]}
+        assert plain_ids, level
+        created = _save(admin, filters)
+        assert created.status_code in (200, 201), created.text[:200]
+        try:
+            kept = created.json()["filters"]
+            assert kept == filters, (level, kept)
+            replay = admin.post("/activity/events/search", json=kept)
+            assert plain_ids & {e["id"] for e in replay.json()["events"]}, level
+        finally:
+            admin.delete(f"/activity/saved-searches/{created.json()['id']}")
+
+
+def test_while_no_typed_name_is_recorded_a_saved_search_for_one_is_refused(admin, levels_restored):
+    store(dict(levels_restored, signin_names="none"))
+    typed = unique("typedatnone")
+    created = _save(admin, {"user": typed})
+    assert created.status_code == 422, created.text[:200]
+    assert "not recorded at the current recording levels" in created.json()["detail"]
+    assert typed not in psql("SELECT coalesce(string_agg(filters::text, ' '), '') FROM activity_saved_searches")

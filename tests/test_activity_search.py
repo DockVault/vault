@@ -3,8 +3,9 @@
 POST /activity/events/search, /activity/summary/search and /activity/export take the same filters, with the same
 bounds, as their GET forms and run the same handler, so a name, an address or free text typed into a filter
 reaches no request line. A typed name matches rows that recorded it in full or as its fingerprint; a fingerprint
-(as a saved search keeps one) matches only those. A saved search keeps a typed name as its fingerprint while names
-typed at sign-in are recorded as fingerprints. The page posts any read whose filters hold typed text.
+(as a saved search keeps one) matches only those. A saved search keeps a name the log holds in full (an account's)
+as typed, and any other typed name as the levels keep it: its fingerprint, or, while none are recorded, not at all.
+The page posts any read whose filters hold typed text.
 """
 import inspect
 import tempfile
@@ -165,16 +166,121 @@ def test_rows_under_no_account_include_a_fingerprinted_name(factory):
 
 # --------------------------------------------------------------------------- saved searches
 
-def test_a_saved_search_keeps_a_typed_name_as_its_fingerprint_while_names_are(monkeypatch):
+def _account(factory, name):
+    db = factory()
+    user = User(username=name, email=f"{name}@example.test", password_hash="x")
+    db.add(user)
+    db.commit()
+    uid = user.id
+    db.close()
+    return uid
+
+
+def _account_row(factory, uid, action):
     ap.use(ap.Policy(9, {**ap.POLICY_ONE, "signin_names": "fingerprint"}))
-    out = saved.clean_filters({"user": " eve.smith ", "q": "upload", "ip": "192.0.2.1"})
-    assert out["user"] == fp.fingerprint(fp.SIGNIN, "eve.smith")
-    assert out["q"] == "upload" and out["ip"] == "192.0.2.1"
-    assert saved.clean_filters({"user": out["user"]})["user"] == out["user"]
-    ap.use(ap.Policy(10, dict(ap.POLICY_ONE)))
-    assert saved.clean_filters({"user": "eve.smith"})["user"] == "eve.smith"
+    db = factory()
+    AuditLogger(db).log_action(action=action, status="success", user_id=uid)
+    db.close()
+
+
+def _saved(factory, filters, level):
+    """The filters a saved search keeps, saved through the routes' check, while typed names are at ``level``."""
+    ap.use(ap.Policy(9, {**ap.POLICY_ONE, "signin_names": level}))
+    db = factory()
+    try:
+        return saved.clean_filters(filters, saved.held_in_full(db))
+    finally:
+        db.close()
+
+
+def _replay(factory, filters):
+    return _found(factory, username=filters["user"], user_exact=filters.get("user_match") == "exact")
+
+
+@pytest.mark.parametrize("value,match", [("ada.lovelace", "exact"), ("Ada.Lovelace", "exact"), ("lovelace", "contains")])
+def test_at_the_fingerprint_level_a_saved_search_keeps_an_accounts_name_and_finds_its_events(factory, value, match):
+    ada = _account(factory, "ada.lovelace")
+    _account_row(factory, ada, "ada_signed_in")
+    _write(factory, "eve.smith", "fingerprint", "typed_fp")
+    filters = {"user": value, "user_match": match}
+    assert _replay(factory, filters) == ["ada_signed_in"]
+    kept = _saved(factory, filters, "fingerprint")
+    assert kept == filters
+    assert _replay(factory, kept) == ["ada_signed_in"]
+
+
+def test_an_account_with_no_events_yet_is_kept_by_name(factory):
+    _account(factory, "grace.hopper")
+    assert _saved(factory, {"user": "grace.hopper"}, "fingerprint") == {"user": "grace.hopper"}
+
+
+def test_at_the_fingerprint_level_a_typed_name_is_kept_as_its_fingerprint_and_finds_the_same_rows(factory):
+    _account(factory, "ada.lovelace")
+    _write(factory, "eve.smith", "fingerprint", "typed_fp")
+    _write(factory, "bob", "fingerprint", "other_fp")
+    kept = _saved(factory, {"user": " eve.smith ", "user_match": "exact", "q": "upload", "ip": "192.0.2.1"},
+                  "fingerprint")
+    assert kept == {"user": fp.fingerprint(fp.SIGNIN, "eve.smith"), "user_match": "exact", "q": "upload",
+                    "ip": "192.0.2.1"}
+    assert _replay(factory, kept) == _found(factory, username="eve.smith", user_exact=True) == ["typed_fp"]
+    assert _saved(factory, {"user": kept["user"]}, "fingerprint") == {"user": kept["user"]}
+
+
+def test_a_name_the_log_holds_in_full_is_kept_as_typed(factory):
+    _write(factory, "eve.smith", "full", "kept_full")          # recorded in full under earlier levels
+    _write(factory, "eve.smith", "fingerprint", "kept_fp")
+    kept = _saved(factory, {"user": "eve.smith", "user_match": "exact"}, "fingerprint")
+    assert kept["user"] == "eve.smith"
+    assert _replay(factory, kept) == ["kept_fp", "kept_full"]
+
+
+def test_the_check_matches_a_name_as_the_search_does(factory):
+    _write(factory, "eve.smith", "full", "kept_full")
+    _account(factory, "ada.lovelace")
+    db = factory()
+    try:
+        check = saved.held_in_full(db)
+        assert check("EVE.SMITH", True) and check("smith", False) and check("LOVE", False)
+        assert check("ada.lovelace", True) and not check("ada", True) and not check("smith", True)
+        assert not check("eve_smith", False) and not check("eve%", False)      # wildcards are plain text
+    finally:
+        db.close()
+
+
+def test_while_no_typed_name_is_recorded_a_saved_search_cannot_hold_one(factory):
+    _account(factory, "ada.lovelace")
+    _write(factory, "eve.smith", "fingerprint", "kept_fp")
+    with pytest.raises(saved.InvalidSearch, match="not recorded at the current recording levels"):
+        _saved(factory, {"user": "typed.at.minimal"}, "none")
+    with pytest.raises(saved.InvalidSearch):
+        saved.clean_filters({"user": "typed.at.minimal"})
+    assert _saved(factory, {"user": "ada.lovelace"}, "none") == {"user": "ada.lovelace"}
+    value = fp.fingerprint(fp.SIGNIN, "eve.smith")
+    assert _saved(factory, {"user": value}, "none") == {"user": value}
+    assert _saved(factory, {"q": "typed.at.minimal"}, "none") == {"q": "typed.at.minimal"}   # free text: as typed
+
+
+def test_at_the_full_level_a_typed_name_is_kept_as_typed_within_the_env_limit(factory, monkeypatch):
+    assert _saved(factory, {"user": "eve.smith"}, "full") == {"user": "eve.smith"}
     monkeypatch.setattr(settings, "audit_max_signin_names", "fingerprint")
-    assert saved.clean_filters({"user": "eve.smith"})["user"] == fp.fingerprint(fp.SIGNIN, "eve.smith")
+    assert _saved(factory, {"user": "eve.smith"}, "full") == {"user": fp.fingerprint(fp.SIGNIN, "eve.smith")}
+    monkeypatch.setattr(settings, "audit_max_signin_names", "none")
+    with pytest.raises(saved.InvalidSearch):
+        _saved(factory, {"user": "eve.smith"}, "full")
+
+
+def test_with_no_key_to_fingerprint_with_a_typed_name_is_refused_not_kept(factory, monkeypatch):
+    monkeypatch.setattr(settings, "audit_fingerprint_key", "")
+    monkeypatch.setattr(settings, "encryption_key", "")
+    with pytest.raises(saved.InvalidSearch):
+        _saved(factory, {"user": "eve.smith"}, "fingerprint")
+
+
+def test_both_routes_that_store_filters_check_them_against_the_log():
+    for handler in (api.create_saved_search, api.update_saved_search):
+        source = inspect.getsource(handler)
+        assert source.count("rules.clean_filters(body.filters, rules.held_in_full(db))") == 1, handler.__name__
+        assert source.count("clean_filters(") == 1, handler.__name__
 
 
 # --------------------------------------------------------------------------- the page

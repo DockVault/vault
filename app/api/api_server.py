@@ -2753,7 +2753,7 @@ def create_saved_search(body: SavedSearchCreate,
     from app.core.models import ActivitySavedSearch
     rules = _saved_search_rules()
     try:
-        name, filters = rules.clean_name(body.name), rules.clean_filters(body.filters)
+        name, filters = rules.clean_name(body.name), rules.clean_filters(body.filters, rules.held_in_full(db))
     except rules.InvalidSearch as e:
         raise HTTPException(status_code=422, detail=str(e))
     _lock_owner(db, current_user)
@@ -2787,7 +2787,7 @@ def update_saved_search(search_id: str, body: SavedSearchUpdate,
     rules = _saved_search_rules()
     try:
         name = rules.clean_name(body.name) if body.name is not None else None
-        filters = rules.clean_filters(body.filters) if body.filters is not None else None
+        filters = rules.clean_filters(body.filters, rules.held_in_full(db)) if body.filters is not None else None
     except rules.InvalidSearch as e:
         raise HTTPException(status_code=422, detail=str(e))
     _lock_owner(db, current_user)
