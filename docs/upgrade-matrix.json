@@ -334,6 +334,30 @@
       "id": null,
       "fixed_in": "0.33.1",
       "published": "2026-10-02"
+    },
+    "zero-knowledge-key-changed-through-a-taken-over-account": {
+      "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+      "description": "Rotating a zero-knowledge vault's key, sharing the vault, setting its name-index key and creating a zero-knowledge vault were checked against the account that asked, not against the keys the person holds. Whoever could act as the account of someone who holds a vault's key could therefore rotate the vault to a key of their own choosing, replace a member's copy of the key, set a name-index key they know, or create a vault in that person's name under a key they know. Acting as the account needs only its sign-in: an administrator who set the person's password, made them a reset link, reset their second factor or changed their email address could do it, and so could anyone holding a stolen session. 0.32.6 closed the case of an account that holds no key; this is the case of an account that holds one, used by someone else.",
+      "impact": "That person learned the key protecting every file uploaded to the vault after the change, and could read those files through the account they acted as. Members noticed nothing: their browsers took the new key as the vault's own. Files uploaded before the change were not exposed. Rotations and shares are in the audit log (zk_vault_rekeyed, zk_member_key_granted), a zero-knowledge vault created in the person's name is recorded as vault_created, and setting a name-index key is recorded (zk_index_key_wrapped) only from 0.33.0; before that it left no entry. From 0.33.0 a person is also told by email and in the app when an administrator changes their sign-in details.",
+      "remediation": "Upgrade to 0.33.2. Each of these changes now carries a proof, made in the person's browser over a one-time challenge and the exact request, that they hold their own encryption key, the vault's current key and the key the change puts in place. The server refuses a change without a proof (428) or with a wrong one (403), changes nothing when it refuses, and records each failed proof as zk_key_proof_failed. A vault made before 0.33.2 gets its key check the first time a manager who holds its key makes such a change. Reload browser tabs opened before the upgrade. DockVault Desktop builds whose built-in web app predates 0.33.2 cannot make these changes, and cannot remove a member from a zero-knowledge vault, until they are updated; reading, uploading and syncing are unaffected. Setting ZK_KEY_PROOF_ENFORCE=false accepts changes without a proof again, and rolling back below 0.33.2 does the same: either reopens this.",
+      "mitigation": "Until you upgrade, review the audit log for entries made after an administrator changed a vault member's sign-in details: zk_vault_rekeyed and zk_member_key_granted, vault_created for a zero-knowledge vault made by that member's account, and, from 0.33.0, zk_index_key_wrapped (before 0.33.0, setting a name-index key left no entry). Have a key holder rotate any vault with a change nobody recognises. Do not upload to a zero-knowledge vault its owner did not create.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.2",
+      "published": "2026-10-03"
+    },
+    "sign-in-form-sent-credentials-in-the-url": {
+      "title": "A sign-in sent before the page had loaded put the password in the address",
+      "description": "The web app shows its sign-in screen before the script that sends its forms has loaded, and the page's forms named no method. A sign-in sent in that window, for example by pressing Enter while the page was still loading on a slow or interrupted connection, was sent by the browser itself as a GET request with the typed username and password in the address. Every form of the page had no method, but only the sign-in form is on screen before the script has loaded.",
+      "impact": "The address, with the password in clear, went into the browser's history, into the access log of any reverse proxy in front of the vault, where it was also recorded as the Referer of each request the page made next, and, before 0.32.3, into the vault container's own log (0.32.3 and later mask the password there, not the username). Anyone who can read that history or those logs could sign in as the person, unless the account also asks for a second factor. Nothing was sent to another site.",
+      "remediation": "Upgrade to 0.33.2. A script that runs before the first form is shown now stops the browser from ever sending one of the page's forms itself, and every form says method=\"post\", so even with scripts turned off nothing typed goes into an address. The server refuses such a post and sends none of it back.",
+      "mitigation": "Until you upgrade, whoever pressed Sign in while the page was still loading, or saw their password in the address bar, should change their password. Search your reverse proxy's access logs (and, before 0.32.3, the vault container's log) for password= in the request line or the Referer field; restrict or delete those lines and have the people they name change their password. Clear the browser history on shared computers.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:L/AC:L/AT:P/PR:L/UI:P/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.2",
+      "published": "2026-10-03"
     }
   },
   "versions": {
@@ -398,6 +422,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -462,6 +492,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -526,6 +562,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -590,6 +632,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -654,6 +702,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -718,6 +772,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -782,6 +842,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -846,6 +912,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -910,6 +982,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -974,6 +1052,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1038,6 +1122,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1105,6 +1195,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1172,6 +1268,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1248,6 +1350,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1327,6 +1435,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1406,6 +1520,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1485,6 +1605,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1564,6 +1690,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1643,6 +1775,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1722,6 +1860,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1801,6 +1945,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1880,6 +2030,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -1959,6 +2115,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2038,6 +2200,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2117,6 +2285,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2196,6 +2370,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2275,6 +2455,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2354,6 +2540,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2433,6 +2625,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2512,6 +2710,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2594,6 +2798,12 @@
         },
         {
           "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         }
       ]
     },
@@ -2724,6 +2934,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -2869,6 +3089,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3014,6 +3244,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3149,6 +3389,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3269,6 +3519,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3379,6 +3639,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3489,6 +3759,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3599,6 +3879,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3709,6 +3999,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3819,6 +4119,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -3924,6 +4234,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -4029,6 +4349,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -4119,6 +4449,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -4184,6 +4524,16 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
@@ -4209,12 +4559,42 @@
           "advisory": "revoked-permission-came-back-after-a-restart",
           "title": "A permission an administrator revoked came back when the vault restarted",
           "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
         }
       ]
     },
     "0.33.1": {
       "released": "2026-10-03",
       "notes": "Security fixes, three advisories, and the release tooling for supporting two release lines. python dockvault.py update runs the host tool already installed, and the checks and host actions named below are in the tool of 0.33.1, so update the checkout first (git pull, or git fetch --tags and git checkout v0.33.1): an older tool checks none of them and offers neither action. A range in TRUSTED_PROXIES no longer trusts the Docker network's gateway, which every connection Docker relays to a published port comes from (IPv6 clients, clients on the Docker host, on Docker Desktop every client), so those clients can no longer set their own address; only the token gateway or the gateway's exact address trusts it. A reverse proxy on the Docker host arrives from the gateway too: for one, set TRUSTED_PROXIES=gateway and publish the web port on loopback only (WEB_BIND=127.0.0.1 with the secure compose file of 0.33.1; an install that updates by pulling images keeps its compose files and edits its port mapping to 127.0.0.1:<port>:8000 by hand). Until then all of such a proxy's clients are recorded as the gateway and share one set of sign-in limits; the web process says so at start, and the update of 0.33.1's host tool says so before the upgrade (the upgrade condition gateway-no-longer-covered-by-ranges, which says how to check by hand). A permission an administrator revoked from an account now stays revoked when the vault restarts: a start gives an account only the role defaults added in a later release, once, each audited as permission_default_granted. Permissions an earlier restart gave back are still held: after the upgrade, 0.33.1's python dockvault.py accounts --action regranted-defaults lists them (the upgrade condition role-defaults-granted-once). With ACCOUNT_LOCKOUT_MINUTES=0 an administrator's automatic lock now has an end (15 minutes; a pause from every address once its count has lost a failure, 72 minutes by default), one that 0.33.0 armed and is already in place included, while other accounts' automatic locks still last until cleared, and so does a lock with no end from a release before 0.33.0, which is recorded like one an administrator set; with that setting, locking a name shows whether it is an administrator's, because its lock ends. 0.33.1's python dockvault.py accounts --action unlock clears an account's locks from the host, audited as the host operator. A right password no longer counts against the sign-in throttle, so one person signing in again and again, or many accounts behind one address, are no longer refused; wrong passwords count as before, and more right-password sign-ins at the same moment from one address than the login limit (5 by default) still have their extras refused. A password sign-in over SFTP no longer ends the account's other SFTP connections, and a web sign-in no longer ends SFTP connections, which also dropped an SSH-key upload in flight; ending an account's sessions, locking or deactivating it still ends all of them. The database session now runs in UTC whatever the database server's time zone, so times the database stamps are no longer off by that zone's offset. From this release on, the web and SFTP processes read data_requirements before they touch the database and refuse to start when a newer release has marked the data as needing a newer version, naming what changed and how to undo it with that release; ALLOW_START_ON_NEWER_DATA=true starts them anyway. No release writes such a mark yet, and 0.33.0 and earlier do not read it, so a rollback to them is not protected by it. Release lines: each release is published as :vX.Y.Z, the newest release of each line also as :vX.Y (for example :v0.33), and :latest and GitHub's latest release name only the highest version, so a patch release of an older line never moves them; a release tag must be an annotated tag. The upgrade matrix states until when each release line gets security fixes, and lists an advisory by its id alone on versions below 0.27.0. python dockvault.py update and the in-app update check show the newest release of the install's line and until when the line gets security fixes, and an install on an older line is shown a banner when a newer release of its line exists or its line's security fixes have ended; to know about older lines without telling GitHub which one the install runs, the update check, when it is on, also fetches the published matrix of the newest release of each older line the matrix lists (at most five). The image scan fails when a reviewed VEX statement names a package version the image no longer contains; the stale OpenSSL statement was removed. The image sets FORWARDED_ALLOW_IPS empty. The JWT library PyJWT is updated from 2.13.0 to 2.15.1, which fixes eleven advisories in it. One of them reached the vault: a bearer token whose header was nested deeper than the stack made a signed-in route answer 500 instead of 401 (GHSA-8wjv-2p76-3863). That exposed nothing and skipped no check, so the vault has no advisory for it; such a token is now refused with 401 like any other invalid one. A bearer token longer than 8,192 characters, far longer than any the vault signs, is now refused the same way without being decoded, so a very long token no longer costs the server time to reject. Accepted residual, published in .github/SECURITY.md: an administrator whose current password someone else set can still approve another administrator's credential change, so whoever set that password can approve through that account; 0.34.0 refuses such approvals. Personal data this release stores (docs/data-inventory.md lists every store): active_sessions.channel records whether a session was signed in over the web or SFTP, and users.permission_defaults_revision the revision of its role's defaults an account has been given; the audit log records each permission a start grants (permission_default_granted) and each unlock from the host. The host tool can list the permissions an administrator revoked that a restart before 0.33.1 granted again, with usernames, roles and times read from the audit log, on the host's terminal and not audited. data_requirements holds no personal data. Schema: new table data_requirements and nullable columns users.permission_defaults_revision and active_sessions.channel, created at the first start. A rollback to 0.33.0 works, since it ignores all of them, but brings back 0.33.0's flaws: its first start grants revoked defaults again, an administrator's lock can last for good again, a range trusts the gateway again, sign-ins end other channels' sessions again, and it does not read data_requirements. 0.33.x receives security fixes until six months after 0.34.0 ships (.github/SECURITY.md).",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
+          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
+          "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url",
+          "title": "A sign-in sent before the page had loaded put the password in the address",
+          "fixed_in": "0.33.2"
+        }
+      ]
+    },
+    "0.33.2": {
+      "released": "2026-10-03",
+      "notes": "Security fixes, two advisories (zero-knowledge-key-changed-through-a-taken-over-account, medium; sign-in-form-sent-credentials-in-the-url, medium). Creating or sharing a zero-knowledge vault, rotating its key and setting its name-index key now each carry a proof, made in the person's browser over a one-time challenge and the exact request, that they hold their own encryption key, the vault's current key and the key the change puts in place. The server refuses such a change without a proof (428) or with a wrong one (403), changes nothing when it refuses, and records each failed proof as zk_key_proof_failed, so signing in as someone who holds a vault's key, as an administrator who set their password can, or with a stolen session, is no longer enough to change that vault's key. A vault made before 0.33.2 gets its key check the first time a manager who holds its key makes such a change (zk_key_proof_bootstrapped); a vault's owner whose key check cannot be opened can replace it after a step-up (zk_owner_key_reset). Reload browser tabs opened before the upgrade. DockVault Desktop builds whose built-in web app predates 0.33.2 cannot make these changes, and cannot remove a member from a zero-knowledge vault, until they are updated; reading, uploading, downloading and syncing are unaffected, and nobody is signed out. A temporary credential can create a zero-knowledge vault only if it may unlock the account's encryption key. A reverse proxy must pass the X-ZK-Key-Proof request header and the request body on unchanged. ZK_KEY_PROOF_ENFORCE=false in .env, which the settings page cannot change, accepts changes without a proof again, each recorded as zk_key_proof_absent, and the web container says at start that it is off; it reopens the problem this release fixes. docs/design/vault-zk-key-proof-v1.md specifies the protocol. Personal data this release stores (docs/data-inventory.md lists every store): vault_key_proofs records the account that installed each key epoch's proof material (a public key, a sealed key and two MACs, none of them personal), and zk_key_proof_challenges the account a challenge was issued to, for five minutes; the audit log records each refused key proof, each change accepted without one, each key check set up and each owner reset. Schema: new tables vault_key_proofs and zk_key_proof_challenges, created at the first start; this release writes no mark in data_requirements. A rollback to 0.33.1 or 0.33.0 works and strands nothing: every file and key stays readable, the new tables are ignored, and deleting a vault or an account still removes its rows by the database's own rules. It turns the protection off until the next upgrade, and a vault whose key was rotated while rolled back gets its key check again the next time a manager changes it. The web app's forms are now sent only by its scripts, never by the browser itself: before, a sign-in sent while the page was still loading went out as a GET with the username and password in the address, and so in the browser history and in a reverse proxy's access log (and, before 0.32.3, the vault container's log). A script in the page head now stops the browser sending any form, and every form says method=\"post\", so nothing typed goes into an address even with scripts off. Whoever pressed Sign in on a slow load should change their password, and reverse-proxy access logs may still hold such addresses.",
       "support": {
         "eol": false,
         "secure": true
@@ -4608,6 +4988,20 @@
         {
           "id": "older-images-check-newer-data",
           "summary": "From 0.33.1 the web and SFTP processes read the table data_requirements before they touch the database, and refuse to start when a newer release has marked the data as needing a newer version; the log names what changed and how to undo it with that release. ALLOW_START_ON_NEWER_DATA=true in .env starts them anyway, on data they cannot fully read. No release writes such a mark yet. 0.33.0 and earlier do not read the table, so a rollback to one of them is not protected by it; before a downgrade, python dockvault.py update from 0.33.1 on asks the running version what stands in the way, when that version offers the check."
+        }
+      ]
+    },
+    {
+      "from": "0.33.1",
+      "to": "0.33.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "zk-key-proof-enforced",
+          "summary": "From 0.33.2, creating or sharing a zero-knowledge vault, rotating its key and setting its name-index key need proof that the person holds the vault's key and their own encryption key. Reload browser tabs opened before the upgrade. A temporary credential can create a zero-knowledge vault only if it may unlock the account's encryption key; one allowed only to create vaults no longer can. DockVault Desktop builds whose built-in web app predates 0.33.2 cannot do these things, and cannot remove a member from a zero-knowledge vault, until they are updated; reading, uploading and syncing are unaffected. Setting ZK_KEY_PROOF_ENFORCE=false in .env accepts requests without a proof again, which reopens the problem this release fixes. A rollback below 0.33.2 strands nothing (every file and key stays readable) but turns the protection off until the next upgrade, and a vault whose key was rotated while rolled back gets its key check again the next time a manager changes it.",
+          "detect": "SELECT count(*) FROM vaults WHERE type = 'zero_knowledge'"
         }
       ]
     }
