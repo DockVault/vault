@@ -432,9 +432,9 @@ class Settings(BaseSettings):
     security_record_max_days: int = Field(default=365)
     # The most the audit log may record of each kind of personal data (app/core/audit_privacy.py): the
     # panel's recording levels stay at or below these. Names (vault, file and folder): none, fingerprint or
-    # full. Names typed at a failed sign-in: none, fingerprint or full. Email addresses: none or full. IP
-    # addresses: none, shortened or full. Browser descriptions: none or full. A value that is none of these
-    # refuses to start. With audit_levels in SETTINGS_LOCKED_KEYS each limit is also the level.
+    # full. Names typed at a failed sign-in (no such account): none, fingerprint or full. Email addresses:
+    # none or full. IP addresses: none, shortened or full. Browser descriptions: none or full. A value that is
+    # none of these refuses to start. With audit_levels in SETTINGS_LOCKED_KEYS each limit is also the level.
     audit_max_names: str = Field(default="full")
     audit_max_signin_names: str = Field(default="full")
     audit_max_emails: str = Field(default="full")

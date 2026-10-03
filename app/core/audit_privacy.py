@@ -85,7 +85,7 @@ ENV_NAMES: Dict[str, str] = {
 }
 LABELS: Dict[str, str] = {
     NAMES: "Vault, file and folder names",
-    SIGNIN_NAMES: "Names typed at a failed sign-in",
+    SIGNIN_NAMES: "Names typed at a failed sign-in (no such account)",
     EMAILS: "Email addresses",
     IP: "IP addresses",
     USER_AGENT: "Browser descriptions",

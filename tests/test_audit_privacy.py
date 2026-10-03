@@ -366,6 +366,8 @@ def test_the_registry_holds_only_known_kinds_and_its_names_are_the_redacted_name
     assert ap.kind_of("changes.email") == ap.EMAIL
     assert ap.kind_of("filters.something_new") is None
     assert ap.kind_of("nobody_knows") is None
+    # The panel and the notice say which names typed at a sign-in the level governs.
+    assert ap.LABELS[ap.SIGNIN_NAMES] == "Names typed at a failed sign-in (no such account)"
 
 
 # --------------------------------------------------------------------------- levels on real rows
