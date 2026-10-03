@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from conftest import ApiClient, unique
+from _recording_levels import levels_restored, store  # noqa: F401 -- a fixture
 
 
 def _summary(client, **params):
@@ -60,6 +61,19 @@ def test_the_band_counts_the_rows_the_events_list_shows(admin):
     outcomes = admin.get("/activity/catalog").json()["sign_in_outcomes"]
     for outcome, actions in outcomes.items():
         assert _listed(admin, q=name, action=actions)["total"] == band["sign_ins"][outcome], outcome
+
+
+def test_a_name_no_account_has_is_counted_when_only_its_fingerprint_is_kept(admin, levels_restored):
+    # At the fingerprint level a typed name is kept only as its fingerprint, and the row has no username. The
+    # Events list's "no account" filter takes such a row; the band counts the same rows.
+    store(dict(levels_restored, signin_names="fingerprint"))
+    name = unique("band-fp")
+    _failed_sign_in(name)
+    _failed_sign_in(name)
+    band = _settled(admin, 2, range="24h", q=name)
+    assert band["total"] == 2 and band["no_account"] == {"total": 2, "failed": 2}
+    assert _listed(admin, q=name, no_account="true")["total"] == 2
+    assert name not in str(band)
 
 
 def test_the_most_active_people_are_accounts(admin, temp_user):

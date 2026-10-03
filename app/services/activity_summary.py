@@ -299,7 +299,7 @@ def summarize(db, AuditLog, win: Window, filters: dict, since: Optional[datetime
     the log holds) up to `until` (exclusive; None: up to now, and anything written since). Each block
     counts under every filter but its own (OWN_FILTERS); blocks under the same filters share one query.
     `from_` is the start the band states when it is not `since` (all time: the oldest row)."""
-    from sqlalchemy import and_, func, literal_column, text
+    from sqlalchemy import and_, func, literal_column, or_, text
     from app.services.activity_events import build_events_query, stored_action_names
     per_block = block_filters(filters)
     keys = {block: signature(f) for block, f in per_block.items()}
@@ -313,7 +313,10 @@ def summarize(db, AuditLog, win: Window, filters: dict, since: Optional[datetime
         return q
 
     is_failed = AuditLog.status.in_(FAILED_STATUSES)
-    unowned = and_(AuditLog.user_id.is_(None), AuditLog.username.isnot(None))
+    # The rows the Events page's "no account" filter finds (activity_events.build_events_query): a typed name
+    # recorded as its fingerprint is one too.
+    unowned = or_(and_(AuditLog.user_id.is_(None), AuditLog.username.isnot(None)),
+                  AuditLog.recorded["signin_name"].as_string().isnot(None))
     counts = (func.count(), func.count().filter(is_failed), func.count().filter(unowned),
               func.count().filter(and_(unowned, is_failed)))
     # The bucket a row falls in, counted from 1 (width_bucket over the window's bounds; 0 is before the
