@@ -7643,6 +7643,9 @@ async def login(
     auth_service = AuthService(db)
     audit_logger = AuditLogger(db)
     client_ip = get_client_ip(request)
+    # The sign-in method this attempt is resolved under, which a failed attempt's audit row follows too (an
+    # account is named there only when the name could have signed in to it).
+    login_identifier = "username"
     
     try:
         # Check if this is a temporary credential (starts with "temp_")
@@ -7662,12 +7665,13 @@ async def login(
             # Regular user authentication. The org policy decides whether the submitted value is
             # resolved as a username, an email, or either — the temp_ branch above stays first and
             # policy-independent (temp usernames are their own namespace, never an email).
+            login_identifier = _login_identifier(db)
             user, session_token = await run_offloaded(
                 auth_service.authenticate_user,
                 login_request.username,
                 login_request.password,
                 client_ip,
-                login_identifier=_login_identifier(db),
+                login_identifier=login_identifier,
             )
             is_temporary = False
             # Two-step login: if the second factor is in effect for this account, hand out NO session
@@ -7755,7 +7759,8 @@ async def login(
         # door is a "this credential is live and in use" oracle. Only AccountLockedError branches to a
         # 403 below; SessionLimitExceededError falls through to the uniform "Invalid username or
         # password" like InvalidCredentialsError, and is recorded as a failed login like it.
-        record_id = audit_logger.log_login_failure(login_request.username, client_ip, str(e))
+        record_id = audit_logger.log_login_failure(login_request.username, client_ip, str(e),
+                                                   login_identifier=login_identifier)
         
         # AWAITED in the offload pool: the brute-force counter must advance on every failed login
         # (never shed), so it is awaited — the record lands before the response — but OFF the loop.
@@ -7786,7 +7791,8 @@ async def login(
         record_id = audit_logger.log_login_failure(
             login_request.username,
             client_ip,
-            f"Rate limit exceeded: {str(e)}"
+            f"Rate limit exceeded: {str(e)}",
+            login_identifier=login_identifier,
         )
         
         # Awaited in the offload pool, same as the 401 branch — the counter must not be shed, and its

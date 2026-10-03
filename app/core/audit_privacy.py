@@ -4,9 +4,10 @@ Every event is recorded: who acted, what happened, when, its outcome and the ids
 governs is the personal data attached to it, by kind, never by event:
 
     names           vault, file and folder names            none / fingerprint / full
-    signin_names    a name typed at a failed sign-in, or a  none / fingerprint / full
-                    name or text typed into an Activity
-                    filter
+    signin_names    a name typed at a failed sign-in that   none / fingerprint / full
+                    is no account's or temporary
+                    credential's, or a name or text typed
+                    into an Activity filter
     emails          email addresses                         none / full
     ip              the client's address                    none / shortened / full
     user_agent      the browser's description               none / full
@@ -568,8 +569,8 @@ def _host_operator() -> str:
 
 def username_is_typed(row) -> bool:
     """Whether the row's username is a name someone typed rather than an account's: a row with no account
-    names one only for a failed sign-in, and then only when the name is no account's (a failed sign-in for an
-    account says so: AuditLogger.build_row's names_account). The server's operator acting from the host and the
+    names one only for a failed sign-in, and then only when the name is no account's or temporary credential's
+    (a failed sign-in for one says so: AuditLogger.build_row's names_account). The server's operator acting from the host and the
     server's own configuration (a version of the levels the start signs) are neither."""
     return (getattr(row, "user_id", None) is None and bool(getattr(row, "username", None))
             and not getattr(row, "_names_account", False)

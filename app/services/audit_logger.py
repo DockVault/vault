@@ -34,25 +34,57 @@ def _request_address():
     return current_client_ip()
 
 
-def account_named(db, typed) -> Optional[User]:
-    """The account a name typed at a failed sign-in names, or None: the account with that username, or for an
-    email address, the one account with that address (two accounts sharing it name neither, as at sign-in).
-    The rule security_records.record follows. One query whether or not one matches, so the failure's write
-    takes no longer for a name that is an account than for one that is not."""
-    if not isinstance(typed, str) or not typed:
+# Both sign-in doors take a name that starts with this as a temporary credential's, whatever the sign-in
+# method (/auth/login in app/api/api_server.py, check_auth_password in app/sftp/sftp_server.py).
+TEMP_CREDENTIAL_PREFIX = "temp_"
+LOGIN_IDENTIFIERS = ("username", "email", "either")
+
+
+def account_named(db, typed, login_identifier: str = "username") -> Optional[User]:
+    """The account a name typed at a failed sign-in names, or None: the account that sign-in tried, as
+    AuthService.authenticate_user resolves the name under ``login_identifier`` (the web's sign-in method; SFTP
+    always signs in by username). By username, the account with that username; by email, the one account with
+    that address (two accounts sharing it name neither); either way, the username first, then the address. A
+    name that starts with temp_ is a temporary credential's at both doors (credential_named), never an account's.
+    One query whether or not one matches, so the failure's write takes no longer for a name that is an account
+    than for one that is not. Never raises: a failed lookup leaves the name a typed one."""
+    if not isinstance(typed, str) or not typed or typed.startswith(TEMP_CREDENTIAL_PREFIX):
         return None
-    from sqlalchemy import func, or_
-    match = [User.username == typed]
-    if "@" in typed:
-        match.append(func.lower(User.email) == typed.strip().lower())
+    if login_identifier not in LOGIN_IDENTIFIERS:
+        login_identifier = "username"      # as authenticate_user takes an unknown method
+    from sqlalchemy import case, func, or_
+    from app.core.email_identity import normalize_email
+    by_username = login_identifier != "email"
+    match = [User.username == typed] if by_username else []
+    address = normalize_email(typed) if login_identifier != "username" else None
+    if address:
+        match.append(func.lower(User.email) == func.lower(address))
+    if not match:
+        return None
     try:
-        rows = db.query(User).filter(or_(*match)).limit(3).all()
+        rows = (db.query(User).filter(or_(*match))
+                .order_by(case((User.username == typed, 0), else_=1)).limit(3).all())
     except Exception:  # noqa: BLE001 -- the row is still written, as a typed name
         return None
-    by_name = [u for u in rows if u.username == typed]
-    if by_name:
-        return by_name[0]
+    if by_username:
+        by_name = [u for u in rows if u.username == typed]
+        if by_name:
+            return by_name[0]
     return rows[0] if len(rows) == 1 else None
+
+
+def credential_named(db, typed):
+    """The temporary credential a name typed at a failed sign-in names, or None: (id, owner's account id, name)
+    of the credential with exactly that name, as both doors look one up, live or not. One query. Never raises:
+    a failed lookup leaves the name a typed one."""
+    if not isinstance(typed, str) or not typed.startswith(TEMP_CREDENTIAL_PREFIX):
+        return None
+    from app.core.models import TemporaryCredential
+    try:
+        return (db.query(TemporaryCredential.id, TemporaryCredential.user_id, TemporaryCredential.temp_username)
+                .filter(TemporaryCredential.temp_username == typed).first())
+    except Exception:  # noqa: BLE001 -- the row is still written, as a typed name
+        return None
 
 
 class AuditLogger:
@@ -128,6 +160,7 @@ class AuditLogger:
         channel: Optional[str] = None,
         timestamp: Optional[datetime] = None,
         names_account: bool = False,
+        temp_credential=None,
     ) -> AuditLog:
         """The row log_action writes for these arguments, neither added to a session nor committed.
 
@@ -140,11 +173,15 @@ class AuditLogger:
         where they are known.
 
         ``timestamp`` is the row's time, now by default, which is what log_action stores. ``names_account``
-        says that ``username``, given without a user, is an account's username rather than a name someone
-        typed, so the level of typed names does not apply to it (a failed sign-in for an account).
+        says that ``username``, given without a user, is an account's username or a temporary credential's
+        name rather than a name someone typed, so the level of typed names does not apply to it (a failed
+        sign-in for an account or a credential). ``temp_credential``, given without a user, is the (id, name)
+        of the temporary credential the row is about (a failed sign-in with its name).
         """
         temp_credential_id = None
         temp_credential_name = None
+        if temp_credential is not None and not user:
+            temp_credential_id, temp_credential_name = temp_credential
         if user:
             user_id = user.id
             username = user.username
@@ -269,29 +306,43 @@ class AuditLogger:
         reason: str,
         *,
         account: Optional[User] = None,
+        login_identifier: str = "username",
     ):
         """Log failed login attempt, and its security record in the same commit (the name and address in
         full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id.
 
-        A name that is an account's (``account``, or the account the typed name names: account_named) is
-        recorded as that account's username, as every account's is, whatever the level of typed names; only a
-        name that is no account follows that level."""
+        A name that is an account's (``account``, or the account the sign-in tried under ``login_identifier``,
+        the sign-in method in force: account_named) is recorded as that account's username, as every account's
+        is, whatever the level of typed names. A temporary credential's name (credential_named) is recorded in
+        full with the credential, as its successful sign-ins are. Only a name that is neither follows that
+        level."""
         from app.core import security_records
+        credential = None
         if account is None:
-            account = account_named(self.db, username)
+            credential = credential_named(self.db, username)
+            if credential is None:
+                account = account_named(self.db, username, login_identifier)
+        if account is not None:
+            recorded_name = account.username
+        elif credential is not None:
+            recorded_name = credential.temp_username
+        else:
+            recorded_name = username
         row = self.build_row(
             action="login_failure",
             status="failure",
-            username=account.username if account is not None else username,
+            username=recorded_name,
             ip_address=ip_address,
             details={'reason': reason},
             error_message=reason,
-            names_account=account is not None,
+            names_account=account is not None or credential is not None,
+            temp_credential=(credential.id, credential.temp_username) if credential is not None else None,
         )
         self.db.add(row)
         record = security_records.record(self.db, kind=security_records.LOGIN, name=username,
                                          address=ip_address or _request_address(), channel=row.channel,
-                                         reason=reason)
+                                         reason=reason,
+                                         account_id=credential.user_id if credential is not None else None)
         record_id = record.id
         self.db.commit()
         return record_id

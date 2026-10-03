@@ -453,9 +453,10 @@ def test_a_failed_sign_in_for_an_account_names_the_account_at_every_level(factor
     row = _failed_sign_in(factory, channel, level, "ada")
     assert (row.username, row.user_id, row.channel, row.privacy_version) == ("ada", None, channel, 7)
     assert "signin_name" not in (row.recorded or {})
-    # By its email address, the account's username, never the address.
-    row = _failed_sign_in(factory, channel, level, "Grace@Example.test")
-    assert row.username == "grace" and "signin_name" not in (row.recorded or {})
+    # By its email address where the sign-in method takes one, the account's username, never the address.
+    for method in ("email", "either"):
+        row = _failed_sign_in(factory, channel, level, "Grace@Example.test", login_identifier=method)
+        assert row.username == "grace" and "signin_name" not in (row.recorded or {}), method
     # The account the server already found (the SFTP door refusing an account its settings shut out).
     db = factory()
     ada = db.query(User).filter(User.username == "ada").one()
@@ -475,16 +476,134 @@ def test_an_address_two_accounts_share_names_neither(factory):
     _accounts(factory, ("bob", "Bob@example.test"), ("rob", "bob@example.test"), ("ada", "ada@example.test"))
     db = factory()
     try:
-        assert audit_logger.account_named(db, "bob@example.test") is None
-        assert audit_logger.account_named(db, "ada@EXAMPLE.test").username == "ada"
+        for method in ("email", "either"):
+            assert audit_logger.account_named(db, "bob@example.test", method) is None
+            assert audit_logger.account_named(db, "ada@EXAMPLE.test", method).username == "ada"
+            # Spaces around an address, as the sign-in's own lookup takes them.
+            assert audit_logger.account_named(db, "  ada@example.test ", method).username == "ada"
         assert audit_logger.account_named(db, "rob").username == "rob"
         assert audit_logger.account_named(db, "") is None and audit_logger.account_named(db, None) is None
-        # An address-shaped username is found by its username first.
+        # An address-shaped username is found by its username first, and by email only by its address.
         db.add(User(username="ada@example.test", email="other@example.test", password_hash="x"))
         db.commit()
-        assert audit_logger.account_named(db, "ada@example.test").username == "ada@example.test"
+        assert audit_logger.account_named(db, "ada@example.test", "either").username == "ada@example.test"
+        assert audit_logger.account_named(db, "ada@example.test", "email").username == "ada"
+        # By email, an address two accounts share names neither, even where one's username is that address.
+        db.add(User(username="carol@example.test", email="carol@example.test", password_hash="x"))
+        db.add(User(username="carl", email="Carol@example.test", password_hash="x"))
+        db.commit()
+        assert audit_logger.account_named(db, "carol@example.test", "email") is None
+        assert audit_logger.account_named(db, "carol@example.test", "either").username == "carol@example.test"
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("method,by_username,by_address", [
+    ("username", True, False),
+    ("email", False, True),
+    ("either", True, True),
+    ("anything else", True, False),     # as the sign-in takes a method it does not know: by username
+])
+def test_a_name_names_an_account_only_where_the_sign_in_method_takes_it(factory, method, by_username, by_address):
+    """The account is named only when the sign-in could have tried it, which is also what the account's lock
+    counts. SFTP always signs in by username, and so does the web unless its method says otherwise."""
+    _accounts(factory, ("ada", "ada@example.test"))
+    db = factory()
+    try:
+        found = audit_logger.account_named(db, "ada", method)
+        assert (found is not None and found.username == "ada") is by_username
+        found = audit_logger.account_named(db, "Ada@Example.test", method)
+        assert (found is not None and found.username == "ada") is by_address
+    finally:
+        db.close()
+    for level in ("full", "none"):
+        row = _failed_sign_in(factory, "web", level, "ada@example.test", login_identifier=method)
+        if by_address:
+            assert row.username == "ada", level
+        else:
+            assert row.username == ("ada@example.test" if level == "full" else None), level
+    # Without a method, by username, as SFTP signs in.
+    row = _failed_sign_in(factory, "sftp", "none", "ada@example.test")
+    assert row.username is None
+
+
+class _BrokenSession:
+    """A session whose every query fails."""
+
+    def query(self, *entities, **kwargs):
+        raise RuntimeError("the database is gone")
+
+
+def test_a_failed_lookup_leaves_the_name_a_typed_one(factory):
+    broken = _BrokenSession()
+    for method in ("username", "email", "either"):
+        assert audit_logger.account_named(broken, "ada@example.test", method) is None
+    assert audit_logger.credential_named(broken, "temp_abc") is None
+    # The row is still written, with the name as a typed one.
+    from app.core.models import SecurityRecord
+    _accounts(factory, ("ada", "ada@example.test"))
+    ap.use(ap.Policy(7, _levels(signin_names="fingerprint")))
+    db = factory()
+    SecurityRecord.__table__.create(db.get_bind(), checkfirst=True)
+    real = db.query
+
+    def query(*entities, **kwargs):
+        if entities and entities[0] is User:
+            raise RuntimeError("users cannot be read")
+        return real(*entities, **kwargs)
+
+    db.query = query
+    try:
+        AuditLogger(db).log_login_failure("ada", "198.51.100.77", "Invalid username or password")
+    finally:
+        db.close()
+    row = _stored(factory)
+    assert (row.action, row.username, row.privacy_version) == ("login_failure", None, 7)
+    assert (row.recorded or {}).get("signin_name") == fp.fingerprint(fp.SIGNIN, "ada")
+
+
+def _credential(factory, owner, name):
+    from datetime import datetime, timedelta
+    from app.core.models import TemporaryCredential
+    db = factory()
+    TemporaryCredential.__table__.create(db.get_bind(), checkfirst=True)
+    account = db.query(User).filter(User.username == owner).one()
+    later = datetime.utcnow() + timedelta(hours=1)
+    cred = TemporaryCredential(user_id=account.id, temp_username=name, credential_hash="x", expires_at=later,
+                               deactivate_at=later)
+    db.add(cred)
+    db.commit()
+    ids = (cred.id, account.id)
+    db.close()
+    return ids
+
+
+@pytest.mark.parametrize("channel", ["web", "sftp"])
+@pytest.mark.parametrize("level", ["full", "fingerprint", "none"])
+def test_a_failed_sign_in_for_a_temporary_credential_names_it_at_every_level(factory, channel, level):
+    from app.core.models import SecurityRecord
+    _accounts(factory, ("ada", "ada@example.test"), ("temp_lookalike", None))
+    cred_id, owner_id = _credential(factory, "ada", "temp_ada_1")
+    for method in ("username", "email", "either"):
+        row = _failed_sign_in(factory, channel, level, "temp_ada_1", login_identifier=method)
+        assert (row.username, row.user_id, row.temp_credential_id, row.temp_credential_name) == (
+            "temp_ada_1", None, cred_id, "temp_ada_1"), method
+        assert "signin_name" not in (row.recorded or {}) and row.privacy_version == 7
+    db = factory()
+    try:
+        # Its security record is the account's that holds the credential.
+        owners = {r.account_id for r in db.query(SecurityRecord).filter(SecurityRecord.name == "temp_ada_1")}
+        assert owners == {owner_id}
+    finally:
+        db.close()
+    # A name of a temporary credential's shape that is none, or differs from one only in case, follows the
+    # level, and is never taken for an account's: both doors try such a name as a credential.
+    for typed in ("temp_nobody", "TEMP_ADA_1", "temp_ADA_1", "temp_lookalike"):
+        row = _failed_sign_in(factory, channel, level, typed, login_identifier="either")
+        assert (row.temp_credential_id, row.temp_credential_name) == (None, None), typed
+        assert row.username == (typed if level == "full" else None), typed
+        kept = fp.fingerprint(fp.SIGNIN, typed) if level == "fingerprint" else None
+        assert (row.recorded or {}).get("signin_name") == kept, typed
 
 
 def test_a_row_written_without_the_levels_keeps_an_accounts_name_and_drops_a_typed_one(factory, monkeypatch):

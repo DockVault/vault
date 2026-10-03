@@ -5,8 +5,10 @@ failed sign-in is recorded in full, stamped with the version. A version stored i
 stores one) is read by the web app and the SFTP server within seconds: at a shortened address and no typed
 names, a failed web sign-in and a failed SFTP password keep only the network the address is in, and the
 Events filters find such a row by its address and by a block. A failed sign-in for an account names the
-account at every level of typed names, on the web and over SFTP; only a name that is no account follows the
-level. The table is set back afterwards with a newer version. test_audit_privacy.py covers the rules offline.
+account at every level of typed names, on the web and over SFTP, and so does one for a temporary credential;
+an email address names its account only where the sign-in method takes one (the web's, never SFTP); any other
+name follows the level. The table is set back afterwards with a newer version. test_audit_privacy.py covers
+the rules offline.
 """
 import os
 import subprocess
@@ -179,3 +181,84 @@ def test_a_failed_sign_in_for_an_account_names_it_on_web_and_sftp_at_every_level
         assert t_fp.startswith("fp1:") if level == "fingerprint" else t_fp == "", channel
         assert typed not in t_fp
     reset_sign_in_throttle()
+
+
+@pytest.mark.parametrize("level", ["full", "fingerprint", "none"])
+def test_a_failed_sign_in_for_a_temporary_credential_names_it_on_web_and_sftp_at_every_level(
+        admin, levels_restored, level):
+    tc = admin.post("/auth/temp-credentials", json={"note": unique("signin-name")}).json()
+    name = tc["temp_username"]
+    cred_id, owner_id = psql(f"SELECT id, user_id FROM temporary_credentials WHERE temp_username = '{name}'").split("|")
+    ghost = "temp_" + uuid.uuid4().hex[:16]     # a temporary credential's shape, but none
+    try:
+        version = _store(dict(levels_restored, signin_names=level))
+        reset_sign_in_throttle()
+        agent = f"recording-levels-credential/{uuid.uuid4().hex}"
+        started = psql("SELECT now() AT TIME ZONE 'utc'")
+        for typed in (name, ghost):
+            r = requests.post(f"{BASE_URL}/auth/login", json={"username": typed, "password": "wrong-secret"},
+                              headers={"User-Agent": agent}, timeout=30)
+            assert r.status_code in (401, 429), r.text[:200]
+            _sftp_password_fails(typed)
+
+        def rows():
+            out = psql("SELECT channel, coalesce(username, ''), user_id IS NULL, coalesce(temp_credential_id::text, ''), "
+                       "coalesce(temp_credential_name, ''), coalesce(recorded->>'signin_name', '') "
+                       f"FROM audit_logs WHERE action = 'login_failure' AND privacy_version = {version} "
+                       f"AND timestamp >= '{started}' AND (user_agent = '{agent}' OR channel = 'sftp') "
+                       "ORDER BY timestamp")
+            found = [line.split("|") for line in out.splitlines() if line]
+            return found if len(found) >= 4 else None
+
+        found = _wait_for(rows)
+        assert found and len(found) == 4, found
+        by_channel = {}
+        for channel, username, no_user_id, row_cred, row_cred_name, signin_name in found:
+            by_channel.setdefault(channel, []).append((username, no_user_id, row_cred, row_cred_name, signin_name))
+        for channel in ("web", "sftp"):
+            credential, other = by_channel[channel]
+            assert credential == (name, "t", cred_id, name, ""), channel
+            assert other[:4] == ((ghost if level == "full" else ""), "t", "", ""), channel
+            assert other[4].startswith("fp1:") if level == "fingerprint" else other[4] == "", channel
+            assert ghost not in other[4]
+        # The security records keep the name in full, with the account that holds the credential.
+        owners = psql(f"SELECT DISTINCT coalesce(account_id::text, '') FROM security_records WHERE name = '{name}'")
+        assert owners.split() == [owner_id]
+    finally:
+        reset_sign_in_throttle()
+        admin.delete(f"/api/user-management/temp-credentials/{cred_id}")
+
+
+def test_an_address_names_the_account_only_where_the_sign_in_method_takes_one(admin, temp_user, levels_restored):
+    account = temp_user["_username"]
+    address = psql(f"SELECT email FROM users WHERE username = '{account}'")
+    assert address and "@" in address
+    before = admin.get("/settings").json().get("login_identifier")
+    version = _store(dict(levels_restored, signin_names="full"))
+
+    def failed_rows(agent, started):
+        def rows():
+            out = psql("SELECT channel, coalesce(username, '') FROM audit_logs WHERE action = 'login_failure' "
+                       f"AND privacy_version = {version} AND timestamp >= '{started}' "
+                       f"AND (user_agent = '{agent}' OR channel = 'sftp') ORDER BY timestamp")
+            found = [tuple(line.split("|")) for line in out.splitlines() if line]
+            return found if len(found) >= 2 else None
+        return _wait_for(rows)
+
+    try:
+        for method, web_name in (("username", address), ("either", account)):
+            r = admin.put("/settings", json={"login_identifier": method})
+            assert r.status_code == 200, r.text[:200]
+            reset_sign_in_throttle()
+            agent = f"recording-levels-method/{uuid.uuid4().hex}"
+            started = psql("SELECT now() AT TIME ZONE 'utc'")
+            r = requests.post(f"{BASE_URL}/auth/login", json={"username": address, "password": "wrong-password"},
+                              headers={"User-Agent": agent}, timeout=30)
+            assert r.status_code in (401, 429), r.text[:200]
+            # SFTP signs in by username whatever the web's method, so an address there names no account.
+            _sftp_password_fails(address)
+            found = failed_rows(agent, started)
+            assert found == [("web", web_name), ("sftp", address)], (method, found)
+    finally:
+        admin.put("/settings", json={"login_identifier": before or "username"})
+        reset_sign_in_throttle()
