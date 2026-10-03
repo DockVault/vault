@@ -644,8 +644,8 @@ def test_a_browser_sealed_key_opens_in_the_reference_and_its_check_matches():
 
 
 def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
-    """The tag verifies only whole: the right tag with any one byte changed, with a byte appended or
-    with a byte dropped is refused."""
+    """The tag verifies only whole: the right tag with any one bit of any byte flipped, with a byte
+    appended or with a byte dropped is refused."""
     out = _node("""
   const res = { checks: [], lineage: {} };
   for (const d of V.dek_check) res.checks.push(await lib.dekCheck(await aes(d.dek_hex), d.vault_id, d.dek_epoch));
@@ -656,9 +656,11 @@ def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
     const tag = Buffer.from(l.lineage_tag_b64, 'base64');
     const flipped = [];
     for (let i = 0; i < tag.length; i++) {
-      const changed = Buffer.from(tag);
-      changed[i] ^= 1;
-      flipped.push(await lib.verifyKeyLineageTag(prev, f, changed.toString('base64')));
+      for (let bit = 0; bit < 8; bit++) {
+        const changed = Buffer.from(tag);
+        changed[i] ^= 1 << bit;
+        flipped.push(await lib.verifyKeyLineageTag(prev, f, changed.toString('base64')));
+      }
     }
     const near = {};
     for (const [name, bytes] of Object.entries({
@@ -681,7 +683,7 @@ def test_the_browser_key_check_and_lineage_tag_reproduce_the_vectors():
     for ln in v["lineage"]:
         assert out["lineage"][ln["mode"]] == {
             "tag": ln["lineage_tag_b64"], "verifies": True, "other_field": False, "other_dek": False,
-            "garbage": False, "flipped": [False] * 32,
+            "garbage": False, "flipped": [False] * (32 * 8),
             "near": {"appended_zero": False, "appended_copy": False, "dropped_last": False, "dropped_first": False},
         }, ln["mode"]
 
