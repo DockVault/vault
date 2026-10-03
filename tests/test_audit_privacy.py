@@ -101,6 +101,81 @@ def _wrappers(trees):
     return found
 
 
+def _names_in(node, name):
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def _module_of(path, root):
+    return ".".join(path.relative_to(root).with_suffix("").parts)
+
+
+def _imported(tree, root):
+    """local name -> (module, name) for every ``from module import name`` in a file."""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                out[alias.asname or alias.name] = (node.module, alias.name)
+    return out
+
+
+def _kwargs_wrappers(trees, wrappers, root=ROOT):
+    """(module, name) -> its named parameters, for every function that takes ``**kwargs`` and hands them on as
+    an audit write's details: inside the details it passes to a write or a helper, or spread (``**kwargs``) into
+    another such function. A call's keyword arguments other than the named ones are then detail keys. A helper is
+    matched where it is defined and where it is imported by name, so another module's function of the same name
+    is not taken for it."""
+    fns = [(_module_of(path, root), tree, fn) for path, tree in trees.items() for fn in ast.walk(tree)
+           if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.args.kwarg]
+    imports = {_module_of(path, root): _imported(tree, root) for path, tree in trees.items()}
+    found = {}
+    changed = True
+    while changed:
+        changed = False
+        for module, tree, fn in fns:
+            if (module, fn.name) in found:
+                continue
+            spread = fn.args.kwarg.arg
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call):
+                    continue
+                callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+                given = [kw.value for kw in call.keywords if kw.arg == "details"]
+                if callee in wrappers:
+                    given += [call.args[i] for i in wrappers[callee] if i < len(call.args)]
+                onward = (_kwargs_helper(found, imports, module, callee) is not None
+                          and any(kw.arg is None and _names_in(kw.value, spread) for kw in call.keywords))
+                if onward or any(_names_in(node, spread) for node in given):
+                    found[(module, fn.name)] = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+                    changed = True
+                    break
+    return found, imports
+
+
+def _kwargs_helper(found, imports, module, callee):
+    """The named parameters of the kwargs helper a call in ``module`` to ``callee`` reaches, or None."""
+    if (module, callee) in found:
+        return found[(module, callee)]
+    origin = imports.get(module, {}).get(callee)
+    return found.get(origin) if origin else None
+
+
+def _spreads_into_a_write(trees):
+    """Every function that spreads its ``**kwargs`` straight into an audit write, where the scan cannot see the
+    details its callers pass."""
+    out = []
+    for path, tree in trees.items():
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or not fn.args.kwarg:
+                continue
+            for call in ast.walk(fn):
+                callee = getattr(getattr(call, "func", None), "attr", None) or getattr(getattr(call, "func", None), "id", None)
+                if (isinstance(call, ast.Call) and callee in AUDIT_FUNCTIONS
+                        and any(kw.arg is None and _names_in(kw.value, fn.args.kwarg.arg) for kw in call.keywords)):
+                    out.append(f"{path.name}:{fn.name}")
+    return out
+
+
 def _returned_dicts(trees):
     """function name -> the dict expressions it returns (directly, or through a name it assigned one to)."""
     out = collections.defaultdict(list)
@@ -151,6 +226,7 @@ def detail_paths(trees, root=ROOT):
     """path -> where it is written, for every literal detail key reachable from an audit write: a dict passed
     as details, or assigned (or subscript-assigned) to the name passed, in the same function."""
     wrappers = _wrappers(trees)
+    kwargs_wrappers, imports = _kwargs_wrappers(trees, wrappers, root)
     returned = _returned_dicts(trees)
     found = collections.defaultdict(set)
     for path, tree in trees.items():
@@ -170,6 +246,15 @@ def detail_paths(trees, root=ROOT):
                 if not isinstance(call, ast.Call):
                     continue
                 callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+                named = _kwargs_helper(kwargs_wrappers, imports, _module_of(path, root), callee)
+                if named is not None:
+                    # A helper that takes the details as its keyword arguments: each one it does not name.
+                    where = f"{path.relative_to(root).as_posix()}:{call.lineno}"
+                    for kw in call.keywords:
+                        if kw.arg and kw.arg not in named:
+                            found[kw.arg].add(where)
+                            for key in _paths(kw.value, kw.arg + "."):
+                                found[key].add(where)
                 if callee not in wrappers:
                     continue
                 given = [kw.value for kw in call.keywords if kw.arg == "details"]
@@ -203,6 +288,13 @@ def test_every_detail_key_a_call_site_writes_is_classified():
     unclassified = {p: sorted(w)[:2] for p, w in paths.items() if ap.kind_of(p) is None}
     assert not unclassified, ("detail keys with no recording kind; add each to audit_privacy.DETAIL_KEYS "
                               f"with what it holds: {unclassified}")
+    # A helper that hands its keyword arguments on as the details is read too (Email Studio's), and none spreads
+    # them into a write itself, where its callers' details could not be read.
+    for wanted in ("action_key", "template_id", "recipients", "filename", "promoted_default"):
+        assert wanted in paths, wanted
+    assert _spreads_into_a_write(_trees()) == []
+    # A file name kept as written is only ever an Email Studio image's: a vault's file names are file_name.
+    assert {w.split(":")[0] for w in paths["filename"]} == {"app/api/email_studio_router.py"}
 
 
 def test_the_scan_finds_a_key_through_a_variable_and_a_wrapper_and_reports_it(tmp_path):
@@ -215,10 +307,52 @@ def test_the_scan_finds_a_key_through_a_variable_and_a_wrapper_and_reports_it(tm
             details["second_made_up"] = 2
             AuditLogger(db).build_row(action="y", status="success", details=details)
             _helper(db, actor, {"third_made_up": {"inner_made_up": 3}})
+
+        def _kw_helper(db, request, user, action, **details):
+            AuditLogger(db).log_action(action=action, status="success", user=user, details=details or None)
+
+        def _kw_onward(db, user, *, note=None, **more):
+            _kw_helper(db, None, user, "z", **more)
+
+        def other_route(db, actor, request):
+            _kw_helper(db, request, actor, "w", fourth_made_up=1, fifth_made_up={"sixth_made_up": 2})
+            _kw_onward(db, actor, note="named, not a detail", seventh_made_up=3)
     ''')
-    found = detail_paths({tmp_path / "fake.py": ast.parse(source)}, root=tmp_path)
-    assert set(found) == {"made_up_key", "second_made_up", "third_made_up", "third_made_up.inner_made_up"}
+    elsewhere = textwrap.dedent('''
+        from fake import _kw_helper
+
+        def third_route(db, actor, request):
+            _kw_helper(db, request, actor, "v", eighth_made_up=1)
+    ''')
+    unrelated = textwrap.dedent('''
+        def _kw_helper(kind, **extra):
+            print(kind, extra)
+
+        def _logs(db, **extra):
+            AuditLogger(db).log_action(action="u", status="success", details=None)
+
+        def fourth_route():
+            _kw_helper("a", not_a_detail=1)
+            _logs(None, nor_this=2)
+    ''')
+    trees = {tmp_path / name: ast.parse(text)
+             for name, text in (("fake.py", source), ("elsewhere.py", elsewhere), ("unrelated.py", unrelated))}
+    found = detail_paths(trees, root=tmp_path)
+    assert set(found) == {"made_up_key", "second_made_up", "third_made_up", "third_made_up.inner_made_up",
+                          "fourth_made_up", "fifth_made_up", "fifth_made_up.sixth_made_up", "seventh_made_up",
+                          "eighth_made_up"}
     assert [p for p in found if ap.kind_of(p) is not None] == []
+
+
+def test_a_helper_that_spreads_its_keyword_arguments_into_a_write_is_reported(tmp_path):
+    source = textwrap.dedent('''
+        def _opaque(db, **fields):
+            AuditLogger(db).log_action(**fields)
+
+        def _plain(db, **fields):
+            AuditLogger(db).log_action(action="x", status="success", details=None)
+    ''')
+    assert _spreads_into_a_write({tmp_path / "fake.py": ast.parse(source)}) == ["fake.py:_opaque"]
 
 
 def test_the_registry_holds_only_known_kinds_and_its_names_are_the_redacted_names():
@@ -320,6 +454,17 @@ def test_secrets_are_never_recorded_and_an_error_keeps_only_its_type(factory):
     row = _write(factory, "web", levels=FULL_LEVELS, details={"error": "boom: the file q3.xlsx is gone"},
                  action="file_upload")
     assert row.details == {}
+
+
+def test_a_count_is_kept_only_as_a_number(factory):
+    details = {"template_id": "t-1", "sent": 2, "failed": 0, "attempted": 2, "recipients": 3, "errors": 1}
+    row = _write(factory, "web", levels={k: ap.NONE for k in ap.POLICY_KEYS}, details=details,
+                 action="email_template_sent")
+    assert row.details == details
+    listed = {"recipients": ["ada@example.test"], "errors": [{"recipient": "ada@example.test"}], "sent": "2"}
+    row = _write(factory, "web", levels=FULL_LEVELS, details=listed, action="email_template_sent")
+    assert row.details == {}
+    assert "example.test" not in repr(row.recorded)
 
 
 def test_filter_values_follow_their_kinds(factory):

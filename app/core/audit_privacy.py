@@ -132,8 +132,9 @@ AGENT = "user_agent"
 IDENTIFIER = "identifier"     # always recorded: ids, counts, roles, usernames, labels, settings, reasons
 SECRET = "secret"             # never recorded
 ERROR = "error"               # only an exception's type
+COUNT = "count"               # only a number: a key whose name could also hold a list keeps nothing else
 NESTED = "nested"             # a dict whose own keys are classified, under "<key>."
-KINDS = (NAME, SIGNIN_NAME, EMAIL, ADDRESS, AGENT, IDENTIFIER, SECRET, ERROR, NESTED)
+KINDS = (NAME, SIGNIN_NAME, EMAIL, ADDRESS, AGENT, IDENTIFIER, SECRET, ERROR, COUNT, NESTED)
 # The policy key that sets each personal kind's level.
 KIND_POLICY = {NAME: NAMES, SIGNIN_NAME: SIGNIN_NAMES, EMAIL: EMAILS, ADDRESS: IP, AGENT: USER_AGENT}
 
@@ -176,6 +177,10 @@ _IDENTIFIER_KEYS = (
     "expire_files_after_days", "expire_files_unit", "unlock_remember_minutes",
     # a settings value before and after a change, and a recording policy
     "old", "new", "version", "previous_version", "levels", "limits",
+    # Email Studio: its sending profiles, templates, automatic emails and the images templates use; a file name
+    # here is the name of an image an administrator uploaded, which every administrator sees in Email Studio
+    "profile_id", "promoted_default", "template_id", "action_key", "enabled", "resource_id", "filename",
+    "content_type", "byte_size",
 )
 
 DETAIL_KEYS: Dict[str, str] = {key: IDENTIFIER for key in _IDENTIFIER_KEYS}
@@ -191,6 +196,8 @@ DETAIL_KEYS.update({
     "session_token": SECRET, "token": SECRET, "password": SECRET, "passcode": SECRET, "secret": SECRET,
     "code": SECRET, "otp": SECRET, "link_token": SECRET,
     "error": ERROR,
+    # how many messages an email from a template went to, was sent, failed or could not be built for
+    "recipients": COUNT, "attempted": COUNT, "sent": COUNT, "failed": COUNT, "errors": COUNT,
     # what changed on a settings save or an account: the setting's or field's name, then its old and new
     # value; an account's email address is an email address
     "changes": NESTED,
@@ -606,6 +613,8 @@ class _Recorder:
             return False, None
         if kind == ERROR:
             return (True, value) if isinstance(value, str) and _TYPE_NAME.fullmatch(value) else (False, None)
+        if kind == COUNT:
+            return (True, value) if isinstance(value, int) else (False, None)
         if kind == NESTED:
             if not isinstance(value, dict):
                 return True, value
