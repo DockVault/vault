@@ -3,8 +3,8 @@
 What a DockVault deployment stores about people: where, which fields, why, for how long, and how it
 is erased. It is written for the operator of a deployment (in GDPR terms, the controller) filling in
 a record of processing activities (Art. 30) or a privacy notice (Art. 13 and 14). It describes
-version 0.33.0. Entries marked **New in 0.33.0** are what that release started storing; the list is
-repeated at the end.
+version 0.33.2. Entries marked **New in 0.33.0**, **New in 0.33.1** or **New in 0.33.2** are what that
+release started storing; each release's list is repeated at the end.
 
 DockVault is software you run. Nothing described here leaves your deployment unless you configure it
 to: email goes through the SMTP server you set, the optional update check sends no personal data
@@ -68,7 +68,9 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `groups`, `user_groups`, `user_permissions`, `user_endpoint_permissions` | Group names and descriptions; who belongs to which group with what role, who added them and when; granted permissions. | Access control. | Until changed. **New in 0.33.0:** a change of role resets an account's granted permissions (`user_endpoint_permissions`) to the new role's defaults, keeping those another administrator granted it. | An administrator; memberships and grants are deleted with the account. |
 | `vault_members`, `vault_group_access`, `vault_favorites`, `vault_views` | Who can use which vault and how, who added them and when; a person's starred vaults and when they last opened each. | Access control; the vault list's order. | Until changed. | The vault owner or an administrator; deleted with the account or the vault. |
 | `shares`, `share_claims` | Who shared what with which people or departments, limits, status; who claimed it, when they last used it, how many downloads. | Sharing inside the deployment. | After expiry or revocation too, until the shared item, the vault or the sharer's account is deleted. | Deleting the item, the vault or the account. |
-| `user_keypairs`, `vault_member_keys`, `vault_member_index_keys`, `zk_share_invites`, `vault_key_proofs` | Public keys, fingerprints, wrapped keys, who granted or revoked them. **New in 0.33.2:** `vault_key_proofs` holds each zero-knowledge key epoch's proof material (a public key, a sealed key and two MACs, none of them personal) and the id of the account that installed it. | Zero-knowledge vaults. | Until revoked or replaced; a key epoch's proof material until the vault is deleted or the epoch is retired. | Deleted with the account or the vault; the installer's id is cleared when that account is deleted. |
+| `user_keypairs`, `vault_member_keys`, `vault_member_index_keys`, `zk_share_invites` | Public keys, fingerprints, wrapped keys, who granted or revoked them. | Zero-knowledge vaults. | Until revoked or replaced. | Deleted with the account or the vault. |
+| `vault_key_proofs` **New in 0.33.2** | For each key epoch of a zero-knowledge vault: the vault, the epoch, how it was set up (`create`, `rotate`, `bootstrap` or `owner_reset`), when, and the id of the account that installed it (`created_by`), the only column that points to a person. The proof material beside it (a public key, a sealed private key and two MACs) is derived from the vault's key and says nothing about anyone. | A change to the vault's keys (rotating, sharing, setting the name-index key) must prove it holds the current epoch's key; the account id says who set up each epoch's check. | Until the vault is deleted, or until its epoch is retired (an epoch below the oldest one still in use, when a manager retires old key versions). | Deleted with the vault; retiring the epoch; `created_by` is cleared (set to empty) when that account is deleted, and the row stays for the vault. |
+| `zk_key_proof_challenges` **New in 0.33.2** | The id of the account a challenge was issued to (`user_id`), the vault it is for, the operation, the key epochs, a sealed one-time server key, a random nonce, a hash of the vault's verifying key, and when it was issued. | Each key change to a zero-knowledge vault answers a one-time challenge issued to that account for that vault and operation; the account id makes sure only the account it was issued to can use it. At most 32 live challenges per account. | Five minutes. A challenge is deleted as soon as it is answered. | Answering it; the account's next challenge request deletes its expired ones; the periodic cleanup (every 5 minutes) deletes the rest; deleted with the account. |
 
 ### Content
 
@@ -107,10 +109,8 @@ Visits to a link and uploads through one are also in the audit log.
 
 `system_settings`, `schema_steps`, `retired_object_ids`, `share_tags`, `note_link_tags`,
 `receiver_tags`, `second_factor_actions`, `email_actions`, `email_profiles`, `email_templates`,
-`email_resources`, `vault_storage_grants`, `vault_key_history`, `ecc_registration_challenges`,
-`ecc_key_update_challenges` and `zk_key_proof_challenges` hold settings, policies, templates, storage
-allocations and key material. (`zk_key_proof_challenges`, **new in 0.33.2**, also holds the id of the vault
-a challenge is for; its rows last five minutes and the periodic cleanup deletes them.)
+`email_resources`, `vault_storage_grants`, `vault_key_history`, `ecc_registration_challenges` and
+`ecc_key_update_challenges` hold settings, policies, templates, storage allocations and key material.
 Their only personal data is the id of the account that created, owns or was allocated an item, and
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
 account and group ids that may use a tag. `data_requirements` holds no personal data: each row
@@ -335,3 +335,18 @@ There is no built-in per-person erasure yet.
 - `active_sessions.channel`: whether a session was signed in over the web or SFTP.
 - `audit_logs`: `permission_default_granted`, when a start gives an account a permission its role gained
   by default in a newer release.
+
+## What 0.33.2 added
+
+- `vault_key_proofs`: for each zero-knowledge key epoch, the id of the account that set up its key
+  check, kept with the vault until the epoch is retired, and cleared when that account is deleted.
+- `zk_key_proof_challenges`: the id of the account each key-proof challenge was issued to, for five
+  minutes at most.
+- `audit_logs`: how each change to a zero-knowledge vault's keys was proved (`proof`), each refused key
+  proof (`zk_key_proof_failed`, with the operation and the part that failed), each change accepted
+  without one while the check is switched off (`zk_key_proof_absent`), each key check set up for an
+  older vault (`zk_key_proof_bootstrapped`) and each owner's reset of it (`zk_owner_key_reset`). The
+  proof itself and the request body are never stored.
+- Changed: the web app's forms are sent only by its scripts, never by the browser itself, so what is
+  typed into them (a username and password at sign-in included) no longer reaches an address, the
+  browser history or a reverse proxy's log when a form is sent before the page has finished loading.
