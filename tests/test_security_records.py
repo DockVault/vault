@@ -2,7 +2,8 @@
 
 Every failed sign-in the app audits (a web password, a second-factor code, an SFTP password) writes a
 security record in the same commit as its audit row, with the name as typed and the address in full whatever
-the audit row keeps. The pruner deletes records past the window (security_record_days, bounded by .env) and
+the audit row keeps; a record that cannot be written never costs the audit row (an alert says so instead).
+The pruner deletes records past the window (security_record_days, bounded by .env) and
 clears the names and addresses of older security alerts, resolved or not; alert messages hold placeholders
 instead of names and addresses, completed when shown. The security monitor's statistics read the records.
 These run on a throwaway SQLite database.
@@ -132,11 +133,16 @@ def test_the_settings_are_configured_documented_and_kept_by_the_tool(monkeypatch
 # --------------------------------------------------------------------------- writing it
 
 def test_a_failed_sign_in_writes_its_record_in_the_commit_of_its_audit_row(env, factory):
+    from app.core import request_context
     db = factory()
     alice = _user(db)
-    for name in ("alice", "no-such-name", "Alice@X.org", "nobody@x.org"):
-        record_id = audit_logger.AuditLogger(db).log_login_failure(name, "203.0.113.7", "Invalid credentials")
-        assert record_id is not None
+    request_context.set_process_default_channel("sftp")
+    try:
+        for name in ("alice", "no-such-name", "Alice@X.org", "nobody@x.org"):
+            record_id = audit_logger.AuditLogger(db).log_login_failure(name, "203.0.113.7", "Invalid credentials")
+            assert record_id is not None
+    finally:
+        request_context.set_process_default_channel(None)
     got = {r.name: r for r in _records(factory)}
     first = got["alice"]
     assert (first.kind, first.name, first.address, first.account_id, first.reason) == (
@@ -144,21 +150,52 @@ def test_a_failed_sign_in_writes_its_record_in_the_commit_of_its_audit_row(env, 
     assert got["no-such-name"].account_id is None
     assert got["Alice@X.org"].account_id == alice.id        # a sign-in by email address names its account
     assert got["nobody@x.org"].account_id is None
-    assert first.channel == factory().query(AuditLog).first().channel
+    assert first.channel == factory().query(AuditLog).first().channel == "sftp"
     rows = factory().query(AuditLog).filter(AuditLog.action == "login_failure").count()
     assert rows == 4
 
 
-def test_the_record_and_the_audit_row_commit_together_or_not_at_all(env, factory, monkeypatch):
-    def broken(*a, **k):
-        raise RuntimeError("no record")
+def _degraded_alerts():
+    from app.core import audit_privacy as ap
+    return [a for a in ap.pending_alerts() if a["reason"] == ap.RECORD_NOT_WRITTEN]
 
-    monkeypatch.setattr(srec, "record", broken)
+
+def test_a_record_that_cannot_be_written_never_costs_the_audit_row(env, factory):
+    """A fault in the security_records table alone (here it is gone, so its insert fails) loses the records,
+    never the audit rows written with them or the caller's answer: the methods return, the rows commit, and
+    an alert without any value of the failures tells the administrators."""
+    from app.core import audit_privacy as ap
     db = factory()
-    with pytest.raises(RuntimeError):
+    alice = _user(db)
+    SecurityRecord.__table__.drop(db.get_bind())
+    for name in ("alice", "no-such-name"):
+        assert audit_logger.AuditLogger(db).log_login_failure(name, "203.0.113.7", "Invalid credentials") is None
+    audit_logger.AuditLogger(db).log_second_factor_failure(alice, ip_address="192.0.2.5", details={"method": "totp"})
+    check = factory()
+    assert check.query(AuditLog).filter(AuditLog.action == "login_failure").count() == 2
+    assert check.query(AuditLog).filter(AuditLog.action == "second_factor_failed").count() == 1
+    # The session that wrote them goes on as usual.
+    assert db.query(User).filter(User.username == "alice").one().id == alice.id
+    # One alert for the process (the cooldown folds the repeats), with the error's type and the row's action.
+    assert _degraded_alerts() == [{"reason": ap.RECORD_NOT_WRITTEN, "subject": "OperationalError",
+                                   "action": "login_failure"}]
+    assert ap.flush_alerts(factory) == 1
+    (alert,) = check.query(SecurityAlert).all()
+    assert alert.event_type == ap.ALERT_EVENT and alert.details["reason"] == ap.RECORD_NOT_WRITTEN
+    assert "could not be written" in alert.message and "OperationalError" in alert.message
+    for value in ("alice", "no-such-name", "203.0.113.7", "192.0.2.5"):
+        assert value not in repr((alert.message, alert.details, alert.username, alert.ip_address))
+
+
+def test_an_audit_row_that_cannot_be_written_writes_no_record(env, factory):
+    """The other way round, the failure still raises as before, and its record is not written either."""
+    db = factory()
+    AuditLog.__table__.drop(db.get_bind())
+    with pytest.raises(sa.exc.OperationalError):
         audit_logger.AuditLogger(db).log_login_failure("alice", "203.0.113.7", "x")
     db.rollback()
-    assert factory().query(AuditLog).count() == 0
+    assert _records(factory) == []
+    assert _degraded_alerts() == []
 
 
 def test_the_record_keeps_full_values_whatever_the_audit_row_keeps(env, factory, monkeypatch):

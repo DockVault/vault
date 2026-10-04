@@ -790,6 +790,9 @@ def for_output(kind: str, value) -> str:
 
 UNCLASSIFIED = "unclassified"
 FAILED = "failed"
+# A failed sign-in's or second-factor code's security record (app/core/security_records.py) that could not be
+# written, while its audit row was (``subject`` is the error's type).
+RECORD_NOT_WRITTEN = "security_record"
 ALERT_EVENT = "audit_recording_degraded"
 # A process raises the same alert at most once in this many seconds.
 ALERT_COOLDOWN_SECONDS = 600.0
@@ -802,8 +805,8 @@ _alerts_sent: Dict[Tuple[str, str], float] = {}
 
 def raise_alert(reason: str, subject: Optional[str], action: Optional[str]) -> bool:
     """Queue an alert for the administrators: a detail key with no classification (``subject`` is its key)
-    or a row recorded without its personal values because deciding failed (``subject`` is the error's
-    type). Written by this process's background thread, never on the row's own transaction. Returns whether
+    or a row recorded without its personal values because deciding failed, or a failure's security record
+    that could not be written (for both, ``subject`` is the error's type). Written by this process's background thread, never on the row's own transaction. Returns whether
     it was queued (not within the cooldown of the same alert). No value of the row goes into it."""
     key = (reason, str(subject or ""))
     now = time.monotonic()
@@ -828,6 +831,10 @@ def alert_message(alert: Mapping[str, str]) -> str:
     if alert["reason"] == UNCLASSIFIED:
         return (f"An audit row of '{alert['action'] or 'an event'}' carried a detail ({alert['subject']}) "
                 "that nothing classifies, so it was not recorded. The event itself was recorded.")
+    if alert["reason"] == RECORD_NOT_WRITTEN:
+        return (f"Security records of failed sign-ins could not be written ({alert['subject']}), first on a "
+                f"'{alert['action'] or 'failed sign-in'}'. Their audit rows were recorded, but the failed sign-in "
+                "counts in the security metrics, which read these records, leave them out.")
     return (f"An audit row of '{alert['action'] or 'an event'}' was recorded without its personal values "
             f"(names, addresses, user agent), because deciding what to record failed "
             f"({alert['subject']}). The event itself was recorded, with recording version -1.")

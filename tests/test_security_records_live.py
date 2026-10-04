@@ -1,8 +1,8 @@
 """The security record on a running stack (app/core/security_records.py).
 
 A failed web sign-in, a rejected second-factor code and a failed SFTP password each write a security
-record with the name as typed, the address and the way in, in the commit of the failure's audit row. An
-alert raised by repeated failures holds placeholders instead of the name and the address, is shown with
+record with the name as typed, the address and the way in, in the commit of the failure's audit row; a record
+the database refuses costs neither the audit row nor the answer, and raises an alert instead. An alert raised by repeated failures holds placeholders instead of the name and the address, is shown with
 them filled in, and is linked from the records that raised it. A pass of the pruner deletes records past
 the window and clears the names and addresses of alerts past it, resolved or not. test_security_records.py
 covers the rules offline.
@@ -110,6 +110,72 @@ def test_a_failed_sftp_password_writes_its_record(temp_user):
     kind, account, address, channel, reason, _ = rec[0]
     assert (kind, account, channel) == ("login_failure", temp_user["id"], "sftp")
     assert address and reason
+    reset_sign_in_throttle()
+
+
+def _refuse_records_for(name):
+    """Make the database refuse every security record for ``name`` (a trigger that raises, as a fault in that
+    one table would), and return the undo. Only this name's records are refused, so nothing else running on
+    the stack is touched."""
+    tag = uuid.uuid4().hex[:12]
+    psql(f"CREATE FUNCTION refuse_record_{tag}() RETURNS trigger LANGUAGE plpgsql AS "
+         "$$BEGIN RAISE EXCEPTION 'security record refused'; END$$")
+    psql(f"CREATE TRIGGER refuse_record_{tag} BEFORE INSERT ON security_records FOR EACH ROW "
+         f"WHEN (NEW.name = '{name}') EXECUTE FUNCTION refuse_record_{tag}()")
+
+    def undo():
+        psql(f"DROP TRIGGER IF EXISTS refuse_record_{tag} ON security_records")
+        psql(f"DROP FUNCTION IF EXISTS refuse_record_{tag}()")
+    return undo
+
+
+def _failure_rows(name, since):
+    """The ways in and actions of ``name``'s failed sign-in and second-factor rows since ``since``."""
+    out = psql("SELECT coalesce(channel, '') || '|' || action FROM audit_logs "
+               f"WHERE action IN ('login_failure', 'second_factor_failed') AND username = '{name}' "
+               f"AND timestamp >= '{since}' ORDER BY timestamp")
+    return [line for line in out.splitlines() if line]
+
+
+def test_a_record_the_database_refuses_never_costs_the_audit_row_or_the_answer(temp_user, temp_user_client):
+    reset_sign_in_throttle()
+    name = temp_user["_username"]
+    since = psql("SELECT now() AT TIME ZONE 'utc'")
+    undo = _refuse_records_for(name)
+    try:
+        # A wrong password is answered as always (401, not a 500), over SFTP refused as always ...
+        assert _web(name, WRONG).status_code == 401
+        t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        t.banner_timeout = 30
+        try:
+            with pytest.raises(paramiko.AuthenticationException):
+                t.connect(username=name, password=WRONG)
+        finally:
+            t.close()
+        # ... and so is a wrong second-factor code.
+        enroll_totp(temp_user, temp_user_client)
+        fresh = ApiClient()
+        r = fresh.session.post(f"{BASE_URL}/auth/login",
+                               json={"username": name, "password": temp_user["_password"]})
+        assert r.status_code == 200 and r.json()["second_factor_required"] is True, r.text
+        ph = {"Authorization": f"Bearer {r.json()['pre_auth_token']}"}
+        assert fresh.session.post(f"{BASE_URL}/auth/second-factor/verify", headers=ph,
+                                  json={"method": "totp", "code": "000000"}).status_code == 401
+        rows = _wait_for(lambda: len(_failure_rows(name, since)) >= 3 and _failure_rows(name, since))
+    finally:
+        undo()
+    # Every failure kept its audit row; only the records are missing, and an alert says so, without the name.
+    assert sorted(rows or []) == ["sftp|login_failure", "web|login_failure", "web|second_factor_failed"]
+    assert _records(name) == []
+    message = _wait_for(lambda: psql(
+        "SELECT message FROM security_alerts WHERE event_type = 'audit_recording_degraded' "
+        "AND details->>'reason' = 'security_record' "
+        "AND timestamp >= (now() AT TIME ZONE 'utc') - interval '11 minutes' ORDER BY timestamp DESC LIMIT 1"))
+    assert "could not be written" in message and name not in message
+    # With the table writable again, the next failure writes its record as before.
+    reset_sign_in_throttle()
+    assert _web(name, WRONG).status_code == 401
+    assert [rec[0] for rec in _records(name)] == ["login_failure"]
     reset_sign_in_throttle()
 
 

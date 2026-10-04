@@ -309,7 +309,8 @@ class AuditLogger:
         login_identifier: str = "username",
     ):
         """Log failed login attempt, and its security record in the same commit (the name and address in
-        full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id.
+        full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id, or None
+        when the record could not be written: the audit row is written all the same (_add_security_record).
 
         A name that is an account's (``account``, or the account the sign-in tried under ``login_identifier``,
         the sign-in method in force: account_named) is recorded as that account's username, as every account's
@@ -338,27 +339,46 @@ class AuditLogger:
             names_account=account is not None or credential is not None,
             temp_credential=(credential.id, credential.temp_username) if credential is not None else None,
         )
-        self.db.add(row)
-        record = security_records.record(self.db, kind=security_records.LOGIN, name=username,
-                                         address=ip_address or _request_address(), channel=row.channel,
-                                         reason=reason,
-                                         account_id=credential.user_id if credential is not None else None)
-        record_id = record.id
+        record_id = self._add_security_record(
+            row, kind=security_records.LOGIN, name=username, address=ip_address or _request_address(),
+            reason=reason, account_id=credential.user_id if credential is not None else None)
         self.db.commit()
         return record_id
 
     def log_second_factor_failure(self, user: User, ip_address: Optional[str] = None,
                                   details: Optional[Dict[str, Any]] = None):
-        """Log a rejected second-factor code, and its security record in the same commit."""
+        """Log a rejected second-factor code, and its security record in the same commit (the audit row is
+        written even when the record cannot be: _add_security_record)."""
         from app.core import security_records
         row = self.build_row(action="second_factor_failed", status="failed", user=user, ip_address=ip_address,
                              details=details)
-        self.db.add(row)
         method = (details or {}).get("method")
-        security_records.record(self.db, kind=security_records.SECOND_FACTOR, name=user.username,
-                                account_id=user.id, address=ip_address or _request_address(), channel=row.channel,
-                                reason=f"second factor ({method})" if method else "second factor")
+        self._add_security_record(
+            row, kind=security_records.SECOND_FACTOR, name=user.username, account_id=user.id,
+            address=ip_address or _request_address(),
+            reason=f"second factor ({method})" if method else "second factor")
         self.db.commit()
+
+    def _add_security_record(self, row: AuditLog, **fields):
+        """Add the audit row ``row`` of a failure to the session, then the failure's security record under a
+        savepoint of the same transaction, and return the record's id; None when the record cannot be
+        written. The audit row is written first, outside the savepoint, so a record that fails (a fault in
+        its one table) is rolled back alone and never costs the audit row, or the caller its answer. Such a
+        failure raises a degraded-recording alert for the administrators instead (the error's type and the
+        row's action; no value of the failure). An audit row that cannot be written still raises, and then
+        no record is written either."""
+        from app.core import audit_privacy, security_records
+        self.db.add(row)
+        self.db.flush()
+        try:
+            with self.db.begin_nested():
+                record = security_records.record(self.db, channel=row.channel, **fields)
+            return record.id
+        except Exception as exc:  # noqa: BLE001 -- the audit row stays; the alert says what is missing
+            audit_privacy.raise_alert(audit_privacy.RECORD_NOT_WRITTEN, type(exc).__name__, row.action)
+            logger.warning("A %s security record could not be written (%s); its audit row was",
+                           row.action, type(exc).__name__)
+            return None
     
     def log_logout(self, user: User, ip_address: str):
         """Log logout."""
