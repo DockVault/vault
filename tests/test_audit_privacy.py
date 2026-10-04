@@ -564,15 +564,15 @@ def test_a_failed_lookup_leaves_the_name_a_typed_one(factory):
     assert (row.recorded or {}).get("signin_name") == fp.fingerprint(fp.SIGNIN, "ada")
 
 
-def _credential(factory, owner, name):
+def _credential(factory, owner, name, **state):
     from datetime import datetime, timedelta
     from app.core.models import TemporaryCredential
     db = factory()
     TemporaryCredential.__table__.create(db.get_bind(), checkfirst=True)
     account = db.query(User).filter(User.username == owner).one()
     later = datetime.utcnow() + timedelta(hours=1)
-    cred = TemporaryCredential(user_id=account.id, temp_username=name, credential_hash="x", expires_at=later,
-                               deactivate_at=later)
+    cred = TemporaryCredential(user_id=account.id, temp_username=name, credential_hash="x",
+                               **{"expires_at": later, "deactivate_at": later, **state})
     db.add(cred)
     db.commit()
     ids = (cred.id, account.id)
@@ -606,6 +606,36 @@ def test_a_failed_sign_in_for_a_temporary_credential_names_it_at_every_level(fac
         assert row.username == (typed if level == "full" else None), typed
         kept = fp.fingerprint(fp.SIGNIN, typed) if level == "fingerprint" else None
         assert (row.recorded or {}).get("signin_name") == kept, typed
+
+
+@pytest.mark.parametrize("level", ["full", "fingerprint", "none"])
+def test_a_temporary_credential_is_named_live_or_not(factory, level):
+    """Both doors look a credential up by its name whatever its state, so a failed sign-in with the name of a
+    switched-off, expired, past its sign-in window or used credential names it as a live one's does. Only a
+    deleted credential's name (no row left) is a typed name."""
+    from datetime import datetime, timedelta
+    from app.core.models import TemporaryCredential
+    _accounts(factory, ("ada", "ada@example.test"))
+    earlier = datetime.utcnow() - timedelta(hours=1)
+    states = {"temp_ada_off": {"is_active": False},
+              "temp_ada_expired": {"expires_at": earlier, "deactivate_at": earlier},
+              "temp_ada_window": {"deactivate_at": earlier},
+              "temp_ada_used": {"is_used": True, "used_at": earlier}}
+    ids = {name: _credential(factory, "ada", name, **state)[0] for name, state in states.items()}
+    _credential(factory, "ada", "temp_ada_gone")
+    db = factory()
+    db.query(TemporaryCredential).filter(TemporaryCredential.temp_username == "temp_ada_gone").delete()
+    db.commit()
+    db.close()
+    for channel in ("web", "sftp"):
+        for name, cred_id in ids.items():
+            row = _failed_sign_in(factory, channel, level, name)
+            assert (row.username, row.user_id, row.temp_credential_id, row.temp_credential_name) == (
+                name, None, cred_id, name), (channel, name)
+            assert "signin_name" not in (row.recorded or {}), (channel, name)
+        row = _failed_sign_in(factory, channel, level, "temp_ada_gone")
+        assert (row.temp_credential_id, row.temp_credential_name) == (None, None), channel
+        assert row.username == ("temp_ada_gone" if level == "full" else None), channel
 
 
 def test_a_row_written_without_the_levels_keeps_an_accounts_name_and_drops_a_typed_one(factory, monkeypatch):
