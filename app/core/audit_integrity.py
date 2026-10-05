@@ -33,6 +33,12 @@ app/core/audit_chain_verify.py (``python -m app.core.audit_integrity verify``).
 """
 from __future__ import annotations
 
+if __name__ == "__main__":
+    # Run as the host command: hand over to the verifier, which imports this module under its own name (run as
+    # __main__, this file would register its settings a second time when the app imports it).
+    from app.core.audit_chain_verify import main as _main
+    raise SystemExit(_main())
+
 import bisect
 import secrets
 import threading
@@ -1321,8 +1327,8 @@ def seal_pass(session_factory, *, engine=None, st: Optional[ChainState] = None, 
                 result.rows += seal.row_count
         genesis = st.view.genesis or {}
         through = genesis.get("backlog_through")
-        if through and (st.view.newest_hour_end is None or
-                        st.view.newest_hour_end <= fmt.parse_time_text(through)):
+        next_hour = st.view.newest_hour_end or st.view.first_hour()
+        if through and next_hour is not None and next_hour <= fmt.parse_time_text(through):
             result.backlog = True
         st.backlog = result.backlog
         # Late rows.
@@ -1507,7 +1513,3 @@ def head_for_export(st: Optional[ChainState] = None) -> Optional[str]:
 def main(argv=None) -> int:
     from app.core import audit_chain_verify
     return audit_chain_verify.main(argv)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

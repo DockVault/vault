@@ -34,7 +34,7 @@ def _wait_for(check, timeout=180.0, step=2.0):
 
 def _tool(*args):
     r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.audit_integrity", *args],
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, text=True, encoding="utf-8", timeout=600)
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     return r.returncode, (json.loads(lines[-1]) if lines else None), r.stderr
 
@@ -224,7 +224,7 @@ def throwaway():
 
 def test_the_chain_on_real_postgres_rows(throwaway):
     r = subprocess.run(["docker", "exec", "-i", API, "python", "-", throwaway], input=PROBE,
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, text=True, encoding="utf-8", timeout=600)
     assert r.returncode == 0, (r.stderr or r.stdout)[-3000:]
     out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out["stopped"] is None, out

@@ -333,3 +333,33 @@ def test_a_row_added_to_the_backlog_before_its_hour_is_sealed_is_found(env):
     env.row(T0 - timedelta(hours=25))           # inserted into the backlog before its hour is sealed
     env.run_until_sealed()
     assert "backlog-count" in failures(env.verify())
+
+
+def test_a_fresh_install_has_no_backlog(env):
+    env.seal()
+    assert env.st.backlog is False                 # nothing before the first row's hour: normal passes
+
+
+def test_an_old_log_is_sealed_with_passes_close_together(monkeypatch, tmp_path):
+    from _audit_chain_env import Env
+    from app.core import retention
+    e = Env(monkeypatch, tmp_path)
+    try:
+        for h in range(3):
+            e.row(T0 - timedelta(days=3, hours=h))
+        ai.seal_pass(e.session, engine=e.engine, st=e.st, now=e.clock(), time_left=lambda: False)
+        assert e.st.backlog is True
+        assert retention.interval_seconds() == retention.BACKLOG_PAUSE_SECONDS
+        e.run_until_sealed()
+        assert e.st.backlog is False
+    finally:
+        e.close()
+
+
+def test_the_host_command_runs_the_module_without_registering_its_settings_twice(monkeypatch):
+    import runpy
+    from app.core import audit_chain_verify
+    monkeypatch.setattr(audit_chain_verify, "main", lambda argv=None: 0)
+    with pytest.raises(SystemExit) as done:
+        runpy.run_module("app.core.audit_integrity", run_name="__main__")
+    assert done.value.code == 0

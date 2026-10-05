@@ -83,7 +83,7 @@ def throwaway():
 
 def _run(name, body, env=None):
     args = ["docker", "exec", "-i"] + [f"-e{k}={v}" for k, v in (env or {}).items()] + [API, "python", "-", name]
-    r = subprocess.run(args, input=HEAD + body, capture_output=True, text=True, timeout=600)
+    r = subprocess.run(args, input=HEAD + body, capture_output=True, text=True, encoding="utf-8", timeout=600)
     assert r.returncode == 0, (r.stderr or r.stdout)[-3000:]
     return json.loads(r.stdout.strip().splitlines()[-1])
 
