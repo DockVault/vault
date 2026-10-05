@@ -3097,3 +3097,294 @@ class DataRequirement(Base):
     since = Column(DateTime, nullable=False,
                    server_default=text("(now() AT TIME ZONE 'utc')"),
                    default=datetime.utcnow)
+
+
+# --------------------------------------------------------------------------- compliance access
+# An auditor's investigation of vaults, in a case a second administrator approves and the vault's owner is
+# told of at once, and legal holds that keep a vault's files (app/core/compliance_settings.py has the
+# deployment's limits). NEW tables, so create_all builds them on an existing deployment, and a release that
+# does not know them ignores them. Free text (a justification, a note to the owner, an objection, a reason)
+# is sealed at rest with security.seal_case_field, bound to its row and field; rows carry ids, never names.
+
+# The states of an auditor grant. A grant waiting for its second administrator, one in force and one
+# suspended are open: an account has at most one open grant.
+AUDITOR_GRANT_OPEN = ('proposed', 'active', 'suspended')
+AUDITOR_GRANT_STATES = AUDITOR_GRANT_OPEN + ('expired', 'revoked', 'rejected', 'lapsed')
+
+
+class AuditorGrant(Base):
+    """The auditor right of one account: one row per grant, kept after it ends.
+
+    The right is held in addition to the account's role (an ordinary user or an administrator), never as a
+    role or a permission: authorization never reads this table. One administrator proposes a grant and an
+    independent one approves it (or the server's operator on the host, when there is none). It is bound
+    to the TOTP enrollment the account had when it was approved (``second_factor_enrollment_id``; no
+    foreign key, so the binding outlives a reset that deletes the enrollment), and lists everyone who
+    changed the account's sign-in details while it stood (``credential_changers``: [{id, name, at}], the
+    host operator with no id), which the independence rule reads long after the records of those changes
+    are pruned."""
+    __tablename__ = 'auditor_grants'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    username_at_grant = Column(String(255), nullable=False)
+    status = Column(String(16), nullable=False, default='proposed')
+    note_enc = Column(Text, nullable=True)
+    proposed_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    proposed_by_username = Column(String(255), nullable=False)
+    proposed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # NULL with approved_by_operator: the server's operator on the host.
+    approved_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    approved_by_username = Column(String(255), nullable=True)
+    approved_by_operator = Column(Boolean, nullable=False, default=False, server_default='false')
+    approved_at = Column(DateTime, nullable=True)
+    rejected_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    rejected_by_username = Column(String(255), nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+    reject_reason_enc = Column(Text, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    second_factor_enrollment_id = Column(UUID(as_uuid=True), nullable=True)
+    credential_changers = Column(JSON, nullable=False, default=list)
+    suspended_at = Column(DateTime, nullable=True)
+    suspend_reason = Column(String(64), nullable=True)
+    reconfirmed_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    revoked_by_username = Column(String(255), nullable=True)
+    revoke_reason_enc = Column(Text, nullable=True)
+    # When it ended, whichever way (expired, revoked, rejected, lapsed).
+    ended_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        # One open grant per account.
+        Index('uq_auditor_grant_open', 'user_id', unique=True,
+              postgresql_where=text("status IN ('proposed', 'active', 'suspended')"),
+              sqlite_where=text("status IN ('proposed', 'active', 'suspended')")),
+        Index('idx_auditor_grant_status', 'status'),
+    )
+
+
+# The states of a case. Pending waits for its approval; active gives access; hold_only keeps a hold after
+# the access ended; suspended is a suspension the holder caused (the deployment switching compliance access
+# off is computed on each request, never stored).
+CASE_STATES = ('pending', 'active', 'hold_only', 'suspended', 'closed', 'rejected', 'withdrawn',
+               'expired_unapproved')
+
+
+class ComplianceCase(Base):
+    """One investigation: who asked, why (sealed), what for, which vaults, for how long, and who approved it.
+
+    ``number`` (C-YYYY-NNNN) is given in the approving transaction from compliance_case_counters, so numbers
+    are never reused and have no gaps; NULL until then. ``settings_at_approval`` keeps the compliance
+    settings in force at the approval: a case uses the stricter of those and the current ones.
+    ``closed_at`` is when the case reached a final state (closed, rejected, withdrawn, expired before its
+    approval); ``records_kept_until`` is set then: its records and their audit rows are kept until then at
+    least (app/core/compliance_retention.py). ``version`` is the optimistic lock an approval checks. The auditor's account cannot be
+    deleted while it has a case (RESTRICT)."""
+    __tablename__ = 'compliance_cases'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    number = Column(String(20), unique=True, nullable=True)
+    status = Column(String(24), nullable=False, default='pending')
+    purpose = Column(String(32), nullable=False)
+    legal_basis = Column(String(16), nullable=False)
+    lia_reference = Column(String(255), nullable=True)
+    special_category = Column(Boolean, nullable=False, default=False, server_default='false')
+    art9_condition = Column(String(32), nullable=True)
+    criminal_offence = Column(Boolean, nullable=False, default=False, server_default='false')
+    justification_enc = Column(Text, nullable=False)
+    owner_note_enc = Column(Text, nullable=False)
+    objection_enc = Column(Text, nullable=True)
+    auditor_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    auditor_username = Column(String(255), nullable=False)
+    grant_id = Column(UUID(as_uuid=True), ForeignKey('auditor_grants.id', ondelete='SET NULL'), nullable=True)
+    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # What was asked for, before an approval decides it.
+    access_days = Column(Integer, nullable=True)
+    hold_requested = Column(Boolean, nullable=False, default=False, server_default='false')
+    approved_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    approved_by_username = Column(String(255), nullable=True)
+    approved_by_operator = Column(Boolean, nullable=False, default=False, server_default='false')
+    approved_at = Column(DateTime, nullable=True)
+    rejected_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    rejected_by_username = Column(String(255), nullable=True)
+    reject_reason_enc = Column(Text, nullable=True)
+    can_export = Column(Boolean, nullable=False, default=False, server_default='false')
+    password_policy = Column(String(16), nullable=True)
+    password_override = Column(Boolean, nullable=False, default=False, server_default='false')
+    settings_at_approval = Column(JSON, nullable=True)
+    access_starts_at = Column(DateTime, nullable=True)
+    access_ends_at = Column(DateTime, nullable=True)
+    total_access_days = Column(Integer, nullable=False, default=0, server_default='0')
+    files_from = Column(DateTime, nullable=True)
+    files_to = Column(DateTime, nullable=True)
+    notice_email_status = Column(String(16), nullable=True)
+    notice_written_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    closed_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_by_username = Column(String(255), nullable=True)
+    close_reason_enc = Column(Text, nullable=True)
+    records_kept_until = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1, server_default='1')
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_compliance_case_auditor', 'auditor_id', 'status'),
+        Index('idx_compliance_case_status', 'status'),
+    )
+
+
+class ComplianceCaseScope(Base):
+    """What a case asked for: a vault, a folder (and its subtree), or a custodian (a person, whose vaults
+    an approval resolves)."""
+    __tablename__ = 'compliance_case_scopes'
+
+    case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), primary_key=True)
+    kind = Column(String(16), primary_key=True)          # 'vault' | 'folder' | 'custodian'
+    target_id = Column(UUID(as_uuid=True), primary_key=True)
+
+
+class ComplianceCaseVault(Base):
+    """A vault an approval gave a case: its type and owner as they were then, and the folders it covers
+    (NULL: the whole vault). No foreign key to the vault: the record outlives it."""
+    __tablename__ = 'compliance_case_vaults'
+
+    case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), primary_key=True)
+    vault_id = Column(UUID(as_uuid=True), primary_key=True)
+    vault_type_at_approval = Column(String(16), nullable=False)
+    folder_ids = Column(JSON, nullable=True)
+    owner_id_at_approval = Column(UUID(as_uuid=True), nullable=True)
+    notice_written_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (Index('idx_compliance_case_vault_vault', 'vault_id'),)
+
+
+class ComplianceCasePerson(Base):
+    """A person a case concerns: the owner of a vault in it, a custodian, or someone the auditor named. A
+    person concerned cannot approve, extend or release anything of the case."""
+    __tablename__ = 'compliance_case_people'
+
+    case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), primary_key=True)
+    why = Column(String(16), nullable=False)             # 'owner' | 'custodian' | 'named'
+
+    __table_args__ = (Index('idx_compliance_case_person_user', 'user_id'),)
+
+
+class ComplianceCaseCounter(Base):
+    """The last case number given in a year. The approving transaction takes the year's row (locked until
+    it commits), so two approvals never get the same number and a rolled-back one leaves no gap."""
+    __tablename__ = 'compliance_case_counters'
+
+    year = Column(Integer, primary_key=True)
+    last_number = Column(Integer, nullable=False, default=0)
+
+
+class ComplianceExport(Base):
+    """An export of a case's files: made once, fetched once by the account that made it. No token is kept."""
+    __tablename__ = 'compliance_exports'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    fetched_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    status = Column(String(16), nullable=False, default='ready')
+    file_ids = Column(JSON, nullable=True)                # NULL: every file in the case's scope
+    file_count = Column(Integer, nullable=True)
+    total_bytes = Column(BigInteger, nullable=True)
+    manifest_sha256 = Column(String(64), nullable=True)
+
+    __table_args__ = (Index('idx_compliance_export_case', 'case_id'),)
+
+
+class ComplianceReveal(Base):
+    """An auditor revealing a name an audit row recorded in full, outside a case, with a sealed reason."""
+    __tablename__ = 'compliance_reveals'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id = Column(UUID(as_uuid=True), nullable=False)
+    auditor_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    auditor_username = Column(String(255), nullable=False)
+    vault_id = Column(UUID(as_uuid=True), nullable=True)
+    reason_category = Column(String(32), nullable=False)
+    reason_text_enc = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (Index('idx_compliance_reveal_auditor', 'auditor_id', 'created_at'),
+                      Index('idx_compliance_reveal_vault', 'vault_id'))
+
+
+class ComplianceNoticeOutbox(Base):
+    """An email notice to a vault's owner, written in the transaction that grants the access it tells of and
+    sent afterwards, with retries. The address is sealed as it was when the row was written, with the one
+    before when an administrator changed it recently, so a later change cannot reroute it. ``dedup_key``
+    makes a retry of the transaction write it once."""
+    __tablename__ = 'compliance_notice_outbox'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), nullable=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    kind = Column(String(32), nullable=False)
+    dedup_key = Column(String(255), nullable=False, unique=True)
+    address_enc = Column(Text, nullable=True)
+    previous_address_enc = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default='pending')
+    attempts = Column(Integer, nullable=False, default=0, server_default='0')
+    next_attempt_at = Column(DateTime, nullable=True)
+    last_error_class = Column(String(64), nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (Index('idx_compliance_outbox_due', 'status', 'next_attempt_at'),)
+
+
+class LegalHoldVault(Base):
+    """A legal hold a case keeps on one vault: placed, confirmed by a second administrator (or lapsed),
+    reviewed, released. While it stands, what is deleted from the vault is kept, until ``purge_after``
+    once it is released. No foreign key to the vault: the record outlives it."""
+    __tablename__ = 'legal_hold_vaults'
+
+    case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), primary_key=True)
+    vault_id = Column(UUID(as_uuid=True), primary_key=True)
+    placed_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    placed_by_username = Column(String(255), nullable=False)
+    placed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    confirm_by_deadline = Column(DateTime, nullable=True)
+    confirmed_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    confirmed_by_username = Column(String(255), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    lapsed_at = Column(DateTime, nullable=True)
+    last_reviewed_at = Column(DateTime, nullable=True)
+    released_at = Column(DateTime, nullable=True)
+    released_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    released_by_username = Column(String(255), nullable=True)
+    release_reason_enc = Column(Text, nullable=True)
+    purge_after = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('idx_legal_hold_vault_open', 'vault_id',
+              postgresql_where=text('released_at IS NULL'), sqlite_where=text('released_at IS NULL')),
+    )
+
+
+class HeldNameHistory(Base):
+    """The name a file or folder had before it was renamed in a vault under a legal hold, sealed as it was
+    (it opens with the object's own id), so a rename cannot erase what the hold keeps."""
+    __tablename__ = 'held_name_history'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    object_id = Column(UUID(as_uuid=True), nullable=False)
+    vault_id = Column(UUID(as_uuid=True), nullable=False)
+    kind = Column(String(8), nullable=False)             # 'file' | 'folder'
+    name = Column(String(255), nullable=True)
+    enc_name = Column(Text, nullable=True)
+    name_key_version = Column(Integer, nullable=True)
+    renamed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (Index('idx_held_name_history_object', 'vault_id', 'object_id'),)

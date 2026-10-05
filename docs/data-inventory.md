@@ -107,6 +107,26 @@ Visits to a link and uploads through one are also in the audit log.
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
 | `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
 
+### Compliance access (new in 0.34.0)
+
+An auditor (an account two administrators gave the auditor right) may open vaults in a case a second
+administrator approves; the vault's owner is told at once. A case can keep a vault's files under a legal
+hold. Free text (a justification, a note to the owner, an objection, a reason) is sealed at rest under a
+key derived from `ENCRYPTION_KEY`, bound to its row; the audit rows of a case carry ids, never names. The
+pruner keeps a case's audit rows while the case is open or a hold stands, and for
+`COMPLIANCE_RECORD_MIN_DAYS` (2190 by default) after it closes; rows of the compliance category are kept
+that long after they were written.
+
+| Table | Personal data | Purpose | Kept for | Erased by |
+|---|---|---|---|---|
+| `auditor_grants` | The account given the auditor right and its username at the time; who proposed, approved, turned down or revoked it (ids and usernames, or the server's operator); a sealed note and reasons; the id of the TOTP enrollment the grant is bound to; the ids and usernames of everyone who changed the account's sign-in details while it stood; times and state. | Who may act as an auditor, granted by two people, and suspended or ended when the account changes. | For ever, as the record of who held the right. | Nothing deletes it. Account ids are cleared when an account is deleted; the usernames stay. |
+| `compliance_cases`, `compliance_case_scopes`, `compliance_case_vaults`, `compliance_case_people` | The auditor (id and username) and who approved, turned down or closed the case; purpose and legal basis; the sealed justification, note to the owner, objection and reasons; the vaults, folders and custodians asked for and given, with each vault's owner at the approval; the people the case concerns (owners, custodians, people named); dates. | The investigation and its accountability: who asked, why, what for, who approved it, and whom it concerns. | For ever by default: the case records are never deleted by the app. Their audit rows: while the case is open or a hold stands, then `COMPLIANCE_RECORD_MIN_DAYS` after it closes, then as the audit log's retention says. | Nothing deletes them. The auditor's account cannot be deleted while it has a case; the ids of who approved, turned down or closed it are cleared when their account is deleted; the people concerned and the vault owners are kept by id. |
+| `compliance_exports` | The case, who made the export, when, how many files and bytes, and the hash of its manifest. No file names. | Exports are fetched once, by the account that made them. | With the case. | With the case. |
+| `compliance_reveals` | The auditor (id and username), the audit row whose recorded name was revealed, its vault, the reason's category and the sealed reason. | Accountability for a name revealed outside a case. | For ever. | Nothing deletes it. The auditor's id is cleared when the account is deleted. |
+| `compliance_notice_outbox` | The vault owner's id, the kind of notice, the sealed email address it goes to (and the address before an administrator's recent change), the delivery state and attempts. | The owner's email notice is written with the access it tells of and sent with retries; a later address change cannot reroute it. | With the case. | With the case; the owner's id is cleared when the account is deleted. |
+| `legal_hold_vaults` | The case and vault; who placed, confirmed and released the hold (ids and usernames) and the sealed reason; dates. | A legal hold keeps what is deleted from the vault, until released and purged. | For ever, as the record of the hold. | Nothing deletes it. Account ids are cleared when an account is deleted. |
+| `held_name_history` | The name a file or folder had before it was renamed while its vault was under a hold (sealed as it was), the object, the vault and when. | A rename cannot erase what a hold keeps. | Until the hold is released and what it kept is purged. | The purge after the hold's release. |
+
 ### Other tables
 
 `system_settings`, `schema_steps`, `retired_object_ids`, `share_tags`, `note_link_tags`,
@@ -117,6 +137,7 @@ Their only personal data is the id of the account that created, owns or was allo
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
 account and group ids that may use a tag. `data_requirements` holds no personal data: each row
 says which version a change to the stored data needs, what the change was, and how to undo it.
+`compliance_case_counters` (new in 0.34.0) holds the last case number given in each year.
 
 `managed_settings` (new in 0.34.0) holds the values administrators set for the settings the panel
 manages within the deployment's limits, one row per setting, with the id and username of whoever set
@@ -359,6 +380,7 @@ There is no built-in per-person erasure yet.
 | `ACCOUNT_LOCKOUT_MINUTES` | `15` | Automatic locks, and the phantom-name counters in Redis. |
 | `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `300` | Sign-in counters. |
 | `ENFORCE_FILE_EXPIRY` | `true` | Whether vault and upload-link expiry deletes files. |
+| `COMPLIANCE_RECORD_MIN_DAYS` | `2190` | A compliance case's audit rows after the case closes, and the compliance rows of the audit log after they were written: none younger is deleted. A case's rows are also kept while it is open or a hold stands. |
 | Per vault and per upload link | Off | How long files are kept. |
 | Fixed | 30 days | Finished sessions and pending sign-ins. |
 | Fixed | 14 days | Credential-change records, after the change is made or the request ends. |
