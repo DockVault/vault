@@ -363,3 +363,10 @@ def test_the_host_command_runs_the_module_without_registering_its_settings_twice
     with pytest.raises(SystemExit) as done:
         runpy.run_module("app.core.audit_integrity", run_name="__main__")
     assert done.value.code == 0
+
+
+def test_a_chain_started_after_its_first_rows_reports_no_backlog(env):
+    env.row(T0 - timedelta(minutes=10))
+    env.seal()
+    info = env.verify().kinds("information")
+    assert "backlog-in-progress" not in info and "sealing-behind" in info

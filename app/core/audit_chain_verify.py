@@ -565,7 +565,8 @@ def _coverage(view, hour_seals, report: Report, now: datetime) -> None:
     except (TypeError, ValueError):
         return
     newest = view.newest_hour_end
-    if newest is None or newest <= through:
+    next_hour = newest or view.first_hour()
+    if next_hour is not None and next_hour <= through:
         report.add(INFO, "backlog-in-progress",
                    f"the first start's backlog is sealed through {fmt.hour_text(newest) if newest else 'nothing'} "
                    f"of {fmt.hour_text(through)}")
@@ -574,7 +575,9 @@ def _coverage(view, hour_seals, report: Report, now: datetime) -> None:
     if counted != int(genesis.get("backlog_rows") or 0):
         report.add(FAILURE, "backlog-count", f"the backlog's hours hold {counted} rows; genesis counted "
                                              f"{genesis.get('backlog_rows')}")
-    if now - newest > ai.lag() + timedelta(hours=2):
+    if newest is None:
+        report.add(INFO, "sealing-behind", "no hour is sealed yet: the first is sealed once it has closed")
+    elif now - newest > ai.lag() + timedelta(hours=2):
         report.add(INFO, "sealing-behind", f"hours are sealed through {fmt.hour_text(newest)}")
     for seal in hour_seals:
         if seal.period_end > through + ai.HOUR and seal.sealed_at - seal.period_end > timedelta(days=1):
