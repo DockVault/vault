@@ -1,0 +1,220 @@
+"""What the pruner keeps for compliance access, offline (app/core/compliance_retention.py).
+
+A positive audit retention deletes no row written under a case while the case is open or one of its holds
+stands, nor before COMPLIANCE_RECORD_MIN_DAYS (and the case's own floor) after it closed; rows of the
+compliance category are kept that long after they were written. The size cap never deletes them either.
+After the floor they follow the audit log's retention like any other row. The rules are registered with
+the pruner when it is imported, so every pass reads them.
+"""
+import tempfile
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.orm import sessionmaker
+
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
+
+from app.core import audit_catalog  # noqa: E402
+from app.core import audit_retention as ar  # noqa: E402
+from app.core import compliance_retention as cr  # noqa: E402
+from app.core import retention  # noqa: E402
+from app.core import settings_registry as reg  # noqa: E402
+from app.core.models import (AuditLog, ComplianceCase, LegalHoldVault, ManagedSetting,  # noqa: E402
+                             ManagedSettingChange, SystemSetting, User)
+
+pytestmark = pytest.mark.unit
+
+NOW = datetime(2026, 10, 20, 12, 0, 0)
+PLAIN = "file_upload"
+
+
+@pytest.fixture
+def env(monkeypatch):
+    settings = SimpleNamespace(settings_locked_keys="", retention_hold=False, log_prune_interval_minutes=15,
+                               log_prune_batch_rows=5000, retention_reduction_delay_days=7,
+                               audit_log_retention_days=0, audit_min_retention_days=0, audit_protected_min_days=0,
+                               audit_log_max_mb=0, plan_log_max_days=-1, plan_log_max_mb=-1,
+                               compliance_record_min_days=2190)
+    monkeypatch.setattr(reg, "_cache", reg._Cache())
+    monkeypatch.setattr(reg, "_deployment_settings", lambda: settings)
+    monkeypatch.setattr(retention, "_settings", lambda: settings)
+    monkeypatch.setattr(retention, "KEEP_RULES", {"audit_logs": [cr.case_rows_kept, cr.compliance_rows_kept]})
+    return settings
+
+
+def _copy(model, metadata):
+    columns = []
+    for column in model.__table__.columns:
+        default = column.server_default
+        if default is not None and "now()" in str(getattr(default, "arg", "")):
+            default = sa.schema.DefaultClause(sa.text("CURRENT_TIMESTAMP"))
+        elif default is not None:
+            default = sa.schema.DefaultClause(default.arg)
+        columns.append(sa.Column(column.name, column.type, primary_key=column.primary_key, nullable=column.nullable,
+                                 server_default=default))
+    sa.Table(model.__tablename__, metadata, *columns)
+
+
+@pytest.fixture
+def factory(monkeypatch):
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'audit.db'}")
+        copies = sa.MetaData()
+        for model in (User, AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting, ComplianceCase,
+                      LegalHoldVault):
+            _copy(model, copies)
+        copies.create_all(engine)
+        make = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        made = []
+
+        def session():
+            made.append(make())
+            return made[-1]
+
+        monkeypatch.setattr(reg, "_default_session_factory", session)
+        yield session
+        for s in made:
+            s.close()
+        engine.dispose()
+
+
+def _case(db, *, closed_days=None, kept_until_days=None):
+    case = ComplianceCase(id=uuid.uuid4(), status="closed" if closed_days is not None else "active",
+                          purpose="internal_investigation", legal_basis="f", justification_enc="x",
+                          owner_note_enc="x", auditor_id=uuid.uuid4(), auditor_username="aud",
+                          closed_at=None if closed_days is None else NOW - timedelta(days=closed_days),
+                          records_kept_until=None if kept_until_days is None else NOW + timedelta(days=kept_until_days))
+    db.add(case)
+    db.commit()
+    return case.id
+
+
+def _hold(db, case_id, *, released=False, lapsed=False):
+    db.add(LegalHoldVault(case_id=case_id, vault_id=uuid.uuid4(), placed_by_username="aud",
+                          placed_at=NOW - timedelta(days=4000),
+                          released_at=NOW - timedelta(days=1) if released else None,
+                          lapsed_at=NOW - timedelta(days=1) if lapsed else None))
+    db.commit()
+
+
+def _row(db, days, action=PLAIN, case_id=None, size=0):
+    row = AuditLog(id=uuid.uuid4(), action=action, status="success", case_id=case_id,
+                   timestamp=NOW - timedelta(days=days), details={"pad": "x" * size} if size else None)
+    db.add(row)
+    db.commit()
+    return row.id
+
+
+def _left(factory, ids):
+    return {r.id for r in factory().query(AuditLog.id).filter(AuditLog.id.in_(list(ids))).all()}
+
+
+def _prune(factory, numbers):
+    return ar.prune(retention.Pass(factory, now=NOW), numbers)
+
+
+def test_the_rules_are_registered_with_the_pruner_when_it_is_imported():
+    """In a process of its own, importing the pruner alone registers both rules."""
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parent.parent
+    script = ("import sys; sys.path.insert(0, 'tests'); from _bare_api_env import set_bare_api_env; "
+              "set_bare_api_env(); from app.core import retention; "
+              "print(sorted(r.__module__ + '.' + r.__name__ for r in retention.KEEP_RULES['audit_logs']))")
+    out = subprocess.run([sys.executable, "-c", script], cwd=root, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-600:]
+    assert out.stdout.strip() == ("['app.core.compliance_retention.case_rows_kept', "
+                                  "'app.core.compliance_retention.compliance_rows_kept']")
+    assert retention.KEEP_MODULES == ("app.core.compliance_retention",)
+
+
+def test_a_positive_retention_deletes_no_case_row_while_it_must_stay(env, factory):
+    db = factory()
+    open_case = _case(db)
+    closed_recently = _case(db, closed_days=100)
+    closed_long_ago = _case(db, closed_days=3000)
+    held = _case(db, closed_days=3000)
+    _hold(db, held)
+    released = _case(db, closed_days=3000)
+    _hold(db, released, released=True)
+    lapsed = _case(db, closed_days=3000)
+    _hold(db, lapsed, lapsed=True)
+    own_floor = _case(db, closed_days=3000, kept_until_days=30)
+    own_floor_passed = _case(db, closed_days=3000, kept_until_days=-1)
+    kept = {
+        "plain young": _row(db, 10),
+        "open case": _row(db, 4000, case_id=open_case),
+        "closed recently": _row(db, 4000, case_id=closed_recently),
+        "hold standing": _row(db, 4000, case_id=held),
+        "its own floor": _row(db, 4000, case_id=own_floor),
+        "unknown case": _row(db, 4000, case_id=uuid.uuid4()),
+        "compliance row": _row(db, 400, action="auditor_granted"),
+    }
+    gone = {
+        "plain old": _row(db, 400),
+        "closed long ago": _row(db, 4000, case_id=closed_long_ago),
+        "hold released": _row(db, 4000, case_id=released),
+        "hold lapsed": _row(db, 4000, case_id=lapsed),
+        "its own floor passed": _row(db, 4000, case_id=own_floor_passed),
+        "compliance row past the floor": _row(db, 2200, action="case_file_viewed"),
+    }
+    done = _prune(factory, ar.Numbers(30, 0, 0, 0))
+    assert done.deleted == len(gone)
+    left = _left(factory, list(kept.values()) + list(gone.values()))
+    assert {k for k, v in kept.items() if v not in left} == set()
+    assert {k for k, v in gone.items() if v in left} == set()
+
+
+def test_the_floor_is_read_from_the_settings(env, factory):
+    db = factory()
+    case = _case(db, closed_days=500)
+    row = _row(db, 4000, case_id=case)
+    compliance = _row(db, 500, action="hold_placed")
+    _prune(factory, ar.Numbers(30, 0, 0, 0))
+    assert _left(factory, [row, compliance]) == {row, compliance}
+    env.compliance_record_min_days = 400
+    _prune(factory, ar.Numbers(30, 0, 0, 0))
+    assert _left(factory, [row, compliance]) == set()
+
+
+def test_the_size_cap_never_deletes_a_row_a_case_keeps(env, factory):
+    db = factory()
+    case = _case(db)
+    quarter = ar.MB // 4 - 200                          # four rows fit in a megabyte
+    # The kept rows are the oldest: without the rules the cap would delete them first.
+    keep = [_row(db, d, case_id=case, size=quarter) for d in (50, 51, 52)]
+    keep.append(_row(db, 53, action="case_approved", size=quarter))
+    plain = [_row(db, d, size=quarter) for d in (30, 31, 32, 33)]
+    _prune(factory, ar.Numbers(0, 0, 0, 1))
+    left = _left(factory, keep + plain)
+    assert set(keep) <= left
+    assert not set(plain) & left
+
+
+def test_without_a_maximum_nothing_is_deleted_and_after_the_floor_case_rows_go_like_the_rest(env, factory):
+    db = factory()
+    case = _case(db, closed_days=3000)
+    rows = [_row(db, 4000, case_id=case), _row(db, 4000)]
+    _prune(factory, ar.Numbers(0, 0, 0, 0))
+    assert _left(factory, rows) == set(rows)
+    _prune(factory, ar.Numbers(5000, 0, 0, 0))
+    assert _left(factory, rows) == set(rows)
+    _prune(factory, ar.Numbers(3999, 0, 0, 0))
+    assert _left(factory, rows) == set()
+
+
+def test_every_compliance_action_is_in_its_own_category():
+    names = set(audit_catalog.stored_names(["compliance"]))
+    assert ("compliance", "Compliance access") in audit_catalog.CATEGORIES
+    for name in ("auditor_grant_proposed", "auditor_granted", "auditor_grant_refused", "auditor_suspended",
+                 "case_requested", "case_approved", "case_file_viewed", "case_access_refused", "hold_placed",
+                 "held_file_purged", "hold_blocked_delete", "audit_name_revealed", "owner_notice_written",
+                 "owner_notice_email_failed", "case_names_viewed", "auditor_events_viewed"):
+        assert name in names, name
+    assert len(names) == 44

@@ -18,7 +18,8 @@ session-level advisory lock on a connection of its own, and a pass that cannot t
 
 What a job may not delete. Other modules register row-keep rules for a table (register_keep): each gives a
 condition for rows that must stay (a category's protected minimum, rows a compliance case or a legal hold
-keeps), and every job over that table leaves them.
+keeps), and every job over that table leaves them. Those modules are listed in KEEP_MODULES and imported with
+this one.
 
 The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with RETENTION_HOLD=true the panel
 cannot turn it off) stops every job over logs and security records while it is on. The jobs over working
@@ -29,6 +30,7 @@ fallback rows, waiting settings changes) keep running. Turning the hold off dele
 from __future__ import annotations
 
 import asyncio
+import importlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -445,3 +447,10 @@ async def run_forever(*, first_delay: float = FIRST_PASS_SECONDS, interval: Opti
         except Exception as exc:  # noqa: BLE001
             _say(f"Warning: the pruner's pass failed ({type(exc).__name__})")
         await asyncio.sleep(interval())
+
+
+# The modules that register row-keep rules, imported with this one so that every pass reads their rules
+# (compliance access keeps a case's audit rows and the compliance rows: app/core/compliance_retention.py).
+KEEP_MODULES: tuple = ("app.core.compliance_retention",)
+for _name in KEEP_MODULES:
+    importlib.import_module(_name)
