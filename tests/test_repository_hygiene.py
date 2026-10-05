@@ -75,11 +75,14 @@ def _is_contract_text(path: Path) -> bool:
 
 
 def _attributes(paths: list[Path], *names: str) -> dict[Path, dict[str, str]]:
+    # The paths go through stdin: on Windows a command line holds at most 32,767 characters, which the
+    # tracked files' names together pass.
     result = subprocess.run(
-        ["git", "check-attr", "-z", *names, "--", *(path.as_posix() for path in paths)],
+        ["git", "check-attr", "--stdin", "-z", *names],
         cwd=ROOT,
         check=True,
         capture_output=True,
+        input="".join(path.as_posix() + "\0" for path in paths).encode("utf-8"),
     )
     fields = result.stdout.decode("utf-8").split("\0")
     if fields and not fields[-1]:
