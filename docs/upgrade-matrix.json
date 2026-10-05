@@ -4599,6 +4599,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.33.3": {
+      "released": "2026-10-05",
+      "notes": "Downloads of small files start every time. Since 0.30.0 the web app streams a download straight to disk. When the page finished writing a file before the browser asked for it, which happens with small files, the download did not start, though the page said it was downloading. It happened most with files of up to about 150 KB in a zero-knowledge vault, and could happen with a Standard vault's files too. If the browser has not asked for a download within a minute of the page finishing, the page now says it did not start. Reload browser tabs opened before the upgrade; a download that was running during the upgrade may need to be started again.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -5004,6 +5012,13 @@
           "detect": "SELECT count(*) FROM vaults WHERE type = 'zero_knowledge'"
         }
       ]
+    },
+    {
+      "from": "0.33.2",
+      "to": "0.33.3",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
     }
   ],
   "waivers": [
