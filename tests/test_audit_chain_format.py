@@ -131,6 +131,12 @@ def test_nesting_limit_in_the_main_thread_and_a_worker():
     assert results["main"] == results["worker"] == (b"\x06", b"\x07", b"\x07")
 
 
+def test_the_parser_itself_refuses_nesting_past_the_limit():
+    f.parse_json(_deep(f.MAX_DEPTH))
+    with pytest.raises(f.NotCanonical):
+        f.parse_json(_deep(f.MAX_DEPTH + 1))
+
+
 def test_a_scalar_is_depth_zero():
     assert f._depth(1) == 0 and f._depth([]) == 1 and f._depth({"a": [{}]}) == 3
 

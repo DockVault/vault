@@ -213,12 +213,12 @@ def test_a_reduction_is_refused_while_sealing_is_stopped(env):
 # --------------------------------------------------------------------------- the database can only hold back
 
 def test_a_value_written_into_the_database_that_deletes_sooner_is_not_acted_on(env):
-    env.seal()
+    old = env.row(T0 - timedelta(days=200))
+    env.run_until_sealed()
     with env.session() as db:
         reg.store(db, "audit_max_days", 30)
         db.commit()
     reg.refresh(env.session)
-    old = env.row(T0 - timedelta(days=200))
     env.clock.advance(hours=3)
     retention.run_pass(env.session, now=env.clock())
     with env.session() as db:
@@ -339,3 +339,92 @@ def test_verify_rejects_an_applies_seal_early_after_a_cancel_or_twice(env):
     with env.session() as db:
         report = verify_mod.verify(db, record=None, held={}, now=env.clock(), check_rows=False)
     assert any(f.kind == "unjustified" and f.seq == early and "delay" in f.message for f in report.findings)
+
+
+def test_the_database_turning_the_hold_off_does_not_release_the_audit_rows(env, monkeypatch):
+    old = env.row(T0 - timedelta(days=200))
+    env.run_until_sealed()
+    ada = _admin(env)
+    _change(env, ada, "logs_hold", True)
+    monkeypatch.setenv("AUDIT_LOG_RETENTION_DAYS", "30")
+    env.settings.audit_log_retention_days = 30
+    with env.session() as db:
+        reg.store(db, "logs_hold", None)       # the hold "off" in the database only
+        db.commit()
+    reg.refresh(env.session)
+    _passes(env, 12)
+    with env.session() as db:
+        assert db.get(AuditLog, old) is not None
+    assert ar.chain_numbers()[2] is True
+
+
+def test_a_stop_of_two_days_moves_a_due_change_on_by_its_length(env):
+    env.seal()
+    ada = _admin(env)
+    _change(env, ada, "logs_hold", True)
+    _change(env, ada, "logs_hold", False)
+    _passes(env, 24)
+    env.clock.advance(days=2)                   # the server was stopped: no pass, no seal
+    _passes(env, 5 * 24 + 6)                    # seven days after the request, five of them sealing
+    assert ar.chain_numbers()[2] is True
+    _passes(env, 2 * 24 + 6)
+    assert ar.chain_numbers()[2] is False
+    assert failures(env.verify()) == []
+
+
+def test_vetoes_from_the_database_are_sealed_at_most_once_a_day(env):
+    env.seal()
+    for value in (900, 1000):
+        with env.session() as db:
+            reg.store(db, "audit_admin_min_days", value)
+            db.commit()
+        _passes(env, 1, step=1)
+    vetoes = [s for s in env.seals() if s.kind == "policy" and s.detail["cause"] == "database"]
+    assert len(vetoes) == 1 and vetoes[0].detail["state"]["audit_admin_min_days"]["value"] == 900
+    _passes(env, 24)
+    vetoes = [s for s in env.seals() if s.kind == "policy" and s.detail["cause"] == "database"]
+    assert len(vetoes) == 2 and vetoes[1].detail["state"]["audit_admin_min_days"]["value"] == 1000
+    assert failures(env.verify()) == []
+
+
+def test_a_request_short_of_the_delay_is_unjustified(env):
+    env.seal()
+    _forge(env, "request", {"what": "setting", "request": str(uuid.uuid4()), "setting": "audit_max_days", "old": 0,
+                            "new": 30, "subject": None, "placeholder": None,
+                            "not_before": fmt.time_text(env.clock() + timedelta(days=1)), "audit_row": None,
+                            "by": "admin", "user_id": None})
+    with env.session() as db:
+        off = verify_mod.verify(db, record=None, held={}, now=env.clock(), check_rows=False)
+    found = [f for f in off.findings if f.kind == "unjustified"]
+    assert found and "short of the delay" in found[0].message
+
+
+def test_a_policy_seal_that_does_not_copy_an_entry_it_does_not_set_is_unjustified(env):
+    env.seal()
+    newest = _newest_policy(env)
+    state = {k: dict(v) for k, v in newest.detail["state"].items()}
+    seq = env.seals()[-1].seq + 1
+    state["logs_hold"] = {"value": True, "source": "setting", "setting": True, "request_seq": seq, "set_by": seq}
+    state["audit_max_days"]["set_by"] = seq      # its fields unchanged: it names a seal that did not set it
+    _forge(env, "policy", {"state": state, "inputs": newest.detail["inputs"], "cause": "request",
+                           "request_seq": None, "request": None, "audit_row": None, "by": "admin", "user_id": None})
+    with env.session() as db:
+        off = verify_mod.verify(db, record=None, held={}, now=env.clock(), check_rows=False)
+    found = [f for f in off.findings if f.kind == "unjustified"]
+    assert found and "not copied" in found[0].message
+
+
+def test_nothing_applies_while_a_gap_is_open(env):
+    """A request whose delay ran while sealing ran, then a stop of 13 hours: on the return, before anything is
+    sealed again, nothing is due (the pass seals first, which closes the gap and counts it)."""
+    env.seal()
+    ada = _admin(env)
+    _change(env, ada, "logs_hold", True)
+    _change(env, ada, "logs_hold", False)
+    request = [s for s in env.seals() if s.kind == "request"][-1]
+    for _ in range(30):                          # seven and a half days of sealing, nothing applied
+        env.clock.advance(hours=6)
+        env.seal()
+    assert ps.due_requests(env.st.view, env.clock()) == [request.seq]
+    env.clock.advance(hours=13)                  # stopped
+    assert ps.due_requests(env.st.view, env.clock()) == []

@@ -312,3 +312,24 @@ def test_build_row_gives_every_row_a_random_nonce():
     a = AuditLogger(_Db()).build_row(action="logout", status="success", username="x")
     b = AuditLogger(_Db()).build_row(action="logout", status="success", username="x")
     assert isinstance(a.seal_nonce, bytes) and len(a.seal_nonce) == 16 and a.seal_nonce != b.seal_nonce
+
+
+def test_rows_changed_with_a_late_row_are_never_sealed_over(env):
+    first = env.row(T0 - timedelta(hours=3, minutes=10))
+    env.run_until_sealed()
+    env.row(ai.hour_floor(T0 - timedelta(hours=3, minutes=10)) + timedelta(minutes=20))   # the same hour
+    _update(env, first, username="mallory")
+    env.clock.advance(hours=1)
+    assert env.seal().late == 0
+    assert {"rows-added", "rows-altered"} <= set(failures(env.verify()))
+
+
+def test_a_row_added_to_the_backlog_before_its_hour_is_sealed_is_found(env):
+    for h in (30, 20, 10):
+        env.row(T0 - timedelta(hours=h))
+    r = ai.seal_pass(env.session, engine=env.engine, st=env.st, now=env.clock(), time_left=lambda: False)
+    assert r.stopped is None and [s.kind for s in env.seals()] == ["genesis", "policy"]
+    assert env.seals()[0].detail["backlog_rows"] == 3
+    env.row(T0 - timedelta(hours=25))           # inserted into the backlog before its hour is sealed
+    env.run_until_sealed()
+    assert "backlog-count" in failures(env.verify())

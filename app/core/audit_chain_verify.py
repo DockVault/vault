@@ -94,17 +94,11 @@ def _set_entries(prev: dict, state: dict) -> set:
 
 
 def _holds_together(state: dict, inputs: dict) -> Optional[str]:
-    """Every entry of a state agrees with its own bounds."""
+    """Every entry of a state agrees with its own bounds. The delay's entry is not looked at here: a genesis
+    or env seal's state must equal exactly what its inputs give, and any other seal may not set the delay at
+    all, so the delay always holds .env's value (source env or default, no setting, no request)."""
     ns = pol.settings_from_inputs(inputs)
     specs = {s.key: s for s in pol.chain_specs()}
-    delay = state.get(pol.DELAY_ENTRY)
-    if not isinstance(delay, dict):
-        return "the state has no delay"
-    if delay.get("source") not in ("env", "default") or delay.get("setting") is not None \
-            or delay.get("request_seq") is not None:
-        return "the delay is set by something other than .env"
-    if delay.get("value") != pol.delay_entry(ns, inputs)["value"]:
-        return "the delay is not the one .env gives"
     for name, entry in state.items():
         if name == pol.DELAY_ENTRY:
             continue
@@ -638,7 +632,15 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
         if added:
             report.add(FAILURE, "rows-added", f"{len(added)} rows in {label} are not in its seal: "
                                               f"{', '.join(added[:20])}", root.seq, label)
-        if missing or added:
+        if missing:
+            return
+        if added:
+            # The rows the seal holds, without the added ones, must still give its roots.
+            kept = ai.hour_figures(rows, salt, {rid: e[0] for rid, e in erased.items()},
+                                   exclude={fmt.as_uuid(a) for a in added})
+            if (kept.root_s, kept.root_c) != (root.root_s, root.root_c):
+                which = "stable fields" if kept.root_s != root.root_s else "personal values"
+                report.add(FAILURE, "rows-altered", f"rows of {label} changed in their {which}", root.seq, label)
             return
     elif fig.count != root.count:
         kind = "rows-missing" if fig.count < root.count else "rows-added"

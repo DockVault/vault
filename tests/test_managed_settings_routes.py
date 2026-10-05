@@ -384,3 +384,19 @@ def test_a_cancel_whose_audit_row_cannot_be_written_leaves_the_change_waiting(en
     assert "still waiting" in caught.value.detail
     assert db.get(ManagedSettingChange, uuid.UUID(change_id)).status == sc.PENDING
     assert len(quiet["announced"]) == 1
+
+
+def test_while_sealing_is_stopped_a_reduction_is_refused_and_a_longer_value_is_saved(env, db, chain):
+    from app.core.models import AuditSeal
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    from app.core import audit_integrity
+    chain.st.view.reset()
+    user = _admin(db)
+    with pytest.raises(HTTPException) as refused:
+        routes.put_managed_setting("keep_days", routes.ManagedValue(value=10), request=None, current_user=user, db=db)
+    assert refused.value.status_code == 409 and "not sealing" in refused.value.detail
+    out = routes.put_managed_setting("keep_days", routes.ManagedValue(value=400), request=None, current_user=user,
+                                     db=db)
+    assert out["status"] == "applied"
+    assert audit_integrity
