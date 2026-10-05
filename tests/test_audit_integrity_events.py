@@ -433,3 +433,46 @@ def test_the_host_acknowledges_failures_and_they_leave_the_status(env):
     assert done["failures"] == ["rows-altered"]
     assert ai.status(env.st)["failures"] == {}
     assert env.seals()[-1].detail["failures"][0][0] == "rows-altered"
+
+
+def test_a_head_record_written_by_root_belongs_to_the_directorys_owner(tmp_path, monkeypatch):
+    """A host command runs in the web container as root; the web process runs as the app's user, so every
+    file of the head record a root process writes is handed to the owner of the keys directory."""
+    from app.core import audit_head_record as hr
+    chowned = []
+    monkeypatch.setattr(hr.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(hr.os, "chown", lambda path, uid, gid: chowned.append(os.path.basename(path)), raising=False)
+    store = hr.HeadStore(str(tmp_path / "keys" / "audit-chain-head.json"))
+    store.write(lambda rec: {**rec, "seq": 1}, datetime(2026, 1, 1))
+    assert "audit-chain-head.json.lock" in chowned
+    assert any(name.startswith(".audit-chain-head.") for name in chowned)       # the file before its rename
+    chowned.clear()
+    monkeypatch.setattr(hr.os, "geteuid", lambda: 10001, raising=False)
+    store.write(lambda rec: {**rec, "seq": 2}, datetime(2026, 1, 1))
+    assert chowned == []
+
+
+def test_a_head_record_that_cannot_be_read_stops_a_new_process_and_not_a_running_one(env, monkeypatch):
+    from app.core import audit_head_record as hr
+    env.run_until_sealed()
+
+    def refuse(path):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(hr, "read_file", refuse)
+    env.clock.advance(hours=2)
+    assert env.seal().stopped is None                     # the running process goes on from its own copy
+    assert "head-record-unwritable" in ai.status(env.st)["warnings"]
+    env.fresh_process()
+    assert env.seal().stopped == "head-record-missing"   # a new one cannot know the head
+
+
+def test_an_unreadable_head_record_never_lets_genesis_run_again(env, monkeypatch):
+    from app.core import audit_head_record as hr
+
+    def refuse(path):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(hr, "read_file", refuse)
+    assert env.seal().stopped == "head-record-missing"
+    assert env.seals() == []

@@ -879,7 +879,7 @@ def main(argv=None) -> int:
         if getattr(args, "json", False):
             out.write(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}) + "\n")
         return 2
-    if args.json:
+    if getattr(args, "json", False):
         out.write(json.dumps({"ok": True, "head": report.head, "head_at": report.head_at, "key_id": report.key_id,
                               "seals": report.seals, "exit_code": report.exit_code,
                               "findings": [f.as_dict() for f in report.findings]}) + "\n")

@@ -58,12 +58,27 @@ def order(record: Optional[Dict[str, Any]]) -> tuple:
 
 # --------------------------------------------------------------------------- file locking
 
+def _owned_like_directory(path: str) -> None:
+    """Give ``path`` the owner of its directory when this process runs as root. The web process runs as the
+    app's user, and a host command run with ``docker compose exec`` runs as root: a file it made would be
+    root's, which the web process could then neither read nor replace."""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() != 0:
+        return
+    try:
+        st = os.stat(os.path.dirname(path) or ".")
+        os.chown(path, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+
+
 @contextmanager
 def _file_lock(path: str):
     """An exclusive lock on ``path`` + '.lock', between processes."""
     lock_path = path + ".lock"
     os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    _owned_like_directory(lock_path)
     try:
         if os.name == "nt":
             import msvcrt
@@ -114,6 +129,7 @@ def _write_file(path: str, record: Dict[str, Any]) -> None:
             json.dump(record, fh, sort_keys=True, separators=(",", ":"))
             fh.flush()
             os.fsync(fh.fileno())
+        _owned_like_directory(tmp)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -247,10 +263,18 @@ class HeadStore:
         self._mutex = threading.Lock()
 
     def load(self) -> Optional[Dict[str, Any]]:
-        """The higher of memory and the file. Raises ValueError for a file that is not a record."""
+        """The higher of memory and the file. Raises ValueError for a file that is not a record, or one this
+        process cannot read while it holds no copy of its own; with a copy, it goes on from that, and says the
+        file cannot be used (``unwritable``)."""
         with self._mutex:
-            with _file_lock(self.path):
-                disk = read_file(self.path)
+            try:
+                with _file_lock(self.path):
+                    disk = read_file(self.path)
+            except OSError as exc:
+                if self.memory is None:
+                    raise ValueError(f"the head record cannot be read ({type(exc).__name__})") from None
+                self.unwritable = f"{type(exc).__name__}: {exc}"
+                return copy.deepcopy(self.memory)
             if disk is None:
                 return copy.deepcopy(self.memory) if self.memory else None
             if self.memory is None or order(disk) >= order(self.memory):

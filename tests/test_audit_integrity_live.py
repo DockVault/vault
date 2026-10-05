@@ -169,9 +169,12 @@ out["recorded"] = tamper(
     "UPDATE audit_logs SET recorded = CAST('" + q(recorded) + "' AS jsonb) WHERE id = '" + rid + "'")
 with engine.begin() as c:
     keep = c.execute(text("SELECT row_to_json(a)::text FROM audit_logs a WHERE id = '" + rid + "'")).scalar()
-out["deleted"] = tamper("DELETE FROM audit_logs WHERE id = '" + rid + "'",
-                        "INSERT INTO audit_logs SELECT * FROM json_populate_record(NULL::audit_logs, CAST('" +
-                        q(keep) + "' AS json))")
+with engine.begin() as c:
+    c.execute(text("DELETE FROM audit_logs WHERE id = '" + rid + "'"))
+out["deleted"], _ = report()
+with engine.begin() as c:
+    c.execute(text("INSERT INTO audit_logs SELECT * FROM json_populate_record(NULL::audit_logs, CAST(:row AS json))"),
+              {"row": keep})
 out["after_restore"], _ = report()
 
 with engine.begin() as c:

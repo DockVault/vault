@@ -157,8 +157,9 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
     except registry.SettingRefused as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc))
-    except Exception:  # noqa: BLE001 -- no change without its audit row
+    except Exception as exc:  # noqa: BLE001 -- no change without its audit row
         db.rollback()
+        registry._say(f"Warning: a change of {key} was not saved ({type(exc).__name__}: {exc})")
         raise HTTPException(status_code=503, detail="The change was not saved: its audit record could not be "
                                                     "written. Nothing was changed.")
     if outcome.status == "applied":
@@ -198,8 +199,9 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
     except registry.SettingRefused as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc))
-    except Exception:  # noqa: BLE001 -- no cancel without its audit row
+    except Exception as exc:  # noqa: BLE001 -- no cancel without its audit row
         db.rollback()
+        registry._say(f"Warning: a cancel of a waiting change was not saved ({type(exc).__name__}: {exc})")
         raise HTTPException(status_code=503, detail="The change was not cancelled: its audit record could not "
                                                     "be written. It is still waiting.")
     setting_changes.announce(setting_changes.CANCELLED_BY_ADMIN, details, current_user.username)
