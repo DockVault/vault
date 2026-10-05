@@ -8267,6 +8267,8 @@ async function loadMfaActions() {
     try { data = await apiRequest('/second-factor/actions', { silent: true }); }
     catch (_) { table.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load the action list.')); return; }
     renderMfaActions((data && data.actions) || []);
+    // The step-ups no switch changes are listed read-only below the matrix (static/js/compliance.js).
+    if (typeof window.renderFixedStepUps === 'function') window.renderFixedStepUps((data && data.fixed) || []);
 }
 
 // Toggles are edited LOCALLY; the admin saves the whole matrix once (one step-up), instead of an OTP

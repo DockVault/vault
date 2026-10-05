@@ -74,6 +74,21 @@ FIXED_STEP_UP_ACTIONS: dict = {
     "admin.audit_privacy.write": ("Change what the audit log records", "password_always"),
 }
 
+# The steps of compliance access (app/api/compliance_router.py), each under the compliance policy: the password
+# and a TOTP or recovery code, every time, whatever the matrix says. An email code never counts (an
+# administrator can change the address it goes to), and an account with no TOTP enrollment enrolls first.
+COMPLIANCE_STEP_UPS: dict = {
+    "compliance.grant.propose": "Propose an auditor grant",
+    "compliance.grant.approve": "Approve or turn down an auditor grant",
+    "compliance.grant.reconfirm": "Reconfirm your auditor right",
+    "compliance.case.request": "Request a compliance case",
+    "compliance.case.approve": "Approve, turn down or extend a compliance case",
+    "compliance.case.export": "Export files from a compliance case",
+    "compliance.hold.place": "Place a legal hold",
+    "compliance.hold.decide": "Confirm or release a legal hold",
+}
+FIXED_STEP_UP_ACTIONS.update({key: (name, "compliance") for key, name in COMPLIANCE_STEP_UPS.items()})
+
 
 def fixed_policy(key: str):
     """The policy of a fixed step-up, or None for any other key."""

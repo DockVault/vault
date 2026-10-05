@@ -750,6 +750,9 @@ app.include_router(activity_search_router)
 # Unlocking a password-protected vault's names on the Activity page, with the vault password once.
 from app.api.activity_unlock_router import router as activity_unlock_router  # noqa: E402
 app.include_router(activity_unlock_router)
+# Compliance access: the auditor right, cases, legal holds and their step-ups.
+from app.api.compliance_router import router as compliance_router  # noqa: E402
+app.include_router(compliance_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -10378,7 +10381,9 @@ async def list_second_factor_actions(
 ):
     """The admin step-up policy matrix: one row per cataloged action with its two independent toggles
     (require_otp / require_password). Rendered in catalog order; a key with no stored row yet shows its
-    code default."""
+    code default. ``fixed`` lists the step-ups no toggle changes (app/core/fixed_step_up.py), shown read-only
+    with what they always ask for."""
+    from app.core import fixed_step_up
     from app.core.second_factor_actions import SECOND_FACTOR_ACTIONS
     rows = {r.key: r for r in db.query(SecondFactorAction).all()}
     return {"actions": [
@@ -10386,7 +10391,7 @@ async def list_second_factor_actions(
          "require_otp": bool(rows[key].require_otp) if key in rows else bool(default_otp),
          "require_password": bool(rows[key].require_password) if key in rows else False}
         for key, name, default_otp in SECOND_FACTOR_ACTIONS
-    ]}
+    ], "fixed": fixed_step_up.describe()}
 
 
 @app.put("/second-factor/actions/{key}")
