@@ -6,7 +6,8 @@ update check) read nothing else. Repeated across every affected release, one adv
 10 KB, so the format will change to references that carry only the id. Readers have to accept that
 form several releases before anything writes it; these are the two in this repository. A title or
 fixed_in a reference leaves out is taken from the top-level `advisories` map, and a missing title
-falls back to the id. The validator still requires the repeated fields until 0.30.x is out of support.
+falls back to the id. The validator accepts the short form only below 0.27.0: the host tools of
+0.30.0 to 0.32.x list the newest releases from the repeated fields, and that list reaches 0.27.0.
 """
 import copy
 import importlib.util
@@ -115,8 +116,9 @@ def test_a_reference_missing_only_one_field_takes_that_one_from_its_advisory():
         ("Kept", "1.0.1")]
 
 
-def test_the_validator_still_requires_the_repeated_fields():
-    # The 0.30.x readers read only the repeated fields, so nothing may write the new form yet.
+def test_the_validator_still_requires_the_repeated_fields_where_older_readers_list_them():
+    # The 0.30.x to 0.32.x host tools list the newest releases from the repeated fields alone, so on
+    # those releases a short reference is still refused.
     spec = importlib.util.spec_from_file_location(
         "upgrade_matrix_for_references", ROOT / ".github" / "scripts" / "upgrade_matrix.py")
     module = importlib.util.module_from_spec(spec)

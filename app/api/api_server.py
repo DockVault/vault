@@ -228,6 +228,12 @@ async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPE
     return await fastapi_http_exception_handler(request, exc)
 
 
+# A refusal on a key-proof path renders as {"detail": <sentence>, "reason": <slug>}, never a 401 and never
+# with a word the web app acts on (see app/services/zk_key_proof.py).
+from app.services.zk_key_proof import KeyProofRefusal as _KeyProofRefusal, refusal_handler as _key_proof_refusal_handler  # noqa: E402
+app.add_exception_handler(_KeyProofRefusal, _key_proof_refusal_handler)
+
+
 @app.exception_handler(RequestValidationError)
 async def _request_validation_error_handler(request: StarletteRequest, exc: RequestValidationError):
     """A 422 names the field and says what is wrong with it, and never repeats the value: the default
@@ -1267,6 +1273,10 @@ class VaultCreate(BaseModel):
     team_dek_ephemeral_public_key: Optional[str] = None
     wrapped_team_privkey: Optional[str] = None
     team_privkey_ephemeral_public_key: Optional[str] = None
+    # With a key proof, for a DIRECT zero-knowledge vault: the first epoch's proof material
+    # {public_key, sealed_private_key, dek_check}, the proof key sealed under the vault's DEK. A
+    # hierarchical vault's verifier is its team public key.
+    key_proof: Optional[Dict[str, Any]] = None
 
     @field_validator('name')
     @classmethod
@@ -3806,6 +3816,14 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             raise HTTPException(
                 status_code=400,
                 detail=f"{managed_key} is managed by the deployment environment",
+            )
+    # Switches only the host operator may set, in the environment. Nothing reads them from here; the
+    # refusal (whatever the key's case) keeps a settings save from appearing to change one.
+    for env_only_key in ("zk_key_proof_enforce",):
+        if any(isinstance(key, str) and key.lower() == env_only_key for key in payload):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{env_only_key} is managed by the deployment environment",
             )
 
     # Custom rate-limit overrides (general-API buckets + the login / vault / SFTP throttles) share one
@@ -7402,7 +7420,8 @@ async def second_factor_login_verify(
     db.commit()
     auth_service = AuthService(db)
     session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at)
+    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at,
+                                                 channel=auth_service.WEB)
     _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
     access_token = create_access_token(
         data={"sub": str(user.id), "username": user.username, "session_token": session_token,
@@ -9911,7 +9930,8 @@ async def acknowledge_recovery_codes(
         db.commit()
         auth_service = AuthService(db)
         session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at)
+        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
+                                                     channel=auth_service.WEB)
         _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
         access_token = create_access_token(
             data={"sub": str(current_user.id), "username": current_user.username,
@@ -16075,6 +16095,31 @@ def _enforce_zk_vault_cap(db) -> None:
         )
 
 
+def _check_create_vault_type(db: Session, current_user: User, requested: Optional[str]) -> str:
+    """May `current_user` create a vault of the requested type? Returns the type, or raises.
+
+    The account's permission to create vaults, the deployment's confidentiality policy, and a scoped
+    temporary credential's restriction to one vault type. Shared by POST /vaults and the key-proof
+    challenge for a zero-knowledge create, so the two cannot drift."""
+    PermissionService(db).require_permission(current_user, PermissionEnum.VAULT_CREATE)
+    vault_type = _resolve_vault_type_for_create(current_user, requested, db)
+    from app.core.temp_scope import require_create_vault_type
+    require_create_vault_type(current_user, vault_type)
+    return vault_type
+
+
+def _require_vault_id_unused(db: Session, vault_id) -> None:
+    """Refuse (409) a vault id that is in use or was ever in use.
+
+    "In use" includes "was in use". A retired vault id is the most valuable one to refuse: the server
+    never generates a zero-knowledge vault key, it stores a wrap the browser supplies, so an old key
+    holder could otherwise recreate the vault under its own id, re-supply that same wrap, and read
+    whatever survived the delete."""
+    if (db.query(Vault.id).filter(Vault.id == vault_id).first()
+            or db.query(RetiredObjectId.id).filter(RetiredObjectId.id == vault_id).first()):
+        raise HTTPException(status_code=409, detail="That vault id is already in use.")
+
+
 def _resolve_vault_type_for_create(current_user: User, requested: Optional[str], db: Session) -> str:
     """Creation-time confidentiality-policy chokepoint (design sequencing item 2 + §5).
 
@@ -16161,15 +16206,9 @@ async def create_vault(
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
 
-    # Check permission
-    permission_service.require_permission(current_user, PermissionEnum.VAULT_CREATE)
-
-    # Confidentiality-policy hook (defaults to 'standard'; rejects unbuilt tiers).
-    vault_type = _resolve_vault_type_for_create(current_user, vault_create.type, db)
-
-    # A scoped temp credential may be restricted to a specific vault type (standard vs ZK).
-    from app.core.temp_scope import require_create_vault_type
-    require_create_vault_type(current_user, vault_type)
+    # Permission, the confidentiality policy (defaults to 'standard'; rejects unbuilt tiers) and a scoped
+    # temporary credential's vault-type restriction -- shared with the key-proof challenge for a create.
+    vault_type = _check_create_vault_type(db, current_user, vault_create.type)
 
     # Per-user vault-count cap: a single account cannot create unbounded vaults.
     _enforce_vault_count(db, current_user)
@@ -16219,14 +16258,7 @@ async def create_vault(
         # Reject a taken id before anything is built. Note what actually guarantees uniqueness:
         # the primary key. This check turns that constraint violation into a clear answer, and
         # two simultaneous requests for one id still race past it -- hence the guard below.
-        # "In use" includes "was in use". A retired vault id is the most valuable one to refuse:
-        # the server never generates a zero-knowledge vault key, it stores a wrap the browser
-        # supplies, so an old key holder could otherwise recreate the vault under its own id,
-        # re-supply that same wrap, and read whatever survived the delete.
-        if (db.query(Vault.id).filter(Vault.id == vault_create.id).first()
-                or db.query(RetiredObjectId.id).filter(
-                    RetiredObjectId.id == vault_create.id).first()):
-            raise HTTPException(status_code=409, detail="That vault id is already in use.")
+        _require_vault_id_unused(db, vault_create.id)
 
     # Name / seal validation. A standard vault needs a real plaintext name. A zero-knowledge vault
     # seals its name (and optionally its description) in the BROWSER and sends only its non-secret
@@ -16276,6 +16308,61 @@ async def create_vault(
         _enc_name = None                          # a standard vault never carries browser seals
         _enc_description = None
 
+    # Zero-knowledge: everything the key setup needs is checked BEFORE the vault is built, the key proof
+    # included, so a refused request creates nothing (there is nothing to delete again afterwards).
+    zk_hierarchical = (vault_create.key_wrapping_mode == 'hierarchical')
+    zk_proof_ch = None
+    zk_proof_material = None
+    if vault_type == 'zero_knowledge':
+        from app.api import ecc_router as _ecc
+        from app.core.models import UserKeyPair
+        from app.services import zk_key_proof
+        if not db.query(UserKeyPair.id).filter(UserKeyPair.user_id == current_user.id).first():
+            raise HTTPException(
+                status_code=400,
+                detail="Set up your encryption key before creating a zero-knowledge vault.",
+            )
+        if zk_hierarchical:
+            # Hierarchical: the DEK is wrapped to the TEAM public key, and the owner gets the TEAM
+            # PRIVATE key wrapped to their identity key. The team public key is the vault's verifier,
+            # so it must be a P-384 key.
+            if not (vault_create.team_public_key and vault_create.team_wrapped_dek
+                    and vault_create.team_dek_ephemeral_public_key
+                    and vault_create.wrapped_team_privkey
+                    and vault_create.team_privkey_ephemeral_public_key):
+                raise HTTPException(
+                    status_code=400,
+                    detail="A hierarchical zero-knowledge vault requires the team public key, the "
+                           "DEK wrapped to it, and the team private key wrapped to the owner.",
+                )
+            _ecc._p384_or_malformed(vault_create.team_public_key, "team_public_key")
+        elif not (vault_create.wrapped_dek and vault_create.ephemeral_public_key):
+            raise HTTPException(
+                status_code=400,
+                detail="A browser-wrapped vault key is required to create a zero-knowledge vault.",
+            )
+        header = _ecc._key_proof_header(request)
+        if header is not None:
+            # The proof binds the id the vault will have, so a proven create names it.
+            if vault_create.id is None:
+                raise zk_key_proof.malformed("id is required with a key proof")
+            if zk_hierarchical:
+                new_pem = vault_create.team_public_key
+            else:
+                zk_proof_material = _ecc._direct_proof_material(vault_create.key_proof, "key_proof")
+                new_pem = zk_proof_material["public_key"]
+            raw_body = await request.body()
+            zk_proof_ch = _ecc._consume_key_proof_challenge(
+                db, current_user, vault_id=vault_create.id, op="create", header=header)
+            # The challenge was issued for the mode this body creates; a body in another mode was not
+            # what the proof was prepared for.
+            if (zk_proof_ch.mode, zk_proof_ch.dek_epoch, zk_proof_ch.team_epoch) != (
+                    'hierarchical' if zk_hierarchical else 'direct', 1, 1):
+                raise zk_key_proof.KeyProofRefusal("zk-key-proof-stale")
+            # Identity (the caller's own key) and new key (the verifier this vault starts with).
+            _ecc._verify_key_proof(db, current_user, zk_proof_ch, header, vault_id=vault_create.id,
+                                   body=raw_body, current_pem=None, new_pem=new_pem)
+
     try:
         vault = vault_service.create_vault(
             vault_id=vault_create.id,
@@ -16312,35 +16399,15 @@ async def create_vault(
     # Zero-knowledge vaults: the DEK is generated AND wrapped IN THE BROWSER to the
     # owner's own public key; the owner's wrapped copy is supplied here. The server
     # stores only the opaque wrapped DEK + ephemeral public key and NEVER sees the
-    # key — that is what makes it zero-knowledge. Reject (and roll back the vault) if
-    # the owner has no keypair or the client didn't supply a wrapped DEK, since that
-    # would leave a vault nobody can decrypt.
+    # key — that is what makes it zero-knowledge. Everything this needs was checked
+    # before the vault was built (above). The first epoch's proof row, from a proven
+    # request only, is written in the same commit as the owner's key row.
     if vault_type == 'zero_knowledge':
-        from app.core.models import UserKeyPair, VaultMemberKey
-        if not db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first():
-            db.delete(vault)
-            db.commit()
-            raise HTTPException(
-                status_code=400,
-                detail="Set up your encryption key before creating a zero-knowledge vault.",
-            )
-        hierarchical = (vault_create.key_wrapping_mode == 'hierarchical')
-        if hierarchical:
+        from app.core.models import VaultKeyProof, VaultMemberKey
+        if zk_hierarchical:
             # Hierarchical: the DEK is wrapped to the TEAM public key (team_key map @ epoch 1),
             # and the owner gets the TEAM PRIVATE key wrapped to their identity key (a TEAMPRIV
             # row @ team epoch 1). The server stores only public keys + opaque wraps.
-            missing = not (vault_create.team_public_key and vault_create.team_wrapped_dek
-                           and vault_create.team_dek_ephemeral_public_key
-                           and vault_create.wrapped_team_privkey
-                           and vault_create.team_privkey_ephemeral_public_key)
-            if missing:
-                db.delete(vault)
-                db.commit()
-                raise HTTPException(
-                    status_code=400,
-                    detail="A hierarchical zero-knowledge vault requires the team public key, the "
-                           "DEK wrapped to it, and the team private key wrapped to the owner.",
-                )
             import json as _json
             vault.key_wrapping_mode = 'hierarchical'
             vault.team_public_key = vault_create.team_public_key
@@ -16360,16 +16427,13 @@ async def create_vault(
                 granted_by=current_user.id,
                 granted_at=datetime.now(timezone.utc),
             ))
+            if zk_proof_ch is not None:
+                # The team public key is the verifier; the row records who made the first epoch.
+                db.add(VaultKeyProof(vault_id=vault.id, dek_epoch=1, source="create",
+                                     created_by=current_user.id))
             db.commit()
             db.refresh(vault)
         else:
-            if not (vault_create.wrapped_dek and vault_create.ephemeral_public_key):
-                db.delete(vault)
-                db.commit()
-                raise HTTPException(
-                    status_code=400,
-                    detail="A browser-wrapped vault key is required to create a zero-knowledge vault.",
-                )
             db.add(VaultMemberKey(
                 vault_id=vault.id,
                 user_id=current_user.id,
@@ -16380,9 +16444,20 @@ async def create_vault(
                 granted_by=current_user.id,
                 granted_at=datetime.now(timezone.utc),
             ))
+            if zk_proof_ch is not None:
+                db.add(VaultKeyProof(
+                    vault_id=vault.id, dek_epoch=1,
+                    proof_public_key=zk_proof_material["public_key"],
+                    sealed_private_key=zk_proof_material["sealed_private_key"],
+                    dek_check=zk_proof_material["dek_check"],
+                    source="create", created_by=current_user.id,
+                ))
             vault.key_wrapping_mode = 'direct'
             db.commit()
             db.refresh(vault)
+        if zk_proof_ch is None:
+            _ecc._audit_key_proof_absent(db, current_user, vault.id, "create",
+                                         'hierarchical' if zk_hierarchical else 'direct')
 
     audit_logger.log_vault_created(
         vault.id, vault.name, current_user, get_client_ip(request)
@@ -23467,10 +23542,13 @@ async def cleanup_expired_sessions():
                 # counts with nothing left to count are dropped.
                 try:
                     from app.core import sign_in_lockout
+                    # An administrator's lock that has no end is given one first (see
+                    # end_administrators_open_locks), so the release below can clear it; the end it is
+                    # given is kept even when nothing is released yet.
+                    sign_in_lockout.end_administrators_open_locks(db)
                     released = sign_in_lockout.release_expired(db)
-                    pruned_counts = sign_in_lockout.prune_stale(db)
-                    if released or pruned_counts:
-                        db.commit()
+                    sign_in_lockout.prune_stale(db)
+                    db.commit()
                     if released:
                         print(f"🔓 Released {released} automatic sign-in lock(s) past their duration")
                 except Exception as lockout_err:
@@ -23503,6 +23581,18 @@ async def cleanup_expired_sessions():
                 except Exception as purge_err:
                     db.rollback()
                     print(f"⚠ session retention purge failed: {type(purge_err).__name__}")
+
+                # Delete key-proof challenges nobody answered in time (each holds a sealed one-time
+                # key; see app/core/session_retention.py).
+                try:
+                    from app.core.session_retention import purge_expired_key_proof_challenges
+                    purged_challenges = purge_expired_key_proof_challenges(db)
+                    if purged_challenges:
+                        db.commit()
+                        print(f"🧹 Deleted {purged_challenges} expired key-proof challenge(s)")
+                except Exception as challenge_err:
+                    db.rollback()
+                    print(f"⚠ key-proof challenge purge failed: {type(challenge_err).__name__}")
 
                 # Prune abandoned chunked-upload sessions AND reclaim their buffered chunks
                 # on disk. A terminal/expired session holds the plaintext filename/MIME as
@@ -23771,18 +23861,17 @@ def _seed_default_receiver_tags(bootstrap_status=None):
 
 
 def _backfill_default_permissions():
-    """Grant role-default endpoint permissions to existing non-admin users
-    (idempotent). Picks up newly-added defaults such as temp-credential
-    self-service for the 'user' role without needing the user to be recreated."""
+    """Give existing accounts that are not administrators the role defaults added since they were last
+    given them, once each (endpoint_permissions.grant_newer_role_defaults). Until 0.33.1 this granted
+    every default again at every start, so a default an administrator had revoked came back at the next
+    restart; now a revoked default stays revoked."""
     try:
         from app.core.database import get_db_context
-        from app.core.endpoint_permissions import grant_default_permissions_for_role
-        from app.core.models import RoleEnum, User
+        from app.core.endpoint_permissions import grant_newer_role_defaults
         with get_db_context() as db:
-            users = db.query(User).filter(User.role != RoleEnum.ADMIN).all()
-            for u in users:
-                grant_default_permissions_for_role(str(u.id), u.role.value, db)
-            print(f"[OK] Backfilled default permissions for {len(users)} non-admin user(s)")
+            done = grant_newer_role_defaults(db)
+            print(f"[OK] Role defaults up to date: {done['grants']} new default(s) granted to "
+                  f"{done['accounts']} account(s)")
     except Exception as e:
         print(f"⚠ Permission backfill skipped: {e}")
 
@@ -24084,11 +24173,17 @@ END $$;""",
             # revocation (web logout/lock survives a Redis outage). Both additive + idempotent.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP",
             "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE",
+            # Where a session was signed in ('web' or 'sftp'), so a sign-in on one ends only its own
+            # channel's earlier sessions. Nullable: a release that does not know it ignores it.
+            "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS channel VARCHAR(8)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN NOT NULL DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sftp_password_auth BOOLEAN NOT NULL DEFAULT TRUE",
             # An administrator's second-factor reset asks the user to set the factor up again at the
             # next sign-in. Nullable, so a rollback to a release that does not know it is unaffected.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS second_factor_reset_at TIMESTAMP",
+            # The revision of the role defaults an account has been given, so a start grants each default
+            # once instead of granting again one an administrator revoked. Nullable, for the same reason.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_defaults_revision INTEGER",
             # An administrator's invitation keeps its inviter's lineage from the moment it is made, for
             # the two-administrator rule (app/core/admin_grants.py). Nullable, for the same reason.
             "ALTER TABLE account_invitations ADD COLUMN IF NOT EXISTS inviter_lineage JSON",
@@ -24825,6 +24920,10 @@ async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     # Startup
     initialize_runtime()
+    # Before anything touches the database: a newer release may have changed it in a way this one
+    # cannot read. Raises, and the start stops, unless ALLOW_START_ON_NEWER_DATA is set.
+    from app.core.data_requirements import check_at_startup as _check_data_requirements
+    _check_data_requirements("web")
     init_db()
     print("Database initialized")
     recorded = _run_lightweight_migrations()
@@ -24871,6 +24970,10 @@ async def lifespan(app: FastAPI):
     # without touching anything.
     expiry_cleared = file_expiry.prepare_at_startup()
     expiry_task = asyncio.create_task(file_expiry.run_forever(cleared=expiry_cleared))
+
+    # Say so when requests that change zero-knowledge keys are accepted without a key proof.
+    from app.services import zk_key_proof
+    zk_key_proof.report_at_startup()
 
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.
@@ -24959,6 +25062,12 @@ if __name__ == "__main__":
     # edited to publish on 0.0.0.0, could expose the plaintext API — login credentials and bearer
     # tokens would then cross the network in cleartext. Terminate TLS in-process (API_USE_HTTPS=true
     # + certs) or front the app with an HTTPS reverse proxy (set TRUSTED_PROXIES).
+    # What the trusted-proxy set does that an operator may not expect: TRUST_ALL_PROXIES, and a range
+    # that covers the Docker gateway (a range no longer trusts it; app/core/net_utils.py).
+    from app.core.net_utils import trust_warnings
+    for _warning in trust_warnings():
+        print(f"\n⚠️  WARNING: {_warning}")
+
     if _should_warn_plaintext_transport(settings.api_use_https, settings.environment, settings.trusted_proxies):
         print("\n⚠️  WARNING: serving PLAINTEXT HTTP with ENVIRONMENT != development and no TRUSTED_PROXIES set.")
         print("   Login credentials and bearer tokens cross the network in cleartext if this port is")

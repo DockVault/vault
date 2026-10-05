@@ -40,7 +40,10 @@ bcrypt==5.0.0
 # not reachable here since decode pins a single-element algorithms allowlist and the app is JWS-only)
 # to the maintained PyJWT. app/core/config.py rejects a non-HMAC jwt_algorithm at startup, defeating any
 # alg-confusion regardless of library.
-PyJWT==2.13.0
+# 2.14.0 is the floor: before it, a token whose header was nested deeper than the stack let a
+# RecursionError out of jwt.decode (GHSA-8wjv-2p76-3863), so every signed-in route answered a crafted
+# Authorization header with a 500 instead of a 401. tests/test_access_token_nesting.py pins that.
+PyJWT==2.15.1
 keyring==25.7.0
 
 # HTML sanitization for admin-authored email templates. nh3 is a Rust ammonia binding: an

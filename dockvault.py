@@ -52,7 +52,7 @@ MENU = [
     ("reset",   "Reset - tear down (optionally destroy data)"),
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
-    ("accounts", "Accounts - reset a user's password or second factor, approve a held change"),
+    ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
 ]
 
 
@@ -372,9 +372,9 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), enforce_file_expiry (raw string; only a false value is written),
-    max_single_request_upload_mb (int or None; written only when set), settings_locked_keys (str;
-    written only when set)."""
+    invite_token_pepper (str), enforce_file_expiry and zk_key_proof_enforce (raw strings; only a false
+    value is written), max_single_request_upload_mb (int or None; written only when set),
+    settings_locked_keys (str; written only when set)."""
     lines = []
 
     def q(k):
@@ -491,6 +491,10 @@ def build_env_lines(cfg):
     # a fresh volume set instead of silently switching back on.
     if str(cfg.get("enforce_file_expiry") or "").strip().lower() in ("false", "0", "no", "off"):
         bare("ENFORCE_FILE_EXPIRY", "false")
+    # The key proof on zero-knowledge key changes likewise: on by default and never mentioned, written
+    # only when the operator has postponed it, so a fresh volume set does not switch it back on.
+    if str(cfg.get("zk_key_proof_enforce") or "").strip().lower() in ("false", "0", "no", "off"):
+        bare("ZK_KEY_PROOF_ENFORCE", "false")
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -1291,6 +1295,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # Keep a postponed file-expiry enforcement across a fresh volume set, like the choices above
         # (raw, so an explicit "false" survives; the default is on).
         "enforce_file_expiry": (current_env.get("ENFORCE_FILE_EXPIRY") or "").strip() or None,
+        # And a postponed key proof on zero-knowledge key changes, for the same reason.
+        "zk_key_proof_enforce": (current_env.get("ZK_KEY_PROOF_ENFORCE") or "").strip() or None,
     }
     return cfg
 
@@ -1560,6 +1566,45 @@ GHCR_IMAGE = "ghcr.io/dockvault/vault"
 # unset DOCKVAULT_IMAGE. Naming it here lets the from-source paths point .env back at a local build
 # after a release image has been pulled over it.
 LOCAL_IMAGE = "dockvault-vault:latest"
+# The setting that lets an image start on data a newer release changed in a way it cannot read (see
+# app/core/data_requirements.py). An operator sets it by hand, for as long as they need it; setup
+# never writes it, so no .env this tool authors carries it.
+NEWER_DATA_ESCAPE = "ALLOW_START_ON_NEWER_DATA"
+# The first release whose image checks for such data and refuses to start on it. An image older
+# than this has no check at all: it starts on data a newer release changed, whatever that data is,
+# and may delete or change what the newer release keeps.
+FIRST_NEWER_DATA_CHECK = "0.33.1"
+
+
+def newer_data_escape_set(env):
+    return str((env or {}).get(NEWER_DATA_ESCAPE) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def checks_newer_data(version):
+    """True when `version`'s image refuses to start on data a newer release changed in a way it cannot
+    read. False for a release before FIRST_NEWER_DATA_CHECK, and for a version that cannot be read:
+    neither can be relied on to refuse."""
+    parsed = parse_semver(version)
+    return bool(parsed) and parsed >= parse_semver(FIRST_NEWER_DATA_CHECK)
+
+
+# What `python -m app.core.host_operator ...` prints in an image that has no host operator module
+# (every release before 0.33.0), as its own line.
+_NO_HOST_OPERATOR = re.compile(r"No module named '?app\.core\.host_operator'?\s*$", re.MULTILINE)
+
+
+def parse_downgrade_blockers(answer):
+    """The blockers in a `downgrade-blockers` answer, or None when the answer does not say.
+
+    Each is a dict with at least a `reason`; `requires_at_least` and `undo` are shown when present.
+    An answer that is not ok, or whose list is missing or malformed, says nothing -- which is not
+    the same as saying there is nothing in the way."""
+    if not isinstance(answer, dict) or answer.get("ok") is not True:
+        return None
+    blockers = answer.get("blockers")
+    if not isinstance(blockers, list) or not all(isinstance(b, dict) for b in blockers):
+        return None
+    return blockers
 
 
 def release_image_ref(version):
@@ -1638,9 +1683,19 @@ def is_downgrade(current, target):
     return bool(parse_semver(current) and parse_semver(target) and compare_semver(target, current) < 0)
 
 
+def sort_release_tags(tags):
+    """Release tags highest version first; a tag that does not parse is dropped.
+
+    The releases list is ordered by when each release was made, so a patch release of an older line
+    made after a newer line's release comes first in it, and its first tag is then not the newest
+    release. Everything that takes the newest release from the list sorts it first."""
+    return sorted((t for t in tags or [] if parse_semver(t)), key=parse_semver, reverse=True)
+
+
 def parse_releases(data):
-    """Release tags from the GitHub releases LIST JSON (a list of {tag_name,...}), preserving the
-    API's newest-first order, keeping only version-shaped tags, de-duplicated. Pure; [] on non-list."""
+    """Release tags from the GitHub releases LIST JSON (a list of {tag_name,...}), highest version
+    first (sort_release_tags), keeping only version-shaped tags, de-duplicated. Pure; [] on
+    non-list."""
     if not isinstance(data, list):
         return []
     tags = []
@@ -1650,7 +1705,23 @@ def parse_releases(data):
         tag = (rel.get("tag_name") or "").strip()
         if tag and parse_semver(tag) and tag not in tags:
             tags.append(tag)
-    return tags
+    return sort_release_tags(tags)
+
+
+def release_line(version):
+    """The release line of a version: '0.33' for '0.33.2' or 'v0.33.2'; None if it does not parse."""
+    parsed = parse_semver(version)
+    return "%d.%d" % parsed[:2] if parsed else None
+
+
+def newest_on_line(tags, version):
+    """The highest tag among `tags` on the same release line as `version`, or None.
+
+    Taken from the releases list rather than from any matrix, so only a release that exists is ever
+    named."""
+    line = release_line(version)
+    same = [t for t in sort_release_tags(tags) if line and release_line(t) == line]
+    return same[0] if same else None
 
 
 def _default_release_fetch(url):
@@ -1798,6 +1869,93 @@ def plan_upgrade_path(matrix, current, target):
     }
 
 
+def env_upgrade_notes(env, current, target):
+    """What an upgrade from ``current`` to ``target`` changes for this deployment because of a line in
+    its .env, as sentences to show before the image changes. Pure: ``env`` is the parsed .env. update()
+    prints them, so only a checkout whose tool has them (0.33.1 or later) shows them: both the pull and
+    the source path run the tool already installed, and the source path checks out the target itself."""
+    notes = []
+    cur, tgt = parse_semver(current), parse_semver(target)
+
+    def crosses(version):
+        # Taken as crossing when the running version is not known.
+        return tgt is not None and tgt >= version and (cur is None or cur < version)
+
+    if crosses((0, 33, 1)):
+        raw = (env.get("ACCOUNT_LOCKOUT_MINUTES") or "").strip()
+        try:
+            minutes = int(raw) if raw else None
+        except ValueError:
+            minutes = None
+        if minutes == 0:
+            notes.append(
+                "ACCOUNT_LOCKOUT_MINUTES=0 in .env: from 0.33.1 an administrator's automatic lock (after "
+                "failed sign-ins) has an end instead of lasting until another administrator clears it: a "
+                "lock on sign-ins from one address ends after 15 minutes, a pause on sign-ins from every "
+                "address once its count has also lost a failure (72 minutes with the default settings). "
+                "Other accounts' automatic locks still last until cleared, and so does a lock with no end "
+                "that a release before 0.33.0 armed, which is recorded like one an administrator set. "
+                "From the host, python dockvault.py accounts --action unlock clears any account's locks.")
+    return notes
+
+
+# Where Docker puts compose networks by default (its default address pools), for when the deployment's
+# own network cannot be inspected.
+DOCKER_DEFAULT_POOLS = ("172.16.0.0/12", "192.168.0.0/16")
+
+
+def gateway_trust_note(trusted, gateways, current, target):
+    """The sentence to show before an upgrade from ``current`` to ``target`` when TRUSTED_PROXIES
+    (``trusted``, the raw .env value) holds a range that covers the Docker network's gateway: from
+    0.33.1 a range no longer trusts it. ``gateways`` are the gateway addresses of the deployment's
+    network (read with docker network inspect); when none could be read, a range that overlaps Docker's
+    default pools counts. None when nothing changes. Pure."""
+    import ipaddress
+    cur, tgt = parse_semver(current), parse_semver(target)
+    if tgt is None or tgt < (0, 33, 1) or (cur is not None and cur >= (0, 33, 1)):
+        return None
+    ranges, exact, named = [], [], False
+    for spec in (s.strip() for s in (trusted or "").split(",")):
+        if not spec:
+            continue
+        if spec.lower() == "gateway":
+            named = True
+            continue
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            continue
+        (exact if net.num_addresses == 1 else ranges).append(net)
+    if named or not ranges:
+        return None
+    covered = []
+    for gw in gateways or ():
+        try:
+            addr = ipaddress.ip_address(gw)
+        except ValueError:
+            continue
+        if not any(addr in n for n in exact) and any(addr in n for n in ranges):
+            covered.append(str(addr))
+    if gateways:
+        if not covered:
+            return None
+        where = "the gateway of the vault's Docker network (%s)" % ", ".join(covered)
+    else:
+        pools = [ipaddress.ip_network(p) for p in DOCKER_DEFAULT_POOLS]
+        if not any(r.overlaps(p) for r in ranges for p in pools if r.version == p.version):
+            return None
+        where = "the part of Docker's address space where the vault's network gateway usually is"
+    return ("TRUSTED_PROXIES=%s in .env covers %s. From 0.33.1 a range no longer trusts the gateway: every "
+            "connection Docker relays to the published web port arrives from it (IPv6 clients, clients on this "
+            "host, on Docker Desktop every client), so those clients could set their own address. After the "
+            "upgrade they are recorded as the gateway and their X-Forwarded-For is ignored. A reverse proxy on "
+            "this host arrives from the gateway too: for one, set TRUSTED_PROXIES=gateway and WEB_BIND=127.0.0.1 "
+            "in .env (WEB_BIND needs the compose files of 0.33.1 or later; an install that updates by pulling "
+            "images keeps its own, so publish the web port as 127.0.0.1:<port>:8000 there by hand). A proxy "
+            "container on the vault's network is unaffected: list its address."
+            % ((trusted or "").strip(), where))
+
+
 def backup_reason(plan, down=False):
     """Why a version change needs a backup first, or None when it does not.
 
@@ -1939,6 +2097,26 @@ def _severity(value):
     return text if text in _SEVERITY_RANK else None
 
 
+def _fix_list(value):
+    """An advisory's `fixed_in_lines` as a list of version strings, or [] when it is absent or not a
+    list. Bounded like every fetched scalar: at most 20 entries, each one that parses as a version."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:20]:
+        if isinstance(item, str) and parse_semver(item) and item not in out:
+            out.append(_bound_scalar(item, cap=32))
+    return out
+
+
+def _line_fix(version, fixes):
+    """Which of an advisory's fixes an affected version is told about: the lowest fix above it, which
+    is the fix on its own line when that line has one (every other line's fix above it is on a
+    higher line), and otherwise the next line's; None when there is none above it."""
+    above = [f for f in fixes if parse_semver(version) and parse_semver(f) > parse_semver(version)]
+    return min(above, key=parse_semver) if above else None
+
+
 def version_vulnerabilities(matrix, version):
     """The known vulnerabilities declared for `version`, or [].
 
@@ -1946,13 +2124,15 @@ def version_vulnerabilities(matrix, version):
     version, or states something other than a list, reads as 'none listed' rather than an error. A
     non-dict entry is dropped.
 
-    Each entry is normalised to {title, fixed_in, advisory, severity, cvss, impact, remediation,
-    mitigation}. title and fixed_in are read from the version's own entry exactly as every older copy
-    of this tool reads them, and coerced to a bounded str or None before they reach the dedupe -- so
-    an unhashable JSON value ({} / []) in either can never blow the (title, fixed_in) key. An entry
-    may instead carry only its advisory's id ({"advisory": "<slug>"}); a title or fixed_in it leaves
-    out is then taken from that advisory, and a missing title falls back to the id, so the
-    vulnerability is still counted and named (the app's update check reads references the same way).
+    Each entry is normalised to {title, fixed_in, fixed_in_lines, advisory, severity, cvss, impact,
+    remediation, mitigation}. title and fixed_in are read from the version's own entry exactly as
+    every older copy of this tool reads them, and coerced to a bounded str or None before they reach
+    the dedupe -- so an unhashable JSON value ({} / []) in either can never blow the (title, fixed_in)
+    key. An entry may instead carry only its advisory's id ({"advisory": "<slug>"}); a title or
+    fixed_in it leaves out is then taken from that advisory -- the fix on the version's own line when
+    the advisory lists one per line (`fixed_in_lines`) -- and a missing title falls back to the id, so
+    the vulnerability is still counted and named (the app's update check reads references the same
+    way). fixed_in_lines is the advisory's list of fixes, one per line, or [].
     The rest comes from the advisory the entry names in the matrix's top-level `advisories`
     (schema 3), or from the entry itself when it carries the fields (an older matrix, or a list this
     tool has already resolved and merged). Every string is bounded here and escape-stripped where
@@ -1982,11 +2162,19 @@ def version_vulnerabilities(matrix, version):
             return value if value is not None else _record.get(name)
 
         # A field the entry carries wins, as it always has; one it leaves out comes from its advisory.
+        # An advisory fixed on several lines names one release per line; a reference that leaves its
+        # fix out is then told its own line's fix, not the lowest one.
+        fixes = _fix_list(v.get("fixed_in_lines") if "fixed_in_lines" in v
+                          else record.get("fixed_in_lines"))
         title = v["title"] if "title" in v else (record.get("title") or slug)
-        fixed_in = v["fixed_in"] if "fixed_in" in v else record.get("fixed_in")
+        if "fixed_in" in v:
+            fixed_in = v["fixed_in"]
+        else:
+            fixed_in = _line_fix(version, fixes) or record.get("fixed_in")
         out.append({
             "title": _bound_scalar(title),
             "fixed_in": _bound_scalar(fixed_in),
+            "fixed_in_lines": fixes,
             "advisory": _bound_scalar(slug),
             "severity": _severity(detail("severity")),
             "cvss": _bound_scalar(detail("cvss")),
@@ -2025,9 +2213,12 @@ def describe_vulnerabilities(vulns, indent="    ", width=100):
     lines = []
     for v in sorted(vulns, key=rank):
         fixed = v.get("fixed_in")
-        lines.append("%s- [%s] %s -- %s" % (
+        others = [f for f in v.get("fixed_in_lines") or [] if f != fixed]
+        lines.append("%s- [%s] %s -- %s%s" % (
             indent, (v.get("severity") or "unrated").upper(), clean_matrix_text(v.get("title") or ""),
-            ("fixed in %s" % clean_matrix_text(fixed)) if fixed else "no fix released yet"))
+            ("fixed in %s" % clean_matrix_text(fixed)) if fixed else "no fix released yet",
+            ("; on other lines in %s" % ", ".join(clean_matrix_text(f) for f in others))
+            if fixed and others else ""))
         for heading, key in (("Impact", "impact"), ("Remediation", "remediation"),
                              ("Mitigation", "mitigation")):
             text = clean_matrix_text(v.get(key) or "")
@@ -2040,10 +2231,22 @@ def describe_vulnerabilities(vulns, indent="    ", width=100):
     return lines
 
 
+def _finding_key(v):
+    """One vulnerability's identity: its advisory's id when it names one, else (title, fixed_in).
+
+    The id is what stays the same across lines: a reference names the fix on its own version's
+    line, so the same advisory reads (title, 0.33.2) on 0.33.1 and (title, 0.34.1) on 0.34.0, and a
+    move between them would otherwise both fix one vulnerability and bring one back."""
+    slug = v.get("advisory")
+    if isinstance(slug, str) and slug:
+        return ("advisory", slug)
+    return ("finding", v.get("title"), v.get("fixed_in"))
+
+
 def _finding_keys(matrix, version):
-    """The set of (title, fixed_in) identities a version is affected by -- the same key the merge
-    dedupes on, so a finding counts once however many sources list it."""
-    return {(v.get("title"), v.get("fixed_in")) for v in version_vulnerabilities(matrix, version)}
+    """The set of identities (_finding_key) a version is affected by, so a finding counts once
+    however many sources list it."""
+    return {_finding_key(v) for v in version_vulnerabilities(matrix, version)}
 
 
 def _declares_version(matrix, version):
@@ -2063,8 +2266,9 @@ def safer_alternative(matrix, target, candidates):
 
     A release the matrix does not declare is never offered: it has no known vulnerabilities only
     because nothing is known about it. A target with nothing listed has no safer alternative, since
-    nothing is a strict subset of an empty set. Among several, the fewest known vulnerabilities wins,
-    then the newest."""
+    nothing is a strict subset of an empty set. Among several, one on the target's own release line
+    wins (the smaller move: someone asking for 0.33.1 is pointed at 0.33.2 before 0.34.1), then the
+    fewest known vulnerabilities, then the newest."""
     if not _declares_version(matrix, target):
         return None
     affected = _finding_keys(matrix, target)
@@ -2079,8 +2283,9 @@ def safer_alternative(matrix, target, candidates):
             continue
         keys = _finding_keys(matrix, candidate)
         if keys < affected:
-            better.append((len(keys), tuple(-part for part in parse_semver(candidate)), candidate))
-    return min(better)[2] if better else None
+            better.append((release_line(candidate) != release_line(target), len(keys),
+                           tuple(-part for part in parse_semver(candidate)), candidate))
+    return min(better)[-1] if better else None
 
 
 def support_line(matrix, version):
@@ -2188,23 +2393,100 @@ def _bound_scalar(value, cap=200):
 
 
 def _merge_vulnerabilities(local_v, remote_v):
-    """Union of two vulnerability lists, deduped by (title, fixed_in). Local entries are always kept;
-    the remote can only ADD."""
-    seen, out = set(), []
+    """Union of two vulnerability lists. Two entries are one finding when both name the same
+    advisory id, or when either names none and their (title, fixed_in) agree; so a title or fix
+    worded differently in the two copies still counts once, and two advisories that happen to share
+    a title and fix still count twice. Local entries are always kept; the remote can only ADD."""
+    ids, pairs, out = set(), {}, []
     for v in list(local_v or []) + list(remote_v or []):
         if not isinstance(v, dict):
             continue
-        key = (v.get("title"), v.get("fixed_in"))
-        if key not in seen:
-            seen.add(key)
-            out.append(v)
+        slug = v.get("advisory") if isinstance(v.get("advisory"), str) and v.get("advisory") else None
+        pair = (v.get("title"), v.get("fixed_in"))
+        if slug is not None and slug in ids:
+            continue
+        if pair in pairs and (slug is None or pairs[pair] is None):
+            continue
+        if slug is not None:
+            ids.add(slug)
+        pairs.setdefault(pair, slug)
+        out.append(v)
     return out
+
+
+def line_support_until(matrix, line):
+    """What a matrix's `lines` map says about a release line, as (stated, until).
+
+    stated is False when the map is missing or malformed, or does not list the line. When stated,
+    until is the day the line's security fixes end (YYYY-MM-DD), or None for the newest line, whose
+    end is set when the next minor release ships. A value of any other shape reads as not stated: a
+    fetched matrix is untrusted, and only a plain date is ever printed."""
+    lines = matrix.get("lines") if isinstance(matrix, dict) else None
+    entry = lines.get(line) if isinstance(lines, dict) and isinstance(line, str) else None
+    if not isinstance(entry, dict) or "security_fixes_until" not in entry:
+        return False, None
+    until = entry["security_fixes_until"]
+    if until is None:
+        return True, None
+    if isinstance(until, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", until):
+        return True, until
+    return False, None
+
+
+def _merge_lines(local_lines, main_lines):
+    """Add-only merge of two `lines` maps: every line either copy states, and where both state one,
+    the earlier end wins (a day is earlier than no end yet). main can only bring a line's end
+    forward, never push it back."""
+    merged = {}
+    for source in (local_lines, main_lines):
+        if not isinstance(source, dict):
+            continue
+        for line in source:
+            stated, until = line_support_until({"lines": source}, line)
+            if not stated or not re.fullmatch(r"[0-9]+\.[0-9]+", str(line)):
+                continue
+            if line in merged:
+                until = _earlier_date(merged[line]["security_fixes_until"], until)
+            merged[line] = {"security_fixes_until": until}
+    return merged
+
+
+def _today():
+    import datetime as _dt
+    return _dt.date.today().isoformat()
+
+
+def line_support_note(matrix, version, today=None):
+    """How the release line of `version` stands, for one line of output, or '' when the matrix does
+    not say.
+
+    Reads the `lines` map: a line with a day is supported until then and ended after it; the newest
+    line has no end yet; a line below the first one listed was never given a support period."""
+    line = release_line(version)
+    if line is None:
+        return ""
+    stated, until = line_support_until(matrix, line)
+    if not stated:
+        lines = matrix.get("lines") if isinstance(matrix, dict) else None
+        listed = [l for l in lines if re.fullmatch(r"[0-9]+\.[0-9]+", str(l))] \
+            if isinstance(lines, dict) else []
+        first = min(listed, key=lambda l: parse_semver(l + ".0")) if listed else None
+        if first and parse_semver(line + ".0") < parse_semver(first + ".0"):
+            return "no longer receives security fixes (lines before %s are not supported)" % first
+        return ""
+    if until is None:
+        return ("the newest line: security fixes continue until six months after the next minor "
+                "release")
+    if until < (today or _today()):
+        return "security fixes ended on %s" % until
+    return "security fixes until %s" % until
 
 
 def merge_lifecycle_matrix(local_matrix, main_matrix, released_ceiling):
     """A copy of `local_matrix` with each version's LIFECYCLE (support + vulnerabilities) merged
-    ADD-ONLY with main's. Returns (merged_matrix, source): source 'main' when main contributed, else
-    'local'. DISPLAY/advisory only -- the hard upgrade-path gates keep reading the tag-pinned
+    ADD-ONLY with main's, and each release line's support period (`lines`: every line either copy
+    states, the earlier end winning). Returns (merged_matrix, source): source 'main' when main
+    contributed, else 'local'. DISPLAY/advisory only -- the hard upgrade-path gates keep reading the tag-pinned
     matrices, so a compromised main can raise a false warning but can never block or wave through a
     hop. Never prefers a source and never clears a field."""
     import copy as _copy
@@ -2229,6 +2511,9 @@ def merge_lifecycle_matrix(local_matrix, main_matrix, released_ceiling):
                 meta["vulnerabilities"] = [
                     {**v, "title": _bound_scalar(v.get("title")), "fixed_in": _bound_scalar(v.get("fixed_in"))}
                     for v in mv]
+        lines = _merge_lines((local_matrix or {}).get("lines"), main_matrix.get("lines"))
+        if lines:
+            merged["lines"] = lines
         return merged, "main"
     except Exception:  # a malformed remote must never crash the tool's upgrade path (constraint 2);
         return local_matrix, "local"
@@ -2261,6 +2546,26 @@ def fetch_upgrade_matrix(tag, root=None, opener=None):
         except Exception:
             pass
     return None, "no upgrade matrix could be read"
+
+
+def fetch_describing_matrix(target, current, root=None):
+    """The matrix a move from `current` to `target` is described by, and where it came from.
+
+    The target's published matrix first (fetch_upgrade_matrix; this checkout's copy when offline).
+    A release made on an older line after the target shipped is not in the target's matrix, so when
+    that one does not declare both versions, the running version's own published matrix is asked:
+    it declares that release's way up. Both are tag matrices, fixed once published and checked by the
+    release gate; the copy on main is never used to describe or gate a move. When neither declares
+    both, the target's answer stands and the move reads as not described."""
+    matrix, source = fetch_upgrade_matrix(target, root=root)
+    if not parse_semver(current) or (_declares_version(matrix, current)
+                                     and _declares_version(matrix, target)):
+        return matrix, source
+    own = current if str(current).startswith("v") else "v" + str(current)
+    other, other_source = fetch_upgrade_matrix(own, root=None)
+    if _declares_version(other, current) and _declares_version(other, target):
+        return other, other_source
+    return matrix, source
 
 
 def read_version_file(root):
@@ -2589,6 +2894,8 @@ ACCOUNT_ACTIONS = (
     ("approve", "Approve a change waiting for a second administrator"),
     ("list", "List the changes waiting for approval"),
     ("user-managers", "List who may manage users without being an administrator"),
+    ("regranted-defaults", "List revoked permissions that a restart granted again (before 0.33.1)"),
+    ("unlock", "Unlock an account: its automatic locks and an administrator's lock"),
 )
 
 
@@ -3546,6 +3853,18 @@ class DockVault:
         """docker compose against the root secure shim, anchored to the root .env."""
         return ["docker", "compose", "--env-file", self._env_path(),
                 "-f", os.path.join(self.root, "docker-compose.secure.yml")] + list(args)
+
+    def _network_gateways(self):
+        """The gateway address(es) of the deployment's Docker network, or [] when it cannot be read (no
+        Docker, or the network does not exist yet). Read-only."""
+        name = "%s_vault-network" % DEFAULT_PROJECT
+        try:
+            r = subprocess.run(["docker", "network", "inspect", name, "--format",
+                                "{{range .IPAM.Config}}{{.Gateway}} {{end}}"],
+                               capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return (r.stdout or "").split() if r.returncode == 0 else []
 
     def _run_dc(self, *args, **kw):
         """Run `docker compose ...` with stdin CLOSED, always.
@@ -4776,6 +5095,12 @@ class DockVault:
             (env.get("UPDATE_CHECK_ENABLED") or "false"),
             env.get("UPDATE_CHECK_INTERVAL_MINUTES") or "360"))
 
+        if newer_data_escape_set(env):
+            print(pal.paint(
+                "  %s is set in .env: this deployment starts even on data a newer version changed "
+                "in a way it cannot read. Remove it once you are back on that version or have "
+                "undone the change." % NEWER_DATA_ESCAPE, "yellow"))
+
         tag = getattr(args, "tag", None) if args else None
         from_source = bool(getattr(args, "source", False)) if args else False
         # This checkout's matrix describes every version's lifecycle up to what it ships; use it to
@@ -4786,10 +5111,26 @@ class DockVault:
         # hard gates below stay on the tag-pinned matrices. Fixed URL, bounded, fail-safe to
         # source 'local'. The ceiling for a credible remote fix is the newest release tag we can
         # see, never the running version.
-        _release_tags = fetch_release_tags()
+        _release_tags = sort_release_tags(fetch_release_tags())
         _lifecycle_ceiling = _release_tags[0] if _release_tags else None
         merged_lifecycle, lifecycle_source = merge_lifecycle_matrix(
             local_matrix, fetch_main_lifecycle_matrix(), _lifecycle_ceiling)
+        # The install's release line: how long it gets security fixes, and its newest release, taken
+        # from the releases list so only a release that exists is named.
+        _line_note = line_support_note(merged_lifecycle, current)
+        _line_newest = newest_on_line(_release_tags, current)
+        if release_line(current) and _line_note:
+            text = "  release line    : %s -- %s" % (release_line(current), _line_note)
+            ended = _line_note.startswith(("security fixes ended", "no longer"))
+            print(pal.paint(text, "yellow") if ended else text)
+        if _line_newest and parse_semver(_line_newest) > parse_semver(current):
+            _gone = len(_finding_keys(merged_lifecycle, current)
+                        - _finding_keys(merged_lifecycle, _line_newest))
+            text = "  newest on line  : %s" % _line_newest
+            if _gone:
+                text += " (fixes %d known %s in %s)" % (
+                    _gone, "vulnerability" if _gone == 1 else "vulnerabilities", current)
+            print(pal.paint(text, "green") if _gone else text)
         if not tag:
             tags = _release_tags
             if tags:
@@ -4798,6 +5139,8 @@ class DockVault:
                 print(pal.paint("\n  Available releases (newest first):", "cyan"))
                 for t in offered[:15]:
                     label = "   <- current" if parse_semver(t) == parse_semver(current) else ""
+                    if t == _line_newest and not label:
+                        label = "   <- newest of your line"
                     note = support_line(merged_lifecycle, t)
                     if note and note != "supported":
                         label += "   (%s)" % note
@@ -4830,7 +5173,7 @@ class DockVault:
         print(pal.paint("  The database has no down-migrations, so a change across a schema change can fail", "yellow"))
         print(pal.paint("  to start (a downgrade especially).", "yellow"))
 
-        matrix, matrix_source = fetch_upgrade_matrix(tag, root=self.root)
+        matrix, matrix_source = fetch_describing_matrix(tag, current, root=self.root)
         plan = plan_upgrade_path(matrix, current, tag)
 
         # A hop planned from the FILE is planned from a guess. The pull path never rewrites
@@ -4849,6 +5192,11 @@ class DockVault:
             plan = plan_upgrade_path(None, current, tag)
 
         self._describe_hop(plan, matrix_source, current, tag, down)
+        for note in env_upgrade_notes(env, current, tag):
+            print(pal.paint("  Note: " + note, "yellow"))
+        gateway_note = gateway_trust_note(env.get("TRUSTED_PROXIES"), self._network_gateways(), current, tag)
+        if gateway_note:
+            print(pal.paint("  Note: " + gateway_note, "yellow"))
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
         # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version
@@ -4871,13 +5219,20 @@ class DockVault:
             else:
                 print(pal.paint(
                     "  WARNING: %s has known unpatched vulnerabilities. (%s)" % (tag, _src_phrase), "red"))
+        _target_line = line_support_note(merged_lifecycle, tag)
+        if _target_line.startswith(("security fixes ended", "no longer")) \
+                and release_line(tag) != release_line(current):
+            print(pal.paint("  Note: %s is on the %s line, which %s." % (
+                tag, release_line(tag), _target_line.replace("security fixes ended",
+                                                             "stopped receiving security fixes")),
+                "yellow"))
 
         # What this change does to the deployment's known vulnerabilities -- only when where it starts
         # from is actually known; compared against a guessed version it would describe a different move.
         if version_source == "the running container" and _declares_version(merged_lifecycle, current):
             now = _finding_keys(merged_lifecycle, current)
-            after = {(v.get("title"), v.get("fixed_in")) for v in target_vulns}
-            gained = [v for v in target_vulns if (v.get("title"), v.get("fixed_in")) not in now]
+            after = {_finding_key(v) for v in target_vulns}
+            gained = [v for v in target_vulns if _finding_key(v) not in now]
             if gained:
                 print(pal.paint("  Moving to %s brings back %d known %s that %s does not have:"
                                 % (tag, len(gained), "vulnerability" if len(gained) == 1
@@ -4927,6 +5282,56 @@ class DockVault:
         if plan["blocked"] is not None:
             self._fail("the upgrade matrix says this change must not be taken directly: %s"
                        % clean_matrix_text(plan["blocked"].get("reason", "no reason recorded")))
+
+        # Going back: the running version knows which of its changes to the data an older one
+        # cannot read, so ask it. An older image from FIRST_NEWER_DATA_CHECK on refuses to start on
+        # such data by itself; this says so before the change is made, and names how to undo each
+        # first. An image older than that has no check and starts regardless, so going back to one
+        # over such data is refused here even when forced: this is the only check there is.
+        if down and version_source == "the running container":
+            offered, blockers = self._downgrade_blockers(tag)
+            target_checks = checks_newer_data(tag)
+            if blockers:
+                print(pal.paint("\n  %s has changed this deployment's data in a way %s cannot read:"
+                                % (current, tag), "red"))
+                for blocker in blockers:
+                    needs = server_text(blocker.get("requires_at_least"))
+                    print(pal.paint("    - %s%s" % (server_text(blocker.get("reason"), "no reason given"),
+                                                    (" (needs %s or later)" % needs) if needs else ""),
+                                    "red"))
+                    if blocker.get("undo"):
+                        print("      undo it first, with %s running: %s"
+                              % (current, server_text(blocker.get("undo"))))
+                if not target_checks:
+                    self._fail(
+                        "undo these with %s first, then run update again. %s is older than %s, the "
+                        "first version that checks for this: it would start on this data regardless, "
+                        "and may delete or change what %s keeps. --force-downgrade does not go back to "
+                        "a version older than %s; to go back without undoing these, choose %s or later."
+                        % (current, tag, FIRST_NEWER_DATA_CHECK, current, FIRST_NEWER_DATA_CHECK,
+                           FIRST_NEWER_DATA_CHECK))
+                if not (args and getattr(args, "force_downgrade", False)):
+                    self._fail(
+                        "undo these with %s first, then run update again. %s would refuse to start "
+                        "on this data. (--force-downgrade goes back anyway; %s then starts only with "
+                        "%s=true in .env, on data it cannot fully read.)"
+                        % (current, tag, tag, NEWER_DATA_ESCAPE))
+                print(pal.paint(
+                    "  --force-downgrade given: going on. %s refuses to start on this data unless "
+                    "%s=true is set in .env." % (tag, NEWER_DATA_ESCAPE), "yellow"))
+            elif offered is None:
+                if target_checks:
+                    print(pal.paint(
+                        "  Could not ask the running deployment whether %s can read its data. If it "
+                        "cannot, %s refuses to start and says how to undo the change." % (tag, tag),
+                        "yellow"))
+                else:
+                    print(pal.paint(
+                        "  Could not ask the running deployment whether %s can read its data. %s is "
+                        "older than %s, the first version that checks for this: if %s changed the data "
+                        "in a way %s cannot read, %s starts anyway and may delete or change what %s "
+                        "keeps." % (tag, tag, FIRST_NEWER_DATA_CHECK, current, tag, tag, current),
+                        "yellow"))
 
         dry_run = bool(getattr(args, "dry_run", False)) if args else False
         if dry_run:
@@ -4989,6 +5394,37 @@ class DockVault:
         healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
         print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
                         "green" if healthy else "red"))
+
+    def _downgrade_blockers(self, target):
+        """What the running deployment says stops it going back to `target`: (offered, blockers).
+
+        Asked of the host operator in the running web container (the one-container layout names the
+        service `vault`, the split one `vault-api`):
+
+            python -m app.core.host_operator downgrade-blockers --target X.Y.Z
+
+        which answers, as its last line, {"ok": true, "blockers": [{"key": ..., "requires_at_least":
+        "X.Y.Z", "reason": ..., "undo": ...}, ...]} -- an empty list when nothing is in the way.
+        offered is True with that answer; False when the container's host operator has no such
+        action (argparse calls it an invalid choice), or the container has no host operator at all
+        (Python finds no such module), which is every release before the one that added the action
+        and is not a problem: such a release wrote nothing an older one cannot read; None when it
+        could not be asked at all.
+        """
+        version = str(target).lstrip("vV")
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.host_operator",
+                                 "downgrade-blockers", "--target", version, timeout=180)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            blockers = parse_downgrade_blockers(parse_operator_answer(getattr(r, "stdout", "")))
+            if blockers is not None:
+                return True, blockers
+            stderr = getattr(r, "stderr", "") or ""
+            if "invalid choice" in stderr or _NO_HOST_OPERATOR.search(stderr):
+                return False, []
+        return None, []
 
     def _perform_leg(self, tag, from_source, index=1, total=1):
         """Move the deployment onto one version and prove it came up before going on.
@@ -5344,6 +5780,27 @@ class DockVault:
                             "it: granting it while the account still holds it does nothing.\n", "yellow"))
             return
 
+        if action == "regranted-defaults":
+            answer = self._run_account_tool("regranted-defaults")
+            if not answer.get("ok"):
+                self._fail(server_text(answer.get("error")) or "the list could not be read")
+            rows = answer.get("permissions") or []
+            if not rows:
+                print(pal.paint("  No revoked permission was found granted again by a restart.\n", "green"))
+                return
+            print(pal.paint("\n  Permissions an administrator revoked that a restart granted again", "cyan"))
+            for r in rows:
+                print("  %s  (%s%s)  %-16s revoked %s, granted again %s" % (
+                    server_text(r.get("username")), server_text(r.get("role")),
+                    "" if r.get("active") else ", deactivated", server_text(r.get("group")),
+                    server_text(r.get("revoked_at"))[:16].replace("T", " "),
+                    server_text(r.get("granted_again_at"))[:16].replace("T", " ")))
+            print(pal.paint("  Before 0.33.1 every start granted each role default again. Where one is still not "
+                            "wanted, revoke it again with the account's Permissions button on the Users page "
+                            "(DELETE /permissions/users/{id}/revoke/<group>); from 0.33.1 it stays revoked.\n",
+                            "yellow"))
+            return
+
         if action == "approve":
             request_id = (getattr(args, "request_id", None) if args else None) or (
                 ask("Request id (see: List)", pal) if interactive else None)
@@ -5370,7 +5827,7 @@ class DockVault:
                               % server_text(req.get("target_username")), "yellow")]))
             return
 
-        if action not in ("reset-password", "reset-second-factor"):
+        if action not in ("reset-password", "reset-second-factor", "unlock"):
             self._fail("unknown action: %s" % action)
         username = (getattr(args, "username", None) if args else None) or (
             ask("Username", pal) if interactive else None)
@@ -5390,6 +5847,12 @@ class DockVault:
         answer = self._run_account_tool(*tool_args)
         if not answer.get("ok"):
             self._fail(server_text(answer.get("error")) or "nothing was changed")
+        if action == "unlock":
+            print(pal.paint("  Unlocked %s: %s%d automatic lock(s) cleared. Recorded as the host operator's "
+                            "change, and the account was told." % (
+                                username, "the administrator's lock removed, " if answer.get("was_locked") else "",
+                                int(answer.get("sign_in_locks_cleared") or 0)), "green"))
+            return
         if action == "reset-second-factor":
             print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
                             "with their own password, at the next sign-in." % username, "green"))
@@ -5555,6 +6018,11 @@ def build_parser():
     up.add_argument("--yes", dest="yes", action="store_true", help="confirm the version change (required in --non-interactive)")
     up.add_argument("--dry-run", dest="dry_run", action="store_true", help="report what the change involves and stop, changing nothing")
     up.add_argument("--backup-verified", dest="backup_verified", action="store_true", help="you keep backups elsewhere; skip taking one (not checked)")
+    up.add_argument("--force-downgrade", dest="force_downgrade", action="store_true",
+                    help="go back even though the running version says the older one cannot read data it "
+                         "changed (the older one then starts only with %s=true). Not accepted for a "
+                         "version older than %s, which has no such check and would start on that data "
+                         "regardless" % (NEWER_DATA_ESCAPE, FIRST_NEWER_DATA_CHECK))
     up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lp = parsers["logs"]
@@ -5563,7 +6031,8 @@ def build_parser():
 
     ac = parsers["accounts"]
     ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
-                    help="reset-password | reset-second-factor | approve | list | user-managers")
+                    help="reset-password | reset-second-factor | approve | list | user-managers | "
+                         "regranted-defaults | unlock")
     ac.add_argument("--username", dest="username", help="the account to act on")
     ac.add_argument("--confirm-username", dest="confirm_username",
                     help="the account's username typed again; nothing changes unless it matches")

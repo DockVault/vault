@@ -57,4 +57,5 @@ def test_the_general_header_inspector_knows_every_purpose_the_grammar_defines(ou
     an undefined one is still malformed."""
     assert "ok   the header inspector reads an index-key wrap (0x05) as a v2 envelope" in out, out
     assert "ok   the header inspector reads a link-token purpose (0x06) as a v2 envelope" in out, out
-    assert "ok   a purpose the grammar does not define (0x00, 0x07) is still malformed to the inspector" in out, out
+    assert "ok   the header inspector reads a sealed proof-key purpose (0x07) as a v2 envelope" in out, out
+    assert "ok   a purpose the grammar does not define (0x00, 0x08) is still malformed to the inspector" in out, out

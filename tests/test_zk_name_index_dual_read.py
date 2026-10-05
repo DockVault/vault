@@ -24,6 +24,7 @@ import pytest
 from conftest import (
     unique, ensure_ecc_keypair, create_zk_vault, zk_encrypt_name, zk_name_blind_index,
 )
+from conftest import post_zk
 
 DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
@@ -46,7 +47,7 @@ def _rekey_to(admin, vid, from_v, to_v):
     def _stub(p):
         import base64
         return base64.b64encode(f"{p}-{uuid.uuid4().hex}".encode()).decode()
-    r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+    r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
         "from_version": from_v, "to_version": to_v, "revoke_user_id": None,
         "member_keys": [{"user_id": str(admin.user["id"]),
                          "wrapped_dek": _stub("dek"), "ephemeral_public_key": _stub("eph")}],

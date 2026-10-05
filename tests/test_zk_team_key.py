@@ -25,6 +25,7 @@ import uuid
 import pytest
 
 from conftest import unique, ensure_ecc_keypair, ApiClient, ZK_ENC_NAME_STUB
+from conftest import post_zk, team_public_key
 
 
 @contextlib.contextmanager
@@ -44,11 +45,11 @@ def _stub(prefix="w"):
 def _create_hier_vault(admin):
     """Create a hierarchical ZK vault with opaque stub wraps (server stores them verbatim)."""
     ensure_ecc_keypair(admin)
-    r = admin.post("/vaults", json={
+    r = post_zk(admin, "/vaults", json={
         "name": unique("hteam"),
         "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
         "key_wrapping_mode": "hierarchical",
-        "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+        "team_public_key": team_public_key(),
         "team_wrapped_dek": _stub("tdek"),
         "team_dek_ephemeral_public_key": _stub("teph"),
         "wrapped_team_privkey": _stub("tpriv"),
@@ -61,7 +62,7 @@ def _create_hier_vault(admin):
 def _grant_team(admin, vid, target_id, target_client):
     """Hierarchical share: wrap the team privkey to the target (TEAMPRIV) + grant authz."""
     ensure_ecc_keypair(target_client)
-    r = admin.post(f"/ecc/vaults/{vid}/members", json={
+    r = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
         "user_id": str(target_id),
         "wrapped_team_privkey": _stub("tpriv"),
         "team_ephemeral_public_key": _stub("tpeph"),
@@ -73,7 +74,7 @@ def _grant_team(admin, vid, target_id, target_client):
 
 def _routine_rotate(admin, vid, frm):
     """Routine O(1) DEK rotation: new DEK wrapped to the SAME team pubkey, no member_keys."""
-    return admin.post(f"/ecc/vaults/{vid}/rekey", json={
+    return post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
         "from_version": frm, "to_version": frm + 1, "revoke_user_id": None,
         "member_keys": [],
         "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
@@ -82,11 +83,11 @@ def _routine_rotate(admin, vid, frm):
 
 def _team_rotate(admin, vid, frm, revoke_user_id, member_ids):
     """Team-keypair rotation (forward-secret revoke): NEW team pubkey + TEAMPRIV for each remaining."""
-    return admin.post(f"/ecc/vaults/{vid}/rekey", json={
+    return post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
         "from_version": frm, "to_version": frm + 1, "revoke_user_id": revoke_user_id,
         "member_keys": [{"user_id": str(u), "wrapped_dek": _stub("tpriv"),
                          "ephemeral_public_key": _stub("tpeph")} for u in member_ids],
-        "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+        "team_public_key": team_public_key(),
         "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
     })
 
@@ -192,7 +193,7 @@ def test_cheap_dek_only_rotation_rejected_for_team_member_revoke(admin, temp_use
     vid = v["id"]
     try:
         _grant_team(admin, vid, temp_user["id"], temp_user_client)
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": str(temp_user["id"]),
             "member_keys": [],  # cheap path: no team rotation
             "team_dek_wrapped": _stub("tdek"), "team_dek_ephemeral_public_key": _stub("teph"),
@@ -299,7 +300,7 @@ def test_direct_vault_unaffected(admin):
     """A plain (direct) ZK vault still reports mode='direct' and carries no team fields."""
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        r = admin.post("/vaults", json={
+        r = post_zk(admin, "/vaults", json={
             "name": unique("hdirect"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": _stub("dek"), "ephemeral_public_key": _stub("eph"),
         })

@@ -7,6 +7,7 @@ kind. Holding `vault.create` still permits both. No create cap at all -> can't c
 import contextlib
 
 from conftest import unique, ensure_ecc_keypair, ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB, ZK_ENC_NAME_STUB
+from conftest import post_zk
 
 
 @contextlib.contextmanager
@@ -30,12 +31,12 @@ def _scoped_client(admin, caps):
 
 
 def _mk_standard(c):
-    return c.post("/vaults", json={"name": unique("s"), "type": "standard"})
+    return post_zk(c, "/vaults", json={"name": unique("s"), "type": "standard"})
 
 
 def _mk_zk(c):
     ensure_ecc_keypair(c)   # the temp cred authenticates as its creator, who has a keypair
-    return c.post("/vaults", json={"name": unique("z"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
+    return post_zk(c, "/vaults", json={"name": unique("z"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
                                    "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB})
 
 

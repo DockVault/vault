@@ -25,6 +25,7 @@ import uuid
 import pytest
 
 from conftest import unique, ZK_ENC_NAME_STUB
+from conftest import post_zk
 
 
 pytestmark = pytest.mark.integration
@@ -32,7 +33,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture
 def vault(admin):
-    r = admin.post("/vaults", json={"name": unique("retired")})
+    r = post_zk(admin, "/vaults", json={"name": unique("retired")})
     r.raise_for_status()
     vid = r.json()["id"]
     yield vid
@@ -122,7 +123,7 @@ def test_a_deleted_vaults_object_ids_are_spent_too(admin):
     application code on that path to record anything, so an implementation that inserted from
     Python would leave every file of every deleted vault re-claimable — and it would look correct.
     """
-    v = admin.post("/vaults", json={"name": unique("cascade")})
+    v = post_zk(admin, "/vaults", json={"name": unique("cascade")})
     v.raise_for_status()
     vid = v.json()["id"]
     chosen = uuid.uuid4()
@@ -131,7 +132,7 @@ def test_a_deleted_vaults_object_ids_are_spent_too(admin):
 
     admin.delete_vault(vid)
 
-    other = admin.post("/vaults", json={"name": unique("after")})
+    other = post_zk(admin, "/vaults", json={"name": unique("after")})
     other.raise_for_status()
     oid = other.json()["id"]
     try:
@@ -159,7 +160,7 @@ def test_a_retired_vault_id_is_refused_by_the_create_endpoint(admin, zk_enabled)
     retired = uuid.uuid4()
     _seed_retired(retired, kind=3)
 
-    r = admin.post("/vaults", json={"name": unique("reborn"), "id": str(retired),
+    r = post_zk(admin, "/vaults", json={"name": unique("reborn"), "id": str(retired),
                                     "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
     assert r.status_code == 409, (
         f"a retired vault id was not refused ({r.status_code}: {r.text[:200]})")
@@ -174,7 +175,7 @@ def test_a_fresh_vault_id_still_reaches_the_zero_knowledge_checks(admin, zk_enab
     A fresh id must NOT produce the same 409 -- it goes on to whatever the zero-knowledge flow
     says, which for a request carrying no wrapped key is a different rejection entirely.
     """
-    r = admin.post("/vaults", json={"name": unique("fresh-zk"), "id": str(uuid.uuid4()),
+    r = post_zk(admin, "/vaults", json={"name": unique("fresh-zk"), "id": str(uuid.uuid4()),
                                     "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
     assert "not enabled" not in r.text, (
         "zero-knowledge vaults are off, so this never reached the id check and proves nothing")
@@ -192,7 +193,7 @@ def _zk_vault(admin, vault_id=None):
             "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB}
     if vault_id:
         body["id"] = str(vault_id)
-    return admin.post("/vaults", json=body)
+    return post_zk(admin, "/vaults", json=body)
 
 
 def _zk_folder(admin, vault_id, folder_id):

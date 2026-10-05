@@ -10,9 +10,19 @@ an attacker, and an operator that signs in as the administrator.
 
 Each address check is a failed sign-in under a new, unique name, sent through one proxy set-up; the
 address the vault stored for it is read back from the audit log. Each scheme check mints a
-password-reset link through a TLS proxy and reads the scheme the link was built with. The API is
-restarted once per trust setting (nothing trusted, 127.0.0.1, the three proxies, trust all, the
-whole network).
+password-reset link through a TLS proxy and reads the scheme the link was built with. Each key-proof
+check creates a zero-knowledge vault and rotates its key through one proxy, both requests carrying a
+key proof: the proof is a MAC over the exact request body and travels in the X-ZK-Key-Proof header,
+so it verifies only when the proxy passes both on unchanged. The API is restarted once per trust
+setting (nothing trusted, 127.0.0.1, the three proxies, trust all, the whole network, the gateway by
+name).
+
+Two trust settings also publish the API's port on the Docker host's loopback (IPv4, and IPv6 where the
+host allows it), as the shipped secure compose publishes it: connections Docker relays to a published
+port arrive from the network's gateway. A client in the host's network namespace reaches it that way
+(over IPv4 and over IPv6), and so does an nginx in the host's network namespace, a reverse proxy on the
+Docker host, which the client container reaches at the gateway's address. A range that contains the
+gateway must not trust it; the token `gateway` must.
 
 Usage:
     python3 .github/scripts/proxy_matrix.py --image dockvault-vault:latest
@@ -20,12 +30,15 @@ Usage:
 
 Needs Docker and Python 3.10+ on the host, nothing else: the probes run inside the image under test
 (it has Python), the proxy configurations are copied into their containers, and the TLS certificate
-is made inside the image as well. Postgres and Redis are the images deploy/docker-compose.yml pins.
+is made inside the image as well. The key-proof probe takes the test suite's key-proof client
+(tests/zk_proof_harness.py and tests/zk_key_proof_reference.py) into the image in its own source.
+Postgres and Redis are the images deploy/docker-compose.yml pins.
 
 Safety: every container and network it creates carries the label `com.dockvault.proxy-matrix` set
 to the prefix, and a name starting with `<prefix>-`. Cleanup (at start, at the end, and with
---cleanup-only) removes only what has BOTH. It creates no named volumes, publishes no ports, and
-keeps the databases in memory. Run one matrix per prefix at a time: a second run with the same
+--cleanup-only) removes only what has BOTH. It creates no named volumes, publishes the API only on the
+host's loopback (for the gateway checks), binds the host-side nginx only to the network's gateway
+address, and keeps the databases in memory. Run one matrix per prefix at a time: a second run with the same
 prefix clears the first one's containers when it starts.
 
 Exit status: 0 when every check matched, 1 when any check differed, 2 when the matrix could not be
@@ -53,6 +66,7 @@ from typing import Callable, Iterable, Optional
 
 LABEL = "com.dockvault.proxy-matrix"
 DEFAULT_PREFIX = "dockvault-proxy-matrix"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 _PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 
 # The proxies under test, pinned like every other image the pipeline runs. They are fixtures, not
@@ -67,6 +81,11 @@ JUNK = "not-an-address-junk"
 LOGIN_LIMIT = 5              # failed sign-ins per name; the vault allows twice that per address
 VICTIM_TRIES = 16            # more than the per-address allowance, so the throttle must show
 PROBE_PASSWORD = "not-the-password-1"
+
+# The key-proof check: what it does and what it reports when every step passed. A proof covers the
+# exact body bytes and arrives in a header, so a proxy that rewrites either one makes it fail.
+KEY_PROOF_ACTION = "zero-knowledge vault created and its key rotated, each with a key proof"
+KEY_PROOF_PASSED = "proved"
 
 # Host numbers inside the test network. The API keeps .2 across restarts, so the proxies in front
 # of it never need reconfiguring.
@@ -87,7 +106,17 @@ VIA = {
     "nginx-tls": "https://{nginx}",
     "edge": "http://{edge}",
     "haproxy": "http://{haproxy}",
+    # Relayed by Docker through the network's gateway: a client on the Docker host reaching the port
+    # published on loopback, over IPv4 and over IPv6, and an nginx on the Docker host (reached by the
+    # client container at the gateway's address) that proxies to that port.
+    "relayed": "http://127.0.0.1:{published}",
+    "relayed6": "http://[::1]:{published}",
+    "host-proxy": "http://{gateway}:{hostproxy}",
 }
+
+# Where a probe runs: the client container on the test network, or, for the relayed set-ups, a
+# container in the Docker host's own network namespace.
+HOST_VIAS = ("relayed", "relayed6")
 
 
 class HarnessError(RuntimeError):
@@ -102,6 +131,7 @@ class Config:
     title: str
     trusted: str          # TRUSTED_PROXIES, with {role} placeholders
     trust_all: bool = False
+    publish: bool = False  # also publish the API on the Docker host's loopback (the gateway checks)
 
 
 CONFIGS = (
@@ -109,7 +139,10 @@ CONFIGS = (
     Config("loopback", "TRUSTED_PROXIES=127.0.0.1", "127.0.0.1"),
     Config("proxies", "TRUSTED_PROXIES lists the three proxies", "{nginx},{edge},{haproxy}"),
     Config("all", "TRUST_ALL_PROXIES=true", "", trust_all=True),
-    Config("subnet", "TRUSTED_PROXIES is the whole network, clients included", "{subnet}"),
+    Config("subnet", "TRUSTED_PROXIES is the whole network, clients and its gateway included", "{subnet}",
+           publish=True),
+    Config("gateway", "TRUSTED_PROXIES=gateway, the port published on loopback only", "gateway",
+           publish=True),
 )
 
 
@@ -118,13 +151,15 @@ class Check:
     config: str
     setup: str
     action: str
-    probe: str                        # "address" | "scheme" | "budget"
+    probe: str                        # "address" | "scheme" | "budget" | "log" | "key-proof"
     via: str                          # a key of VIA
-    expect: str                       # a role ("client", "loopback", "forged", "edge"), a scheme,
-                                      # or "baseline" for the budget check
+    expect: str                       # a role ("client", "loopback", "forged", "edge", "gateway"), a
+                                      # scheme, "baseline" for the budget check, "warned" for a log
+                                      # check, or KEY_PROOF_PASSED
     xff: Optional[str] = None         # X-Forwarded-For the client sends
     xfp: Optional[str] = None         # X-Forwarded-Proto the client sends
     note: str = ""
+    ipv6: bool = False                # needs the Docker host to relay IPv6 loopback; skipped where not
 
 
 CHECKS = (
@@ -157,6 +192,14 @@ CHECKS = (
           "address", "edge", "client", xff=FORGED),
     Check("proxies", "TLS nginx on another host, listed", "reset link scheme",
           "scheme", "nginx-tls", "https"),
+    Check("proxies", "nginx that appends, listed", KEY_PROOF_ACTION,
+          "key-proof", "nginx", KEY_PROOF_PASSED),
+    Check("proxies", "TLS nginx on another host, listed", KEY_PROOF_ACTION,
+          "key-proof", "nginx-tls", KEY_PROOF_PASSED),
+    Check("proxies", "two nginx in a chain, both listed", KEY_PROOF_ACTION,
+          "key-proof", "edge", KEY_PROOF_PASSED),
+    Check("proxies", "HAProxy 'option forwardfor' (its own header line), listed", KEY_PROOF_ACTION,
+          "key-proof", "haproxy", KEY_PROOF_PASSED),
     Check("all", "nginx that appends, trust all", "client sends a forged X-Forwarded-For",
           "address", "nginx", "client", xff=FORGED),
     Check("all", "two nginx in a chain, trust all", "real client",
@@ -167,7 +210,31 @@ CHECKS = (
     Check("subnet", "client behind two proxies, whole network listed",
           "client sends a forged X-Forwarded-For", "address", "edge", "forged", xff=FORGED,
           note="documented: a client inside a listed network is believed"),
+    Check("subnet", "client on the Docker host, relayed through the gateway, whole network listed",
+          "client sends a forged X-Forwarded-For", "address", "relayed", "gateway", xff=FORGED,
+          note="a range does not trust the gateway"),
+    Check("subnet", "IPv6 client, relayed through the gateway, whole network listed",
+          "client sends a forged X-Forwarded-For", "address", "relayed6", "gateway", xff=FORGED,
+          note="a range does not trust the gateway", ipv6=True),
+    Check("subnet", "nginx on the Docker host that appends, whole network listed", "real client",
+          "address", "host-proxy", "gateway",
+          note="documented: a range does not trust the gateway; the start-up warning says what to set"),
+    Check("subnet", "the web process at start, whole network listed",
+          "names TRUSTED_PROXIES=gateway and WEB_BIND=127.0.0.1", "log", "direct", "warned"),
+    Check("gateway", "nginx on the Docker host that appends, gateway named", "real client",
+          "address", "host-proxy", "client"),
+    Check("gateway", "nginx on the Docker host that appends, gateway named",
+          "client sends a forged X-Forwarded-For", "address", "host-proxy", "client", xff=FORGED),
+    Check("gateway", "nginx on the network, only the gateway named",
+          "client sends a forged X-Forwarded-For", "address", "nginx", "nginx", xff=FORGED),
+    Check("gateway", "client on the Docker host itself, gateway named",
+          "client sends a forged X-Forwarded-For", "address", "relayed", "forged", xff=FORGED,
+          note="documented: with the gateway named, a client on the host is believed as its proxy is; "
+               "publish the port on loopback only"),
 )
+
+# What the web process must say at start when a range covers the gateway (probe "log").
+GATEWAY_WARNING = ("TRUSTED_PROXIES=gateway", "WEB_BIND=127.0.0.1")
 
 
 def addresses(subnet: str) -> dict[str, str]:
@@ -176,7 +243,10 @@ def addresses(subnet: str) -> dict[str, str]:
     if net.version != 4 or net.prefixlen > 24:
         raise ValueError(f"{subnet}: the matrix needs an IPv4 network of /24 or larger")
     out = {role: str(net.network_address + n) for role, n in HOSTS.items()}
-    out.update(subnet=str(net), loopback="127.0.0.1", forged=FORGED)
+    # Docker gives a network made with --subnet the first address as its gateway. The two ports are
+    # the API's published port and the host-side nginx's, chosen when the matrix starts.
+    out.update(subnet=str(net), loopback="127.0.0.1", forged=FORGED, gateway=str(net.network_address + 1),
+               published="18000", hostproxy="18001")
     return out
 
 
@@ -189,16 +259,21 @@ def url_for(check: Check, addr: dict[str, str]) -> str:
 
 
 def expected_value(check: Check, addr: dict[str, str]) -> str:
-    """The concrete value a check expects: an address for a role, or the scheme itself."""
+    """The concrete value a check expects: an address for a role, or the scheme (or word) itself."""
     if check.probe == "address":
         return addr[check.expect]
     return check.expect
 
 
+def probe_role(check: Check) -> str:
+    """Which container a check's request comes from."""
+    return "host" if check.via in HOST_VIAS else "client"
+
+
 def role_of(value: str, addr: dict[str, str]) -> str:
     """Name the role an address belongs to, for the report ("10.1.2.101" -> "client")."""
     for role in ("client", "attacker", "operator", "loopback", "forged", "nginx", "edge",
-                 "haproxy", "api"):
+                 "haproxy", "api", "gateway"):
         if addr.get(role) == value:
             return role
     return ""
@@ -221,6 +296,7 @@ class Result:
     expect: str
     ok: bool
     detail: str = ""
+    skipped: bool = False     # could not run here (an IPv6 check on a host that relays no IPv6)
 
 
 def judge(check: Check, got: str, addr: dict[str, str]) -> Result:
@@ -255,13 +331,14 @@ def format_report(image: str, results: list[Result], addr: dict[str, str]) -> st
         if r.check.config != current:
             current = r.check.config
             lines.append(f"== {titles.get(current, current)}")
-        mark = "PASS" if r.ok else "FAIL"
+        mark = "SKIP" if r.skipped else ("PASS" if r.ok else "FAIL")
         lines.append(f"  {mark}  {r.check.setup} | {r.check.action}")
         lines.append(f"        got {describe(r.got, addr)}, expected {describe(r.expect, addr)}"
                      + (f"  [{r.check.note}]" if r.check.note else "")
                      + (f"  ({r.detail})" if r.detail else ""))
-    failed = [r for r in results if not r.ok]
-    lines.append(f"{len(results)} checks, {len(failed)} failed")
+    failed = [r for r in results if not r.ok and not r.skipped]
+    skipped = [r for r in results if r.skipped]
+    lines.append(f"{len(results)} checks, {len(failed)} failed" + (f", {len(skipped)} skipped" if skipped else ""))
     return "\n".join(lines)
 
 
@@ -270,14 +347,15 @@ def markdown_report(image: str, results: list[Result], addr: dict[str, str]) -> 
         return text.replace("|", "\\|")
 
     titles = {c.key: c.title for c in CONFIGS}
-    failed = sum(1 for r in results if not r.ok)
-    rows = [f"### Proxy matrix: {len(results)} checks, {failed} failed",
+    failed = sum(1 for r in results if not r.ok and not r.skipped)
+    skipped = sum(1 for r in results if r.skipped)
+    rows = [f"### Proxy matrix: {len(results)} checks, {failed} failed" + (f", {skipped} skipped" if skipped else ""),
             "", f"Image `{image}`, network `{addr['subnet']}`.", "",
             "| | Trust setting | Set-up | Check | Got | Expected |",
             "|---|---|---|---|---|---|"]
     for r in results:
         rows.append("| " + " | ".join(cell(x) for x in (
-            "pass" if r.ok else "**FAIL**", titles.get(r.check.config, r.check.config),
+            "skip" if r.skipped else ("pass" if r.ok else "**FAIL**"), titles.get(r.check.config, r.check.config),
             r.check.setup, r.check.action, describe(r.got, addr),
             describe(r.expect, addr))) + " |")
     return "\n".join(rows) + "\n"
@@ -286,9 +364,11 @@ def markdown_report(image: str, results: list[Result], addr: dict[str, str]) -> 
 def results_json(image: str, results: list[Result], addr: dict[str, str]) -> str:
     return json.dumps({
         "image": image, "subnet": addr["subnet"],
-        "checks": len(results), "failed": sum(1 for r in results if not r.ok),
+        "checks": len(results), "failed": sum(1 for r in results if not r.ok and not r.skipped),
+        "skipped": sum(1 for r in results if r.skipped),
         "results": [{"config": r.check.config, "setup": r.check.setup, "check": r.check.action,
-                     "got": r.got, "expect": r.expect, "ok": r.ok, "detail": r.detail}
+                     "got": r.got, "expect": r.expect, "ok": r.ok, "detail": r.detail,
+                     "skipped": r.skipped}
                     for r in results],
     }, indent=2)
 
@@ -318,6 +398,20 @@ def link_scheme(body: str) -> str:
     if not isinstance(link, str) or "://" not in link:
         return f"(no link: {str(link)[:60]})"
     return link.split("://", 1)[0]
+
+
+def key_proof_outcome(stdout: str) -> str:
+    """What the key-proof probe reports on its last line: KEY_PROOF_PASSED, or the step that failed."""
+    lines = [line for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        raise HarnessError("the key-proof probe printed nothing")
+    try:
+        outcome = json.loads(lines[-1]).get("outcome")
+    except (ValueError, AttributeError) as exc:
+        raise HarnessError(f"the key-proof probe's last line is not its outcome: {lines[-1][:200]!r}") from exc
+    if not isinstance(outcome, str) or not outcome:
+        raise HarnessError(f"the key-proof probe's outcome has the wrong shape: {lines[-1][:200]!r}")
+    return outcome
 
 
 def owned_names(listing: str, prefix: str) -> list[str]:
@@ -364,7 +458,7 @@ APPEND = "$proxy_add_x_forwarded_for"
 PASS_THROUGH = "$http_x_forwarded_for"
 
 
-def nginx_server(listen: int, upstream: str, xff: str, ssl: bool = False) -> str:
+def nginx_server(listen, upstream: str, xff: str, ssl: bool = False) -> str:
     tls = ("    ssl_certificate /etc/nginx/cert.pem;\n"
            "    ssl_certificate_key /etc/nginx/key.pem;\n") if ssl else ""
     return (f"server {{\n    listen {listen}{' ssl' if ssl else ''};\n{tls}"
@@ -375,9 +469,12 @@ def nginx_server(listen: int, upstream: str, xff: str, ssl: bool = False) -> str
 
 
 def proxy_configs(addr: dict[str, str]) -> dict[str, str]:
-    """Each proxy's configuration, keyed by role ("local" is the nginx in the API's namespace)."""
+    """Each proxy's configuration, keyed by role ("local" is the nginx in the API's namespace, "hostproxy"
+    the one in the Docker host's, listening on the network's gateway and proxying to the published port)."""
     api = f"{addr['api']}:8000"
     return {
+        "hostproxy": nginx_server(f"{addr['gateway']}:{addr['hostproxy']}", f"127.0.0.1:{addr['published']}",
+                                  APPEND),
         "nginx": nginx_server(80, api, APPEND) + nginx_server(443, api, APPEND, ssl=True),
         "edge": nginx_server(80, f"{addr['nginx']}:80", APPEND),
         # 8081 hands the client's own header on untouched (a proxy that does not set it), 8082
@@ -467,6 +564,150 @@ print(json.dumps({
 }))
 '''
 
+# The key-proof probe proves with the test suite's own client: the harness makes each proof the way the
+# web app does, with the independent reference implementation. Both modules travel in the probe's
+# source and are written to a directory of their own inside the container before the probe imports
+# them; they need only `cryptography`, which the image has.
+KEY_PROOF_MODULES = ("zk_key_proof_reference", "zk_proof_harness")
+
+KEY_PROOF_LOADER = r'''
+import os, sys, tempfile
+_modules = tempfile.mkdtemp(prefix="key-proof-")
+for _name, _source in MODULES:
+    with open(os.path.join(_modules, _name + ".py"), "w", encoding="utf-8") as _fh:
+        _fh.write(_source)
+sys.path.insert(0, _modules)
+'''
+
+KEY_PROOF_PROBE = r'''
+import base64, hashlib, hmac, json, ssl, sys, urllib.error, urllib.request
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import zk_proof_harness as harness
+
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+# Stand-ins for what a browser wraps and seals: the server stores them and cannot read them.
+WRAPPED = base64.b64encode(b"wrapped-dek-stub" * 4).decode()
+EPHEMERAL = base64.b64encode(b"ephemeral-pubkey-stub" * 5).decode()
+SEALED_NAME = "zk2:" + base64.urlsafe_b64encode(b"zk-vault-name-seal-stub" * 3).decode()
+
+
+class Response:
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class Client:
+    """The part of the test suite's HTTP client the key-proof harness uses."""
+
+    def __init__(self, base, token=None, user=None):
+        self.base, self.token, self.user = base, token, user
+
+    def call(self, method, path, body=None, data=None, headers=None):
+        headers = dict(headers or {})
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers.setdefault("Content-Type", "application/json")
+        request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+        try:
+            with opener.open(request, timeout=30) as resp:
+                return Response(resp.status, resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            return Response(e.code, e.read().decode("utf-8", "replace"))
+
+    def get(self, path, headers=None):
+        return self.call("GET", path, headers=headers)
+
+    def post(self, path, json=None, data=None, headers=None):
+        return self.call("POST", path, json, data, headers)
+
+    def put(self, path, json=None, data=None, headers=None):
+        return self.call("PUT", path, json, data, headers)
+
+
+def finish(outcome):
+    print(json.dumps({"outcome": outcome}))
+    sys.exit(0)
+
+
+def need(step, response, status):
+    if response.status_code != status:
+        finish(f"{step}: {response.status_code} {response.text[:160]}")
+
+
+def proved(step, response):
+    """A guarded request that was sent with a proof, and passed."""
+    if response.zk_challenge_status != 200:
+        finish(f"{step}: no challenge was issued ({response.zk_challenge_status}), so nothing was proved")
+    need(step, response, 200)
+
+
+args = json.loads(sys.argv[1])
+try:
+    signin = Client(args["direct"]).post(
+        "/auth/login", json={"username": args["username"], "password": args["password"]})
+    need("sign-in", signin, 200)
+    session = signin.json()
+    direct = Client(args["direct"], session["access_token"], session["user"])
+    via = Client(args["via"], session["access_token"], session["user"])
+
+    # The account's encryption key, registered with its proof of possession, directly.
+    key = harness.identity_private_key(args["username"])
+    pem = harness.public_pem(key)
+    challenge = direct.post("/ecc/keys/register/challenge")
+    need("key registration challenge", challenge, 200)
+    challenge = challenge.json()
+    server = serialization.load_pem_public_key(challenge["server_ephemeral_public_key"].encode())
+    mac_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"dv-ecc-pop-v1",
+                   info=b"registration-pop").derive(key.exchange(ec.ECDH(), server))
+    mac = hmac.new(mac_key, base64.b64decode(challenge["nonce"]) + pem.encode(), hashlib.sha256).digest()
+    need("key registration", direct.post("/ecc/keys/register", json={
+        "public_key": pem,
+        "encrypted_private_key": json.dumps({"encrypted": "opaque", "salt": "opaque", "iterations": 600000}),
+        "pop": {"challenge_id": challenge["challenge_id"], "mac": base64.b64encode(mac).decode()}}), 201)
+
+    # Through the proxy: create a zero-knowledge vault, then rotate its key, each with a proof.
+    made = harness.post_zk(via, "/vaults", json={
+        "name": "zkproxy-" + args["username"], "type": "zero_knowledge", "enc_name": SEALED_NAME,
+        "name_key_version": 1, "wrapped_dek": WRAPPED, "ephemeral_public_key": EPHEMERAL})
+    proved("create", made)
+    vault = made.json()["id"]
+    path = f"/ecc/vaults/{vault}/rekey"
+    member = [{"user_id": session["user"]["id"], "wrapped_dek": WRAPPED, "ephemeral_public_key": EPHEMERAL}]
+    proved("rotation", harness.post_zk(via, path, json={
+        "from_version": 1, "to_version": 2, "member_keys": member}))
+
+    # The same request without its proof is refused, so the two above passed on their proofs.
+    unproved = harness.prepare_zk(via, path, {"from_version": 2, "to_version": 3, "member_keys": member})
+    need("a rotation without its proof", harness.send_prepared(via, path, unproved, header=None), 428)
+
+    keys = direct.get(f"/ecc/vaults/{vault}/keys")
+    need("reading the vault's keys", keys, 200)
+    keys = keys.json()
+    material = keys.get("key_proof") or {}
+    if (keys.get("current_dek_version"), material.get("state"), material.get("source")) != (2, "set", "rotate"):
+        finish(f"stored: epoch {keys.get('current_dek_version')}, key proof "
+               f"{material.get('state')} from {material.get('source')}")
+    finish(args["passed"])
+except Exception as exc:
+    finish(f"(the probe failed: {exc!r})"[:300])
+'''
+
+
+def key_proof_script(root: Path) -> str:
+    """The key-proof probe's source: the test suite's key-proof modules, then the probe itself."""
+    modules = [[name, (root / "tests" / f"{name}.py").read_text(encoding="utf-8")]
+               for name in KEY_PROOF_MODULES]
+    # A JSON list of [name, source] pairs is also a Python literal.
+    return f"MODULES = {json.dumps(modules)}\n" + KEY_PROOF_LOADER + KEY_PROOF_PROBE
+
 
 # --- Docker -------------------------------------------------------------------------------------
 
@@ -516,6 +757,7 @@ class Matrix:
         self.docker, self.image, self.prefix, self.log = docker, image, prefix, log
         self.run_id = secrets.token_hex(3)
         self.images = compose_images(compose_path.read_text(encoding="utf-8"))
+        self.key_proof_probe = key_proof_script(REPO_ROOT)
         self.requested_subnet = subnet
         self.addr: dict[str, str] = {}
         self.admin_password = "Matrix-Admin-" + secrets.token_urlsafe(18)
@@ -531,6 +773,7 @@ class Matrix:
         }
         self.cert: dict[str, str] = {}
         self.results: list[Result] = []
+        self.ipv6_published = False
 
     # names and labels
     def name(self, role: str) -> str:
@@ -585,11 +828,14 @@ class Matrix:
 
     def start_clients(self) -> None:
         """Three idle containers of the image under test; each probe is a `docker exec` of its
-        Python, so a probe's source address is the container's fixed address."""
+        Python, so a probe's source address is the container's fixed address. A fourth, "host", runs in
+        the Docker host's network namespace: a client on the host, whose connections to a published port
+        Docker relays through the gateway."""
+        idle = ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--entrypoint", "python"]
         for role in ("client", "attacker", "operator"):
-            self.run_container(role, self.image, [
-                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--entrypoint", "python",
-            ], ["-c", "import time\nwhile True: time.sleep(3600)"])
+            self.run_container(role, self.image, idle, ["-c", "import time\nwhile True: time.sleep(3600)"])
+        self.docker("run", "-d", "--name", self.name("host"), *self.labels, "--network", "host", *idle,
+                    self.image, "-c", "import time\nwhile True: time.sleep(3600)", timeout=300)
 
     def make_certificate(self) -> None:
         r = self.docker("exec", "-i", self.name("operator"), "python", "-", input=CERT_SCRIPT,
@@ -606,8 +852,10 @@ class Matrix:
         else:
             image, dest = NGINX_IMAGE, "/etc/nginx"
             files = {"conf.d/default.conf": (configs[role].encode(), 0o644), **tls}
-        net = ["--network", network] if network else [
-            "--network", self.name("net"), "--ip", self.addr[role]]
+        if network is not None:
+            net = ["--network", network]
+        else:
+            net = ["--network", self.name("net"), "--ip", self.addr[role]]
         self.docker("create", "--name", self.name(role), *self.labels, *net, image, timeout=300)
         self.docker("cp", "-", f"{self.name(role)}:{dest}", input=tar_of(files))
         self.docker("start", self.name(role))
@@ -616,8 +864,19 @@ class Matrix:
         for role in ("nginx", "edge", "haproxy"):
             self.start_proxy(role)
 
+    def published_ports(self) -> list[str]:
+        """The -p options that publish the API on the Docker host's loopback, IPv6 too when possible."""
+        port = self.addr["published"]
+        both = ["-p", f"127.0.0.1:{port}:8000", "-p", f"[::1]:{port}:8000"]
+        return both if self.ipv6_published else both[:2]
+
+    def choose_ports(self) -> None:
+        """Two free ports on the Docker host, for the published API and the host-side nginx."""
+        rng = random.Random()
+        self.addr["published"], self.addr["hostproxy"] = (str(p) for p in rng.sample(range(41000, 49000), 2))
+
     def start_api(self, config: Config) -> None:
-        for role in ("local", "api"):
+        for role in ("local", "api", "hostproxy"):
             self.docker("rm", "-f", "-v", self.name(role), check=False)
         env = {
             "DOCKER_CONTAINER": "true", "ENVIRONMENT": "development",
@@ -631,15 +890,44 @@ class Matrix:
         args = [a for k, v in env.items() for a in ("-e", f"{k}={v}")]
         args += [a for k in ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "LOG_TOKEN_PEPPER",
                              "ADMIN_PASSWORD", "DATABASE_URL") for a in ("-e", k)]
-        self.docker("run", "-d", "--name", self.name("api"), *self.labels,
-                    "--network", self.name("net"), "--ip", self.addr["api"], *args,
-                    self.image, "python", "-m", "app.api.api_server", env=self.env(), timeout=300)
+        if not config.publish:
+            ports = []
+        else:
+            # IPv6 loopback too where the Docker host can publish on it; a host that cannot refuses the
+            # container, which is then started with IPv4 alone and the IPv6 checks are skipped.
+            self.ipv6_published = True
+            ports = self.published_ports()
+        started = self.docker("run", "-d", "--name", self.name("api"), *self.labels,
+                              "--network", self.name("net"), "--ip", self.addr["api"], *ports, *args,
+                              self.image, "python", "-m", "app.api.api_server", env=self.env(), timeout=300,
+                              check=not config.publish)
+        if config.publish and started.returncode != 0:
+            self.docker("rm", "-f", "-v", self.name("api"), check=False)
+            self.ipv6_published = False
+            self.docker("run", "-d", "--name", self.name("api"), *self.labels,
+                        "--network", self.name("net"), "--ip", self.addr["api"], *self.published_ports(), *args,
+                        self.image, "python", "-m", "app.api.api_server", env=self.env(), timeout=300)
         self.wait("operator", [f"http://{self.addr['api']}:8000/health"], 180, "the API")
         self.reset_throttles()
         self.start_proxy("local", network=f"container:{self.name('api')}")
         base = self.addr["api"]
         self.wait("operator", [f"http://{base}:8081/health", f"http://{base}:8082/health",
                                f"https://{base}:8443/health"], 30, "the proxy on 127.0.0.1")
+        if config.publish:
+            self.start_proxy("hostproxy", network="host")
+            self.wait("host", [f"http://127.0.0.1:{self.addr['published']}/health"], 60,
+                      "the port published on the Docker host")
+            self.wait("client", [f"http://{self.addr['gateway']}:{self.addr['hostproxy']}/health"], 30,
+                      "the nginx on the Docker host")
+            # Some Docker hosts accept the IPv6 mapping but relay nothing on it inside the host's
+            # network namespace (Docker Desktop): the IPv6 checks are then skipped, not failed.
+            if self.ipv6_published and not self.answers("host", f"http://[::1]:{self.addr['published']}/health"):
+                self.ipv6_published = False
+
+    def answers(self, role: str, url: str, seconds: float = 10) -> bool:
+        r = self.docker("exec", "-i", self.name(role), "python", "-", str(seconds), url,
+                        input=WAIT_SCRIPT, check=False, timeout=seconds + 30)
+        return r.returncode == 0
 
     def wait(self, role: str, urls: list[str], seconds: float, what: str) -> None:
         r = self.docker("exec", "-i", self.name(role), "python", "-", str(seconds), *urls,
@@ -682,10 +970,16 @@ class Matrix:
 
     def probe_address(self, check: Check) -> str:
         name = f"probe-{secrets.token_hex(6)}"
-        res = self.requests("client", [self.login(url_for(check, self.addr), name, check.xff)])[0]
+        res = self.requests(probe_role(check), [self.login(url_for(check, self.addr), name, check.xff)])[0]
         if res["status"] == 0:
             return f"(no answer: {res['body'][:120]})"
         return self.recorded_address(name)
+
+    def probe_log(self, check: Check) -> str:
+        """Whether the API's own output, since it started, carries the start-up warning."""
+        r = self.docker("logs", self.name("api"), check=False)
+        text = (r.stdout or "") + (r.stderr or "")
+        return "warned" if all(part in text for part in GATEWAY_WARNING) else "(no warning)"
 
     def admin_token(self) -> str:
         res = self.requests("operator", [{
@@ -734,6 +1028,32 @@ class Matrix:
         attacked = victim()
         return judge_budget(check, baseline, attacked, attacker)
 
+    def probe_key_proof(self, check: Check) -> str:
+        """Through the check's set-up, as an account made for it alone: create a zero-knowledge vault
+        and rotate its key, each with a key proof, and see a rotation without one refused. Returns
+        KEY_PROOF_PASSED, or the step that went otherwise."""
+        self.reset_throttles()      # every check signs in twice; the sign-in budget is not under test
+        direct = f"http://{self.addr['api']}:8000"
+        auth = {"Authorization": f"Bearer {self.admin_token()}"}
+        name = "keyproof" + secrets.token_hex(5)
+        password = "Key-Proof-" + secrets.token_hex(8)
+        setup = self.requests("operator", [
+            {"url": f"{direct}/settings", "method": "PUT", "headers": auth,
+             "body": {"zero_knowledge_enabled": True}},
+            {"url": f"{direct}/users", "headers": auth,
+             "body": {"username": name, "email": f"{name}@example.com", "password": password, "role": "user"}},
+        ])
+        if setup[0]["status"] != 200 or setup[1]["status"] not in (200, 201):
+            raise HarnessError("could not prepare the key-proof account: "
+                               + "; ".join(f"{r['status']} {r['body'][:160]}" for r in setup))
+        args = {"direct": direct, "via": url_for(check, self.addr), "username": name, "password": password,
+                "passed": KEY_PROOF_PASSED}
+        r = self.docker("exec", "-i", self.name("client"), "python", "-", json.dumps(args),
+                        input=self.key_proof_probe, check=False, timeout=180)
+        if r.returncode != 0:
+            raise HarnessError(f"the key-proof probe did not run: {(r.stderr or '').strip()[-600:]}")
+        return key_proof_outcome(r.stdout)
+
     def run_checks(self, checks: Iterable[Check] = CHECKS) -> list[Result]:
         """Run the checks one trust setting at a time, collecting into self.results as it goes
         (so a run that stops half way still reports what it saw)."""
@@ -746,20 +1066,30 @@ class Matrix:
             self.log(f"== {config.title}: starting the API")
             self.start_api(config)
             for check in mine:
-                if check.probe == "budget":
+                if check.ipv6 and not self.ipv6_published:
+                    result = Result(check, "", expected_value(check, self.addr), False,
+                                    "the Docker host does not relay IPv6 loopback to a published port",
+                                    skipped=True)
+                elif check.probe == "budget":
                     result = self.probe_budget(check)
                 elif check.probe == "scheme":
                     result = judge(check, self.probe_scheme(check), self.addr)
+                elif check.probe == "log":
+                    result = judge(check, self.probe_log(check), self.addr)
+                elif check.probe == "key-proof":
+                    result = judge(check, self.probe_key_proof(check), self.addr)
                 else:
                     result = judge(check, self.probe_address(check), self.addr)
                 results.append(result)
-                self.log(f"  {'PASS' if result.ok else 'FAIL'}  {check.setup} | {check.action}: "
+                self.log(f"  {'SKIP' if result.skipped else ('PASS' if result.ok else 'FAIL')}  "
+                         f"{check.setup} | {check.action}: "
                          f"got {describe(result.got, self.addr)}, "
                          f"expected {describe(result.expect, self.addr)}")
         return results
 
     def set_up(self) -> None:
         self.create_network()
+        self.choose_ports()
         self.log("starting Postgres and Redis")
         self.start_backing_services()
         self.log("starting the clients")
@@ -844,7 +1174,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(markdown_report(args.image, results, matrix.addr))
-    return 0 if results and all(r.ok for r in results) else 1
+    ran = [r for r in results if not r.skipped]
+    return 0 if ran and all(r.ok for r in ran) else 1
 
 
 if __name__ == "__main__":

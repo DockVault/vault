@@ -1,14 +1,16 @@
 name: CodeQL
 
-# Static analysis (SAST) of the Python source on every PR and push to main, plus a weekly full
-# scan so a rule added to CodeQL later still runs against unchanged code. Findings surface in the
-# repository's Security > Code scanning tab. This is free for public repositories.
+# Static analysis (SAST) of the Python source on every PR and push to main and each maintenance
+# line, plus a weekly full scan so a rule added to CodeQL later still runs against unchanged code.
+# Findings surface in the repository's Security > Code scanning tab. This is free for public
+# repositories.
 
 on:
+  # main and each maintenance line release/X.Y: both publish.
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/[0-9]+.[0-9]+"]
   push:
-    branches: ["main"]
+    branches: ["main", "release/[0-9]+.[0-9]+"]
   schedule:
     # Weekly, so newly published CodeQL queries run against code that has not changed.
     - cron: "23 6 * * 1"

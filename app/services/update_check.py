@@ -39,7 +39,7 @@ _USER_AGENT = "DockVault-update-check"
 
 # Process-level cache; re-checks after a restart, which is fine (no persistence needed).
 _cache = {"checked_at": 0.0, "latest": None, "url": None, "notes": None, "matrix": None,
-          "main_matrix": None, "main_fetched_at": None}
+          "main_matrix": None, "main_fetched_at": None, "line_matrices": {}}
 # Serialize the outbound fetch so concurrent admin requests (this runs in FastAPI's sync-endpoint
 # threadpool) coalesce into ONE GitHub call per interval instead of a thundering herd at expiry.
 _fetch_lock = threading.Lock()
@@ -147,10 +147,19 @@ def get_update_status(current_version, enabled, managed, force=False, interval_s
                     # requests however often it polls. A matrix that cannot be fetched is left
                     # None: the banner then degrades to what it said before this existed, which is
                     # a worse banner but not a broken one.
+                    main_matrix = fetch_main_matrix()
+                    # An install on an older release line is offered the newest release of that
+                    # line too, but only once that release's own published matrix has been
+                    # fetched: main's copy names it, the tag's matrix proves it was released. The
+                    # matrices of every older supported line's newest release are fetched, in the
+                    # same round, whatever this install runs: requests that depended on the running
+                    # version would tell GitHub which line it is on.
                     _cache.update({"checked_at": time.time(), "latest": latest, "url": url,
                                    "notes": notes, "matrix": _fetch_matrix(latest),
-                                   "main_matrix": fetch_main_matrix(),
-                                   "main_fetched_at": time.time()})
+                                   "main_matrix": main_matrix,
+                                   "main_fetched_at": time.time(),
+                                   "line_matrices": {v: _fetch_matrix(v) for v in
+                                                     _older_line_releases(main_matrix, latest)}})
     latest = _cache["latest"]
     available = is_newer(latest, current_version)
     status = {
@@ -172,10 +181,21 @@ def get_update_status(current_version, enabled, managed, force=False, interval_s
     # copy. Always present when the check runs (fail-safe source "bundled" when main is unreachable);
     # never a false secure. The ceiling for a credible remote fix is the newest release we can see
     # (latest), never the running version, so a fix in a newer release is still surfaced.
+    bundled = _read_bundled_matrix()
     status["security"] = merged_security(
         current_version, released_ceiling=latest,
-        local_matrix=_read_bundled_matrix(), main_matrix=_cache.get("main_matrix"),
+        local_matrix=bundled, main_matrix=_cache.get("main_matrix"),
         fetched_at=_cache.get("main_fetched_at"))
+    try:
+        line = line_status(current_version, bundled, _cache.get("main_matrix"))
+        if line is not None:
+            status["line"] = line
+        update = line_update(current_version, latest, bundled, _cache.get("main_matrix"),
+                             _cache.get("line_matrices"))
+        if update is not None:
+            status["line_update"] = update
+    except Exception:  # noqa: BLE001 -- a malformed remote never breaks the status; no line notice
+        pass
     return status
 
 
@@ -352,20 +372,51 @@ def _version_support(matrix, version):
     return support if isinstance(support, dict) else {}
 
 
-def _reference_title_and_fix(ref, advisories):
+def _release_line(version):
+    """'0.33' for '0.33.2' or 'v0.33.2'; None when the version does not parse."""
+    parsed = _parse_semver(version)
+    return "%d.%d" % parsed[:2] if parsed else None
+
+
+def _fix_list(value):
+    """An advisory's `fixed_in_lines` as a list of version strings (at most 20, each one that parses
+    as a version), or [] when it is absent or not a list."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:20]:
+        if isinstance(item, str) and _parse_semver(item) and item[:32] not in out:
+            out.append(item[:32])
+    return out
+
+
+def _line_fix(version, fixes):
+    """The lowest of an advisory's fixes above `version`: the fix on its own line when that line has
+    one (every other line's fix above it is on a higher line), else the next line's; or None."""
+    parsed = _parse_semver(version)
+    above = [f for f in fixes if parsed and _parse_semver(f) > parsed]
+    return min(above, key=_parse_semver) if above else None
+
+
+def _reference_title_and_fix(ref, advisories, version=None):
     """A version's reference to an advisory, as (title, fixed_in).
 
     A reference repeats its advisory's title and fixed_in today, because readers older than the
     top-level `advisories` map read nothing else. A later matrix may carry only the advisory's id
     ({"advisory": "<slug>"}); a field the reference leaves out is then taken from that advisory in the
-    same matrix, and a missing title falls back to the id, so the vulnerability is still counted and
-    named. A field the reference does carry wins, as it always has, so both forms of one advisory
-    dedupe to the same (title, fixed_in)."""
+    same matrix -- the fix on `version`'s own line when the advisory lists one per line
+    (`fixed_in_lines`) -- and a missing title falls back to the id, so the vulnerability is still
+    counted and named. A field the reference does carry wins, as it always has, so both forms of one
+    advisory dedupe to the same (title, fixed_in)."""
     slug = ref.get("advisory") if isinstance(ref.get("advisory"), str) else None
     record = advisories.get(slug) if slug is not None else None
     record = record if isinstance(record, dict) else {}
     title = ref["title"] if "title" in ref else (record.get("title") or slug)
-    fixed_in = ref["fixed_in"] if "fixed_in" in ref else record.get("fixed_in")
+    if "fixed_in" in ref:
+        fixed_in = ref["fixed_in"]
+    else:
+        fixed_in = (_line_fix(version, _fix_list(record.get("fixed_in_lines")))
+                    or record.get("fixed_in"))
     return title, fixed_in
 
 
@@ -376,6 +427,14 @@ def _version_vulnerabilities(matrix, version):
     never blow the (title, fixed_in) dedupe key. A non-dict entry is dropped. A reference that carries
     only its advisory's id takes its title and fixed_in from the matrix's `advisories` map
     (_reference_title_and_fix)."""
+    return [{"title": v["title"], "fixed_in": v["fixed_in"]}
+            for v in _version_findings(matrix, version)]
+
+
+def _version_findings(matrix, version):
+    """_version_vulnerabilities with each entry's advisory id kept ({title, fixed_in, advisory}), which
+    is what tells one advisory apart across lines: a reference names its own line's fix, so the same
+    advisory reads (title, 0.33.2) on 0.33.1 and (title, 0.34.1) on 0.34.0."""
     if not isinstance(matrix, dict):
         return []
     version = (version or "").lstrip("vV")
@@ -391,8 +450,9 @@ def _version_vulnerabilities(matrix, version):
     for v in vulns:
         if not isinstance(v, dict):
             continue
-        title, fixed_in = _reference_title_and_fix(v, advisories)
-        out.append({"title": _bound(title), "fixed_in": _bound(fixed_in)})
+        title, fixed_in = _reference_title_and_fix(v, advisories, version)
+        slug = v.get("advisory") if isinstance(v.get("advisory"), str) and v.get("advisory") else None
+        out.append({"title": _bound(title), "fixed_in": _bound(fixed_in), "advisory": _bound(slug)})
     return out
 
 
@@ -447,17 +507,165 @@ def _merge_support(local_s, remote_s):
 
 
 def _merge_vulnerabilities(local_vulns, remote_vulns):
-    """Union of two vulnerability lists, deduped by (title, fixed_in). Local (bundled) entries are
-    always kept; the remote can only ADD."""
-    seen, out = set(), []
+    """Union of two vulnerability lists. Two entries are one finding when both name the same advisory
+    id, or when either names none and their (title, fixed_in) agree -- the host tool's rule, pinned by
+    a test that feeds both the same matrices. Local (bundled) entries are always kept; the remote can
+    only ADD."""
+    ids, pairs, out = set(), {}, []
     for v in list(local_vulns or []) + list(remote_vulns or []):
         if not isinstance(v, dict):
             continue
-        key = (v.get("title"), v.get("fixed_in"))
-        if key not in seen:
-            seen.add(key)
-            out.append(v)
+        slug = v.get("advisory") if isinstance(v.get("advisory"), str) and v.get("advisory") else None
+        pair = (v.get("title"), v.get("fixed_in"))
+        if slug is not None and slug in ids:
+            continue
+        if pair in pairs and (slug is None or pairs[pair] is None):
+            continue
+        if slug is not None:
+            ids.add(slug)
+        pairs.setdefault(pair, slug)
+        out.append(v)
     return out
+
+
+def _finding_key(v):
+    """One vulnerability's identity: its advisory's id when it names one, else (title, fixed_in)."""
+    slug = v.get("advisory")
+    if isinstance(slug, str) and slug:
+        return ("advisory", slug)
+    return ("finding", v.get("title"), v.get("fixed_in"))
+
+
+# --- release lines ----------------------------------------------------------------------------------
+#
+# A line is every release sharing major.minor. From 0.33 on, the matrix's top-level `lines` map says
+# until when each line gets security fixes (null for the newest line). An install on an older line is
+# told about the newest release of its own line -- a smaller move than the newest release overall --
+# and when its line's fixes have ended. Main's copy is read add-only here too: a line it states is
+# added, and where both copies state one, the earlier end wins. The host tool applies the same rules;
+# a test feeds both the same matrices.
+
+_DAY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_LINE_RE = re.compile(r"[0-9]+[.][0-9]+")
+
+
+def _line_support_until(matrix, line):
+    """(stated, until) for `line` in a matrix's `lines` map: until is a YYYY-MM-DD day, or None for
+    the newest line. stated is False when the map does not state the line in that shape."""
+    lines = matrix.get("lines") if isinstance(matrix, dict) else None
+    entry = lines.get(line) if isinstance(lines, dict) and isinstance(line, str) else None
+    if not isinstance(entry, dict) or "security_fixes_until" not in entry:
+        return False, None
+    until = entry["security_fixes_until"]
+    if until is None:
+        return True, None
+    if isinstance(until, str) and _DAY_RE.fullmatch(until):
+        return True, until
+    return False, None
+
+
+def _merge_lines(local_lines, main_lines):
+    """Every line either copy states, mapped to its end; where both do, the earlier end (a day is
+    earlier than none)."""
+    merged = {}
+    for source in (local_lines, main_lines):
+        if not isinstance(source, dict):
+            continue
+        for line in source:
+            stated, until = _line_support_until({"lines": source}, line)
+            if not stated or not _LINE_RE.fullmatch(str(line)):
+                continue
+            if line in merged:
+                until = _earlier_date(merged[line], until)
+            merged[line] = until
+    return merged
+
+
+def _lines_of(matrix):
+    return matrix.get("lines") if isinstance(matrix, dict) else None
+
+
+def line_status(current_version, local_matrix, main_matrix, today=None):
+    """{line, security_fixes_until, ended} for the running version's line, or None when neither copy
+    states it. ended is True once the day has passed."""
+    line = _release_line(current_version)
+    merged = _merge_lines(_lines_of(local_matrix), _lines_of(main_matrix))
+    if line is None or line not in merged:
+        return None
+    until = merged[line]
+    today = today or time.strftime("%Y-%m-%d", time.gmtime())
+    return {"line": line, "security_fixes_until": until, "ended": until is not None and until < today}
+
+
+def _line_newest(main_matrix, current_version, latest):
+    """The highest release main's copy declares on the running version's line, above it -- only when
+    that line is not the newest release's line, whose update is the ordinary one. None otherwise."""
+    line = _release_line(current_version)
+    if line is None or line == _release_line(latest) or not isinstance(main_matrix, dict):
+        return None
+    versions = main_matrix.get("versions")
+    if not isinstance(versions, dict):
+        return None
+    current = _parse_semver(current_version)
+    above = [v for v in versions if isinstance(v, str) and _release_line(v) == line
+             and _parse_semver(v) > current]
+    return max(above, key=_parse_semver) if above else None
+
+
+# At most this many older lines are asked about per round; SECURITY.md supports far fewer at once.
+_MAX_OLDER_LINES = 5
+
+
+def _older_line_releases(main_matrix, latest):
+    """The newest release main's copy declares on each line its `lines` map lists, other than the
+    newest release's line, newest line first and at most _MAX_OLDER_LINES of them. Read from main's
+    copy alone, so the requests made for them are the same on every install."""
+    if not isinstance(main_matrix, dict):
+        return []
+    lines = main_matrix.get("lines")
+    versions = main_matrix.get("versions")
+    if not isinstance(lines, dict) or not isinstance(versions, dict):
+        return []
+    newest = {}
+    for version in versions:
+        line = _release_line(version) if isinstance(version, str) else None
+        if line is None or line not in lines or line == _release_line(latest):
+            continue
+        if line not in newest or _parse_semver(version) > _parse_semver(newest[line]):
+            newest[line] = version
+    ordered = sorted(newest.values(), key=_parse_semver, reverse=True)
+    return ordered[:_MAX_OLDER_LINES]
+
+
+def line_update(current_version, latest, local_matrix, main_matrix, line_matrices, today=None):
+    """The newest release of the running version's line, when that is not the newest line:
+    {version, line, fixes_vulnerability, security_fixes_until}, or None.
+
+    Named by main's copy, and offered only when that release's own published matrix was fetched
+    (`line_matrices`, by version) and declares it: that proves the tag exists, since main's copy
+    alone is not trusted to say what was released. fixes_vulnerability is True when the running
+    version has a vulnerability that release does not."""
+    version = _line_newest(main_matrix, current_version, latest)
+    line_matrix = line_matrices.get(version) if isinstance(line_matrices, dict) else None
+    if version is None or not isinstance(line_matrix, dict):
+        return None
+    declared = line_matrix.get("versions")
+    if not isinstance(declared, dict) or version not in declared:
+        return None
+    have = _merge_vulnerabilities(
+        _version_findings(local_matrix, current_version),
+        _credible_remote_vulns(_version_findings(main_matrix, current_version), latest))
+    after = _merge_vulnerabilities(
+        _version_findings(line_matrix, version),
+        _credible_remote_vulns(_version_findings(main_matrix, version), latest))
+    status = line_status(current_version, local_matrix, main_matrix, today)
+    return {
+        "version": _bound(version, cap=32),
+        "line": _release_line(current_version),
+        "fixes_vulnerability": bool({_finding_key(v) for v in have}
+                                    - {_finding_key(v) for v in after}),
+        "security_fixes_until": status["security_fixes_until"] if status else None,
+    }
 
 
 def _read_bundled_matrix():
@@ -553,9 +761,9 @@ def _security_block(current_version, released_ceiling, local_matrix, main_matrix
     source = "main" if main_matrix is not None else "bundled"
 
     local_s = _version_support(local_matrix, current_version)
-    local_v = _version_vulnerabilities(local_matrix, current_version)
+    local_v = _version_findings(local_matrix, current_version)
     remote_s = _version_support(main_matrix, current_version)
-    remote_v = _credible_remote_vulns(_version_vulnerabilities(main_matrix, current_version),
+    remote_v = _credible_remote_vulns(_version_findings(main_matrix, current_version),
                                       released_ceiling)
 
     support = _merge_support(local_s, remote_s)

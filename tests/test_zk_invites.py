@@ -14,6 +14,7 @@ import subprocess
 import pytest
 
 from conftest import ApiClient, ensure_ecc_keypair, create_zk_vault, unique
+from conftest import post_zk
 
 # Env-overridable so the suite can be pointed at a second stack instead of silently
 # targeting whatever "vault-db" happens to be running.
@@ -129,7 +130,7 @@ def test_grant_to_keyless_still_rejected(admin):
         vid = create_zk_vault(admin, name=unique("zk"))["id"]
         target = admin.create_user(role="user")
         try:
-            r = admin.post(f"/ecc/vaults/{vid}/members",
+            r = post_zk(admin, f"/ecc/vaults/{vid}/members",
                            json={"user_id": target["id"], "wrapped_dek": "x", "ephemeral_public_key": "y"})
             assert r.status_code == 400, r.text
             assert "has not set up an encryption key" in r.text
@@ -153,7 +154,7 @@ def test_grant_clears_stale_invite(admin):
                   f"VALUES (gen_random_uuid(), '{vid}', '{target['id']}', now())")
             assert _psql(f"SELECT count(*) FROM zk_share_invites WHERE vault_id='{vid}' "
                          f"AND target_user_id='{target['id']}'") == "1"
-            r = admin.post(f"/ecc/vaults/{vid}/members",
+            r = post_zk(admin, f"/ecc/vaults/{vid}/members",
                            json={"user_id": target["id"], "wrapped_dek": "x", "ephemeral_public_key": "y"})
             assert r.status_code == 200, r.text
             # the successful grant dropped the stale invite

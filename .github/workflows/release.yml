@@ -1,8 +1,13 @@
 name: Release
 
-# A release is publication of one immutable main-branch commit. The tag and VERSION file are
-# validated before the same commit enters both reusable Docker gates. Only the final job can
-# authenticate to GHCR or write repository/package state.
+# A release is publication of one immutable commit, from main or from a maintenance branch
+# release/X.Y. The tag and VERSION file are validated before the same commit enters both reusable
+# Docker gates. Only the final job can authenticate to GHCR or write repository/package state.
+#
+# The gate decides what the publication may move besides the version's own tag: `:vX.Y` for the
+# newest release of a line, and `:latest` and GitHub's "latest release" only for the highest version
+# there is. It decides that again immediately before authentication, from refs fetched at that
+# moment, because another release may have been tagged while this one was being tested.
 
 on:
   push:
@@ -18,7 +23,7 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate main tag
+    name: Validate release tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -33,10 +38,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch origin/main
-        run: git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
+      # Every release branch and every release tag, not only main: the gate places this tag on
+      # main or on a maintenance line, and against every other release.
+      - name: Fetch origin/main, the maintenance branches and the release tags
+        run: |
+          git fetch --no-tags --prune origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/release/*:refs/remotes/origin/release/*" \
+            "+refs/tags/v*:refs/tags/v*"
 
-      - name: Validate tag, version, commit, and main ancestry
+      - name: Validate tag, version, commit, and ancestry
         id: gate
         env:
           RELEASE_REF: ${{ github.ref }}
@@ -109,12 +120,11 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Fetch current release refs
-        env:
-          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           git fetch --no-tags --prune origin \
             "+refs/heads/main:refs/remotes/origin/main" \
-            "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}"
+            "+refs/heads/release/*:refs/remotes/origin/release/*" \
+            "+refs/tags/v*:refs/tags/v*"
 
       - name: Validate publication inputs before build
         id: publish_gate
@@ -258,12 +268,11 @@ jobs:
           vex: dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.openvex.json
 
       - name: Refresh release refs immediately before authentication
-        env:
-          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           git fetch --force --no-tags --prune origin \
             "+refs/heads/main:refs/remotes/origin/main" \
-            "+refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}"
+            "+refs/heads/release/*:refs/remotes/origin/release/*" \
+            "+refs/tags/v*:refs/tags/v*"
 
       - name: Revalidate immediately before authentication
         id: auth_gate
@@ -278,6 +287,30 @@ jobs:
             --repository-owner "$REPOSITORY_OWNER" \
             --github-output "$GITHUB_OUTPUT"
 
+      # A version is published once. The gate accepts a release with a newer one already tagged on
+      # top of it (the older of two releases cut the same day is checked again that way), and a
+      # re-run after a partial failure; a re-run of a finished release would copy this run's new
+      # build over the image its version tag already names. The GitHub Release is the last thing a
+      # run makes, so its existence marks a finished release.
+      - name: Refuse to publish a finished release again
+        id: not_published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.publish_gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName \
+               >/dev/null 2>"$RUNNER_TEMP/release-view.err"; then
+            echo "::error::the GitHub Release ${TAG} exists, so ${TAG} has already been published and is not published again. If a run failed while creating that release, delete the release (not the tag) and re-run."
+            exit 1
+          fi
+          if ! grep -qi "release not found" "$RUNNER_TEMP/release-view.err"; then
+            echo "::error::cannot tell whether ${TAG} has already been published"
+            cat "$RUNNER_TEMP/release-view.err"
+            exit 1
+          fi
+
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -291,22 +324,46 @@ jobs:
         env:
           IMAGE: ${{ steps.publish_gate.outputs.image }}
           TAG: ${{ steps.publish_gate.outputs.tag }}
+          VERSION: ${{ steps.publish_gate.outputs.version }}
+          # From the gate that ran just before authentication, not the one before the build: a
+          # release tagged on top of this one in the meantime owns `latest` and the line tag.
+          FLOATING_TAGS: ${{ steps.auth_gate.outputs.floating_tags }}
         run: |
           set -euo pipefail
+          tag_args=(--tag "${IMAGE}:${TAG}")
+          for floating in ${FLOATING_TAGS}; do
+            [[ "$floating" =~ ^(latest|v[0-9]+\.[0-9]+)$ ]] \
+              || { echo "::error::the gate named an unexpected moving tag: ${floating}"; exit 1; }
+            # A moving tag never goes backwards. The gate already refuses an out-of-order release;
+            # this reads what the registry holds now, which is what an operator's pull would get.
+            if current="$(docker buildx imagetools inspect "${IMAGE}:${floating}" \
+                  --format '{{ index (index .Image "linux/amd64").Config.Labels "org.opencontainers.image.version" }}' \
+                  2>"$RUNNER_TEMP/inspect.err")"; then
+              if [ -n "$current" ] && [ "$current" != "$VERSION" ] \
+                 && [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" = "$current" ]; then
+                echo "::error::${IMAGE}:${floating} holds ${current}, above ${VERSION}; refusing to move it backwards"
+                exit 1
+              fi
+            elif ! grep -qi "not found" "$RUNNER_TEMP/inspect.err"; then
+              echo "::error::cannot read what ${IMAGE}:${floating} holds now"; cat "$RUNNER_TEMP/inspect.err"
+              exit 1
+            fi
+            tag_args+=(--tag "${IMAGE}:${floating}")
+          done
           # `imagetools create` copies the staged manifests as they are — the same index, the same
           # per-platform digests, the ones the scans just cleared. It does not rebuild, so nothing
           # unscanned can enter the published artifact.
-          docker buildx imagetools create \
-            --tag "${IMAGE}:${TAG}" \
-            --tag "${IMAGE}:latest" \
-            "${STAGING_IMAGE}:${TAG}"
+          docker buildx imagetools create "${tag_args[@]}" "${STAGING_IMAGE}:${TAG}"
 
           staged_digest="$(docker buildx imagetools inspect "${STAGING_IMAGE}:${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           resolved_version="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          resolved_latest="$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          # What was published is what was staged and scanned, and both tags name it.
+          # What was published is what was staged and scanned, and every tag this run moved names it.
           test "$resolved_version" = "$staged_digest"
-          test "$resolved_latest" = "$staged_digest"
+          for floating in ${FLOATING_TAGS}; do
+            resolved_floating="$(docker buildx imagetools inspect "${IMAGE}:${floating}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            test "$resolved_floating" = "$staged_digest" \
+              || { echo "::error::${IMAGE}:${floating} resolves to ${resolved_floating}, not ${staged_digest}"; exit 1; }
+          done
           echo "digest=${resolved_version}" >> "$GITHUB_OUTPUT"
 
       - name: Verify every published platform is anonymously pullable
@@ -381,11 +438,18 @@ jobs:
       - name: Stage the upgrade matrix as a release asset
         run: cp docs/upgrade-matrix.json upgrade.json
 
+      # "Latest" and the notes' comparison base are stated, not left to GitHub: by default it marks
+      # the newest PUBLISHED release as latest, which a maintenance release of an older line would
+      # take from the highest version, and it picks the base itself. The body is a first line for a
+      # maintenance release; GitHub puts the generated notes after it.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.publish_gate.outputs.tag }}
           generate_release_notes: true
+          make_latest: ${{ steps.auth_gate.outputs.make_latest }}
+          previous_tag: ${{ steps.auth_gate.outputs.previous_tag }}
+          body: ${{ steps.auth_gate.outputs.notes_preamble }}
           files: |
             dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
             dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json

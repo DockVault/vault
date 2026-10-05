@@ -111,10 +111,12 @@ async function main() {
     note(lib._inspectV2Header(good) === 'UNSUPPORTED', 'the header inspector reads an index-key wrap (0x05) as a v2 envelope');
     const linkTok = good.slice(); linkTok[5] = lib.V2_PURPOSE_LINK_TOKEN;
     note(lib._inspectV2Header(linkTok) === 'UNSUPPORTED', 'the header inspector reads a link-token purpose (0x06) as a v2 envelope');
-    const beyond = good.slice(); beyond[5] = 0x07;
+    const proofKey = good.slice(); proofKey[5] = lib.V2_PURPOSE_KEY_PROOF_KEY;
+    note(lib._inspectV2Header(proofKey) === 'UNSUPPORTED', 'the header inspector reads a sealed proof-key purpose (0x07) as a v2 envelope');
+    const beyond = good.slice(); beyond[5] = 0x08;
     const none = good.slice(); none[5] = 0x00;
     note(lib._inspectV2Header(beyond) === 'INVALID' && lib._inspectV2Header(none) === 'INVALID',
-        'a purpose the grammar does not define (0x00, 0x07) is still malformed to the inspector');
+        'a purpose the grammar does not define (0x00, 0x08) is still malformed to the inspector');
 
     if (failures) { console.error(`${failures} failure(s)`); process.exit(1); }
     console.log('index-key wrap round-trips, is bound to (vault, recipient), and cannot be swapped with a DEK wrap');

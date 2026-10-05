@@ -13,7 +13,22 @@
  * The token lives in localStorage OR sessionStorage (the app.js storage helper
  * falls back to sessionStorage in private mode), so check both. Mirrors the
  * pre-paint pattern of ui-boot.js; app.js clears data-auth once it routes.
+ *
+ * It also stops the browser from ever sending a form of this page itself. Every form
+ * is sent by app.js (or activity.js) with fetch, but app.js loads at the end of
+ * <body>: on a slow load the sign-in screen is on screen and usable before its
+ * handlers are bound, and pressing Enter there made the browser send the form on
+ * its own, as a GET that put the typed username and password in the address (and
+ * so in the history and in a reverse proxy's access log). This guard is installed
+ * first, on the document in the capture phase, for every load; preventDefault()
+ * stops only the browser's own sending, so the forms' handlers still run. The
+ * forms also say method="post", so with scripts off nothing goes into an address.
  */
+(function () {
+    'use strict';
+    document.addEventListener('submit', function (e) { e.preventDefault(); }, true);
+})();
+
 (function () {
     'use strict';
     try {

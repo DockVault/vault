@@ -65,6 +65,21 @@ def decrypt_secret(stored: str) -> str:
     except (InvalidToken, ValueError, UnicodeDecodeError):
         return stored  # legacy plaintext (pre-encryption) — used as-is until re-saved
 
+
+def decrypt_secret_strict(stored: str) -> str:
+    """Decrypt a value written by encrypt_secret, and ONLY such a value.
+
+    decrypt_secret hands a value that is not a Fernet token back unchanged, which is right for a stored
+    credential written before at-rest encryption and wrong for anything a verifier then relies on: there
+    a planted plaintext value would be used as if this server had sealed it. This variant raises
+    ValueError for an empty value, a value that is not a Fernet token, and one sealed under another key."""
+    if not stored or not isinstance(stored, str):
+        raise ValueError("no sealed value")
+    try:
+        return _fernet().decrypt(stored.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("not a value sealed by this deployment") from exc
+
 # --- AES-256-GCM chunked at-rest stream (format version 0x10) ---------------
 # The legacy at-rest format is a global-key Fernet chunk stream (encrypt_chunk /
 # decrypt_chunk_stream). Fernet has no AAD, so a stored blob is not bound to the
@@ -1359,16 +1374,31 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
+# The longest access token verify_access_token will decode. A token this server signs is a few
+# hundred characters (about 450 with a 50-character username); even a 255-character username made
+# entirely of characters that JSON escapes as surrogate pairs, signed with HS512, stays near 4,500.
+# jwt.decode base64-checks and parses the whole string before it can check the signature, so a
+# longer token is refused on its length alone, as any other invalid token is, and never reaches the
+# library: nobody can make a request cost what decoding a megabyte-long header costs.
+MAX_ACCESS_TOKEN_LENGTH = 8192
+
+
 def verify_access_token(token: str) -> Optional[dict]:
     """
     Verify and decode a JWT access token.
-    
+
+    Every bearer token the web API reads goes through here: the request dependencies, sign-out, the
+    live monitor, the rate limiter's per-user bucket and the upload size check.
+
     Args:
         token: JWT token string
-        
+
     Returns:
-        Decoded token data if valid, None otherwise
+        Decoded token data if valid, None otherwise. A token longer than MAX_ACCESS_TOKEN_LENGTH
+        is None without being decoded.
     """
+    if isinstance(token, (str, bytes)) and len(token) > MAX_ACCESS_TOKEN_LENGTH:
+        return None
     try:
         payload = jwt.decode(
             token,
@@ -1376,7 +1406,9 @@ def verify_access_token(token: str) -> Optional[dict]:
             algorithms=[_runtime_settings().jwt_algorithm]
         )
         return payload
-    except jwt.PyJWTError:
+    except (jwt.PyJWTError, RecursionError):
+        # PyJWT before 2.14.0 let the RecursionError from a header nested deeper than the stack out
+        # of jwt.decode. Such a token is invalid like any other, whatever the library does.
         return None
 
 

@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, func, or_
 
 from app.core.config import settings
-from app.core.models import ActiveSession, PendingLogin
+from app.core.models import ActiveSession, PendingLogin, ZkKeyProofChallenge
 
 # Finished session and pending-login rows older than this are deleted.
 SESSION_DATA_RETENTION_DAYS = 30
@@ -79,3 +79,17 @@ def purge_old_session_data(db, *, now=None, token_lifetime_minutes=None,
         *finished_pending_login_conditions(pending_model, now)
     ).delete(synchronize_session=False)
     return sessions, pending
+
+
+def purge_expired_key_proof_challenges(db, *, now=None, model=ZkKeyProofChallenge):
+    """Delete key-proof challenges past their lifetime.
+
+    Issuing a challenge already deletes the caller's own expired ones; this sweeps the rest, so a
+    challenge nobody came back for does not stay in the database with its sealed one-time key. A row
+    past its lifetime can no longer be answered, so deleting it changes no outcome: the request it was
+    issued for is refused either way. Returns the number deleted; the caller commits."""
+    from app.services.zk_key_proof import CHALLENGE_TTL_SECONDS
+    now = now or utc_now()
+    return db.query(model).filter(
+        model.created_at < now - timedelta(seconds=CHALLENGE_TTL_SECONDS)
+    ).delete(synchronize_session=False)

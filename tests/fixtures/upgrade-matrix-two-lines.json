@@ -1,0 +1,194 @@
+{
+  "schema_version": 3,
+  "about": "A synthetic matrix for tests: a fix released on two lines (0.33.2 and 0.34.1) after 0.34.0 shipped, a skip edge from the older line, and dated support periods.",
+  "kinds": {
+    "direct": "Upgrade in place.",
+    "blocked": "Do not upgrade in place."
+  },
+  "lines": {
+    "0.33": {
+      "security_fixes_until": "2027-06-10"
+    },
+    "0.34": {
+      "security_fixes_until": null
+    }
+  },
+  "advisories": {
+    "older-issue": {
+      "title": "Session list misses idle sessions",
+      "description": "Revoking sessions left idle ones signed in.",
+      "impact": "A revoked idle session kept working.",
+      "remediation": "Upgrade to 0.33.1.",
+      "mitigation": null,
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.1",
+      "published": "2026-10-28"
+    },
+    "two-lines": {
+      "title": "Shared link opens after its owner is locked",
+      "description": "A link stayed usable after its owner was locked.",
+      "impact": "Someone holding the link could still download the file.",
+      "remediation": "Upgrade to 0.33.2 on the 0.33 line, or 0.34.1.",
+      "mitigation": null,
+      "severity": "high",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.2",
+      "fixed_in_lines": [
+        "0.33.2",
+        "0.34.1"
+      ],
+      "published": "2027-01-11"
+    }
+  },
+  "versions": {
+    "0.32.6": {
+      "released": "2026-09-27",
+      "notes": "0.32.6",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "older-issue",
+          "title": "Session list misses idle sessions",
+          "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "two-lines",
+          "title": "Shared link opens after its owner is locked",
+          "fixed_in": "0.33.2"
+        }
+      ]
+    },
+    "0.33.0": {
+      "released": "2026-09-29",
+      "notes": "0.33.0",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "older-issue",
+          "title": "Session list misses idle sessions",
+          "fixed_in": "0.33.1"
+        },
+        {
+          "advisory": "two-lines",
+          "title": "Shared link opens after its owner is locked",
+          "fixed_in": "0.33.2"
+        }
+      ]
+    },
+    "0.33.1": {
+      "released": "2026-10-28",
+      "notes": "0.33.1",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "two-lines",
+          "title": "Shared link opens after its owner is locked",
+          "fixed_in": "0.33.2"
+        }
+      ]
+    },
+    "0.33.2": {
+      "released": "2027-01-11",
+      "notes": "0.33.2",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
+    "0.34.0": {
+      "released": "2026-12-10",
+      "notes": "0.34.0",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "two-lines",
+          "title": "Shared link opens after its owner is locked",
+          "fixed_in": "0.34.1"
+        }
+      ]
+    },
+    "0.34.1": {
+      "released": "2027-01-11",
+      "notes": "0.34.1",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    }
+  },
+  "edges": [
+    {
+      "from": "0.32.6",
+      "to": "0.33.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.0",
+      "to": "0.33.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.1",
+      "to": "0.33.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.1",
+      "to": "0.34.0",
+      "kind": "direct",
+      "reversible": false,
+      "requires_backup": true
+    },
+    {
+      "from": "0.34.0",
+      "to": "0.34.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "held-rows",
+          "summary": "Rows under a hold are kept; going back to 0.34.0 is refused while any exist.",
+          "detect": "SELECT count(*) FROM held_rows;",
+          "blocks_rollback": true
+        }
+      ]
+    },
+    {
+      "from": "0.33.2",
+      "to": "0.34.1",
+      "kind": "direct",
+      "reversible": false,
+      "requires_backup": true,
+      "conditions": [
+        {
+          "id": "held-rows",
+          "summary": "Rows under a hold are kept; going back to 0.34.0 is refused while any exist.",
+          "detect": "SELECT count(*) FROM held_rows;",
+          "blocks_rollback": true
+        }
+      ]
+    }
+  ]
+}

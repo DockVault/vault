@@ -27,6 +27,7 @@ from conftest import (
     unique, ensure_ecc_keypair, create_zk_vault, ApiClient,
     zk_encrypt_name, zk_name_blind_index,
 )
+from conftest import post_zk
 
 
 @contextlib.contextmanager
@@ -53,7 +54,7 @@ def _share_zk(admin, vid, target_id, target_client, level="read"):
     """Share a ZK vault to another user the way the UI does: wrap the DEK (member key) AND
     grant authz (vault_members row). target_client must already have a keypair."""
     ensure_ecc_keypair(target_client)
-    r = admin.post(f"/ecc/vaults/{vid}/members", json={
+    r = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
         "user_id": str(target_id), "wrapped_dek": _stub("share"), "ephemeral_public_key": _stub("eph"),
     })
     r.raise_for_status()
@@ -75,7 +76,7 @@ def test_rekey_bumps_version_revokes_and_keeps_old_epoch(admin, temp_user, temp_
         assert temp_user_client.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
 
         owner_id = admin.user["id"]
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2,
             "revoke_user_id": str(temp_user["id"]),
             "member_keys": [_mk(owner_id)],  # only the owner remains
@@ -105,7 +106,7 @@ def test_rekey_forward_secrecy_new_epoch_unreadable_by_revoked(admin, temp_user,
         vid = create_zk_vault(admin)["id"]
     try:
         _share_zk(admin, vid, temp_user["id"], temp_user_client)
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": str(temp_user["id"]),
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
@@ -131,7 +132,7 @@ def test_rekey_rejects_omitted_remaining_member(admin, temp_user, temp_user_clie
     try:
         _share_zk(admin, vid, temp_user["id"], temp_user_client)
         # Revoke nobody, but supply only the owner — temp_user is a remaining member omitted.
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         })
@@ -148,7 +149,7 @@ def test_rekey_rejects_revoked_user_in_member_keys(admin, temp_user, temp_user_c
         vid = create_zk_vault(admin)["id"]
     try:
         _share_zk(admin, vid, temp_user["id"], temp_user_client)
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": str(temp_user["id"]),
             "member_keys": [_mk(admin.user["id"]), _mk(temp_user["id"])],  # revoked user must not be here
         })
@@ -162,7 +163,7 @@ def test_rekey_rejects_stale_from_version(admin):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 9, "to_version": 10, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         })
@@ -176,7 +177,7 @@ def test_rekey_rejects_non_consecutive_to_version(admin):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 3, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         })
@@ -193,7 +194,7 @@ def test_rekey_requires_owner_or_manager(admin, temp_user, temp_user_client):
         vid = create_zk_vault(admin)["id"]
     try:
         _share_zk(admin, vid, temp_user["id"], temp_user_client, level="read")  # plain member
-        r = temp_user_client.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"]), _mk(temp_user["id"])],
         })
@@ -284,7 +285,7 @@ def test_upload_with_stale_epoch_is_rejected(admin):
         vid = create_zk_vault(admin)["id"]
     try:
         # Rotate to epoch 2 (no revoke; owner remains).
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
@@ -327,7 +328,7 @@ def test_retire_version_drops_unused_epochs(admin):
         # the member/content rows it rotates.
         vid = create_zk_vault(admin, seal_name=False)["id"]
     try:
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
@@ -354,7 +355,7 @@ def test_retire_version_keeps_epochs_still_in_use(admin):
         vid = create_zk_vault(admin, seal_name=False)["id"]
     try:
         _zk_chunked_upload(admin, vid, b"old-epoch-file" * 2, zk_key_version=1)  # file pins epoch 1
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
@@ -389,7 +390,7 @@ def test_retire_version_keeps_epoch_used_by_a_folder_name(admin):
             "name_bi": zk_name_blind_index(nm, dek, vid, 1),
             "name_key_version": 1,
         }).raise_for_status()
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
@@ -464,7 +465,7 @@ def test_rekey_does_not_rewrap_an_unauthorized_orphan(admin, temp_user, temp_use
         # Owner rotates (revoking nobody explicitly). 'remaining' must be {owner} ONLY —
         # the orphan is dropped — so supplying just the owner's wrap is accepted (it would
         # 400 'missing member' if the orphan were still counted as remaining).
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         })
@@ -502,7 +503,7 @@ def test_grant_member_key_requires_manager_not_just_a_key(admin, temp_user, temp
         vid = create_zk_vault(admin)["id"]
     try:
         _share_zk(admin, vid, temp_user["id"], temp_user_client, level="read")  # plain member, holds a key
-        r = temp_user_client.post(f"/ecc/vaults/{vid}/members", json={
+        r = post_zk(temp_user_client, f"/ecc/vaults/{vid}/members", json={
             "user_id": str(admin.user["id"]), "wrapped_dek": _stub(), "ephemeral_public_key": _stub(),
         })
         assert r.status_code == 403, r.text
@@ -526,7 +527,7 @@ def test_epochless_upload_is_refused_before_a_byte_is_sent(admin):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()
@@ -571,7 +572,7 @@ def test_a_session_opened_without_an_epoch_is_still_refused_at_completion(admin)
 
         # Put the session into the state a pre-requirement client would have left it in.
         _db(f"UPDATE chunked_upload_sessions SET zk_key_version = NULL WHERE id = '{sid}'")
-        admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [_mk(admin.user["id"])],
         }).raise_for_status()

@@ -15,9 +15,11 @@ Two things make that deadline real, and both go through this module:
 * A sweep in the web process (:func:`run_forever`, started at boot) deletes expired files and their
   stored bytes in batches, once a minute, and records one ``file_expired`` audit row for each.
 
-The comparison is always made against a naive UTC "now" (:func:`utc_now`). An aware datetime bound
-into a query against this column is converted through the database session's time zone, so on a
-server not running in UTC it would be wrong by the zone's offset.
+The comparison is always made against a naive UTC "now" (:func:`utc_now`). Every app connection's
+session runs in UTC (app/core/database.py), so an aware datetime bound into a query against this column
+is converted to UTC too. Deadlines written before 0.32.6 were stamped with an aware time through the
+session's zone, which was the database's: on a database set to a zone behind UTC those files expire
+early by that offset.
 
 A vault whose expiry is off has no file deadlines. Changing the setting leaves the deadlines files
 already have, but turning it off takes the deadline off every file in the vault in the same

@@ -60,7 +60,12 @@ def is_admin_action(key: str) -> bool:
 # them, with the usual receipt and 403 shape, so the web app's step-up prompt and retry work unchanged. A
 # route guards one with app.core.fixed_step_up.guard(key), called inside its body, and the boot contract
 # refuses to start while one is guarded by no route.
-FIXED_STEP_UP_ACTIONS: dict = {}
+OWNER_KEY_RESET = "vault.owner_key_reset"
+FIXED_STEP_UP_ACTIONS: dict = {
+    # A zero-knowledge vault owner's key reset (app/api/ecc_router.py, rekey_vault): whenever the owner has a
+    # second factor enrolled, the reset needs it; an account without one is not asked.
+    OWNER_KEY_RESET: ("Reset a zero-knowledge vault's key as its owner", "factor_when_enrolled"),
+}
 
 
 def fixed_policy(key: str):

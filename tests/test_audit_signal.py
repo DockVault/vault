@@ -104,6 +104,42 @@ def test_a_factory_that_is_not_a_session_factory_is_left_alone():
     assert audit_signal.install(object()) is False
 
 
+_LISTENERS = (("after_flush", audit_signal._after_flush), ("after_commit", audit_signal._after_commit),
+              ("after_transaction_end", audit_signal._after_transaction_end))
+
+
+def _listener_counts(f):
+    s = f()
+    try:
+        return [list(getattr(s.dispatch, name)).count(fn) for name, fn in _LISTENERS]
+    finally:
+        s.close()
+
+
+def test_installing_twice_on_one_factory_listens_once():
+    f = sessionmaker()
+    assert audit_signal.install(f) is True
+    assert audit_signal.install(f) is True
+    assert _listener_counts(f) == [1, 1, 1]
+
+
+def test_a_new_factory_at_a_freed_factorys_address_still_listens():
+    # SQLAlchemy records listeners by the target's address. A dropped factory frees its address and the
+    # next one usually takes it, so SQLAlchemy reports the new factory as already listening although it
+    # never was. install() must listen on it all the same, or its commits send no signal.
+    from sqlalchemy import event
+    stale = 0
+    for _ in range(200):
+        f = sessionmaker()
+        if event.contains(f, "after_commit", audit_signal._after_commit):
+            stale += 1
+        assert audit_signal.install(f) is True
+        assert _listener_counts(f) == [1, 1, 1]
+        del f
+    # The case under test must have happened, or this proved nothing.
+    assert stale > 0
+
+
 def test_the_message_names_only_ids_and_categories():
     a, b = str(uuid.uuid4()), str(uuid.uuid4())
     msg = json.loads(audit_signal.message([(a, "sign_in"), (b, "files")]))

@@ -3,8 +3,8 @@
 What a DockVault deployment stores about people: where, which fields, why, for how long, and how it
 is erased. It is written for the operator of a deployment (in GDPR terms, the controller) filling in
 a record of processing activities (Art. 30) or a privacy notice (Art. 13 and 14). It describes
-version 0.33.0. Entries marked **New in 0.33.0** are what that release started storing; the list is
-repeated at the end.
+version 0.33.2. Entries marked **New in 0.33.0**, **New in 0.33.1** or **New in 0.33.2** are what that
+release started storing; each release's list is repeated at the end.
 
 DockVault is software you run. Nothing described here leaves your deployment unless you configure it
 to: email goes through the SMTP server you set, the optional update check sends no personal data
@@ -49,10 +49,10 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
-| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. | The account. | Life of the account. | Deleting the account. |
+| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. **New in 0.33.1:** `permission_defaults_revision`, the revision of the role's default permissions the account has been given. | The account. | Life of the account. | Deleting the account. |
 | `user_ssh_keys` | Key name, public key, fingerprint, created, last used. | SFTP sign-in by key. | Until removed. | The person or an administrator removing it; deleted with the account. |
 | `second_factor_enrollments`, `second_factor_recovery_codes` | Method, the authenticator seed (encrypted), times; recovery-code hashes. | Second factor. | Until reset or removed. | Resetting the second factor; deleted with the account. |
-| `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The periodic cleanup (every 5 minutes); deleted with the account. |
+| `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. **New in 0.33.1:** where it was signed in (`web` or `sftp`). The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The periodic cleanup (every 5 minutes); deleted with the account. |
 | `pending_logins` | The account, client address, attempts. | A sign-in waiting for its second factor. | 30 days after it completed or expired. | The periodic cleanup; deleted with the account. |
 | `sign_in_lockouts` **New in 0.33.0** | The account, the source address (an IPv6 address as its /64, or `*` for the account-wide count), failure count, window start, last failure, lock start and end. | Automatic locks: wrong passwords from one address lock new sign-ins from that address, and past a higher count from all addresses together over about 24 hours, from everywhere. | An address count with no lock: a day after its last failure. The account-wide count: at most a day after its last failure, by when it has lost every one (it loses one every 24 hours divided by the backstop, every 72 minutes by default). A right password adds nothing here. A lock: until it ends (`ACCOUNT_LOCKOUT_MINUTES`, 15 by default; the account-wide pause lasts until its count has lost a failure, if that is later), or until an administrator clears it when that setting is 0. | The periodic cleanup; an administrator's unlock (deletes every row for the account); deleted with the account. |
 | `temporary_credentials`, `temp_credential_vault_access` | The generated username, a hash of the credential, the owner's note about it (free text), its scope and passcode hash, times, creator. | Delegated, time-limited access. | Until the owner deletes it: an expired credential stays listed. | The owner deleting it; deleted with the account. |
@@ -69,6 +69,8 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `vault_members`, `vault_group_access`, `vault_favorites`, `vault_views` | Who can use which vault and how, who added them and when; a person's starred vaults and when they last opened each. | Access control; the vault list's order. | Until changed. | The vault owner or an administrator; deleted with the account or the vault. |
 | `shares`, `share_claims` | Who shared what with which people or departments, limits, status; who claimed it, when they last used it, how many downloads. | Sharing inside the deployment. | After expiry or revocation too, until the shared item, the vault or the sharer's account is deleted. | Deleting the item, the vault or the account. |
 | `user_keypairs`, `vault_member_keys`, `vault_member_index_keys`, `zk_share_invites` | Public keys, fingerprints, wrapped keys, who granted or revoked them. | Zero-knowledge vaults. | Until revoked or replaced. | Deleted with the account or the vault. |
+| `vault_key_proofs` **New in 0.33.2** | For each key epoch of a zero-knowledge vault: the vault, the epoch, how it was set up (`create`, `rotate`, `bootstrap` or `owner_reset`), when, and the id of the account that installed it (`created_by`), the only column that points to a person. The proof material beside it (a public key, a sealed private key and two MACs) is derived from the vault's key and says nothing about anyone. | A change to the vault's keys (rotating, sharing, setting the name-index key) must prove it holds the current epoch's key; the account id says who set up each epoch's check. | Until the vault is deleted, or until its epoch is retired (an epoch below the oldest one still in use, when a manager retires old key versions). | Deleted with the vault; retiring the epoch; `created_by` is cleared (set to empty) when that account is deleted, and the row stays for the vault. |
+| `zk_key_proof_challenges` **New in 0.33.2** | The id of the account a challenge was issued to (`user_id`), the vault it is for, the operation, the key epochs, a sealed one-time server key, a random nonce, a hash of the vault's verifying key, and when it was issued. | Each key change to a zero-knowledge vault answers a one-time challenge issued to that account for that vault and operation; the account id makes sure only the account it was issued to can use it. At most 32 live challenges per account. | Five minutes. A challenge is deleted as soon as it is answered. | Answering it; the account's next challenge request deletes its expired ones; the periodic cleanup (every 5 minutes) deletes the rest; deleted with the account. |
 
 ### Content
 
@@ -111,7 +113,8 @@ Visits to a link and uploads through one are also in the audit log.
 `ecc_key_update_challenges` hold settings, policies, templates, storage allocations and key material.
 Their only personal data is the id of the account that created, owns or was allocated an item, and
 `email_profiles` holds the sending address and SMTP login you configure. Tag policies can list
-account and group ids that may use a tag.
+account and group ids that may use a tag. `data_requirements` holds no personal data: each row
+says which version a change to the stored data needs, what the change was, and how to undo it.
 
 `managed_settings` (new in 0.34.0) holds the values administrators set for the settings the panel
 manages within the deployment's limits, one row per setting, with the id and username of whoever set
@@ -138,7 +141,10 @@ Each row of `audit_logs` holds:
   agent. Before 0.33.0 no row carried a user agent;
 - details, which depend on the action: for example the account a change was made to, an email
   address before and after a change, who a share went to, or the filters of an export. Vault, file
-  and folder names are never stored: they are removed from the details as each row is written;
+  and folder names are never stored: they are removed from the details as each row is written.
+  **New in 0.33.2:** a change to a zero-knowledge vault's keys records how it was proved (`proof`),
+  and a refused key proof records the operation and which part failed. The proof itself (its
+  header, MACs, challenge nonce) and the request body are never stored;
 - an error message for a failure;
 - **New in 0.34.0, and empty on every row so far:** `recorded` (what the recording policy keeps of the
   row's personal values), `privacy_version` (which policy that was), `seal_nonce` (a random value per
@@ -234,7 +240,11 @@ the recipients' mailboxes.
   email and last sign-in are printed on the host's terminal, and the lookup is not audited, since the
   operator can read the database anyway) and change it (audited as the host operator). **New in
   0.33.0:** it can list the accounts that may view or manage users without being administrators (their
-  usernames, roles, and who granted each permission when), not audited either.
+  usernames, roles, and who granted each permission when), not audited either. **New in 0.33.1:** it
+  can list the permissions an administrator revoked that a restart before 0.33.1 granted again (usernames,
+  roles, the permission, and when it was revoked and granted again, read from the audit log), not
+  audited either, and unlock an account (its automatic locks and an administrator's lock), audited as
+  the host operator.
 
 ## The browser
 
@@ -330,3 +340,25 @@ There is no built-in per-person erasure yet.
 - Changed: the cache keys and the fallback table that count failed sign-ins by name hold a keyed
   stand-in, not the name as typed; the Activity page's username search suggests accounts only and
   never reads the audit log.
+
+## What 0.33.1 added
+
+- `users.permission_defaults_revision`.
+- `active_sessions.channel`: whether a session was signed in over the web or SFTP.
+- `audit_logs`: `permission_default_granted`, when a start gives an account a permission its role gained
+  by default in a newer release.
+
+## What 0.33.2 added
+
+- `vault_key_proofs`: for each zero-knowledge key epoch, the id of the account that set up its key
+  check, kept with the vault until the epoch is retired, and cleared when that account is deleted.
+- `zk_key_proof_challenges`: the id of the account each key-proof challenge was issued to, for five
+  minutes at most.
+- `audit_logs`: how each change to a zero-knowledge vault's keys was proved (`proof`), each refused key
+  proof (`zk_key_proof_failed`, with the operation and the part that failed), each change accepted
+  without one while the check is switched off (`zk_key_proof_absent`), each key check set up for an
+  older vault (`zk_key_proof_bootstrapped`) and each owner's reset of it (`zk_owner_key_reset`). The
+  proof itself and the request body are never stored.
+- Changed: the web app's forms are sent only by its scripts, never by the browser itself, so what is
+  typed into them (a username and password at sign-in included) no longer reaches an address, the
+  browser history or a reverse proxy's log when a form is sent before the page has finished loading.

@@ -68,6 +68,8 @@ NOT_RECORDED = {
         "issues a one-time challenge; registering the key is recorded",
     ("app/api/ecc_router.py", "POST /keys/private/challenge"):
         "issues a one-time challenge; the key change is recorded, and so is a refused proof",
+    ("app/api/ecc_router.py", "POST /vaults/{vault_id}/key-proof/challenge"):
+        "issues a one-time challenge; the key change it is for is recorded by its own route",
     ("app/api/email_studio_router.py", "POST /templates/preview"):
         "renders a preview; nothing is stored or sent",
 }

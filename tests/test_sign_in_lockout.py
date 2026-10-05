@@ -767,11 +767,12 @@ def _slow_checks(monkeypatch, seconds=0.6, right=False):
     return checked
 
 
-def _burst(Session, name, addresses, password="a-guess"):
+def _burst(Session, name, addresses, password="a-guess", channel=None):
     """Sign-in attempts by ``name``, one from each address, all at once, each on its own session and
     thread as the web and SFTP servers run them. Returns how each ended, sorted: "signed in", "wrong" (its
     password was checked and was wrong), or the refusal's scope (refused unchecked), and how long the last
-    one took."""
+    one took. With ``channel``, each signs in there with its real session (ended and written as a sign-in
+    does), instead of stand-ins."""
     import threading
     import time
     start, outcomes, lock = threading.Barrier(len(addresses)), [], threading.Lock()
@@ -781,12 +782,13 @@ def _burst(Session, name, addresses, password="a-guess"):
         s = Session()
         svc = A.AuthService(s)
         svc._check_rate_limit = lambda *a, **k: None
-        svc._terminate_existing_sessions = lambda *a, **k: None
-        svc._create_session = lambda *a, **k: "session-token"
+        if channel is None:
+            svc._terminate_existing_sessions = lambda *a, **k: None
+            svc._create_session = lambda *a, **k: "session-token"
         start.wait()
         began = time.monotonic()
         try:
-            svc.authenticate_user(name, password, address)
+            svc.authenticate_user(name, password, address, **({"channel": channel} if channel else {}))
             seen = "signed in"
         except A.AccountLockedError as e:
             seen = e.scope
@@ -927,10 +929,19 @@ def test_right_passwords_arriving_at_once_past_the_backstop_all_sign_in(Session,
 def test_twelve_connections_at_once_with_the_right_password_all_sign_in(Session, limits, monkeypatch):
     # What the desktop app and SFTP clients do: several connections at once, one account, one password.
     # Each waits for the ones before it; the last waits about eleven checks.
-    _add_user(Session, username="owner")
+    from app.core.models import ActiveSession, TemporaryCredential
+    for model in (TemporaryCredential, ActiveSession):
+        model.__table__.create(Session.kw["bind"])
+    uid = _add_user(Session, username="owner")
     _slow_checks(monkeypatch, seconds=0.2, right=True)
-    assert _burst(Session, "owner", [HOME] * 12, password=PASSWORD) == ["signed in"] * 12
+    monkeypatch.setattr(A, "_best_effort_cache", lambda code, op: None)
+    assert _burst(Session, "owner", [HOME] * 12, password=PASSWORD, channel=A.SFTP_CHANNEL) == ["signed in"] * 12
     assert _burst.longest >= 11 * 0.2, "one at a time: the last one waited for the eleven before it"
+    # And every one of the twelve is still signed in: none ended another (SFTP checks this at every step).
+    s = Session()
+    live = s.query(ActiveSession).filter(ActiveSession.user_id == uid, ActiveSession.is_active.is_(True)).count()
+    s.close()
+    assert live == 12
 
 
 def test_an_attempt_that_dies_during_its_check_leaves_nothing_counted(Session, limits, monkeypatch):

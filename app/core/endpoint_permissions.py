@@ -17,7 +17,7 @@ from app.core.api_catalog import (
     dependency_closure,
     dependent_closure,
 )
-from app.core.models import RoleEnum, UserEndpointPermission
+from app.core.models import RoleEnum, User, UserEndpointPermission
 
 
 # Populated when route modules apply @require_endpoint_permission. api_server
@@ -224,15 +224,40 @@ def grant_endpoint_permission(
     return groups
 
 
-def role_default_groups(role) -> List[str]:
+# The revision of the role defaults that every release before revisions existed granted: those releases
+# granted each account its role's defaults again at every start, so an account they left behind (its
+# users.permission_defaults_revision NULL) holds them, apart from those revoked since.
+BASELINE_DEFAULTS_REVISION = 1
+
+# Written for each default a start gives an account (grant_newer_role_defaults).
+DEFAULT_GRANTED_ACTION = "permission_default_granted"
+
+
+def current_defaults_revision() -> int:
+    """The newest revision of the role defaults: the highest ``default_since`` of any default."""
+    return max([group.default_since for group in GRANTABLE_API_CATALOG.values() if group.default_for_roles]
+               + [BASELINE_DEFAULTS_REVISION])
+
+
+def role_default_groups(role, since: Optional[int] = None) -> List[str]:
     """The groups ``role`` (a RoleEnum or its text) has by default, with their prerequisites, in
-    dependency-first order."""
+    dependency-first order. With ``since``, only the defaults added after that revision, with their
+    prerequisites."""
     role_str = str(getattr(role, "value", role)).lower().replace("roleenum.", "").replace("role.", "")
     return _ordered_with_dependencies([
         group_name
         for group_name, group in GRANTABLE_API_CATALOG.items()
         if role_str in [item.lower() for item in group.default_for_roles]
+        and (since is None or group.default_since > since)
     ])
+
+
+def _record_defaults_revision(db: Session, user_id) -> None:
+    """The account ``user_id`` now holds every default of its role: record the current revision, in the
+    caller's transaction."""
+    account = db.get(User, uuid_module.UUID(str(user_id)))
+    if account is not None:
+        account.permission_defaults_revision = current_defaults_revision()
 
 
 def reset_to_role_defaults(user_id, role, db: Session) -> dict:
@@ -274,6 +299,7 @@ def reset_to_role_defaults(user_id, role, db: Session) -> dict:
         ).delete(synchronize_session=False)
     added = [group for group in defaults if group not in held]
     _insert_permission_groups(target, added, db, None)
+    _record_defaults_revision(db, target)
     return {"removed": removed, "added": sorted(added), "kept": sorted((keep & held) - set(defaults))}
 
 
@@ -287,16 +313,58 @@ def grant_default_permissions_for_role(
 
     `commit=False` lets a caller fold the grant into a surrounding transaction (e.g. invitation
     acceptance, which claims the invite and creates the user in one commit); the default keeps the
-    self-committing behaviour every existing caller relies on."""
+    self-committing behaviour every existing caller relies on. The account is recorded as holding the
+    current revision of the defaults (users.permission_defaults_revision)."""
     groups = role_default_groups(role)
     try:
         _insert_permission_groups(uuid_module.UUID(user_id), groups, db, None)
+        _record_defaults_revision(db, user_id)
         if commit:
             db.commit()
     except Exception:
         db.rollback()
         raise
     return groups
+
+
+def grant_newer_role_defaults(db: Session) -> dict:
+    """At start: give each account that is not an administrator the defaults of its role that are newer
+    than the revision it has been given, once, and record the current revision on it. Returns
+    ``{"accounts": n, "grants": m}``, how many accounts were brought up to date and how many
+    permissions were granted. Commits.
+
+    A default an administrator revoked is not given back: only a default added in a later revision is
+    granted, with what it depends on, and each grant is recorded as ``permission_default_granted`` in
+    the same commit. An account no revision was recorded for (every account an earlier release left
+    behind) counts as holding revision 1, whose defaults those releases granted at every start; a start
+    therefore grants it nothing of revision 1, only what came after. Administrators are skipped: they
+    hold every group, and a change of role records the revision."""
+    from sqlalchemy import or_
+    from app.services.audit_logger import AuditLogger
+
+    current = current_defaults_revision()
+    accounts = db.query(User).filter(
+        User.role != RoleEnum.ADMIN,
+        or_(User.permission_defaults_revision.is_(None), User.permission_defaults_revision < current),
+    ).all()
+    grants = 0
+    for account in accounts:
+        since = account.permission_defaults_revision or BASELINE_DEFAULTS_REVISION
+        held = {row[0] for row in db.query(UserEndpointPermission.endpoint_group).filter(
+            UserEndpointPermission.user_id == account.id).all()}
+        new = [group for group in role_default_groups(account.role, since=since) if group not in held]
+        _insert_permission_groups(account.id, new, db, None)
+        for group in new:
+            db.add(AuditLogger(db).build_row(
+                action=DEFAULT_GRANTED_ACTION, status="success", resource_type="user",
+                resource_id=str(account.id),
+                details={"endpoint_group": group, "target_user": account.username,
+                         "role": getattr(account.role, "value", account.role),
+                         "from_revision": since, "to_revision": current}))
+        grants += len(new)
+        account.permission_defaults_revision = current
+    db.commit()
+    return {"accounts": len(accounts), "grants": grants}
 
 
 def revoke_endpoint_permission(

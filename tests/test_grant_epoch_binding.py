@@ -28,6 +28,7 @@ import uuid
 import pytest
 
 from conftest import unique, ensure_ecc_keypair, create_zk_vault, ZK_ENC_NAME_STUB
+from conftest import post_zk, team_public_key
 
 DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 
@@ -64,14 +65,14 @@ def test_a_share_declaring_a_stale_epoch_is_refused(admin, temp_user, temp_user_
         ensure_ecc_keypair(temp_user_client)
         # Rotate so the live epoch is 2 and epoch 1 is stale.
         me = admin.get("/users/me").json()["id"]
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [{"user_id": str(me), "wrapped_dek": _stub("dek"),
                              "ephemeral_public_key": _stub("eph")}],
         })
         assert r.status_code == 200, r.text
 
-        stale = admin.post(f"/ecc/vaults/{vid}/members", json={
+        stale = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_dek": _stub("dek"),
             "ephemeral_public_key": _stub("eph"), "dek_version": 1,
         })
@@ -85,7 +86,7 @@ def test_a_share_declaring_a_stale_epoch_is_refused(admin, temp_user, temp_user_
 
         # The same share at the live epoch succeeds, so the guard rejects staleness and not
         # sharing in general.
-        good = admin.post(f"/ecc/vaults/{vid}/members", json={
+        good = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_dek": _stub("dek"),
             "ephemeral_public_key": _stub("eph"), "dek_version": 2,
         })
@@ -111,7 +112,7 @@ def test_a_refused_share_leaves_the_existing_row_untouched(admin, temp_user, tem
     try:
         ensure_ecc_keypair(temp_user_client)
         good_blob = _stub("keepme")
-        r = admin.post(f"/ecc/vaults/{vid}/members", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_dek": good_blob,
             "ephemeral_public_key": _stub("eph"), "dek_version": 1,
         })
@@ -120,7 +121,7 @@ def test_a_refused_share_leaves_the_existing_row_untouched(admin, temp_user, tem
         before = temp_user_client.get(f"/ecc/vaults/{vid}/keys").json()
         assert before["wrapped_dek"] == good_blob
 
-        rejected = admin.post(f"/ecc/vaults/{vid}/members", json={
+        rejected = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_dek": _stub("clobber"),
             "ephemeral_public_key": _stub("eph"), "dek_version": 99,
         })
@@ -150,7 +151,7 @@ def test_a_client_that_omits_the_epoch_still_works(admin, temp_user, temp_user_c
 
     try:
         ensure_ecc_keypair(temp_user_client)
-        r = admin.post(f"/ecc/vaults/{vid}/members", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_dek": _stub("dek"),
             "ephemeral_public_key": _stub("eph"),
         })
@@ -237,7 +238,7 @@ def test_the_grant_serializes_against_a_held_vault_lock(admin, temp_user, temp_u
 
     try:
         ensure_ecc_keypair(temp_user_client)
-        _assert_blocks_on_vault_lock(vid, lambda: admin.post(
+        _assert_blocks_on_vault_lock(vid, lambda: post_zk(admin,
             f"/ecc/vaults/{vid}/members",
             json={"user_id": temp_user["id"], "wrapped_dek": _stub("dek"),
                   "ephemeral_public_key": _stub("eph"), "dek_version": 1},
@@ -256,11 +257,11 @@ def test_a_hierarchical_grant_refuses_an_epoch_it_cannot_honour(admin, temp_user
     """
     admin.put("/settings", json={"zero_knowledge_enabled": True})
     try:
-        r = admin.post("/vaults", json={
+        r = post_zk(admin, "/vaults", json={
             "name": unique("hierepoch"),
             "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "key_wrapping_mode": "hierarchical",
-            "team_public_key": "TEAMPUB-" + uuid.uuid4().hex,
+            "team_public_key": team_public_key(),
             "team_wrapped_dek": _stub("tdek"),
             "team_dek_ephemeral_public_key": _stub("teph"),
             "wrapped_team_privkey": _stub("tpriv"),
@@ -273,7 +274,7 @@ def test_a_hierarchical_grant_refuses_an_epoch_it_cannot_honour(admin, temp_user
 
     try:
         ensure_ecc_keypair(temp_user_client)
-        bad = admin.post(f"/ecc/vaults/{vid}/members", json={
+        bad = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_team_privkey": _stub("tpriv"),
             "team_ephemeral_public_key": _stub("tpeph"), "dek_version": 1,
         })
@@ -283,7 +284,7 @@ def test_a_hierarchical_grant_refuses_an_epoch_it_cannot_honour(admin, temp_user
         assert "hierarchical" in bad.text
 
         # Omitted, the same grant succeeds -- so the guard rejects the field, not the flow.
-        ok = admin.post(f"/ecc/vaults/{vid}/members", json={
+        ok = post_zk(admin, f"/ecc/vaults/{vid}/members", json={
             "user_id": temp_user["id"], "wrapped_team_privkey": _stub("tpriv"),
             "team_ephemeral_public_key": _stub("tpeph"),
         })

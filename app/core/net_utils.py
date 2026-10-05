@@ -18,32 +18,89 @@ by default would let a DIRECT client forge its audit IP / evade the per-IP throt
 its own X-Forwarded-For. To get real client IPs behind a genuine reverse proxy the operator must
 list that proxy's network(s) explicitly. settings.trust_all_proxies=true honours XFF from any
 peer (only correct behind a proxy that itself strips/normalises client-supplied XFF).
+
+A range never trusts the container's gateway (its default route: the Docker network's gateway). Every
+connection that Docker relays to a published port arrives from it: an IPv6 client, a client on the host
+itself, and on Docker Desktop every client. So a range that happens to contain the gateway (the
+172.16.0.0/12 that covers Docker's default networks, say) let any of those clients set its own address
+with X-Forwarded-For. The gateway is trusted only when TRUSTED_PROXIES names it: the token ``gateway``,
+or its exact address (/32, /128). That is right for a reverse proxy on the host that reaches a port
+published on loopback only (WEB_BIND=127.0.0.1), and for nothing else.
 """
 import contextvars
 import ipaddress
+import sys
+import threading
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 from app.core.config import settings
 
+# The TRUSTED_PROXIES token for the container's default gateway (see the module docstring).
+GATEWAY_TOKEN = "gateway"
+
+
+def _read_default_gateways(route_v4: str = "/proc/net/route",
+                           route_v6: str = "/proc/net/ipv6_route") -> List["ipaddress._BaseAddress"]:
+    """The addresses of this container's default routes, IPv4 and IPv6: the Docker network's gateway.
+    Empty outside Linux, or with no default route."""
+    found: List[ipaddress._BaseAddress] = []
+    try:
+        with open(route_v4, encoding="ascii") as fh:
+            for line in fh.read().splitlines()[1:]:
+                f = line.split()
+                # Iface Destination Gateway Flags RefCnt Use Metric Mask ...: a default route has
+                # destination and mask 0; the gateway is written as a little-endian hex word.
+                if len(f) >= 8 and f[1] == "00000000" and f[7] == "00000000" and int(f[2], 16):
+                    found.append(ipaddress.IPv4Address(int(f[2], 16).to_bytes(4, "little")))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(route_v6, encoding="ascii") as fh:
+            for line in fh.read().splitlines():
+                f = line.split()
+                # destination, its prefix length, source, its prefix length, next hop, ...
+                if len(f) >= 10 and f[0] == "0" * 32 and f[1] == "00" and f[4] != "0" * 32:
+                    found.append(ipaddress.IPv6Address(bytes.fromhex(f[4])))
+    except (OSError, ValueError):
+        pass
+    return list(dict.fromkeys(found))
+
+
+class _Trust(NamedTuple):
+    networks: Tuple["ipaddress._BaseNetwork", ...]    # every listed range and address
+    gateway_named: bool                                  # TRUSTED_PROXIES has the token `gateway`
+    gateways: Tuple["ipaddress._BaseAddress", ...]      # this container's default gateway(s)
+
 
 @lru_cache(maxsize=1)
-def _trusted_networks() -> List[ipaddress._BaseNetwork]:
-    """Parsed trusted-proxy networks (cached). An empty settings.trusted_proxies means NO proxy
+def _trusted_networks() -> _Trust:
+    """The trusted set, parsed once (cached): the listed networks, whether the gateway is named, and the
+    container's gateway(s), read at the same time. An empty settings.trusted_proxies means NO proxy
     is trusted (fail-closed: XFF ignored, peer used) — the operator must declare their proxy
     network(s) to opt into X-Forwarded-For. Unparseable entries are skipped."""
     raw = (getattr(settings, "trusted_proxies", "") or "").strip()
-    if not raw:
-        return []
     nets: List[ipaddress._BaseNetwork] = []
+    named = False
     for spec in (s.strip() for s in raw.split(",")):
         if not spec:
+            continue
+        if spec.lower() == GATEWAY_TOKEN:
+            named = True
             continue
         try:
             nets.append(ipaddress.ip_network(spec, strict=False))
         except ValueError:
             continue
-    return nets
+    return _Trust(tuple(nets), named, tuple(_normalize(g) for g in _read_default_gateways()))
+
+
+def _names_exactly(trust: _Trust, addr) -> bool:
+    return any(net.num_addresses == 1 and addr in net for net in trust.networks)
+
+
+def _range_covers(trust: _Trust, addr) -> bool:
+    return any(net.num_addresses > 1 and addr in net for net in trust.networks)
 
 
 def _normalize(addr: "ipaddress._BaseAddress") -> "ipaddress._BaseAddress":
@@ -91,7 +148,53 @@ def _is_trusted_addr(addr: Optional["ipaddress._BaseAddress"]) -> bool:
         return True
     if addr is None:
         return False
-    return any(addr in net for net in _trusted_networks())
+    trust = _trusted_networks()
+    if addr in trust.gateways:
+        # Only by name: a range never covers the gateway (see the module docstring).
+        return trust.gateway_named or _names_exactly(trust, addr)
+    return any(addr in net for net in trust.networks)
+
+
+def _gateway_advice(gateway) -> str:
+    return (f"TRUSTED_PROXIES covers this container's gateway ({gateway}) with a range, and a range does "
+            "not trust the gateway: every connection Docker relays to the published port arrives from it "
+            "(IPv6 clients, clients on the host, on Docker Desktop every client), so those clients could "
+            "have set their own address. Their X-Forwarded-For is ignored and they are recorded as the "
+            "gateway. If your reverse proxy runs on this host and reaches the published port, set "
+            "TRUSTED_PROXIES=gateway in .env and publish the port on loopback only: WEB_BIND=127.0.0.1 in "
+            ".env with deploy/docker-compose.secure.yml, or 127.0.0.1:<port>:8000 in your own compose file.")
+
+
+def trust_warnings() -> List[str]:
+    """What the web process says at start about its trusted-proxy set: TRUST_ALL_PROXIES in force, a range
+    that covers the gateway, and the token `gateway` with no gateway to trust."""
+    out = []
+    if getattr(settings, "trust_all_proxies", False):
+        out.append("TRUST_ALL_PROXIES=true: X-Forwarded-For is believed from every peer, so any client that "
+                   "reaches the web port directly can set its own address. Use it only behind a proxy that "
+                   "replaces the header, and that nothing else can reach the port past; list your proxies in "
+                   "TRUSTED_PROXIES instead where you can.")
+    trust = _trusted_networks()
+    for gateway in trust.gateways:
+        if not trust.gateway_named and not _names_exactly(trust, gateway) and _range_covers(trust, gateway):
+            out.append(_gateway_advice(gateway))
+    if trust.gateway_named and not trust.gateways:
+        out.append("TRUSTED_PROXIES names the gateway, but this process has no default route: nothing is "
+                   "trusted by that token.")
+    return out
+
+
+_ignored_warned = threading.Event()
+
+
+def _note_ignored_gateway_header(peer) -> None:
+    """Once per process: a request came from the gateway with X-Forwarded-For that a range would have
+    trusted before. Its header is ignored; say what to change, at the moment it matters."""
+    if _ignored_warned.is_set():
+        return
+    _ignored_warned.set()
+    print(f"WARNING: a request arrived from the gateway with X-Forwarded-For, which is ignored. "
+          f"{_gateway_advice(peer)}", file=sys.stderr, flush=True)
 
 
 def _is_trusted_peer(peer: Optional[str]) -> bool:
@@ -145,11 +248,16 @@ def client_ip(request) -> str:
     'unknown'."""
     peer = request.client.host if request.client else None
     forwarded = forwarded_for_chain(request)
-    if forwarded and _is_trusted_peer(peer):
-        real = _real_client_from_xff(forwarded)
-        if real:
-            return real
     parsed_peer = _parse_ip(peer)
+    if forwarded:
+        if _is_trusted_addr(parsed_peer):
+            real = _real_client_from_xff(forwarded)
+            if real:
+                return real
+        elif parsed_peer is not None and not _ignored_warned.is_set():
+            trust = _trusted_networks()
+            if parsed_peer in trust.gateways and _range_covers(trust, parsed_peer):
+                _note_ignored_gateway_header(parsed_peer)
     return str(parsed_peer) if parsed_peer is not None else (peer or "unknown")
 
 

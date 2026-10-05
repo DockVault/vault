@@ -9,6 +9,7 @@ import contextlib
 import uuid
 
 from conftest import create_zk_vault, ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB
+from conftest import post_zk, put_zk
 
 
 @contextlib.contextmanager
@@ -43,14 +44,14 @@ def test_ecc_mutators_enforce_temp_credential_scope(admin):
         # Out-of-scope: granted the vault but WITHOUT vault.change_permissions.
         ro = _scoped_client(admin, ["vault.see_info", "vault.see_files"], vid)
         assert ro.delete(f"/ecc/vaults/{vid}/members/{uid}").status_code == 403
-        assert ro.post(f"/ecc/vaults/{vid}/members",
+        assert post_zk(ro, f"/ecc/vaults/{vid}/members",
                        json={"user_id": uid, "wrapped_dek": "x", "ephemeral_public_key": "y"}).status_code == 403
-        assert ro.post(f"/ecc/vaults/{vid}/rekey",
+        assert post_zk(ro, f"/ecc/vaults/{vid}/rekey",
                        json={"from_version": 1, "to_version": 2, "member_keys": []}).status_code == 403
         assert ro.post(f"/ecc/vaults/{vid}/retire-version").status_code == 403
         # The index-key PUT mints/extends the ZK name-index key -- the same class of vault-
         # management mutation as the others, and it must honour the same per-vault scope.
-        assert ro.put(f"/ecc/vaults/{vid}/index-key",
+        assert put_zk(ro, f"/ecc/vaults/{vid}/index-key",
                       json={"wraps": [{"user_id": uid, "encrypted_index_key": "x",
                                        "ephemeral_public_key": "y"}]}).status_code == 403
 
@@ -60,7 +61,7 @@ def test_ecc_mutators_enforce_temp_credential_scope(admin):
         assert mgr.post(f"/ecc/vaults/{vid}/retire-version").status_code == 200
 
         # And an unrestricted admin can still rotate the key end-to-end (in-scope manager -> 200).
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [{"user_id": str(admin.user["id"]),
                              "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB}],
@@ -68,7 +69,7 @@ def test_ecc_mutators_enforce_temp_credential_scope(admin):
         assert r.status_code == 200, r.text
         # ...and the index-key PUT still works for the unrestricted manager (the new gate
         # confines a scoped cred without breaking the normal management path).
-        ik = admin.put(f"/ecc/vaults/{vid}/index-key", json={
+        ik = put_zk(admin, f"/ecc/vaults/{vid}/index-key", json={
             "wraps": [{"user_id": str(admin.user["id"]),
                        "encrypted_index_key": ZK_WRAPPED_DEK_STUB,
                        "ephemeral_public_key": ZK_EPHEMERAL_STUB}]})
@@ -169,10 +170,10 @@ def test_rekey_member_keys_are_bounded(admin):
         base = {"from_version": 1, "to_version": 2, "revoke_user_id": None}
         too_many = [{"user_id": str(uuid.uuid4()), "wrapped_dek": "x", "ephemeral_public_key": "y"}
                     for _ in range(513)]
-        r1 = admin.post(f"/ecc/vaults/{vid}/rekey", json={**base, "member_keys": too_many})
+        r1 = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={**base, "member_keys": too_many})
         assert r1.status_code == 422, f"an over-long member_keys list should be rejected: {r1.status_code}"
         huge = [{"user_id": str(uuid.uuid4()), "wrapped_dek": "x" * 9000, "ephemeral_public_key": "y"}]
-        r2 = admin.post(f"/ecc/vaults/{vid}/rekey", json={**base, "member_keys": huge})
+        r2 = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={**base, "member_keys": huge})
         assert r2.status_code == 422, f"an over-long wrap field should be rejected: {r2.status_code}"
     finally:
         admin.delete_vault(vid)

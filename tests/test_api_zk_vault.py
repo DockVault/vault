@@ -24,6 +24,7 @@ from conftest import (
     zk_encrypt_name, zk_decrypt_name, zk_name_blind_index, zk_chunked_upload, ZK_NAME_PREFIX,
     ZK_NAME_PREFIX_V2,
 )
+from conftest import post_zk
 
 
 @contextlib.contextmanager
@@ -71,7 +72,7 @@ def test_zk_vault_stores_owner_client_wrapped_dek_verbatim(admin):
     sentinel and assert it round-trips unchanged — proof the server didn't make a DEK."""
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        r = admin.post("/vaults", json={
+        r = post_zk(admin, "/vaults", json={
             "name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": "EPH-SENTINEL",
         })
@@ -93,7 +94,7 @@ def test_zk_vault_creation_requires_client_wrapped_dek(admin):
     browser-wrapped DEK is refused (and leaves no orphan vault)."""
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
-        r = admin.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
+        r = post_zk(admin, "/vaults", json={"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
         assert r.status_code == 400, r.text
         assert "key" in r.json().get("detail", "").lower()
 
@@ -111,7 +112,7 @@ def test_zk_vault_creation_requires_a_keypair(admin):
         with _zk_enabled(admin):
             # ensure this fresh user truly has no keypair
             assert client.get("/ecc/keys/public").json().get("has_keypair") is False
-            r = client.post("/vaults", json={"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
+            r = post_zk(client, "/vaults", json={"name": unique("zk"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1})
             assert r.status_code in (400, 403), r.text
             if r.status_code == 400:
                 assert "key" in r.json().get("detail", "").lower()
@@ -206,7 +207,7 @@ def test_grant_member_key_requires_granter_to_hold_key(admin, temp_user_client):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        r = temp_user_client.post(
+        r = post_zk(temp_user_client,
             f"/ecc/vaults/{vid}/members",
             json={"user_id": str(temp_user_client.user["id"]), "wrapped_dek": "AAAA", "ephemeral_public_key": "AAAA"},
         )
@@ -224,7 +225,7 @@ def test_grant_and_fetch_member_key(admin, temp_user, temp_user_client):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        r = admin.post(
+        r = post_zk(admin,
             f"/ecc/vaults/{vid}/members",
             json={"user_id": temp_user["id"], "wrapped_dek": "V1JBUFBFRA==", "ephemeral_public_key": "RVBL"},
         )
@@ -242,7 +243,7 @@ def test_grant_member_key_rejects_recipient_without_keypair(admin, temp_user):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        r = admin.post(
+        r = post_zk(admin,
             f"/ecc/vaults/{vid}/members",
             json={"user_id": temp_user["id"], "wrapped_dek": "AAAA", "ephemeral_public_key": "AAAA"},
         )
@@ -257,7 +258,7 @@ def test_revoke_member_key(admin, temp_user, temp_user_client):
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]
     try:
-        admin.post(f"/ecc/vaults/{vid}/members",
+        post_zk(admin, f"/ecc/vaults/{vid}/members",
                    json={"user_id": temp_user["id"], "wrapped_dek": "QQ==", "ephemeral_public_key": "QQ=="})
         assert temp_user_client.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
         assert admin.delete(f"/ecc/vaults/{vid}/members/{temp_user['id']}").status_code == 200
@@ -289,7 +290,7 @@ def test_manager_cannot_overwrite_owner_or_peer_manager_wrap(admin):
     try:
         # Owner gives m1 and m2 a DEK wrap, then promotes both to Manager.
         for u in (m1, m2):
-            assert admin.post(f"/ecc/vaults/{vid}/members",
+            assert post_zk(admin, f"/ecc/vaults/{vid}/members",
                               json={"user_id": u["id"], "wrapped_dek": "QQ==",
                                     "ephemeral_public_key": "QQ=="}).status_code == 200
             assert admin.post(f"/vaults/{vid}/permissions",
@@ -301,19 +302,19 @@ def test_manager_cannot_overwrite_owner_or_peer_manager_wrap(admin):
         assert owner_before and m2_before  # both hold a real wrap going in
 
         # (1) Manager m1 CANNOT overwrite the OWNER's wrap; the owner's stored wrap is untouched.
-        r = m1c.post(f"/ecc/vaults/{vid}/members",
+        r = post_zk(m1c, f"/ecc/vaults/{vid}/members",
                      json={"user_id": owner_id, "wrapped_dek": ATTACK, "ephemeral_public_key": ATTACK})
         assert r.status_code == 403, r.text
         assert admin.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") == owner_before
 
         # (2) Manager m1 CANNOT overwrite a PEER Manager (m2)'s wrap; m2's wrap is untouched.
-        r = m1c.post(f"/ecc/vaults/{vid}/members",
+        r = post_zk(m1c, f"/ecc/vaults/{vid}/members",
                      json={"user_id": m2["id"], "wrapped_dek": ATTACK, "ephemeral_public_key": ATTACK})
         assert r.status_code == 403, r.text
         assert m2c.get(f"/ecc/vaults/{vid}/keys").json().get("wrapped_dek") == m2_before
 
         # (3) Positive controls: the owner may refresh their OWN wrap...
-        assert admin.post(f"/ecc/vaults/{vid}/members",
+        assert post_zk(admin, f"/ecc/vaults/{vid}/members",
                           json={"user_id": owner_id, "wrapped_dek": "T0s=",
                                 "ephemeral_public_key": "T0s="}).status_code == 200
         # ...and a Manager may grant/refresh a REGULAR MEMBER's wrap. reg is made a member
@@ -321,7 +322,7 @@ def test_manager_cannot_overwrite_owner_or_peer_manager_wrap(admin):
         # path -- a regression narrowing the peer check to `if peer:` would wrongly 403 here.
         assert admin.post(f"/vaults/{vid}/permissions",
                           json={"user_id": reg["id"], "level": "read"}).status_code == 200
-        assert m1c.post(f"/ecc/vaults/{vid}/members",
+        assert post_zk(m1c, f"/ecc/vaults/{vid}/members",
                         json={"user_id": reg["id"], "wrapped_dek": "UkVH",
                               "ephemeral_public_key": "UkVH"}).status_code == 200
         assert regc.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is True
@@ -336,7 +337,7 @@ def test_manager_cannot_overwrite_owner_or_peer_manager_wrap(admin):
 def test_force_zk_blocks_standard_for_non_whitelisted(admin):
     ensure_ecc_keypair(admin)
     with _force_zk(admin):  # no whitelist -> everyone must use ZK
-        r = admin.post("/vaults", json={"name": unique("v")})  # standard (default)
+        r = post_zk(admin, "/vaults", json={"name": unique("v")})  # standard (default)
         assert r.status_code == 400, r.text
         assert "zero-knowledge" in r.json()["detail"].lower()
         # a ZK vault is still allowed
@@ -350,7 +351,7 @@ def test_force_zk_allows_standard_for_whitelisted_department(admin):
     admin.post(f"/groups/{gid}/members", json={"user_ids": [str(admin.user["id"])]})
     try:
         with _force_zk(admin, allowed_groups=[gid]):
-            r = admin.post("/vaults", json={"name": unique("v")})  # standard
+            r = post_zk(admin, "/vaults", json={"name": unique("v")})  # standard
             assert r.status_code == 200, r.text
             assert r.json()["type"] == "standard"
             admin.delete_vault(r.json()["id"])
@@ -899,7 +900,7 @@ def test_zk_seal_names_works_on_password_protected_vault(admin):
     ensure_ecc_keypair(admin)
     pw = "Zk-Vault-Pass-123"
     with _zk_enabled(admin):
-        r = admin.post("/vaults", json={
+        r = post_zk(admin, "/vaults", json={
             "name": unique("zkpw"), "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
             "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": "EPH-SENTINEL",
             "password": pw,

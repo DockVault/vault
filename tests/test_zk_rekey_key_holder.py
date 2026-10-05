@@ -21,6 +21,10 @@ required only management rights.
 This file drives the real handlers (without their permission decorators, which the live tests cover)
 against the real tables in a throwaway SQLite database. test_zk_rekey_key_holder_live.py drives the
 route on a running deployment, including the lock under a real concurrent removal.
+
+The requests here carry no key proof, so they run with enforcement off, where a request without one is
+handled as it was before proofs existed: the rule under test is the key-holder check, which a proof
+adds to rather than replaces (test_zk_key_proof_handler.py covers the proofs).
 """
 import inspect
 import json
@@ -80,6 +84,7 @@ def Session(monkeypatch):
     monkeypatch.setattr(sqltypes.Uuid, "bind_processor", bind_processor)
     monkeypatch.setattr(E, "_ecc_rate_limit", lambda *a, **k: None)
     monkeypatch.setattr(E, "_audit_zk", lambda *a, **k: None)
+    monkeypatch.setattr(E.zk_key_proof, "enforcement_enabled", lambda: False)
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'zk.db'}",
                                   connect_args={"check_same_thread": False})
@@ -165,9 +170,17 @@ def _routine_hier_body(frm=1):
                           team_dek_wrapped="dek-to-team", team_dek_ephemeral_public_key="eph")
 
 
+def _new_team_public_key():
+    """A fresh P-384 public key: a team rotation must install one."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    return ec.generate_private_key(ec.SECP384R1()).public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+
 def _team_rotation_body(*remaining, revoke=None, frm=1):
     return E.RekeyRequest(from_version=frm, to_version=frm + 1, revoke_user_id=revoke,
-                          member_keys=_wraps(*remaining), team_public_key="NEW-TEAMPUB",
+                          member_keys=_wraps(*remaining), team_public_key=_new_team_public_key(),
                           team_dek_wrapped="dek-to-team", team_dek_ephemeral_public_key="eph")
 
 

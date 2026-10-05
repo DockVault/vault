@@ -14,6 +14,7 @@ from conftest import (
     ensure_ecc_keypair, create_zk_vault,
     ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB, ApiClient,
 )
+from conftest import post_zk
 
 
 @contextlib.contextmanager
@@ -28,7 +29,7 @@ def _zk_enabled(admin):
 def _grant_direct(admin, vid, target_id, target_client, level="read"):
     """Give ``target`` a wrapped DEK for a direct ZK vault plus an authz row at ``level``."""
     ensure_ecc_keypair(target_client)
-    admin.post(f"/ecc/vaults/{vid}/members", json={
+    post_zk(admin, f"/ecc/vaults/{vid}/members", json={
         "user_id": str(target_id),
         "wrapped_dek": ZK_WRAPPED_DEK_STUB,
         "ephemeral_public_key": ZK_EPHEMERAL_STUB,
@@ -170,7 +171,7 @@ def test_rekey_writes_audit_row(admin):
     vid = v["id"]
     try:
         # Direct rekey — the owner is the only member, re-wrap their DEK to the new epoch.
-        r = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [{"user_id": str(admin.user["id"]),
                              "wrapped_dek": ZK_WRAPPED_DEK_STUB,

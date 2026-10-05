@@ -1,8 +1,11 @@
 """Static security contract for zero-knowledge vault creation in the browser.
 
 The live Playwright gate proves the request trace against the exact candidate image. These
-source-level assertions fail faster and make the least-privilege boundary explicit for reviewers:
-creating a vault needs the registered public identity key, never the private identity envelope.
+source-level assertions fail faster and make the boundary explicit for reviewers: the vault key is
+wrapped to the registered public identity key, and the create then proves, through the one key-proof
+helper, that this browser holds the account's identity key and the key the vault starts with -- so a
+session without the identity key cannot create a vault "as" its account under a key of its choosing.
+The create flow itself never reads the private identity envelope; the helper unlocks the key, once.
 """
 
 from pathlib import Path
@@ -68,7 +71,7 @@ def test_create_submit_wraps_a_fresh_dek_to_the_server_public_key():
     public_lookup = "const identity = await zkEnsurePublicKeyForCreate();"
     public_import = "const myPub = await lib.importPublicKeyPEM(identity.pem);"
     fresh_dek = "const dek = await lib.generateVaultDEK();"
-    create_request = "const created = await apiRequest('/vaults'"
+    create_request = "? await zkKeyProofRequest(payload.id, 'create', {"
 
     assert public_lookup in create_flow
     assert public_import in create_flow
@@ -87,9 +90,11 @@ def test_create_submit_wraps_a_fresh_dek_to_the_server_public_key():
     assert mint_id in create_flow
     assert create_flow.index(mint_id) < create_flow.index(stamp)
 
+    # The create flow does not unlock or read the private envelope itself: the proof helper does, once.
     assert "zkEnsureKeypair" not in create_flow
     assert "zkEnsureUnlocked" not in create_flow
     assert "/ecc/keys/private" not in create_flow
+    assert create_flow.count("zkKeyProofRequest(") == 1
 
 
 def test_first_identity_key_registration_remains_interactive_and_pop_bound():

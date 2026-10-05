@@ -182,6 +182,23 @@ The existing note at private-envelope decryption, that the platform exception "i
 for" and is not propagated, is superseded here: the cause is retained on the object but is not
 rendered outside debug mode, which serves the same intent without discarding the diagnostic.
 
+### 4.1 The key-proof operations
+
+The key proof that zero-knowledge key changes carry added eight public operations and no new code. Each is
+registered with its default code, like every other public method:
+
+| Operation | Raises | Default |
+|---|---|---|
+| `sealKeyProofKey` | `INVALID_INPUT` for a DEK that is not AES-GCM-256, or a malformed vault id or epoch | `CRYPTO_OPERATION_FAILED` |
+| `openKeyProofKey` | `WRAP_INVALID` for a blob that is not a sealed proof key, `WRAP_FAILED` when it does not authenticate, `KEY_MISMATCH` when it opens but holds a key other than the one its public key names, `INVALID_INPUT` for a DEK that is not AES-GCM-256 | `WRAP_FAILED` |
+| `dekCheck`, `keyLineageTag` | `INVALID_INPUT` for a bad DEK, id, epoch or field | `CRYPTO_OPERATION_FAILED` |
+| `verifyKeyLineageTag`, `teamPrivateKeyMatchesPublic` | nothing: each answers false, including when it cannot compute an answer | `CRYPTO_OPERATION_FAILED`, `KEY_UNUSABLE` |
+| `keyProofTranscript` | `INVALID_INPUT` for an unknown operation or mode, a nonce that is not 32 bytes, or a malformed id or epoch | `INVALID_INPUT` |
+| `computeKeyProof` | as `keyProofTranscript`, and `INVALID_INPUT` without an identity key | `CRYPTO_OPERATION_FAILED` |
+
+A failed open is never `AUTH_FAILED`: the user supplied no secret to reach it, so it must not read as a
+passphrase problem (§3).
+
 ## 5. How call sites use it
 
 Branch on `.code`, from the constant set. Never on `.message`, and never on a substring of it.

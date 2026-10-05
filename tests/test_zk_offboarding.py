@@ -8,6 +8,7 @@ vault surfaces as 'rekey owed' so a manager can do the manual DEK rotation for f
 import contextlib
 
 from conftest import ensure_ecc_keypair, create_zk_vault, ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB, ApiClient
+from conftest import post_zk
 
 UM = "/api/user-management"
 
@@ -23,7 +24,7 @@ def _zk_enabled(admin):
 
 def _grant_direct(admin, vid, target_id, target_client):
     ensure_ecc_keypair(target_client)
-    admin.post(f"/ecc/vaults/{vid}/members", json={
+    post_zk(admin, f"/ecc/vaults/{vid}/members", json={
         "user_id": str(target_id), "wrapped_dek": ZK_WRAPPED_DEK_STUB,
         "ephemeral_public_key": ZK_EPHEMERAL_STUB,
     }).raise_for_status()
@@ -52,7 +53,7 @@ def test_deactivation_blacklists_zk_keys_and_flags_rekey_owed(admin, temp_user, 
         assert c2.get(f"/ecc/vaults/{vid}/keys").json()["has_access"] is False
 
         # A manager rekey (mints a new epoch) clears the owed flag.
-        rk = admin.post(f"/ecc/vaults/{vid}/rekey", json={
+        rk = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
             "from_version": 1, "to_version": 2, "revoke_user_id": None,
             "member_keys": [{"user_id": str(admin.user["id"]),
                              "wrapped_dek": ZK_WRAPPED_DEK_STUB, "ephemeral_public_key": ZK_EPHEMERAL_STUB}],

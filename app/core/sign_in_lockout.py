@@ -71,7 +71,7 @@ from typing import Dict, Iterable, NamedTuple, Optional
 
 from sqlalchemy import text, update
 
-from app.core.models import SignInLockout, User
+from app.core.models import RoleEnum, SignInLockout, User
 
 ACCOUNT_WIDE = "*"
 SCOPE_ADDRESS = "address"
@@ -87,6 +87,14 @@ STALE_ADDRESS_COUNT = timedelta(days=1)
 # The account-wide count holds the failures of about this long: it loses one every ACCOUNT_PERIOD /
 # backstop (see the module docstring).
 ACCOUNT_PERIOD = timedelta(hours=24)
+
+# With a lockout duration of 0 an automatic lock has no end: it lasts until an administrator clears it.
+# For an administrator's own account that promise fails once every administrator is locked out, so an
+# administrator's automatic lock ends after this many minutes (the shipped duration) when the duration is
+# 0; the server's operator can also clear any lock from the host (python dockvault.py accounts --action
+# unlock). Other accounts' locks, and those of names that are no account (the phantoms below, which
+# mimic an ordinary account), still have no end.
+ADMINISTRATOR_LOCK_MINUTES = 15
 
 # The longest an attempt waits for its account's turn (take_turn) before it is refused as busy. Each
 # turn lasts about one password check, so a client's connections opened at once are all through well
@@ -244,6 +252,21 @@ def take_turn(db, user_id) -> None:
     db.execute(text("SELECT set_config('lock_timeout', :was, true)"), {"was": was})
 
 
+def is_administrator(user) -> bool:
+    role = getattr(user, "role", None)
+    return getattr(role, "value", role) == RoleEnum.ADMIN.value
+
+
+def _lock_end(now, minutes, administrator):
+    """When a lock armed now ends: after the lockout duration, or, when that is 0, never, except for an
+    administrator, whose lock ends after ADMINISTRATOR_LOCK_MINUTES. None: no end."""
+    if minutes > 0:
+        return now + timedelta(minutes=minutes)
+    if administrator:
+        return now + timedelta(minutes=ADMINISTRATOR_LOCK_MINUTES)
+    return None
+
+
 def _audit_row(db, action, user, ip_address, details):
     from app.services.audit_logger import AuditLogger
     return AuditLogger(db).build_row(
@@ -292,7 +315,7 @@ def record_failure(db, user, address, *, arm=True, now=None) -> list:
     once: the next attempt's turn then finds it."""
     threshold, backstop, _window, minutes = limits()
     now = now or utcnow()
-    until = now + timedelta(minutes=minutes) if minutes > 0 else None
+    until = _lock_end(now, minutes, is_administrator(user))
     source = source_of(address)
     # Both counts first, the audit rows after: the rows are added to the caller's transaction and
     # written by its commit, with nothing flushed ahead of it. The account-wide row is taken first, so
@@ -305,15 +328,15 @@ def record_failure(db, user, address, *, arm=True, now=None) -> list:
                 until=until, now=now)
 
 
-def count_at_limit(db, user_id, address, *, now=None) -> Optional[Lock]:
+def count_at_limit(db, user_id, address, *, administrator=False, now=None) -> Optional[Lock]:
     """The lock a count already at its limit would arm, when it holds none: the account-wide count, else
     the address's. For an account an administrator locked, whose failures are counted but arm nothing
     (record_failure with arm=False): a password attempt it finds is refused unchecked, as the lock the
-    next failure would arm, so its guesses stay bounded like any account's. None when neither count is
-    at its limit."""
+    next failure would arm, so its guesses stay bounded like any account's. ``administrator``: the
+    account is one, so that lock would end (_lock_end). None when neither count is at its limit."""
     threshold, backstop, _window, minutes = limits()
     now = now or utcnow()
-    until = now + timedelta(minutes=minutes) if minutes > 0 else None
+    until = _lock_end(now, minutes, administrator)
     source = source_of(address)
     rows = {r.source: r for r in db.query(SignInLockout)
             .filter(SignInLockout.user_id == user_id, SignInLockout.source.in_([ACCOUNT_WIDE, source]))
@@ -345,6 +368,29 @@ def lock_in_force(db, user_id, address, *, now=None) -> Optional[Lock]:
         return None
     r = next((r for r in live if r.source == ACCOUNT_WIDE), live[0])
     return Lock(SCOPE_ACCOUNT if r.source == ACCOUNT_WIDE else SCOPE_ADDRESS, r.locked_until, r.source)
+
+
+def end_administrators_open_locks(db, *, user_id=None, now=None) -> int:
+    """Give an end to each automatic lock with none that an administrator's account holds: one armed
+    while the lockout duration was 0 by a release before 0.33.1, or before the account was made an
+    administrator. It ends ADMINISTRATOR_LOCK_MINUTES after it was armed (an account-wide pause no
+    sooner than its count has lost a failure, as _pause_until), and release_expired clears it once that
+    has passed. The periodic release passes no ``user_id``; an administrator's sign-in passes the
+    account. In the caller's transaction. Returns how many were given an end."""
+    now = now or utcnow()
+    _threshold, backstop, _window, _minutes = limits()
+    q = (db.query(SignInLockout)
+         .filter(SignInLockout.locked_at.isnot(None), SignInLockout.locked_until.is_(None),
+                 SignInLockout.user_id.in_(db.query(User.id).filter(User.role == RoleEnum.ADMIN))))
+    if user_id is not None:
+        q = q.filter(SignInLockout.user_id == user_id)
+    rows = q.with_for_update(skip_locked=True).all()
+    for r in rows:
+        end = r.locked_at + timedelta(minutes=ADMINISTRATOR_LOCK_MINUTES)
+        r.locked_until = _pause_until(end, r.window_start, backstop) if r.source == ACCOUNT_WIDE else end
+    if rows:
+        db.flush()      # release_expired, which follows, finds them by a query
+    return len(rows)
 
 
 def clear_after_success(db, user_id, address) -> None:

@@ -326,6 +326,18 @@ class Settings(BaseSettings):
     # enforcement existed -- so an operator can postpone it while reviewing what it would remove.
     # Expiry times are recorded at upload either way. See app/core/file_expiry.py.
     enforce_file_expiry: bool = Field(default=True)
+    # Start although a newer release has changed this database in a way this one cannot read (a row
+    # in data_requirements names a version above this one). Off, the web and SFTP processes refuse to
+    # start and say what changed and how to undo it with the newer release. An escape for an operator
+    # who has decided to run the older release on that data anyway; never written by setup. See
+    # app/core/data_requirements.py.
+    allow_start_on_newer_data: bool = Field(default=False)
+    # Whether a request that changes a zero-knowledge vault's keys -- creating one, sharing it, rotating
+    # its key, setting its name-index key -- must carry a key proof (app/services/zk_key_proof.py). On,
+    # such a request without one is refused; off, it is accepted as before and recorded in the audit
+    # log, while a request that does carry a proof is still checked in full. Environment only: the
+    # settings page refuses it, so only the host operator can turn it off.
+    zk_key_proof_enforce: bool = Field(default=True)
     
     # Rate Limiting
     rate_limit_login_attempts: int = Field(default=5)
@@ -344,7 +356,11 @@ class Settings(BaseSettings):
     # How long (minutes) new sign-ins stay refused after too many failed ones: from one address, or
     # from every address once the account-wide limit below is reached. The lock ends by itself;
     # sessions already signed in keep working. An ADMIN lock (set via the API) stays permanent.
-    # 0 keeps an automatic lock until an administrator clears it.
+    # 0 keeps an automatic lock until an administrator clears it, except an administrator's own, which
+    # then still ends: after 15 minutes from one address (app/core/sign_in_lockout.py,
+    # ADMINISTRATOR_LOCK_MINUTES), and the account-wide pause no sooner than its count has lost a
+    # failure (72 minutes by default); the host tool can clear any lock (python dockvault.py accounts
+    # --action unlock).
     account_lockout_minutes: int = Field(default=15)
     # The account-wide lock: failed sign-ins to one account from ALL addresses together per 24 hours
     # that refuse new sign-ins from everywhere, as a multiple of rate_limit_login_attempts (the

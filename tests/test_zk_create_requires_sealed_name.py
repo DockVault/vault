@@ -12,6 +12,7 @@ import contextlib
 import pytest
 
 from conftest import ensure_ecc_keypair, unique, ZK_WRAPPED_DEK_STUB, ZK_EPHEMERAL_STUB, ZK_ENC_NAME_STUB
+from conftest import post_zk
 
 
 @contextlib.contextmanager
@@ -37,7 +38,7 @@ def test_zk_create_with_plaintext_name_and_no_seal_is_refused(admin):
     with _zk_enabled(admin):
         payload = _base_zk_payload()
         payload["name"] = unique("secret-name")     # a real name, sent in the clear, unsealed
-        r = admin.post("/vaults", json=payload)
+        r = post_zk(admin, "/vaults", json=payload)
         assert r.status_code == 400, (
             f"a ZK vault name sent in the clear must be refused, not stored (got {r.status_code}: {r.text[:200]})"
         )
@@ -52,7 +53,7 @@ def test_zk_create_with_sealed_name_is_accepted(admin):
         payload["name"] = unique("label")           # a non-secret label, alongside the seal
         payload["enc_name"] = ZK_ENC_NAME_STUB
         payload["name_key_version"] = 1
-        r = admin.post("/vaults", json=payload)
+        r = post_zk(admin, "/vaults", json=payload)
         assert r.status_code == 200, r.text
         vault = r.json()
         assert vault["type"] == "zero_knowledge"
@@ -64,13 +65,13 @@ def test_zk_create_with_no_name_and_no_seal_is_allowed(admin):
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
         payload = _base_zk_payload()                 # no name, no enc_name
-        r = admin.post("/vaults", json=payload)
+        r = post_zk(admin, "/vaults", json=payload)
         assert r.status_code == 200, r.text
         admin.delete_vault(r.json()["id"])
 
 
 def test_standard_vault_with_plaintext_name_is_unaffected(admin):
     """A Standard vault still requires and accepts a real plaintext name (sealed at rest server-side)."""
-    r = admin.post("/vaults", json={"name": unique("std"), "type": "standard"})
+    r = post_zk(admin, "/vaults", json={"name": unique("std"), "type": "standard"})
     assert r.status_code == 200, r.text
     admin.delete_vault(r.json()["id"])

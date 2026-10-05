@@ -15,7 +15,6 @@ import subprocess
 import uuid
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 import pytest
 
 from app.core.zk_temp_access import TEMP_ZK_KEY_ACCESS_DENIED
@@ -31,6 +30,7 @@ from conftest import (
     zk_encrypt_name,
     zk_name_blind_index,
 )
+from conftest import client_username, identity_private_key, post_zk
 
 
 pytestmark = pytest.mark.crypto_compatibility
@@ -60,8 +60,10 @@ def _opaque_envelope(label: str) -> str:
 
 
 def _registration_payload(client, envelope: str) -> dict:
-    """Build a valid P-384 registration request, including proof of possession."""
-    private_key = ec.generate_private_key(ec.SECP384R1())
+    """Build a valid P-384 registration request, including proof of possession.
+
+    The key is the account's derived identity key, so a later key proof for the account can be made."""
+    private_key = identity_private_key(client_username(client))
     public_key = (
         private_key.public_key()
         .public_bytes(
@@ -1174,8 +1176,8 @@ def test_change_permissions_key_release_tracks_live_manager_role(
             vault = create_zk_vault(admin, name=unique("zk_reader_role"))
             vault_ids.append(vault["id"])
             wrapped_for_reader = "cmVhZGVyLXdyYXBwZWQtZGVr"
-            shared = admin.post(
-                f"/ecc/vaults/{vault['id']}/members",
+            shared = post_zk(
+                admin, f"/ecc/vaults/{vault['id']}/members",
                 json={
                     "user_id": str(temp_user["id"]),
                     "wrapped_dek": wrapped_for_reader,
@@ -1842,8 +1844,8 @@ def test_global_admin_manager_cap_requires_live_direct_relationship_not_key_only
             vault = create_zk_vault(owner, name=unique("zk_global_admin_reader"))
             vault_ids.append(vault["id"])
             wrapped_for_admin = "YWRtaW4td3JhcHBlZC1kZWs="
-            shared = owner.post(
-                f"/ecc/vaults/{vault['id']}/members",
+            shared = post_zk(
+                owner, f"/ecc/vaults/{vault['id']}/members",
                 json={
                     "user_id": str(admin.user["id"]),
                     "wrapped_dek": wrapped_for_admin,
@@ -2345,8 +2347,8 @@ def test_direct_mode_old_epoch_cannot_substitute_for_inactive_current_epoch(
         try:
             vault = create_zk_vault(owner, name=unique("zk_direct_old_epoch"))
             vault_ids.append(vault["id"])
-            rotated = owner.post(
-                f"/ecc/vaults/{vault['id']}/rekey",
+            rotated = post_zk(
+                owner, f"/ecc/vaults/{vault['id']}/rekey",
                 json={
                     "from_version": 1,
                     "to_version": 2,
@@ -2613,8 +2615,8 @@ def test_direct_reader_see_files_qualifies_only_while_zk_vault_is_active(
             vault = create_zk_vault(admin, name=unique("zk_direct_reader_active"))
             vault_ids.append(vault["id"])
             wrapped_for_reader = "cmVhZGVyLXNlZS1maWxlcy13cmFw"
-            shared = admin.post(
-                f"/ecc/vaults/{vault['id']}/members",
+            shared = post_zk(
+                admin, f"/ecc/vaults/{vault['id']}/members",
                 json={
                     "user_id": str(temp_user["id"]),
                     "wrapped_dek": wrapped_for_reader,
@@ -2811,7 +2813,7 @@ def test_a_credential_cannot_manufacture_its_own_envelope_eligibility(
                 # inserts the creator's own VaultMemberKey at the current epoch. Omit it and the
                 # account still holds no live key for any zero-knowledge vault, so the closing 403
                 # would hold with the bound under test reverted and this test would prove nothing.
-                created = temp.post("/vaults", json={
+                created = post_zk(temp, "/vaults", json={
                     "name": unique("zk_self_escalation"),
                     "type": "zero_knowledge", "enc_name": ZK_ENC_NAME_STUB, "name_key_version": 1,
                     "description": "created by the temporary credential",

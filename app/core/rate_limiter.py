@@ -524,7 +524,8 @@ return {over, tostring(reset_at)}
         key: str,
         limit: int,
         window: int,
-        fail_open: bool = True
+        fail_open: bool = True,
+        entry_id: Optional[str] = None,
     ) -> Tuple[bool, int, int]:
         """
         Check rate limit using sliding window algorithm.
@@ -539,6 +540,8 @@ return {over, tostring(reset_at)}
                 RateLimiterUnavailable so a security-sensitive caller (auth) can
                 deny or fall back to a durable throttle instead of silently
                 disabling rate limiting.
+            entry_id: The window entry an allowed call adds, so the caller can give the charge back
+                (release). A random one by default.
 
         Returns:
             (allowed, remaining, reset_time)
@@ -571,7 +574,7 @@ return {over, tostring(reset_at)}
                     now,
                     limit,
                     window + 1,
-                    str(uuid.uuid4()),
+                    entry_id or str(uuid.uuid4()),
                     window,
                 ))
             _cb_record_success()  # Redis is healthy — reset the breaker
@@ -651,7 +654,8 @@ return {over, tostring(reset_at)}
         limit: int,
         window: int,
         prefix: str = "rate_limit",
-        fail_open: bool = True
+        fail_open: bool = True,
+        entry_id: Optional[str] = None,
     ) -> Tuple[bool, int, int]:
         """
         Check if rate limit is exceeded for an identifier.
@@ -664,12 +668,30 @@ return {over, tostring(reset_at)}
             fail_open: See _sliding_window_check. Default True. Auth paths pass
                 False so a Redis outage raises RateLimiterUnavailable instead of
                 silently allowing the request.
+            entry_id: See _sliding_window_check: name the charge, to give it back with release().
 
         Returns:
             (allowed, remaining, reset_time)
         """
         key = f"{prefix}:{identifier}"
-        return self._sliding_window_check(key, limit, window, fail_open=fail_open)
+        return self._sliding_window_check(key, limit, window, fail_open=fail_open, entry_id=entry_id)
+
+    def release(self, identifier: str, entry_id: str, prefix: str = "rate_limit") -> bool:
+        """Give back one charge check_rate_limit made with ``entry_id``: take its entry out of the
+        window, so it no longer counts. A sign-in with the right password gives its charges back, so
+        the login throttle counts only failures. Best-effort and never raises: a charge that cannot be
+        given back stays counted until the window passes it, which is what happened to every charge
+        before. Does nothing while the breaker is open, and never drives it. Returns whether an entry
+        was removed."""
+        if not entry_id or _cb_is_open(time.time()):
+            return False
+        try:
+            from app.core import redis_guard
+            return bool(redis_guard.timed_redis(
+                "RateLimiter.release", lambda: self.redis.zrem(f"{prefix}:{identifier}", entry_id)))
+        except Exception as e:  # noqa: BLE001 - giving a charge back is best-effort
+            logger.warning(f"Rate limit release skipped: {type(e).__name__}")
+            return False
     
     def get_rate_limit_headers(
         self,
