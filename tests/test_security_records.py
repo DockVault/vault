@@ -8,8 +8,10 @@ clears the names and addresses of older security alerts, resolved or not; alert 
 instead of names and addresses, completed when shown. The security monitor's statistics read the records.
 These run on a throwaway SQLite database.
 """
+import contextlib
 import inspect
 import logging
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timedelta
@@ -204,6 +206,43 @@ def test_an_audit_row_that_cannot_be_written_writes_no_record(env, factory):
         audit_logger.AuditLogger(db).log_login_failure("alice", "203.0.113.7", "x")
     db.rollback()
     assert _records(factory) == []
+    assert _degraded_alerts() == []
+
+
+def test_a_failed_account_lookup_runs_under_a_savepoint_of_its_own_and_keeps_the_record(env, factory):
+    """The record is written under the savepoint the failure's audit row opens for it (_add_security_record), so
+    its own lookup of the account the typed name names runs under a savepoint of its own: on PostgreSQL a
+    statement that fails aborts the transaction it runs in, and the record would be lost with it
+    (tests/test_security_records_live.py has that on PostgreSQL). Here the record's lookup fails and notes how
+    many savepoints it ran under; the record and its audit row are written all the same, without the account."""
+    db = factory()
+    _user(db)
+    depth, queried = [0], []
+    real_nested, real_query = db.begin_nested, db.query
+
+    @contextlib.contextmanager
+    def nested():
+        depth[0] += 1
+        try:
+            with real_nested():
+                yield
+        finally:
+            depth[0] -= 1
+
+    def query(*entities, **kwargs):
+        if sys._getframe(1).f_code.co_filename.endswith("security_records.py"):
+            queried.append(depth[0])
+            raise RuntimeError("the users table cannot be read")
+        return real_query(*entities, **kwargs)
+
+    db.begin_nested, db.query = nested, query
+    record_id = audit_logger.AuditLogger(db).log_login_failure("alice", "203.0.113.7", "Invalid credentials")
+    assert record_id is not None
+    # One lookup (the name has no "@"), under _add_security_record's savepoint and one of its own.
+    assert queried == [2]
+    (rec,) = _records(factory)
+    assert (rec.name, rec.account_id, rec.address) == ("alice", None, "203.0.113.7")
+    assert factory().query(AuditLog).filter(AuditLog.action == "login_failure").count() == 1
     assert _degraded_alerts() == []
 
 

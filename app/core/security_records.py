@@ -64,14 +64,15 @@ def record(db, *, kind: str, name: Optional[str], address: Optional[str], channe
            reason: Optional[str] = None, account_id=None, at: Optional[datetime] = None):
     """Add a security record to ``db``'s transaction, and return it. The caller commits it with the audit
     row of the same failure. When ``account_id`` is not given, the name is looked up among the accounts."""
-    from app.core.models import SecurityRecord, User
+    from app.core.models import SecurityRecord
     if account_id is None and name:
-        try:
-            account_id = db.query(User.id).filter(User.username == name).scalar()
-            if account_id is None and "@" in name:    # a sign-in by email address
-                account_id = db.query(User.id).filter(func.lower(User.email) == name.strip().lower()).scalar()
-        except Exception:  # noqa: BLE001 -- a record without its account is still a record
-            account_id = None
+        # Under a savepoint of its own (audit_logger._looked_up): the record is written under the savepoint
+        # the failure's audit row opens for it (AuditLogger._add_security_record), and on PostgreSQL a lookup
+        # that fails there (waiting past the lock timeout behind a change to the users table, or a transient
+        # error) would abort that savepoint and lose the record. Rolled back to its own, the lookup leaves the
+        # record without its account, which is still a record.
+        from app.services.audit_logger import _looked_up
+        account_id = _looked_up(db, lambda: _account_named(db, name))
     import uuid
     row = SecurityRecord(id=uuid.uuid4(), at=at or utcnow(), kind=kind, account_id=account_id,
                          name=(name or None) and name[:255],
@@ -79,6 +80,16 @@ def record(db, *, kind: str, name: Optional[str], address: Optional[str], channe
                          reason=(reason or None) and str(reason)[:255])
     db.add(row)
     return row
+
+
+def _account_named(db, name: str):
+    """The id of the account ``name`` names: its username, or for a sign-in by email address its email address;
+    None when there is none."""
+    from app.core.models import User
+    account_id = db.query(User.id).filter(User.username == name).scalar()
+    if account_id is None and "@" in name:    # a sign-in by email address
+        account_id = db.query(User.id).filter(func.lower(User.email) == name.strip().lower()).scalar()
+    return account_id
 
 
 def render_message(alert) -> str:

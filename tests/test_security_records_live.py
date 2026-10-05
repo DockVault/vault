@@ -3,7 +3,7 @@
 A failed web sign-in, a rejected second-factor code and a failed SFTP password each write a security
 record with the name as typed, the address and the way in, in the commit of the failure's audit row; a record
 the database refuses costs neither the audit row nor the answer, and raises an alert instead, and a lookup
-of the name typed that fails costs neither of them. An alert raised by repeated failures holds placeholders
+of the name typed that fails costs none of them, the record included. An alert raised by repeated failures holds placeholders
 instead of the name and the address, is shown with them filled in, and is linked from the records that
 raised it. A pass of the pruner deletes records past the window and clears the names and addresses of
 alerts past it, resolved or not. test_security_records.py covers the rules offline.
@@ -280,3 +280,63 @@ def test_a_pass_deletes_old_records_and_clears_old_alerts(admin):
     finally:
         psql(f"DELETE FROM security_alerts WHERE id IN ('{old_alert}', '{new_alert}')")
         psql(f"DELETE FROM security_records WHERE id = '{record_id}'")
+
+
+# Inside the web container, on the application's own engine: the security record's own lookup of the account a
+# failed sign-in's name names (a statement on the users table run from app/core/security_records.py) fails once
+# at the server, as one waiting past the lock timeout does. The record is written under a savepoint of the
+# failure's transaction; on PostgreSQL that failure aborts the savepoint, and the record with it, unless the
+# lookup ran under a savepoint of its own.
+_RECORD_LOOKUP_FAILS = r"""
+import json
+import traceback
+from datetime import datetime
+from sqlalchemy import event
+from app.core.database import SessionLocal, _require_engine
+from app.core.models import AuditLog, SecurityRecord
+from app.services.audit_logger import AuditLogger
+
+LOCK_TIMEOUT = ("DO $$ BEGIN RAISE EXCEPTION 'canceling statement due to lock timeout' "
+                "USING ERRCODE = 'lock_not_available'; END $$")
+armed = [True]
+
+@event.listens_for(_require_engine(), "before_cursor_execute", retval=True)
+def _fail_once(conn, cursor, statement, parameters, context, executemany):
+    if armed and "FROM users" in statement and any(
+            frame.filename.endswith("security_records.py") for frame in traceback.extract_stack()):
+        armed.clear()
+        return LOCK_TIMEOUT, {}
+    return statement, parameters
+
+start = datetime.utcnow()
+db = SessionLocal()
+try:
+    record_id = AuditLogger(db).log_login_failure(NAME, "198.51.100.62", "Invalid credentials")
+    answer = "answered"
+except Exception as exc:
+    record_id, answer = None, "raised " + type(exc).__name__
+    db.rollback()
+finally:
+    db.close()
+check = SessionLocal()
+rows = check.query(AuditLog).filter(AuditLog.action == "login_failure", AuditLog.timestamp >= start).count()
+record = check.get(SecurityRecord, record_id) if record_id is not None else None
+out = {"failed": not armed, "answer": answer, "rows": rows,
+       "record": [record.name, record.account_id is None] if record is not None else None}
+check.close()
+print("OUTCOME=" + json.dumps(out))
+"""
+
+
+def test_the_records_own_account_lookup_that_fails_never_costs_the_record(temp_user):
+    name = temp_user["_username"]
+    r = in_api_container(f"NAME = {name!r}\n" + _RECORD_LOOKUP_FAILS)
+    lines = [line for line in r.stdout.splitlines() if line.startswith("OUTCOME=")]
+    assert lines, (r.stdout[-2000:], r.stderr[-2000:])
+    out = json.loads(lines[-1][len("OUTCOME="):])
+    try:
+        # The record's lookup did fail; the failure was answered with its audit row and its record, which
+        # names no account.
+        assert out == {"failed": True, "answer": "answered", "rows": 1, "record": [name, True]}, out
+    finally:
+        psql(f"DELETE FROM security_records WHERE name = '{name}'")
