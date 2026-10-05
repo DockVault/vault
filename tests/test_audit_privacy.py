@@ -8,6 +8,7 @@ and the alerts. test_audit_privacy_live.py checks the same on a running stack.
 """
 import ast
 import collections
+import contextlib
 import inspect
 import re
 import tempfile
@@ -530,9 +531,21 @@ def test_a_name_names_an_account_only_where_the_sign_in_method_takes_it(factory,
 
 
 class _BrokenSession:
-    """A session whose every query fails."""
+    """A session whose every query fails, noting how many savepoints each one ran under."""
+
+    def __init__(self):
+        self.savepoints, self.queried = 0, []
+
+    @contextlib.contextmanager
+    def begin_nested(self):
+        self.savepoints += 1
+        try:
+            yield
+        finally:
+            self.savepoints -= 1
 
     def query(self, *entities, **kwargs):
+        self.queried.append(self.savepoints)
         raise RuntimeError("the database is gone")
 
 
@@ -541,6 +554,9 @@ def test_a_failed_lookup_leaves_the_name_a_typed_one(factory):
     for method in ("username", "email", "either"):
         assert audit_logger.account_named(broken, "ada@example.test", method) is None
     assert audit_logger.credential_named(broken, "temp_abc") is None
+    # Each lookup ran under a savepoint: on PostgreSQL a statement that fails aborts the transaction it runs
+    # in, and the audit row is written next in the same one (tests/test_security_records_live.py has it live).
+    assert broken.queried == [1, 1, 1, 1]
     # The row is still written, with the name as a typed one.
     from app.core.models import SecurityRecord
     _accounts(factory, ("ada", "ada@example.test"))

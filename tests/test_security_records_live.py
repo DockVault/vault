@@ -2,10 +2,11 @@
 
 A failed web sign-in, a rejected second-factor code and a failed SFTP password each write a security
 record with the name as typed, the address and the way in, in the commit of the failure's audit row; a record
-the database refuses costs neither the audit row nor the answer, and raises an alert instead. An alert raised by repeated failures holds placeholders instead of the name and the address, is shown with
-them filled in, and is linked from the records that raised it. A pass of the pruner deletes records past
-the window and clears the names and addresses of alerts past it, resolved or not. test_security_records.py
-covers the rules offline.
+the database refuses costs neither the audit row nor the answer, and raises an alert instead, and a lookup
+of the name typed that fails costs neither of them. An alert raised by repeated failures holds placeholders
+instead of the name and the address, is shown with them filled in, and is linked from the records that
+raised it. A pass of the pruner deletes records past the window and clears the names and addresses of
+alerts past it, resolved or not. test_security_records.py covers the rules offline.
 """
 import json
 import os
@@ -177,6 +178,67 @@ def test_a_record_the_database_refuses_never_costs_the_audit_row_or_the_answer(t
     assert _web(name, WRONG).status_code == 401
     assert [rec[0] for rec in _records(name)] == ["login_failure"]
     reset_sign_in_throttle()
+
+
+# Inside the web container, on the application's own engine: the statement that looks up the name a failed
+# sign-in typed (as an account's, or as a temporary credential's) fails once at the server, as one waiting past
+# the connections' lock timeout behind a change to its table does. On PostgreSQL that aborts the transaction the
+# failure's audit row is written in, unless the lookup ran under a savepoint of it.
+_LOOKUP_FAILS = r'''
+import json
+from datetime import datetime
+from sqlalchemy import event
+from app.core.database import SessionLocal, _require_engine
+from app.core.models import AuditLog, SecurityRecord
+from app.services.audit_logger import AuditLogger
+
+LOCK_TIMEOUT = ("DO $$ BEGIN RAISE EXCEPTION 'canceling statement due to lock timeout' "
+                "USING ERRCODE = 'lock_not_available'; END $$")
+armed = []
+
+@event.listens_for(_require_engine(), "before_cursor_execute", retval=True)
+def _fail_once(conn, cursor, statement, parameters, context, executemany):
+    if armed and armed[0] in statement:
+        armed.clear()
+        return LOCK_TIMEOUT, {}
+    return statement, parameters
+
+out = {}
+for case, name, marker in CASES:
+    start = datetime.utcnow()
+    db = SessionLocal()
+    armed[:] = [marker]
+    try:
+        record_id = AuditLogger(db).log_login_failure(name, "198.51.100.61", "Invalid credentials")
+        answer = "answered"
+    except Exception as exc:
+        record_id, answer = None, "raised " + type(exc).__name__
+        db.rollback()
+    finally:
+        db.close()
+    check = SessionLocal()
+    rows = check.query(AuditLog).filter(AuditLog.action == "login_failure", AuditLog.timestamp >= start).count()
+    record = check.get(SecurityRecord, record_id) if record_id is not None else None
+    out[case] = {"failed": not armed, "answer": answer, "rows": rows,
+                 "record": record.name if record is not None else None}
+    check.close()
+    armed.clear()
+print("OUTCOME=" + json.dumps(out))
+'''
+
+
+def test_a_lookup_that_fails_never_costs_the_audit_row_or_the_answer(temp_user):
+    account, credential = temp_user["_username"], unique("temp_gone")
+    cases = [("account", account, "ORDER BY CASE"), ("credential", credential, "FROM temporary_credentials")]
+    r = in_api_container(f"CASES = {cases!r}\n" + _LOOKUP_FAILS)
+    out = json.loads([line for line in r.stdout.splitlines() if line.startswith("OUTCOME=")][-1][len("OUTCOME="):])
+    try:
+        for case, name, _marker in cases:
+            # The lookup's statement did fail; the failure was answered all the same, with its audit row and
+            # its security record.
+            assert out[case] == {"failed": True, "answer": "answered", "rows": 1, "record": name}, (case, out)
+    finally:
+        psql(f"DELETE FROM security_records WHERE name IN ('{account}', '{credential}')")
 
 
 def test_an_alert_is_stored_without_the_name_and_shown_with_it(admin):

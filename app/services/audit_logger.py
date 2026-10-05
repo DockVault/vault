@@ -47,7 +47,7 @@ def account_named(db, typed, login_identifier: str = "username") -> Optional[Use
     that address (two accounts sharing it name neither); either way, the username first, then the address. A
     name that starts with temp_ is a temporary credential's at both doors (credential_named), never an account's.
     One query whether or not one matches, so the failure's write takes no longer for a name that is an account
-    than for one that is not. Never raises: a failed lookup leaves the name a typed one."""
+    than for one that is not. Never raises: a failed lookup leaves the name a typed one (_looked_up)."""
     if not isinstance(typed, str) or not typed or typed.startswith(TEMP_CREDENTIAL_PREFIX):
         return None
     if login_identifier not in LOGIN_IDENTIFIERS:
@@ -61,10 +61,9 @@ def account_named(db, typed, login_identifier: str = "username") -> Optional[Use
         match.append(func.lower(User.email) == func.lower(address))
     if not match:
         return None
-    try:
-        rows = (db.query(User).filter(or_(*match))
-                .order_by(case((User.username == typed, 0), else_=1)).limit(3).all())
-    except Exception:  # noqa: BLE001 -- the row is still written, as a typed name
+    rows = _looked_up(db, lambda: db.query(User).filter(or_(*match))
+                      .order_by(case((User.username == typed, 0), else_=1)).limit(3).all())
+    if rows is None:
         return None
     if by_username:
         by_name = [u for u in rows if u.username == typed]
@@ -76,13 +75,24 @@ def account_named(db, typed, login_identifier: str = "username") -> Optional[Use
 def credential_named(db, typed):
     """The temporary credential a name typed at a failed sign-in names, or None: (id, owner's account id, name)
     of the credential with exactly that name, as both doors look one up, live or not. One query. Never raises:
-    a failed lookup leaves the name a typed one."""
+    a failed lookup leaves the name a typed one (_looked_up)."""
     if not isinstance(typed, str) or not typed.startswith(TEMP_CREDENTIAL_PREFIX):
         return None
     from app.core.models import TemporaryCredential
+    return _looked_up(db, lambda: db.query(TemporaryCredential.id, TemporaryCredential.user_id,
+                                           TemporaryCredential.temp_username)
+                      .filter(TemporaryCredential.temp_username == typed).first())
+
+
+def _looked_up(db, query):
+    """What ``query()`` returns, run under a savepoint of the session's transaction; None when it fails. On
+    PostgreSQL a statement that fails aborts the transaction it runs in, so without the savepoint a lookup
+    that fails (waiting past the lock timeout behind a change to its table, or a transient error) would cost
+    the failure's audit row, written next in the same transaction, and the caller its answer. Rolled back to
+    the savepoint, the transaction goes on and the name is recorded as a typed one."""
     try:
-        return (db.query(TemporaryCredential.id, TemporaryCredential.user_id, TemporaryCredential.temp_username)
-                .filter(TemporaryCredential.temp_username == typed).first())
+        with db.begin_nested():
+            return query()
     except Exception:  # noqa: BLE001 -- the row is still written, as a typed name
         return None
 
