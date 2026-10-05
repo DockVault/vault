@@ -106,6 +106,26 @@ A methodological note, since it nearly produced a wrong conclusion: the first ru
 not the case the app produces -- it always knows the plaintext length -- and the difference looked
 like a browser behaviour until the probe was corrected.
 
+## A slot outlives its writer until the browser asks for it (0.33.3)
+
+Up to 0.33.2 the worker deleted a slot as soon as the page said it was done. Nothing orders the page's
+messages to the worker against the hidden frame's request for the slot, and for a small file the page
+writes everything and says done before that request reaches the worker, which then found no slot and
+answered 404: no download, while the page had already said the file was downloading. Measured against
+0.33.2 in Chromium on the server's own page, zero-knowledge files of 10 B to 150 KB failed in 20 of 20
+attempts in a headed browser and 21 of 24 headless; 2 MB never failed. Standard files never failed in
+those runs, but their path has the same shape, and a test that holds the frame back fails it the same
+way.
+
+From 0.33.3 a finished or aborted slot stays until the browser's request takes it, for at most
+`SLOT_TTL_MS` (60 s) after the page finished; the request uses the slot up, so a second request for it
+gets the 404 it always did. The worker tells the page when the browser has asked (`dv-sink-taken`, and
+`reportsTaken` in its ready reply, so a page talking to an older worker does not wait for a message
+that never comes). The page keeps the frame until then, since removing the frame cancels its request,
+and tells the user a download did not start if the browser has not asked within the same 60 s.
+`tests/test_ui_download_sink_late_request.py` holds back the frame, and in the other order the page's
+done, so each order is tested instead of being left to timing.
+
 ## Measured after building it: the memory case is not made
 
 The sink was built to remove a memory ceiling. Measured, it does not do that. It moves the cost

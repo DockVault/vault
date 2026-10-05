@@ -13072,6 +13072,10 @@ function zkDownloadHeaders() {
 // docs/design/vault-download-sink-and-policy.md for what it costs.
 
 let _sinkWorker = null;
+// How long the page waits, once it has written a whole download, for the browser to ask the worker
+// for it before telling the user the download did not start. The worker's own limit for keeping a
+// finished download: past it the worker has let the download go, so it can no longer start.
+const DV_SINK_CLAIM_WAIT_MS = 60_000;
 // Why the last dvSinkWorker() call produced no sink, so _refuseTooLarge can pick honest wording:
 //   'timeout-installing' -> a first-visit worker still installing at the backstop; a retry will work.
 //   'redundant' / 'unsupported' / 'register-failed' / 'blocked' -> this browser cannot stream here.
@@ -13163,11 +13167,33 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     const channel = new MessageChannel();
 
+    let frame = null;
+    const cleanup = () => { try { if (frame) frame.remove(); } catch (_) { /* already gone */ } };
+
+    // Whether the worker says when the browser has asked for the download (an older worker does
+    // not), whether it has, and whether the page has finished writing. A small file can be written
+    // in full before the browser's request for it arrives, so the frame that makes that request
+    // must stay until the request has been made: removing it earlier cancels the download.
+    let reportsTaken = false;
+    let taken = false;
+    let finished = false;
+    let unclaimedTimer = null;
+
     const url = await new Promise(resolve => {
         const timer = setTimeout(() => resolve(null), 5000);
         channel.port1.onmessage = event => {
             const data = event.data || {};
-            if (data.type === 'dv-sink-ready') { clearTimeout(timer); resolve(data.url); }
+            if (data.type === 'dv-sink-ready') {
+                clearTimeout(timer);
+                reportsTaken = data.reportsTaken === true;
+                resolve(data.url);
+            } else if (data.type === 'dv-sink-taken') {
+                taken = true;
+                if (finished) {
+                    clearTimeout(unclaimedTimer);
+                    setTimeout(cleanup, 2000);
+                }
+            }
         };
         worker.postMessage(
             { type: 'dv-sink-open', id, filename, size, mime }, [channel.port2]);
@@ -13179,12 +13205,10 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
     // an error page and the application is gone. Measured: Chromium tolerates it, Firefox does
     // not -- the page was destroyed. An iframe confines a failure to the frame. CSP already
     // allows it (frame-src 'self').
-    const frame = document.createElement('iframe');
+    frame = document.createElement('iframe');
     frame.style.display = 'none';
     frame.src = url;
     document.body.appendChild(frame);
-
-    const cleanup = () => { try { frame.remove(); } catch (_) { /* already gone */ } };
 
     return {
         write(bytes) {
@@ -13193,7 +13217,18 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
         },
         done() {
             channel.port1.postMessage({ type: 'done' });
-            setTimeout(cleanup, 2000);
+            finished = true;
+            if (taken || !reportsTaken) {
+                setTimeout(cleanup, 2000);
+                return;
+            }
+            // Written in full, and the browser has not asked for it yet. The worker keeps it until
+            // the browser does; if that never happens the user would otherwise be left with a
+            // success message and no file, so say so.
+            unclaimedTimer = setTimeout(() => {
+                cleanup();
+                if (!taken) showError(`"${filename}" did not start downloading. Try again.`);
+            }, DV_SINK_CLAIM_WAIT_MS);
         },
         abort(reason) {
             // Erroring the stream is what makes the browser mark the download failed rather than
