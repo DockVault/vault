@@ -163,8 +163,9 @@ _IDENTIFIER_KEYS = (
     "password_protected", "require_otp", "require_password", "has_expiry", "email_sent", "is_temporary",
     "job", "table", "superseded", "cleared", "is_active",
     "at_promotion", "added_by_left_because", "link_made_by_other", "locked", "was_locked",
-    # a zero-knowledge key change: the operation, and how it was proved ("key" or "absent"), never the proof
-    "op", "proof",
+    # a zero-knowledge key change: the operation, and how it was proved ("key" or "absent"), never the proof;
+    # and what a member's browser found when it checked the vault key it holds (one of KEY_CHECK_FINDINGS)
+    "op", "proof", "finding",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
