@@ -93,6 +93,14 @@
 
 .act-blocked { padding: 48px 16px; text-align: center; color: var(--text-secondary); }
 .act-blocked-text { margin: 0 auto; max-width: 52ch; }
+/* The audit log's integrity strip (static/js/audit-integrity.js). */
+.act-integrity { margin: 8px 0 12px; padding: 8px 12px; border: 1px solid var(--border-color, rgba(127,127,127,.3)); border-radius: 8px; display: grid; gap: 4px; font-size: .9rem; }
+.act-integrity[data-state="failed"] { border-color: var(--danger, #c0392b); }
+.act-integrity[data-state="warning"] { border-color: var(--warning, #d68910); }
+.act-integrity-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.act-integrity-code { overflow-wrap: anywhere; word-break: break-all; font-size: .8rem; min-width: 0; }
+.act-integrity-failure { color: var(--danger, #c0392b); }
+.act-integrity-warning { color: var(--warning, #d68910); }
 #activity-section.is-blocked .act-band, #activity-section.is-blocked .act-toolbar,
 #activity-section.is-blocked .act-body, #activity-section.is-blocked .act-live,
 #activity-section.is-blocked .act-head-tools { display: none; }

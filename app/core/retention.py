@@ -234,10 +234,33 @@ def _settings():
     return settings
 
 
+def seal_audit_rows(p: Pass) -> JobResult:
+    """The audit log's integrity chain (app/core/audit_integrity.py): every hour that may be sealed, the late
+    rows of the last 6 hours, the cheap checks, and once a day the whole check. Deletes nothing; never held."""
+    from app.core import audit_chain_verify, audit_integrity
+    audit_integrity.seal_pass(p.session_factory, now=p.now, time_left=p.time_left)
+    if p.time_left() and audit_integrity.state().stopped is None:
+        audit_chain_verify.daily_check(p.session_factory)
+    return JobResult()
+
+
 def apply_waiting_changes(p: Pass) -> JobResult:
-    """Waiting settings changes that are due (app/core/setting_changes.py). Deletes nothing itself."""
-    from app.core import setting_changes
-    setting_changes.apply_due(p.session_factory, now=p.now, limit_statements=limit_statements)
+    """Waiting settings changes that are due, as the audit chain's request seals say, and the database's
+    values compared with the chain (app/core/audit_chain_policy_seals.py). Deletes nothing itself. Before the
+    chain has started, or while sealing is stopped, nothing applies."""
+    from app.core import audit_chain_policy_seals as ps
+    from app.core import audit_integrity
+    st = audit_integrity.state()
+    if st.stopped is not None or st.view.newest_policy() is None:
+        _say("Waiting settings changes wait for the audit chain")
+        return JobResult()
+    engine = audit_integrity._engine_of(p.session_factory)
+    ps.apply_due(engine, st, p.now)
+    found = ps.backstop(engine, st, p.now, p.session_factory)
+    failures = {k: v for k, v in found.items() if k in audit_integrity.FAILURE_KINDS}
+    warnings = {k: v for k, v in found.items() if k not in audit_integrity.FAILURE_KINDS}
+    if failures or warnings:
+        audit_integrity.report_failures(st, p.session_factory, failures, warnings)
     return JobResult()
 
 
@@ -333,6 +356,7 @@ def prune_audit_logs(p: Pass) -> JobResult:
 
 
 JOBS: list[Job] = [
+    Job("audit_seals", "Sealing of audit rows", seal_audit_rows),
     Job("setting_changes", "Waiting settings changes that are due", apply_waiting_changes),
     Job("sessions", "Finished sessions and sign-ins", prune_sessions),
     Job("key_proof_challenges", "Expired key-proof challenges", prune_key_proof_challenges),
@@ -424,7 +448,17 @@ def executor() -> ThreadPoolExecutor:
     return _executor
 
 
+# While the audit chain's first-start backlog is being sealed, passes follow each other this closely.
+BACKLOG_PAUSE_SECONDS = 5.0
+
+
 def interval_seconds() -> float:
+    try:
+        from app.core import audit_integrity
+        if audit_integrity.state().backlog:
+            return BACKLOG_PAUSE_SECONDS
+    except Exception:  # noqa: BLE001 -- the normal interval
+        pass
     return float(registry.resolve(INTERVAL_KEY)) * 60.0
 
 

@@ -19,8 +19,9 @@ from app.services.audit_logger import REDACTED_NAME_KEYS, AuditLogger
 
 pytestmark = pytest.mark.unit
 
-# Every stored column but the two that differ by construction: the id (set on insert) and the time.
-COLUMNS = [c.name for c in AuditLog.__table__.columns if c.name not in ("id", "timestamp")]
+# Every stored column but the three that differ by construction: the id (set on insert), the time, and the
+# integrity chain's nonce (random on every row; tests/test_audit_row_columns.py checks it is there).
+COLUMNS = [c.name for c in AuditLog.__table__.columns if c.name not in ("id", "timestamp", "seal_nonce")]
 
 
 class _Session:

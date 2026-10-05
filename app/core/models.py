@@ -1368,6 +1368,45 @@ class ManagedSettingChange(Base):
     reason = Column(String(255), nullable=True)
 
 
+class AuditSeal(Base):
+    """One seal of the audit log's integrity chain (app/core/audit_integrity.py; the encoding is
+    app/core/audit_chain_format.py).
+
+    Seals are numbered 1, 2, 3 ... with no gap. Each seal's link hashes the previous link and the seal's body
+    (every column up to ``sealed_at``), and ``mac`` authenticates the link under the chain's key, which the
+    database never holds: only ``key_id`` names it. ``link`` is stored for tools that print one seal; every
+    check recomputes it. ``row_ids`` (an hour's 16-byte ids in (timestamp, id) order) and ``legacy_salt`` (the
+    salt of the nonces of an hour's rows written without one) are working data, not bound: a wrong value
+    changes a recomputed digest or root. Seals are never deleted. Created by create_all; an older release
+    ignores the table.
+    """
+    __tablename__ = 'audit_seals'
+
+    seq = Column(BigInteger, primary_key=True, autoincrement=False)
+    kind = Column(String(16), nullable=False)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    format = Column(SmallInteger, nullable=False)
+    row_count = Column(BigInteger, nullable=False)
+    row_bytes = Column(BigInteger, nullable=False)
+    root_s = Column(LargeBinary, nullable=True)
+    root_c = Column(LargeBinary, nullable=True)
+    ids_digest = Column(LargeBinary, nullable=True)
+    detail = Column(JSON().with_variant(JSONB(), 'postgresql'), nullable=False)
+    key_id = Column(String(32), nullable=False)
+    sealed_at = Column(DateTime, nullable=False)
+    mac = Column(LargeBinary, nullable=False)
+    link = Column(LargeBinary, nullable=False)
+    row_ids = Column(LargeBinary, nullable=True)
+    legacy_salt = Column(LargeBinary, nullable=True)
+
+    __table_args__ = (
+        # One hour seal per period start: hours are sealed once, in order.
+        Index('uq_audit_seals_hour', 'period_start', unique=True,
+              postgresql_where=text("kind = 'hour'"), sqlite_where=text("kind = 'hour'")),
+    )
+
+
 class SftpProcess(Base):
     """An SFTP server process and the version it runs (app/core/sftp_versions.py): recorded when it starts
     and refreshed while it runs, so the web app can tell whether every live SFTP process runs its own

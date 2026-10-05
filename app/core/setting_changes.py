@@ -84,6 +84,9 @@ class Outcome:
     setting: object = None
     change: object = None
     superseded: list = field(default_factory=list)
+    # The audit row the change wrote, and the cancel rows of the pending changes it kept (for the chain).
+    audit_row: object = None
+    cancel_rows: list = field(default_factory=list)
 
 
 def _lock(db) -> None:
@@ -129,9 +132,13 @@ def pending_for(db, key: Optional[str] = None):
 
 
 def _audit(db, action, *, user=None, details, key):
+    """Add the audit row of a change to ``db``'s transaction, and return it (its id goes into the change's
+    seal in the audit chain)."""
     from app.services.audit_logger import AuditLogger
-    db.add(AuditLogger(db).build_row(action=action, status="success", user=user, resource_type="setting",
-                                     resource_id=key, details=details))
+    row = AuditLogger(db).build_row(action=action, status="success", user=user, resource_type="setting",
+                                    resource_id=key, details=details)
+    db.add(row)
+    return row
 
 
 def _end(change, status, *, by_id, by_name, now, reason) -> None:
@@ -157,36 +164,39 @@ def request(db, key: str, requested, *, actor, now: Optional[datetime] = None) -
     if requested == stored:
         if not waiting:
             return Outcome("unchanged", **base)
+        rows = []
         for change in waiting:
             _end(change, SUPERSEDED, by_id=actor.id, by_name=actor.username, now=now,
                  reason="the value in force was kept")
-            _audit(db, CANCELLED_ACTION, user=actor, key=key, details={
+            rows.append(_audit(db, CANCELLED_ACTION, user=actor, key=key, details={
                 "key": key, "change_id": str(change.id), "old": change.old_value, "new": change.new_value,
-                "setting": change.setting, "kept": old_value})
-        return Outcome("kept", superseded=waiting, **base)
+                "setting": change.setting, "kept": old_value}))
+        return Outcome("kept", superseded=waiting, cancel_rows=rows, **base)
     for change in waiting:
         _end(change, SUPERSEDED, by_id=actor.id, by_name=actor.username, now=now,
              reason="a newer change of the same setting")
     superseded = [str(c.id) for c in waiting]
     if not deletes_sooner(spec, old_setting, new_setting):
         registry.store(db, key, requested, by_id=actor.id, by_name=actor.username, now=now)
-        _audit(db, CHANGED, user=actor, key=key, details={**base, "superseded": superseded})
-        return Outcome("applied", superseded=waiting, **base)
+        row = _audit(db, CHANGED, user=actor, key=key, details={**base, "superseded": superseded})
+        return Outcome("applied", superseded=waiting, audit_row=row, **base)
     change = Change(key=key, setting=requested, old_value=old_value, new_value=new_value, status=PENDING,
                     requested_by=actor.id, requested_by_name=actor.username, requested_at=now,
                     effective_at=now + delay())
     db.add(change)
     db.flush()
-    _audit(db, REQUESTED, user=actor, key=key, details={
+    row = _audit(db, REQUESTED, user=actor, key=key, details={
         **base, "change_id": str(change.id), "effective_at": change.effective_at.isoformat() + "Z",
         "superseded": superseded})
-    return Outcome("pending", change=change, superseded=waiting, **base)
+    return Outcome("pending", change=change, superseded=waiting, audit_row=row, **base)
 
 
-def schedule(db, key: str, setting, *, by_name: str, old_value, now: Optional[datetime] = None) -> dict:
+def schedule(db, key: str, setting, *, by_name: str, old_value, now: Optional[datetime] = None,
+             rows: Optional[list] = None) -> dict:
     """A waiting change the server itself asks for, with no administrator behind it (the first pass after
     an upgrade, app/core/audit_retention.py): recorded like a request, in ``db``'s transaction, with its
-    audit row. It supersedes a waiting change of the setting. Returns the details its notice needs."""
+    audit row (added to ``rows`` when given, for the change's seal). It supersedes a waiting change of the
+    setting. Returns the details its notice needs."""
     from app.core.models import ManagedSettingChange as Change
     spec = registry.spec_for(key)
     now = now or utcnow()
@@ -201,7 +211,9 @@ def schedule(db, key: str, setting, *, by_name: str, old_value, now: Optional[da
     details = {"key": key, "old": old_value, "new": change.new_value, "setting": setting,
                "change_id": str(change.id), "effective_at": change.effective_at.isoformat() + "Z",
                "requested_by": by_name}
-    _audit(db, SCHEDULED_ACTION, key=key, details=details)
+    row = _audit(db, SCHEDULED_ACTION, key=key, details=details)
+    if rows is not None:
+        rows.append(row)
     return details
 
 
@@ -217,7 +229,7 @@ def cancel(db, change_id, *, actor, now: Optional[datetime] = None):
     if change.status != PENDING:
         raise registry.SettingRefused(f"This change is no longer waiting: it was {change.status}.")
     _end(change, CANCELLED, by_id=actor.id, by_name=actor.username, now=now, reason="cancelled")
-    _audit(db, CANCELLED_ACTION, user=actor, key=change.key, details={
+    change._audit_row = _audit(db, CANCELLED_ACTION, user=actor, key=change.key, details={
         "key": change.key, "change_id": str(change.id), "old": change.old_value, "new": change.new_value,
         "setting": change.setting, "requested_by": change.requested_by_name})
     return change

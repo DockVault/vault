@@ -7,7 +7,8 @@ nor one younger than the reduction delay, and tells the administrators once a da
 alone do not fit. .env ceilings forbid "for ever" and "off"; the startup contract refuses numbers that
 contradict each other. The preview says what the job deletes, by the same conditions. After an upgrade, a
 positive AUDIT_LOG_RETENTION_DAYS waits like any change that deletes sooner. These run on a throwaway SQLite
-database.
+database, with the audit log's integrity chain running on it: the audit job deletes only rows of sealed
+hours, through the chain, and acts on the chain's state.
 """
 import inspect
 import tempfile
@@ -29,8 +30,9 @@ from app.core import audit_retention as ar  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import setting_changes as sc  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, ManagedSetting, ManagedSettingChange, RoleEnum,  # noqa: E402
-                             SystemSetting, User)
+from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange,  # noqa: E402
+                             RoleEnum, SystemSetting, User)
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -67,7 +69,7 @@ def factory(monkeypatch):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'audit.db'}")
         copies = sa.MetaData()
-        for model in (User, AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting):
+        for model in (User, AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, SystemSetting):
             columns = []
             for column in model.__table__.columns:
                 default = column.server_default
@@ -107,7 +109,30 @@ def _left(factory):
         AuditLog.action.in_((PLAIN, ADMIN_ACTION, SECURITY_ACTION))).all()}
 
 
+_CHAIN = []
+
+
+@pytest.fixture(autouse=True)
+def chain(request, monkeypatch, tmp_path):
+    """The audit chain on the test's database, when the test has one."""
+    if "factory" not in request.fixturenames:
+        yield None
+        return
+    c = Chain(monkeypatch, tmp_path, request.getfixturevalue("env"), request.getfixturevalue("factory"), NOW)
+    _CHAIN.append(c)
+    yield c
+    _CHAIN.clear()
+
+
+def _run(factory, now=NOW):
+    """A pass of the pruner at ``now`` (the chain's clock too)."""
+    _CHAIN[-1].at(now)
+    return retention.run_pass(factory, now=now)
+
+
 def _prune(factory, numbers, now=NOW):
+    """The audit job with these numbers, once every hour that may be sealed at ``now`` is sealed."""
+    _CHAIN[-1].seal_all(now)
     return ar.prune(retention.Pass(factory, now=now), numbers)
 
 
@@ -268,8 +293,9 @@ def test_rows_younger_than_the_delay_neither_count_nor_go(env, factory):
     left = _left(factory)
     assert set(fresh) <= left and set(old) <= left          # the 0.75 MB counted fits
     env.retention_reduction_delay_days = 1
+    _CHAIN[-1].setenv("RETENTION_REDUCTION_DELAY_DAYS", 1)   # .env's delay, which the chain seals first
     later = NOW + timedelta(days=2)
-    ar.prune(retention.Pass(factory, now=later), _numbers(max_mb=1))
+    _prune(factory, _numbers(max_mb=1), now=later)
     assert len(set(fresh + old) & _left(factory)) == 4       # newest 1 MB of the counted rows
 
 
@@ -283,7 +309,7 @@ def test_the_hour_the_cap_cuts_through_keeps_its_rows_younger_than_the_delay(env
     shown = ar.preview(factory(), now, _numbers(max_mb=1))
     assert shown["by_size"]["rows"] == 5
     assert shown["by_size"]["newest"] <= (now - timedelta(days=7)).isoformat() + "Z"
-    ar.prune(retention.Pass(factory, now=now), _numbers(max_mb=1))
+    _prune(factory, _numbers(max_mb=1), now=now)
     left = _left(factory)
     assert young in left and not set(counted) & left
 
@@ -377,23 +403,30 @@ def test_a_retention_set_in_env_before_the_upgrade_waits_with_notice(env, factor
     told = []
     monkeypatch.setattr(sc, "announce", lambda event, details, by=None: told.append((event, details)))
     env.audit_log_retention_days = 90
+    _CHAIN[-1].setenv("AUDIT_LOG_RETENTION_DAYS", 90)
     ids = _seed_ages(factory)
-    done = dict(retention.run_pass(factory, now=NOW))
+    done = dict(_run(factory, now=NOW))
     assert done["audit_logs"].deleted == 0 and _left(factory) == set(ids.values())
     stored = factory().get(ManagedSetting, ar.MAX_DAYS)
     assert (stored.value, stored.updated_by_name) == (0, ar.SERVER)
     change = factory().query(ManagedSettingChange).one()
+    # The server's request, sealed in the audit chain: once it applies, 90 is the panel's value, which a later
+    # change of AUDIT_LOG_RETENTION_DAYS no longer moves.
     assert (change.status, change.setting, change.old_value, change.new_value, change.requested_by_name) == (
-        sc.PENDING, None, 0, 90, ar.SERVER)
+        sc.PENDING, 90, 0, 90, ar.SERVER)
     assert change.effective_at == NOW + timedelta(days=7)
     ((event, details),) = told
     assert event == sc.SCHEDULED and details["new"] == 90
     rows = [r.details for r in factory().query(AuditLog).filter(AuditLog.action == sc.SCHEDULED_ACTION)]
     assert rows and rows[0]["requested_by"] == ar.SERVER
-    # Nothing is deleted until the wait is over, and nothing is scheduled twice.
-    retention.run_pass(factory, now=NOW + timedelta(days=6))
+    # Nothing is deleted until the wait is over, and nothing is scheduled twice. The pruner runs every few
+    # hours meanwhile: the wait counts only time while sealing ran.
+    at = NOW
+    while at < NOW + timedelta(days=6, hours=18):
+        at += timedelta(hours=6)
+        _run(factory, now=at)
     assert _left(factory) == set(ids.values()) and factory().query(ManagedSettingChange).count() == 1
-    retention.run_pass(factory, now=NOW + timedelta(days=7))
+    _run(factory, now=NOW + timedelta(days=7))
     assert factory().query(ManagedSettingChange).one().status == sc.APPLIED
     assert ids["plain_400"] not in _left(factory) and ids["plain_10"] in _left(factory)
 
@@ -407,13 +440,13 @@ def test_the_audit_job_deletes_nothing_until_the_first_pass_has_decided(env, fac
 
     real = ar.schedule_env_retention_once
     monkeypatch.setattr(ar, "schedule_env_retention_once", broken)
-    done = dict(retention.run_pass(factory, now=NOW))
+    done = dict(_run(factory, now=NOW))
     assert done["audit_env_retention"] is None and done["audit_logs"].deleted == 0
     assert _left(factory) == set(ids.values())
     assert factory().get(SystemSetting, ar.MARKER) is None
     assert "the audit_env_retention job has not run yet" in capsys.readouterr().out
     monkeypatch.setattr(ar, "schedule_env_retention_once", real)
-    done = dict(retention.run_pass(factory, now=NOW))
+    done = dict(_run(factory, now=NOW))
     assert done["audit_logs"].deleted == 0 and _left(factory) == set(ids.values())
     assert factory().query(ManagedSettingChange).one().new_value == 90
 
@@ -428,7 +461,7 @@ def test_nothing_waits_when_nothing_would_be_deleted_or_the_choice_is_already_ma
         db.commit()
     if case == "locked":
         env.settings_locked_keys = ar.GROUP
-    retention.run_pass(factory, now=NOW)
+    _run(factory, now=NOW)
     assert factory().query(ManagedSettingChange).count() == 0
     assert factory().get(SystemSetting, ar.MARKER) is not None
     stored = factory().get(ManagedSetting, ar.MAX_DAYS)
@@ -492,6 +525,6 @@ def test_the_preview_counts_an_hour_the_maximum_cuts_through_as_the_job_does(env
     db.commit()
     numbers = _numbers(max_days=45, max_mb=1)
     shown = ar.preview(factory(), now, numbers)
-    result = ar.prune(retention.Pass(factory, now=now), numbers)
+    result = _prune(factory, numbers, now=now)
     assert (shown["by_age"]["rows"], shown["by_size"]["rows"]) == (1, 0)
     assert result.deleted == 1

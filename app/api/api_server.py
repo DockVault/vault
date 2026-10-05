@@ -750,6 +750,9 @@ app.include_router(activity_search_router)
 # Unlocking a password-protected vault's names on the Activity page, with the vault password once.
 from app.api.activity_unlock_router import router as activity_unlock_router  # noqa: E402
 app.include_router(activity_unlock_router)
+# The audit log's integrity status on the Activity page: the chain's head and the last check.
+from app.api.audit_integrity_router import router as audit_integrity_router  # noqa: E402
+app.include_router(audit_integrity_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():

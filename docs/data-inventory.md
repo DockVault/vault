@@ -105,6 +105,7 @@ Visits to a link and uploads through one are also in the audit log.
 | `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. **Changed in 0.34.0:** the person filter keeps a name the audit log holds in full (an account's username, or a name recorded in full under earlier levels) as typed; any other name, one typed at a failed sign-in, is kept as the recording levels keep those: in full, as its fingerprint, or, at "not recorded", not at all (such a search cannot be saved). The free text and addresses are kept as typed. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
+| `audit_seals` **New in 0.34.0** | The audit log's integrity chain: one seal per closed hour of audit rows (two hashes over the hour's rows and the ids of its rows), and one per retention change, cancel, acknowledgment and deletion of audit rows. A retention change's seal names the setting, its values, the change's id and the administrator's account id; an acknowledgment's names the seals it acknowledges. An hour's seal also keeps the 16-byte ids of its rows, and, for rows written without a nonce, a random value per hour from which their nonces are derived. No username, address, name or text of a row: those enter only as a hash, under each row's random nonce. | Finding changes made to the audit log in the database. | For ever: seals are never deleted, and they stay when the rows they cover are deleted. | Nothing deletes a seal. Deleting rows writes a seal that says so; an erase destroys the rows' nonces, so the old hashes reveal nothing. |
 | `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
 
 ### Other tables
@@ -183,9 +184,10 @@ Each row of `audit_logs` holds:
   `privacy_version` says which version of the levels a row was recorded under (none: an earlier release;
   -1: recorded without its personal values because deciding failed, with an alert). Changing the levels
   never rewrites older rows;
-- **New in 0.34.0, and empty on every row so far:** `seal_nonce` (a random value per row for the log's
-  integrity chain), `ip_via` (how the address was learned) and `case_id` (a compliance case).
-  `security_alerts` gains the same `ip_via`, also empty.
+- **New in 0.34.0:** `seal_nonce`, 16 random bytes on every row written from 0.34.0 on, under which the
+  log's integrity chain hashes the row's personal values (`audit_seals`), so that once it is destroyed the
+  hash reveals nothing about them. **Empty on every row so far:** `ip_via` (how the address was learned)
+  and `case_id` (a compliance case). `security_alerts` gains the same `ip_via`, also empty.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is
@@ -196,7 +198,11 @@ never deletes them. An administrator can change the maximum, the minimums and th
 within the limits `.env` sets; a change that deletes sooner waits `RETENTION_REDUCTION_DELAY_DAYS` and
 every administrator is told. After an upgrade from a release that deleted only when an administrator's
 dashboard loaded, a positive `AUDIT_LOG_RETENTION_DAYS` first waits in the same way. The application only
-adds rows and deletes old ones; anyone with database access can change the table.
+adds rows and deletes old ones; anyone with database access can change the table, but from 0.34.0 every
+closed hour is sealed (`audit_seals`), and a change made in the database without the server's key to an
+hour already sealed is found by `python dockvault.py audit verify` and by the server's daily check. It is not
+found when it is made by whoever holds the key (`AUDIT_CHAIN_KEY`, or `ENCRYPTION_KEY` when that is unset),
+nor before the row's hour is sealed (about two hours).
 
 Names typed at failed sign-ins appear on the Activity page (filtered as "no account", which also lists a
 failed sign-in for an account or a temporary credential, as its row has no account id) and in its exports. The summary charts' "most active people" leaves them out, and the page's username search
@@ -275,6 +281,12 @@ the recipients' mailboxes.
   details and error. No vault, file or folder names. Each export is itself audited
   (`audit_exported`, with its filters). The file is personal data wherever it is saved.
 - **Log access**: an administrator's download of the log-access file.
+- **The audit chain's head record** **New in 0.34.0**: a file on the keys volume (`AUDIT_CHAIN_HEAD_FILE`)
+  that holds the newest seal's number and hash, the chain's key ids, the hour summaries of the last 30
+  days (counts and hashes), and the integrity check's findings (kinds, times, seal numbers and row ids, never a
+  row's values). Kept with the keys volume, in every backup. **`python dockvault.py audit verify`** prints
+  the findings and the chain's head on the host's terminal; an export of the Activity page ends with that
+  head. **`python dockvault.py audit acknowledge`** writes an acknowledgment, audited as the host operator.
 - **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.

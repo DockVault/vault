@@ -53,6 +53,7 @@ MENU = [
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
     ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
+    ("audit", "Audit log - verify its integrity chain and print the head to keep elsewhere"),
 ]
 
 
@@ -268,6 +269,9 @@ RETENTION_ENV_KEYS = (
     ("audit_max_emails", "AUDIT_MAX_EMAILS", "full"),
     ("audit_max_ip", "AUDIT_MAX_IP", "full"),
     ("audit_max_user_agent", "AUDIT_MAX_USER_AGENT", "full"),
+    # The audit log's integrity chain: when an hour is sealed, and where the head record lives.
+    ("audit_seal_lag_minutes", "AUDIT_SEAL_LAG_MINUTES", "60"),
+    ("audit_chain_head_file", "AUDIT_CHAIN_HEAD_FILE", "/app/keys/audit-chain-head.json"),
 )
 
 # What the audit log may record of personal data at most: setup offers three presets for the AUDIT_MAX_* limits
@@ -430,7 +434,8 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), audit_fingerprint_key (str; written only when set), enforce_file_expiry and
+    invite_token_pepper (str), audit_fingerprint_key and audit_chain_key (str; each written only when set),
+    enforce_file_expiry and
     zk_key_proof_enforce (raw strings; only a false value is written), max_single_request_upload_mb (int or
     None; written only when set), settings_locked_keys (str; written only when set)."""
     lines = []
@@ -575,6 +580,10 @@ def build_env_lines(cfg):
     # generated derives one from ENCRYPTION_KEY, and keeps doing so until a key is added here.
     if cfg.get("audit_fingerprint_key"):
         bare("AUDIT_FINGERPRINT_KEY", "'%s'" % cfg["audit_fingerprint_key"])
+    # The audit log's integrity chain key. Written when there is one: an install set up before it was
+    # generated derives the chain's key from ENCRYPTION_KEY until one is added here.
+    if cfg.get("audit_chain_key"):
+        bare("AUDIT_CHAIN_KEY", "'%s'" % cfg["audit_chain_key"])
     return lines
 
 
@@ -1348,8 +1357,9 @@ def new_set_config(current_env, new_prefix, new_id):
         **{cfg_key: (current_env.get(env_name) or "").strip() or None
            for cfg_key, env_name, _default in RETENTION_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
-        # A new set is new data: its audit fingerprints get a key of their own.
+        # A new set is new data: its audit fingerprints get a key of their own, and so does its audit chain.
         "audit_fingerprint_key": gen_hex(32),
+        "audit_chain_key": gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
@@ -3785,6 +3795,7 @@ class DockVault:
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "invite_token_pepper": gen_hex(32),
             "audit_fingerprint_key": gen_hex(32),
+            "audit_chain_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
@@ -5804,6 +5815,106 @@ class DockVault:
         print("  last sign-in:  %s" % (server_text(account.get("last_login")) or "never"))
         print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
 
+    def audit(self, args=None):
+        """Verify the audit log's integrity chain in the running web container, and print every finding and
+        the chain's head. Keep the head somewhere else (a ticket, a printout): a later change to the history
+        before it then shows. Exit status: 0 clean, 1 failures or warnings, 2 the check could not run."""
+        pal = self.pal
+        if args is not None and getattr(args, "audit_action", "verify") == "acknowledge":
+            return self._audit_acknowledge(args)
+        tool_args = ["verify", "--json"]
+        for flag, name in (("--from", "audit_from"), ("--to", "audit_to"), ("--anchor", "anchor")):
+            value = getattr(args, name, None) if args else None
+            if value:
+                tool_args += [flag, value]
+        ok, why = docker_available()
+        if not ok:
+            self._fail("Docker is not available: %s" % why)
+        answer = None
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.audit_integrity", *tool_args,
+                                 timeout=3600)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("could not run the audit check: %s" % type(exc).__name__)
+            answer = parse_operator_answer(getattr(r, "stdout", ""))
+            if answer is not None:
+                break
+        if answer is None:
+            self._fail("the audit check did not answer. Is the deployment running? (python dockvault.py status)")
+        if not answer.get("ok"):
+            print(pal.paint("  The audit check could not run: %s" % server_text(answer.get("error")), "red"))
+            raise SystemExit(2)
+        findings = answer.get("findings") or []
+        colour = {"failure": "red", "warning": "yellow"}
+        for f in findings:
+            where = (" (seal %s)" % f["seq"]) if f.get("seq") else ""
+            where += (" [%s]" % server_text(f.get("hour"))) if f.get("hour") else ""
+            print(pal.paint("  %-12s %s%s: %s" % (server_text(f.get("severity")).upper(), server_text(f.get("kind")),
+                                                   where, server_text(f.get("message"))),
+                            colour.get(f.get("severity"), "")))
+        if not findings:
+            print(pal.paint("  The audit log's chain verifies clean.", "green"))
+        print("  Seals: %s" % server_text(answer.get("seals")))
+        if answer.get("head"):
+            print(pal.paint("\n  Head (keep it somewhere else):", "cyan"))
+            print("  %s" % server_text(answer.get("head")))
+            print("  at %s, key %s\n" % (server_text(answer.get("head_at")), server_text(answer.get("key_id"))))
+        code = int(answer.get("exit_code") or 0)
+        if code:
+            raise SystemExit(code)
+
+    def _audit_tool(self, *tool_args):
+        """Run `python -m app.core.audit_integrity ...` in the running web container; its JSON answer."""
+        ok, why = docker_available()
+        if not ok:
+            self._fail("Docker is not available: %s" % why)
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.audit_integrity", *tool_args,
+                                 timeout=3600)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("could not run the audit tool: %s" % type(exc).__name__)
+            answer = parse_operator_answer(getattr(r, "stdout", ""))
+            if answer is not None:
+                return answer
+        self._fail("the audit tool did not answer. Is the deployment running? (python dockvault.py status)")
+
+    def _audit_acknowledge(self, args):
+        """Two steps, as every host command that writes a seal: read the chain and show what will be
+        acknowledged, ask, then write with the head that was shown, so nothing appended in between is
+        acknowledged unseen."""
+        pal = self.pal
+        seqs = (getattr(args, "seqs", None) or "").strip()
+        failures = bool(getattr(args, "failures", False))
+        if not seqs and not failures:
+            self._fail("say what to acknowledge: --seqs <seal numbers> or --failures")
+        seen = self._audit_tool("verify", "--json")
+        if not seen.get("ok") or not seen.get("head"):
+            self._fail("the chain could not be read: %s" % server_text(seen.get("error")))
+        wanted = {int(s) for s in seqs.split(",") if s.strip().isdigit()}
+        for f in seen.get("findings") or []:
+            if (f.get("seq") in wanted) or (failures and f.get("severity") == "failure"):
+                print("  %-12s %s: %s" % (server_text(f.get("severity")).upper(), server_text(f.get("kind")),
+                                          server_text(f.get("message"))))
+        print("  Head now: %s" % server_text(seen.get("head")))
+        if not getattr(args, "yes", False):
+            try:
+                answer = input(pal.paint("  Acknowledge these? Type yes: ", "cyan"))
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() != "yes":
+                print(pal.paint("  Nothing acknowledged.\n", "yellow"))
+                return
+        tool = ["acknowledge", "--expect", seen["head"]] + (["--seqs", seqs] if seqs else []) + \
+            (["--failures"] if failures else [])
+        done = self._audit_tool(*tool)
+        if not done.get("ok"):
+            self._fail(server_text(done.get("error")) or "the acknowledgment was refused")
+        print(pal.paint("  Acknowledged: seals %s; failures %s\n" % (
+            ", ".join(map(str, done.get("acknowledged") or [])) or "none",
+            ", ".join(server_text(k) for k in (done.get("failures") or [])) or "none"), "green"))
+
     def accounts(self, args=None):
         """Act on an account as the person who runs the server: reset a password or a second factor,
         or approve a change waiting for a second administrator.
@@ -6140,6 +6251,20 @@ def build_parser():
     ac.add_argument("--temporary-password", dest="temporary_password", action="store_true",
                     help="reset-password: set a temporary password instead of creating a reset link")
     ac.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    au = parsers["audit"]
+    au.add_argument("audit_action", nargs="?", default="verify", choices=("verify", "acknowledge"),
+                    help="verify (the default): check the chain and print its head; acknowledge: acknowledge "
+                         "warnings (--seqs) or failures (--failures) once you have looked at them")
+    au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
+    au.add_argument("--failures", dest="failures", action="store_true",
+                    help="acknowledge: every failure not yet acknowledged")
+    au.add_argument("--yes", dest="yes", action="store_true", help="acknowledge without asking")
+    au.add_argument("--from", dest="audit_from", help="the first hour whose rows are checked (YYYY-MM-DDTHH:00:00Z); "
+                                                      "every hour by default")
+    au.add_argument("--to", dest="audit_to", help="the hour the row check stops before")
+    au.add_argument("--anchor", dest="anchor", help="a head you kept elsewhere (dvchain1:...): the seals up to it "
+                                                    "must be the ones it names")
 
     lk = parsers["lock"]
     lk.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")

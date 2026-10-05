@@ -11,6 +11,7 @@ These run on a throwaway SQLite database.
 """
 import ast
 import inspect
+import os
 import re
 import tempfile
 import threading
@@ -31,9 +32,10 @@ set_bare_api_env()
 from app.api import api_server as api  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (ActiveSession, AuditLog, CredentialChange, ManagedSetting,  # noqa: E402
+from app.core.models import (ActiveSession, AuditLog, AuditSeal, CredentialChange, ManagedSetting,  # noqa: E402
                              ManagedSettingChange, PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert,
                              SystemSetting, User, ZkKeyProofChallenge)
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -64,7 +66,8 @@ def factory(monkeypatch):
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'retention.db'}")
         copies = sa.MetaData()
         for model in (User, ActiveSession, PendingLogin, CredentialChange, RateLimitRecord, SecurityAlert,
-                      AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting, ZkKeyProofChallenge):
+                      AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, SystemSetting,
+                      ZkKeyProofChallenge):
             # Each column as it is, without the foreign keys (the tables they name are not copied), and with
             # SQLite's spelling of "now" where Postgres's is the default.
             columns = []
@@ -123,8 +126,34 @@ def _count(factory, model, *conditions):
     return factory().query(model).filter(*conditions).count()
 
 
+_CHAIN = []
+
+
+@pytest.fixture(autouse=True)
+def chain(request, monkeypatch, tmp_path):
+    """The audit log's integrity chain on the test's database, when the test has one: the audit job deletes
+    only through it."""
+    if "factory" not in request.fixturenames:
+        yield None
+        return
+    c = Chain(monkeypatch, tmp_path, request.getfixturevalue("env"), request.getfixturevalue("factory"), NOW)
+    _CHAIN.append(c)
+    yield c
+    _CHAIN.clear()
+
+
+def _retention_days(env, days):
+    """AUDIT_LOG_RETENTION_DAYS changed in .env on a running install: the chain has started (under the
+    deployment's first values), and the next pass seals the change before it acts on it."""
+    _CHAIN[-1].seal_all(NOW)
+    env.audit_log_retention_days = days
+    _CHAIN[-1].setenv("AUDIT_LOG_RETENTION_DAYS", days)
+
+
 def _pass(factory, **kw):
     kw.setdefault("now", NOW)
+    if _CHAIN:
+        _CHAIN[-1].at(kw["now"])
     return dict(retention.run_pass(factory, **kw))
 
 
@@ -201,7 +230,7 @@ def test_the_retention_settings_are_configured_documented_and_kept_by_the_tool(m
 
 def test_the_jobs_and_which_the_hold_switch_stops():
     assert [(j.name, j.held) for j in retention.JOBS] == [
-        ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
+        ("audit_seals", False), ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
         ("credential_changes", False),
         ("rate_limit_records", False), ("security_alerts", True), ("security_records", True),
         ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True)]
@@ -270,34 +299,36 @@ def test_audit_rows_go_only_after_a_positive_retention(env, factory):
     _audit(db, OLD, n=3)
     _audit(db, NOW - timedelta(days=1))
     assert _pass(factory)["audit_logs"].deleted == 0 and _count(factory, AuditLog) == 4
-    env.audit_log_retention_days = 30
+    _retention_days(env, 30)
     assert _pass(factory)["audit_logs"].deleted == 3
     assert _count(factory, AuditLog, AuditLog.action == "file_upload") == 1
     (row,) = _pruned(factory, "audit_logs")
     assert row["deleted"] == 3
 
 
-@pytest.mark.parametrize("rows,transactions", [(5, 3), (4, 3), (1, 1), (0, 1)])
-def test_a_job_deletes_in_batches_one_transaction_each(env, factory, monkeypatch, rows, transactions):
-    env.audit_log_retention_days = 30
-    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name == "audit_logs"])
+@pytest.mark.parametrize("batch_rows,records", [(5000, [3, 1]), (2, [2, 1, 1]), (1, [2, 1, 1])])
+def test_a_job_deletes_a_day_of_hours_at_most_per_transaction(env, factory, monkeypatch, batch_rows, records):
+    """Audit rows go through the chain: each transaction deletes the rows of at most one day of sealed hours
+    (and stops adding hours once it has deleted a batch of rows; an hour is never split), with its prune seal
+    and its record."""
     db = factory()
-    _audit(db, OLD, n=rows)
-    before = len(factory.made)
-    assert _pass(factory, batch_rows=2)["audit_logs"].deleted == rows
-    # One session to read the settings, one to see the first pass after an upgrade is done, and one per
-    # batch (5 rows in twos: 2, 2, 1; 4 rows: 2, 2, then an empty one), each batch writing its own record.
-    assert len(factory.made) - before == 2 + transactions
+    _audit(db, OLD, n=2)
+    _audit(db, OLD + timedelta(hours=1))
+    _audit(db, OLD + timedelta(days=1))
+    _retention_days(env, 30)
+    assert _pass(factory, batch_rows=batch_rows)["audit_logs"].deleted == 4
     assert _count(factory, AuditLog, AuditLog.action == "file_upload") == 0
-    assert [r["deleted"] for r in _pruned(factory, "audit_logs")] == [2] * (rows // 2) + [1] * (rows % 2)
+    assert [r["deleted"] for r in _pruned(factory, "audit_logs")] == records
+    prunes = factory().query(AuditSeal).filter(AuditSeal.kind == "prune").order_by(AuditSeal.seq).all()
+    assert [len(p.detail["hours"]) for p in prunes] == ([2, 1] if batch_rows > 4 else [1, 1, 1])
 
 
 def test_every_batch_statement_is_bounded(env, factory, monkeypatch):
     seen = []
     monkeypatch.setattr(retention, "limit_statements", lambda db: seen.append(db))
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=5)
+    _retention_days(env, 30)
     _pass(factory, batch_rows=2)
     assert len(seen) >= 3
 
@@ -314,17 +345,17 @@ def test_the_statement_bound_is_set_on_postgres(monkeypatch):
 
 
 def test_a_pass_stops_when_its_time_runs_out(env, factory):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=5)
+    _retention_days(env, 30)
     assert _pass(factory, budget_seconds=0) == {}
     assert _count(factory, AuditLog) == 5
 
 
 def test_a_job_that_fails_never_stops_the_others(env, factory, monkeypatch, capsys):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=2)
+    _retention_days(env, 30)
 
     def broken(p):
         raise RuntimeError("no")
@@ -337,10 +368,11 @@ def test_a_job_that_fails_never_stops_the_others(env, factory, monkeypatch, caps
 
 def test_every_batch_commits_with_its_record_or_not_at_all(env, factory, monkeypatch, capsys):
     """A pass stopped part way leaves a record of each batch it committed, and a batch whose record cannot
-    be written deletes nothing."""
-    env.audit_log_retention_days = 30
-    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name == "audit_logs"])
-    _audit(factory(), OLD, n=5)
+    be written deletes nothing (nor writes its seal)."""
+    for day in range(3):
+        _audit(factory(), OLD + timedelta(days=day), n=2 if day < 2 else 1)
+    _retention_days(env, 30)
+    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name in ("audit_seals", "audit_logs")])
     real, calls = retention.Pass.record, []
 
     def second_fails(self, db, done, table=None):
@@ -374,12 +406,12 @@ def test_the_record_is_catalogued_as_the_servers_own():
 # --------------------------------------------------------------------------- the hold switch and what is kept
 
 def test_the_hold_switch_stops_the_log_jobs_and_not_the_working_records(env, factory):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=2)
     _alert(db, OLD, True)
     db.add(RateLimitRecord(id=uuid.uuid4(), identifier="x", action="login", window_start=OLD, attempt_count=1))
     db.commit()
+    _retention_days(env, 30)
     reg.store(db, retention.HOLD_KEY, True)             # stored by another process: the pass reads it itself
     db.commit()
     done = _pass(factory)
@@ -390,14 +422,20 @@ def test_the_hold_switch_stops_the_log_jobs_and_not_the_working_records(env, fac
     reg.store(db, retention.HOLD_KEY, None)
     db.commit()
     done = _pass(factory)
-    assert done["audit_logs"].deleted == 2 and done["security_alerts"].deleted == 1
+    # The database's hold kept more than the audit chain's state, so the pass sealed it as a veto: clearing
+    # the database's value afterwards does not release the audit rows (only an administrator's change,
+    # sealed and waited for, does); the security records, outside the chain, follow the database.
+    assert done["audit_logs"].deleted == 0 and done["security_alerts"].deleted == 1
+    vetoes = [s for s in factory().query(AuditSeal).filter(AuditSeal.kind == "policy").all()
+              if s.detail["cause"] == "database"]
+    assert len(vetoes) == 1 and vetoes[0].detail["state"]["logs_hold"]["value"] is True
 
 
 def test_rows_a_keep_rule_keeps_are_never_deleted(env, factory):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, action="settings_updated", n=2)
     _audit(db, OLD, action="file_upload", n=3)
+    _retention_days(env, 30)
     retention.register_keep("audit_logs", lambda model, now: model.action == "settings_updated")
     retention.register_keep("audit_logs", lambda model, now: None)      # keeps nothing just now
     assert _pass(factory)["audit_logs"].deleted == 3
@@ -414,17 +452,37 @@ def test_a_keep_rule_is_added_once(env):
 # --------------------------------------------------------------------------- the waiting settings changes
 
 def test_a_pass_applies_the_settings_changes_that_are_due(env, factory, monkeypatch):
+    """A change is made with its seal in the audit chain, and the pruner applies it from the chain once its
+    delay has run, while sealing ran (a pass every few hours, as on a running install)."""
+    from app.core import audit_chain_policy_seals as ps
     from app.core import setting_changes as sc
     monkeypatch.setattr(sc, "announce", lambda *a, **k: None)
     db = factory()
     alice = _user(db)
-    sc.request(db, retention.HOLD_KEY, True, actor=alice, now=NOW - timedelta(days=30))
-    db.commit()
+    chain = _CHAIN[-1]
+    chain.seal_all(NOW - timedelta(days=31))
+    engine = db.get_bind()
+
+    def change(value, at):
+        chain.at(at)
+        with ps.change_transaction(engine) as w:
+            outcome = sc.request(w.db, retention.HOLD_KEY, value, actor=alice, now=at)
+            ps.seal_request_outcome(w, outcome, alice)
+        return outcome.status
+
+    assert change(True, NOW - timedelta(days=30)) == "applied"
     reg.refresh(factory)
-    sc.request(db, retention.HOLD_KEY, False, actor=alice, now=NOW - timedelta(days=8))
-    db.commit()
+    assert change(False, NOW - timedelta(days=8)) == "pending"
     assert reg.resolve(retention.HOLD_KEY) is True
-    _pass(factory)
+    at = NOW - timedelta(days=8)
+    while at < NOW - timedelta(days=1, hours=6):
+        at += timedelta(hours=6)
+        _pass(factory, now=at)
+    reg.refresh(factory)
+    assert reg.resolve(retention.HOLD_KEY) is True          # seven days have not yet run
+    while at < NOW:
+        at += timedelta(hours=6)
+        _pass(factory, now=at)
     reg.refresh(factory)
     assert reg.resolve(retention.HOLD_KEY) is False
 

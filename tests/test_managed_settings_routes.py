@@ -28,7 +28,9 @@ from app.api import api_server as api  # noqa: E402
 from app.api import managed_settings_router as routes  # noqa: E402
 from app.core import setting_changes as sc  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import AuditLog, ManagedSetting, ManagedSettingChange, RoleEnum, User  # noqa: E402
+from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, RoleEnum,  # noqa: E402
+                             SystemSetting, User)
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -60,7 +62,7 @@ def env(monkeypatch):
 def db(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'managed.db'}")
-        for model in (User, ManagedSetting, ManagedSettingChange, AuditLog):
+        for model in (User, ManagedSetting, ManagedSettingChange, AuditLog, AuditSeal, SystemSetting):
             model.__table__.create(engine)
         factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         monkeypatch.setattr(reg, "_default_session_factory", factory)
@@ -68,6 +70,21 @@ def db(monkeypatch):
         yield session
         session.close()
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def chain(request, monkeypatch, tmp_path):
+    """The audit log's integrity chain, started on the test's database: every change writes its seal there."""
+    if "db" not in request.fixturenames:
+        yield None
+        return
+    from datetime import datetime, timezone
+    settings = request.getfixturevalue("env")
+    request.getfixturevalue("db")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    c = Chain(monkeypatch, tmp_path, settings, reg._default_session_factory, now)
+    c.seal_all()
+    yield c
 
 
 @pytest.fixture(autouse=True)

@@ -42,6 +42,9 @@ class AuditAction(NamedTuple):
     # The server writes the row on its own, with no person acting (the file-expiry sweep). Such a row
     # has no user, and the Activity page says the system did it rather than "Unknown".
     automatic: bool = False
+    # The row's username may be a name someone typed, with no account (a failed sign-in): an account's
+    # name on such a row with no account linked is expected, not an account row unlinked from its account.
+    typed_name: bool = False
 
 
 ACTIONS: Tuple[AuditAction, ...] = (
@@ -50,7 +53,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     # A row says which (ROW_LABELS); these are the labels the filters list.
     AuditAction("account_auto_locked", "sign_in", "New sign-ins paused after failed sign-ins", "warning"),
     AuditAction("account_auto_unlocked", "sign_in", "Sign-ins resumed", "info"),
-    AuditAction("login_failure", "sign_in", "Sign-in failed", "warning"),
+    AuditAction("login_failure", "sign_in", "Sign-in failed", "warning", typed_name=True),
     AuditAction("login_password_ok", "sign_in", "Password accepted, second factor pending", "info"),
     AuditAction("login_success", "sign_in", "Signed in", "info"),
     # A user said they had read the notice of what this vault records, after a change (reading, not consent).
@@ -254,6 +257,14 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("note_link_tag_deactivated", "administration", "Note-link tag deactivated", "notice"),
     AuditAction("note_link_tag_updated", "administration", "Note-link tag changed", "notice"),
     AuditAction("receiver_tag_created", "administration", "Upload-link tag created", "notice"),
+    # The audit log's integrity chain (app/core/audit_integrity.py): a check found the log or its seals
+    # changed (announced once per finding; the status itself is kept outside the database), rows that arrived
+    # in an hour already sealed were sealed late, and an acknowledgment of such warnings.
+    AuditAction("audit_integrity_failed", "security", "Audit log integrity check failed", "warning",
+                automatic=True),
+    AuditAction("audit_rows_sealed_late", "security", "Audit rows sealed late", "warning", automatic=True),
+    AuditAction("audit_integrity_acknowledged", "administration", "Audit log integrity warning acknowledged",
+                "notice"),
     # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
     AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),

@@ -486,6 +486,15 @@ class Settings(BaseSettings):
     log_prune_interval_minutes: int = Field(default=15)
     log_prune_batch_rows: int = Field(default=5000)
     retention_hold: bool = Field(default=False)
+    # The audit log's integrity chain (app/core/audit_integrity.py): every closed hour of audit rows is
+    # sealed, and the seals are chained under a key the database never holds. AUDIT_CHAIN_KEY is that key's
+    # secret (at least 32 random characters, not ENCRYPTION_KEY; setup writes one). Unset, the key is
+    # derived from ENCRYPTION_KEY, which everyone who holds ENCRYPTION_KEY can then use too. An hour is
+    # sealed AUDIT_SEAL_LAG_MINUTES after it closes (0-1440). AUDIT_CHAIN_HEAD_FILE is where the server
+    # keeps its own copy of the chain's head, outside the database, on the keys volume.
+    audit_chain_key: str = Field(default="")
+    audit_seal_lag_minutes: int = Field(default=60)
+    audit_chain_head_file: str = Field(default="/app/keys/audit-chain-head.json")
     
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
     # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old
@@ -642,6 +651,11 @@ def _validate_runtime_settings(candidate: Settings) -> None:
     weak = key_problem(candidate)
     if weak:
         raise RuntimeBootstrapError("audit-fingerprint-key-weak", weak + ".")
+
+    from app.core.audit_chain_keys import key_problem as chain_key_problem
+    weak = chain_key_problem(candidate)
+    if weak:
+        raise RuntimeBootstrapError("audit-chain-key-weak", weak + ".")
 
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
         raise RuntimeBootstrapError(

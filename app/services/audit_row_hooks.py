@@ -17,8 +17,8 @@ otherwise give the row its id only when it is flushed. A hook changes the row in
 nothing. It must not raise: build_row runs inside the transaction of the change the row records, so an
 exception here fails that change. raw_details is a copy, and the caller's own dict is never changed.
 
-In this release privacy applies the recording levels (app/core/audit_privacy.py); the other hooks leave
-the row as it is, so their columns stay NULL.
+In this release privacy applies the recording levels (app/core/audit_privacy.py) and seal_nonce gives the
+row its nonce; provenance and case leave the row as it is, so their columns stay NULL.
 """
 
 
@@ -39,4 +39,8 @@ def privacy(row, raw_details) -> None:
 
 
 def seal_nonce(row) -> None:
-    """The row's integrity-chain nonce. Not set yet: row.seal_nonce stays NULL."""
+    """The row's integrity-chain nonce: 16 random bytes (app/core/audit_integrity.py), under which the chain
+    commits to the row's personal values, so an erase that later destroys it leaves nothing that can be tested
+    against a guess of the old values."""
+    import secrets
+    row.seal_nonce = secrets.token_bytes(16)

@@ -60,3 +60,21 @@ def test_the_env_example_says_what_the_retention_setting_does():
     assert "deletes audit rows older than that many days" in comment, comment
     assert "the pruner does it on a timer (LOG_PRUNE_INTERVAL_MINUTES below)" in comment, comment
     assert "anyone with access to the database" in comment, comment
+
+
+# What the integrity chain gives, said the same way wherever it is described, and no more.
+CHAIN_CLAIM = ("tamper-evident against changes made in the database without the server's key; not against the "
+               "server's operator")
+
+
+def _flat(text):
+    return " ".join(text.replace("#", " ").split())
+
+
+def test_the_integrity_chain_is_described_as_what_it_is():
+    from app.api.audit_integrity_router import CLAIM
+    assert _flat(CLAIM).lower() == (CHAIN_CLAIM + ".").lower()
+    example = _flat((ROOT / ".env.example").read_text(encoding="utf-8"))
+    assert CHAIN_CLAIM + ", who holds the key" in example
+    module = _flat((ROOT / "app" / "core" / "audit_integrity.py").read_text(encoding="utf-8"))
+    assert "It is " + CHAIN_CLAIM + ", who holds the key." in module

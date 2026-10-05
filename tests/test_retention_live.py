@@ -3,11 +3,12 @@ app/core/setting_changes.py, app/api/managed_settings_router.py).
 
 Changing a managed setting asks for the password every time. Turning the hold switch on applies at once;
 turning it off deletes sooner, so it waits, every administrator is told, and any administrator can cancel
-it; a pass of the pruner applies it once it is due. A pass deletes old resolved alerts and the sign-in
-throttle's old fallback rows and writes a retention_pruned row for each job that deleted something; the
-hold switch stops the jobs over logs and security records and not the working-record jobs; and while
-another runner holds the pruner's lock, a pass does nothing. test_retention.py and test_setting_changes.py
-cover the rules offline.
+it. Each change and each cancel is sealed in the audit log's integrity chain in its own transaction, and a
+waiting change applies only from its seal: its time edited in the database changes nothing (the offline tests
+apply one once its delay has run). A pass deletes old resolved alerts and the sign-in throttle's old fallback
+rows and writes a retention_pruned row for each job that deleted something; the hold switch stops the jobs
+over logs and security records and not the working-record jobs; and while another runner holds the pruner's
+lock, a pass does nothing. test_retention.py and test_setting_changes.py cover the rules offline.
 """
 import json
 import subprocess
@@ -57,6 +58,15 @@ def _clear(key):
          f"WHERE key = '{key}' AND status = 'pending'")
     psql(f"UPDATE managed_settings SET value = NULL, version = (SELECT max(version) + 1 FROM managed_settings) "
          f"WHERE key = '{key}'")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def chain_started():
+    """The web process's pruner starts the audit chain a minute after the server starts; a change that
+    deletes sooner is refused until it has."""
+    ok = _wait_for(lambda: psql("SELECT count(*) FROM audit_seals WHERE kind = 'policy'") not in ("", "0"),
+                   timeout=240, step=3)
+    assert ok, "the audit chain never started"
 
 
 def _run_pass():
@@ -135,19 +145,19 @@ def test_the_hold_goes_on_at_once_and_off_only_after_the_wait_unless_cancelled(a
         _clear("logs_hold")
 
 
-def test_a_pass_applies_a_waiting_change_once_it_is_due(admin):
+def test_a_waiting_change_is_sealed_and_its_time_edited_in_the_database_changes_nothing(admin):
     try:
         with second_admin(admin) as (account, client):
             assert _put(client, account["_password"], "logs_hold", True).status_code == 200
             change = _put(client, account["_password"], "logs_hold", False).json()["change"]
+        sealed = json.loads(psql("SELECT detail::text FROM audit_seals WHERE kind = 'request' "
+                                 f"AND detail->>'request' = '{change['id']}'"))
+        assert (sealed["setting"], sealed["old"], sealed["new"], sealed["by"]) == ("logs_hold", True, False, "admin")
         psql(f"UPDATE managed_setting_changes SET effective_at = now() - interval '1 minute' "
              f"WHERE id = '{change['id']}'")
         _run_pass()
-        assert psql(f"SELECT status FROM managed_setting_changes WHERE id = '{change['id']}'") == "applied"
-        assert _wait_for(lambda: _row(admin, "logs_hold")["value"] is False)
-        details = json.loads(psql("SELECT details FROM audit_logs WHERE action = 'setting_change_applied' "
-                                  "ORDER BY timestamp DESC LIMIT 1"))
-        assert (details["change_id"], details["old"], details["new"]) == (change["id"], True, False)
+        assert psql(f"SELECT status FROM managed_setting_changes WHERE id = '{change['id']}'") == "pending"
+        assert _row(admin, "logs_hold")["value"] is True
     finally:
         _clear("logs_hold")
 

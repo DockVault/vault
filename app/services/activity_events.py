@@ -560,13 +560,22 @@ def _cell(value):
     return formula_safe(str(value))
 
 
-def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP):
+_HEAD_NOW = object()
+
+
+def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP, head=_HEAD_NOW):
     """The export, a line at a time. `fetch_batch(after)` returns (row_views, next_cursor) for the rows
-    after the cursor (None: from the newest). Stops at `cap` rows; when more matched, the last line says
-    how many were left out."""
+    after the cursor (None: from the newest). Stops at `cap` rows; when more matched, a line says how many
+    were left out. The last line carries the audit chain's head as it stood when the export started
+    (app/core/audit_integrity.py): an anchor for checking the log later; the export itself is not
+    verifiable, since it carries no nonces. No head yet, no line."""
     import csv
     import io
     import json
+
+    if head is _HEAD_NOW:
+        from app.core import audit_integrity
+        head = audit_integrity.head_for_export()
 
     def csv_line(cells):
         buf = io.StringIO()
@@ -592,3 +601,8 @@ def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP):
             yield csv_line(["# " + note])
         else:
             yield json.dumps({"truncated": True, "exported": sent, "total": total, "message": note}) + "\n"
+    if head:
+        if fmt == "csv":
+            yield csv_line([f"# Audit chain head when this export started: {head}"])
+        else:
+            yield json.dumps({"audit_chain_head": head}) + "\n"

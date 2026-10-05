@@ -250,22 +250,52 @@ def _delay() -> timedelta:
     return setting_changes.delay()
 
 
+def chain_numbers() -> Optional[tuple]:
+    """(numbers, delay, hold) as the audit chain's honoured state gives them, or None when the chain cannot
+    give them yet (no chain, or sealing stopped): then the audit job deletes nothing."""
+    from app.core import audit_chain_policy_seals as ps
+    from app.core.audit_chain_policy import DELAY_ENTRY
+    from app.core.retention import HOLD_KEY
+    values = ps.numbers()
+    if values is None:
+        return None
+    try:
+        numbers = Numbers(int(values[MAX_DAYS]), int(values[MIN_DAYS]), int(values[ADMIN_MIN_DAYS]),
+                          int(values[MAX_MB]))
+        return numbers, timedelta(days=int(values[DELAY_ENTRY])), bool(values.get(HOLD_KEY))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def prune(p, numbers: Optional[Numbers] = None):
-    """The pruner's audit job: rows older than the maximum, then the oldest the size cap allows no room for."""
-    from app.core import retention
+    """The pruner's audit job: rows older than the maximum, then the oldest the size cap allows no room for.
+    Both act on the audit chain's state, never on the database's values alone, and delete through ``prune``
+    seals (app/core/audit_chain_prune.py), so a deletion keeps the chain valid. ``numbers`` replaces the
+    chain's numbers (a test's); the chain must still be running."""
+    from app.core import audit_chain_prune, retention
     from app.core.models import AuditLog
-    numbers = numbers or current()
     result = retention.JobResult()
+    chain = chain_numbers()
+    if chain is None:
+        registry._say("The pruner's audit_logs job waits for the audit chain")
+        return result
+    chain_values, delay, hold = chain
+    if hold:
+        return result
+    numbers = numbers or chain_values
     aged = by_age(AuditLog, p.now, numbers)
     if aged:
-        done = p.delete_in_batches(AuditLog, retention.deletable(AuditLog, p.now, *aged), AuditLog.timestamp)
+        done = audit_chain_prune.prune(p, retention.deletable(AuditLog, p.now, *aged), reason="retention")
         result.add(done.deleted, done.oldest, done.newest)
     if numbers.max_mb and p.time_left():
         with p.transaction() as db:
-            plan = size_plan(db, AuditLog, p.now, numbers, _delay())
+            plan = size_plan(db, AuditLog, p.now, numbers, delay)
         sized = by_size(AuditLog, p.now, numbers, plan)
         if sized:
-            done = p.delete_in_batches(AuditLog, retention.deletable(AuditLog, p.now, *sized), AuditLog.timestamp)
+            size = {"cap": numbers.max_mb * MB, "delay": delay.days,
+                    "from": (p.now - delay).isoformat() + "Z", "counted": plan.counted_bytes, "held_back": []}
+            done = audit_chain_prune.prune(p, retention.deletable(AuditLog, p.now, *sized), reason="size-cap",
+                                           size=size)
             result.add(done.deleted, done.oldest, done.newest)
         if not plan.met:
             warn_cap_unmet(numbers, plan, p.now)

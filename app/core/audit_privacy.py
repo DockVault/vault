@@ -165,6 +165,9 @@ _IDENTIFIER_KEYS = (
     "at_promotion", "added_by_left_because", "link_made_by_other", "locked", "was_locked",
     # a zero-knowledge key change: the operation, and how it was proved ("key" or "absent"), never the proof
     "op", "proof",
+    # the audit log's integrity chain: the kinds of what a check found and what it says (seal numbers, hours,
+    # row ids and counts, never a row's values), and the seals an acknowledgment names
+    "kinds", "messages", "seq", "hour", "acknowledges", "failures",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

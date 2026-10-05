@@ -1,0 +1,141 @@
+"""Deleting sealed audit rows without breaking the chain: a ``prune`` seal per day of hours changed.
+
+The pruner deletes audit rows one sealed hour at a time, and at most one UTC day per transaction. Each
+transaction, under the chain lock:
+
+1. verifies each hour first: its rows (with the nonces its salt gives, and an erase's earlier commitments)
+   must give the roots of the hour's newest root seal in the verified view; an hour that does not is left
+   as it is, and the failure is reported, so a prune never seals over a tamper or destroys its evidence;
+2. writes the derived nonces of rows written without one into their rows and deletes the hour's salt, which
+   changes no leaf;
+3. deletes the rows and writes the ``prune`` seal with each changed hour's new count, bytes, roots and ids,
+   naming the ``policy`` seal in force, together with the ``retention_pruned`` audit row.
+
+Only sealed hours are pruned: rows in hours not yet sealed (the first start's backlog, the current hour) wait.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from sqlalchemy import and_, func
+
+from app.core import audit_chain_format as fmt
+
+
+def _ai():
+    from app.core import audit_integrity
+    return audit_integrity
+
+
+def _hours_matching(db, conditions, before: datetime, limit: int) -> List[datetime]:
+    from app.core.audit_retention import _hour, _as_time
+    from app.core.models import AuditLog as A
+    dialect = db.get_bind().dialect.name
+    hour = _hour(A, dialect)
+    rows = (db.query(hour).filter(*conditions, A.timestamp < before).group_by(hour).order_by(hour)
+            .limit(limit).all())
+    return [_as_time(r[0]) for r in rows]
+
+
+class HourNotVerified(Exception):
+    pass
+
+
+def _verify_hour(w, hour: datetime):
+    """(the hour's root entry, its working row, its salt, the erase commitments) once its rows check out."""
+    ai = _ai()
+    view = w.st.view
+    entry = view.entry_for(hour)
+    own = view.hours.get(hour)
+    root = own.root if own is not None else entry.roots[0]
+    wr = ai.working_row(w.db, hour)
+    salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
+    c_prev = ai.erase_c_prev(w.db, view, own) if own is not None and own.erases else {}
+    rows = list(ai.iter_rows(w.db, hour, hour + ai.HOUR))
+    fig = ai.hour_figures(rows, salt, c_prev)
+    if (fig.count, fig.root_s, fig.root_c, fig.ids_digest) != (root.count, root.root_s, root.root_c,
+                                                               root.ids_digest) or fig.missing_nonce:
+        raise HourNotVerified(fmt.hour_text(hour))
+    return root, wr, salt, c_prev, rows
+
+
+def _materialise(w, rows, salt: Optional[bytes], wr) -> None:
+    """Write each nonce-less row's derived nonce into the row, then delete the hour's salt."""
+    from app.core.models import AuditLog as A
+    if salt is None:
+        return
+    for row in rows:
+        if row.get("seal_nonce") is None:
+            w.db.query(A).filter(A.id == row["id"]).update({A.seal_nonce: fmt.legacy_nonce(salt, row["id"])},
+                                                          synchronize_session=False)
+    if wr is not None:
+        wr.legacy_salt = None
+
+
+def prune(p, conditions, *, reason: str, size: Optional[dict] = None):
+    """Delete the audit rows meeting ``conditions`` in sealed hours, oldest first, one day of hours per
+    ``prune`` seal and transaction, while the pass has time. Returns a retention.JobResult."""
+    from app.core import retention
+    from app.core.models import AuditLog as A
+    ai = _ai()
+    st = ai.state()
+    result = retention.JobResult()
+    engine = ai._engine_of(p.session_factory)
+    failures: Dict[str, str] = {}
+    skipped: set = set()
+    while p.time_left():
+        with ai.ChainWriter(engine, st) as w:
+            view = w.st.view
+            newest = view.newest_policy()
+            if newest is None or view.newest_hour_end is None:
+                break
+            hours = [h for h in _hours_matching(w.db, conditions, view.newest_hour_end, 200) if h not in skipped]
+            if not hours:
+                break
+            day = hours[0].date()
+            entries = []
+            batch = retention.JobResult()
+            for hour in hours:
+                if hour.date() != day or batch.deleted >= p.batch_rows:
+                    break
+                if view.entry_for(hour) is None:
+                    skipped.add(hour)
+                    continue
+                try:
+                    root, wr, salt, c_prev, rows = _verify_hour(w, hour)
+                except HourNotVerified:
+                    skipped.add(hour)
+                    failures["rows-altered"] = f"the rows of {fmt.hour_text(hour)} no longer give its seal; it was " \
+                                               "not pruned"
+                    continue
+                gone = [r[0] for r in w.db.query(A.id, A.timestamp).filter(
+                    *conditions, A.timestamp >= hour, A.timestamp < hour + ai.HOUR).all()]
+                if not gone:
+                    skipped.add(hour)
+                    continue
+                _materialise(w, rows, salt, wr)
+                times = [r["timestamp"] for r in rows if r["id"] in set(gone)]
+                w.db.query(A).filter(A.id.in_(gone)).delete(synchronize_session=False)
+                w.db.flush()
+                kept = [r for r in ai.iter_rows(w.db, hour, hour + ai.HOUR)]
+                fig = ai.hour_figures(kept, None, c_prev)
+                if wr is not None:
+                    wr.row_ids = fig.ids
+                entries.append([fmt.hour_text(hour), root.seq, fig.count, fig.bytes, fig.root_s.hex(),
+                                fig.root_c.hex(), fig.ids_digest.hex()])
+                batch.add(len(gone), min(times) if times else None, max(times) if times else None)
+            if not entries:
+                w.db.rollback()
+                if all(h in skipped for h in hours):
+                    continue
+                break
+            detail = {"reason": reason, "policy_seq": newest[0], "request_seq": None, "hours": entries}
+            if size is not None:
+                detail["size"] = size
+            p.record(w.db, batch, A.__tablename__)
+            w.append("prune", detail=detail)
+        result.add(batch.deleted, batch.oldest, batch.newest)
+    if failures:
+        ai.report_failures(st, p.session_factory, failures)
+    return result
