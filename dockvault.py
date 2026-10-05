@@ -270,6 +270,26 @@ RETENTION_ENV_KEYS = (
     ("audit_max_user_agent", "AUDIT_MAX_USER_AGENT", "full"),
 )
 
+# The boundary of compliance access and legal holds, set only in .env (see .env.example), as (config key, .env
+# name, the app's default): written only when they differ from the default, and kept across a fresh volume set.
+COMPLIANCE_ENV_KEYS = (
+    ("compliance_access", "COMPLIANCE_ACCESS", "enabled"),
+    ("compliance_password_vaults", "COMPLIANCE_PASSWORD_VAULTS", "with_password"),
+    ("compliance_export", "COMPLIANCE_EXPORT", "allowed"),
+    ("compliance_max_access_days", "COMPLIANCE_MAX_ACCESS_DAYS", "30"),
+    ("compliance_max_total_days", "COMPLIANCE_MAX_TOTAL_DAYS", "90"),
+    ("compliance_max_case_vaults", "COMPLIANCE_MAX_CASE_VAULTS", "25"),
+    ("compliance_export_ttl_hours", "COMPLIANCE_EXPORT_TTL_HOURS", "24"),
+    ("compliance_hold_confirm_days", "COMPLIANCE_HOLD_CONFIRM_DAYS", "7"),
+    ("compliance_hold_purge_delay_days", "COMPLIANCE_HOLD_PURGE_DELAY_DAYS", "7"),
+    ("compliance_hold_review_days", "COMPLIANCE_HOLD_REVIEW_DAYS", "180"),
+    ("compliance_view_rate", "COMPLIANCE_VIEW_RATE", "600"),
+    ("compliance_reveals_per_day", "COMPLIANCE_REVEALS_PER_DAY", "100"),
+    ("compliance_auditor_not_admin", "COMPLIANCE_AUDITOR_NOT_ADMIN", "false"),
+    ("compliance_auditor_grant_days", "COMPLIANCE_AUDITOR_GRANT_DAYS", "365"),
+    ("compliance_record_min_days", "COMPLIANCE_RECORD_MIN_DAYS", "2190"),
+)
+
 # What the audit log may record of personal data at most: setup offers three presets for the AUDIT_MAX_* limits
 # (see .env.example). The panel then chooses the levels at or below them. "full" is the app's default (nothing is
 # written); with --lock-recording-levels each limit is also the level (SETTINGS_LOCKED_KEYS gains audit_levels).
@@ -565,6 +585,10 @@ def build_env_lines(cfg):
     # The limits on how long records are kept (see .env.example). Written only when they differ from the
     # app's defaults, so an install that never mentions them authors the .env it always did.
     for _cfg_key, _env_name, _default in RETENTION_ENV_KEYS:
+        if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
+            bare(_env_name, str(cfg[_cfg_key]).strip())
+    # The boundary of compliance access and legal holds (see .env.example), by the same rule.
+    for _cfg_key, _env_name, _default in COMPLIANCE_ENV_KEYS:
         if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
             bare(_env_name, str(cfg[_cfg_key]).strip())
     # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
@@ -1347,6 +1371,9 @@ def new_set_config(current_env, new_prefix, new_id):
         # And its limits on how long records are kept.
         **{cfg_key: (current_env.get(env_name) or "").strip() or None
            for cfg_key, env_name, _default in RETENTION_ENV_KEYS},
+        # And the boundary of compliance access and legal holds.
+        **{cfg_key: (current_env.get(env_name) or "").strip() or None
+           for cfg_key, env_name, _default in COMPLIANCE_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
         # A new set is new data: its audit fingerprints get a key of their own.
         "audit_fingerprint_key": gen_hex(32),
