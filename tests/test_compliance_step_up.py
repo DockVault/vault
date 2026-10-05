@@ -143,6 +143,74 @@ def test_the_router_guards_each_and_the_boot_contract_holds():
     api._assert_step_up_boot_contract()
 
 
+# The boot contract sees a check as soon as the router makes it, so it holds before any route calls one. This
+# pin is the other half: each check is called in the body of a route. The steps whose routes are not written
+# yet are listed here; writing one fails this test until its step leaves the list, and the list is empty when
+# compliance access is complete.
+ROUTES_TO_COME = {"compliance.grant.propose", "compliance.grant.approve", "compliance.grant.reconfirm",
+                  "compliance.case.request", "compliance.case.approve", "compliance.case.export",
+                  "compliance.hold.place", "compliance.hold.decide"}
+ROUTE_METHODS = {"get", "post", "put", "patch", "delete"}
+
+
+def _routes_calling(source: str, check_names) -> dict:
+    """{check name: the route handlers whose own body calls it}. A route handler is a function decorated with
+    ``<router>.get/post/put/patch/delete(...)``; a call is ``NAME(...)`` or ``<module>.NAME(...)``."""
+    found = {name: set() for name in check_names}
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any(isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in ROUTE_METHODS
+                   for d in node.decorator_list):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
+            if name in found:
+                found[name].add(node.name)
+    return found
+
+
+def test_the_route_scan_finds_a_call_in_a_route_body_and_nothing_else():
+    source = (
+        "@router.post('/x')\n"
+        "def route_a(request, db, current_user):\n"
+        "    STEP_UP_CASE_REQUEST(db, current_user, request)\n"
+        "@router.put('/y')\n"
+        "async def route_b(request, db, current_user):\n"
+        "    compliance_router.STEP_UP_HOLD_PLACE(db, current_user, request)\n"
+        "def helper(db, user, request):\n"
+        "    STEP_UP_CASE_EXPORT(db, user, request)\n"
+        "@some_decorator\n"
+        "def not_a_route(db, user, request):\n"
+        "    STEP_UP_HOLD_DECIDE(db, user, request)\n"
+        "@router.get('/z')\n"
+        "def route_c():\n"
+        "    return STEP_UP_CASE_APPROVE\n")
+    found = _routes_calling(source, ("STEP_UP_CASE_REQUEST", "STEP_UP_HOLD_PLACE", "STEP_UP_CASE_EXPORT",
+                                     "STEP_UP_HOLD_DECIDE", "STEP_UP_CASE_APPROVE"))
+    assert found == {"STEP_UP_CASE_REQUEST": {"route_a"}, "STEP_UP_HOLD_PLACE": {"route_b"},
+                     "STEP_UP_CASE_EXPORT": set(), "STEP_UP_HOLD_DECIDE": set(), "STEP_UP_CASE_APPROVE": set()}
+
+
+def test_each_compliance_check_is_called_by_a_route_once_its_routes_are_written():
+    names = {name: value.action for name, value in vars(compliance_router).items()
+             if callable(value) and getattr(value, "action", None) in KEYS}
+    assert sorted(names.values()) == sorted(KEYS)
+    assert ROUTES_TO_COME <= set(KEYS)
+    called = {key: set() for key in KEYS}
+    for path in sorted((ROOT / "app").rglob("*.py")):
+        for name, handlers in _routes_calling(path.read_text(encoding="utf-8"), names).items():
+            called[names[name]] |= {f"{path.name}:{h}" for h in handlers}
+    for key in KEYS:
+        if key in ROUTES_TO_COME:
+            assert not called[key], f"{key} is called by {sorted(called[key])}: take it off ROUTES_TO_COME"
+        else:
+            assert called[key], f"no route calls the check of {key}"
+
+
 @pytest.mark.parametrize("action", ["admin.retention.write", "admin.audit_privacy.write", acts.OWNER_KEY_RESET,
                                     "admin.settings.write", "compliance.case.nothing"])
 def test_only_a_compliance_action_gets_the_compliance_check(action):
