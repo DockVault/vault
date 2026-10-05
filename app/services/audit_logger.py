@@ -6,7 +6,6 @@ import copy
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 import logging
-import time
 import uuid
 import json
 
@@ -18,19 +17,84 @@ from app.services import audit_row_hooks
 
 logger = logging.getLogger(__name__)
 
-# Process-wide throttle for opportunistic audit-log pruning (see
-# AuditLogger.cleanup_old_audit_logs): run at most once per hour per process. None = never
-# run yet, so the first eligible cleanup always runs.
-_last_audit_cleanup_at = None
-
 # At-rest privacy: these keys hold plaintext names that are ENCRYPTED in the files/folders/vaults
-# tables (and, for a zero-knowledge vault, the residual plaintext label), so they must never be
-# persisted in an audit row's `details` JSON. log_action() strips them on every write, and the boot
-# migration app/core/audit_migrations.py purges them from legacy rows -- both read THIS ONE list, so
-# adding a key here covers both surfaces at once. A row that must commit with the caller's own
-# transaction is built with AuditLogger.build_row, which strips them too; nothing else constructs an
-# AuditLog (tests/test_audit_route_coverage.py holds that).
-REDACTED_NAME_KEYS = ("file_name", "folder_name", "old_name", "new_name", "vault_name")
+# tables (and, for a zero-knowledge vault, the residual plaintext label), so their plaintext is never
+# persisted in an audit row's `details` JSON. The recording levels decide every row's details as it is
+# written (app/core/audit_privacy.py, through build_row's privacy hook, which nothing else bypasses:
+# tests/test_audit_route_coverage.py holds that nothing else constructs an AuditLog), and the boot
+# migration app/core/audit_migrations.py purges them from legacy rows. Both read the names' kind from
+# audit_privacy.DETAIL_KEYS, so this list is the same one.
+from app.core.audit_privacy import DETAIL_KEYS as _DETAIL_KEYS, NAME as _NAME_KIND  # noqa: E402
+REDACTED_NAME_KEYS = tuple(sorted(k for k, kind in _DETAIL_KEYS.items() if kind == _NAME_KIND and "." not in k))
+
+
+def _request_address():
+    """The address the middleware resolved for this request, or None outside one."""
+    from app.core.net_utils import current_client_ip
+    return current_client_ip()
+
+
+# Both sign-in doors take a name that starts with this as a temporary credential's, whatever the sign-in
+# method (/auth/login in app/api/api_server.py, check_auth_password in app/sftp/sftp_server.py).
+TEMP_CREDENTIAL_PREFIX = "temp_"
+LOGIN_IDENTIFIERS = ("username", "email", "either")
+
+
+def account_named(db, typed, login_identifier: str = "username") -> Optional[User]:
+    """The account a name typed at a failed sign-in names, or None: the account that sign-in tried, as
+    AuthService.authenticate_user resolves the name under ``login_identifier`` (the web's sign-in method; SFTP
+    always signs in by username). By username, the account with that username; by email, the one account with
+    that address (two accounts sharing it name neither); either way, the username first, then the address. A
+    name that starts with temp_ is a temporary credential's at both doors (credential_named), never an account's.
+    One query whether or not one matches, so the failure's write takes no longer for a name that is an account
+    than for one that is not. Never raises: a failed lookup leaves the name a typed one (_looked_up)."""
+    if not isinstance(typed, str) or not typed or typed.startswith(TEMP_CREDENTIAL_PREFIX):
+        return None
+    if login_identifier not in LOGIN_IDENTIFIERS:
+        login_identifier = "username"      # as authenticate_user takes an unknown method
+    from sqlalchemy import case, func, or_
+    from app.core.email_identity import normalize_email
+    by_username = login_identifier != "email"
+    match = [User.username == typed] if by_username else []
+    address = normalize_email(typed) if login_identifier != "username" else None
+    if address:
+        match.append(func.lower(User.email) == func.lower(address))
+    if not match:
+        return None
+    rows = _looked_up(db, lambda: db.query(User).filter(or_(*match))
+                      .order_by(case((User.username == typed, 0), else_=1)).limit(3).all())
+    if rows is None:
+        return None
+    if by_username:
+        by_name = [u for u in rows if u.username == typed]
+        if by_name:
+            return by_name[0]
+    return rows[0] if len(rows) == 1 else None
+
+
+def credential_named(db, typed):
+    """The temporary credential a name typed at a failed sign-in names, or None: (id, owner's account id, name)
+    of the credential with exactly that name, as both doors look one up, live or not. One query. Never raises:
+    a failed lookup leaves the name a typed one (_looked_up)."""
+    if not isinstance(typed, str) or not typed.startswith(TEMP_CREDENTIAL_PREFIX):
+        return None
+    from app.core.models import TemporaryCredential
+    return _looked_up(db, lambda: db.query(TemporaryCredential.id, TemporaryCredential.user_id,
+                                           TemporaryCredential.temp_username)
+                      .filter(TemporaryCredential.temp_username == typed).first())
+
+
+def _looked_up(db, query):
+    """What ``query()`` returns, run under a savepoint of the session's transaction; None when it fails. On
+    PostgreSQL a statement that fails aborts the transaction it runs in, so without the savepoint a lookup
+    that fails (waiting past the lock timeout behind a change to its table, or a transient error) would cost
+    the failure's audit row, written next in the same transaction, and the caller its answer. Rolled back to
+    the savepoint, the transaction goes on and the name is recorded as a typed one."""
+    try:
+        with db.begin_nested():
+            return query()
+    except Exception:  # noqa: BLE001 -- the row is still written, as a typed name
+        return None
 
 
 class AuditLogger:
@@ -105,6 +169,8 @@ class AuditLogger:
         error_message: Optional[str] = None,
         channel: Optional[str] = None,
         timestamp: Optional[datetime] = None,
+        names_account: bool = False,
+        temp_credential=None,
     ) -> AuditLog:
         """The row log_action writes for these arguments, neither added to a session nor committed.
 
@@ -112,14 +178,20 @@ class AuditLogger:
         (an automatic account lock, the file-expiry sweep): it adds the row to its own session, so
         its commit writes both and its rollback drops both. log_action cannot give that, because it
         commits on its own. log_action is this method plus the add and the commit, so a row built
-        here gets everything log_action applies: the name redaction, the acting user's name and
+        here gets everything log_action applies: the recording levels, the acting user's name and
         temporary credential, and the request's channel, method, route, user agent and address
         where they are known.
 
-        ``timestamp`` is the row's time, now by default, which is what log_action stores.
+        ``timestamp`` is the row's time, now by default, which is what log_action stores. ``names_account``
+        says that ``username``, given without a user, is an account's username or a temporary credential's
+        name rather than a name someone typed, so the level of typed names does not apply to it (a failed
+        sign-in for an account or a credential). ``temp_credential``, given without a user, is the (id, name)
+        of the temporary credential the row is about (a failed sign-in with its name).
         """
         temp_credential_id = None
         temp_credential_name = None
+        if temp_credential is not None and not user:
+            temp_credential_id, temp_credential_name = temp_credential
         if user:
             user_id = user.id
             username = user.username
@@ -136,26 +208,14 @@ class AuditLogger:
             except Exception:  # noqa: BLE001 -- a missing name never stops the row
                 username = None
 
-        # What the caller passed, before anything is taken out, for the privacy hook below. A deep copy, so a
-        # hook cannot change the caller's dict or a value inside it, which the row's details share. Details
-        # are JSON values (the column stores nothing else), so they always copy.
+        # What the caller passed, for the privacy hook below, which decides what the row's details keep
+        # (app/core/audit_privacy.py: names, addresses and email addresses at their recording levels,
+        # secrets never, an unclassified key never). A deep copy, so a hook cannot change the caller's dict
+        # or a value inside it: a caller may also use its dict for a live broadcast that keeps the name.
+        # Details are JSON values (the column stores nothing else), so they always copy. The row itself is
+        # built without details: only the hook gives it any.
         raw_details = copy.deepcopy(details) if isinstance(details, dict) else details
-
-        # At-rest privacy: file/folder names are encrypted in the files/folders tables,
-        # so we must not persist their plaintext in the audit details JSON (that would
-        # leave the very names one table over, recoverable from a DB/backup read).
-        # resource_id still identifies the affected file/folder by UUID. Redact on a COPY
-        # so a details dict the caller also uses for a transient SSE broadcast is untouched.
-        if isinstance(details, dict):
-            # old_name/new_name are the rename before/after names — just as sensitive as file_name,
-            # so redact them too (they otherwise persist in cleartext for Standard-vault renames).
-            # vault_name is redacted for the same reason: resource_id already identifies the vault by
-            # UUID, and for a zero-knowledge vault the name is the residual plaintext label. The
-            # transient SSE/monitor broadcast keeps the name because this redacts a COPY (below).
-            # The key set is the module-level REDACTED_NAME_KEYS so the boot purge migration stays in
-            # lockstep with what is redacted on write.
-            if any(k in details for k in REDACTED_NAME_KEYS):
-                details = {k: v for k, v in details.items() if k not in REDACTED_NAME_KEYS}
+        details = None
 
         # Where the request came from and what it was, when the caller did not say: the request
         # context (a web request) or the process default (the SFTP server).
@@ -195,6 +255,8 @@ class AuditLogger:
             details=details,
             error_message=error_message
         )
+        if names_account:
+            audit_log._names_account = True
         # Then what other modules decide about the row, in this order (app/services/audit_row_hooks.py).
         audit_row_hooks.provenance(audit_log)
         audit_row_hooks.case(audit_log)
@@ -251,17 +313,84 @@ class AuditLogger:
         self,
         username: str,
         ip_address: str,
-        reason: str
+        reason: str,
+        *,
+        account: Optional[User] = None,
+        login_identifier: str = "username",
     ):
-        """Log failed login attempt."""
-        self.log_action(
+        """Log failed login attempt, and its security record in the same commit (the name and address in
+        full, whatever the audit row keeps: app/core/security_records.py). Returns the record's id, or None
+        when the record could not be written: the audit row is written all the same (_add_security_record).
+
+        A name that is an account's (``account``, or the account the sign-in tried under ``login_identifier``,
+        the sign-in method in force: account_named) is recorded as that account's username, as every account's
+        is, whatever the level of typed names. A temporary credential's name (credential_named) is recorded in
+        full with the credential, as its successful sign-ins are. Only a name that is neither follows that
+        level."""
+        from app.core import security_records
+        credential = None
+        if account is None:
+            credential = credential_named(self.db, username)
+            if credential is None:
+                account = account_named(self.db, username, login_identifier)
+        if account is not None:
+            recorded_name = account.username
+        elif credential is not None:
+            recorded_name = credential.temp_username
+        else:
+            recorded_name = username
+        row = self.build_row(
             action="login_failure",
             status="failure",
-            username=username,
+            username=recorded_name,
             ip_address=ip_address,
             details={'reason': reason},
-            error_message=reason
+            error_message=reason,
+            names_account=account is not None or credential is not None,
+            temp_credential=(credential.id, credential.temp_username) if credential is not None else None,
         )
+        record_id = self._add_security_record(
+            row, kind=security_records.LOGIN, name=username, address=ip_address or _request_address(),
+            reason=reason, account_id=credential.user_id if credential is not None else None)
+        self.db.commit()
+        return record_id
+
+    def log_second_factor_failure(self, user: User, ip_address: Optional[str] = None,
+                                  details: Optional[Dict[str, Any]] = None):
+        """Log a rejected second-factor code, and its security record in the same commit (the audit row is
+        written even when the record cannot be: _add_security_record)."""
+        from app.core import security_records
+        row = self.build_row(action="second_factor_failed", status="failed", user=user, ip_address=ip_address,
+                             details=details)
+        method = (details or {}).get("method")
+        self._add_security_record(
+            row, kind=security_records.SECOND_FACTOR, name=user.username, account_id=user.id,
+            address=ip_address or _request_address(),
+            reason=f"second factor ({method})" if method else "second factor")
+        self.db.commit()
+
+    def _add_security_record(self, row: AuditLog, **fields):
+        """Add the audit row ``row`` of a failure to the session, then the failure's security record under a
+        savepoint of the same transaction, and return the record's id; None when the record cannot be
+        written. The audit row is written first, outside the savepoint, so a record that fails (a fault in
+        its one table) is rolled back alone and never costs the audit row, or the caller its answer. Such a
+        failure raises a degraded-recording alert for the administrators instead (the error's type and the
+        row's action; no value of the failure). An audit row that cannot be written still raises, and then
+        no record is written either."""
+        from app.core import audit_privacy, security_records
+        self.db.add(row)
+        self.db.flush()
+        try:
+            with self.db.begin_nested():
+                record = security_records.record(self.db, channel=row.channel, **fields)
+            return record.id
+        except Exception as exc:  # noqa: BLE001 -- the audit row stays; the alert says what is missing
+            audit_privacy.raise_alert(audit_privacy.RECORD_NOT_WRITTEN, type(exc).__name__, row.action)
+            # The error's type only: on PostgreSQL its text can carry the whole failing row, the name as
+            # typed (which can be a password) and the address with it.
+            logger.warning("A %s security record could not be written (%s); its audit row was kept",
+                           row.action, type(exc).__name__)
+            return None
     
     def log_logout(self, user: User, ip_address: str):
         """Log logout."""
@@ -613,39 +742,3 @@ class AuditLogger:
             error_message=error_message,
             details=details
         )
-
-    def cleanup_old_audit_logs(self, days: Optional[int] = None) -> int:
-        """Opportunistically prune audit_logs older than the retention window.
-
-        Retention is OPT-IN: a window of 0 or negative -- the default -- keeps every audit row. A
-        deleted record of what happened cannot be brought back, so deleting them is left to the
-        operator. When a positive window is configured (settings.audit_log_retention_days), rows older
-        than it are deleted. Process-wide throttled to at most once per hour, so it can be wired into
-        a frequently-hit admin read path without issuing a DELETE per request. Returns the rows
-        deleted (0 when disabled or throttled).
-        """
-        global _last_audit_cleanup_at
-
-        if days is None:
-            days = getattr(settings, 'audit_log_retention_days', 0)
-        # Disabled (the default): keep everything. Checked BEFORE the throttle so that enabling
-        # retention later takes effect on the next read instead of waiting out a throttle window that
-        # would have been advanced while it was still disabled.
-        if not days or days <= 0:
-            return 0
-
-        now = time.monotonic()
-        if _last_audit_cleanup_at is not None and now - _last_audit_cleanup_at < 3600:
-            return 0
-        _last_audit_cleanup_at = now
-
-        # Naive UTC to match the TIMESTAMP-WITHOUT-TIME-ZONE column, and synchronize_session=False so
-        # the DELETE runs entirely in Postgres (the default 'evaluate' strategy would compare the
-        # naive column value against the cutoff in Python and raise on naive-vs-aware).
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        deleted = self.db.query(AuditLog).filter(
-            AuditLog.timestamp < cutoff
-        ).delete(synchronize_session=False)
-        self.db.commit()
-        logger.info("Pruned %d audit_logs rows older than %dd", deleted, days)
-        return deleted

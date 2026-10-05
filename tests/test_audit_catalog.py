@@ -33,6 +33,7 @@ PASS_THROUGH = {
     ("app/api/ecc_router.py", "_audit_zk"),
     ("app/api/email_studio_router.py", "_audit"),
     ("app/core/temp_scope.py", "_audit_scope_denial"),
+    ("app/core/setting_changes.py", "_audit"),
     ("app/services/audit_logger.py", "log_action"),
     ("app/services/audit_logger.py", "log_custom_action"),
     ("app/services/audit_logger.py", "log_error"),

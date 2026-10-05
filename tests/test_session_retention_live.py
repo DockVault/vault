@@ -73,11 +73,10 @@ def test_finished_rows_older_than_thirty_days_are_deleted(temp_user):
     out = _run(_API_CONTAINER, ["python", "-c",
                                 "from app.core.config import bootstrap_entrypoint\n"
                                 "bootstrap_entrypoint('retention-test')\n"
-                                "from app.core.database import get_db_context\n"
-                                "from app.core.session_retention import purge_old_session_data\n"
-                                "with get_db_context() as db:\n"
-                                "    print(purge_old_session_data(db))\n"])
-    assert out.splitlines()[-1].startswith("("), out
+                                "from app.core import retention\n"
+                                "from app.core.database import SessionLocal\n"
+                                "print(retention.prune_sessions(retention.Pass(SessionLocal)).deleted)\n"])
+    assert out.splitlines()[-1].isdigit(), out
 
     assert _left("active_sessions", old_sessions | kept_sessions) == kept_sessions
     assert _left("pending_logins", old_pending | kept_pending) == kept_pending

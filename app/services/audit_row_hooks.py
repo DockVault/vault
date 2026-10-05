@@ -7,8 +7,8 @@ this order, once each:
     provenance(row)             how the recorded address was learned (row.ip_via);
     case(row)                   the compliance case the request acts under (row.case_id);
     privacy(row, raw_details)   what is recorded of the row's personal values (row.privacy_version,
-                                row.recorded, and what stays in the row's own fields); raw_details is
-                                the caller's details before build_row took the name keys out;
+                                row.recorded, and what stays in the row's own fields and details);
+                                raw_details is the caller's details as given;
     seal_nonce(row)             the value per row under which the log's integrity chain commits to the
                                 row's personal values (row.seal_nonce).
 
@@ -17,7 +17,8 @@ otherwise give the row its id only when it is flushed. A hook changes the row in
 nothing. It must not raise: build_row runs inside the transaction of the change the row records, so an
 exception here fails that change. raw_details is a copy, and the caller's own dict is never changed.
 
-In this release every hook leaves the row as it is, so these columns stay NULL.
+In this release privacy applies the recording levels (app/core/audit_privacy.py); the other hooks leave
+the row as it is, so their columns stay NULL.
 """
 
 
@@ -30,8 +31,11 @@ def case(row) -> None:
 
 
 def privacy(row, raw_details) -> None:
-    """What is recorded of the row's personal values. The row keeps what build_row put in it, with the
-    name keys already taken out of its details; row.privacy_version and row.recorded stay NULL."""
+    """What is recorded of the row's personal values: the recording levels decide its username, address,
+    user agent and details, and stamp row.privacy_version and row.recorded (app/core/audit_privacy.py).
+    Never raises: a failure writes the row without personal values."""
+    from app.core import audit_privacy
+    audit_privacy.apply(row, raw_details)
 
 
 def seal_nonce(row) -> None:

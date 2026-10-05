@@ -3,8 +3,8 @@
 Five columns on audit_logs (seal_nonce, privacy_version, recorded, ip_via, case_id) and ip_via on
 security_alerts are nullable with no default, added at start by one statement per table, so Postgres
 adds them without rewriting a row and a release that does not know them ignores them. build_row sets
-the row's id itself, then calls four hooks in a fixed order (app/services/audit_row_hooks.py), each of
-which leaves the row alone in this release. test_audit_row_columns_live.py checks the columns on a
+the row's id itself, then calls four hooks in a fixed order (app/services/audit_row_hooks.py); privacy
+applies the recording levels (tests/test_audit_privacy.py), and the others leave the row alone. test_audit_row_columns_live.py checks the columns on a
 running stack's database.
 """
 import ast
@@ -141,13 +141,15 @@ def test_every_row_gets_its_own_id(db, calls):
     assert first.id != second.id
 
 
-def test_privacy_is_given_the_callers_details_before_the_names_are_taken_out(db, calls):
+def test_privacy_is_given_a_copy_of_the_callers_details_and_alone_gives_the_row_any(db, calls):
     details = {"file_name": "report.pdf", "vault_name": "Finance", "size": 3, "parts": {"n": 1}, "tags": ["a"]}
     row = AuditLogger(db).build_row(action="file_uploaded", status="success", details=details)
     (privacy,) = [c for c in calls if c[0] == "privacy"]
     (raw,) = privacy[3]
     assert raw == {"file_name": "report.pdf", "vault_name": "Finance", "size": 3, "parts": {"n": 1}, "tags": ["a"]}
-    assert row.details == {"size": 3, "parts": {"n": 1}, "tags": ["a"]}
+    # build_row gives the row no details of its own: what it keeps is the recording levels' decision
+    # (app/core/audit_privacy.py), here replaced by a recorder that decides nothing.
+    assert row.details is None
     assert set(REDACTED_NAME_KEYS) >= {"file_name", "vault_name"}
     # A copy, all the way down: a hook that changes what it was given, or a value inside it, changes neither
     # the caller's dict nor the row.
@@ -156,7 +158,7 @@ def test_privacy_is_given_the_callers_details_before_the_names_are_taken_out(db,
     raw["parts"]["n"] = 2
     raw["tags"].append("b")
     assert details == {"file_name": "report.pdf", "vault_name": "Finance", "size": 3, "parts": {"n": 1}, "tags": ["a"]}
-    assert row.details == {"size": 3, "parts": {"n": 1}, "tags": ["a"]}
+    assert row.details is None
 
 
 def test_privacy_is_given_what_the_caller_passed_when_it_is_not_a_dict(db, calls):
@@ -166,14 +168,16 @@ def test_privacy_is_given_what_the_caller_passed_when_it_is_not_a_dict(db, calls
     assert raws == [None, {"size": 1}]
 
 
-def test_the_hooks_leave_the_row_alone_so_the_columns_stay_empty(db):
+def test_the_other_hooks_leave_their_columns_empty_and_privacy_stamps_the_policy(db):
     row = AuditLogger(db).log_action(action="thing_done", status="success", username="ada",
-                                     details={"file_name": "x", "n": 1}, ip_address="192.0.2.7")
+                                     details={"file_name": "x", "count": 1}, ip_address="192.0.2.7")
     db.expire_all()
     stored = db.query(AuditLog).one()
-    assert (stored.seal_nonce, stored.privacy_version, stored.recorded, stored.ip_via, stored.case_id) == (
-        None, None, None, None, None)
-    assert stored.id == row.id and stored.details == {"n": 1} and stored.ip_address == "192.0.2.7"
+    assert (stored.seal_nonce, stored.ip_via, stored.case_id) == (None, None, None)
+    # Policy 1 (app/core/audit_privacy.py) records what earlier releases did: no names, the rest in full,
+    # and nothing in another form.
+    assert (stored.privacy_version, stored.recorded) == (1, None)
+    assert stored.id == row.id and stored.details == {"count": 1} and stored.ip_address == "192.0.2.7"
 
 
 class _Untouchable:
@@ -187,13 +191,19 @@ class _Untouchable:
         raise AssertionError(f"a hook deleted {name}")
 
 
-@pytest.mark.parametrize("name", HOOKS)
-def test_each_hook_changes_nothing_and_returns_nothing(name):
+@pytest.mark.parametrize("name", [h for h in HOOKS if h != "privacy"])
+def test_each_hook_but_privacy_changes_nothing_and_returns_nothing(name):
     hook = getattr(audit_row_hooks, name)
-    raw = {"file_name": "x"}
-    args = (_Untouchable(), raw) if name == "privacy" else (_Untouchable(),)
-    assert hook(*args) is None
-    assert raw == {"file_name": "x"}
+    assert hook(_Untouchable()) is None
+
+
+def test_privacy_hands_the_row_to_the_recording_levels(monkeypatch):
+    from app.core import audit_privacy
+    seen = []
+    monkeypatch.setattr(audit_privacy, "apply", lambda row, raw: seen.append((row, raw)))
+    row, raw = object(), {"file_name": "x"}
+    assert audit_row_hooks.privacy(row, raw) is None
+    assert seen == [(row, raw)] and raw == {"file_name": "x"}
 
 
 def test_the_hooks_are_called_through_the_module_so_they_can_be_filled_in_one_place():

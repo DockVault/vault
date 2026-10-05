@@ -53,6 +53,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("login_failure", "sign_in", "Sign-in failed", "warning"),
     AuditAction("login_password_ok", "sign_in", "Password accepted, second factor pending", "info"),
     AuditAction("login_success", "sign_in", "Signed in", "info"),
+    # A user said they had read the notice of what this vault records, after a change (reading, not consent).
+    AuditAction("privacy_notice_seen", "sign_in", "Recording notice read", "info"),
     AuditAction("logout", "sign_in", "Signed out", "info"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
@@ -197,6 +199,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("vault_permission_revoked", "vaults", "Vault access removed", "notice"),
     AuditAction("vault_storage_allocated", "vaults", "Vault storage allocation changed", "info"),
     AuditAction("vault_settings_updated", "vaults", "Vault settings changed", "notice"),
+    # An administrator gave a vault's password to see its names on the Activity page (or gave a wrong one).
+    AuditAction("activity_vault_unlocked", "vaults", "Vault names unlocked on the Activity page", "notice"),
     # Zero-knowledge keys
     AuditAction("zk_index_key_wrapped", "zero_knowledge", "Name-index key given to members", "notice"),
     # A request to change a vault's keys whose proof that the caller holds the keys did not check out, and
@@ -226,6 +230,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("device_sync_cred_mint", "devices", "Sync login issued to a device", "info"),
     # Administration
     AuditAction("audit_exported", "administration", "Audit log exported", "notice"),
+    # A new version of the recording levels (app/core/audit_privacy.py): by an administrator, or by the server
+    # bringing a level within a lowered .env limit (then the row has no account and says so).
+    AuditAction("audit_privacy_changed", "administration", "Recording levels changed", "warning"),
     AuditAction("brand_asset_reset", "administration", "Logo or icon reset to default", "info"),
     AuditAction("brand_asset_uploaded", "administration", "Logo or icon uploaded", "info"),
     AuditAction("email_action_test_sent", "administration", "Test automatic email sent", "info"),
@@ -247,8 +254,21 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("note_link_tag_deactivated", "administration", "Note-link tag deactivated", "notice"),
     AuditAction("note_link_tag_updated", "administration", "Note-link tag changed", "notice"),
     AuditAction("receiver_tag_created", "administration", "Upload-link tag created", "notice"),
+    # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
+    AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
+    # A managed setting (app/core/settings_registry.py): the row carries the values before and after.
+    AuditAction("setting_changed", "administration", "Managed setting changed", "notice"),
+    # A change that deletes records sooner waits (app/core/setting_changes.py): asked for, cancelled by any
+    # administrator (or kept at the value in force), and applied by the server once it is due.
+    AuditAction("setting_change_applied", "administration", "Waiting setting change applied", "warning",
+                automatic=True),
+    AuditAction("setting_change_cancelled", "administration", "Waiting setting change cancelled", "notice"),
+    AuditAction("setting_change_scheduled", "administration",
+                "Setting change that deletes records sooner scheduled by the server", "warning", automatic=True),
+    AuditAction("setting_change_requested", "administration", "Setting change that deletes records sooner requested",
+                "warning"),
     AuditAction("settings_updated", "administration", "Settings changed", "notice"),
     AuditAction("share_tag_created", "administration", "Share tag created", "notice"),
     AuditAction("share_tag_deactivated", "administration", "Share tag deactivated", "notice"),

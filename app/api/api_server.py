@@ -544,6 +544,12 @@ _RATE_LIMIT_API_SETTING_KEYS = tuple(
 )
 
 
+def _rate_limit_overrides_in_force(blob) -> dict:
+    """The stored settings without the rate-limit overrides the deployment locked."""
+    from app.core.rate_limit_settings import unlocked_overrides
+    return dict(unlocked_overrides(blob))
+
+
 def _api_rate_limit_deployment_defaults() -> dict:
     return {key: int(getattr(settings, key)) for key in _RATE_LIMIT_API_SETTING_KEYS}
 
@@ -555,7 +561,9 @@ def _load_stored_api_rate_limit_overrides() -> dict:
     db = SessionLocal()
     try:
         row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
-        return dict(row.value) if row and row.value else {}
+        # A limit the deployment locked (SETTINGS_LOCKED_KEYS) keeps its deployment value.
+        from app.core.rate_limit_settings import unlocked_overrides
+        return dict(unlocked_overrides(dict(row.value))) if row and row.value else {}
     finally:
         db.close()
 
@@ -726,6 +734,22 @@ app.include_router(ecc_router, prefix="/ecc")
 # Import and include Email Studio router (SMTP profiles / HTML templates / image resources)
 from app.api.email_studio_router import router as email_studio_router
 app.include_router(email_studio_router, prefix="/email")
+
+# The settings the panel manages through the settings registry (app/core/settings_registry.py)
+from app.api.managed_settings_router import router as managed_settings_router
+app.include_router(managed_settings_router)
+# What the audit log records of personal data (Settings -> Activity and records).
+from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
+app.include_router(recording_levels_router)
+# What users are told the audit log records: the public notice, its page, and the banner after a change.
+from app.api.recording_notice_router import router as recording_notice_router  # noqa: E402
+app.include_router(recording_notice_router)
+# The Activity page's searches with the filters in the body, so what was typed reaches no request line.
+from app.api.activity_search_router import router as activity_search_router  # noqa: E402
+app.include_router(activity_search_router)
+# Unlocking a password-protected vault's names on the Activity page, with the vault password once.
+from app.api.activity_unlock_router import router as activity_unlock_router  # noqa: E402
+app.include_router(activity_unlock_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -2146,7 +2170,7 @@ def _fire_offloop(fn, *args, **kwargs) -> None:
     task.add_done_callback(_BG_TASKS.discard)
 
 
-def _record_failed_login_bg(username, ip_address, reason) -> None:
+def _record_failed_login_bg(username, ip_address, reason, record_id=None) -> None:
     """Record a failed login in the security monitor on its OWN short-lived DB session. Both login
     except branches call it via `await run_offloaded(...)`: the brute-force counter must advance on
     every failed login, so it is AWAITED (the record lands before the response, never shed under a
@@ -2160,7 +2184,7 @@ def _record_failed_login_bg(username, ip_address, reason) -> None:
         from app.core.database import get_db_context
         from app.services.security_monitor import get_security_monitor
         with get_db_context() as bg_db:
-            get_security_monitor(bg_db).record_failed_login(username, ip_address, reason)
+            get_security_monitor(bg_db).record_failed_login(username, ip_address, reason, record_id=record_id)
     except Exception as e:  # noqa: BLE001 — best-effort threat telemetry; never fails the response
         # The class only: the write carries the name typed at sign-in, which a database error's
         # message would repeat into the log.
@@ -2371,14 +2395,6 @@ async def recent_audit_events(
     """Recent audit-log entries for the dashboard activity feed (admin only)."""
     from app.core.models import AuditLog
     limit = max(1, min(limit, 50))
-    # Opportunistically prune audit rows past the retention window (throttled once/hour; a no-op
-    # unless an operator set a positive audit_log_retention_days). Do it BEFORE the fetch: the prune
-    # commits, and a failed DELETE must not leave the shared session aborted and 500 the feed.
-    try:
-        from app.services.audit_logger import AuditLogger
-        AuditLogger(db).cleanup_old_audit_logs()
-    except Exception:
-        db.rollback()
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
     for r in rows:
@@ -2431,6 +2447,11 @@ def _build_audit_query(db: Session, user_id=None, action=None, from_date=None, t
     return q
 
 
+def _recorded_value(r, key):
+    from app.services.activity_events import recorded_value
+    return recorded_value(r, key)
+
+
 def _audit_row_to_dict(r):
     return {
         "timestamp": r.timestamp.isoformat() if r.timestamp else None,
@@ -2442,7 +2463,8 @@ def _audit_row_to_dict(r):
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
         "action": r.action,
         "status": r.status,
-        "ip_address": r.ip_address,
+        # In full, or the network a shortened address is in (app/core/audit_privacy.py).
+        "ip_address": r.ip_address or _recorded_value(r, "ip"),
         "resource_type": r.resource_type,
         "resource_id": r.resource_id,
         "details": r.details,
@@ -2517,6 +2539,7 @@ def activity_events(
     ids: List[str] = Query([], max_length=8000),
     count_only: bool = False,
     limit: int = 50,
+    request: Request = None,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
@@ -2605,11 +2628,23 @@ def activity_events(
             out["prev_cursor"] = ev.encode_cursor(rows[0].timestamp, rows[0].id)
 
     events = [ev.row_view(r) for r in rows]
-    from app.services.activity_names import names_for, temp_credential_names
+    from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
+                                             unlocked_vaults)
+    # Vaults whose names this administrator unlocked with the vault password (a receipt for each).
+    unlocked = unlocked_vaults(db, current_user, request)
     for event, names in zip(events, names_for(db, current_user, events)):
         event["names"] = names
+    for event, recorded in zip(events, recorded_names_for(db, current_user, rows, unlocked)):
+        event["recorded_names"] = recorded
+    show_unlocked(events, unlocked)
     temp_credential_names(db, events)
     out["events"] = events
+    # The recording levels in force, so the page can mark a row recorded under other ones.
+    from app.core import audit_privacy
+    try:
+        out["recording_version"] = audit_privacy.current().version
+    except audit_privacy.PolicyUnavailable:
+        out["recording_version"] = None
     newest = max(rows, key=lambda r: (r.timestamp, r.id)) if rows else None
     out["head_cursor"] = ev.encode_cursor(newest.timestamp, newest.id) if newest else None
     return out
@@ -2617,12 +2652,14 @@ def activity_events(
 
 @app.get("/activity/events/{event_id}")
 def activity_event(event_id: str,
+                   request: Request = None,
                    current_user: User = Depends(require_interactive_admin),
                    db: Session = Depends(get_db)):
     """One event, as the Events list shows it (admin only): for a copied link to an event."""
     from app.core.models import AuditLog
     from app.services import activity_events as ev
-    from app.services.activity_names import names_for, temp_credential_names
+    from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
+                                             unlocked_vaults)
     try:
         row = db.query(AuditLog).filter(AuditLog.id == uuid.UUID(event_id)).first()
     except ValueError:
@@ -2630,7 +2667,10 @@ def activity_event(event_id: str,
     if row is None:
         raise HTTPException(status_code=404, detail="That event is not in the log.")
     event = ev.row_view(row)
+    unlocked = unlocked_vaults(db, current_user, request)
     event["names"] = names_for(db, current_user, [event])[0]
+    event["recorded_names"] = recorded_names_for(db, current_user, [row], unlocked)[0]
+    show_unlocked([event], unlocked)
     temp_credential_names(db, [event])
     return event
 
@@ -2734,7 +2774,7 @@ def create_saved_search(body: SavedSearchCreate,
     from app.core.models import ActivitySavedSearch
     rules = _saved_search_rules()
     try:
-        name, filters = rules.clean_name(body.name), rules.clean_filters(body.filters)
+        name, filters = rules.clean_name(body.name), rules.clean_filters(body.filters, rules.held_in_full(db))
     except rules.InvalidSearch as e:
         raise HTTPException(status_code=422, detail=str(e))
     _lock_owner(db, current_user)
@@ -2768,7 +2808,7 @@ def update_saved_search(search_id: str, body: SavedSearchUpdate,
     rules = _saved_search_rules()
     try:
         name = rules.clean_name(body.name) if body.name is not None else None
-        filters = rules.clean_filters(body.filters) if body.filters is not None else None
+        filters = rules.clean_filters(body.filters, rules.held_in_full(db)) if body.filters is not None else None
     except rules.InvalidSearch as e:
         raise HTTPException(status_code=422, detail=str(e))
     _lock_owner(db, current_user)
@@ -2963,6 +3003,7 @@ def activity_export(
     vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
+    request: Request = None,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
@@ -2976,7 +3017,8 @@ def activity_export(
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
     from app.services import activity_events as ev
-    from app.services.activity_names import temp_credential_names
+    from app.services.activity_names import recorded_names_for, show_unlocked, temp_credential_names, unlocked_vaults
+    unlocked = unlocked_vaults(db, current_user, request)
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
@@ -3017,6 +3059,10 @@ def activity_export(
             nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
             views = [ev.row_view(r) for r in got]
             temp_credential_names(s, views)
+            viewer = s.get(User, current_user.id)
+            for view, recorded in zip(views, recorded_names_for(s, viewer, got, unlocked) if viewer
+                                      else [None] * len(views)):
+                view["recorded_names"] = recorded
             return views, nxt
         finally:
             s.close()
@@ -3819,6 +3865,23 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
             raise HTTPException(status_code=400,
                                 detail=f"{_key.lower()} is not saved here: it is a managed setting")
 
+    # The recording levels keep a table of their own and are saved in Settings -> Activity and records, with
+    # the password every time (app/api/recording_levels_router.py): the general settings never hold a copy,
+    # which would look as if it had changed what the audit log records.
+    # The notice's legal basis and contact, as the operator states them: plain text, bounded.
+    from app.core.recording_notice import NOTICE_KEYS as _notice_keys, NOTICE_MAX_LENGTH as _notice_max
+    for _key in _notice_keys:
+        if _key in payload and payload[_key] is not None and (
+                not isinstance(payload[_key], str) or len(payload[_key]) > _notice_max):
+            raise HTTPException(status_code=400,
+                                detail=f"{_key} is text of at most {_notice_max} characters")
+    from app.core.audit_privacy import SETTINGS_KEYS_REFUSED as _levels_refused
+    for _key in payload:
+        if isinstance(_key, str) and _key.lower() in _levels_refused:
+            raise HTTPException(status_code=400,
+                                detail=f"{_key.lower()} is not saved here: the recording levels are saved in "
+                                       "Settings, Activity and records")
+
     # Deployment-managed / server-computed rate-limit fields are READ-ONLY: the deployment value comes
     # from the environment and the API must never write it (a client cannot edit it via a payload key).
     for managed_key in ("rate_limit_api_enabled", "rate_limit_api_deployment_defaults",
@@ -3848,6 +3911,10 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
                 _rl_settings.validate_override(_rl_key, payload[_rl_key])
             except ValueError as _rl_err:
                 raise HTTPException(status_code=400, detail=str(_rl_err))
+            # A limit the deployment locked keeps its deployment value: clearing an override (0) is taken,
+            # a new one is refused rather than saved and ignored.
+            if payload[_rl_key] != 0 and _rl_settings.is_locked(_rl_key):
+                raise HTTPException(status_code=400, detail=f"{_rl_key} is locked by the deployment")
 
     for bool_key in ("zero_knowledge_enabled", "force_zero_knowledge", "force_no_remember_vault_password",
                      "sharing_enabled"):
@@ -4234,6 +4301,32 @@ def require_step_up(action: str):
     return decorator
 
 
+# A value longer than this is recorded in the settings audit by its digest and length, not as itself.
+_SETTINGS_AUDIT_TEXT_MAX = 200
+
+
+def _settings_value_for_audit(key, value):
+    """How the settings audit records ``value`` of ``key``: a secret only as whether it is set, a long text
+    (an image, a template) by its SHA-256 and length, anything else as itself."""
+    if key in _SETTINGS_SENSITIVE:
+        return "(set)" if value not in (None, "") else None
+    if isinstance(value, str) and len(value) > _SETTINGS_AUDIT_TEXT_MAX:
+        return {"sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(), "length": len(value)}
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, sort_keys=True, default=str)
+        if len(text) > _SETTINGS_AUDIT_TEXT_MAX:
+            return {"sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "length": len(text)}
+    return value
+
+
+def _settings_changes_for_audit(existing: dict, merged: dict) -> dict:
+    """{key: {"old": ..., "new": ...}} for every key a settings save changed, each value as the audit
+    records it (_settings_value_for_audit)."""
+    return {key: {"old": _settings_value_for_audit(key, existing.get(key)),
+                  "new": _settings_value_for_audit(key, merged.get(key))}
+            for key in sorted(merged) if existing.get(key) != merged.get(key)}
+
+
 @app.put("/settings")
 async def update_settings(
     payload: dict,
@@ -4279,12 +4372,27 @@ async def update_settings(
         # Shared writer (also used by asset uploads): non-empty sets, empty
         # clears -> env default. Values were validated by _validate_brand_overrides above.
         set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
-    db.commit()
+    # The audit row, with each changed key's values before and after, commits with the change or neither
+    # does: a save whose record cannot be written is not made.
+    try:
+        db.add(AuditLogger(db).build_row(
+            action="settings_updated",
+            status="success",
+            user=current_user,
+            ip_address=get_client_ip(request),
+            details={"keys": sorted((payload or {}).keys()),
+                     "changes": _settings_changes_for_audit(existing, merged)},
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="The settings were not saved: their audit record could not "
+                                                    "be written. Nothing was changed.")
     if (
         _api_rate_limit_policy_cache is not None
         and any(key in (payload or {}) for key in _RATE_LIMIT_API_SETTING_KEYS)
     ):
-        _api_rate_limit_policy_cache.replace(merged)
+        _api_rate_limit_policy_cache.replace(_rate_limit_overrides_in_force(merged))
     # Drop the login/vault/SFTP throttle-override cache so a just-saved change takes effect immediately
     # (the general-API buckets have their own cache, replaced just above).
     from app.core import rate_limit_settings as _rl_settings_write
@@ -4294,16 +4402,6 @@ async def update_settings(
     if "max_file_size" in (payload or {}):
         from app.core import body_limit as _body_limit
         _body_limit.forget_largest_file()
-    try:
-        AuditLogger(db).log_action(
-            action="settings_updated",
-            status="success",
-            user=current_user,
-            ip_address=get_client_ip(request),
-            details={"keys": sorted((payload or {}).keys())},
-        )
-    except Exception:
-        pass  # never fail the save just because the audit write did
     return {"status": "ok"}
 
 
@@ -7622,9 +7720,8 @@ async def second_factor_login_verify(
         # A wrong login second factor was previously invisible in both the audit log and the live
         # monitor. Record it as a failed action and push it to the monitor as a security event.
         try:
-            AuditLogger(db).log_action(action="second_factor_failed", status="failed", user=user,
-                                       ip_address=client_ip,
-                                       details={"method": _sf_method_name(body.method)})
+            AuditLogger(db).log_second_factor_failure(user, ip_address=client_ip,
+                                                      details={"method": _sf_method_name(body.method)})
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -7756,8 +7853,12 @@ async def second_factor_step_up(
         otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if m != "password"}
         if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
                 db, user=current_user, action=body.action, method=body.method, code=body.code):
-            _audit_change(db, current_user, "second_factor_failed", "user", current_user.id,
-                          {"method": _sf_method_name(body.method), "step_up": body.action}, status="failed")
+            try:
+                AuditLogger(db).log_second_factor_failure(
+                    current_user, details={"method": _sf_method_name(body.method), "step_up": body.action})
+            except Exception as audit_err:  # noqa: BLE001 -- the refusal stands without its row
+                print(f"⚠ audit write skipped for second_factor_failed: {type(audit_err).__name__}")
+                db.rollback()
             raise HTTPException(status_code=403, detail="That code is not valid.")
     if req["password"]:
         pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
@@ -7789,6 +7890,9 @@ async def login(
     auth_service = AuthService(db)
     audit_logger = AuditLogger(db)
     client_ip = get_client_ip(request)
+    # The sign-in method this attempt is resolved under, which a failed attempt's audit row follows too (an
+    # account is named there only when the name could have signed in to it).
+    login_identifier = "username"
     
     try:
         # Check if this is a temporary credential (starts with "temp_")
@@ -7808,12 +7912,13 @@ async def login(
             # Regular user authentication. The org policy decides whether the submitted value is
             # resolved as a username, an email, or either — the temp_ branch above stays first and
             # policy-independent (temp usernames are their own namespace, never an email).
+            login_identifier = _login_identifier(db)
             user, session_token = await run_offloaded(
                 auth_service.authenticate_user,
                 login_request.username,
                 login_request.password,
                 client_ip,
-                login_identifier=_login_identifier(db),
+                login_identifier=login_identifier,
             )
             is_temporary = False
             # Two-step login: if the second factor is in effect for this account, hand out NO session
@@ -7901,14 +8006,15 @@ async def login(
         # door is a "this credential is live and in use" oracle. Only AccountLockedError branches to a
         # 403 below; SessionLimitExceededError falls through to the uniform "Invalid username or
         # password" like InvalidCredentialsError, and is recorded as a failed login like it.
-        audit_logger.log_login_failure(login_request.username, client_ip, str(e))
+        record_id = audit_logger.log_login_failure(login_request.username, client_ip, str(e),
+                                                   login_identifier=login_identifier)
         
         # AWAITED in the offload pool: the brute-force counter must advance on every failed login
         # (never shed), so it is awaited — the record lands before the response — but OFF the loop.
         # The guard skips the socket while open; the one re-probe per cooldown boundary that does
         # reach the socket runs in the offload pool, so it never stalls the event loop. The request
         # already holds its slot, so this adds no new pool pressure.
-        await run_offloaded(_record_failed_login_bg, login_request.username, client_ip, str(e))
+        await run_offloaded(_record_failed_login_bg, login_request.username, client_ip, str(e), record_id)
 
         # An administrator's lock is raised only AFTER the password verified (verify-first ordering
         # in authenticate_user), so the caller has already proven they know the credential. An
@@ -7929,16 +8035,17 @@ async def login(
 
     except AuthRateLimitExceededError as e:
         # Log the rate limit event
-        audit_logger.log_login_failure(
+        record_id = audit_logger.log_login_failure(
             login_request.username,
             client_ip,
-            f"Rate limit exceeded: {str(e)}"
+            f"Rate limit exceeded: {str(e)}",
+            login_identifier=login_identifier,
         )
         
         # Awaited in the offload pool, same as the 401 branch — the counter must not be shed, and its
         # boundary re-probe must not stall the loop.
         await run_offloaded(_record_failed_login_bg, login_request.username, client_ip,
-                            f"Rate limit exceeded: {str(e)}")
+                            f"Rate limit exceeded: {str(e)}", record_id)
         
         detail, headers = _login_429_detail_and_headers(login_request.username, e)
         raise HTTPException(
@@ -9134,8 +9241,6 @@ async def terminate_temp_credential_sessions(
             details={
                 "temp_username": temp_username,
                 "session_id": str(session.id),
-                "session_token": session.session_token,
-                "ip_address": session.ip_address
             }
         )
 
@@ -9894,7 +9999,7 @@ async def confirm_email_change(
     try:
         AuditLogger(db).log_action(action="email_change_confirmed", status="success", user=user,
                                    ip_address=get_client_ip(request),
-                                   details={"old": old_email, "new": new_email})
+                                   details={"old_email": old_email, "new_email": new_email})
     except Exception:  # noqa: BLE001
         pass
     return UserResponse.model_validate(user)
@@ -11342,7 +11447,6 @@ async def terminate_user_sessions(
         details={
             "username": user.username,
             "terminated_count": terminated_count,
-            "ip_address": get_client_ip(request),
         }
     )
 
@@ -19606,7 +19710,7 @@ async def upload_file(
                     user=current_user,
                     resource_type='vault',
                     resource_id=str(vault_id),
-                    details={'error': str(e), 'file_name': upload_file.filename},
+                    details={'error': type(e).__name__, 'file_name': upload_file.filename},
                     ip_address=get_client_ip(request)
                 )
                 raise HTTPException(
@@ -23380,20 +23484,8 @@ async def get_security_alerts(
     try:
         from app.services.security_monitor import get_security_monitor
         
+        from app.core.security_records import render_message as render_alert_message
         monitor = get_security_monitor(db)
-
-        # Opportunistically prune old RESOLVED alerts (throttled process-wide to once/hour, reads the
-        # retention setting). Do it BEFORE fetching: cleanup commits, and expire_on_commit would
-        # otherwise expire the fetched rows -> a just-deleted one raises ObjectDeletedError on
-        # serialization. Best-effort: never let cleanup fail the alerts view.
-        try:
-            monitor.cleanup_old_alerts()
-        except Exception:
-            # A failed cleanup DELETE/commit aborts the transaction; roll back so the shared session
-            # stays usable for the fetch below (mirrors _raise_alert's except pattern) -- else the
-            # next SELECT raises "current transaction is aborted" and 500s the view.
-            db.rollback()
-
         alerts = monitor.get_recent_alerts(limit=limit, severity=severity)
 
         # Convert to dict for JSON response
@@ -23403,7 +23495,7 @@ async def get_security_alerts(
                     "id": str(alert.id),
                     "event_type": alert.event_type,
                     "severity": alert.severity,
-                    "message": alert.message,
+                    "message": render_alert_message(alert),
                     "username": alert.username,
                     "ip_address": alert.ip_address,
                     "timestamp": alert.timestamp.isoformat(),
@@ -23722,8 +23814,11 @@ from contextlib import asynccontextmanager
 import asyncio
 
 async def cleanup_expired_sessions():
-    """Background task to periodically clean up expired sessions."""
-    from app.core.models import ActiveSession, RateLimitRecord
+    """Background task to periodically clean up expired sessions.
+
+    It runs on the event loop, so nothing that can take long belongs here: every timed deletion of records
+    is a job of the pruner (app/core/retention.py), which runs on a thread of its own."""
+    from app.core.models import ActiveSession
     from app.core.database import get_db_context
 
     while True:
@@ -23791,18 +23886,6 @@ async def cleanup_expired_sessions():
                     db.commit()
                     print(f"🧹 Released {released_slots} finished credential slot(s)")
 
-                # Prune stale DB-backed login-throttle rows (only written when Redis
-                # is down). Their window is minutes; anything older than an hour is
-                # dead and would otherwise accumulate one row per distinct
-                # username/IP seen during an outage. Bounds the table's growth.
-                rl_cutoff = datetime.utcnow() - timedelta(hours=1)
-                pruned = db.query(RateLimitRecord).filter(
-                    RateLimitRecord.window_start < rl_cutoff
-                ).delete(synchronize_session=False)
-                if pruned:
-                    db.commit()
-                    print(f"🧹 Pruned {pruned} stale rate-limit record(s)")
-
                 # Automatic sign-in locks whose time ran out end, each recorded with its scope; and
                 # counts with nothing left to count are dropped.
                 try:
@@ -23819,45 +23902,6 @@ async def cleanup_expired_sessions():
                 except Exception as lockout_err:
                     db.rollback()
                     print(f"⚠ sign-in lock release failed: {type(lockout_err).__name__}")
-
-                # Records of changes applied, or requests decided, more than 14 days ago are read by
-                # nothing and name addresses and keys that may never have been applied: they go (the
-                # audit log keeps the history).
-                try:
-                    from app.core import credential_changes as _cc_prune
-                    pruned_changes = _cc_prune.prune_done(db)
-                    if pruned_changes:
-                        db.commit()
-                        print(f"🧹 Pruned {pruned_changes} finished credential change record(s)")
-                except Exception as prune_err:
-                    db.rollback()
-                    print(f"⚠ credential change pruning failed: {type(prune_err).__name__}")
-
-                # Delete finished session and pending-login rows once they are past retention.
-                # Each holds the address a sign-in came from, and nothing else ever removed them
-                # (see app/core/session_retention.py).
-                try:
-                    from app.core.session_retention import purge_old_session_data
-                    purged_sessions, purged_pending = purge_old_session_data(db)
-                    if purged_sessions or purged_pending:
-                        db.commit()
-                        print(f"🧹 Deleted {purged_sessions} old session row(s) and "
-                              f"{purged_pending} old pending sign-in row(s)")
-                except Exception as purge_err:
-                    db.rollback()
-                    print(f"⚠ session retention purge failed: {type(purge_err).__name__}")
-
-                # Delete key-proof challenges nobody answered in time (each holds a sealed one-time
-                # key; see app/core/session_retention.py).
-                try:
-                    from app.core.session_retention import purge_expired_key_proof_challenges
-                    purged_challenges = purge_expired_key_proof_challenges(db)
-                    if purged_challenges:
-                        db.commit()
-                        print(f"🧹 Deleted {purged_challenges} expired key-proof challenge(s)")
-                except Exception as challenge_err:
-                    db.rollback()
-                    print(f"⚠ key-proof challenge purge failed: {type(challenge_err).__name__}")
 
                 # Prune abandoned chunked-upload sessions AND reclaim their buffered chunks
                 # on disk. A terminal/expired session holds the plaintext filename/MIME as
@@ -24285,6 +24329,17 @@ SSH_KEY_MAKER_FROM_AUDIT = (
 )
 
 
+AUDIT_PRIVACY_POLICIES_DDL = (
+    "CREATE OR REPLACE FUNCTION dv_audit_privacy_policies_only_grow() RETURNS trigger LANGUAGE plpgsql AS $dv$ "
+    "BEGIN RAISE EXCEPTION 'audit_privacy_policies only grows: a change of the recording levels adds a version'; "
+    "END $dv$",
+    "CREATE OR REPLACE TRIGGER trg_audit_privacy_policies_only_grow BEFORE UPDATE OR DELETE ON audit_privacy_policies "
+    "FOR EACH ROW EXECUTE FUNCTION dv_audit_privacy_policies_only_grow()",
+    "CREATE OR REPLACE TRIGGER trg_audit_privacy_policies_no_truncate BEFORE TRUNCATE ON audit_privacy_policies "
+    "FOR EACH STATEMENT EXECUTE FUNCTION dv_audit_privacy_policies_only_grow()",
+)
+
+
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
@@ -24372,6 +24427,11 @@ def _run_lightweight_migrations():
             # rewriting a row, however large the log, and an older release ignores them.
             AUDIT_ROW_COLUMNS_DDL,
             "ALTER TABLE security_alerts ADD COLUMN IF NOT EXISTS ip_via VARCHAR(24)",
+            # The recording levels' versions only grow (app/core/audit_privacy.py): a change adds one, and
+            # the database refuses to change or delete one (create_all builds the table).
+            *AUDIT_PRIVACY_POLICIES_DDL,
+            # The recording notice an account last said it had read (see User in models.py). Nullable.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS privacy_seen_version INTEGER",
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",
@@ -25239,6 +25299,11 @@ async def lifespan(app: FastAPI):
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state
     print(f"Schema state: {refresh_schema_state(recorded=recorded)}")
+    # The recording levels, before anything below writes an audit row: version 1 written on a new database,
+    # the stored levels brought within the .env limits, the policy in force read and kept fresh in the
+    # background (app/core/audit_privacy.py).
+    from app.core import audit_privacy
+    audit_privacy.start()
     _verify_encryption_key_canary()     # refuse to boot under a mismatched ENCRYPTION_KEY, BEFORE any seal migration
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest
@@ -25283,6 +25348,13 @@ async def lifespan(app: FastAPI):
     # Say so when requests that change zero-knowledge keys are accepted without a key proof.
     from app.services import zk_key_proof
     zk_key_proof.report_at_startup()
+
+    # The pruner: every timed deletion of records (finished sessions, expired key-proof challenges, the
+    # records of credential changes, the sign-in throttle's fallback rows, resolved alerts, audit rows) and
+    # the settings changes that wait, on a thread of its own, one runner at a time, first a minute after the
+    # start. Only this process runs it. See app/core/retention.py.
+    from app.core import retention
+    retention_task = asyncio.create_task(retention.run_forever())
 
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.
@@ -25330,7 +25402,13 @@ async def lifespan(app: FastAPI):
         await expiry_task
     except asyncio.CancelledError:
         pass
+    retention_task.cancel()
+    try:
+        await retention_task
+    except asyncio.CancelledError:
+        pass
     settings_registry.stop()
+    audit_privacy.stop()
 
 # Update app initialization
 app.router.lifespan_context = lifespan

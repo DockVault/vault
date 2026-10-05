@@ -1,4 +1,4 @@
-"""The two tables behind the key proof: their shape, their constraints, and the purge of old challenges.
+"""The two tables behind the key proof: their shape, their constraints, and the pruner's job for old challenges.
 
 Offline. The shape is read from the models, which is what create_all builds on a fresh database and on
 an existing one alike (both tables are new, so no boot statement is involved). The constraints are
@@ -19,8 +19,8 @@ from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
 
-from app.core import session_retention as R  # noqa: E402
-from app.core.models import Base, VaultKeyProof, ZkKeyProofChallenge  # noqa: E402
+from app.core import retention  # noqa: E402
+from app.core.models import AuditLog, Base, VaultKeyProof, ZkKeyProofChallenge  # noqa: E402
 from app.services import zk_key_proof as kp  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -83,6 +83,7 @@ def db():
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'proofs.db'}")
         VaultKeyProof.__table__.create(engine)
         ZkKeyProofChallenge.__table__.create(engine)
+        AuditLog.__table__.create(engine)     # the pruner's records
         s = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
         yield s
         s.close()
@@ -136,21 +137,41 @@ def _challenge(db, created):
     return row.id
 
 
+def _prune(db):
+    """The pruner's key-proof challenge job over the test database, in batches of two: how many it deleted."""
+    made = []
+
+    def factory():
+        made.append(sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)())
+        return made[-1]
+
+    try:
+        return retention.prune_key_proof_challenges(retention.Pass(factory, now=NOW, batch_rows=2)).deleted
+    finally:
+        for s in made:
+            s.close()
+        db.expire_all()
+
+
 def test_challenges_past_their_lifetime_are_purged_and_live_ones_kept(db):
     ttl = timedelta(seconds=kp.CHALLENGE_TTL_SECONDS)
-    old = _challenge(db, NOW - ttl - timedelta(seconds=1))
+    old = {_challenge(db, NOW - ttl - timedelta(seconds=n)) for n in (1, 2, 3)}
     edge = _challenge(db, NOW - ttl + timedelta(seconds=1))
     fresh = _challenge(db, NOW)
-    assert R.purge_expired_key_proof_challenges(db, now=NOW) == 1
-    db.commit()
+    assert _prune(db) == 3
     left = {r.id for r in db.query(ZkKeyProofChallenge).all()}
-    assert left == {edge, fresh} and old not in left
+    assert left == {edge, fresh} and not old & left
+    # Each batch wrote the pruner's record of what it deleted, in its own transaction.
+    records = [r.details for r in db.query(AuditLog).filter(AuditLog.action == "retention_pruned").all()]
+    assert sorted(r["deleted"] for r in records) == [1, 2]
+    assert {r["table"] for r in records} == {"zk_key_proof_challenges"}
 
 
-def test_the_periodic_cleanup_runs_the_challenge_purge_and_commits_it():
+def test_the_pruner_runs_the_challenge_purge_and_the_periodic_loop_does_not():
+    job = next(j for j in retention.JOBS if j.name == "key_proof_challenges")
+    # A working record: the hold switch, which stops the jobs over logs, does not stop it.
+    assert job.run is retention.prune_key_proof_challenges and job.held is False
     src = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
     reaper = src[src.index("async def cleanup_expired_sessions"):]
     reaper = reaper[:reaper.index("\ndef ")]
-    assert reaper.count("purge_expired_key_proof_challenges(db)") == 1
-    call = reaper.index("purge_expired_key_proof_challenges(db)")
-    assert reaper.index("db.commit()", call) < reaper.index("db.rollback()", call)
+    assert "ZkKeyProofChallenge" not in reaper and "key_proof_challenge" not in reaper

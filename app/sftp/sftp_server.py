@@ -2317,7 +2317,8 @@ class SFTPServer(paramiko.ServerInterface):
                                 ActiveSession.session_token == hash_session_token(session_token)
                             ).update({"is_active": False})
                             db.commit()
-                            audit_logger.log_login_failure(username, self.client_address, deny)
+                            audit_logger.log_login_failure(username, self.client_address, deny,
+                                                           account=user)
                             return paramiko.AUTH_FAILED
 
                         self.user = user
@@ -2580,6 +2581,10 @@ def start_sftp_server():
     # (app/core/settings_registry.py).
     from app.core import settings_registry
     settings_registry.start(load_now=False)
+    # The recording levels the same way: brought within .env and read on a thread of their own; an audit
+    # row written before that reads the policy itself (app/core/audit_privacy.py).
+    from app.core import audit_privacy
+    audit_privacy.start(load_now=False)
 
     # Which version this process runs, recorded in the database now and while it runs, on a thread of its
     # own, so the web app can tell whether every SFTP process runs its version (app/core/sftp_versions.py).

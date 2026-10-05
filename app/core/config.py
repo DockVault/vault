@@ -440,12 +440,52 @@ class Settings(BaseSettings):
     security_bulk_deletion_threshold: int = Field(default=10)  # Files deleted in time window
     security_bulk_deletion_window: int = Field(default=60)  # Time window in seconds
     security_alert_retention_days: int = Field(default=90)  # How long to keep resolved alerts
+    # The security record (app/core/security_records.py): each failed sign-in in full, with the name typed and
+    # the address, for this many days (the panel may change it between the two bounds); alerts lose their
+    # names and addresses after the same time.
+    security_record_days: int = Field(default=30)
+    security_record_min_days: int = Field(default=7)
+    security_record_max_days: int = Field(default=365)
+    # The most the audit log may record of each kind of personal data (app/core/audit_privacy.py): the
+    # panel's recording levels stay at or below these. Names (vault, file and folder): none, fingerprint or
+    # full. Names typed at a failed sign-in (no such account): none, fingerprint or full. Email addresses:
+    # none or full. IP addresses: none, shortened or full. Browser descriptions: none or full. A value that is
+    # none of these refuses to start. With audit_levels in SETTINGS_LOCKED_KEYS each limit is also the level.
+    audit_max_names: str = Field(default="full")
+    audit_max_signin_names: str = Field(default="full")
+    audit_max_emails: str = Field(default="full")
+    audit_max_ip: str = Field(default="full")
+    audit_max_user_agent: str = Field(default="full")
+    # The key of the fingerprints the audit log keeps of names recorded at the fingerprint level
+    # (app/core/audit_fingerprints.py): at least 32 characters. Empty derives one from ENCRYPTION_KEY.
+    audit_fingerprint_key: str = Field(default="")
     # Audit-log retention in days. 0 (the default) keeps every audit row: a deleted record of what
     # happened cannot be brought back, so deleting them is left to the operator. A positive value
-    # deletes rows older than that many days, at most once an hour, when an administrator's dashboard
-    # loads its recent activity (AuditLogger.cleanup_old_audit_logs). The app only adds rows and
-    # deletes old ones; the table is an ordinary one that anyone with database access can change.
+    # deletes rows older than that many days; the pruner (app/core/retention.py) does it on a timer.
+    # The app only adds rows and deletes old ones; the table is an ordinary one that anyone with
+    # database access can change.
     audit_log_retention_days: int = Field(default=0)
+    # The rest of the audit log's retention (app/core/audit_retention.py). AUDIT_MIN_RETENTION_DAYS: no row
+    # younger is deleted, and the panel cannot go below it. AUDIT_PROTECTED_MIN_DAYS: no administration or
+    # security row younger is deleted by age; only .env can lower it. AUDIT_LOG_MAX_MB: a size cap (0 is
+    # off) that deletes the oldest rows, never administration or security rows. PLAN_LOG_MAX_DAYS and
+    # PLAN_LOG_MAX_MB: ceilings on the maximum and the cap (-1 is none; a ceiling forbids "for ever" and
+    # "off").
+    audit_min_retention_days: int = Field(default=0)
+    audit_protected_min_days: int = Field(default=365)
+    audit_log_max_mb: int = Field(default=0)
+    plan_log_max_days: int = Field(default=-1)
+    plan_log_max_mb: int = Field(default=-1)
+    # How long records are kept is managed in the panel (app/core/settings_registry.py), within the limits
+    # set here. A change there that makes records be deleted sooner waits this many days before it takes
+    # effect (1-90); any administrator can cancel it meanwhile (app/core/setting_changes.py).
+    retention_reduction_delay_days: int = Field(default=7)
+    # The pruner (app/core/retention.py): the minutes between two passes (1-1440), the rows it deletes
+    # in one transaction (100-100000), and the hold switch's deployment value. RETENTION_HOLD=true stops
+    # every deletion of audit rows, security records and alerts, and the panel cannot turn it off.
+    log_prune_interval_minutes: int = Field(default=15)
+    log_prune_batch_rows: int = Field(default=5000)
+    retention_hold: bool = Field(default=False)
     
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
     # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old
@@ -588,6 +628,20 @@ def _validate_runtime_settings(candidate: Settings) -> None:
             "jwt-secret-weak",
             "The JWT signing secret is missing, too short, or a known placeholder.",
         )
+
+    from app.core.audit_privacy import env_problems
+    unreadable = env_problems(candidate)
+    if unreadable:
+        raise RuntimeBootstrapError(
+            "audit-recording-limit-invalid",
+            "A recording limit in .env cannot be read: " + "; ".join(unreadable)
+            + ". Fix the line in .env, then run docker compose up -d.",
+        )
+
+    from app.core.audit_fingerprints import key_problem
+    weak = key_problem(candidate)
+    if weak:
+        raise RuntimeBootstrapError("audit-fingerprint-key-weak", weak + ".")
 
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
         raise RuntimeBootstrapError(

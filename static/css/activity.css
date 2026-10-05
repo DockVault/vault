@@ -683,3 +683,31 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     .act-progress::before { animation: none; width: 100%; }
     .act-col, .act-fp-disclose .icon, .act-d-raw-chev { transition: none; }
 }
+
+/* Settings -> Activity and records: the recording levels (static/js/settings-records.js). */
+.recording-choices { display: flex; flex-wrap: wrap; gap: .25rem 1rem; }
+.recording-choice { display: inline-flex; align-items: baseline; gap: .25rem; cursor: pointer; }
+.recording-choice.is-disabled { opacity: .6; cursor: not-allowed; }
+.recording-env-line { flex-basis: 100%; }
+.recording-history { margin: 0; padding-left: 1.25rem; }
+.recording-history-item { margin-bottom: .5rem; }
+@media (max-width: 640px) {
+    #recording-levels-table thead { display: none; }
+    #recording-levels-table tr { display: block; padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); }
+    #recording-levels-table th, #recording-levels-table td { display: block; border: 0; padding: .125rem 0; }
+}
+
+/* A notice the signed-in user has to read, across the top of the app (static/js/notice-banner.js). */
+.notice-banners { position: sticky; top: 0; z-index: 900; }
+.notice-banner {
+    display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; padding: .6rem 1rem;
+    background: var(--color-info-bg, #eff6ff); color: var(--color-text, inherit);
+    border-bottom: 1px solid var(--color-border, #bfdbfe);
+}
+.notice-banner-text { flex: 1 1 16rem; }
+.notice-banner-link { white-space: nowrap; }
+
+/* The details' unlock of a password-protected vault's names (static/js/activity.js unlockForm). */
+.act-unlock { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+.act-unlock-password { max-width: 14rem; }
+.act-unlock-msg { flex-basis: 100%; font-size: .85em; }

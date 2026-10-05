@@ -21,7 +21,7 @@ retention period suits your organisation, are yours to decide.
 | Holders of a temporary credential | Someone an account holder gave a temporary credential to. They act under that account; the audit log records the credential's name. |
 | Recipients of a public link (a file, folder or note) | No account. Each visit is audited with their address and browser's user agent. |
 | Senders to an upload link | No account. Their address is kept with the upload for about a day, and each upload is audited with their address and user agent. |
-| Anyone who types a name at the sign-in page | A failed sign-in is audited with the name exactly as typed, whether or not it is an account (a password typed into the username box included), with the address and, on the web, the user agent. The sign-in throttles count it under a keyed stand-in, not the name. |
+| Anyone who types a name at the sign-in page | A failed sign-in is audited with the address and, on the web, the user agent. A name that is an account's username, or its email address where the sign-in method accepts one, is recorded as the account's username, and a temporary credential's name with the credential; any other name (a password typed into the username box included) exactly as typed, or as the recording levels keep a name typed at a failed sign-in (**new in 0.34.0**). The sign-in throttles count it under a keyed stand-in, not the name. |
 | People invited by email | Their username, email address and role, from the invitation. |
 | Administrators acting on others | Their username appears in the records of the people they changed, and in the record of each administrator they made. |
 
@@ -49,11 +49,11 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
-| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. **New in 0.33.1:** `permission_defaults_revision`, the revision of the role's default permissions the account has been given. **New in 0.34.0:** `password_set_by` and `password_set_by_other_at`, which account set the current password and when, when that was someone other than the person (an administrator, a user who manages users, the server's operator, or the maker of a reset link someone else made); filled once at the first start from the audit log for existing accounts, cleared when the person sets their own. | The account; taking back a password someone else set when the account is made an administrator, and refusing its approvals until then. | Life of the account. | Deleting the account. |
+| `users` | Username, email (optional), password hash, role, active and locked state, failed sign-in count, last sign-in, creation time and creator, storage quota, SFTP settings. **New in 0.33.0:** `second_factor_reset_at`, when an administrator reset the person's second factor. **New in 0.33.1:** `permission_defaults_revision`, the revision of the role's default permissions the account has been given. **New in 0.34.0:** `password_set_by` and `password_set_by_other_at`, which account set the current password and when, when that was someone other than the person (an administrator, a user who manages users, the server's operator, or the maker of a reset link someone else made); filled once at the first start from the audit log for existing accounts, cleared when the person sets their own. `privacy_seen_version`, the version of the recording notice the person last said they had read. | The account; taking back a password someone else set when the account is made an administrator, and refusing its approvals until then. | Life of the account. | Deleting the account. |
 | `user_ssh_keys` | Key name, public key, fingerprint, created, last used, who added it. **New in 0.34.0:** `created_by_name`, the username of who added it (the person, an administrator, or `operator@host`), kept when that account is deleted; filled at the first start for older keys from the account that added them or the audit row of the addition. | SFTP sign-in by key; showing who added a key, and telling its owner when the administrator who added it leaves. | Until removed. | The person or an administrator removing it; deleted with the account. |
 | `second_factor_enrollments`, `second_factor_recovery_codes` | Method, the authenticator seed (encrypted), times; recovery-code hashes. | Second factor. | Until reset or removed. | Resetting the second factor; deleted with the account. |
-| `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. **New in 0.33.1:** where it was signed in (`web` or `sftp`). The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The periodic cleanup (every 5 minutes); deleted with the account. |
-| `pending_logins` | The account, client address, attempts. | A sign-in waiting for its second factor. | 30 days after it completed or expired. | The periodic cleanup; deleted with the account. |
+| `active_sessions` | Session token hash, the account, a temporary credential if one was used, the client address, start, last activity, expiry. **New in 0.33.1:** where it was signed in (`web` or `sftp`). The Activity page's "Now" panel shows each signed-in account's latest address from here. | Keeping a person signed in; ending sessions. | While the session lasts, then 30 days after it ended (longer only if tokens are configured to live longer). | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the account. |
+| `pending_logins` | The account, client address, attempts. | A sign-in waiting for its second factor. | 30 days after it completed or expired. | The pruner; deleted with the account. |
 | `sign_in_lockouts` **New in 0.33.0** | The account, the source address (an IPv6 address as its /64, or `*` for the account-wide count), failure count, window start, last failure, lock start and end. | Automatic locks: wrong passwords from one address lock new sign-ins from that address, and past a higher count from all addresses together over about 24 hours, from everywhere. | An address count with no lock: a day after its last failure. The account-wide count: at most a day after its last failure, by when it has lost every one (it loses one every 24 hours divided by the backstop, every 72 minutes by default). A right password adds nothing here. A lock: until it ends (`ACCOUNT_LOCKOUT_MINUTES`, 15 by default; the account-wide pause lasts until its count has lost a failure, if that is later), or until an administrator clears it when that setting is 0. | The periodic cleanup; an administrator's unlock (deletes every row for the account); deleted with the account. |
 | `temporary_credentials`, `temp_credential_vault_access` | The generated username, a hash of the credential, the owner's note about it (free text), its scope and passcode hash, times, creator. | Delegated, time-limited access. | Until the owner deletes it: an expired credential stays listed. | The owner deleting it; deleted with the account. |
 | `devices`, `device_grants` | Device label, secret hashes, last seen, created, expiry; which vaults it syncs. | Desktop sync. | Until revoked and deleted. | The person deleting the device; deleted with the account. |
@@ -70,7 +70,7 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `shares`, `share_claims` | Who shared what with which people or departments, limits, status; who claimed it, when they last used it, how many downloads. | Sharing inside the deployment. | After expiry or revocation too, until the shared item, the vault or the sharer's account is deleted. | Deleting the item, the vault or the account. |
 | `user_keypairs`, `vault_member_keys`, `vault_member_index_keys`, `zk_share_invites` | Public keys, fingerprints, wrapped keys, who granted or revoked them. | Zero-knowledge vaults. | Until revoked or replaced. | Deleted with the account or the vault. |
 | `vault_key_proofs` **New in 0.33.2** | For each key epoch of a zero-knowledge vault: the vault, the epoch, how it was set up (`create`, `rotate`, `bootstrap` or `owner_reset`), when, and the id of the account that installed it (`created_by`), the only column that points to a person. The proof material beside it (a public key, a sealed private key and two MACs) is derived from the vault's key and says nothing about anyone. | A change to the vault's keys (rotating, sharing, setting the name-index key) must prove it holds the current epoch's key; the account id says who set up each epoch's check. | Until the vault is deleted, or until its epoch is retired (an epoch below the oldest one still in use, when a manager retires old key versions). | Deleted with the vault; retiring the epoch; `created_by` is cleared (set to empty) when that account is deleted, and the row stays for the vault. |
-| `zk_key_proof_challenges` **New in 0.33.2** | The id of the account a challenge was issued to (`user_id`), the vault it is for, the operation, the key epochs, a sealed one-time server key, a random nonce, a hash of the vault's verifying key, and when it was issued. | Each key change to a zero-knowledge vault answers a one-time challenge issued to that account for that vault and operation; the account id makes sure only the account it was issued to can use it. At most 32 live challenges per account. | Five minutes. A challenge is deleted as soon as it is answered. | Answering it; the account's next challenge request deletes its expired ones; the periodic cleanup (every 5 minutes) deletes the rest; deleted with the account. |
+| `zk_key_proof_challenges` **New in 0.33.2** | The id of the account a challenge was issued to (`user_id`), the vault it is for, the operation, the key epochs, a sealed one-time server key, a random nonce, a hash of the vault's verifying key, and when it was issued. | Each key change to a zero-knowledge vault answers a one-time challenge issued to that account for that vault and operation; the account id makes sure only the account it was issued to can use it. At most 32 live challenges per account. | Five minutes. A challenge is deleted as soon as it is answered. | Answering it; the account's next challenge request deletes its expired ones; the pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default) deletes the rest; deleted with the account. |
 
 ### Content
 
@@ -95,15 +95,17 @@ Visits to a link and uploads through one are also in the audit log.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|
-| `audit_logs` | See [The audit log](#the-audit-log). | Accountability and security. | **For ever by default** (`AUDIT_LOG_RETENTION_DAYS=0`). | A positive `AUDIT_LOG_RETENTION_DAYS` deletes older rows. **Not** deleted with the account. |
-| `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. | Opening the alerts view deletes old resolved alerts, at most once an hour. **Not** deleted with the account. |
-| `rate_limit_records` | An address; for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The periodic cleanup. |
-| `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key), and the ids of the administrator who asked, of the administrators that administrator's grant descends from, and of those who had changed the account in the 14 days before; and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The periodic cleanup (every 5 minutes); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
+| `audit_logs` | See [The audit log](#the-audit-log). | Accountability and security. | **For ever by default** (`AUDIT_LOG_RETENTION_DAYS=0`). | The pruner, by the maximum days (`AUDIT_LOG_RETENTION_DAYS`, or the panel) and the size cap (`AUDIT_LOG_MAX_MB`, or the panel), never below the protected minimums (`AUDIT_MIN_RETENTION_DAYS`; `AUDIT_PROTECTED_MIN_DAYS`, 365 days, for administration and security rows, which the size cap never deletes), and not while the hold switch (`RETENTION_HOLD`, or the panel) is on. **Not** deleted with the account. |
+| `security_alerts` | Event type, a message, the username and address involved, details, who resolved it and their notes. **Changed in 0.34.0:** the message no longer spells out the name and the address (it is completed from the alert's own fields when shown). | Alerting administrators to attacks. | A resolved alert: `SECURITY_ALERT_RETENTION_DAYS` (90 by default). An unresolved alert: until resolved. **New in 0.34.0:** the name and the address are cleared once the alert is older than the security record's window (`SECURITY_RECORD_DAYS`), resolved or not. | The pruner deletes old resolved alerts and clears the names and addresses, unless the hold switch is on. **Not** deleted with the account. |
+| `security_records` **New in 0.34.0** | Each failed sign-in (a web password, a second-factor code, an SFTP password): the time, what failed, the account the name matched, the name exactly as typed (which can be a password typed into the wrong box), the address, the way in, the reason, and the alert it raised. Kept in full whatever the audit log keeps. A record that cannot be written (a fault in this table) never costs the failure's audit row: the row is written, and an alert for the administrators (`audit_recording_degraded`) says records are missing. | Blocking addresses, counting failures and investigating attacks. | `SECURITY_RECORD_DAYS` (30 by default; the panel can change it between `SECURITY_RECORD_MIN_DAYS` and `SECURITY_RECORD_MAX_DAYS`). | The pruner, unless the hold switch is on. The account id is cleared when the account is deleted. |
+| `rate_limit_records` | An address; for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The pruner. |
+| `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key), and the ids of the administrator who asked, of the administrators that administrator's grant descends from, and of those who had changed the account in the 14 days before; and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
 | `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | Who may approve a held change: neither the administrator who asked nor the approver may have made the other one, directly or through administrators they made, and the approver must have been one for 14 days before the request. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
 | `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username; and to every other administrator, that an account became an administrator and who made it one. | Telling people what happened. | Until the person deletes it. | The person; deleted with the account. |
-| `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
+| `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. **Changed in 0.34.0:** the person filter keeps a name the audit log holds in full (an account's username, or a name recorded in full under earlier levels) as typed; any other name, one typed at a failed sign-in, is kept as the recording levels keep those: in full, as its fingerprint, or, at "not recorded", not at all (such a search cannot be saved). The free text and addresses are kept as typed. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
+| `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
 
 ### Other tables
 
@@ -120,6 +122,15 @@ says which version a change to the stored data needs, what the change was, and h
 manages within the deployment's limits, one row per setting, with the id and username of whoever set
 each one last and when. A row is overwritten by the next change and never deleted.
 
+Everyone can read what the audit log records, how long each store keeps data and who can see it at
+`/recording` (new in 0.34.0), linked from the sign-in, invitation and link pages and the account menu; the
+operator states the legal basis and a contact in Settings, Activity and records.
+
+`audit_privacy_policies` (new in 0.34.0) holds each version of the recording levels (what the audit log
+records of each kind of personal data), with the id and username of the administrator who saved it, or
+"server configuration" for a version the server wrote to bring a level within a lowered `.env` limit, and
+when. Rows are never changed or deleted: each change adds a version.
+
 `sftp_processes` (new in 0.34.0) holds each running SFTP server process's version and its container's
 host name, refreshed every 30 seconds; it holds no personal data. A process removes its row when it
 stops, and rows not refreshed for 7 days are removed.
@@ -128,8 +139,11 @@ stops, and rows not refreshed for 7 days are removed.
 
 Each row of `audit_logs` holds:
 
-- the account's id and username. For a failed sign-in with a name that is no account, the name
-  exactly as it was typed, with no account id;
+- the account's id and username. For a failed sign-in, no account id: the account's username when the
+  name typed is an account's username or **(new in 0.34.0)** its email address where the sign-in method
+  accepts one (the web's method in Settings, Accounts & Access; SFTP signs in by username), a temporary
+  credential's name with its id and name when the name typed is one, and otherwise the name as it was
+  typed, as the recording levels keep it;
 - for a temporary credential, its id and **(new in 0.33.0)** its name, kept after the credential is
   deleted;
 - what happened (the action), its outcome, the resource's type and id, and the time;
@@ -141,24 +155,51 @@ Each row of `audit_logs` holds:
   agent. Before 0.33.0 no row carried a user agent;
 - details, which depend on the action: for example the account a change was made to, an email
   address before and after a change, who a share went to, or the filters of an export. Vault, file
-  and folder names are never stored: they are removed from the details as each row is written.
-  **New in 0.33.2:** a change to a zero-knowledge vault's keys records how it was proved (`proof`),
-  and a refused key proof records the operation and which part failed. The proof itself (its
-  header, MACs, challenge nonce) and the request body are never stored;
+  and folder names are never stored in the details; nor are session tokens, passwords or link tokens,
+  and of an error only its type is. **New in 0.33.2:** a change to a zero-knowledge vault's keys
+  records how it was proved (`proof`), and a refused key proof records the operation and which part
+  failed. The proof itself (its header, MACs, challenge nonce) and the request body are never stored.
+  **New in 0.34.0:** a detail whose key the application does not classify is not stored (its key is
+  noted in `recorded`, and an alert is raised);
 - an error message for a failure;
-- **New in 0.34.0, and empty on every row so far:** `recorded` (what the recording policy keeps of the
-  row's personal values), `privacy_version` (which policy that was), `seal_nonce` (a random value per
-  row for the log's integrity chain), `ip_via` (how the address was learned) and `case_id` (a
-  compliance case). `security_alerts` gains the same `ip_via`, also empty.
+- **New in 0.34.0: the recording levels.** What a row keeps of vault, file and folder names, of the name typed
+  at a failed sign-in, of email addresses, of the address and of the user agent follows the levels an
+  administrator chooses, within the
+  limits `.env` sets (`AUDIT_MAX_NAMES`, `AUDIT_MAX_SIGNIN_NAMES`, `AUDIT_MAX_EMAILS`, `AUDIT_MAX_IP`,
+  `AUDIT_MAX_USER_AGENT`). Version 1, the default, records what earlier releases did. A value recorded at
+  a lower level is either not stored or stored in another form in `recorded` (a shortened address keeps
+  the /24 or /48 it is in; a name at the fingerprint level keeps a keyed fingerprint, under a key of its
+  own for each vault's names); the row's own columns and details hold only values recorded in full. A row
+  never keeps a vault, file or folder name in plain text: at the full level a name is kept sealed in
+  `recorded`, encrypted under a key derived for its vault and its row, and is opened only for administrators
+  who can read the vault: the vault's own name always; a file's or a folder's name only in a vault that is not
+  zero-knowledge, and in a password-protected vault only once its password is given on the Activity page.
+  A fingerprint is made with `AUDIT_FINGERPRINT_KEY` (or a key derived from `ENCRYPTION_KEY`): it hides a
+  name from someone who reads the database without `.env`, but anyone who holds `.env` (it is in the
+  backups) can test guesses, and finds a short or common name quickly. Any administrator can also test a
+  guess of a name typed at a failed sign-in, by searching the Activity page for it: the search fingerprints
+  what is typed and finds the rows that kept the same fingerprint. Name fingerprints, and names opened from
+  their seals, are shown and exported only to administrators who can read the vault.
+  `privacy_version` says which version of the levels a row was recorded under (none: an earlier release;
+  -1: recorded without its personal values because deciding failed, with an alert). Changing the levels
+  never rewrites older rows;
+- **New in 0.34.0, and empty on every row so far:** `seal_nonce` (a random value per row for the log's
+  integrity chain), `ip_via` (how the address was learned) and `case_id` (a compliance case).
+  `security_alerts` gains the same `ip_via`, also empty.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is
-kept for ever. A positive value deletes rows older than that many days, at most once an hour, when an
-administrator's dashboard loads. The application only adds rows and deletes old ones; anyone with
-database access can change the table.
+kept for ever. A positive value makes the pruner delete rows older than that many days, on a timer, unless
+the hold switch is on (`RETENTION_HOLD`, or the panel). Administration and security rows are kept at least
+`AUDIT_PROTECTED_MIN_DAYS` (365 days by default) whatever the maximum, and a size cap (`AUDIT_LOG_MAX_MB`)
+never deletes them. An administrator can change the maximum, the minimums and the cap in the panel,
+within the limits `.env` sets; a change that deletes sooner waits `RETENTION_REDUCTION_DELAY_DAYS` and
+every administrator is told. After an upgrade from a release that deleted only when an administrator's
+dashboard loaded, a positive `AUDIT_LOG_RETENTION_DAYS` first waits in the same way. The application only
+adds rows and deletes old ones; anyone with database access can change the table.
 
-Names typed at failed sign-ins appear on the Activity page (filtered as "no account") and in its
-exports. The summary charts' "most active people" leaves them out, and the page's username search
+Names typed at failed sign-ins appear on the Activity page (filtered as "no account", which also lists a
+failed sign-in for an account or a temporary credential, as its row has no account id) and in its exports. The summary charts' "most active people" leaves them out, and the page's username search
 suggests only accounts: it does not read the log for its suggestions, whatever it is asked.
 
 ## Cache (Redis)
@@ -266,6 +307,8 @@ and the unlock state.
    - their rows in `audit_logs` (username, addresses, user agents, details), and the row recording
      the deletion;
    - `security_alerts` naming them (resolved ones age out after `SECURITY_ALERT_RETENTION_DAYS`);
+   - `security_records` of failed sign-ins with their name (deleted after `SECURITY_RECORD_DAYS`; the account
+     id on them is cleared);
    - their username on other accounts' `credential_changes` rows, as the requesting or deciding
      administrator, and their id in a request's kept approval record, until those rows are deleted 14
      days after the change or decision (a request they had open is withdrawn when they are deleted);
@@ -289,6 +332,7 @@ and the unlock state.
    -- Back up first. These deletions are not themselves audited.
    DELETE FROM audit_logs WHERE username = 'the-username';
    DELETE FROM security_alerts WHERE username = 'the-username';
+   DELETE FROM security_records WHERE name = 'the-username';
    DELETE FROM account_invitations WHERE username = 'the-username';
    ```
 
@@ -302,8 +346,16 @@ There is no built-in per-person erasure yet.
 
 | Setting | Default | Governs |
 |---|---|---|
-| `AUDIT_LOG_RETENTION_DAYS` | `0` (keep for ever) | Audit rows. |
+| `AUDIT_LOG_RETENTION_DAYS` | `0` (keep for ever) | Audit rows: the deployment's maximum days, which the panel can change. |
+| `AUDIT_MIN_RETENTION_DAYS` | `0` | Audit rows: none younger is deleted; the panel cannot go below it. |
+| `AUDIT_PROTECTED_MIN_DAYS` | `365` | Administration and security audit rows: none younger is deleted by age; only `.env` lowers it. |
+| `AUDIT_LOG_MAX_MB` | `0` (off) | Audit rows: a size cap; the oldest go first, never administration or security rows. |
+| `PLAN_LOG_MAX_DAYS`, `PLAN_LOG_MAX_MB` | `-1` (none) | Ceilings on the audit log's maximum days and size cap. |
+| `RETENTION_REDUCTION_DELAY_DAYS` | `7` | How long a change that deletes sooner waits; any administrator can cancel it meanwhile. |
+| `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
+| `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |
+| `SECURITY_RECORD_DAYS` | `30` | Failed sign-ins kept in full, and the names and addresses in security alerts (between `SECURITY_RECORD_MIN_DAYS`, 7, and `SECURITY_RECORD_MAX_DAYS`, 365). |
 | `ACCOUNT_LOCKOUT_MINUTES` | `15` | Automatic locks, and the phantom-name counters in Redis. |
 | `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `300` | Sign-in counters. |
 | `ENFORCE_FILE_EXPIRY` | `true` | Whether vault and upload-link expiry deletes files. |

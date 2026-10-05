@@ -20,6 +20,10 @@ Security properties (relied on by the auth throttles, so they are enforced HERE,
     deployment-managed keys elsewhere.
   * The stored sentinel 0 (or absent) means "use the deployment default", so clearing an override is a
     save of 0 — identical to the API-bucket and the legacy login-limit convention.
+  * LOCKABLE: each limit is listed in the settings registry (group ``rate_limits``), so the deployment can
+    lock it with SETTINGS_LOCKED_KEYS (its key, the group, or ``*``). A locked limit resolves to the
+    deployment default whatever the blob holds (unlocked_overrides), and the settings API refuses a
+    change to it.
 """
 from __future__ import annotations
 
@@ -271,6 +275,36 @@ _BY_KEY: dict[str, RateLimitSpec] = {s.key: s for s in REGISTRY}
 # rate_limit_api_enabled, *_deployment_defaults) is deployment-managed and refused by the API.
 OVERRIDE_KEYS: frozenset[str] = frozenset(_BY_KEY)
 
+# The group SETTINGS_LOCKED_KEYS names to lock every rate limit at once.
+LOCK_GROUP = "rate_limits"
+
+
+def _list_in_registry() -> None:
+    from app.core import settings_registry
+    for spec in REGISTRY:
+        if spec.key not in settings_registry._LISTED:
+            settings_registry.register_listed(spec.key, group=LOCK_GROUP, label=spec.label)
+
+
+_list_in_registry()
+
+
+def is_locked(key: str) -> bool:
+    """Whether the deployment has locked the limit ``key`` (SETTINGS_LOCKED_KEYS)."""
+    from app.core import settings_registry
+    return settings_registry.listed_locked(key)
+
+
+def unlocked_overrides(blob: Optional[Mapping]) -> Mapping:
+    """``blob`` without the overrides of the limits the deployment has locked: what every reader of the
+    custom limits resolves from, so a locked limit is its deployment default."""
+    if not isinstance(blob, Mapping):
+        return {}
+    locked = [key for key in OVERRIDE_KEYS if key in blob and is_locked(key)]
+    if not locked:
+        return blob
+    return {k: v for k, v in blob.items() if k not in locked}
+
 
 def deployment_default(key: str) -> int:
     """The environment-configured value for `key`, clamped into [deployment_floor, maximum] (a bad env
@@ -306,7 +340,7 @@ def resolve(key: str, blob: Optional[Mapping]) -> int:
     """The effective limit for `key`: a valid, in-bounds custom override, else the deployment default.
     FAIL-SAFE — any problem with the override yields the deployment default, never an open limit."""
     spec = _BY_KEY[key]
-    if isinstance(blob, Mapping):
+    if isinstance(blob, Mapping) and not is_locked(key):
         custom = _valid_custom(blob.get(key), spec)
         if custom is not None:
             return custom
@@ -314,8 +348,9 @@ def resolve(key: str, blob: Optional[Mapping]) -> int:
 
 
 def custom_value(key: str, blob: Optional[Mapping]) -> Optional[int]:
-    """The stored custom override for `key` if one is set and usable, else None (UI: no override)."""
-    if isinstance(blob, Mapping):
+    """The stored custom override for `key` if one is set, usable and not locked, else None (UI: no
+    override)."""
+    if isinstance(blob, Mapping) and not is_locked(key):
         return _valid_custom(blob.get(key), _BY_KEY[key])
     return None
 
@@ -352,6 +387,7 @@ def describe_all(blob: Optional[Mapping]) -> list[dict]:
             "deployment": deployment_default(spec.key),
             "custom": custom_value(spec.key, blob),
             "effective": resolve(spec.key, blob),
+            "locked": is_locked(spec.key),
         })
     return rows
 

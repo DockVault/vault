@@ -16,8 +16,21 @@ from conftest import unique
 pytestmark = pytest.mark.ui
 
 
+def _request_filters(request) -> dict:
+    """The filters a read of the Events list carried: in the query string, or, for a read whose filters hold
+    typed text, in the body of its posted form (which keeps what was typed out of the request line)."""
+    from urllib.parse import parse_qs, urlparse
+    if request.method == "POST":
+        return request.post_data_json or {}
+    return {k: v if len(v) > 1 else v[0] for k, v in parse_qs(urlparse(request.url).query).items()}
+
+
+def _filters(resp) -> dict:
+    return _request_filters(resp.request)
+
+
 def _ids_read(resp):
-    return "/activity/events" in resp.url and "ids=" in resp.url
+    return "/activity/events" in resp.url and "ids" in _filters(resp)
 
 
 def _open_on(page: Page, user, name):
@@ -43,7 +56,7 @@ def test_a_new_event_appears_at_the_top_of_an_idle_list(page: Page, anon, activi
     # server answers with nothing.
     with page.expect_response(_ids_read, timeout=10000) as other:
         failed_sign_in(anon)
-    assert f"user={name}" in other.value.url
+    assert _filters(other.value)["user"] == name and name not in other.value.url
     assert other.value.json()["events"] == []
     expect(rows(page)).to_have_count(1)
 
@@ -101,7 +114,7 @@ def test_a_row_committed_late_goes_in_by_its_time(page: Page, anon, activity_adm
     held = {}
 
     def first_read_without_the_middle_row(route):
-        if "ids=" in route.request.url or held.get("done"):
+        if "ids" in _request_filters(route.request) or held.get("done"):
             return route.continue_()
         resp = route.fetch()
         body = resp.json()

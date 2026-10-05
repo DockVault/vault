@@ -21,7 +21,8 @@ import json
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, desc
 
-from app.core.models import AuditLog, User, SecurityAlert
+from app.core.models import AuditLog, User, SecurityAlert, SecurityRecord
+from app.core.security_records import ADDRESS_TOKEN, LOGIN, NAME_TOKEN, render_message
 from app.core.database import redis_client
 from app.core.config import settings
 
@@ -31,10 +32,6 @@ logger = logging.getLogger(__name__)
 # emit at most once per cooldown window per process during a Redis outage. None = never emitted yet, so
 # the FIRST emit always runs (monotonic() can be < the window on a freshly-booted host).
 _last_degraded_signal_at = None
-
-# Process-wide throttle for opportunistic old-alert cleanup (see cleanup_old_alerts): run at most once
-# per hour per process. None = never run yet, so the first cleanup always runs.
-_last_alert_cleanup_at = None
 
 
 def _sanitize_for_log(value: Optional[str], max_len: int = 256) -> Optional[str]:
@@ -111,14 +108,15 @@ class SecurityMonitor:
     # Event Recording
     # ========================================================================
     
-    def record_failed_login(self, username: str, ip_address: str, reason: str):
+    def record_failed_login(self, username: str, ip_address: str, reason: str, record_id=None):
         """
         Record a failed login attempt and check for suspicious patterns.
-        
+
         Args:
             username: Username attempted
             ip_address: Source IP address
             reason: Failure reason
+            record_id: the failure's security record, linked to the alert it raises
         """
         now = time.time()
         # The counter's key carries the name's keyed stand-in, never the name as typed, which can be a
@@ -143,8 +141,12 @@ class SecurityMonitor:
         username = _sanitize_for_log(username)
         ip_address = _sanitize_for_log(ip_address)
 
+        # The alert's message holds placeholders where the name and the address belong: they are kept in
+        # the alert's own fields, cleared after the security record's window, and put back into the text
+        # only when it is shown (app/core/security_records.py).
+        alert = None
         if recent_attempts >= self.failed_login_threshold_critical:
-            self._raise_alert(
+            alert = self._raise_alert(
                 event_type=SecurityEventType.BRUTE_FORCE_ATTEMPT,
                 severity=SecurityAlertLevel.CRITICAL,
                 username=username,
@@ -154,10 +156,11 @@ class SecurityMonitor:
                     'window_minutes': self.failed_login_window_minutes,
                     'reason': reason
                 },
-                message=f"CRITICAL: Brute force attack detected - {recent_attempts} failed login attempts for {username} from {ip_address} in {self.failed_login_window_minutes} minutes"
+                message=(f"CRITICAL: Brute force attack detected - {recent_attempts} failed login attempts for "
+                         f"{NAME_TOKEN} from {ADDRESS_TOKEN} in {self.failed_login_window_minutes} minutes")
             )
         elif recent_attempts >= self.failed_login_threshold_warning:
-            self._raise_alert(
+            alert = self._raise_alert(
                 event_type=SecurityEventType.MULTIPLE_FAILED_LOGINS,
                 severity=SecurityAlertLevel.WARNING,
                 username=username,
@@ -167,10 +170,23 @@ class SecurityMonitor:
                     'window_minutes': self.failed_login_window_minutes,
                     'reason': reason
                 },
-                message=f"WARNING: Multiple failed login attempts - {recent_attempts} failures for {username} from {ip_address}"
+                message=(f"WARNING: Multiple failed login attempts - {recent_attempts} failures for {NAME_TOKEN} "
+                         f"from {ADDRESS_TOKEN}")
             )
+        if alert is not None and record_id is not None:
+            try:
+                from app.core.models import SecurityRecord
+                self.db.query(SecurityRecord).filter(SecurityRecord.id == record_id).update(
+                    {"alert_id": alert.id}, synchronize_session=False)
+                self.db.commit()
+            except Exception:  # noqa: BLE001 -- the record stands without its link
+                self.db.rollback()
         
-        logger.info(f"Failed login recorded: {username} from {ip_address} ({recent_attempts} recent attempts)")
+        # The container's output shows the name and the address only as far as the recording levels record
+        # them (app/core/audit_privacy.py).
+        from app.core.audit_privacy import ADDRESS, SIGNIN_NAME, for_output
+        logger.info(f"Failed login recorded: {for_output(SIGNIN_NAME, username)} from "
+                    f"{for_output(ADDRESS, ip_address)} ({recent_attempts} recent attempts)")
     
     def record_file_deletion(self, user_id: str, vault_id: str, file_count: int = 1):
         """
@@ -228,7 +244,7 @@ class SecurityMonitor:
                 ip_address=ip_address,
                 details={"surface": surface, "reasons": reasons},
                 message=(f"WARNING: Malicious content blocked in {surface} from "
-                         f"{username or user_id or 'unknown user'}: "
+                         f"{NAME_TOKEN if username else (user_id or 'unknown user')}: "
                          f"{', '.join(reasons) or 'unspecified'}"),
             )
         except Exception:
@@ -392,13 +408,11 @@ class SecurityMonitor:
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         
-        # Query recent security events from audit log
-        failed_logins = self.db.query(AuditLog).filter(
-            and_(
-                AuditLog.action == 'login_failure',
-                AuditLog.timestamp >= cutoff
-            )
-        ).count()
+        # Failed sign-ins come from the security record, which keeps each one in full whatever the audit
+        # log keeps of it (app/core/security_records.py).
+        naive_cutoff = cutoff.replace(tzinfo=None)
+        failed_logins = self.db.query(SecurityRecord).filter(
+            SecurityRecord.kind == LOGIN, SecurityRecord.at >= naive_cutoff).count()
         
         successful_logins = self.db.query(AuditLog).filter(
             and_(
@@ -424,18 +438,12 @@ class SecurityMonitor:
             )
         ).count()
         
-        # Get top failed login IPs
-        failed_login_logs = self.db.query(AuditLog).filter(
-            and_(
-                AuditLog.action == 'login_failure',
-                AuditLog.timestamp >= cutoff
-            )
-        ).all()
-        
+        # Top addresses of failed sign-ins
         ip_failures = defaultdict(int)
-        for log in failed_login_logs:
-            if log.ip_address:
-                ip_failures[log.ip_address] += 1
+        for (address,) in self.db.query(SecurityRecord.address).filter(
+                SecurityRecord.kind == LOGIN, SecurityRecord.at >= naive_cutoff).all():
+            if address:
+                ip_failures[address] += 1
         
         top_failed_ips = sorted(
             ip_failures.items(),
@@ -617,7 +625,7 @@ class SecurityMonitor:
                 'id': str(alert.id),
                 'event_type': alert.event_type,
                 'severity': alert.severity,
-                'message': alert.message,
+                'message': render_message(alert),
                 'username': alert.username,
                 'ip_address': alert.ip_address,
                 'timestamp': alert.timestamp.isoformat(),
@@ -662,45 +670,6 @@ class SecurityMonitor:
             logger.info(f"Security alert {alert_id} resolved by {_sanitize_for_log(resolved_by)}")
             return True
         return False
-    
-    # ========================================================================
-    # Cleanup
-    # ========================================================================
-    
-    def cleanup_old_alerts(self, days: Optional[int] = None):
-        """
-        Delete old RESOLVED alerts beyond the retention window (unresolved alerts are always kept).
-        Process-wide throttled to at most once per hour so it can be wired into a frequently-hit
-        endpoint without issuing a DELETE per request.
-
-        Args:
-            days: retention window; defaults to settings.security_alert_retention_days.
-        """
-        global _last_alert_cleanup_at
-        now = time.monotonic()
-        if _last_alert_cleanup_at is not None and now - _last_alert_cleanup_at < 3600:
-            return 0
-        _last_alert_cleanup_at = now
-
-        if days is None:
-            days = getattr(settings, 'security_alert_retention_days', 90)
-        # Naive UTC to match the TIMESTAMP-WITHOUT-TIME-ZONE column, and synchronize_session=False so
-        # the DELETE runs entirely in Postgres (the default 'evaluate' would compare the naive column
-        # value against the cutoff in Python and raise on naive-vs-aware).
-        cutoff = datetime.utcnow() - timedelta(days=days)
-
-        deleted = self.db.query(SecurityAlert).filter(
-            and_(
-                SecurityAlert.resolved == True,
-                SecurityAlert.timestamp < cutoff
-            )
-        ).delete(synchronize_session=False)
-
-        self.db.commit()
-
-        logger.info(f"Cleaned up {deleted} old security alerts (retention {days}d)")
-
-        return deleted
 
 
 # Global security monitor instance (initialized with db session when needed)

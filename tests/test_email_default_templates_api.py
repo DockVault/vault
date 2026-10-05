@@ -13,7 +13,8 @@ pytestmark = pytest.mark.integration
 
 _ACTION_KEYS = {"email_change", "password_reset", "account_invite", "account_welcome",
                 "login_alert", "share_created", "vault_member_added", "temp_credential_issued",
-                "account_changed_by_admin", "administrator_added", "ssh_keys_adder_left"}
+                "account_changed_by_admin", "administrator_added", "ssh_keys_adder_left",
+                "retention_change"}
 
 
 def _defaults(admin):

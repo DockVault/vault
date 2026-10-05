@@ -105,6 +105,126 @@ def names_for(db, viewer, events: List[dict]) -> List[Dict[str, Optional[str]]]:
     return out
 
 
+def _recorded_names(row) -> Optional[dict]:
+    recorded = getattr(row, "recorded", None)
+    names = recorded.get("names") if isinstance(recorded, dict) else None
+    if not isinstance(names, dict) or not isinstance(names.get("values"), dict):
+        return None
+    return names
+
+
+# The name a vault event records: the vault's own. Every other recorded name is a file's or a folder's.
+VAULT_NAME_KEY = "vault_name"
+SEALED_UNREADABLE = "Recorded, but it cannot be opened"
+
+
+def recorded_names_for(db, viewer, rows, unlocked=frozenset()) -> List[Optional[dict]]:
+    """For each audit row, the names its recording levels kept (recorded.names), or None. Only for a vault the
+    viewer can read, by the same rules as the names above: a fingerprint of a name in a vault the viewer is not
+    in would let them test guesses of what is in it. Each key gives its fingerprint, and a name recorded in
+    full opened where the viewer may see it: the vault's name in a vault they can read; a file's or a folder's
+    name only when, in addition, the vault is not zero-knowledge and has no vault password, or its names were
+    unlocked with the password (``unlocked``: vault ids with a valid receipt, app/core/vault_unlock_receipts.py)."""
+    from app.core.audit_privacy import open_name
+    from app.core.models import Vault
+    kept = [_recorded_names(r) for r in rows]
+    vaults = {_uuid(n.get("vault")) for n in kept if n}
+    vaults.discard(None)
+    readable = readable_vault_ids(db, viewer, vaults) if vaults else set()
+    facts = {r[0]: (r[1], bool(r[2])) for r in db.query(Vault.id, Vault.type, Vault.password_hash)
+             .filter(Vault.id.in_(readable)).all()} if readable else {}
+    out = []
+    for row, names in zip(rows, kept):
+        vault = _uuid(names.get("vault")) if names else None
+        if vault is None or vault not in readable:
+            out.append(None)
+            continue
+        kind, has_password = facts.get(vault, (None, False))
+        items_open = kind != "zero_knowledge" and (not has_password or vault in unlocked)
+        shown = {}
+        for key, value in names["values"].items():
+            if not isinstance(value, dict):
+                continue
+            entry = {"fingerprint": value.get("fp")}
+            if value.get("sealed") and (key == VAULT_NAME_KEY or items_open):
+                try:
+                    entry["name"] = open_name(vault, row.id, key, value["sealed"])
+                except Exception:  # noqa: BLE001 -- a value that does not open is said to, never guessed at
+                    entry["name"] = SEALED_UNREADABLE
+            shown[key] = entry
+        out.append(shown)
+    return out
+
+
+# An unlocked vault's item recorded nothing of its name (the levels in force then recorded none).
+NOT_RECORDED = "Not recorded at the levels in force then"
+# The keys an item's name is recorded under, the one to show first.
+ITEM_NAME_KEYS = ("file_name", "folder_name", "new_name", "old_name")
+
+
+def show_unlocked(events: List[dict], unlocked) -> None:
+    """For an event in a vault whose names were unlocked, show its item as it was recorded: the name recorded in
+    full, or its fingerprint (a fingerprint stays a fingerprint), or that nothing was recorded. Never the item's
+    name looked up now: the recording levels decide what is shown. Changes the events in place; each needs its
+    "names" and "recorded_names" first."""
+    if not unlocked:
+        return
+    for event in events:
+        names = event.get("names") or {}
+        vault_id, _ = targets(event)
+        if names.get("item") != PASSWORD_HIDDEN or vault_id not in unlocked:
+            continue
+        recorded = event.get("recorded_names") or {}
+        shown = NOT_RECORDED
+        for key in ITEM_NAME_KEYS:
+            entry = recorded.get(key)
+            if entry:
+                shown = entry.get("name") or entry.get("fingerprint") or NOT_RECORDED
+                break
+        names["item"] = shown
+
+
+def unlocked_vaults(db, viewer, request) -> frozenset:
+    """The vaults whose names this request may see, from the receipts it carries (X-Activity-Unlock:
+    ``<vault id>:<receipt>`` pairs, comma-separated): each checked for this session, account and vault, the
+    vault readable by the viewer, existing, not zero-knowledge, with its password as it is now."""
+    from app.core import vault_unlock_receipts as receipts
+    from app.core.models import Vault
+    raw = request.headers.get(UNLOCK_HEADER) if request is not None else None
+    if not raw:
+        return frozenset()
+    pairs = {}
+    for part in raw.split(",")[:MAX_UNLOCKED]:
+        vid, _, receipt = part.strip().partition(":")
+        vault_id = _uuid(vid)
+        if vault_id is not None and receipt:
+            pairs[vault_id] = receipt
+    if not pairs:
+        return frozenset()
+    from app.api.api_server import _current_session_hash
+    session_hash = _current_session_hash(request)
+    facts = {r[0]: (r[1], r[2]) for r in db.query(Vault.id, Vault.type, Vault.password_hash)
+             .filter(Vault.id.in_(set(pairs))).all()}
+    readable = readable_vault_ids(db, viewer, set(facts))
+    out = set()
+    for vault_id, receipt in pairs.items():
+        if vault_id not in facts or vault_id not in readable:
+            continue
+        kind, password_hash = facts[vault_id]
+        if kind == "zero_knowledge" or not password_hash:
+            continue
+        if receipts.verify(receipt, purpose=receipts.PURPOSE_ACTIVITY, session_hash=session_hash,
+                           vault_id=vault_id, user_id=viewer.id,
+                           credential=receipts.credential_digest(password_hash)):
+            out.add(vault_id)
+    return frozenset(out)
+
+
+UNLOCK_HEADER = "X-Activity-Unlock"
+# The most vaults one request may carry receipts for.
+MAX_UNLOCKED = 20
+
+
 def temp_credential_names(db, events: List[dict]) -> None:
     """Fill in the temporary credential's name on events that record only its id (rows written before
     0.33.0 kept the id alone), while that credential still exists. Changes the events in place."""

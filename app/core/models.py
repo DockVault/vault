@@ -176,6 +176,10 @@ class User(Base):
     # email-less accounts coexist. See app/core/email_identity.py.
     email = Column(String(255), unique=True, nullable=True, index=True)
     password_hash = Column(String(255), nullable=False)
+    # The version of the recording levels (app/core/audit_privacy.py) whose notice this account last said it
+    # had read; NULL is version 1, what the vault recorded before the levels existed. A newer version shows a
+    # banner after sign-in until it is read (app/core/recording_notice.py). Nullable: an older release ignores it.
+    privacy_seen_version = Column(Integer, nullable=True)
     role = Column(Enum(RoleEnum), nullable=False, default=RoleEnum.USER)
     
     is_active = Column(Boolean, default=True)
@@ -1231,8 +1235,9 @@ class AuditLog(Base):
     resource_type = Column(String(50), nullable=True)
     resource_id = Column(String(255), nullable=True)
     
-    # When
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    # When. Indexed once, by idx_audit_timestamp below (an install made before 0.34.0 also has a second,
+    # identical ix_audit_logs_timestamp, which background maintenance drops).
+    timestamp = Column(DateTime, default=datetime.utcnow)
     
     # Where
     ip_address = Column(String(45), nullable=True)
@@ -1250,13 +1255,15 @@ class AuditLog(Base):
     details = Column(JSON, nullable=True)  # Additional context
     error_message = Column(Text, nullable=True)
 
-    # Set through AuditLogger.build_row's hooks (app/services/audit_row_hooks.py), which leave them NULL
-    # for now. Nullable with no default: adding them to an existing table rewrites no row, and a release
-    # that does not know them writes NULL and never reads them.
+    # Set through AuditLogger.build_row's hooks (app/services/audit_row_hooks.py). Nullable with no
+    # default: adding them to an existing table rewrites no row, and a release that does not know them
+    # writes NULL and never reads them.
     #   seal_nonce      -- a random value per row, under which the log's integrity chain commits to the
     #                      row's personal values;
-    #   privacy_version -- the recording policy the row was written under;
-    #   recorded        -- what that policy kept of the row's personal values;
+    #   privacy_version -- the recording policy the row was written under (app/core/audit_privacy.py;
+    #                      -1: recorded without its personal values because deciding failed);
+    #   recorded        -- what that policy kept of the row's personal values in another form than the
+    #                      value itself, and the detail keys it dropped as unclassified;
     #   ip_via          -- how the recorded address was learned;
     #   case_id         -- the compliance case the row was written under.
     seal_nonce = Column(LargeBinary, nullable=True)
@@ -1288,6 +1295,31 @@ class SystemSetting(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class AuditPrivacyPolicy(Base):
+    """One version of the recording levels: what the audit log records of each kind of personal data
+    (app/core/audit_privacy.py), within the limits the deployment's .env sets.
+
+    The table only grows: a change adds the next version, and nothing updates or deletes a row (on Postgres
+    a trigger refuses it). Version 1 is what earlier releases recorded. Each audit row stamps the version it
+    was recorded under in ``audit_logs.privacy_version``. ``created_by_name`` is the account's username, or
+    "server configuration" for a version the server wrote itself to bring a level within a lowered limit.
+    Created by create_all; an older release ignores it.
+    """
+    __tablename__ = 'audit_privacy_policies'
+
+    version = Column(Integer, primary_key=True, autoincrement=False)
+    names = Column(String(16), nullable=False)
+    signin_names = Column(String(16), nullable=False)
+    emails = Column(String(16), nullable=False)
+    ip = Column(String(16), nullable=False)
+    user_agent = Column(String(16), nullable=False)
+    # initial, admin, limit (brought within a lowered .env limit) or locked (set to the limit while locked)
+    reason = Column(String(16), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_by_name = Column(String(255), nullable=True)
+
+
 class ManagedSetting(Base):
     """An administrator's value for one setting of the settings registry (app/core/settings_registry.py),
     which resolves it against the deployment's .env, floor, ceiling and lock.
@@ -1305,6 +1337,35 @@ class ManagedSetting(Base):
     updated_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     updated_by_name = Column(String(255), nullable=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ManagedSettingChange(Base):
+    """A change of a managed setting that deletes data sooner, waiting before it applies
+    (app/core/setting_changes.py), and how it ended.
+
+    ``setting`` is what the administrator asked for (NULL: back to the deployment's value); ``old_value`` and
+    ``new_value`` the values in force before it and once it applies, as they stood when it was asked for.
+    ``status`` is pending, applied, cancelled or superseded; ``reason`` says why one that did not apply ended.
+    Any administrator may cancel a pending change. Rows are kept: they are the record of every such change,
+    alongside the audit log. Created by create_all; an older release ignores it, and a pending change then
+    waits until the next upgrade.
+    """
+    __tablename__ = 'managed_setting_changes'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key = Column(String(64), nullable=False, index=True)
+    setting = Column(JSON, nullable=True)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    status = Column(String(16), nullable=False, index=True)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=True)
+    requested_at = Column(DateTime, nullable=False)
+    effective_at = Column(DateTime, nullable=False, index=True)
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    reason = Column(String(255), nullable=True)
 
 
 class SftpProcess(Base):
@@ -1995,6 +2056,27 @@ class UserEndpointPermission(Base):
         # Unique constraint: user can't have same permission twice
         UniqueConstraint('user_id', 'endpoint_group', name='uq_user_endpoint'),
     )
+
+
+class SecurityRecord(Base):
+    """A failed sign-in, kept in full for the security record's window (app/core/security_records.py): when,
+    what failed (``kind``), the account the name matched, the name exactly as typed, the address, how the
+    address was learned (``ip_via``, NULL for now), the way in, the reason, and the alert it raised. Written
+    in the transaction of the failure's audit row. Created by create_all; an older release ignores it."""
+    __tablename__ = 'security_records'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    at = Column(DateTime, nullable=False, index=True)
+    kind = Column(String(32), nullable=False)
+    account_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    name = Column(String(255), nullable=True)
+    address = Column(String(45), nullable=True, index=True)
+    ip_via = Column(String(24), nullable=True)
+    channel = Column(String(20), nullable=True)
+    reason = Column(String(255), nullable=True)
+    # Indexed: deleting an alert sets this to NULL, which would otherwise scan the table once per alert.
+    alert_id = Column(UUID(as_uuid=True), ForeignKey('security_alerts.id', ondelete='SET NULL'), nullable=True,
+                      index=True)
 
 
 class SecurityAlert(Base):

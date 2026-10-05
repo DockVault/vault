@@ -454,26 +454,25 @@ def test_activity_monitor_dead_code_removed_and_complete_wired():
     assert "tracker.complete_operation(operation_id" in api, "the upload finalizer must complete the operation record"
 
 
-def test_cleanup_old_alerts_prunes_old_resolved(admin):
-    # cleanup_old_alerts must delete old RESOLVED alerts beyond the retention window (and keep recent
-    # ones + unresolved ones). Reads settings.security_alert_retention_days, not a hard-coded 90.
+def test_the_pruner_deletes_old_resolved_alerts(admin):
+    # The pruner's security_alerts job deletes old RESOLVED alerts beyond the retention window (and keeps
+    # recent ones + unresolved ones). Reads settings.security_alert_retention_days, not a hard-coded 90.
     u = admin.create_user(role="user")
     try:
         script = "\n".join([
             "import datetime",
             "from app.core.database import get_db_context",
             "from app.services import security_monitor",
-            "security_monitor._last_alert_cleanup_at = None  # ensure the once/hour throttle allows this run",
-            "from app.services.security_monitor import SecurityMonitor",
+            "from app.core import retention",
+            "from app.core.database import SessionLocal",
             "from app.core.models import SecurityAlert",
             f"uid = '{u['id']}'",
             "with get_db_context() as db:",
-            "    m = SecurityMonitor(db)",
             "    old = SecurityAlert(event_type='bulk_file_deletion', severity='warning', message='old', user_id=uid, resolved=True, timestamp=datetime.datetime(2000,1,1,tzinfo=datetime.timezone.utc), details={})",
             "    recent = SecurityAlert(event_type='bulk_file_deletion', severity='warning', message='new', user_id=uid, resolved=True, timestamp=datetime.datetime.now(datetime.timezone.utc), details={})",
             "    db.add(old); db.add(recent); db.commit()",
             "    old_id=str(old.id); recent_id=str(recent.id)",
-            "    m.cleanup_old_alerts()",
+            "    retention.prune_resolved_alerts(retention.Pass(SessionLocal))",
             "    old_gone = db.query(SecurityAlert).filter(SecurityAlert.id==old_id).first() is None",
             "    recent_kept = db.query(SecurityAlert).filter(SecurityAlert.id==recent_id).first() is not None",
             "    db.query(SecurityAlert).filter(SecurityAlert.id==recent_id).delete(); db.commit()",
@@ -1268,24 +1267,22 @@ def test_secure_compose_hardening():
 
 
 def test_audit_retention_prunes_by_setting():
-    # A positive AUDIT_LOG_RETENTION_DAYS makes cleanup_old_audit_logs() (called with no argument, so
-    # it reads settings) delete audit rows older than the window and keep recent ones -- proving the
-    # setting drives the prune, not just an explicit days= argument. The window is deliberately huge
+    # A positive AUDIT_LOG_RETENTION_DAYS makes the pruner's audit_logs job (which reads settings) delete
+    # audit rows older than the window and keep recent ones. The window is deliberately huge
     # (3650d -> cutoff ~2016) so the DELETE only ever reaches the year-2000 seed and never purges
     # real audit history on a persistent dev/VM stack these _in_container tests may run against.
     script = "\n".join([
         "import datetime",
         "from app.core.database import get_db_context",
-        "from app.services import audit_logger as al",
-        "al._last_audit_cleanup_at = None  # allow the once/hour throttle to run",
-        "from app.services.audit_logger import AuditLogger",
+        "from app.core import retention",
+        "from app.core.database import SessionLocal",
         "from app.core.models import AuditLog",
         "with get_db_context() as db:",
         "    old = AuditLog(action='retn_old', status='success', timestamp=datetime.datetime(2000,1,1), details={})",
         "    recent = AuditLog(action='retn_new', status='success', timestamp=datetime.datetime.utcnow(), details={})",
         "    db.add(old); db.add(recent); db.commit()",
         "    old_id=str(old.id); recent_id=str(recent.id)",
-        "    deleted = AuditLogger(db).cleanup_old_audit_logs()",
+        "    deleted = retention.prune_audit_logs(retention.Pass(SessionLocal)).deleted",
         "    old_gone = db.query(AuditLog).filter(AuditLog.id==old_id).first() is None",
         "    recent_kept = db.query(AuditLog).filter(AuditLog.id==recent_id).first() is not None",
         "    db.query(AuditLog).filter(AuditLog.id==recent_id).delete(); db.commit()",
@@ -1299,20 +1296,19 @@ def test_audit_retention_prunes_by_setting():
 
 def test_audit_retention_disabled_by_default_keeps_all():
     # The default (audit_log_retention_days=0) keeps every audit row: audit rows are compliance
-    # records, so deletion is opt-in. Seeding an ancient row and running cleanup with the default
-    # setting must leave it untouched and report zero deletions.
+    # records, so deletion is opt-in. Seeding an ancient row and running the pruner's audit job with the
+    # default setting must leave it untouched and report zero deletions.
     script = "\n".join([
         "import datetime",
         "from app.core.config import settings",
         "from app.core.database import get_db_context",
-        "from app.services import audit_logger as al",
-        "al._last_audit_cleanup_at = None",
-        "from app.services.audit_logger import AuditLogger",
+        "from app.core import retention",
+        "from app.core.database import SessionLocal",
         "from app.core.models import AuditLog",
         "with get_db_context() as db:",
         "    old = AuditLog(action='retn_keep', status='success', timestamp=datetime.datetime(2000,1,1), details={})",
         "    db.add(old); db.commit(); old_id=str(old.id)",
-        "    deleted = AuditLogger(db).cleanup_old_audit_logs()",
+        "    deleted = retention.prune_audit_logs(retention.Pass(SessionLocal)).deleted",
         "    kept = db.query(AuditLog).filter(AuditLog.id==old_id).first() is not None",
         "    db.query(AuditLog).filter(AuditLog.id==old_id).delete(); db.commit()",
         "    print('DEFAULT=%s DELETED=%s KEPT=%s' % (settings.audit_log_retention_days, deleted, kept))",
@@ -1321,9 +1317,6 @@ def test_audit_retention_disabled_by_default_keeps_all():
     assert "DEFAULT=0" in proc.stdout, f"audit_log_retention_days must default to 0 (keep forever)\n{proc.stdout}\n{proc.stderr}"
     assert "DELETED=0" in proc.stdout, f"disabled retention must delete nothing\n{proc.stdout}"
     assert "KEPT=True" in proc.stdout, f"an ancient audit row must survive when retention is disabled\n{proc.stdout}"
-    # The admin dashboard feed must actually invoke the prune (a no-op while disabled).
-    api = _read("app/api/api_server.py")
-    assert "cleanup_old_audit_logs()" in api, "the /audit/events feed must call cleanup_old_audit_logs"
 
 
 def test_vault_scope_denial_is_audited():

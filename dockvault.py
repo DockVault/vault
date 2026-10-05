@@ -246,6 +246,64 @@ import tempfile # noqa: E402
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
 REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
 
+# The .env limits on how long records are kept, and on what the audit log records, as (config key, .env
+# name, the app's default): written only when they differ from the default, and kept across a fresh volume
+# set (see .env.example).
+RETENTION_ENV_KEYS = (
+    ("retention_reduction_delay_days", "RETENTION_REDUCTION_DELAY_DAYS", "7"),
+    ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
+    ("log_prune_batch_rows", "LOG_PRUNE_BATCH_ROWS", "5000"),
+    ("retention_hold", "RETENTION_HOLD", "false"),
+    ("audit_min_retention_days", "AUDIT_MIN_RETENTION_DAYS", "0"),
+    ("audit_protected_min_days", "AUDIT_PROTECTED_MIN_DAYS", "365"),
+    ("audit_log_max_mb", "AUDIT_LOG_MAX_MB", "0"),
+    ("plan_log_max_days", "PLAN_LOG_MAX_DAYS", "-1"),
+    ("plan_log_max_mb", "PLAN_LOG_MAX_MB", "-1"),
+    ("security_record_days", "SECURITY_RECORD_DAYS", "30"),
+    ("security_record_min_days", "SECURITY_RECORD_MIN_DAYS", "7"),
+    ("security_record_max_days", "SECURITY_RECORD_MAX_DAYS", "365"),
+    # The most the audit log may record of each kind of personal data (the recording levels' limits).
+    ("audit_max_names", "AUDIT_MAX_NAMES", "full"),
+    ("audit_max_signin_names", "AUDIT_MAX_SIGNIN_NAMES", "full"),
+    ("audit_max_emails", "AUDIT_MAX_EMAILS", "full"),
+    ("audit_max_ip", "AUDIT_MAX_IP", "full"),
+    ("audit_max_user_agent", "AUDIT_MAX_USER_AGENT", "full"),
+)
+
+# What the audit log may record of personal data at most: setup offers three presets for the AUDIT_MAX_* limits
+# (see .env.example). The panel then chooses the levels at or below them. "full" is the app's default (nothing is
+# written); with --lock-recording-levels each limit is also the level (SETTINGS_LOCKED_KEYS gains audit_levels).
+RECORDING_PRESETS = {
+    "full": {"audit_max_names": "full", "audit_max_signin_names": "full", "audit_max_emails": "full",
+             "audit_max_ip": "full", "audit_max_user_agent": "full"},
+    "standard": {"audit_max_names": "fingerprint", "audit_max_signin_names": "fingerprint",
+                 "audit_max_emails": "full", "audit_max_ip": "shortened", "audit_max_user_agent": "full"},
+    "minimal": {"audit_max_names": "none", "audit_max_signin_names": "none", "audit_max_emails": "none",
+                "audit_max_ip": "none", "audit_max_user_agent": "none"},
+}
+RECORDING_PRESET_HELP = (
+    "full     = the audit log may record names typed at sign-in, email addresses, IP addresses and browser",
+    "           descriptions in full, and vault, file and folder names (sealed); the panel can record less",
+    "standard = at most fingerprints of names, IP addresses shortened to their network, email addresses and",
+    "           browser descriptions in full",
+    "minimal  = none of these is recorded; every event still is (who, what, when, the outcome)",
+)
+RECORDING_LOCK_GROUP = "audit_levels"
+
+
+def recording_preset_config(preset, lock=False, locked_keys=None):
+    """The setup config keys for a recording preset: the five AUDIT_MAX_* limits, and SETTINGS_LOCKED_KEYS with
+    audit_levels added when ``lock`` (kept with whatever ``locked_keys`` already named)."""
+    if preset not in RECORDING_PRESETS:
+        raise ValueError("unknown recording preset %r (one of %s)" % (preset, ", ".join(RECORDING_PRESETS)))
+    cfg = dict(RECORDING_PRESETS[preset])
+    tokens = [t for t in str(locked_keys or "").replace(";", ",").replace(" ", ",").split(",") if t.strip()]
+    if lock and RECORDING_LOCK_GROUP not in [t.strip().lower() for t in tokens]:
+        tokens.append(RECORDING_LOCK_GROUP)
+    cfg["settings_locked_keys"] = ",".join(t.strip() for t in tokens) or None
+    return cfg
+
+
 # Admin-password rules mirror the app's startup guard (app/core/config.py): the shipped placeholder
 # is refused everywhere; a reachable (non-development) deploy also rejects a known-weak value or one
 # under 12 chars. A BLANK password is allowed (the post-bootstrap no-op).
@@ -372,9 +430,9 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), enforce_file_expiry and zk_key_proof_enforce (raw strings; only a false
-    value is written), max_single_request_upload_mb (int or None; written only when set),
-    settings_locked_keys (str; written only when set)."""
+    invite_token_pepper (str), audit_fingerprint_key (str; written only when set), enforce_file_expiry and
+    zk_key_proof_enforce (raw strings; only a false value is written), max_single_request_upload_mb (int or
+    None; written only when set), settings_locked_keys (str; written only when set)."""
     lines = []
 
     def q(k):
@@ -504,10 +562,19 @@ def build_env_lines(cfg):
     # install's .env never mentions it, and kept across a fresh volume set.
     if str(cfg.get("settings_locked_keys") or "").strip():
         bare("SETTINGS_LOCKED_KEYS", "'%s'" % str(cfg["settings_locked_keys"]).strip())
+    # The limits on how long records are kept (see .env.example). Written only when they differ from the
+    # app's defaults, so an install that never mentions them authors the .env it always did.
+    for _cfg_key, _env_name, _default in RETENTION_ENV_KEYS:
+        if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
+            bare(_env_name, str(cfg[_cfg_key]).strip())
     # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
     # decoupled from the JWT secret (the app falls back to the JWT secret only when this is absent).
     if cfg.get("invite_token_pepper"):
         bare("INVITE_TOKEN_PEPPER", "'%s'" % cfg["invite_token_pepper"])
+    # The key of the audit log's fingerprints. Written when there is one: an install set up before it was
+    # generated derives one from ENCRYPTION_KEY, and keeps doing so until a key is added here.
+    if cfg.get("audit_fingerprint_key"):
+        bare("AUDIT_FINGERPRINT_KEY", "'%s'" % cfg["audit_fingerprint_key"])
     return lines
 
 
@@ -1277,7 +1344,12 @@ def new_set_config(current_env, new_prefix, new_id):
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
         # The settings the deployment locks against the admin panel.
         "settings_locked_keys": (current_env.get("SETTINGS_LOCKED_KEYS") or "").strip() or None,
+        # And its limits on how long records are kept.
+        **{cfg_key: (current_env.get(env_name) or "").strip() or None
+           for cfg_key, env_name, _default in RETENTION_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
+        # A new set is new data: its audit fingerprints get a key of their own.
+        "audit_fingerprint_key": gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
@@ -3664,6 +3736,25 @@ class DockVault:
             sftp_public_host = (a("sftp_public_host") or "").strip() or None
             sftp_public_port = a("sftp_public_port")
             update_check, log_pull = bool(a("update_check")), bool(a("enable_log_pull"))
+        # What the audit log may record of personal data at most (RECORDING_PRESETS).
+        preset, lock_levels = a("recording_preset"), bool(a("lock_recording_levels"))
+        if interactive and not preset:
+            print(pal.paint("What may the audit log record of personal data, at most?", "cyan"))
+            for line in RECORDING_PRESET_HELP:
+                print(line)
+            while True:
+                preset = ask("Recording preset (full / standard / minimal)", pal, "full").strip().lower()
+                if preset in RECORDING_PRESETS:
+                    break
+                print(pal.paint("  choose full, standard or minimal", "red"))
+            if not lock_levels:
+                lock_levels = confirm("Make these limits also the levels, so no one can record less in the panel "
+                                      "(for a regulator that requires the records)?", pal, default=False)
+        try:
+            recording = recording_preset_config(preset or "full", lock_levels)
+        except ValueError as exc:
+            self._fail(str(exc))
+
         if sftp_public_host and not validate_server_name(sftp_public_host):
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
         if sftp_public_port is not None and not (1 <= int(sftp_public_port) <= 65535):
@@ -3693,6 +3784,7 @@ class DockVault:
             "plan_log_pull": log_pull,
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "invite_token_pepper": gen_hex(32),
+            "audit_fingerprint_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
@@ -3705,6 +3797,7 @@ class DockVault:
             "max_single_request_upload_mb": parse_single_request_upload_mb(
                 getattr(args, "max_single_request_upload_mb", None) if args else None),
             "_generated_pw": generated,
+            **recording,
         }
 
     def _resolve_cert_cfg(self, args):
@@ -5957,6 +6050,13 @@ def build_parser():
                          "0 = no cap but the file-size ceiling). It is held in memory before it is "
                          "checked; larger files go through the resumable uploader, which the web "
                          "app and the upload-link page always use")
+    sp.add_argument("--recording-preset", dest="recording_preset", choices=tuple(RECORDING_PRESETS),
+                    help="the most the audit log may record of personal data: full (the default; the panel can "
+                         "record less), standard (fingerprints of names, shortened IP addresses) or minimal "
+                         "(none); it writes the AUDIT_MAX_* lines")
+    sp.add_argument("--lock-recording-levels", dest="lock_recording_levels", action="store_true",
+                    help="make the AUDIT_MAX_* limits also the recording levels, which the panel cannot lower "
+                         "(adds audit_levels to SETTINGS_LOCKED_KEYS)")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")

@@ -213,6 +213,11 @@ def _wait_for_background_work(started_before, timeout=30.0):
     for t in threading.enumerate():
         if t not in started_before and t is not threading.current_thread() and t.name != "audit-signal":
             t.join(max(0.0, deadline - time.monotonic()))
+    # The alerts this run's audit rows raised (a row written without the recording levels it should follow, a
+    # detail nothing classifies). A server writes them from the thread that also refreshes the levels, which
+    # this tool does not start, so they are written here or not at all. Never raises.
+    from app.core import audit_privacy
+    audit_privacy.flush_alerts()
 
 
 def run(argv=None) -> int:
@@ -242,6 +247,9 @@ def run(argv=None) -> int:
 
 
 def _run(args, api) -> int:
+    # The rows this tool writes are the deployment's own: they follow the recording levels in force.
+    from app.core import audit_privacy
+    audit_privacy.require()
     from app.core import credential_changes as cc
     from app.core.database import get_db_context
     from app.services.audit_logger import AuditLogger

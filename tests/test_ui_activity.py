@@ -135,7 +135,7 @@ def test_an_export_the_server_refuses_says_why(page: Page, activity_admin):
     """An export the server could not record in the audit log is refused (503): the page says the
     server's reason rather than a bare status number. The refusal is served here."""
     reason = "The export could not be recorded in the audit log, so it was not made. Try again shortly."
-    page.route("**/activity/export?*", lambda route: route.fulfill(status=503, json={"detail": reason}))
+    page.route("**/activity/export", lambda route: route.fulfill(status=503, json={"detail": reason}))
     _login(page, activity_admin)
     _open_activity(page)
     expect(page.locator("#activity-rows tr.act-row").first).to_be_visible(timeout=15000)

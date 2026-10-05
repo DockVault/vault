@@ -264,15 +264,20 @@ def test_records_nothing_reads_any_more_are_pruned_after_fourteen_days(db):
     assert cc.prune_done(db, now) == 0
 
 
-def test_the_periodic_cleanup_prunes_the_records():
-    # The cleanup loop cannot run offline (it sleeps five minutes first); pin that it calls the prune,
-    # once, inside the loop that expires held requests.
-    src = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
-    start = src.index("async def cleanup_expired_sessions(")
-    ends = [i for i in (src.find("\ndef ", start + 1), src.find("\nasync def ", start + 1)) if i > 0]
-    body = src[start:min(ends)]
-    assert body.count(".prune_done(db)") == 1
-    assert body.index("_expire_held_credential_changes(db)") < body.index(".prune_done(db)")
+def test_the_pruner_prunes_the_records(db):
+    # The pruner's credential_changes job runs prune_done, as of the pass's time, in a bounded transaction.
+    from app.core import retention
+    job = next(j for j in retention.JOBS if j.name == "credential_changes")
+    assert job.run is retention.prune_credential_changes and job.held is False
+    seen = []
+    real = cc.prune_done
+    cc.prune_done = lambda session, now=None: seen.append(now) or 0
+    try:
+        when = cc.utcnow()
+        retention.prune_credential_changes(retention.Pass(lambda: db, now=when))
+    finally:
+        cc.prune_done = real
+    assert seen == [when]
 
 
 def test_an_approved_change_opens_a_new_window_from_its_approval(db):

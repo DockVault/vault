@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>What this vault records</title>
+  <link rel="icon" href="/static/favicon.ico">
+  <link rel="stylesheet" href="/static/css/recording.css?v=20261002a">
+</head>
+<body>
+  <main class="wrap">
+    <header class="head">
+      <p class="brand" id="brand-name">DockVault</p>
+      <h1>What this vault records</h1>
+      <p class="lead" id="always">Every event is recorded: who acted, what happened, when and its outcome.</p>
+    </header>
+
+    <div id="loading" class="muted">Loading&hellip;</div>
+    <div id="failed" class="notice" hidden>The notice could not be loaded. Try again shortly.</div>
+
+    <section id="levels-section" hidden aria-labelledby="levels-h">
+      <h2 id="levels-h">Personal data recorded with each event</h2>
+      <dl id="levels" class="levels"></dl>
+      <p id="fingerprints" class="muted" hidden></p>
+    </section>
+
+    <section id="kept-section" hidden aria-labelledby="kept-h">
+      <h2 id="kept-h">Where it is kept, and for how long</h2>
+      <ul id="stores" class="stores"></ul>
+    </section>
+
+    <section id="who-section" hidden aria-labelledby="who-h">
+      <h2 id="who-h">Who can see it</h2>
+      <ul id="who"></ul>
+    </section>
+
+    <section id="basis-section" hidden aria-labelledby="basis-h">
+      <h2 id="basis-h">Why, and who to ask</h2>
+      <p id="basis"></p>
+      <p id="contact"></p>
+    </section>
+
+    <section id="history-section" hidden aria-labelledby="history-h">
+      <h2 id="history-h">Earlier versions</h2>
+      <ol id="history" class="history" reversed></ol>
+    </section>
+
+    <p id="changes" class="muted"></p>
+    <p class="back"><a href="/">Back to the vault</a></p>
+  </main>
+  <script src="/static/js/recording.js?v=20261002a" defer></script>
+</body>
+</html>

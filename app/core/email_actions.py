@@ -183,6 +183,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "retention_change": {
+        "name": "How long records are kept",
+        "subject": "A change to how long {{vault.name}} keeps its records",
+        "body_html": (
+            "<h2>A change to how long records are kept</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>A change that makes records be deleted sooner waits before it takes effect, and any "
+            "administrator can cancel it meanwhile on the Settings page. If you did not expect this, check "
+            "the Settings page at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -214,6 +229,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("ssh_keys_adder_left", "SSH keys an administrator added",
      "Sent to a user when an administrator who added SSH keys to their account is demoted, deactivated, "
      "locked or deleted — names the keys, which still sign in, and links to where they are removed.", SYSTEM),
+    ("retention_change", "How long records are kept",
+     "Sent to every administrator when a setting for how long records are kept changes, when a change "
+     "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
+     SYSTEM),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(

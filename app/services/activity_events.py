@@ -119,16 +119,24 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
         wanted = statuses_for(statuses)
         q = q.filter(AuditLog.status.in_(wanted) if wanted else false())
 
-    if username and user_exact:
-        from sqlalchemy import func
-        q = q.filter(func.lower(AuditLog.username) == username[:MAX_TEXT].lower())
-    elif username:
-        q = q.filter(AuditLog.username.ilike(f"%{like_escape(username[:MAX_TEXT])}%", escape="\\"))
+    if username:
+        # A name typed at a failed sign-in may be recorded as its fingerprint (app/core/audit_fingerprints.py):
+        # the typed text matches it exactly, and a fingerprint (a saved search keeps one) matches that.
+        by_fingerprint = signin_fingerprint_match(AuditLog, username[:MAX_TEXT])
+        if user_exact:
+            from sqlalchemy import func
+            q = q.filter(or_(func.lower(AuditLog.username) == username[:MAX_TEXT].lower(), by_fingerprint))
+        else:
+            q = q.filter(or_(AuditLog.username.ilike(f"%{like_escape(username[:MAX_TEXT])}%", escape="\\"),
+                             by_fingerprint))
 
     if no_account:
-        # A name no account had: typed at a failed sign-in, an account deleted since, or the server's
-        # operator acting from the host (credential_changes.HOST_OPERATOR, which no account may take).
-        q = q.filter(AuditLog.user_id.is_(None), AuditLog.username.isnot(None))
+        # A name no account had: typed at a failed sign-in, an account deleted since, the server's operator
+        # acting from the host (credential_changes.HOST_OPERATOR, which no account may take) or the server's
+        # configuration signing a version of the recording levels (audit_privacy.SERVER_CONFIGURATION). A typed
+        # name recorded as its fingerprint is one too.
+        q = q.filter(or_(and_(AuditLog.user_id.is_(None), AuditLog.username.isnot(None)),
+                         AuditLog.recorded["signin_name"].as_string().isnot(None)))
 
     if actions:
         wanted = stored_action_names(actions)
@@ -149,15 +157,17 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
         q = q.filter(false())                      # an unreadable IP filter matches nothing
     elif net is not None:
         if net.num_addresses == 1:
-            q = q.filter(AuditLog.ip_address == str(net.network_address))
+            full = AuditLog.ip_address == str(net.network_address)
         else:
             # Only rows whose stored value is a plain address are cast; anything else never matches.
             # CASE keeps the cast from being evaluated on the rest.
             pattern = r"^[0-9.]+$" if net.version == 4 else r"^[0-9a-fA-F:]+$"
-            q = q.filter(case(
+            full = case(
                 (AuditLog.ip_address.op("~")(pattern),
                  cast(AuditLog.ip_address, _inet()).op("<<=")(cast(literal(str(net)), _inet()))),
-                else_=False))
+                else_=False)
+        # A row recorded with a shortened address keeps the network it is in (recorded.ip), not the address.
+        q = q.filter(or_(full, shortened_match(AuditLog, net)))
 
     if text:
         like = f"%{like_escape(text[:MAX_TEXT])}%"
@@ -169,6 +179,7 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
             AuditLog.resource_id.ilike(like, escape="\\"),
             AuditLog.error_message.ilike(like, escape="\\"),
             cast(AuditLog.details, String).ilike(like, escape="\\"),
+            signin_fingerprint_match(AuditLog, text[:MAX_TEXT]),
         ))
 
     if temp_credential_id:
@@ -198,6 +209,43 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
     if end is not None:
         q = q.filter(AuditLog.timestamp < end)
     return q
+
+
+def is_fingerprint(text) -> bool:
+    from app.core.audit_fingerprints import is_fingerprint as check
+    return check((text or "").strip())
+
+
+def signin_fingerprint_match(AuditLog, text: str):
+    """Rows whose typed name was recorded as the fingerprint of ``text`` (or as ``text``, when it is a
+    fingerprint). Matches nothing when no fingerprint can be made."""
+    from sqlalchemy import false
+    from app.core.audit_fingerprints import SIGNIN, fingerprint
+    text = (text or "").strip()
+    if not text:
+        return false()
+    try:
+        wanted = text if is_fingerprint(text) else fingerprint(SIGNIN, text)
+    except Exception:  # noqa: BLE001 -- no key: the full-value filters still apply
+        return false()
+    return AuditLog.recorded["signin_name"].as_string() == wanted
+
+
+def shortened_match(AuditLog, net):
+    """Rows whose shortened address (recorded.ip, app/core/audit_privacy.py) is in ``net`` or holds it:
+    for an address, or a block inside one shortened network, the one network it is in (an equality the
+    index on recorded.ip serves); for a wider block, every network inside it."""
+    from sqlalchemy import case, cast, literal
+    from app.core.audit_privacy import SHORT_PREFIX, shorten
+    prefix = SHORT_PREFIX[net.version]
+    recorded_ip = AuditLog.recorded["ip"].as_string()
+    if net.prefixlen >= prefix:
+        network = shorten(net.network_address)
+        return recorded_ip == network
+    pattern = r"^[0-9.]+/[0-9]+$" if net.version == 4 else r"^[0-9a-fA-F:]+/[0-9]+$"
+    return case((recorded_ip.op("~")(pattern),
+                 cast(recorded_ip, _inet()).op("<<=")(cast(literal(str(net)), _inet()))),
+                else_=False)
 
 
 def _inet():
@@ -344,6 +392,25 @@ def is_host_operator(r) -> bool:
             and r.action in HOST_OPERATOR_ACTIONS)
 
 
+def recorded_by_earlier_release(r) -> bool:
+    """Whether a row was written by a release without the recording levels after they began on this vault."""
+    from app.core.audit_privacy import levels_began
+    began = levels_began()
+    ts = getattr(r, "timestamp", None)
+    if began is None or ts is None or getattr(r, "privacy_version", None) is not None:
+        return False
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts > began
+
+
+def recorded_value(r, key: str):
+    """A value the row's recording policy kept in another form (recorded[key]), or None."""
+    recorded = getattr(r, "recorded", None)
+    value = recorded.get(key) if isinstance(recorded, dict) else None
+    return value if isinstance(value, str) else None
+
+
 def row_view(r) -> dict:
     entry = audit_catalog.lookup(r.action or "")
     ts = r.timestamp
@@ -356,6 +423,8 @@ def row_view(r) -> dict:
         "cursor": encode_cursor(r.timestamp, r.id) if r.timestamp is not None else None,
         "timestamp": ts.isoformat() if ts else None,
         "username": r.username,
+        # A name typed at a failed sign-in, recorded as its fingerprint (app/core/audit_fingerprints.py).
+        "signin_fingerprint": recorded_value(r, "signin_name"),
         # Shown as "Server operator", not as its internal name.
         "host_operator": is_host_operator(r),
         "temp_credential_id": str(r.temp_credential_id) if r.temp_credential_id else None,
@@ -368,7 +437,14 @@ def row_view(r) -> dict:
         "automatic": bool(entry and entry.automatic),
         "status": r.status,
         "channel": r.channel,
-        "ip_address": r.ip_address,
+        # The address in full, or the network a shortened one is in (recorded.ip).
+        "ip_address": r.ip_address or recorded_value(r, "ip"),
+        # The recording policy the row was written under (app/core/audit_privacy.py): None for a row from an
+        # earlier release, -1 for one recorded without its personal values.
+        "privacy_version": getattr(r, "privacy_version", None),
+        # Written with no version after the levels began: by an earlier release, rolled back to, which records
+        # everything in full whatever the levels say.
+        "recorded_by_earlier_release": recorded_by_earlier_release(r),
         "method": r.method,
         "endpoint": r.endpoint,
         "user_agent": r.user_agent,
@@ -444,7 +520,11 @@ EXPORT_COLUMNS = (
     ("Status", "status"), ("User", "username"), ("Temporary credential", "temp_credential_name"),
     ("Channel", "channel"), ("IP address", "ip_address"), ("Method", "method"), ("Route", "endpoint"),
     ("User agent", "user_agent"), ("Resource type", "resource_type"), ("Resource ID", "resource_id"),
-    ("Details", "details"), ("Error", "error_message"), ("Temporary credential ID", "temp_credential_id"),
+    ("Details", "details"), ("Error", "error_message"),
+    # What the recording levels kept in another form: a typed name's fingerprint, and the names' fingerprints
+    # of a vault the exporting administrator can read.
+    ("Typed name (fingerprint)", "signin_fingerprint"), ("Recorded names", "recorded_names"),
+    ("Temporary credential ID", "temp_credential_id"),
 )
 
 

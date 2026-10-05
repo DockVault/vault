@@ -254,10 +254,86 @@
         constructor(message, status, detail) { super(message); this.status = status; this.detail = detail; }
     }
 
+    // A read whose filters hold something typed (a name, an address, free text) is posted, with the filters in
+    // the body, so what was typed reaches no request line: /activity/events?... and /activity/summary?... go to
+    // their /search form, which answers the same. The export always is.
+    const SEARCHES = { '/activity/events': '/activity/events/search', '/activity/summary': '/activity/summary/search' };
+    const LIST_FILTERS = new Set(['category', 'channel', 'status', 'action', 'ids']);
+    const TYPED_FILTERS = ['user', 'q', 'ip', 'temp_credential'];
+
+    function typedIn(params) {
+        return TYPED_FILTERS.some((key) => (params.get(key) || '').trim() !== '');
+    }
+
+    function bodyOf(params) {
+        const out = {};
+        params.forEach((value, key) => {
+            if (LIST_FILTERS.has(key)) (out[key] = out[key] || []).push(value);
+            else out[key] = value;
+        });
+        return out;
+    }
+
+    function post(path, params) {
+        return fetch(API_BASE + path, {
+            method: 'POST',
+            headers: Object.assign({ Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, unlockHeader()),
+            body: JSON.stringify(bodyOf(params)),
+        });
+    }
+
+    // Vaults whose names were unlocked with the vault password: a receipt each, good for 15 minutes, sent with
+    // every read (POST /activity/vaults/{id}/unlock). Kept in memory only.
+    const UNLOCKS = new Map();
+
+    function unlockHeader() {
+        const now = Date.now();
+        const parts = [];
+        UNLOCKS.forEach((u, vid) => { if (u.expires > now) parts.push(`${vid}:${u.receipt}`); else UNLOCKS.delete(vid); });
+        return parts.length ? { 'X-Activity-Unlock': parts.join(',') } : {};
+    }
+
+    async function unlockVault(vid, password) {
+        const out = await apiRequest(`/activity/vaults/${encodeURIComponent(vid)}/unlock`,
+            { method: 'POST', body: JSON.stringify({ password }), silent: true });
+        UNLOCKS.set(vid, { receipt: out.receipt, expires: Date.parse(out.expires_at) || (Date.now() + 15 * 60000) });
+        await reloadList({ keepSelection: true });
+        renderDetail();
+    }
+
+    // In the details: a vault whose item names are hidden by its vault password can be unlocked here.
+    function unlockForm(vid) {
+        const wrap = el('form', 'act-unlock');
+        const input = el('input', 'form-control act-unlock-password');
+        input.type = 'password';
+        input.autocomplete = 'off';
+        input.setAttribute('aria-label', 'Vault password');
+        input.placeholder = 'Vault password';
+        const go = button('btn btn-sm btn-primary', 'Show names');
+        go.type = 'submit';
+        const msg = el('span', 'act-unlock-msg text-secondary', 'Names as recorded, for 15 minutes.');
+        wrap.append(input, go, msg);
+        wrap.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            go.disabled = true;
+            try {
+                await unlockVault(vid, input.value);
+            } catch (err) {
+                msg.textContent = err.message || 'The names could not be unlocked.';
+                go.disabled = false;
+            }
+            input.value = '';
+        });
+        return wrap;
+    }
+
     // A GET under /activity (or the session probe). A 401 is handed to the app's own sign-in handling;
     // a refusal for a temporary credential stops the page (see blockAsTemporary).
     async function get(path) {
-        const resp = await fetch(API_BASE + path, { headers: { Authorization: `Bearer ${authToken}` } });
+        const [base, query] = path.split('?');
+        const params = new URLSearchParams(query || '');
+        const resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
+            : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader()) });
         if (resp.status === 401) {
             await apiRequest(path, { silent: true });          // the app signs out
             throw new RequestError('Your session has ended.', 401, null);
@@ -679,9 +755,7 @@
         p.set('format', fmt);
         btn.setAttribute('aria-busy', 'true');
         try {
-            const resp = await fetch(`${API_BASE}/activity/export?${p.toString()}`, {
-                headers: { Authorization: `Bearer ${authToken}` },
-            });
+            const resp = await post('/activity/export', p);
             if (resp.status === 403) {
                 let data = null;
                 try { data = await resp.json(); } catch (_) { /* no body */ }
@@ -864,6 +938,10 @@
             return { text: 'Server operator', quiet: true, title: `The server's operator, working on the host (${ev.username})` };
         }
         if (ev.username) return { text: ev.username, quiet: false };
+        if (ev.signin_fingerprint) {
+            return { text: 'Name typed (fingerprint)', quiet: true,
+                title: `Recorded as a fingerprint: ${ev.signin_fingerprint}` };
+        }
         if (anonymous) return { text: 'Someone with the link', quiet: true };
         if (ev.automatic) return { text: 'System', quiet: true };
         return { text: 'Unknown', quiet: true };
@@ -931,6 +1009,13 @@
         name.title = who.title || who.text;
         whoWrap.appendChild(name);
         if (ev.temp_credential_id) whoWrap.appendChild(tempBadge(ev));
+        const under = recordedUnder(ev);
+        if (under) {
+            const badge = el('span', 'badge badge-secondary act-temp act-recorded', ev.recorded_by_earlier_release
+                ? 'earlier release' : (ev.privacy_version === -1 ? 'stripped' : `levels v${ev.privacy_version}`));
+            badge.title = under;
+            whoWrap.appendChild(badge);
+        }
         whoTd.appendChild(whoWrap);
         const ch = el('td', 'act-c-ch');
         if (ev.channel) ch.textContent = channelLabel(ev.channel);
@@ -1244,6 +1329,7 @@
                 return;
             }
             S.rows = data.events || [];
+            if (data.recording_version != null) S.recordingVersion = data.recording_version;
             S.total = data.total;
             S.pages = all ? null : (data.pages || 1);
             if (all) { S.allCursor = data.next_cursor || null; S.allDone = !data.next_cursor; S.allCap = ALL_CAP; }
@@ -1525,6 +1611,23 @@
         return d && typeof d === 'object' && d.vault_id ? String(d.vault_id) : null;
     }
 
+    // The names a row can carry, as the details drawer labels them.
+    const NAME_KEY_LABELS = {
+        vault_name: 'Vault name', file_name: 'File name', folder_name: 'Folder name',
+        old_name: 'Name before', new_name: 'Name after',
+    };
+
+    // Which recording levels a row was recorded under, when it is not the version in force: null for a row
+    // recorded under the current levels, or by a release before them.
+    function recordedUnder(ev) {
+        const v = ev.privacy_version;
+        if (ev.recorded_by_earlier_release) return 'By an earlier release, after the recording levels began: recorded in full';
+        if (v == null) return null;
+        if (v === -1) return 'Without its personal values: deciding what to record failed';
+        if (S.recordingVersion != null && v !== S.recordingVersion) return `Under recording levels version ${v}`;
+        return null;
+    }
+
     function cidrOf(ip) {
         if (!ip) return null;
         if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip.split('.').slice(0, 3).join('.') + '.0/24';
@@ -1628,6 +1731,23 @@
         if (ev.error_message) st.appendChild(el('span', 'act-d-error', ev.error_message));
         const group = statusGroup(ev.status);
         field(what.dl, 'Status', st, [group ? detailFilter('Show events with this status', { status: [group] }) : null]);
+        const recorded = recordedUnder(ev);
+        if (recorded) field(what.dl, 'Recorded', el('span', 'act-d-value act-d-recorded', recorded));
+        if (ev.signin_fingerprint) {
+            field(what.dl, 'Name typed', el('span', 'act-d-value act-mono', ev.signin_fingerprint));
+        }
+        const kept = ev.recorded_names || {};
+        Object.keys(kept).sort().forEach((key) => {
+            const value = kept[key] || {};
+            const label = NAME_KEY_LABELS[key] || key;
+            if (value.name) {
+                const shown = el('span', 'act-d-value', value.name);
+                if (value.fingerprint) shown.title = `Fingerprint: ${value.fingerprint}`;
+                field(what.dl, `${label} (as recorded)`, shown);
+            } else if (value.fingerprint) {
+                field(what.dl, `${label} (fingerprint)`, el('span', 'act-d-value act-mono', value.fingerprint));
+            }
+        });
         const names = ev.names || {};
         const vid = vaultIdOf(ev);
         if (names.vault || vid) {
@@ -1635,6 +1755,9 @@
                 [vid ? detailFilter('Show events for this vault', { vault: vid }) : null]);
         }
         if (names.item) field(what.dl, ev.resource_type === 'folder' ? 'Folder' : 'File', names.item);
+        if (vid && names.item === 'Name hidden: the vault has a password' && !UNLOCKS.has(vid)) {
+            field(what.dl, 'Names', unlockForm(vid));
+        }
         if (ev.resource_type) {
             const text = `${ev.resource_type} ${ev.resource_id || ''}`.trim();
             const copy = button('act-d-filter', null, { 'aria-label': 'Copy', title: 'Copy' });

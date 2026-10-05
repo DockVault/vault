@@ -7024,6 +7024,10 @@ function handleSocketFrame(data) {
             if (ev.target === '#users') {
                 try { refreshUsersAfterApprovalNotice(); } catch (_) {}
             }
+            // What the vault records changed: the notice banner checks again (static/js/notice-banner.js).
+            if (ev.notification_type === 'recording_levels_changed') {
+                try { window.dispatchEvent(new CustomEvent('dockvault:recording-levels')); } catch (_) {}
+            }
         }
         return;
     }

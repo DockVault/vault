@@ -65,6 +65,13 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # A zero-knowledge vault owner's key reset (app/api/ecc_router.py, rekey_vault): whenever the owner has a
     # second factor enrolled, the reset needs it; an account without one is not asked.
     OWNER_KEY_RESET: ("Reset a zero-knowledge vault's key as its owner", "factor_when_enrolled"),
+    # How long records are kept (app/api/managed_settings_router.py): the password every time, plus any second
+    # factor the account has enrolled, so an install with one administrator and no second factor can still
+    # manage it.
+    "admin.retention.write": ("Change how long records are kept", "password_always"),
+    # What the audit log records of personal data (app/api/recording_levels_router.py): the same policy, since
+    # the levels decide what is kept about every user.
+    "admin.audit_privacy.write": ("Change what the audit log records", "password_always"),
 }
 
 
