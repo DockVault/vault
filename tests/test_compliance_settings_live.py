@@ -43,12 +43,13 @@ _START = ("from app.core.config import bootstrap_entrypoint\n"
           "bootstrap_entrypoint('compliance-settings-test')\n"
           "from app.core import settings_registry as R\n"
           "try:\n"
-          "    R.start(lambda: None, load_now=False)\n"
+          "    thread = R.start()\n"
           "except R.SettingsContractError as exc:\n"
           "    print('REFUSED:', exc)\n"
           "else:\n"
           "    R.stop()\n"
-          "    print('STARTED')\n")
+          "    thread.join(30)\n"
+          "    print('STARTED', R.resolve('compliance_record_min_days'))\n")
 
 
 def _start_with(**env):
