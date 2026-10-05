@@ -304,9 +304,16 @@ class _Parking:
             raise RuntimeError("redis down")
 
     def wait_entered(self, thread):
+        """Until the probe is parked in its ping. A probe that ends without getting there fails at
+        once; one that is only slow to be scheduled, on a loaded machine, is waited for. The limit
+        is there so that a run cannot hang, not as a measure of how long a probe should take."""
+        assert thread is not None, "there is no probe to wait for"
         with self.lock:
             ev = self.entered.setdefault(thread, threading.Event())
-        assert ev.wait(5), "the probe never reached its ping"
+        deadline = time.monotonic() + 60
+        while not ev.wait(0.05):
+            assert thread.is_alive() or ev.is_set(), "the probe ended without reaching its ping"
+            assert time.monotonic() < deadline, "the probe never reached its ping"
 
     def release(self, thread, outcome="healthy"):
         with self.lock:
