@@ -28,7 +28,11 @@ approval (snapshot()) and uses, for each, the stricter of that and the current v
 
 The startup contract refuses a deployment whose .env contradicts itself here: case records kept at least
 COMPLIANCE_RECORD_MIN_DAYS cannot be kept under a ceiling on the audit log (PLAN_LOG_MAX_DAYS) shorter than
-that, and an access period cannot be longer than all of a case's access.
+that, and an access period cannot be longer than all of a case's access. The first applies while compliance
+access is enabled: a deployment whose audit log may not be kept as long as a case's records (a plan's ceiling
+under the floor, which is never under a year) starts with COMPLIANCE_ACCESS=disabled, and so opens no case.
+Rows an earlier case left are still kept by the row-keep rules (app/core/compliance_retention.py), past the
+ceiling if they must be: the record of an investigation outranks a retention maximum.
 """
 from __future__ import annotations
 
@@ -130,10 +134,12 @@ def _contract(settings) -> list:
     problems = []
     ceiling = number("plan_log_max_days")
     floor = number(RECORD_MIN_DAYS)
-    if ceiling is not None and ceiling > 0 and floor is not None and floor > ceiling:
+    # Only DISABLED lifts it: any other value (one that is not valid is refused by its bounds anyway) is enabled.
+    enabled = getattr(settings, ACCESS, ENABLED) != DISABLED
+    if enabled and ceiling is not None and ceiling > 0 and floor is not None and floor > ceiling:
         problems.append(f"COMPLIANCE_RECORD_MIN_DAYS ({floor}) is longer than PLAN_LOG_MAX_DAYS ({ceiling}): case "
                         "records could be neither kept nor deleted; lower COMPLIANCE_RECORD_MIN_DAYS or raise "
-                        "PLAN_LOG_MAX_DAYS")
+                        "PLAN_LOG_MAX_DAYS, or set COMPLIANCE_ACCESS=disabled")
     period, total = number(MAX_ACCESS_DAYS), number(MAX_TOTAL_DAYS)
     if period is not None and total is not None and period > total:
         problems.append(f"COMPLIANCE_MAX_ACCESS_DAYS ({period}) is longer than COMPLIANCE_MAX_TOTAL_DAYS ({total}): "

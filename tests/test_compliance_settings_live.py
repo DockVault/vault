@@ -2,8 +2,8 @@
 
 The panel lists the fifteen settings as set by the deployment, refuses to change them, and the general
 settings store refuses them too. In the web container's own image and configuration, the settings registry
-refuses to start while COMPLIANCE_RECORD_MIN_DAYS is longer than PLAN_LOG_MAX_DAYS, and while a setting is out
-of its bounds, and starts with the defaults. test_compliance_settings.py covers the bounds, the stricter
+refuses to start while COMPLIANCE_RECORD_MIN_DAYS is longer than PLAN_LOG_MAX_DAYS (unless compliance access is
+disabled), and while a setting is out of its bounds, and starts with the defaults. test_compliance_settings.py covers the bounds, the stricter
 value and the tool offline.
 """
 import subprocess
@@ -73,6 +73,15 @@ def test_the_server_refuses_to_start_while_case_records_outlast_the_audit_logs_c
     out = _start_with(PLAN_LOG_MAX_DAYS="365")
     assert "REFUSED:" in out and "COMPLIANCE_RECORD_MIN_DAYS (2190) is longer than PLAN_LOG_MAX_DAYS (365)" in out
     assert "STARTED" in _start_with(PLAN_LOG_MAX_DAYS="365", COMPLIANCE_RECORD_MIN_DAYS="365")
+
+
+def test_a_plan_keeping_its_log_under_a_year_starts_only_without_compliance_access():
+    short = {"PLAN_LOG_MAX_DAYS": "90", "AUDIT_PROTECTED_MIN_DAYS": "90"}
+    out = _start_with(**short)
+    assert "REFUSED:" in out and "COMPLIANCE_RECORD_MIN_DAYS (2190) is longer than PLAN_LOG_MAX_DAYS (90)" in out
+    out = _start_with(**short, COMPLIANCE_RECORD_MIN_DAYS="90")
+    assert "REFUSED:" in out and "COMPLIANCE_RECORD_MIN_DAYS is not valid" in out
+    assert "STARTED" in _start_with(**short, COMPLIANCE_ACCESS="disabled")
 
 
 @pytest.mark.parametrize("name,value", [("COMPLIANCE_ACCESS", "maybe"), ("COMPLIANCE_VIEW_RATE", "5"),

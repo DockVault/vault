@@ -207,7 +207,7 @@ def test_start_is_refused_while_case_records_outlast_the_audit_logs_ceiling(env)
     problems = [p for p in reg.check_contract() if "COMPLIANCE_RECORD_MIN_DAYS" in p]
     assert problems == ["COMPLIANCE_RECORD_MIN_DAYS (2190) is longer than PLAN_LOG_MAX_DAYS (365): case records "
                         "could be neither kept nor deleted; lower COMPLIANCE_RECORD_MIN_DAYS or raise "
-                        "PLAN_LOG_MAX_DAYS"]
+                        "PLAN_LOG_MAX_DAYS, or set COMPLIANCE_ACCESS=disabled"]
     with pytest.raises(reg.SettingsContractError, match="COMPLIANCE_RECORD_MIN_DAYS"):
         reg.start(lambda: None, load_now=False)
     for ceiling, floor in ((2190, 2190), (3000, 2190), (-1, 2190), (400, 400)):
@@ -215,6 +215,25 @@ def test_start_is_refused_while_case_records_outlast_the_audit_logs_ceiling(env)
         assert not [p for p in reg.check_contract() if "COMPLIANCE_RECORD_MIN_DAYS" in p], (ceiling, floor)
     env.plan_log_max_days, env.compliance_record_min_days = 400, 401
     assert [p for p in reg.check_contract() if "COMPLIANCE_RECORD_MIN_DAYS (401)" in p]
+
+
+@pytest.mark.parametrize("ceiling", [1, 90, 364, 365, 2189])
+def test_a_ceiling_under_the_floor_starts_only_with_compliance_access_disabled(env, ceiling):
+    # The floor is never under a year, so a plan that keeps its audit log for less runs without compliance
+    # access rather than not at all. Enabled, or any value but "disabled" (refused on its own besides), it is
+    # refused.
+    env.plan_log_max_days, env.compliance_record_min_days = ceiling, max(365, ceiling + 1)
+    for access in ("enabled", "Disabled", "off", None):
+        env.compliance_access = access
+        assert [p for p in reg.check_contract() if p.startswith("COMPLIANCE_RECORD_MIN_DAYS (")], access
+    env.compliance_access = "disabled"
+    assert not [p for p in reg.check_contract() if p.startswith("COMPLIANCE_RECORD_MIN_DAYS")]
+    # Nothing else stands in the way once the protected minimum of the audit log fits the ceiling too.
+    env.audit_protected_min_days = min(365, ceiling)
+    assert reg.check_contract() == []
+    # Disabled does not lower the floor's own bound.
+    env.compliance_record_min_days = 364
+    assert [p for p in reg.check_contract() if p.startswith("COMPLIANCE_RECORD_MIN_DAYS is not valid")]
 
 
 def test_start_is_refused_while_one_access_period_outlasts_a_cases_whole_access(env):
