@@ -2252,7 +2252,7 @@ class ZkKeyProofChallenge(Base):
     compute the MAC the server expects. It also records the vault's state when the challenge was
     issued (mode, epochs and the SHA-256 of the verifier's point), which the guarded request must still
     match. Never a user key, never a DEK: transient, single-use and short-lived; expired rows are
-    swept by the periodic cleanup (app/core/session_retention.py).
+    deleted by the pruner (app/core/retention.py).
 
     `vault_id` has no foreign key on purpose: a challenge to create a vault names an id that does not
     exist yet.

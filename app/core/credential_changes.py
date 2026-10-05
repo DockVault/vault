@@ -541,7 +541,7 @@ def prune_done(db, now: Optional[datetime] = None) -> int:
     than 14 days ago (it no longer holds the window open), and a request denied, withdrawn or expired
     more than 14 days ago. Held requests still open are kept. Their summary names an email address or
     a key that may never have been applied, so they are not kept for as long as the account lives; the
-    audit log keeps the history. Run by the periodic cleanup. Returns how many were deleted."""
+    audit log keeps the history. Run by the pruner (app/core/retention.py). Returns how many were deleted."""
     now = now or utcnow()
     cutoff = now - WINDOW
     applied = (db.query(CredentialChange)
