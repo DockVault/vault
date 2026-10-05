@@ -9,6 +9,7 @@ instead of names and addresses, completed when shown. The security monitor's sta
 These run on a throwaway SQLite database.
 """
 import inspect
+import logging
 import tempfile
 import uuid
 from datetime import datetime, timedelta
@@ -160,7 +161,7 @@ def _degraded_alerts():
     return [a for a in ap.pending_alerts() if a["reason"] == ap.RECORD_NOT_WRITTEN]
 
 
-def test_a_record_that_cannot_be_written_never_costs_the_audit_row(env, factory):
+def test_a_record_that_cannot_be_written_never_costs_the_audit_row(env, factory, caplog):
     """A fault in the security_records table alone (here it is gone, so its insert fails) loses the records,
     never the audit rows written with them or the caller's answer: the methods return, the rows commit, and
     an alert without any value of the failures tells the administrators."""
@@ -168,9 +169,17 @@ def test_a_record_that_cannot_be_written_never_costs_the_audit_row(env, factory)
     db = factory()
     alice = _user(db)
     SecurityRecord.__table__.drop(db.get_bind())
+    caplog.set_level(logging.WARNING, logger=audit_logger.logger.name)
     for name in ("alice", "no-such-name"):
         assert audit_logger.AuditLogger(db).log_login_failure(name, "203.0.113.7", "Invalid credentials") is None
     audit_logger.AuditLogger(db).log_second_factor_failure(alice, ip_address="192.0.2.5", details={"method": "totp"})
+    # The operational log names the error by its type alone: its text carries the statement and its values
+    # (on PostgreSQL a constraint's message carries the whole failing row, the name as typed with it).
+    warned = [r for r in caplog.records if r.name == audit_logger.logger.name]
+    assert [r.getMessage() for r in warned] == [
+        f"A {action} security record could not be written (OperationalError); its audit row was kept"
+        for action in ("login_failure", "login_failure", "second_factor_failed")]
+    assert [(r.exc_info, r.stack_info) for r in warned] == [(None, None)] * 3     # nor its traceback
     check = factory()
     assert check.query(AuditLog).filter(AuditLog.action == "login_failure").count() == 2
     assert check.query(AuditLog).filter(AuditLog.action == "second_factor_failed").count() == 1

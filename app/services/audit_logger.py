@@ -386,7 +386,9 @@ class AuditLogger:
             return record.id
         except Exception as exc:  # noqa: BLE001 -- the audit row stays; the alert says what is missing
             audit_privacy.raise_alert(audit_privacy.RECORD_NOT_WRITTEN, type(exc).__name__, row.action)
-            logger.warning("A %s security record could not be written (%s); its audit row was",
+            # The error's type only: on PostgreSQL its text can carry the whole failing row, the name as
+            # typed (which can be a password) and the address with it.
+            logger.warning("A %s security record could not be written (%s); its audit row was kept",
                            row.action, type(exc).__name__)
             return None
     
