@@ -13,7 +13,7 @@ import pytest
 import requests
 
 from conftest import ApiClient, BASE_URL
-from _account_change_helpers import psql
+from _account_change_helpers import own_password, psql
 
 pytestmark = pytest.mark.integration
 
@@ -47,7 +47,9 @@ def accounts(admin):
     made = []
 
     def make(role="user"):
-        account = admin.create_user(role=role)
+        # A password of the account's own, which a promotion keeps (the one an administrator chose is
+        # taken back: test_password_origin_live.py).
+        account = own_password(admin.create_user(role=role))
         made.append(account["id"])
         return account
     try:

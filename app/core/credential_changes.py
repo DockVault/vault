@@ -27,7 +27,12 @@ app/core/admin_grants.py). The approver:
   4. had been an administrator for at least 14 days when the request was made. An administrator from
      before these records existed, and the first one the server set up, count as long-standing. This
      closes what the lineage alone cannot: two accounts one administrator made for the purpose (neither
-     in the other's lineage), and an administrator whose maker was demoted or deleted.
+     in the other's lineage), and an administrator whose maker was demoted or deleted;
+  5. holds a password they set themselves (app/core/password_origin.py). Whoever set an administrator's
+     password could otherwise sign in as them and approve their own change: set an ordinary user's
+     password, wait for another administrator to promote that user, and approve as them. (A promotion
+     takes such a password back as well; an administrator created with one keeps it until they set their
+     own.)
 
 Only an administrator's second change is held. A user given the permission to manage users can make
 a first change to an ordinary user's account, but a second one within the window is refused when asked
@@ -64,6 +69,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Set
 
 from app.core.models import CredentialChange, RoleEnum, User
+from app.core.password_origin import is_set_by_other
 
 WINDOW = timedelta(days=14)
 HOLD = timedelta(days=7)
@@ -207,6 +213,7 @@ MADE_REQUESTER = "maker"         # they made the one who asked an administrator 
 CHANGED_ACCOUNT = "changed"      # they made or approved a change to that account (rule 2)
 BECAME_ADMIN_AFTER = "after"     # they became an administrator after the request was made (rule 4)
 NEW_ADMIN = "new"                # they had been one for less than TENURE when it was made (rule 4)
+PASSWORD_NOT_OWN = "password"    # their current password was set by someone else (rule 5)
 
 
 def changers(db, target_id, since: datetime) -> Set:
@@ -228,11 +235,13 @@ def changers(db, target_id, since: datetime) -> Set:
 
 
 def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant, changed: Set,
-                   requested_at: datetime, target_id=None) -> Optional[str]:
+                   requested_at: datetime, target_id=None,
+                   approver_password_set_by_other: bool = False) -> Optional[str]:
     """Why ``approver_id`` may not approve a change to ``target_id`` that ``requester_id`` asked for at
     ``requested_at``, or None when they may (the module docstring has the rules). ``approver_grant``
     and ``requester_grant`` are their admin_grants records (None: none); ``changed`` is changers() for
-    the account since 14 days before the request."""
+    the account since 14 days before the request; ``approver_password_set_by_other`` whether the
+    approver's current password was set by someone else (password_origin.is_set_by_other)."""
     from app.core import admin_grants
     if approver_id == requester_id:
         return ASKED
@@ -248,6 +257,8 @@ def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant
         return BECAME_ADMIN_AFTER
     if admin_grants.granted_after(approver_grant, requested_at - TENURE):
         return NEW_ADMIN
+    if approver_password_set_by_other:
+        return PASSWORD_NOT_OWN
     return None
 
 
@@ -265,7 +276,8 @@ def refusals(db, requester_id, *, target_id=None, requested_at: Optional[datetim
     changed = changers(db, target_id, min(requested_at, now) - WINDOW) if target_id is not None else set()
     return {a: refusal_reason(a.id, requester_id=requester_id, approver_grant=grants.get(a.id),
                               requester_grant=grants.get(requester_id), changed=changed,
-                              requested_at=requested_at, target_id=target_id)
+                              requested_at=requested_at, target_id=target_id,
+                              approver_password_set_by_other=is_set_by_other(a))
             for a in admins}
 
 
@@ -285,18 +297,19 @@ def snapshot(db, *, requester_id, target_id, requested_at: datetime) -> dict:
 
 
 def _held_refusal(change: CredentialChange, approver_id, *, approver_grant, requester_grant, requester,
-                  changed: Set) -> Optional[str]:
+                  changed: Set, approver_password_set_by_other: bool = False) -> Optional[str]:
     """Why ``approver_id`` may not approve the held ``change``: the rules against the records as they
-    stand (refusal_reason, with ``requester`` the account that asked, None when it is gone, and
-    ``changed`` changers() now), then against the snapshot kept when it was held. None when neither
-    refuses."""
+    stand (refusal_reason, with ``requester`` the account that asked, None when it is gone, ``changed``
+    changers() now, and whether the approver's password was set by someone else), then against the
+    snapshot kept when it was held. None when neither refuses."""
     # The one who asked must still be an administrator who can act. Deleted, their id on the request
     # is gone (NULL) and there is no account to read.
     if requester is None or not can_approve(requester):
         return REQUESTER_GONE
     reason = refusal_reason(approver_id, requester_id=change.requested_by_id, approver_grant=approver_grant,
                             requester_grant=requester_grant, changed=changed,
-                            requested_at=change.requested_at, target_id=change.target_user_id)
+                            requested_at=change.requested_at, target_id=change.target_user_id,
+                            approver_password_set_by_other=approver_password_set_by_other)
     if reason is not None:
         return reason
     # What was kept when it was held. (The asker is the one the request names, checked above; while
@@ -328,7 +341,7 @@ def held_refusals(db, change: CredentialChange, now: Optional[datetime] = None) 
     grants, requester, changed = _held_context(db, change, [a.id for a in admins], now)
     return {a: _held_refusal(change, a.id, approver_grant=grants.get(a.id),
                              requester_grant=grants.get(change.requested_by_id), requester=requester,
-                             changed=changed)
+                             changed=changed, approver_password_set_by_other=is_set_by_other(a))
             for a in admins}
 
 
@@ -422,8 +435,9 @@ def may_approve(change: CredentialChange, approver_id) -> bool:
 def approval_refusal(db, change: CredentialChange, approver_id, now: Optional[datetime] = None) -> Optional[str]:
     """Why ``approver_id`` may not approve ``change`` (one of the reasons above), or None when they
     may: not the one who asked, not the person the change is for, the one who asked still an active
-    administrator, and the four rules both against the records as they stand and against what was kept
-    when it was held (snapshot). None is the host operator, who may approve any request."""
+    administrator, the rules on who made whom and who changed the account both against the records as
+    they stand and against what was kept when it was held (snapshot), the approver's tenure, and a
+    password of the approver's own. None is the host operator, who may approve any request."""
     if approver_id is None:
         return None
     if approver_id == change.requested_by_id:
@@ -432,7 +446,7 @@ def approval_refusal(db, change: CredentialChange, approver_id, now: Optional[da
     grants, requester, changed = _held_context(db, change, [approver_id], now)
     return _held_refusal(change, approver_id, approver_grant=grants.get(approver_id),
                          requester_grant=grants.get(change.requested_by_id), requester=requester,
-                         changed=changed)
+                         changed=changed, approver_password_set_by_other=is_set_by_other(db.get(User, approver_id)))
 
 
 def _decide(change, status, decider_id, decider_name, now):

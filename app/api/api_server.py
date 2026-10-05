@@ -973,6 +973,12 @@ class UserResponse(BaseModel):
     # ({kind, label, by, at, window_ends}), or None. Until window_ends, a further change needs a
     # second administrator's approval. Filled in by the admin users list.
     credential_change: Optional[Dict[str, Any]] = None
+    # The account's current password was set by someone else ({by: their username or None, at}), or None
+    # (app/core/password_origin.py). Filled in by the admin users list, for the promote dialog's warning.
+    password_set_by_other: Optional[Dict[str, Any]] = None
+    # A promotion took back a password someone else had set: {emailed, reset_link, expires_in_minutes}
+    # (_hand_over_promotion_reset). Only in the answer to the change that made the account an administrator.
+    promotion_password_reset: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -990,6 +996,11 @@ class SSHKeyResponse(BaseModel):
     fingerprint: str
     created_at: datetime
     last_used: Optional[datetime] = None
+    # Who added the key, by name ("operator@host" for the server's operator), and whether that was
+    # someone other than the key's owner; both None when it is not known (a key from before the name
+    # was kept, whose maker the audit log does not name). Filled in by _ssh_key_response.
+    added_by: Optional[str] = None
+    added_by_other: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -5414,6 +5425,14 @@ def _resolve_valid_reset_token(db: Session, token: str):
     return None
 
 
+def _reset_link_made_by_other(r) -> bool:
+    """Whether another account made reset link ``r`` for the account (not the person asking for it, nor
+    the server's operator on the host). A link from before the made_by_other column: when one is named."""
+    if r.made_by_other is not None:
+        return bool(r.made_by_other)
+    return r.created_by is not None and r.created_by != r.user_id
+
+
 def _reset_link_refusal(db: Session, r, target, *, lock: bool = False) -> Optional[str]:
     """Why reset link ``r``, for ``target``'s account, may not be used now, or None when it may.
 
@@ -5430,10 +5449,7 @@ def _reset_link_refusal(db: Session, r, target, *, lock: bool = False) -> Option
     they are read, and one that starts later waits until the link has been used."""
     from app.core import account_authority
     from app.core.endpoint_permissions import endpoint_permission_denial
-    made_by_other = r.made_by_other
-    if made_by_other is None:        # a link from before the column: another account made it if one is named
-        made_by_other = r.created_by is not None and r.created_by != r.user_id
-    if not made_by_other:
+    if not _reset_link_made_by_other(r):
         return None
     if lock:
         ids = [i for i in (r.created_by, target.id) if i is not None]
@@ -5596,8 +5612,15 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     from app.core import credential_changes as cc
     payload = payload or {}
     if kind == cc.PASSWORD:
+        from app.core import password_origin
         target.password_hash = payload["password_hash"]
         target.updated_at = datetime.now(timezone.utc)
+        # Someone else chose it (the one who asked, for an approved request; None: the host operator),
+        # unless an administrator set their own through an administrator's route.
+        if for_someone_else:
+            password_origin.set_by_other(target, actor_id)
+        else:
+            password_origin.set_by_self(target)
         # A stolen session must not outlive the response to a suspected compromise.
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
         return {}
@@ -5652,9 +5675,11 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
         if db.query(UserSSHKey.id).filter(UserSSHKey.user_id == target.id,
                                           UserSSHKey.fingerprint == payload["fingerprint"]).first():
             raise HTTPException(status_code=409, detail="This key is already registered for the user")
+        # Who added it, by name too: the name stays when that account is deleted, for the key's owner
+        # to see, and to tell them when an administrator who added it leaves (_report_keys_added_by).
         key = UserSSHKey(user_id=target.id, name=payload["name"], key_type=payload.get("key_type"),
                          public_key=payload["public_key"], fingerprint=payload["fingerprint"],
-                         created_by=actor_id)
+                         created_by=actor_id, created_by_name=actor_name)
         db.add(key)
         db.flush()
         return {"ssh_key": key}
@@ -5797,6 +5822,12 @@ def _approval_refusal_text(reason, requester, *, short=False) -> str:
         return ("You had been an administrator for less than 14 days when this request was made, so you "
                 "cannot approve it. An administrator of longer standing, or the person who runs the "
                 "server (python dockvault.py accounts), can.")
+    if reason == cc.PASSWORD_NOT_OWN:
+        if short:
+            return "You cannot approve this: your password was set by someone else."
+        return ("Your current password was set by someone else, who may still know it, so you cannot approve "
+                "changes to other people's sign-in details. Set a password of your own first: in Your "
+                f"account, or with a reset link from the sign-in page. {_OTHERS_CAN}")
     return "A change you asked for needs another administrator's approval. You can withdraw it."
 
 
@@ -5834,6 +5865,10 @@ def _no_approver_text(refusals, target_name) -> str:
     recent = by_reason.get(cc.NEW_ADMIN, []) + by_reason.get(cc.BECAME_ADMIN_AFTER, [])
     if recent:
         clauses.append(f"{_names_text(recent)} became {admins(recent)} less than 14 days ago")
+    not_own = by_reason.get(cc.PASSWORD_NOT_OWN)
+    if not_own:
+        clauses.append(f"{_names_text(not_own)} {'holds a password' if len(not_own) == 1 else 'hold passwords'} "
+                       "someone else set")
     return "; ".join(clauses)
 
 
@@ -6068,6 +6103,89 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     _revoke_reset_links_outranked_by(db, user, actor=by)
 
 
+def _take_back_password_at_promotion(db, user, *, by) -> Optional[dict]:
+    """``user`` is being made an administrator by ``by`` (a User; None for the host operator): call it with
+    _record_admin_grant, on a promotion, in the caller's transaction. When their current password was set
+    by someone else (app/core/password_origin.py), whoever set it still knows it and could sign in as the
+    new administrator: make it unusable, end their sessions, record it, and return what
+    _hand_over_promotion_reset does after the commit. None when the password is their own.
+
+    Only the person's inbox cuts the one who knows it out, so after the commit they get a reset link there
+    (the promoting administrator gets one to hand over when no email can go). The account stays marked
+    until they set a password of their own, so until then it may not approve a held change either."""
+    import secrets as _secrets
+    from app.core import credential_changes as cc
+    from app.core import password_origin
+    from app.core.security import hash_password
+    if not password_origin.is_set_by_other(user):
+        return None
+    set_by = (db.query(User.username).filter(User.id == user.password_set_by).scalar()
+              if user.password_set_by is not None else None)
+    user.password_hash = hash_password(_secrets.token_urlsafe(32))   # nobody knows it
+    user.updated_at = datetime.now(timezone.utc)
+    _revoke_sessions(db, user_id=user.id, actor_username=by.username if by is not None else cc.HOST_OPERATOR)
+    db.add(AuditLogger(db).build_row(
+        action="password_reset_at_promotion", status="success", user=by,
+        username=None if by is not None else cc.HOST_OPERATOR,
+        resource_type="user", resource_id=str(user.id),
+        details={"target_username": user.username, "password_set_by": set_by,
+                 "password_set_at": user.password_set_by_other_at.isoformat() + "Z"}))
+    return {"user_id": user.id}
+
+
+def _hand_over_promotion_reset(db, taken, *, by, request=None) -> Optional[dict]:
+    """After the commit of a promotion whose password was taken back (``taken``, from
+    _take_back_password_at_promotion; None: nothing to do). Send the person a reset link the way a
+    self-service one goes (_self_service_reset_destination: their address, or for 14 days after an
+    administrator changed it, the one before), so only their inbox chooses the new password. When no email
+    can go (email not set up, no address to send to, the send failed), ``by`` gets a link to hand over,
+    which is judged again when it is used (_reset_link_refusal); the password it sets then counts as set by
+    them. Tells the person either way. Returns what the promoting route answers under
+    ``promotion_password_reset``: {"emailed", "reset_link", "expires_in_minutes"}."""
+    if not taken:
+        return None
+    from app.core.email_actions import public_base_url
+    user = db.get(User, taken["user_id"])
+    if user is None:
+        return None
+    base_url = _public_base_url(request) if request is not None else public_base_url(None)
+    by_name = by.username if by is not None else None
+    destination = _self_service_reset_destination(db, user)
+    if destination is not None and destination[0] and _smtp_configured(db):
+        note = ("<p><small>You were made an administrator. Your password had been set by someone else, so it "
+                "was reset: choose a new one with this link.</small></p>") + destination[1]
+        if _mint_and_send_reset(db, user, base_url, created_by_id=None, to=destination[0], note_html=note):
+            try:
+                AuditLogger(db).log_action(action="password_reset_link_sent", status="success", user=None,
+                                           details={"target_user_id": str(user.id), "email_sent": True,
+                                                    "at_promotion": True})
+            except Exception:  # noqa: BLE001
+                pass
+            _notify_account_change(
+                db, user, ntype="account_changed", title="Your password was reset",
+                change=("You were made an administrator. Your password had been set by someone else, so it was "
+                        "reset and you were signed out everywhere. A link to choose a new one was sent to your "
+                        "email address."), by=_actor_text(by_name))
+            return {"emailed": True, "reset_link": None, "expires_in_minutes": None}
+    link = _mint_reset_link(db, user, base_url, created_by_id=by.id if by is not None else None,
+                            made_by_other=by is not None)
+    _, ttl = _password_reset_policy(db)
+    if link:
+        try:
+            AuditLogger(db).log_action(action="password_reset_link_minted", status="success", user=by,
+                                       details={"target_user_id": str(user.id), "ttl_minutes": ttl,
+                                                "at_promotion": True})
+        except Exception:  # noqa: BLE001
+            pass
+    _notify_account_change(
+        db, user, ntype="account_changed", title="Your password was reset",
+        change=("You were made an administrator. Your password had been set by someone else, so it was reset "
+                "and you were signed out everywhere. " + (
+                    "The administrator who made you one has a link for you to choose a new one."
+                    if link else "Ask an administrator to set a new one.")), by=_actor_text(by_name))
+    return {"emailed": False, "reset_link": link, "expires_in_minutes": ttl if link else None}
+
+
 def _announce_admin_granted(db, user, *, by_name, how) -> None:
     """Tell every other administrator, in the app and by email, that ``user`` became an administrator.
     ``how`` is "created", "promoted" or "invited". After the commit; best-effort.
@@ -6259,15 +6377,117 @@ def _withdraw_requests_of(db, user, *, actor, because) -> list:
     return out
 
 
-def _account_lost_standing(db, user, *, actor, because) -> list:
+def _report_keys_added_by(db, user, *, actor, because) -> Optional[dict]:
+    """``user`` is about to lose their standing (as for _account_lost_standing). When they are an
+    administrator who could act until now, find the SSH keys they added to other people's accounts, write
+    one audit row per account (in the caller's transaction, by ``actor``), and return what
+    _announce_keys_reported tells after the commit: {"maker", "because", "owners": [{"id", "username",
+    "email", "keys": [(name, fingerprint)]}]}. None when there is nothing to tell.
+
+    The keys are never switched off: that would lock out people whose own key an administrator installed
+    for them. Each account's owner was told when the key was added, and is told again now, with the way
+    to remove it. An account that could not act already (demoted, deactivated or locked by an
+    administrator before) was reported when it lost that standing, and is not reported again."""
+    from app.core import credential_changes as cc
+    from app.core.models import UserSSHKey
+    if user is None or user.id is None or not cc.can_approve(user):
+        return None
+    rows = (db.query(UserSSHKey, User)
+            .join(User, User.id == UserSSHKey.user_id)
+            .filter(UserSSHKey.created_by == user.id, UserSSHKey.user_id != user.id)
+            .order_by(User.username, UserSSHKey.created_at)
+            .all())
+    if not rows:
+        return None
+    owners = {}
+    for key, owner in rows:
+        entry = owners.setdefault(owner.id, {"id": owner.id, "username": owner.username,
+                                             "email": owner.email, "keys": []})
+        entry["keys"].append((key.name, key.fingerprint))
+    for entry in owners.values():
+        db.add(AuditLogger(db).build_row(
+            action="ssh_keys_adder_left", status="success", user=actor,
+            username=None if actor is not None else cc.HOST_OPERATOR,
+            resource_type="user", resource_id=str(entry["id"]),
+            details={"target_username": entry["username"], "added_by": user.username,
+                     "added_by_left_because": because,
+                     "keys": [{"name": n, "fingerprint": f} for n, f in entry["keys"]]}))
+    return {"maker": user.username, "because": because, "owners": list(owners.values())}
+
+
+class _LostStanding:
+    """What _account_lost_standing did that is told after the commit (_announce_lost_standing): the
+    requests withdrawn (_withdraw_requests_of) and the SSH keys reported (_report_keys_added_by)."""
+
+    def __init__(self, withdrawn=(), keys=None):
+        self.withdrawn = list(withdrawn)
+        self.keys = keys
+
+
+def _account_lost_standing(db, user, *, actor, because) -> _LostStanding:
     """``user`` is about to lose their standing: demoted from administrator, deactivated, locked by an
     administrator, or deleted (``because``: demoted, deactivated, locked or deleted), by ``actor``. Every
     route that does one of those calls this, and nothing else calls _withdraw_requests_of, so whatever
     follows from an account losing its standing follows on every route. Call it BEFORE the change to
-    ``user`` is made in the session, in the same transaction. What follows today: their open requests are
-    withdrawn and their pending administrator invitations revoked (_withdraw_requests_of). Returns what
-    _announce_withdrawn_requests tells after the commit."""
-    return _withdraw_requests_of(db, user, actor=actor, because=because)
+    ``user`` is made in the session, in the same transaction. What follows: their open requests are
+    withdrawn and their pending administrator invitations revoked (_withdraw_requests_of), and the SSH
+    keys an administrator added to other people's accounts are reported (_report_keys_added_by). Returns
+    what _announce_lost_standing tells after the commit."""
+    withdrawn = _withdraw_requests_of(db, user, actor=actor, because=because)
+    keys = _report_keys_added_by(db, user, actor=actor, because=because)
+    return _LostStanding(withdrawn, keys)
+
+
+def _announce_lost_standing(db, told, request=None) -> None:
+    """Tell, after the commit, what _account_lost_standing did (``told``; an empty list when the route
+    did not call it). Best-effort."""
+    if not isinstance(told, _LostStanding):
+        return
+    _announce_withdrawn_requests(db, told.withdrawn)
+    if told.keys:
+        _announce_keys_reported(db, told.keys, request=request)
+
+
+def _announce_keys_reported(db, report, request=None) -> None:
+    """Tell each account's owner, in the app and by email with the way to remove them, that the
+    administrator who added SSH keys to their account has left (_report_keys_added_by), and tell every
+    other active administrator in the app which accounts hold such keys. After the commit; best-effort."""
+    from app.core.email_actions import public_base_url
+    maker = report["maker"]
+    why = _WITHDRAWN_BECAUSE.get(report["because"], "can no longer act as an administrator")
+    # "Your account", where the owner removes a key; the page opens it after signing in (#profile).
+    link = f"{public_base_url(request)}/#profile"
+    for owner in report["owners"]:
+        keys = owner["keys"]
+        many = len(keys) > 1
+        listed = _names_text([f"\"{name}\" ({fingerprint})" for name, fingerprint in keys])
+        what = (f"The administrator {maker} added the SSH key{'s' if many else ''} {listed} to your account, "
+                f"and {maker} {why}. {'They still sign' if many else 'It still signs'} in to SFTP as you.")
+        try:
+            _notify_users([str(owner["id"])], "ssh_keys_adder_left", title="Check the SSH keys on your account",
+                          body=(f"{what} If you do not use {'them' if many else 'it'}, remove "
+                                f"{'them' if many else 'it'} in Your account, under SSH keys."),
+                          target="#profile")
+        except Exception as e:  # noqa: BLE001 - a notice never undoes the change
+            print(f"⚠ SSH key notice skipped: {type(e).__name__}")
+        try:
+            _fire_action_email(db, "ssh_keys_adder_left", email=owner["email"], username=owner["username"],
+                               action_context={"change": what, "link": link})
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠ SSH key email skipped: {type(e).__name__}")
+    try:
+        accounts = [o["username"] for o in report["owners"]]
+        admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN,
+                                                             User.is_active.is_(True)).all()
+                  if a.username != maker]
+        _notify_users(admins, "ssh_keys_adder_left", title="SSH keys an administrator added",
+                      body=(f"{maker} {why}. {maker} had added SSH keys to the "
+                            f"{'account' if len(accounts) == 1 else 'accounts'} of {_names_text(accounts)}. "
+                            "The keys still sign in to SFTP. Each account's owner was told and can remove "
+                            "them, and so can you on the Users page."),
+                      target="#users")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ SSH key notice to administrators skipped: {type(e).__name__}")
 
 
 def _announce_withdrawn_requests(db, withdrawn) -> None:
@@ -6510,6 +6730,14 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
         db.rollback()
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     user.password_hash = hash_password(body.new_password)
+    # Whose password it now is: a link another account made could have been used by its maker, so the
+    # password counts as theirs; one the person asked for (or the host operator made) is the person's own.
+    from app.core import password_origin
+    made_by_other = _reset_link_made_by_other(r)
+    if made_by_other:
+        password_origin.set_by_other(user, r.created_by)
+    else:
+        password_origin.set_by_self(user)
     db.commit()
     try:
         # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
@@ -6523,7 +6751,7 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
             pass
     try:
         AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
-                                   ip_address=ip, details={})
+                                   ip_address=ip, details={"link_made_by_other": bool(made_by_other)})
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True}
@@ -9337,6 +9565,16 @@ async def create_user(
     _validate_password_policy(db, user_create.password)
 
     is_admin_role = user_create.role == RoleEnum.ADMIN
+
+    def _before_commit(u):
+        # The administrator chose its password (app/core/password_origin.py). An administrator account
+        # also records who made it one, in the same commit: the two-administrator rule refuses that
+        # administrator's approval of its maker's changes.
+        from app.core import password_origin
+        password_origin.set_by_other(u, current_user.id)
+        if is_admin_role:
+            _record_admin_grant(db, u, by=current_user)
+
     try:
         new_user = auth_service.create_user(
             username=user_create.username,
@@ -9344,9 +9582,7 @@ async def create_user(
             password=user_create.password,
             role=user_create.role,
             created_by=current_user.id,
-            # An administrator account records who made it one, in the same commit: the
-            # two-administrator rule refuses that administrator's approval of its maker's changes.
-            before_commit=(lambda u: _record_admin_grant(db, u, by=current_user)) if is_admin_role else None,
+            before_commit=_before_commit,
         )
         
         # Grant default permissions based on role
@@ -9394,6 +9630,8 @@ async def list_users(
     recent = cc.recent_by_account(db, [u.id for u in users])
     from app.core import sign_in_lockout
     blocks = sign_in_lockout.blocks_by_user(db, [u.id for u in users])
+    setters = dict(db.query(User.id, User.username).filter(
+        User.id.in_({u.password_set_by for u in users if u.password_set_by is not None})).all())
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
@@ -9410,6 +9648,9 @@ async def list_users(
                 "at": change.applied_at.isoformat() + "Z",
                 "window_ends": cc.window_ends(change).isoformat() + "Z",
             }
+        if user.password_set_by_other_at is not None:
+            item.password_set_by_other = {"by": setters.get(user.password_set_by),
+                                          "at": user.password_set_by_other_at.isoformat() + "Z"}
         result.append(item)
     return result
 
@@ -9468,6 +9709,10 @@ async def update_own_account(
         _validate_password_policy(db, body.new_password)
         user.password_hash = hash_password(body.new_password)
         changes.append("password")
+        # Now the person's own, unless it is the same password again: whoever set that one still knows it.
+        if body.new_password != body.current_password:
+            from app.core import password_origin
+            password_origin.set_by_self(user)
     if changing_email:
         # When the organization requires it, a self email CHANGE must be proved with a code sent to
         # the new address (request-email-change / confirm-email-change below). A direct change here is
@@ -10519,18 +10764,19 @@ async def update_user(
 
     # Admin-only fields
     admin_granted = False
-    withdrawn = []
+    taken_back = None
+    lost = []
     permissions_removed = []
     if is_admin:
-        # An administrator demoted, deactivated or locked here has their open requests withdrawn, before
-        # any of that is set: who was asked to approve them is read as it stands.
+        # An account demoted, deactivated or locked here loses its standing (_account_lost_standing)
+        # before any of that is set: who was asked to approve its requests is read as it stands.
         from app.services.auth_service import admin_locked
         for because, leaves in (("demoted", user_update.role is not None and user_update.role != RoleEnum.ADMIN
                                  and user.role == RoleEnum.ADMIN),
                                 ("deactivated", user_update.is_active is False and user.is_active),
                                 ("locked", user_update.is_locked is True and not admin_locked(user))):
             if leaves:
-                withdrawn = _account_lost_standing(db, user, actor=current_user, because=because)
+                lost = _account_lost_standing(db, user, actor=current_user, because=because)
                 break
         if user_update.role is not None:
             changes['role'] = {'old': user.role.value, 'new': user_update.role.value}
@@ -10538,6 +10784,7 @@ async def update_user(
             # rule; a demotion drops the record (app/core/admin_grants.py).
             if user_update.role == RoleEnum.ADMIN and user.role != RoleEnum.ADMIN:
                 _record_admin_grant(db, user, by=current_user)
+                taken_back = _take_back_password_at_promotion(db, user, by=current_user)
                 admin_granted = True
             elif user_update.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
                 from app.core import admin_grants as _grants
@@ -10620,18 +10867,23 @@ async def update_user(
                                        permissions_removed=permissions_removed)
     if admin_granted:
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
+    handed_over = _hand_over_promotion_reset(db, taken_back, by=current_user, request=request)
 
     if held:
         # Everything else in the request was saved; the held credential changes wait. 202 with the
         # account as it now stands, plus what is waiting and why.
         for outcome in held:
             _announce_held_change(db, outcome.change, user)
-        body = UserResponse.model_validate(user).model_dump(mode="json")
+        answer = UserResponse.model_validate(user)
+        answer.promotion_password_reset = handed_over
+        body = answer.model_dump(mode="json")
         body["held_changes"] = [_held_body(o, user, current_user.id) for o in held]
         body["message"] = " ".join(h["message"] for h in body["held_changes"])
         return JSONResponse(status_code=202, content=body)
-    return UserResponse.model_validate(user)
+    answer = UserResponse.model_validate(user)
+    answer.promotion_password_reset = handed_over
+    return answer
 
 
 def _parse_ssh_public_key(line: str):
@@ -10687,6 +10939,19 @@ def _ssh_key_target_user(user_id, current_user, db, *, write=False):
     return user
 
 
+def _ssh_key_response(key, owner) -> SSHKeyResponse:
+    """A key as the lists show it, with who added it: ``added_by`` their name, and ``added_by_other``
+    whether that was someone other than ``owner``, the key's account. With the maker's account deleted
+    (created_by is then NULL) the kept name says it; a key with neither is not known (None)."""
+    out = SSHKeyResponse.model_validate(key)
+    out.added_by = key.created_by_name
+    if key.created_by is not None:
+        out.added_by_other = key.created_by != key.user_id
+    elif key.created_by_name is not None:
+        out.added_by_other = key.created_by_name != getattr(owner, "username", None)
+    return out
+
+
 @app.get("/users/{user_id}/ssh-keys", response_model=List[SSHKeyResponse])
 async def list_ssh_keys(
     user_id: uuid.UUID,
@@ -10695,9 +10960,9 @@ async def list_ssh_keys(
 ):
     """List a user's authorized SSH public keys (admin or self)."""
     from app.core.models import UserSSHKey
-    _ssh_key_target_user(user_id, current_user, db)
+    owner = _ssh_key_target_user(user_id, current_user, db)
     keys = db.query(UserSSHKey).filter(UserSSHKey.user_id == user_id).order_by(UserSSHKey.created_at).all()
-    return [SSHKeyResponse.model_validate(k) for k in keys]
+    return [_ssh_key_response(k, owner) for k in keys]
 
 
 @app.post("/users/{user_id}/ssh-keys", response_model=SSHKeyResponse)
@@ -10749,7 +11014,7 @@ async def add_ssh_key(
         )
     except Exception:  # noqa: BLE001
         pass
-    return SSHKeyResponse.model_validate(key)
+    return _ssh_key_response(key, target)
 
 
 @app.delete("/users/{user_id}/ssh-keys/{key_id}")
@@ -11020,7 +11285,7 @@ async def delete_user(
 
     username = user.username
     # Their open requests are withdrawn first: deleting the account would leave them with no asker.
-    withdrawn = _account_lost_standing(db, user, actor=current_user, because="deleted")
+    lost = _account_lost_standing(db, user, actor=current_user, because="deleted")
     db.delete(user)
     db.commit()
     
@@ -11029,7 +11294,7 @@ async def delete_user(
     audit_logger.log_user_deleted(
         username, user_id, current_user, get_client_ip(request)
     )
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
     
     return {"message": f"User {username} deleted successfully"}
 
@@ -24003,6 +24268,23 @@ AUDIT_ROW_COLUMNS_DDL = (
 )
 
 
+# Fill UserSSHKey.created_by_name for a key that has none: from the account that added it while it exists,
+# else from the audit row of the key's addition (the newest for that account and fingerprint), whose
+# username is the one who added it. A key whose maker neither names stays NULL: not known.
+SSH_KEY_MAKER_FROM_ACCOUNT = (
+    "UPDATE user_ssh_keys AS k SET created_by_name = u.username FROM users AS u"
+    " WHERE k.created_by_name IS NULL AND k.created_by = u.id"
+)
+SSH_KEY_MAKER_FROM_AUDIT = (
+    "UPDATE user_ssh_keys AS k SET created_by_name = ("
+    "SELECT a.username FROM audit_logs AS a"
+    " WHERE a.action = 'ssh_key_add' AND a.status = 'success' AND a.resource_id = CAST(k.user_id AS TEXT)"
+    " AND a.details ->> 'fingerprint' = k.fingerprint AND a.username IS NOT NULL"
+    " ORDER BY a.timestamp DESC LIMIT 1)"
+    " WHERE k.created_by_name IS NULL AND k.created_by IS NULL"
+)
+
+
 def _run_lightweight_migrations():
     """Idempotent column additions for existing tables. create_all() only creates
     missing TABLES, not missing COLUMNS, so new columns on existing tables must be
@@ -24463,6 +24745,14 @@ END $$;""",
             # again when it is used (_reset_link_refusal). Nullable: a row from before it is read from
             # created_by, and an older release ignores the column.
             "ALTER TABLE password_reset_tokens ADD COLUMN IF NOT EXISTS made_by_other BOOLEAN",
+            # Who added an SSH key, by name, kept when that account is deleted (UserSSHKey.created_by_name).
+            # Nullable: an older release ignores it. The two statements after it fill it, for a key that
+            # has no name yet, from the account that added it, or when that account is gone from the audit
+            # row of the key's addition. Each touches only keys with no name, so it runs again at every
+            # start at no cost and also names a key added while an older release ran.
+            "ALTER TABLE user_ssh_keys ADD COLUMN IF NOT EXISTS created_by_name VARCHAR(255)",
+            SSH_KEY_MAKER_FROM_ACCOUNT,
+            SSH_KEY_MAKER_FROM_AUDIT,
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
@@ -24483,6 +24773,25 @@ END $$;""",
                     # /health has nothing to consult, and a deployment missing a column reports
                     # itself well until an endpoint that needed the column returns a 500.
                     recorder.record(stmt, SchemaStep.OUTCOME_FAILED, str(e))
+
+            # Whose password each account holds (app/core/password_origin.py): the two columns are added,
+            # and filled from the audit log, once, in one transaction. Deliberately NOT a string in the
+            # list above, because the filling must run only when the columns are new: afterwards the app
+            # keeps them, and a later start must not overwrite that from the log.
+            origin_step = "conditional: users.password_set_by columns, filled from the audit log once"
+            try:
+                from app.core import password_origin
+                db.execute(text("SET LOCAL lock_timeout = 0"))
+                marked = password_origin.add_columns_once(db)
+                db.commit()
+                recorder.record(origin_step, SchemaStep.OUTCOME_APPLIED)
+                if marked is not None:
+                    print(f"[OK] Password origin: {marked} account(s) hold a password someone else set, "
+                          "from the audit log")
+            except Exception as e:
+                db.rollback()
+                print(f"⚠ users.password_set_by columns skipped: {e}")
+                recorder.record(origin_step, SchemaStep.OUTCOME_FAILED, str(e))
 
             # Case-insensitive uniqueness on users.email. Deliberately NOT a string in the list
             # above, because it is conditional: a deployment that already holds two addresses

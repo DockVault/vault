@@ -1483,8 +1483,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Load dashboard stats
         loadDashboardStats();
 
-        // A copied link to an Activity search, opened before signing in, opens it now.
-        openActivityFromHash();
+        // A copied link to an Activity search, opened before signing in, opens it now; a link to Your
+        // account opens that dialog.
+        openActivityFromHash() || openAccountFromHash();
 
         // Prompt a keyless user who's been invited to a ZK vault to set up a key.
         zkMaybePromptPendingInvites();
@@ -5645,6 +5646,15 @@ function renderUserSshKeys(userId, keys, root = document) {
         fp.className = 'ssh-key-fp';
         fp.textContent = k.fingerprint;
         meta.appendChild(fp);
+        // Who added it, when that is known: the person, an administrator, or the server's operator.
+        if (k.added_by) {
+            const by = document.createElement('span');
+            by.className = 'ssh-key-by text-tertiary text-xs';
+            const mine = currentUser && k.added_by === currentUser.username;
+            by.textContent = 'Added by ' + (k.added_by === 'operator@host' ? "the server's operator"
+                : (mine ? 'you' : k.added_by));
+            meta.appendChild(by);
+        }
         item.appendChild(meta);
         const del = document.createElement('button');
         del.type = 'button';
@@ -15181,6 +15191,18 @@ function openActivityFromHash() {
     return false;
 }
 
+// A link to "Your account" (#profile, sent by email about the account's SSH keys) opens that dialog once
+// the person is signed in with their own account. The hash never reaches the server, and it is dropped
+// either way so the dialog does not open again on the next load.
+function openAccountFromHash() {
+    if (location.hash !== '#profile') return false;
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+    const temporary = isScopedTemp || !!(sessionAccess && sessionAccess.is_temp_session);
+    if (!currentUser || temporary) return false;
+    openUserSettingsModal();
+    return true;
+}
+
 // Restore the saved view on app load. Returns true if it handled navigation.
 async function restoreLastView() {
     const nav = getNavState();
@@ -21295,6 +21317,9 @@ async function enterAuthedSession() {
     // Restrict the sidebar for a scoped temp credential AFTER any restore.
     await loadSessionAccess();
 
+    // A link to Your account, opened while signed in, opens that dialog (once the session is known).
+    openAccountFromHash();
+
     // Prompt a keyless user who's been invited to a ZK vault to set up a key.
     zkMaybePromptPendingInvites();
 }
@@ -21899,6 +21924,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const u = (usersView.users || []).find(x => x.id === userId);
             if (u && (email.trim() || null) !== (u.email || null) && pendingApproval(u)
                 && !await confirmCredentialChange(u, 'The new address is saved', null, null, 'Your other changes are saved now.')) return;
+            // Making an account an administrator takes back a password someone else set: say so first.
+            if (u && role === 'admin' && u.role !== 'admin' && u.password_set_by_other) {
+                const setBy = u.password_set_by_other.by || 'someone else';
+                const ok = await showConfirm(
+                    `${u.username}'s password was set by ${setBy}, who may still know it. Making ${u.username} an `
+                    + 'administrator makes that password unusable and signs them out everywhere. They choose a new '
+                    + 'one with a reset link sent to their email address; when no email can go, you get the link to '
+                    + 'give them.',
+                    'Make an administrator?');
+                if (!ok) return;
+            }
 
             // Storage quota: 'inherit' clears the override (null), 'unlimited' exempts the
             // account, a number sets an exact budget. A blank custom box is treated as
@@ -21930,6 +21966,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (r && r.held_changes) showHeldChange(r);
                 else showSuccess('User updated successfully');
                 closeModal();
+                // A promotion that took back a password someone else set: the link, when none was emailed.
+                const taken = r && r.promotion_password_reset;
+                if (taken && taken.reset_link) _showResetLinkModal(taken.reset_link, r.username, taken.expires_in_minutes);
+                else if (taken && taken.emailed) showSuccess('Their password was reset: a link to choose a new one was emailed to them');
+                else if (taken) showError('Their password was reset, and no reset link could be made: set a new password for them');
                 loadUsers();
             } catch (error) {
                 showError('Failed to update user: ' + error.message);

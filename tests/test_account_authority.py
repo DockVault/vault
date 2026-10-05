@@ -318,11 +318,12 @@ _ACCOUNT_CHANGERS = {
     "_credential_change", "_apply_credential_change", "_approve_credential_change", "_mint_reset_link",
     "_mint_and_send_reset", "_record_admin_grant", "_withdraw_requests_of", "grant_endpoint_permission",
     "revoke_endpoint_permission", "create_temporary_credential", "_revoke_sessions",
+    "_take_back_password_at_promotion",
 }
 _ACCOUNT_FIELDS = {
     "password_hash", "email", "role", "is_locked", "locked_until", "failed_login_attempts",
     "second_factor_reset_at", "sftp_enabled", "sftp_password_auth", "storage_quota_bytes",
-    "is_active", "username",
+    "is_active", "username", "password_set_by", "password_set_by_other_at",
 }
 _ACCOUNT_ROWS = {
     "UserSSHKey", "AccountInvitation", "PasswordResetToken", "SecondFactorEnrollment",

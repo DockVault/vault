@@ -38,7 +38,8 @@ import app.api.user_management_api as UM  # noqa: E402
 from app.api.ecc_router import _rekey_owed  # noqa: E402
 from app.core.key_wrap_algorithms import DIRECT_DEK_ALGO  # noqa: E402
 from app.core.models import (  # noqa: E402
-    AccountInvitation, CredentialChange, RoleEnum, User, Vault, VaultMemberKey, vault_members,
+    AccountInvitation, AuditLog, CredentialChange, RoleEnum, User, UserSSHKey, Vault, VaultMemberKey,
+    vault_members,
 )
 
 pytestmark = pytest.mark.unit
@@ -54,8 +55,10 @@ def db():
                                   connect_args={"check_same_thread": False})
         # credential_changes: deactivating an administrator withdraws the requests they have open.
         # account_invitations: and revokes the invitations they made to be an administrator.
+        # user_ssh_keys, audit_logs: and reports the SSH keys they added to other people's accounts.
         for table in (User.__table__, Vault.__table__, vault_members, VaultMemberKey.__table__,
-                      CredentialChange.__table__, AccountInvitation.__table__):
+                      CredentialChange.__table__, AccountInvitation.__table__, UserSSHKey.__table__,
+                      AuditLog.__table__):
             table.create(engine)
         # The application's own session flags (app/core/database.py).
         Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)

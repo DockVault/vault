@@ -199,6 +199,14 @@ class User(Base):
     # those releases granted again at every start. Nullable and added by the boot DDL, so an earlier
     # release reads the table without it.
     permission_defaults_revision = Column(Integer, nullable=True)
+    # When the current password was set by someone other than the person (an administrator, a user who
+    # manages users, the server's operator on the host, or the maker of a reset link someone else made),
+    # and by which account (NULL for the host operator, or once that account is deleted). NULL when it is
+    # the person's own. Read when the account is made an administrator and when it approves a held change
+    # (app/core/password_origin.py). Nullable and added by the boot DDL, which fills them from the audit
+    # log once; an earlier release reads the table without them.
+    password_set_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    password_set_by_other_at = Column(DateTime, nullable=True)
 
     # SFTP access controls (per account). sftp_enabled gates ALL direct SFTP login
     # for this user; sftp_password_auth allows password-based SFTP (key auth via
@@ -274,6 +282,12 @@ class UserSSHKey(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
     created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    # Who added the key, by name, as it was when they added it: the person, an administrator, or the
+    # server's operator ("operator@host"). Kept when the account that added it is deleted (created_by is
+    # then NULL), so the key's owner and the administrators can still see who put it there. Nullable and
+    # added by the boot DDL, which fills it for older keys from created_by and the audit log; an earlier
+    # release reads the table without it.
+    created_by_name = Column(String(255), nullable=True)
 
     user = relationship('User', back_populates='ssh_keys', foreign_keys=[user_id])
 

@@ -304,7 +304,11 @@ def test_every_route_that_can_take_an_administrator_away_withdraws_their_request
     assert removing, "no route found: the check moved"
     assert _functions_calling(tree, "_account_lost_standing") - {"_account_lost_standing"} == removing
     assert _functions_calling(tree, "_withdraw_requests_of") - {"_withdraw_requests_of"} <= {"_account_lost_standing"}
-    assert _functions_calling(tree, "_announce_withdrawn_requests") - {"_announce_withdrawn_requests"} == removing
+    # What it did is told after the commit, through _announce_lost_standing, which alone tells of the
+    # withdrawal.
+    assert _functions_calling(tree, "_announce_lost_standing") - {"_announce_lost_standing"} == removing
+    assert _functions_calling(tree, "_announce_withdrawn_requests") - {"_announce_withdrawn_requests"} <= {
+        "_announce_lost_standing"}
 
 
 # Each route that takes an administrator away, called (test_last_admin.py's stand-ins: the account the

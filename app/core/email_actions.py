@@ -169,6 +169,20 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "ssh_keys_adder_left": {
+        "name": "SSH keys an administrator added",
+        "subject": "Check the SSH keys on your {{vault.name}} account",
+        "body_html": (
+            "<h2>Check the SSH keys on your account</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>Remove any key you do not use in Your account, under SSH keys:</p>"
+            "<p><a href=\"{{action.link}}\">Open Your account</a></p>"
+            "<p>If you do not recognise a key, contact your administrators.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -197,6 +211,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("administrator_added", "New administrator",
      "Sent to every administrator when an account is created as, promoted to or invited as an "
      "administrator — says who, when and by whom.", SYSTEM),
+    ("ssh_keys_adder_left", "SSH keys an administrator added",
+     "Sent to a user when an administrator who added SSH keys to their account is demoted, deactivated, "
+     "locked or deleted — names the keys, which still sign in, and links to where they are removed.", SYSTEM),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(

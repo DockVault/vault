@@ -199,16 +199,28 @@ def test_nothing_but_the_helper_calls_the_withdrawal():
     assert callers == {("api/api_server.py", HELPER)}, sorted(callers)
 
 
-def test_the_helper_withdraws_and_returns_what_is_announced(monkeypatch):
+def test_the_helper_withdraws_reports_keys_and_returns_what_is_announced(monkeypatch):
     calls = []
 
     def withdraw(db, user, *, actor, because):
-        calls.append((db, user, actor, because))
+        calls.append(("withdraw", db, user, actor, because))
         return ["told"]
 
+    def report(db, user, *, actor, because):
+        calls.append(("keys", db, user, actor, because))
+        return {"maker": "bob"}
+
     monkeypatch.setattr(api, "_withdraw_requests_of", withdraw)
-    assert api._account_lost_standing("db", "bob", actor="ada", because="locked") == ["told"]
-    assert calls == [("db", "bob", "ada", "locked")]
+    monkeypatch.setattr(api, "_report_keys_added_by", report)
+    lost = api._account_lost_standing("db", "bob", actor="ada", because="locked")
+    assert (lost.withdrawn, lost.keys) == (["told"], {"maker": "bob"})
+    assert calls == [("withdraw", "db", "bob", "ada", "locked"), ("keys", "db", "bob", "ada", "locked")]
+    # And the announcement after the commit tells both.
+    announced = []
+    monkeypatch.setattr(api, "_announce_withdrawn_requests", lambda db, w: announced.append(("withdrawn", w)))
+    monkeypatch.setattr(api, "_announce_keys_reported", lambda db, r, request=None: announced.append(("keys", r)))
+    api._announce_lost_standing("db", lost)
+    assert announced == [("withdrawn", ["told"]), ("keys", {"maker": "bob"})]
 
 
 # --------------------------------------------------------------------------- throwaway routes

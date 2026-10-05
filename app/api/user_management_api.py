@@ -3,7 +3,7 @@ Enhanced User Management API Endpoints
 Provides comprehensive user management with temp credentials, roles, and activity logging
 """
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 import os
 import hashlib
@@ -607,21 +607,24 @@ async def update_user(
                 made.append(outcome)
 
     admin_granted = False
+    taken_back = None
     permissions_removed = []
-    # An administrator demoted or deactivated here has their open requests withdrawn, before either is
-    # set: who was asked to approve them is read as it stands.
-    withdrawn = []
-    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
+    # An account demoted or deactivated here loses its standing (_account_lost_standing), before either is
+    # set: who was asked to approve its requests is read as it stands.
+    lost = []
+    from app.api.api_server import _account_lost_standing, _announce_lost_standing
     if user.role == RoleEnum.ADMIN and update_data.role is not None and update_data.role != RoleEnum.ADMIN:
-        withdrawn = _account_lost_standing(db, user, actor=current_user, because="demoted")
+        lost = _account_lost_standing(db, user, actor=current_user, because="demoted")
     elif update_data.is_active is False and user.is_active:
-        withdrawn = _account_lost_standing(db, user, actor=current_user, because="deactivated")
+        lost = _account_lost_standing(db, user, actor=current_user, because="deactivated")
     if update_data.role is not None:
         # Who made an administrator one is recorded with the change, for the two-administrator rule;
         # a demotion drops the record (app/core/admin_grants.py).
         if update_data.role == RoleEnum.ADMIN and user.role != RoleEnum.ADMIN:
-            from app.api.api_server import _record_admin_grant
+            from app.api.api_server import _record_admin_grant, _take_back_password_at_promotion
             _record_admin_grant(db, user, by=current_user)
+            # A password someone else set is taken back, and the person sets their own (after the commit).
+            taken_back = _take_back_password_at_promotion(db, user, by=current_user)
             admin_granted = True
         elif update_data.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:
             from app.core import admin_grants
@@ -664,7 +667,9 @@ async def update_user(
     if admin_granted:
         from app.api.api_server import _announce_admin_granted
         _announce_admin_granted(db, user, by_name=current_user.username, how="promoted")
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
+    from app.api.api_server import _hand_over_promotion_reset
+    handed_over = _hand_over_promotion_reset(db, taken_back, by=current_user, request=request)
     
     # Return updated details
     # Keyword args, not positional: get_user_detail is wrapped by require_endpoint_permission,
@@ -674,6 +679,13 @@ async def update_user(
     detail = await get_user_detail(
         user_id=user_id, request=request, current_user=current_user, db=db
     )
+    if handed_over is not None and not held:
+        # The promotion took back a password someone else set: say what became of it (a link to hand
+        # over, when none could be emailed).
+        raw = getattr(detail, "body", b"") or b""
+        body = json.loads(raw) if raw else {"id": str(user_id)}
+        body["promotion_password_reset"] = handed_over
+        return JSONResponse(content=body)
     if held:
         # The rest of the update was saved; the address change waits. 202 with the account as it now
         # stands, plus what is waiting and why.
@@ -685,6 +697,8 @@ async def update_user(
         body = json.loads(raw) if raw else {"id": str(user_id)}
         body["held_changes"] = [_held_body(o, user, current_user.id) for o in held]
         body["message"] = " ".join(h["message"] for h in body["held_changes"])
+        if handed_over is not None:
+            body["promotion_password_reset"] = handed_over
         return JSONResponse(status_code=202, content=body)
     return detail
 
@@ -726,10 +740,10 @@ async def toggle_user_active(
         from app.api.api_server import _enforce_user_cap
         _enforce_user_cap(db)
 
-    # An administrator deactivated here has their open requests withdrawn, before it is set.
-    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
-    withdrawn = (_account_lost_standing(db, user, actor=current_user, because="deactivated")
-                 if user.is_active else [])
+    # An account deactivated here loses its standing (_account_lost_standing), before it is set.
+    from app.api.api_server import _account_lost_standing, _announce_lost_standing
+    lost = (_account_lost_standing(db, user, actor=current_user, because="deactivated")
+            if user.is_active else [])
     user.is_active = not user.is_active
     if not user.is_active:
         # Offboarding also revokes the user's sessions, durably, as PATCH /users/{id} does (their
@@ -752,7 +766,7 @@ async def toggle_user_active(
     from app.api.api_server import _notify_account_status_changes
     _notify_account_status_changes(db, user, by_name=current_user.username,
                                    active=(not user.is_active, user.is_active))
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
     
     return {
         "message": f"User {'activated' if user.is_active else 'deactivated'} successfully",
@@ -784,9 +798,9 @@ async def toggle_user_locked(
         raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
 
     new_locked = not user.is_locked
-    # An administrator locked here has their open requests withdrawn, before the lock is set.
-    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
-    withdrawn = _account_lost_standing(db, user, actor=current_user, because="locked") if new_locked else []
+    # An account locked here loses its standing (_account_lost_standing), before the lock is set.
+    from app.api.api_server import _account_lost_standing, _announce_lost_standing
+    lost = _account_lost_standing(db, user, actor=current_user, because="locked") if new_locked else []
     user.is_locked = new_locked
     user.updated_at = datetime.now(timezone.utc)
 
@@ -824,7 +838,7 @@ async def toggle_user_locked(
     _notify_account_status_changes(db, user, by_name=current_user.username,
                                    locked=(not user.is_locked, user.is_locked),
                                    sign_in_locks_cleared=cleared)
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, request)
     
     return {
         "message": f"User {'locked' if user.is_locked else 'unlocked'} successfully",
@@ -1158,6 +1172,8 @@ class ChangeRoleResponse(BaseModel):
     username: str
     old_role: str
     new_role: str
+    # A promotion took back a password someone else had set: {emailed, reset_link, expires_in_minutes}.
+    promotion_password_reset: Optional[Dict[str, Any]] = None
 
 
 @router.get("/roles", response_model=List[RoleDefinition])
@@ -1269,13 +1285,16 @@ async def change_user_role(
     # Update role. Who made an administrator one is recorded in the same commit, for the
     # two-administrator rule; a demotion drops the record (app/core/admin_grants.py).
     admin_granted = request.new_role == RoleEnum.ADMIN
-    # An administrator demoted here has their open requests withdrawn, before the role is set.
-    from app.api.api_server import _account_lost_standing, _announce_withdrawn_requests
-    withdrawn = (_account_lost_standing(db, target_user, actor=current_user, because="demoted")
-                 if old_role == RoleEnum.ADMIN.value and not admin_granted else [])
+    # An administrator demoted here loses their standing (_account_lost_standing), before the role is set.
+    from app.api.api_server import _account_lost_standing, _announce_lost_standing
+    lost = (_account_lost_standing(db, target_user, actor=current_user, because="demoted")
+            if old_role == RoleEnum.ADMIN.value and not admin_granted else [])
+    taken_back = None
     if admin_granted:
-        from app.api.api_server import _record_admin_grant
+        from app.api.api_server import _record_admin_grant, _take_back_password_at_promotion
         _record_admin_grant(db, target_user, by=current_user)
+        # A password someone else set is taken back, and the person sets their own (after the commit).
+        taken_back = _take_back_password_at_promotion(db, target_user, by=current_user)
     elif old_role == RoleEnum.ADMIN.value:
         from app.core import admin_grants
         admin_grants.forget(db, target_user.id)
@@ -1302,13 +1321,16 @@ async def change_user_role(
     if admin_granted:
         from app.api.api_server import _announce_admin_granted
         _announce_admin_granted(db, target_user, by_name=current_user.username, how="promoted")
-    _announce_withdrawn_requests(db, withdrawn)
+    _announce_lost_standing(db, lost, http_request)
+    from app.api.api_server import _hand_over_promotion_reset
+    handed_over = _hand_over_promotion_reset(db, taken_back, by=current_user, request=http_request)
 
     return ChangeRoleResponse(
         message=f"Role changed successfully from '{old_role}' to '{new_role}'",
         user_id=str(target_user.id),
         username=target_user.username,
         old_role=old_role,
-        new_role=new_role
+        new_role=new_role,
+        promotion_password_reset=handed_over,
     )
 

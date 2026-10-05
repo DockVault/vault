@@ -84,6 +84,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("credential_change_withdrawn", "accounts", "Held change withdrawn", "info"),
     AuditAction("email_change_confirmed", "accounts", "Email address changed", "notice"),
     AuditAction("email_change_requested", "accounts", "Email change requested", "info"),
+    # An account whose password someone else set was made an administrator: the password was made
+    # unusable and its sessions ended, and the person sets a new one with a reset link.
+    AuditAction("password_reset_at_promotion", "accounts", "Password taken back at promotion", "notice"),
     AuditAction("password_reset_completed", "accounts", "Password changed with a reset link", "notice"),
     AuditAction("password_reset_link_minted", "accounts", "Password reset link created", "notice"),
     # An open link a user who manages users made for an account that has just been made an
@@ -101,6 +104,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("self_account_update", "accounts", "Own account details changed", "notice"),
     AuditAction("ssh_key_add", "accounts", "SSH key added", "notice"),
     AuditAction("ssh_key_remove", "accounts", "SSH key removed", "notice"),
+    # An administrator who added SSH keys to other people's accounts was demoted, deactivated, locked or
+    # deleted: one row per account holding such keys, whose owner is told (the keys keep working).
+    AuditAction("ssh_keys_adder_left", "accounts", "SSH keys reported: their adder left", "notice"),
     AuditAction("user_created", "accounts", "User created", "notice"),
     AuditAction("user_deleted", "accounts", "User deleted", "warning"),
     AuditAction("USER_LOCK_CHANGED", "accounts", "User locked or unlocked", "notice"),
