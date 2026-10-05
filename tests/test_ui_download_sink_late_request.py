@@ -5,12 +5,16 @@ slot and says it is done. For a small file all of that can happen before the fra
 reached the worker. A worker that drops the slot as soon as the page is done answers that request
 with 404: no download starts, and the page has already told the user it is downloading.
 
-These tests make that order certain rather than hoping for it. The frame is held back until the
-page has finished writing and the worker has had a round trip after the page's last message, and
-only then let go. The download must start with every byte, the slot must serve exactly one request,
-and a download whose request never comes must be reported to the user instead of passing silently.
-The usual order for a large file, the request first, is held the other way round, so the report is
-made only when it is true.
+These tests make each order certain rather than hoping for it.
+
+  * The frame is held back until the page has finished writing (or has given up) and the worker has
+    had a round trip after the page's last message, and only then let go. The download must start
+    with every byte, or as a failed download when the page gave up, and the slot must serve exactly
+    one request.
+  * The usual order for a large file, the browser's request first, is made certain by holding back
+    the rest of the file's body until the page has heard that the browser asked. Nothing may be
+    reported then.
+  * A download whose request never comes must be reported to the user instead of passing silently.
 
 The page clock is installed so the wait for a request that never comes (a minute) can be skipped
 over; it runs at normal speed otherwise.
@@ -31,13 +35,30 @@ pytestmark = pytest.mark.ui
 # Longer than the page's wait for the browser's request, so its timer is due.
 PAST_THE_CLAIM_WAIT_MS = 61_000
 
-HOLD_SINK_FRAMES = """() => {
+# Records what the page tells the user as an error, and each message the page's ports receive.
+WATCH = """() => {
     window.__errors = [];
     const showErrorBefore = window.showError;
     window.showError = function (message) {
         window.__errors.push(String(message));
         return showErrorBefore.apply(this, arguments);
     };
+    window.__portMessages = [];
+    const onmessage = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
+    Object.defineProperty(MessagePort.prototype, 'onmessage', {
+        configurable: true,
+        get() { return onmessage.get.call(this); },
+        set(handler) {
+            onmessage.set.call(this, handler && function (event) {
+                window.__portMessages.push(event.data && event.data.type);
+                return handler.call(this, event);
+            });
+        },
+    });
+}"""
+
+# Keeps the sink frame out of the document until the test lets it in.
+HOLD_SINK_FRAMES = """() => {
     window.__heldSinkFrames = [];
     const body = document.body;
     const append = body.appendChild;
@@ -51,9 +72,34 @@ HOLD_SINK_FRAMES = """() => {
     };
 }"""
 
-# downloadFile() resolves once the page has written the whole file and told the worker it is
-# done. The frame is still held. A round trip to the same worker afterwards means the worker has
-# had its turn at what the page sent before the frame's request can exist.
+# The file's body arrives in two parts: the first 28 bytes at once (enough for a zero-knowledge
+# file's header), the rest when the test says, or an error instead of the rest.
+HOLD_BODY = """(failRest) => {
+    const realFetch = window.fetch;
+    let release;
+    const released = new Promise((resolve) => { release = resolve; });
+    window.__releaseBody = () => release();
+    window.fetch = async function (input, init) {
+        const response = await realFetch.apply(this, arguments);
+        if (!/\\/files\\/[^/]+\\/download$/.test(String(input))) return response;
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const body = new ReadableStream({
+            async start(controller) {
+                controller.enqueue(bytes.slice(0, 28));
+                await released;
+                if (failRest) { controller.error(new TypeError('network error')); return; }
+                controller.enqueue(bytes.slice(28));
+                controller.close();
+            },
+        });
+        return new Response(body, { status: response.status, headers: response.headers });
+    };
+}"""
+
+# downloadFile() resolves once the page has written the whole file and told the worker it is done,
+# or has given up and told it so. The frame is still held. A round trip to the same worker
+# afterwards means the worker has had its turn at what the page sent before the frame's request can
+# exist.
 FINISH_WHILE_HELD = """async ([fid, name]) => {
     await downloadFile(fid, name);
     const frames = window.__heldSinkFrames.splice(0);
@@ -68,33 +114,18 @@ FINISH_WHILE_HELD = """async ([fid, name]) => {
     return { held: frames.length, src: frames.map(f => f.src), errors: window.__errors.slice() };
 }"""
 
-RELEASE = """() => { for (const f of window.__releasable) window.__appendToBody(f); }"""
+RELEASE_FRAMES = """() => { for (const f of window.__releasable) window.__appendToBody(f); }"""
 
-# The other order, the usual one for a large file: the browser asks for the download while the page
-# is still writing. The page's 'done' is held back until the download has started.
-HOLD_DONE = """() => {
-    window.__errors = [];
-    const showErrorBefore = window.showError;
-    window.showError = function (message) {
-        window.__errors.push(String(message));
-        return showErrorBefore.apply(this, arguments);
-    };
-    window.__heldDone = [];
-    const post = MessagePort.prototype.postMessage;
-    window.__postOnPort = (port, message) => post.call(port, message);
-    MessagePort.prototype.postMessage = function (message, transfer) {
-        if (message && message.type === 'done') {
-            window.__heldDone.push(this);
-            return;
-        }
-        return post.call(this, message, transfer);
-    };
-}"""
-
-RELEASE_DONE = """() => {
-    const ports = window.__heldDone.splice(0);
-    for (const port of ports) window.__postOnPort(port, { type: 'done' });
-    return ports.length;
+# Lets the rest of the body through only once the page has heard that the browser asked for the
+# download, then waits for downloadFile() to settle.
+RELEASE_BODY_AFTER_TAKEN = """async () => {
+    const until = Date.now() + 10000;
+    while (!window.__portMessages.includes('dv-sink-taken')) {
+        if (Date.now() > until) throw new Error('the page never heard that the browser asked');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    window.__releaseBody();
+    await window.__download;
 }"""
 
 FETCH_AGAIN = """async (src) => {
@@ -119,12 +150,12 @@ def _open_vault(page, vault_id: str) -> None:
     expect(page.locator(".file-name[data-file-id]").first).to_be_visible(timeout=15000)
 
 
-def _new_file_id(client, vault_id: str, before: set, page) -> str:
+def _new_file_id(client, vault_id: str, page) -> str:
     for _ in range(60):
         items = client.get(f"/vaults/{vault_id}/files").json()["items"]
-        new = [i["id"] for i in items if i["type"] == "file" and i["id"] not in before]
-        if new:
-            return new[0]
+        files = [i["id"] for i in items if i["type"] == "file"]
+        if files:
+            return files[0]
         page.wait_for_timeout(500)
     raise AssertionError("the upload never landed")
 
@@ -153,15 +184,15 @@ def _page_with_a_file(browser, owner, kind: str, body: bytes, name: str):
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
         page.set_input_files("#file-upload-input", files=[
             {"name": name, "mimeType": "application/octet-stream", "buffer": body}])
-        file_id = _new_file_id(client, vault_id, set(), page)
     else:
         vault_id = client.create_vault(name=unique("late-request"))["id"]
         client.post(f"/vaults/{vault_id}/files",
                     files=[("files", (name, body, "application/octet-stream"))]).raise_for_status()
-        file_id = _new_file_id(client, vault_id, set(), page)
+    file_id = _new_file_id(client, vault_id, page)
     _open_vault(page, vault_id)
     assert page.evaluate("state.downloadSink") == "streaming", (
         "these tests are about the streaming sink, which this deployment does not use")
+    page.evaluate(WATCH)
     return context, page, vault_id, file_id
 
 
@@ -177,7 +208,7 @@ def test_a_download_whose_request_arrives_after_the_page_finished_still_starts(b
         assert not held["errors"], held["errors"]
 
         with page.expect_download(timeout=15000) as info:
-            page.evaluate(RELEASE)
+            page.evaluate(RELEASE_FRAMES)
         download = info.value
         assert download.failure() is None, download.failure()
         assert download.suggested_filename == name
@@ -203,17 +234,39 @@ def test_a_download_the_browser_asks_for_before_the_page_finished_is_not_reporte
     name = f"early-{kind}.bin"
     context, page, vault_id, file_id = _page_with_a_file(browser, owner, kind, body, name)
     try:
-        page.evaluate(HOLD_DONE)
+        page.evaluate(HOLD_BODY, False)
         with page.expect_download(timeout=15000) as info:
-            page.evaluate("([fid, name]) => downloadFile(fid, name)", [file_id, name])
+            page.evaluate("([fid, name]) => { window.__download = downloadFile(fid, name); }", [file_id, name])
         download = info.value
-        assert page.evaluate(RELEASE_DONE) == 1, "the page never said it was done"
+        page.evaluate(RELEASE_BODY_AFTER_TAKEN)
         assert download.failure() is None, download.failure()
         assert Path(download.path()).read_bytes() == body, "the download is not the file"
 
         page.clock.fast_forward(PAST_THE_CLAIM_WAIT_MS)
         page.wait_for_timeout(200)
         assert page.evaluate("window.__errors") == []
+    finally:
+        context.close()
+        owner[1].delete_vault(vault_id)
+
+
+def test_a_download_the_page_gave_up_on_before_the_request_arrived_fails_visibly(browser, owner):
+    body = _body(1024, "gave-up")
+    name = "gave-up.bin"
+    context, page, vault_id, file_id = _page_with_a_file(browser, owner, "standard", body, name)
+    try:
+        page.evaluate(HOLD_SINK_FRAMES)
+        page.evaluate(HOLD_BODY, True)
+        page.evaluate("() => setTimeout(() => window.__releaseBody(), 0)")
+        held = page.evaluate(FINISH_WHILE_HELD, [file_id, name])
+        assert held["held"] == 1, f"expected one sink frame, got {held}"
+        assert held["errors"] == [f'Download of "{name}" failed part-way. '
+                                  "Any partial file in your downloads is incomplete."], held["errors"]
+
+        # The browser still gets the download, as a failed one, so its own list says so too.
+        with page.expect_download(timeout=15000) as info:
+            page.evaluate(RELEASE_FRAMES)
+        assert info.value.failure() is not None, "a download the page gave up on finished as complete"
     finally:
         context.close()
         owner[1].delete_vault(vault_id)

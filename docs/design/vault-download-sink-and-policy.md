@@ -123,8 +123,9 @@ gets the 404 it always did. The worker tells the page when the browser has asked
 `reportsTaken` in its ready reply, so a page talking to an older worker does not wait for a message
 that never comes). The page keeps the frame until then, since removing the frame cancels its request,
 and tells the user a download did not start if the browser has not asked within the same 60 s.
-`tests/test_ui_download_sink_late_request.py` holds back the frame, and in the other order the page's
-done, so each order is tested instead of being left to timing.
+`tests/test_ui_download_sink_late_request.py` holds back the frame until the page has finished, or
+has given up, and in the other order holds back the file's body until the page has heard that the
+browser asked, so each order is tested instead of being left to timing.
 
 ## Measured after building it: the memory case is not made
 
