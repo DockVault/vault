@@ -140,6 +140,30 @@ def test_another_encryption_key_does_not_open_it(key):
     assert security.open_case_field(case, token, "owner_note") == TEXT
 
 
+# Known answers: a fixed ENCRYPTION_KEY, row, field, item and nonce give exactly these stored values. A change to
+# the derivation (the labels, the root, the per-row key, the AAD, the layout) would leave every sealed text
+# already in a database unreadable; these fail first.
+KAT_CASE = uuid.UUID("3b0d6f52-9a41-4c7e-8f20-5d1e2a6b7c90")
+KAT_VAULT = uuid.UUID("c4e8a1f0-2b3d-4e5f-9a6b-7c8d9e0f1a2b")
+KAT_NONCE = bytes(range(12))
+# (field, item, text, ciphertext and tag in hex); the stored value is the marker, then base64(nonce || that).
+KAT = [
+    ("justification", None, "Case text, sealed.",
+     "cb78c8daf4b70d7912428e25f252a099c8cbfaa4f920bed2268469e9c0d1d248b72d"),
+    ("release_reason", KAT_VAULT, "Released.",
+     "da7cd7dab5b00d654863ab07b529154bf2ed713891edfe4a57"),
+]
+
+
+@pytest.mark.parametrize("field,item,text,sealed_hex", KAT, ids=[k[0] for k in KAT])
+def test_a_stored_value_opens_and_seals_to_the_known_answer(key, monkeypatch, field, item, text, sealed_hex):
+    stored = "cenc1:" + base64.b64encode(KAT_NONCE + bytes.fromhex(sealed_hex)).decode("ascii")
+    assert security.open_case_field(KAT_CASE, stored, field, item_id=item) == text
+    assert security.open_case_field(str(KAT_CASE), stored, field, item_id=None if item is None else str(item)) == text
+    monkeypatch.setattr(security.secrets, "token_bytes", lambda n: KAT_NONCE[:n])
+    assert security.seal_case_field(KAT_CASE, text, field, item_id=item) == stored
+
+
 def test_the_key_has_a_label_no_other_derivation_uses():
     app = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "app").rglob("*.py"))
     for label in (b"dockvault-case-enc-key-v1", b"dockvault-case-obj-v1", b"compliance-case-text"):
