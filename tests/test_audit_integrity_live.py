@@ -36,7 +36,8 @@ def _tool(*args):
     r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.audit_integrity", *args],
                        capture_output=True, text=True, encoding="utf-8", timeout=600)
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
-    return r.returncode, (json.loads(lines[-1]) if lines else None), r.stderr
+    last = lines[-1] if lines else None
+    return r.returncode, (json.loads(last) if last and last.startswith("{") else last), r.stderr
 
 
 # --------------------------------------------------------------------------- the stack's own chain
@@ -68,8 +69,8 @@ def test_the_host_command_verifies_the_chain_and_prints_the_head(admin):
     seq = int(answer["head"].split(":")[1])
     link = psql(f"SELECT encode(link, 'hex') FROM audit_seals WHERE seq = {seq}")
     assert answer["head"].endswith(link)
-    code, answer, err = _tool("head")
-    assert code == 0
+    code, head, err = _tool("head")
+    assert code == 0 and head.startswith("dvchain1:"), err[-1500:]
 
 
 def test_an_export_carries_the_head(admin):
