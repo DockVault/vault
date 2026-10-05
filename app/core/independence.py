@@ -86,6 +86,11 @@ def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant
     return None
 
 
+def _as_text(value) -> Optional[str]:
+    """An account id as text; None stays None (no one)."""
+    return None if value is None else str(value)
+
+
 def changer_ids(entries: Iterable) -> Set[str]:
     """The account ids in an auditor grant's list of credential changers ({"id": ..., ...} entries, or bare
     ids), as text. The host operator, who has no account, has no id."""
@@ -109,6 +114,10 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
     who created the auditor's account, ``credential_changers`` the grant's list, ``concerned`` the persons the
     case concerns, ``proposer_id`` who proposed the grant."""
     from app.core import admin_grants
+    # Every id as text before the rule compares them: the same person's id read from a column (a UUID) and
+    # from a record or a request (text) must compare equal, and refusal_reason compares what it is given.
+    approver_id, requester_id, subject_id = _as_text(approver_id), _as_text(requester_id), _as_text(subject_id)
+    changed = {str(person) for person in changed or () if person is not None}
     reason = refusal_reason(approver_id, requester_id=requester_id, approver_grant=approver_grant,
                             requester_grant=requester_grant, changed=changed, requested_at=requested_at,
                             target_id=subject_id, approver_password_set_by_other=approver_password_set_by_other)

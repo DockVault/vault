@@ -120,6 +120,24 @@ CASES = [
     ("lineage before creator", {"approver_grant": _grant([AUDITOR]), "created_by": APPROVER}, ind.MADE_BY_REQUESTER),
     ("fresh before concerned", {"approver_grant": _grant(granted_at=AT - timedelta(days=1)),
                                 "concerned": [APPROVER]}, ind.NEW_ADMIN),
+    # One person whose id arrives once as a UUID (a column) and once as text (a record, a request).
+    ("the auditor's own case, the approver by text", {"approver": str(AUDITOR)}, ind.ASKED),
+    ("the auditor's own case, the request by text", {"approver": AUDITOR, "requester": str(AUDITOR),
+                                                     "subject": str(AUDITOR)}, ind.ASKED),
+    ("the auditor's own grant, the approver by text", {"approver": str(AUDITOR), "requester": PROPOSER},
+     ind.OWN_ACCOUNT),
+    ("the auditor's own grant, the auditor by text", {"approver": AUDITOR, "requester": str(PROPOSER),
+                                                      "subject": str(AUDITOR)}, ind.OWN_ACCOUNT),
+    ("the proposer approves their proposal, by text", {"approver": str(PROPOSER), "requester": PROPOSER},
+     ind.ASKED),
+    ("changed the account in the 14 days before, listed by text", {"changed": [str(APPROVER)]},
+     ind.CHANGED_ACCOUNT),
+    ("changed the account in the 14 days before, the approver by text", {"approver": str(APPROVER),
+                                                                         "changed": [APPROVER]},
+     ind.CHANGED_ACCOUNT),
+    ("someone else changed the account, by text", {"approver": str(APPROVER), "changed": [str(OTHER), None]},
+     None),
+    ("an independent administrator by text", {"approver": str(APPROVER), "requester": str(AUDITOR)}, None),
 ]
 
 
