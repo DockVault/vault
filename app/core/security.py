@@ -923,6 +923,72 @@ def decrypt_note_field(row_id, token: str, field: str) -> str:
     return aesgcm.decrypt(nonce, ct, _note_field_aad(field, row_id)).decode('utf-8')
 
 
+
+# --- Compliance case text sealing ------------------------------------------------------------------
+# The free text of compliance access (a case's justification, its note to the owner, an objection, the reasons
+# given for a rejection, a closing, a release or a revocation, a grant's note, the reason for revealing a name,
+# and the address an owner's notice goes to) is sealed at rest under a key of its own, derived from
+# ENCRYPTION_KEY with a compliance label: HKDF(case-root, case_id) -> AES-256-GCM, with the field and the row
+# bound in the AAD (the construction of encrypt_object_field). A row that is not a case (a grant, a reveal, an
+# outbox row) is bound to its own id. A row keyed by two ids (a hold, by case and vault) passes the second as
+# ``item_id``. A sealed value is self-describing (a marker prefix); a value without it is never read as
+# plaintext. Rotating ENCRYPTION_KEY must re-seal these fields.
+_CASE_SEAL_PREFIX = 'cenc1:'
+CASE_FIELDS = frozenset({
+    'justification', 'owner_note', 'objection', 'reject_reason', 'close_reason', 'release_reason',
+    'grant_note', 'grant_reject_reason', 'revoke_reason', 'reveal_reason', 'notice_address',
+    'notice_previous_address',
+})
+
+
+def _case_encryption_root():
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-case-enc-key-v1', info=b'compliance-case-text',
+    ).derive(_runtime_settings().encryption_key.encode())
+
+
+def _case_object_key(case_id) -> bytes:
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'dockvault-case-obj-v1', info=_uuid_bytes(case_id),
+    ).derive(_case_encryption_root())
+
+
+def _case_field_aad(field: str, case_id, item_id) -> bytes:
+    if field not in CASE_FIELDS:
+        raise ValueError(f"{field!r} is not a sealed compliance field")
+    aad = b'dockvault-case-field:' + field.encode() + b':' + _uuid_bytes(case_id)
+    return aad + (b':' + _uuid_bytes(item_id) if item_id is not None else b'')
+
+
+def is_case_sealed(value) -> bool:
+    """True if ``value`` carries the sealed compliance-text marker."""
+    return isinstance(value, str) and value.startswith(_CASE_SEAL_PREFIX)
+
+
+def seal_case_field(case_id, plaintext: str, field: str, *, item_id=None) -> str:
+    """Seal one compliance text ``field`` of the row ``case_id`` (and ``item_id``, for a row keyed by two ids):
+    marker + base64(nonce || ciphertext + tag). Raises ValueError for a field not in CASE_FIELDS."""
+    if not isinstance(plaintext, str):
+        raise TypeError("a sealed compliance field is text")
+    aad = _case_field_aad(field, case_id, item_id)
+    nonce = secrets.token_bytes(_GCM_NONCE_SIZE)
+    ct = AESGCM(_case_object_key(case_id)).encrypt(nonce, plaintext.encode('utf-8'), aad)
+    return _CASE_SEAL_PREFIX + base64.b64encode(nonce + ct).decode('ascii')
+
+
+def open_case_field(case_id, token: str, field: str, *, item_id=None) -> str:
+    """Inverse of seal_case_field. Raises on another row, another field, a changed value, and a value that is not
+    sealed (it is never taken as plaintext)."""
+    aad = _case_field_aad(field, case_id, item_id)
+    if not is_case_sealed(token):
+        raise ValueError("not a sealed compliance field")
+    raw = base64.b64decode(token[len(_CASE_SEAL_PREFIX):], validate=True)
+    nonce, ct = raw[:_GCM_NONCE_SIZE], raw[_GCM_NONCE_SIZE:]
+    return AESGCM(_case_object_key(case_id)).decrypt(nonce, ct, aad).decode('utf-8')
+
+
 def name_blind_index(vault_id, name: str) -> str:
     """Deterministic per-vault HMAC-SHA256 of an EXACT name, for server-side equality
     lookup without storing plaintext. Same (vault_id, name) -> same hex digest."""
