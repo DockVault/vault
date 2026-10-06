@@ -5820,8 +5820,12 @@ class DockVault:
         the chain's head. Keep the head somewhere else (a ticket, a printout): a later change to the history
         before it then shows. Exit status: 0 clean, 1 failures or warnings, 2 the check could not run."""
         pal = self.pal
-        if args is not None and getattr(args, "audit_action", "verify") == "acknowledge":
+        action = getattr(args, "audit_action", "verify") if args is not None else "verify"
+        if action == "acknowledge":
             return self._audit_acknowledge(args)
+        if action in ("rekey", "after-record", "accept-database-head", "accept-restore",
+                      "acknowledge-removed-before"):
+            return self._audit_host_command(args, action)
         tool_args = ["verify", "--json"]
         for flag, name in (("--from", "audit_from"), ("--to", "audit_to"), ("--anchor", "anchor")):
             value = getattr(args, name, None) if args else None
@@ -5864,15 +5868,22 @@ class DockVault:
         if code:
             raise SystemExit(code)
 
-    def _audit_tool(self, *tool_args):
-        """Run `python -m app.core.audit_integrity ...` in the running web container; its JSON answer."""
+    def _audit_tool(self, *tool_args, input_text=None):
+        """Run `python -m app.core.audit_integrity ...` in the running web container; its JSON answer. With
+        ``input_text`` the command reads it on standard input (an old key: never on a command line, where `ps`
+        or `docker inspect` would show it). `exec` asks Compose no volume question, so this one call may feed
+        its standard input."""
         ok, why = docker_available()
         if not ok:
             self._fail("Docker is not available: %s" % why)
         for service in ("vault", "vault-api"):
+            cmd = ("exec", "-T", service, "python", "-m", "app.core.audit_integrity") + tuple(tool_args)
             try:
-                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.audit_integrity", *tool_args,
-                                 timeout=3600)
+                if input_text is None:
+                    r = self._run_dc(*cmd, timeout=3600)
+                else:
+                    r = subprocess.run(self._dc(*cmd), input=input_text, text=True, capture_output=True,
+                                       cwd=self.root, timeout=3600)
             except (OSError, subprocess.SubprocessError) as exc:
                 self._fail("could not run the audit tool: %s" % type(exc).__name__)
             answer = parse_operator_answer(getattr(r, "stdout", ""))
@@ -5880,41 +5891,129 @@ class DockVault:
                 return answer
         self._fail("the audit tool did not answer. Is the deployment running? (python dockvault.py status)")
 
-    def _audit_acknowledge(self, args):
-        """Two steps, as every host command that writes a seal: read the chain and show what will be
-        acknowledged, ask, then write with the head that was shown, so nothing appended in between is
-        acknowledged unseen."""
+    def _audit_old_key(self, args):
+        """The old AUDIT_CHAIN_KEY from --old-key-file, read here on the host and handed to the tool on its
+        standard input, or None."""
+        path = getattr(args, "old_key_file", None) if args else None
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError as exc:
+            self._fail("could not read %s: %s" % (path, exc))
+        if not text:
+            self._fail("%s is empty" % path)
+        return text + "\n"
+
+    def _audit_two_phase(self, args, tool_args, what):
+        """Every host command that writes a seal runs in two steps: read the chain and show what will be
+        written, ask, then write with the state that was shown, so nothing changed in between is written over
+        unseen. What the read asks to confirm by name must be typed (or given with --confirm)."""
         pal = self.pal
-        seqs = (getattr(args, "seqs", None) or "").strip()
-        failures = bool(getattr(args, "failures", False))
-        if not seqs and not failures:
-            self._fail("say what to acknowledge: --seqs <seal numbers> or --failures")
-        seen = self._audit_tool("verify", "--json")
-        if not seen.get("ok") or not seen.get("head"):
-            self._fail("the chain could not be read: %s" % server_text(seen.get("error")))
-        wanted = {int(s) for s in seqs.split(",") if s.strip().isdigit()}
-        for f in seen.get("findings") or []:
-            kept_by_kind = f.get("severity") == "warning" and not f.get("seq")
-            if (f.get("seq") in wanted) or (failures and (f.get("severity") == "failure" or kept_by_kind)):
-                print("  %-12s %s: %s" % (server_text(f.get("severity")).upper(), server_text(f.get("kind")),
-                                          server_text(f.get("message"))))
-        print("  Head now: %s" % server_text(seen.get("head")))
-        if not getattr(args, "yes", False):
+        key = self._audit_old_key(args)
+        extra = ["--old-key-stdin"] if key is not None else []
+        seen = self._audit_tool(*(list(tool_args) + extra + ["--read"]), input_text=key)
+        if not seen.get("ok"):
+            self._fail(server_text(seen.get("error")) or "the chain could not be read")
+        for line in seen.get("lines") or []:
+            print("  " + server_text(line))
+        given = list(getattr(args, "confirm", None) or [])
+        interactive = not getattr(args, "yes", False)
+        for name in seen.get("confirm") or []:
+            if name in given:
+                continue
+            if not interactive:
+                self._fail("confirm %s first: --confirm %s" % (name, name))
             try:
-                answer = input(pal.paint("  Acknowledge these? Type yes: ", "cyan"))
+                typed = input(pal.paint("  Type %s to confirm it: " % server_text(name), "cyan"))
+            except EOFError:
+                typed = ""
+            if typed.strip() != name:
+                print(pal.paint("  Nothing written.\n", "yellow"))
+                return None
+            given.append(name)
+        if interactive:
+            try:
+                answer = input(pal.paint("  %s? Type yes: " % what, "cyan"))
             except EOFError:
                 answer = ""
             if answer.strip().lower() != "yes":
-                print(pal.paint("  Nothing acknowledged.\n", "yellow"))
-                return
-        tool = ["acknowledge", "--expect", seen["head"]] + (["--seqs", seqs] if seqs else []) + \
-            (["--failures"] if failures else [])
-        done = self._audit_tool(*tool)
+                print(pal.paint("  Nothing written.\n", "yellow"))
+                return None
+        confirms = []
+        for name in given:
+            confirms += ["--confirm", name]
+        done = self._audit_tool(*(list(tool_args) + extra + ["--expect", seen["state"]] + confirms),
+                                input_text=key)
         if not done.get("ok"):
-            self._fail(server_text(done.get("error")) or "the acknowledgment was refused")
-        print(pal.paint("  Acknowledged: seals %s; failures %s\n" % (
+            self._fail(server_text(done.get("error")) or "refused")
+        return done
+
+    def _audit_acknowledge(self, args):
+        """acknowledge: warnings by seal (--seqs), failures (--failures), rows holding a value no release writes
+        (--rows), or rows added to a sealed hour after its window (--late-rows <hour>)."""
+        pal = self.pal
+        seqs = (getattr(args, "seqs", None) or "").strip()
+        failures = bool(getattr(args, "failures", False))
+        rows = (getattr(args, "rows", None) or "").strip()
+        late = (getattr(args, "late_rows", None) or "").strip()
+        if not (seqs or failures or rows or late):
+            self._fail("say what to acknowledge: --seqs, --failures, --rows or --late-rows")
+        tool = ["acknowledge"]
+        if late:
+            tool += ["--late-rows", late]
+        else:
+            tool += (["--seqs", seqs] if seqs else []) + (["--failures"] if failures else []) + \
+                (["--rows", rows] if rows else [])
+        done = self._audit_two_phase(args, tool, "Acknowledge these")
+        if done is None:
+            return
+        if late:
+            print(pal.paint("  Sealed %s rows of %s (seal %s)\n" % (server_text(done.get("added")),
+                                                                  server_text(done.get("hour")),
+                                                                  server_text(done.get("sealed"))), "green"))
+            return
+        print(pal.paint("  Acknowledged: seals %s; failures %s; rows %s\n" % (
             ", ".join(map(str, done.get("acknowledged") or [])) or "none",
-            ", ".join(server_text(k) for k in (done.get("failures") or [])) or "none"), "green"))
+            ", ".join(server_text(k) for k in (done.get("failures") or [])) or "none",
+            ", ".join(server_text(r) for r in (done.get("rows") or [])) or "none"), "green"))
+
+    def _audit_host_command(self, args, action):
+        """rekey, after-record, accept-database-head, accept-restore, acknowledge-removed-before: in two steps,
+        recorded as the host operator."""
+        pal = self.pal
+        tool = [action]
+        if action == "rekey":
+            if getattr(args, "accept_unverified_history", False):
+                tool.append("--accept-unverified-history")
+            if getattr(args, "confirm_return", False):
+                tool.append("--confirm-return")
+            what = "Write the key seal"
+        elif action == "after-record":
+            if getattr(args, "discard", False):
+                tool.append("--discard")
+                if getattr(args, "discard_from", None):
+                    tool += ["--from", str(args.discard_from)]
+            if getattr(args, "confirm_unverified", False):
+                tool.append("--confirm-unverified")
+            what = "Discard these seals" if getattr(args, "discard", False) else "Accept these seals"
+        elif action in ("accept-database-head", "accept-restore"):
+            if getattr(args, "no_reseal", False):
+                tool.append("--no-reseal")
+            what = "Accept this restore"
+        else:
+            before = getattr(args, "before", None)
+            days = getattr(args, "retention_days", None)
+            if not before or not days:
+                self._fail("acknowledge-removed-before needs --before <time> and --retention-days <days>")
+            tool += [before, "--retention-days", str(days)]
+            what = "Seal over this removal"
+        done = self._audit_two_phase(args, tool, what)
+        if done is None:
+            return
+        shown = ", ".join("%s %s" % (k, server_text(v)) for k, v in sorted(done.items()) if k != "ok")
+        print(pal.paint("  Done: %s\n" % shown, "green"))
 
     def accounts(self, args=None):
         """Act on an account as the person who runs the server: reset a password or a second factor,
@@ -6254,14 +6353,43 @@ def build_parser():
     ac.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     au = parsers["audit"]
-    au.add_argument("audit_action", nargs="?", default="verify", choices=("verify", "acknowledge"),
+    au.add_argument("audit_action", nargs="?", default="verify",
+                    choices=("verify", "acknowledge", "rekey", "after-record", "accept-database-head",
+                             "accept-restore", "acknowledge-removed-before"),
                     help="verify (the default): check the chain and print its head; acknowledge: acknowledge "
-                         "warnings (--seqs) or failures (--failures) once you have looked at them")
+                         "warnings (--seqs), failures (--failures), rows (--rows) or late rows (--late-rows) once "
+                         "you have looked at them; rekey: move the chain to the current AUDIT_CHAIN_KEY; "
+                         "after-record: accept or discard the seals after the head record; accept-database-head: "
+                         "accept a restored database or a lost head record; accept-restore: finish a restore of a "
+                         "backup; acknowledge-removed-before: seal over rows an older release removed by age")
     au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
     au.add_argument("--failures", dest="failures", action="store_true",
                     help="acknowledge: every failure, and every warning kept by kind (not a seal's), not yet "
                          "acknowledged")
-    au.add_argument("--yes", dest="yes", action="store_true", help="acknowledge without asking")
+    au.add_argument("--rows", dest="rows", help="acknowledge: rows holding a value no release writes, by id")
+    au.add_argument("--late-rows", dest="late_rows",
+                    help="acknowledge: seal the rows added to this sealed hour (YYYY-MM-DDTHH:00:00Z)")
+    au.add_argument("--old-key-file", dest="old_key_file",
+                    help="rekey, after-record, accept-database-head: a file holding the earlier AUDIT_CHAIN_KEY "
+                         "(read here, handed to the tool on its standard input)")
+    au.add_argument("--accept-unverified-history", dest="accept_unverified_history", action="store_true",
+                    help="rekey: the old key is lost; write the key seal without its proof")
+    au.add_argument("--confirm-return", dest="confirm_return", action="store_true",
+                    help="rekey: return to a key the chain had left")
+    au.add_argument("--discard", dest="discard", action="store_true",
+                    help="after-record: delete the seals after the head record that no writer accepted")
+    au.add_argument("--discard-from", dest="discard_from", type=int, help="after-record --discard: the first seal")
+    au.add_argument("--confirm-unverified", dest="confirm_unverified", action="store_true",
+                    help="after-record: accept a key seal written without its proof, which you wrote")
+    au.add_argument("--no-reseal", dest="no_reseal", action="store_true",
+                    help="accept-database-head, accept-restore: do not seal again the cancels and values lost")
+    au.add_argument("--confirm", dest="confirm", action="append",
+                    help="what the read asks to confirm by name (otherwise it is asked for)")
+    au.add_argument("--before", dest="before", help="acknowledge-removed-before: the removal's cutoff time")
+    au.add_argument("--retention-days", dest="retention_days", type=int,
+                    help="acknowledge-removed-before: the AUDIT_LOG_RETENTION_DAYS the older release ran with")
+    au.add_argument("--yes", dest="yes", action="store_true", help="write without asking (confirmations by name "
+                                                                    "still need --confirm)")
     au.add_argument("--from", dest="audit_from", help="the first hour whose rows are checked (YYYY-MM-DDTHH:00:00Z); "
                                                       "every hour by default")
     au.add_argument("--to", dest="audit_to", help="the hour the row check stops before")

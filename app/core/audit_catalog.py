@@ -265,6 +265,15 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("audit_rows_sealed_late", "security", "Audit rows sealed late", "warning", automatic=True),
     AuditAction("audit_integrity_acknowledged", "administration", "Audit log integrity warning acknowledged",
                 "notice"),
+    # What the host's operator does to the chain (dockvault.py audit): the chain moved to another key, seals
+    # after the head record accepted or discarded, a restored database or backup accepted, and a removal made
+    # by a release without the chain sealed over.
+    AuditAction("audit_chain_key_changed", "administration", "Audit log chain moved to another key", "warning"),
+    AuditAction("audit_seals_accepted", "administration", "Audit log seals accepted by the host", "warning"),
+    AuditAction("audit_seals_discarded", "administration", "Audit log seals discarded by the host", "warning"),
+    AuditAction("audit_chain_restored", "administration", "Audit log restore accepted", "warning"),
+    AuditAction("audit_removal_acknowledged", "administration", "Audit rows removed by an older release sealed over",
+                "warning"),
     # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
     AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),

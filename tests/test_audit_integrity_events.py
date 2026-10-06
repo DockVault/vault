@@ -456,12 +456,20 @@ def test_the_host_acknowledges_a_late_seal_it_has_seen_and_nothing_appended_sinc
     env.seal()
     late = [s for s in env.seals() if s.kind == "late"][0]
     assert "late" in ai.status(env.st)["warnings"]
-    head = env.verify().head
+    seen = host.acknowledge(env.engine, env.st, seqs=[late.seq], failures=False, read=True)
+    assert seen["state"].startswith("dvstate1:") and any(f"seal {late.seq} (late)" in ln for ln in seen["lines"])
     with pytest.raises(host.Refused):
         host.acknowledge(env.engine, env.st, seqs=[late.seq], failures=False, expect="dvchain1:1:" + "00" * 32)
     with pytest.raises(host.Refused):
-        host.acknowledge(env.engine, env.st, seqs=[1], failures=False, expect=head)
-    done = host.acknowledge(env.engine, env.st, seqs=[late.seq], failures=False, expect=head)
+        host.acknowledge(env.engine, env.st, seqs=[1], failures=False, read=True)
+    # A seal appended between the two phases changes the state: nothing is written.
+    env.clock.advance(hours=1)
+    env.seal()
+    with pytest.raises(host.Refused, match="changed since you looked"):
+        host.acknowledge(env.engine, env.st, seqs=[late.seq], failures=False, expect=seen["state"])
+    assert env.seals()[-1].kind != "ack"
+    seen = host.acknowledge(env.engine, env.st, seqs=[late.seq], failures=False, read=True)
+    done = host.acknowledge(env.engine, env.st, seqs=[late.seq], failures=False, expect=seen["state"])
     assert done["acknowledged"] == [late.seq]
     ack = env.seals()[-1]
     assert ack.kind == "ack" and ack.detail["by"] == "host" and ack.detail["acknowledges"] == [late.seq]
@@ -483,7 +491,8 @@ def test_the_host_acknowledges_failures_and_they_leave_the_status(env):
     v.daily_check(env.session, env.st, env.clock(), force=True)
     assert ai.status(env.st)["outcome"] == "failed"
     _update(env, ids[0], action="file_uploaded")
-    done = host.acknowledge(env.engine, env.st, seqs=[], failures=True, expect=env.verify().head)
+    seen = host.acknowledge(env.engine, env.st, seqs=[], failures=True, read=True)
+    done = host.acknowledge(env.engine, env.st, seqs=[], failures=True, expect=seen["state"])
     assert done["failures"] == ["rows-altered"]
     assert ai.status(env.st)["failures"] == {}
     assert env.seals()[-1].detail["failures"][0][0] == "rows-altered"

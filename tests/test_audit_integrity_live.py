@@ -310,7 +310,8 @@ def test_a_value_written_into_the_database_is_neither_shown_nor_followed(admin):
         # A pass that ran while the value was there kept a finding: the host acknowledges it, as an operator would.
         code, answer, _err = _tool("verify", "--json")
         if answer and any(f["kind"] == "unjustified-input" for f in answer.get("findings") or []):
-            _tool("acknowledge", "--failures", "--expect", answer["head"])
+            _code, seen, _err = _tool("acknowledge", "--failures", "--read")
+            _tool("acknowledge", "--failures", "--expect", seen["state"])
 
 
 # --------------------------------------------------------------------------- a throwaway database: what is trusted

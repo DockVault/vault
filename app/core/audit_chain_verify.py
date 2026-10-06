@@ -27,10 +27,7 @@ With ``--anchor dvchain1:...`` and no key, the links up to the anchor authentica
 """
 from __future__ import annotations
 
-import argparse
-import json
 import re
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -508,8 +505,11 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
                                f"seal {seal.seq} was accepted without its key, not confirmed by a head record", seal.seq)
                 elif old is not None or d.get("accepted_unverified"):
                     report.add(FAILURE, "key-unverified", f"key seal {seal.seq}'s proof does not verify", seal.seq)
-            if ok and k is not None and ai._mac_ok(k, link, seal.mac):
-                uncovered = []        # a verified key seal covers every MAC before it
+            if k is not None and ai._mac_ok(k, link, seal.mac):
+                # A key seal whose own MAC verifies covers every MAC before it: the links fix every body
+                # before it, so an older MAC adds nothing (its proof is checked above wherever the old key is
+                # held).
+                uncovered = []
         problem = justification_problem(view, seal, record)
         if problem == "stable-changed":
             report.add(FAILURE, "stable-changed", f"rewrite seal {seal.seq} changes a stable root or the ids", seal.seq)
@@ -660,6 +660,18 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
     if fig.missing_nonce:
         report.add(FAILURE, "nonce-missing", f"{len(fig.missing_nonce)} rows in {label} have no nonce and the hour "
                                              "no salt", hour=label)
+    if fig.unwritable:
+        # A value no release writes: the row was written or changed outside the app. Once the host has looked
+        # at it (``acknowledge --rows``), it is information.
+        seen = [r for r in fig.unwritable if str(r) in view.acked_rows]
+        unseen = [r for r in fig.unwritable if str(r) not in view.acked_rows]
+        if unseen:
+            report.add(FAILURE, "rows-altered", f"value-not-writable: {len(unseen)} rows of {label} hold a value no "
+                                                f"release writes: {', '.join(str(r) for r in unseen[:20])}",
+                       root.seq, label)
+        if seen:
+            report.add(INFO, "value-not-writable", f"{len(seen)} rows of {label} hold a value no release writes; "
+                                                   "the host acknowledged them", root.seq, label)
     if (fig.count, fig.root_s, fig.root_c, fig.ids_digest) == (root.count, root.root_s, root.root_c,
                                                                root.ids_digest):
         return
@@ -864,105 +876,7 @@ def _print_report(report: Report, out) -> None:
         out.write(f"head (keep it somewhere else): {report.head}  at {report.head_at}  key {report.key_id}\n")
 
 
-def _acknowledge(args) -> int:
-    """The host's acknowledgment, answered as one JSON line (dockvault.py reads it)."""
-    import contextlib
-    out = sys.stdout
-    try:
-        seqs = [int(s) for s in args.seqs.split(",") if s.strip()]
-    except ValueError:
-        out.write(json.dumps({"ok": False, "error": "--seqs takes seal numbers"}) + "\n")
-        return 2
-    try:
-        with contextlib.redirect_stdout(sys.stderr):
-            import app.api.api_server  # noqa: F401 -- the configuration and the database, as the server has them
-            from app.core import audit_chain_host
-            from app.core.database import _require_engine
-            ai = _ai()
-            st = ai.ChainState()
-            try:
-                done = audit_chain_host.acknowledge(_require_engine(), st, seqs=seqs, failures=args.failures,
-                                                    expect=args.expect)
-            except audit_chain_host.Refused as why:
-                out.write(json.dumps({"ok": False, "error": str(why)}) + "\n")
-                return 2
-            except ai.ChainStopped as stop:
-                out.write(json.dumps({"ok": False, "error": f"{stop.kind}: {stop}"}) + "\n")
-                return 2
-    except Exception as exc:  # noqa: BLE001
-        out.write(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}) + "\n")
-        return 2
-    out.write(json.dumps({"ok": True, **done}) + "\n")
-    return 0
-
-
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="python -m app.core.audit_integrity")
-    sub = p.add_subparsers(dest="action")
-    v = sub.add_parser("verify", help="verify the audit log's integrity chain and print the head")
-    v.add_argument("--from", dest="from_", help="first hour to rebuild from its rows (YYYY-MM-DDTHH:00:00Z)")
-    v.add_argument("--to", dest="to", help="hour to stop before")
-    v.add_argument("--anchor", help="a head kept elsewhere (dvchain1:...)")
-    v.add_argument("--json", action="store_true", help="print the report as JSON")
-    sub.add_parser("head", help="print the head to keep elsewhere")
-    a = sub.add_parser("acknowledge", help="acknowledge warnings (by seal) or failures, as the host")
-    a.add_argument("--seqs", default="", help="the warning seals to acknowledge, comma-separated")
-    a.add_argument("--failures", action="store_true",
-                   help="acknowledge every failure, and every warning kept by kind, not yet acknowledged")
-    a.add_argument("--expect", required=True, help="the head the operator saw (dvchain1:...)")
-    args = p.parse_args(argv)
-    if args.action == "acknowledge":
-        return _acknowledge(args)
-    if args.action not in ("verify", "head"):
-        p.print_help()
-        return 2
-    import contextlib
-    out = sys.stdout
-    try:
-        with contextlib.redirect_stdout(sys.stderr):
-            import app.api.api_server  # noqa: F401 -- the configuration and the database, as the server has them
-            from app.core.database import SessionLocal
-            ai = _ai()
-            st = ai.ChainState()
-            try:
-                record = st.head_store().load()
-            except ValueError:
-                record = None
-            db = SessionLocal()
-            try:
-                if args.action == "head":
-                    report = verify(db, record=record, check_rows=False)
-                else:
-                    held = {k: v.key for k, v in st.keys_held().items()}
-                    report = verify(db, record=record, held=held, current_key_id=st.current_key().key_id,
-                                    anchor=args.anchor,
-                                    from_hour=fmt.parse_time_text(args.from_) if args.from_ else None,
-                                    to_hour=fmt.parse_time_text(args.to) if args.to else None,
-                                    key_shared=st.current_key().source == "encryption")
-                    if record is None and report.seals:
-                        report.add(FAILURE, "head-record-missing", f"no head record at {st.head_store().path}")
-                    for kind, e in ai.open_failures(record).items():
-                        if kind not in report.kinds(FAILURE):
-                            report.add(FAILURE, kind, f"{e.get('message', '')} (first seen {e.get('first_seen')}, "
-                                                      "not acknowledged)")
-                    for kind, e in ai.open_warnings(record).items():
-                        if kind not in report.kinds(WARNING):
-                            report.add(WARNING, kind, f"{e.get('message', '')} (first seen {e.get('first_seen')}, "
-                                                      "not acknowledged)")
-            finally:
-                db.close()
-    except Exception as exc:  # noqa: BLE001
-        sys.stderr.write(f"cannot verify: {type(exc).__name__}: {exc}\n")
-        if getattr(args, "json", False):
-            out.write(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}) + "\n")
-        return 2
-    if getattr(args, "json", False):
-        out.write(json.dumps({"ok": True, "head": report.head, "head_at": report.head_at, "key_id": report.key_id,
-                              "seals": report.seals, "exit_code": report.exit_code,
-                              "findings": [f.as_dict() for f in report.findings]}) + "\n")
-    elif args.action == "head":
-        out.write((report.head or "no seal yet") + "\n")
-        return 0
-    else:
-        _print_report(report, out)
-    return report.exit_code
+    """The host's command line (app/core/audit_chain_cli.py)."""
+    from app.core.audit_chain_cli import main as cli
+    return cli(argv)

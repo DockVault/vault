@@ -284,6 +284,8 @@ class ChainState:
         # When this process started: the head record says which start first accepted each seal another
         # writer appended (accept-restore acknowledges those of the first start after a restore).
         self.process_started_at = clock()
+        # "server" for the web process, "host" for a host command's process (where it accepted a seal).
+        self.role = "server"
         # Seals another writer appended after the head record, accepted into the view and not yet listed in
         # the record: a writer whose own work failed (or whose record write did not happen) leaves them here,
         # and the next record write lists them.
@@ -443,11 +445,16 @@ class ChainWriter:
     """One transaction that may write seals, holding the chain lock from the head record check through the
     record's write. ``wait`` is how long to wait for the lock (ChainBusy after it)."""
 
-    def __init__(self, engine, st: Optional[ChainState] = None, *, wait: float = 30.0, writer: str = "pruner"):
+    def __init__(self, engine, st: Optional[ChainState] = None, *, wait: float = 30.0, writer: str = "pruner",
+                 check_key: bool = True, check_chain: bool = True):
         self.engine = engine
         self.st = st or state()
         self.wait = wait
         self.writer = writer
+        # The host's commands that resolve a stop run less of the check: rekey all of it but the key's step,
+        # after-record and the restore commands none of it (they build and judge their own view).
+        self.check_key = check_key
+        self.check_chain = check_chain
         self.conn = None
         self.db = None
         self.record: Optional[dict] = None
@@ -499,7 +506,13 @@ class ChainWriter:
             self.db = Session(bind=self.conn, expire_on_commit=False)
             if _is_pg(self.engine):
                 self.db.execute(text(f"SET LOCAL statement_timeout = {SEAL_STATEMENT_TIMEOUT_MS}"))
-            self.check()
+            if self.check_chain:
+                self.check()
+            else:
+                try:
+                    self.record = self.st.head_store().load()
+                except ValueError:
+                    self.record = None
         except BaseException:
             self._list_accepted()
             self._release()
@@ -642,7 +655,8 @@ class ChainWriter:
             self.accepted.append((seal, link))
             view.accept(seal, link)
         view.record_seq = rec_seq
-        self._check_current_key(held)
+        if self.check_key:
+            self._check_current_key(held)
 
     def _accept_after_record(self, seal: Seal, link: bytes, held) -> None:
         st, view, record = self.st, self.st.view, self.record or {}
@@ -682,7 +696,8 @@ class ChainWriter:
             except Exception:  # noqa: BLE001 -- before the first policy seal: the chain's own delay
                 delay = None
             entry = {"generation": view.generation, "seq": seal.seq, "kind": seal.kind, "link": link.hex(),
-                     "accepted_at": fmt.time_text(st.clock()), "where": "start" if not st.started else "running",
+                     "accepted_at": fmt.time_text(st.clock()),
+                     "where": "host" if st.role == "host" else ("start" if not st.started else "running"),
                      "process_started_at": fmt.time_text(st.process_started_at), "delay_days": delay,
                      "acknowledged": False, "discarded": False}
             st.pending_after.append(entry)
@@ -900,7 +915,7 @@ def day_digest_of(db, view: View, day) -> dict:
         S.legacy_salt.isnot(None)).scalar() or 0
     return {"full": fmt.day_digest(entries).hex(),
             "stable": fmt.day_digest([(a, b, c, rs, None, idd) for a, b, c, rs, _rc, idd in entries]).hex(),
-            "hours": len(entries), "salted": bool(salted)}
+            "hours": len(entries), "salted": bool(salted), "generation": view.generation}
 
 
 DAY_DIGESTS_PER_WRITE = 31
@@ -1279,7 +1294,10 @@ def _genesis_ready(db) -> Optional[str]:
     return None
 
 
-def write_genesis(w: ChainWriter, now: datetime) -> Seal:
+def write_genesis(w: ChainWriter, now: datetime, *, replaces: Optional[str] = None,
+                  grace_days: Optional[int] = None) -> Seal:
+    """Seal 1. The host's genesis on a database that lost every seal names the lost head (``replaces``) and
+    carries a grace of ``grace_days`` from its own time, as a restore seal does."""
     from app.core.models import AuditLog as A
     db = w.db
     first = db.query(func.min(A.timestamp)).scalar()
@@ -1293,9 +1311,14 @@ def write_genesis(w: ChainWriter, now: datetime) -> Seal:
     salt = salt if fig.nonceless else None
     detail = {"format": fmt.FORMAT, "release": _release(), "first_row_hour": fmt.hour_text(hour_floor(first)) if first else None,
               "backlog_through": fmt.hour_text(through), "backlog_rows": backlog_rows, "undated_rows": fig.count,
-              "replaces": None, "grace_until": None}
+              "replaces": replaces, "grace_until": None}
+
+    def at_its_time(seq, sealed_at):
+        if grace_days is not None:
+            return {**detail, "grace_until": fmt.time_text(sealed_at + timedelta(days=grace_days))}
+        return detail
     return w.append("genesis", row_count=fig.count, row_bytes=fig.bytes, root_s=fig.root_s, root_c=fig.root_c,
-                    ids_dig=fig.ids_digest, detail=detail, row_ids=fig.ids, legacy_salt=salt)
+                    ids_dig=fig.ids_digest, detail=at_its_time, row_ids=fig.ids, legacy_salt=salt)
 
 
 # --------------------------------------------------------------------------- sealing

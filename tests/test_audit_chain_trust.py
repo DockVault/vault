@@ -85,8 +85,9 @@ def _newest_policy(env):
 
 
 def _ack_by_host(env, seqs=(), failures_too=False):
-    head = env.verify(check_rows=False).head
-    return host.acknowledge(env.engine, env.st, seqs=list(seqs), failures=failures_too, expect=head)
+    """The host's acknowledgment, both phases: read what it would do, then write with the state it saw."""
+    seen = host.acknowledge(env.engine, env.st, seqs=list(seqs), failures=failures_too, read=True)
+    return host.acknowledge(env.engine, env.st, seqs=list(seqs), failures=failures_too, expect=seen["state"])
 
 
 def _lower_max_days_elsewhere(env, days=100):
