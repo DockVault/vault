@@ -3000,8 +3000,8 @@ class CredentialChange(Base):
     is cleared once the request is decided or expires, so nothing waits here longer than needed; an
     applied email change keeps only the address before and after, which a self-service reset link reads
     for the 14 days after the change (it goes to the address before). A row
-    applied, denied, withdrawn or expired more than 14 days ago is deleted by the periodic cleanup
-    (credential_changes.prune_done)."""
+    applied, denied, withdrawn or expired more than 14 days ago is deleted by the pruner
+    (credential_changes.prune_done, run by app/core/retention.py)."""
     __tablename__ = 'credential_changes'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
