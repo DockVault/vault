@@ -249,6 +249,12 @@ or when reset links are not configured, a temporary password) is shown once on y
 nowhere else. Each change is recorded and audited as the host operator's (`operator@host`), and the
 user is told.
 
+Compliance access has a host side too: an auditor right is granted by two people, and a case is approved by
+a second one. When no administrator is independent enough to be that second person, `python dockvault.py
+cases` lets whoever runs the server approve an auditor right (the account's username typed again) or a case
+(its reference typed again), recorded as `operator@host`. It refuses while an administrator who can approve
+exists, and it also revokes a right and lists what is open.
+
 `python dockvault.py accounts --action user-managers` lists, and changes nothing, the accounts that may
 view or manage users without being administrators, with who granted each permission. A change of role
 resets an account's permissions to the new role's defaults, keeping those another administrator granted

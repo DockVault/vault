@@ -308,6 +308,12 @@ the recipients' mailboxes.
   roles, the permission, and when it was revoked and granted again, read from the audit log), not
   audited either, and unlock an account (its automatic locks and an administrator's lock), audited as
   the host operator.
+- **`python dockvault.py cases`** on the host (new in 0.34.0): lists the open auditor rights and cases
+  (usernames, states, dates, a case's purpose and legal basis), shows where an auditor's account came from
+  (when and by whom it was created, who set its password, whether it has an authenticator) and, only when
+  the server's operator may approve a case, the case's justification. Printed on the host's terminal and not
+  audited, since the operator can read the database anyway; approving, turning down and revoking are
+  audited as the host operator.
 
 ## The browser
 
