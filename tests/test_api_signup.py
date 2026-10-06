@@ -10,11 +10,17 @@ body); the per-username rate limit; and the /auth/policy minimal-key negative te
 invite settings, or SMTP/brand leak).
 
 The settings row is global, so every test restores the keys it touches and deletes any account it
-creates.
+creates. A key the deployment never set is restored by removing it again: GET /settings reports it as
+None, and a save refuses None for these keys, so putting the snapshot back as it was read restored
+nothing at all and left a password policy switched on for every later test.
 """
+import json
+import warnings
+
 import pytest
 
 from conftest import BASE_URL, unique
+from _account_change_helpers import psql
 
 pytestmark = pytest.mark.integration
 
@@ -23,17 +29,83 @@ ACCOUNT_KEYS = ("email_requirement", "invite_enabled", "invite_ttl_hours", "sign
                 "email_change_requires_verification")
 PASSWORD_KEYS = ("password_min_length", "require_uppercase", "require_lowercase",
                  "require_numbers", "require_special")
+# The mail settings the public-policy test fills in. Left behind, they make the next start import them as the
+# deployment's sending profile, and every later test then runs with mail configured.
+SMTP_KEYS = ("smtp_server", "from_email")
+SNAPSHOT_KEYS = ACCOUNT_KEYS + PASSWORD_KEYS + SMTP_KEYS
 
 STRONG_PW = "S1gnup-Passw0rd!"
+
+
+def _snapshot(admin):
+    before = admin.get("/settings").json()
+    return {k: before.get(k) for k in SNAPSHOT_KEYS}
+
+
+def _stored_settings():
+    """The settings the deployment stores (the general row), as stored."""
+    raw = psql("SELECT value FROM system_settings WHERE key = 'global'")
+    return json.loads(raw) if raw else {}
+
+
+def _remove_stored(keys):
+    """Remove keys from the stored settings, as if they had never been set (no route removes one)."""
+    removed = "".join(f" - '{k}'" for k in keys)
+    psql(f"UPDATE system_settings SET value = (value::jsonb{removed})::json WHERE key = 'global'")
+
+
+def _restore(admin, snap):
+    """Put the snapshot back: a key that had a value is saved again; a key that was never set is removed."""
+    held = {k: v for k, v in snap.items() if v is not None}
+    never_set = sorted(k for k, v in snap.items() if v is None)
+    if held:
+        r = admin.put("/settings", json=held)
+        assert r.status_code == 200, r.text
+    if never_set:
+        try:
+            _remove_stored(never_set)
+        except pytest.skip.Exception as exc:     # no database container to reach (a remote deployment)
+            warnings.warn(f"could not remove {never_set} from the stored settings: {exc}")
 
 
 @pytest.fixture
 def restore_settings(admin):
     """Snapshot the account + password-policy keys these tests mutate and put them back afterwards."""
-    before = admin.get("/settings").json()
-    snap = {k: before.get(k) for k in (ACCOUNT_KEYS + PASSWORD_KEYS)}
+    snap = _snapshot(admin)
     yield snap
-    admin.put("/settings", json=snap)
+    _restore(admin, snap)
+
+
+def test_every_setting_a_test_here_writes_is_in_the_snapshot():
+    import ast
+    from pathlib import Path
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    written = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) in ("_set", "_enable_signup"):
+            written |= {kw.arg for kw in node.keywords if kw.arg}
+        if isinstance(node, ast.FunctionDef) and node.name == "_enable_signup":
+            for d in ast.walk(node):
+                if isinstance(d, ast.Dict):
+                    written |= {k.value for k in d.keys if isinstance(k, ast.Constant)}
+    assert {"signup_enabled", "require_uppercase", "smtp_server"} <= written
+    assert written <= set(SNAPSHOT_KEYS), f"written but never put back: {sorted(written - set(SNAPSHOT_KEYS))}"
+
+
+def test_the_restore_removes_a_key_that_was_never_set_and_saves_one_that_was(admin):
+    original = _snapshot(admin)
+    try:
+        _remove_stored(["require_special"])
+        snap = _snapshot(admin)
+        assert snap["require_special"] is None, "a key never set is reported as None"
+        _set(admin, require_special=True, password_min_length=(snap["password_min_length"] or 8) + 3)
+        _restore(admin, snap)
+        assert "require_special" not in _stored_settings()
+        after = _snapshot(admin)
+        assert after["require_special"] is None
+        assert after["password_min_length"] == snap["password_min_length"]
+    finally:
+        _restore(admin, original)
 
 
 def _set(admin, **kw):
