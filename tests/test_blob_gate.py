@@ -226,6 +226,49 @@ def test_when_the_kept_table_cannot_be_asked_nothing_is_destroyed(world, monkeyp
     assert (world.root / a).exists() and (world.root / b).exists()
 
 
+def _fail_the_transaction(world):
+    """Leave the session's transaction failed, as an error inside an upload's finalize leaves it before the
+    route's own rollback: a duplicate primary key on flush."""
+    dup = uuid.uuid4()
+    world.db.add(m.File(id=dup, vault_id=world.vault.id, size_bytes=1, storage_path="x1"))
+    world.db.flush()
+    world.db.expunge_all()
+    world.db.add(m.File(id=dup, vault_id=world.vault.id, size_bytes=1, storage_path="x2"))
+    with pytest.raises(Exception):
+        world.db.flush()
+
+
+def test_a_failed_uploads_new_blob_goes_although_its_transaction_had_failed(world):
+    """/complete's error path removes the upload's new, never-committed blob before it rolls the session back:
+    the check is asked again after a rollback, so the blob goes (nothing else would ever remove it)."""
+    new_blob = world.blob(b"a new upload that failed")
+    _fail_the_transaction(world)
+    assert world.service()._remove_blobs([new_blob]) is None
+    assert not (world.root / new_blob).exists()
+    assert world.db.query(m.File).filter(m.File.storage_path.in_(["x1", "x2"])).count() == 0, "rolled back"
+
+
+def test_after_a_failed_transaction_a_kept_blob_still_stays(world):
+    kept, gone = world.blob(), world.blob()
+    world.keep(kept)
+    _fail_the_transaction(world)
+    assert world.service()._destroy_blobs([kept, gone]) == [kept]
+    assert (world.root / kept).read_bytes() == b"evidence" and not (world.root / gone).exists()
+
+
+def test_when_the_check_fails_again_after_the_rollback_nothing_is_destroyed(world, monkeypatch):
+    a = world.blob()
+    asked = []
+
+    def broken(db, paths):
+        asked.append(list(paths))
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(kept_tables, "kept_rows", broken)
+    assert world.service()._destroy_blobs([a]) == [a]
+    assert (world.root / a).exists() and len(asked) == 2, "asked once more after the rollback, then kept"
+
+
 def test_delete_file_leaves_a_kept_blob_and_destroys_another(world):
     kept_rel, gone_rel = world.blob(), world.blob()
     kept_file, gone_file = world.file(kept_rel), world.file(gone_rel)

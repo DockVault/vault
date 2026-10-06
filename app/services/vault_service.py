@@ -1459,19 +1459,27 @@ class VaultService:
         destroyed cannot be brought back. ``fallback``: when secure_delete fails, overwrite and
         unlink by hand (delete_file's way); otherwise a blob that will not go is logged, under the
         event code of the ``path`` that destroys it (``replacement``, ``expiry``), and left.
+        A session whose transaction already failed (an upload's error path, ahead of its own
+        rollback) cannot answer the check: it is rolled back and asked once more. Every caller has
+        committed the deletion of the rows whose blobs it destroys (or never committed the blob's
+        row at all), so the rows the check reads are committed ones and the answer is the same.
         Returns the paths kept."""
         paths = [str(p) for p in dict.fromkeys(rel_paths or []) if p]
         if not paths:
             return []
         try:
             kept = kept_tables.kept_rows(self.db, paths)
-        except Exception as e:  # noqa: BLE001
-            safe_event('blob.keep-check.failed', e)
+        except Exception:  # noqa: BLE001
             try:
                 self.db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
-            return paths
+                kept = kept_tables.kept_rows(self.db, paths)
+            except Exception as e:  # noqa: BLE001
+                safe_event('blob.keep-check.failed', e)
+                try:
+                    self.db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                return paths
         kept_paths = {row[2] for row in kept}
         for rel in paths:
             if rel in kept_paths:
