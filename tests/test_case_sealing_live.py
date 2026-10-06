@@ -43,7 +43,8 @@ def test_a_sealed_case_opens_back_and_a_dump_of_the_database_holds_none_of_its_t
                     "AND justification_enc LIKE 'cenc1:%' AND owner_note_enc LIKE 'cenc1:%'") == "1"
         try:
             dump = subprocess.run(["docker", "exec", DB, "pg_dump", "-U", "sftp_user", "-d", "sftp_db",
-                                   "--data-only"], capture_output=True, text=True, timeout=300)
+                                   "--data-only"], capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=300)
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             pytest.skip(f"docker unavailable: {exc}")
         skip_if_container_absent(dump, DB)
