@@ -335,6 +335,16 @@ def test_who_is_not_independent_of_the_placer_cannot_confirm(db, people, who, re
     assert holds.confirm_refusal(db, case, person, NOW) == reason
 
 
+def test_an_administrator_who_cannot_act_or_an_ordinary_user_decides_nothing(db, people):
+    case = _place(db, people.ada, [people.v1])
+    gone = _user(db, "gina", m.RoleEnum.ADMIN)
+    gone.is_active = False
+    db.commit()
+    assert holds.confirm_refusal(db, case, gone, NOW) == "not_able"
+    assert holds.decider_refusal(db, case, _user(db, "ulla"), NOW) == "not_able"
+    assert holds.confirm_refusal(db, case, people.bob, NOW) is None
+
+
 def test_for_an_auditors_case_the_grants_exclusions_decide(db, people, monkeypatch):
     from app.core import case_eligibility
     asked = []
@@ -547,6 +557,20 @@ def test_a_kept_file_is_not_purged_while_another_hold_stands_on_its_vault(db, pe
     destroyed = []
     assert _purge(db, NOW + timedelta(days=30), destroyed) == (0, [])
     assert destroyed == [] and db.query(m.HeldFile).count() == 1
+
+
+def test_a_standing_hold_keeps_its_files_whatever_its_purge_time_says(db, people):
+    """A hold that stands (never released) keeps what it kept, even when its row carries a purge time from an
+    earlier release or an older write: only a released hold's time counts."""
+    case = _place(db, people.ada, [people.v1])
+    _keep(db, people.v1)
+    (hold,) = holds.standing(db, case.id)
+    hold.purge_after = NOW - timedelta(days=30)
+    db.commit()
+    db.close = lambda: None
+    destroyed = []
+    assert _purge(db, NOW, destroyed) == (0, []) and destroyed == []
+    assert db.query(m.HeldFile).count() == 1
 
 
 def test_a_kept_file_waits_for_the_latest_release_of_its_vault(db, people):

@@ -95,6 +95,9 @@ def test_the_kept_tables_have_every_column_of_the_live_ones_and_no_key_to_anythi
                     "('f', 'u')") == "0"
         assert psql(f"SELECT count(*) FROM pg_index WHERE indrelid = '{kept}'::regclass AND indisunique "
                     "AND NOT indisprimary") == "0"
+        assert psql(f"SELECT string_agg(a.attname, ',') FROM pg_index i JOIN pg_attribute a ON a.attrelid = "
+                    f"i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '{kept}'::regclass "
+                    "AND i.indisprimary") == "id"
         # Every column may be NULL but the id: a row deleted under an older column set is kept too.
         assert psql("SELECT string_agg(column_name, ',') FROM information_schema.columns WHERE table_schema = "
                     f"current_schema() AND table_name = '{kept}' AND is_nullable = 'NO'") == "id"

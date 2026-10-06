@@ -48,7 +48,8 @@ class _Rows:
 class _Catalog:
     """A session answering kept_tables' catalog reads from dicts, as Postgres would."""
 
-    def __init__(self, live=None, kept=None, triggers=None, functions=None):
+    def __init__(self, live=None, kept=None, triggers=None, functions=None, keyed=("held_files", "held_folders")):
+        self.keyed = set(keyed)       # the kept tables that have their primary key
         self.columns = {"files": list(FILES), "folders": list(FOLDERS)}
         self.columns.update(live or {})
         self.columns.update(kept if kept is not None else {
@@ -71,7 +72,7 @@ class _Catalog:
         if "FROM pg_proc" in sql:
             return _Rows((n, b) for n, b in self.functions.items() if n in params["names"])
         if "FROM pg_constraint" in sql:
-            return _Rows([(1,)])
+            return _Rows([(1,)] if params["t"] in self.keyed else [])
         return _Rows([])
 
 
@@ -199,6 +200,13 @@ def test_install_builds_missing_kept_tables_like_the_live_ones_then_the_function
         for statement in t.ddl():
             assert statement in sql
     assert "CREATE INDEX IF NOT EXISTS idx_held_files_storage_path ON held_files (storage_path)" in sql
+
+
+def test_install_gives_a_kept_table_its_primary_key_once():
+    db = _Catalog(keyed=("held_folders",))
+    kt.install(db)
+    assert db.executed.count("ALTER TABLE held_files ADD PRIMARY KEY (id)") == 1
+    assert "ALTER TABLE held_folders ADD PRIMARY KEY (id)" not in db.executed
 
 
 def test_install_refuses_without_the_live_table():
