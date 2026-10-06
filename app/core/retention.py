@@ -63,7 +63,9 @@ registry.register(registry.SettingSpec(
 registry.register(registry.SettingSpec(
     key=INTERVAL_KEY, kind="int", default=15, env="log_prune_interval_minutes", minimum=1, maximum=1440,
     editable=registry.ENV_ONLY, group="retention", unit="minutes",
-    label="Time between two passes of the pruner"))
+    label="Time between two passes of the pruner",
+    help="At most 360 minutes take effect: the audit log's integrity chain needs a seal at least every 12 "
+         "hours, or every pending reduction waits the time between two passes longer."))
 registry.register(registry.SettingSpec(
     key=BATCH_KEY, kind="int", default=5000, env="log_prune_batch_rows", minimum=100, maximum=100000,
     editable=registry.ENV_ONLY, group="retention", unit="rows",
@@ -452,6 +454,12 @@ def executor() -> ThreadPoolExecutor:
 BACKLOG_PAUSE_SECONDS = 5.0
 
 
+# The longest time between two passes: the audit chain counts a stop of more than 12 hours between two seals
+# as a gap, which no delay counts (app/core/audit_chain_policy.py); passes further apart would make every
+# reduction, and every erase, wait for ever.
+MAX_INTERVAL_MINUTES = 360
+
+
 def interval_seconds() -> float:
     try:
         from app.core import audit_integrity
@@ -459,7 +467,7 @@ def interval_seconds() -> float:
             return BACKLOG_PAUSE_SECONDS
     except Exception:  # noqa: BLE001 -- the normal interval
         pass
-    return float(registry.resolve(INTERVAL_KEY)) * 60.0
+    return float(min(int(registry.resolve(INTERVAL_KEY)), MAX_INTERVAL_MINUTES)) * 60.0
 
 
 async def run_forever(*, first_delay: float = FIRST_PASS_SECONDS, interval: Optional[Callable[[], float]] = None,

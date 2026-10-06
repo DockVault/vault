@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import Text, and_, case, cast, func, literal_column, not_, or_
 
@@ -196,10 +196,13 @@ class SizePlan:
     counted_before: Optional[datetime] = None   # the cap counts and deletes only rows older than this
 
 
-def size_plan(db, model, now: datetime, numbers: Numbers, delay: timedelta) -> SizePlan:
+def size_plan(db, model, now: datetime, numbers: Numbers, delay: timedelta,
+              hour_bound: Optional[Callable[[datetime], int]] = None) -> SizePlan:
     """How the size cap applies now: the rows it counts are those older than ``delay`` that the maximum does
     not delete anyway; it keeps the newest of them, protected ones first, that fit under the cap, and the
-    rest of the unprotected ones go."""
+    rest of the unprotected ones go. ``hour_bound`` gives, for each hour, the most it may count (the bytes the
+    audit chain sealed for it): rows written into an hour straight in the database, without the chain's key,
+    then count nothing, so they cannot make the cap delete other hours."""
     plan = SizePlan()
     if not numbers.max_mb:
         return plan
@@ -215,14 +218,20 @@ def size_plan(db, model, now: datetime, numbers: Numbers, delay: timedelta) -> S
     rows = (db.query(hour.label("hour"), protected.label("protected"), func.sum(_row_bytes(model, dialect)))
             .filter(*counted).group_by(hour, protected).all())
     cap = numbers.max_mb * MB
-    by_hour: dict = {}
+    found: dict = {}
     for h, is_protected, size in rows:
-        size = int(size or 0)
-        plan.counted_bytes += size
-        if is_protected:
-            plan.protected_bytes += size
-        else:
-            by_hour[_as_time(h)] = by_hour.get(_as_time(h), 0) + size
+        both = found.setdefault(_as_time(h), [0, 0])
+        both[0 if is_protected else 1] += int(size or 0)
+    by_hour: dict = {}
+    for h, (protected_size, other) in found.items():
+        if hour_bound is not None:
+            total = min(protected_size + other, max(0, int(hour_bound(h))))
+            protected_size = min(protected_size, total)
+            other = total - protected_size
+        plan.counted_bytes += protected_size + other
+        plan.protected_bytes += protected_size
+        if other:
+            by_hour[h] = other
     left = plan.protected_bytes
     for h in sorted(by_hour, reverse=True):
         if left + by_hour[h] > cap:
@@ -267,6 +276,18 @@ def chain_numbers() -> Optional[tuple]:
         return None
 
 
+def sealed_bytes(hour: datetime) -> int:
+    """The bytes the audit chain's verified view holds for ``hour`` (its newest root seal's), and 0 for an hour
+    not sealed yet: what the size cap may count for it."""
+    from app.core import audit_integrity
+    view = audit_integrity.state().view
+    entry = view.entry_for(hour)
+    if entry is None:
+        return 0
+    own = view.hours.get(hour)
+    return int(own.root.bytes) if own is not None else 0
+
+
 def prune(p, numbers: Optional[Numbers] = None):
     """The pruner's audit job: rows older than the maximum, then the oldest the size cap allows no room for.
     Both act on the audit chain's state, never on the database's values alone, and delete through ``prune``
@@ -289,7 +310,7 @@ def prune(p, numbers: Optional[Numbers] = None):
         result.add(done.deleted, done.oldest, done.newest)
     if numbers.max_mb and p.time_left():
         with p.transaction() as db:
-            plan = size_plan(db, AuditLog, p.now, numbers, delay)
+            plan = size_plan(db, AuditLog, p.now, numbers, delay, hour_bound=sealed_bytes)
         sized = by_size(AuditLog, p.now, numbers, plan)
         if sized:
             size = {"cap": numbers.max_mb * MB, "delay": delay.days,
