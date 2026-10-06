@@ -123,6 +123,27 @@ def test_a_module_first_imported_while_a_commit_hands_over_its_work_does_not_bre
     assert "deque mutated" not in run.stderr
 
 
+def test_importing_the_models_alone_installs_the_dispatcher():
+    """Every session of the app uses the models, so a process that has imported them has the listeners before its
+    first session: in a fresh process, nothing but the models imported."""
+    script = textwrap.dedent("""
+        import sys
+        from sqlalchemy import event
+        from sqlalchemy.orm import Session
+        import app.core.models  # noqa: F401
+        dispatcher = sys.modules.get("app.core.after_commit")
+        assert dispatcher is not None, "the models did not import the dispatcher"
+        assert event.contains(Session, "after_commit", dispatcher._after_commit)
+        assert event.contains(Session, "after_transaction_end", dispatcher._after_transaction_end)
+        print("INSTALLED")
+    """)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(ROOT / "tests")])
+    run = subprocess.run([sys.executable, "-c", script], cwd=str(ROOT), env=env, capture_output=True, text=True,
+                         timeout=300)
+    assert run.returncode == 0 and "INSTALLED" in run.stdout, run.stdout[-1000:] + run.stderr[-3000:]
+
+
 def _listens(path: Path):
     """Each (event name, line) of a call to SQLAlchemy's event.listen in ``path`` whose event is a session's
     transaction end."""
