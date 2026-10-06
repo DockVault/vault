@@ -24949,6 +24949,22 @@ END $$;""",
                 print(f"⚠ users.email case-insensitive index skipped: {e}")
                 recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, str(e))
 
+            # The legal hold's kept tables and triggers (app/core/kept_tables.py). Last, after every
+            # statement that adds a column to files or folders: the kept tables gain the same columns and
+            # the trigger functions are generated for them. One transaction, so the triggers are replaced
+            # at once; the check below refuses to serve if this did not land.
+            kept_step = "conditional: the legal hold's kept tables and triggers, built from files and folders"
+            try:
+                from app.core import kept_tables
+                db.execute(text("SET LOCAL lock_timeout = 0"))
+                kept_tables.install(db)
+                db.commit()
+                recorder.record(kept_step, SchemaStep.OUTCOME_APPLIED)
+            except Exception as e:
+                db.rollback()
+                print(f"⚠ Legal hold tables and triggers skipped: {e}")
+                recorder.record(kept_step, SchemaStep.OUTCOME_FAILED, str(e))
+
             recorder.forget_steps_no_longer_declared()
             recording_failed = recorder.broken
     except Exception as e:
@@ -24966,6 +24982,11 @@ END $$;""",
     from app.core.database import get_db_context as _ctx
     with _ctx() as _db:
         _verify_retired_object_id_triggers(_db)
+    # And without what a legal hold keeps, for the same reason: a hold that keeps nothing is a promise
+    # the deployment does not keep.
+    from app.core import kept_tables as _kept_tables
+    with _ctx() as _db:
+        _kept_tables.verify(_db)
 
     return not recording_failed
 

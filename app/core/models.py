@@ -3398,3 +3398,91 @@ class HeldNameHistory(Base):
     renamed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     __table_args__ = (Index('idx_held_name_history_object', 'vault_id', 'object_id'),)
+
+
+# The kept tables: what was deleted from a vault under a legal hold, every column of the row as it was plus
+# when, why and by whom it was kept, and when it may be purged. The database builds them from the live
+# tables (CREATE TABLE ... (LIKE files), then their columns aligned at every start) and fills them from its
+# own triggers (app/core/kept_tables.py), so they have a declarative base of their own, which create_all
+# never builds: a table built from these models would lack the columns the start adds to files and folders
+# outside the models. They map the columns the app reads; the ids are the original ones, so a kept row's
+# name, checksum and content open with the keys they were sealed under.
+KeptBase = declarative_base()
+
+
+class HeldFile(KeptBase):
+    """A file deleted from a vault under a legal hold, as it was (the row the trigger keeps)."""
+    __tablename__ = 'held_files'
+
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    name = Column(String(255), nullable=True)
+    original_name = Column(String(255), nullable=True)
+    vault_id = Column(UUID(as_uuid=True), nullable=True)
+    folder_id = Column(UUID(as_uuid=True), nullable=True)
+    size_bytes = Column(BigInteger, nullable=True)
+    mime_type = Column(String(255), nullable=True)
+    checksum_sha256 = Column(String(64), nullable=True)
+    enc_checksum = Column(Text, nullable=True)
+    content_mac = Column(String(64), nullable=True)
+    storage_path = Column(String(512), nullable=True)
+    is_encrypted = Column(Boolean, nullable=True)
+    encryption_metadata = Column(JSON, nullable=True)
+    enc_name = Column(Text, nullable=True)
+    enc_mime = Column(Text, nullable=True)
+    name_bi = Column(String(64), nullable=True)
+    password_hash = Column(String(255), nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+    uploaded_by = Column(UUID(as_uuid=True), nullable=True)
+    modified_by = Column(UUID(as_uuid=True), nullable=True)
+    kept_at = Column(DateTime, nullable=True)
+    kept_reason = Column(String(16), nullable=True)
+    kept_by = Column(String(64), nullable=True)
+    purge_after = Column(DateTime, nullable=True)
+
+
+class HeldFolder(KeptBase):
+    """A folder deleted from a vault under a legal hold, as it was (the row the trigger keeps)."""
+    __tablename__ = 'held_folders'
+
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    name = Column(String(255), nullable=True)
+    enc_name = Column(Text, nullable=True)
+    name_bi = Column(String(64), nullable=True)
+    name_key_version = Column(Integer, nullable=True)
+    vault_id = Column(UUID(as_uuid=True), nullable=True)
+    parent_folder_id = Column(UUID(as_uuid=True), nullable=True)
+    password_hash = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+    created_by = Column(UUID(as_uuid=True), nullable=True)
+    kept_at = Column(DateTime, nullable=True)
+    kept_reason = Column(String(16), nullable=True)
+    kept_by = Column(String(64), nullable=True)
+    purge_after = Column(DateTime, nullable=True)
+
+
+def _decrypt_held_name(target, *_args):
+    """An old name kept in held_name_history opens with the vault and the renamed object's id, as the
+    object's own name did (a zero-knowledge name stays opaque)."""
+    enc_name = getattr(target, 'enc_name', None)
+    if not enc_name:
+        return
+    from app.core.security import decrypt_object_field, is_zk_sealed_name
+    if is_zk_sealed_name(enc_name):
+        return
+    try:
+        _sa_attributes.set_committed_value(
+            target, 'name', decrypt_object_field(target.vault_id, target.object_id, enc_name, 'name'))
+    except Exception:  # noqa: BLE001 -- never let a decrypt error break a load
+        print(f"⚠ kept name decrypt failed for {getattr(target, 'id', None)}")
+
+
+# Kept rows open their names, MIME type and checksum exactly as the live rows do.
+_sa_event.listen(HeldFile, 'load', _decrypt_file_names)
+_sa_event.listen(HeldFile, 'refresh', _decrypt_file_names)
+_sa_event.listen(HeldFolder, 'load', _decrypt_folder_name)
+_sa_event.listen(HeldFolder, 'refresh', _decrypt_folder_name)
+_sa_event.listen(HeldNameHistory, 'load', _decrypt_held_name)
+_sa_event.listen(HeldNameHistory, 'refresh', _decrypt_held_name)
