@@ -138,6 +138,19 @@ CASES = [
     ("someone else changed the account, by text", {"approver": str(APPROVER), "changed": [str(OTHER), None]},
      None),
     ("an independent administrator by text", {"approver": str(APPROVER), "requester": str(AUDITOR)}, None),
+    # The same id in another text form: upper case, or without hyphens (a request may send either).
+    ("the auditor's own case, the approver in upper case", {"approver": str(AUDITOR).upper()}, ind.ASKED),
+    ("the auditor's own grant, the approver without hyphens", {"approver": AUDITOR.hex, "requester": PROPOSER},
+     ind.OWN_ACCOUNT),
+    ("changed the account, listed in upper case", {"changed": [str(APPROVER).upper()]}, ind.CHANGED_ACCOUNT),
+    ("stand-in account, the creator without hyphens", {"requester": PROPOSER, "created_by": APPROVER.hex},
+     ind.CREATED_SUBJECT),
+    ("a changer listed in upper case", {"changers": [{"id": str(APPROVER).upper(), "name": "x"}]},
+     ind.CHANGED_SUBJECT),
+    ("a person concerned without hyphens", {"concerned": [APPROVER.hex]}, ind.CONCERNED),
+    ("the grant's proposer in upper case", {"proposer": str(APPROVER).upper()}, ind.PROPOSED),
+    ("the approver in upper case, the auditor's lineage", {"approver": str(APPROVER).upper(), "requester": PROPOSER,
+                                                           "subject_grant": _grant([APPROVER])}, ind.MADE_SUBJECT),
 ]
 
 
@@ -158,6 +171,7 @@ def test_the_auditor_lineage_is_read_only_when_someone_else_asked():
 @pytest.mark.parametrize("entries,expected", [
     ([], set()), (None, set()), ([{"id": "a"}, {"id": None}, {"name": "x"}, "b", None], {"a", "b"}),
     ([uuid.UUID(int=1)], {str(uuid.UUID(int=1))}),
+    ([{"id": str(uuid.UUID(int=2)).upper()}, uuid.UUID(int=3).hex], {str(uuid.UUID(int=2)), str(uuid.UUID(int=3))}),
 ])
 def test_the_changers_of_a_grant_are_read_as_ids(entries, expected):
     assert ind.changer_ids(entries) == expected

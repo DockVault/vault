@@ -31,6 +31,7 @@ approves U's case).
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
 from typing import Iterable, Optional, Set
 
@@ -87,18 +88,25 @@ def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant
 
 
 def _as_text(value) -> Optional[str]:
-    """An account id as text; None stays None (no one)."""
-    return None if value is None else str(value)
+    """An account id in one text form, a UUID's canonical one (lower case, with hyphens), whichever form it
+    arrived in: a column's UUID, a record's or a request's text, upper case or without hyphens. A value that is
+    not a UUID is kept as its text. None stays None (no one)."""
+    if value is None:
+        return None
+    try:
+        return str(value if isinstance(value, uuid.UUID) else uuid.UUID(str(value)))
+    except ValueError:
+        return str(value)
 
 
 def changer_ids(entries: Iterable) -> Set[str]:
     """The account ids in an auditor grant's list of credential changers ({"id": ..., ...} entries, or bare
-    ids), as text. The host operator, who has no account, has no id."""
+    ids), in their canonical text form. The host operator, who has no account, has no id."""
     out = set()
     for entry in entries or ():
         value = entry.get("id") if isinstance(entry, dict) else entry
         if value is not None:
-            out.add(str(value))
+            out.add(_as_text(value))
     return out
 
 
@@ -114,10 +122,11 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
     who created the auditor's account, ``credential_changers`` the grant's list, ``concerned`` the persons the
     case concerns, ``proposer_id`` who proposed the grant."""
     from app.core import admin_grants
-    # Every id as text before the rule compares them: the same person's id read from a column (a UUID) and
-    # from a record or a request (text) must compare equal, and refusal_reason compares what it is given.
+    # Every id in one text form before the rule compares them: the same person's id read from a column (a UUID)
+    # and from a record or a request (text, in any case, with or without hyphens) must compare equal, and
+    # refusal_reason compares what it is given.
     approver_id, requester_id, subject_id = _as_text(approver_id), _as_text(requester_id), _as_text(subject_id)
-    changed = {str(person) for person in changed or () if person is not None}
+    changed = {_as_text(person) for person in changed or () if person is not None}
     reason = refusal_reason(approver_id, requester_id=requester_id, approver_grant=approver_grant,
                             requester_grant=requester_grant, changed=changed, requested_at=requested_at,
                             target_id=subject_id, approver_password_set_by_other=approver_password_set_by_other)
@@ -128,13 +137,13 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
         return MADE_BY_SUBJECT
     if admin_grants.made_by(subject_grant, approver_id):
         return MADE_SUBJECT
-    who = str(approver_id)
-    if subject_created_by is not None and str(subject_created_by) == who:
+    who = approver_id
+    if subject_created_by is not None and _as_text(subject_created_by) == who:
         return CREATED_SUBJECT
     if who in changer_ids(credential_changers):
         return CHANGED_SUBJECT
-    if who in {str(person) for person in concerned or ()}:
+    if who in {_as_text(person) for person in concerned or () if person is not None}:
         return CONCERNED
-    if proposer_id is not None and str(proposer_id) == who:
+    if proposer_id is not None and _as_text(proposer_id) == who:
         return PROPOSED
     return None
