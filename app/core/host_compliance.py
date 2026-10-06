@@ -13,10 +13,12 @@ Run inside the web container by ``dockvault.py cases`` (docker compose exec), ne
 
 Every compliance step that gives power takes two people. On a deployment with one administrator, or with none
 independent of the step, the server's operator is the second one: ``grant-approve`` approves a proposed auditor
-right and ``approve`` a case, recorded as ``operator@host`` exactly as an administrator's approval would be.
-Both are refused while an independent administrator with an authenticator exists: the host operator has no
-account, so none of the exclusions of the independence rule (app/core/independence.py) can apply to it, and an
-administrator they do apply to must decide instead. Revoking only removes power and is always allowed.
+right, ``approve`` a case and ``confirm-hold`` a case's legal hold, recorded as ``operator@host`` exactly as an
+administrator's step would be. Each is refused while an independent administrator with an authenticator exists:
+the host operator has no account, so none of the exclusions of the independence rule (app/core/independence.py)
+can apply to it, and an administrator they do apply to must decide instead. ``list`` and ``show`` say whether the
+host may (``host_may_approve``, ``host_may_confirm``) and who else can. Revoking only removes power and is always
+allowed.
 
 Safety: a change names its subject twice (the account's username, or the case's reference, the first eight
 characters of its id as ``list`` and ``show`` print it: a case has no number until it is approved), and nothing
@@ -109,12 +111,20 @@ def _case_summary(db, case):
     from app.core import case_eligibility
     from app.core.models import ComplianceCaseVault
     independent = case_eligibility.independent_approvers(db, case) if case.status == "pending" else []
+    from app.core import legal_holds
+    to_confirm = legal_holds.confirmable(db, case)
+    confirmers = legal_holds.independent_confirmers(db, case) if to_confirm else []
     return {"id": str(case.id), "reference": reference(case.id), "number": case.number, "status": case.status,
             "auditor": case.auditor_username, "requested_at": case.requested_at.isoformat() + "Z",
             "purpose": case.purpose, "legal_basis": case.legal_basis,
             "vaults": db.query(ComplianceCaseVault).filter(ComplianceCaseVault.case_id == case.id).count(),
             "independent_approvers": [a.username for a in independent],
-            "host_may_approve": case.status == "pending" and not independent}
+            "host_may_approve": case.status == "pending" and not independent,
+            # The legal hold: how many of its vaults wait for a confirmation, who could confirm it, and whether
+            # the server's operator may (only when nobody can).
+            "holds_to_confirm": len(to_confirm),
+            "independent_confirmers": [a.username for a in confirmers],
+            "host_may_confirm": bool(to_confirm) and not confirmers}
 
 
 def downgrade_blockers(db, target) -> list:
@@ -290,4 +300,8 @@ def _grant_approve(db, args) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(run())
+    # ``python -m`` runs this file as __main__, a second copy of the module: the modules that own the case steps
+    # register them into app.core.host_compliance, which the web app imports. Run that one, so its CASE_STEPS
+    # are the ones looked up.
+    from app.core import host_compliance as _imported
+    sys.exit(_imported.run())

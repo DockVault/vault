@@ -71,6 +71,8 @@ NO_LIA_REFERENCE = "no_lia_reference"
 SHORT_JUSTIFICATION = "short_justification"
 NO_OWNER_NOTE = "no_owner_note"
 NOTHING_TO_CONFIRM = "nothing_to_confirm"
+CONFIRM_TOO_LATE = "confirm_too_late"
+INDEPENDENT_ADMIN = "independent_admin"
 NOTHING_TO_RELEASE = "nothing_to_release"
 NOTHING_TO_REVIEW = "nothing_to_review"
 NOTHING_TO_UNDO = "nothing_to_undo"
@@ -93,6 +95,9 @@ TEXTS = {
     SHORT_JUSTIFICATION: f"the justification needs at least {JUSTIFICATION_MIN} characters",
     NO_OWNER_NOTE: "write the note the vault's owner reads",
     NOTHING_TO_CONFIRM: "no hold of this case waits for confirmation",
+    CONFIRM_TOO_LATE: "the time to confirm this hold has passed: it lapses",
+    INDEPENDENT_ADMIN: ("an independent administrator can confirm this hold, so the server's operator may not: the "
+                        "host operator has no account the independence rule could check"),
     NOTHING_TO_RELEASE: "no hold of this case stands",
     NOTHING_TO_REVIEW: "no hold of this case stands",
     NOTHING_TO_UNDO: "no release of this case can be undone",
@@ -431,24 +436,44 @@ def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basi
 
 # --------------------------------------------------------------------------- confirming
 
+def confirmable(db, case, now: Optional[datetime] = None) -> list:
+    """``case``'s holds that stand unconfirmed and may still be confirmed: before their confirm deadline (past it a
+    hold lapses, whether or not the periodic job has run yet)."""
+    now = now or utcnow()
+    return [h for h in standing(db, case.id) if h.confirmed_at is None and now < confirm_deadline(h, case)]
+
+
 def confirm_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[str]:
     """Why ``person`` may not confirm ``case``'s holds, or None."""
-    if not any(h.confirmed_at is None for h in standing(db, case.id)):
+    now = now or utcnow()
+    unconfirmed = [h for h in standing(db, case.id) if h.confirmed_at is None]
+    if not unconfirmed:
         return NOTHING_TO_CONFIRM
+    if not confirmable(db, case, now):
+        return CONFIRM_TOO_LATE
     if any(str(h.placed_by) == str(person.id) for h in standing(db, case.id)):
         return PLACER
     return decider_refusal(db, case, person, now)
 
 
+def independent_confirmers(db, case, now: Optional[datetime] = None) -> list:
+    """The administrators who could confirm ``case``'s holds now: able to act, independent of whoever placed them,
+    and with an authenticator set up (the confirmation asks for its code). None of them: the server's operator
+    confirms on the host."""
+    from app.core.auditor_rights import active_totp
+    from app.core.models import RoleEnum, User
+    now = now or utcnow()
+    admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
+    return [a for a in admins if active_totp(db, a.id) is not None and confirm_refusal(db, case, a, now) is None]
+
+
 def confirm(db, case, *, by=None, now: Optional[datetime] = None) -> int:
-    """Confirm every unconfirmed hold of ``case`` that stands, as ``by`` (None: the server's operator on the
-    host), in the caller's transaction. Returns how many."""
+    """Confirm every hold of ``case`` that stands unconfirmed and may still be confirmed, as ``by`` (None: the
+    server's operator on the host), in the caller's transaction. Returns how many."""
     now = now or utcnow()
     name = by.username if by is not None else HOST_OPERATOR
     count = 0
-    for hold in standing(db, case.id):
-        if hold.confirmed_at is not None:
-            continue
+    for hold in confirmable(db, case, now):
         hold.confirmed_at, hold.confirmed_by_username = now, name
         hold.confirmed_by = by.id if by is not None else None
         _audit(db, "hold_confirmed", case, actor=by, actor_name=name, vault_id=hold.vault_id)
@@ -758,11 +783,22 @@ def _sync_marker(db) -> None:
 # --------------------------------------------------------------------------- the host
 
 def _host_confirm(db, case, *, reason=None):
-    """dockvault.py cases confirm-hold: the server's operator confirms the case's holds."""
-    if not standing(db, case.id) or all(h.confirmed_at is not None for h in standing(db, case.id)):
-        from app.core.host_operator import _refuse
+    """dockvault.py cases confirm-hold: the server's operator confirms the case's holds, only when no
+    administrator could (independent_confirmers): the confirmation is the hold's second person, and the operator
+    has no account the independence rule could check. A refusal for that reason is recorded."""
+    from app.core.host_operator import _refuse
+    now = utcnow()
+    if not any(h.confirmed_at is None for h in standing(db, case.id)):
         return _refuse(text(NOTHING_TO_CONFIRM).capitalize() + ".")
-    count = confirm(db, case, by=None)
+    if not confirmable(db, case, now):
+        return _refuse(text(CONFIRM_TOO_LATE).capitalize() + ".")
+    others = independent_confirmers(db, case, now)
+    if others:
+        record_refusal(db, "hold_confirmed", case, actor=None, reason=INDEPENDENT_ADMIN)
+        return _refuse(f"An independent administrator can confirm this hold "
+                       f"({', '.join(sorted(a.username for a in others))}), so the server's operator may not: the "
+                       "host operator has no account the independence rule could check.")
+    count = confirm(db, case, by=None, now=now)
     return {"id": str(case.id), "number": case.number, "confirmed": count}
 
 

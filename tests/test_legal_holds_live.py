@@ -8,13 +8,20 @@ gate in app/services/vault_service.py, app/core/legal_hold_marker.py).
     counts what is kept; an older release is kept from starting (the marker row, and the host's
     downgrade-blockers); release, undo, release again, then the purge secure-deletes and records each file;
   * a hold placed while a deletion holds the vault's row waits for it, and the next deletion is kept;
-  * a hold nobody confirms lapses, and its placer cannot place another on that vault for 30 days;
+  * a hold nobody confirms lapses, and its placer cannot place another on that vault for 30 days; nor after
+    releasing their own hold before anyone confirmed it;
+  * the server's operator confirms a hold on the host (python -m app.core.host_compliance, as dockvault.py runs
+    it) only while no administrator could, and a refusal is recorded;
+  * the person who started a case releases its hold alone only while they stand as they did: not once demoted,
+    nor once their auditor right is revoked; an auditor lists only the cases they started;
+  * the purge leaves a vault whose row a placing or an undo holds for its next pass;
   * a hold is refused while an SFTP server of another version may be running;
   * a refused step is recorded under its case.
 
 test_legal_holds.py, test_blob_gate.py, test_kept_storage.py and test_legal_hold_marker.py cover the rules
 offline; test_kept_tables_live.py the triggers.
 """
+import json
 import os
 import subprocess
 import time
@@ -23,7 +30,8 @@ import uuid
 import pytest
 
 from _account_change_helpers import API, DB, in_api_container, notifications, psql
-from _auditor_helpers import compliance_receipt, run_pass, two_admins
+from _auditor_helpers import (compliance_receipt, forget_grants, grant_right, new_auditor_account, run_pass,
+                              signed_in_with_code, two_admins)
 from conftest import ADMIN_PASS, ADMIN_USER, unique
 
 pytestmark = pytest.mark.integration
@@ -347,3 +355,44 @@ def test_a_refused_decision_is_recorded_under_its_case(admin, admins, vaults):
     assert r.status_code == 403 and r.json()["detail"]["reason"] == "placer", r.text
     assert psql(f"SELECT status || '|' || (details::jsonb ->> 'reason') FROM audit_logs WHERE action = "
                 f"'hold_confirmed' AND case_id = '{case_id}'") == "failure|placer"
+
+
+def _host(*args):
+    """The host's compliance tool as dockvault.py runs it: python -m, inside the web container."""
+    r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.host_compliance", *args],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    assert lines, (r.stderr or "")[-800:]
+    answer = json.loads(lines[-1])
+    assert r.returncode == (0 if answer["ok"] else 2), (r.returncode, answer)
+    return answer
+
+
+def test_the_host_confirms_a_hold_only_when_no_administrator_can(admin, admins, vaults):
+    made, cases = vaults
+    r = _place(admins["ada"], [made[0]["id"]])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    reference = case_id.replace("-", "")[:8]
+    bob = admins["bob"][0]
+    (listed,) = [c for c in _host("list")["cases"] if c["id"] == case_id]
+    assert listed["holds_to_confirm"] == 1 and listed["host_may_confirm"] is False
+    assert bob["_username"] in listed["independent_confirmers"]
+    answer = _host("confirm-hold", "--case", case_id, "--confirm-case", reference)
+    assert answer["ok"] is False and bob["_username"] in answer["error"] and "may not" in answer["error"]
+    assert psql(f"SELECT coalesce(confirmed_by_username, '') FROM legal_hold_vaults WHERE case_id = '{case_id}'") == ""
+    assert psql("SELECT username || '|' || status || '|' || (details::jsonb ->> 'reason') FROM audit_logs "
+                f"WHERE action = 'hold_confirmed' AND case_id = '{case_id}'") == "operator@host|failure|independent_admin"
+    # bob's authenticator removed: the confirmation asks for its code, so no administrator can confirm.
+    psql(f"DELETE FROM second_factor_enrollments WHERE user_id = '{bob['id']}'")
+    shown = _host("show", "--case", case_id)["case"]
+    assert shown["host_may_confirm"] is True and shown["independent_confirmers"] == [], shown
+    answer = _host("confirm-hold", "--case", case_id, "--confirm-case", reference)
+    assert answer["ok"] is True and answer["case"]["confirmed"] == 1, answer
+    assert psql(f"SELECT confirmed_by_username || '|' || (confirmed_by IS NULL) FROM legal_hold_vaults "
+                f"WHERE case_id = '{case_id}'") == "operator@host|true"
+    assert psql("SELECT username FROM audit_logs WHERE action = 'hold_confirmed' AND status = 'success' "
+                f"AND case_id = '{case_id}'") == "operator@host"
+
+

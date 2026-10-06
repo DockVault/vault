@@ -6068,6 +6068,11 @@ class DockVault:
         if c.get("independent_approvers"):
             print(pal.paint("  an administrator can approve it: %s" % ", ".join(
                 server_text(a) for a in c["independent_approvers"]), "yellow"))
+        if c.get("holds_to_confirm"):
+            print("  legal hold: %s vault(s) wait for a confirmation" % server_text(c.get("holds_to_confirm")))
+            if c.get("independent_confirmers"):
+                print(pal.paint("  an administrator can confirm it: %s" % ", ".join(
+                    server_text(a) for a in c["independent_confirmers"]), "yellow"))
 
     def cases(self, args=None):
         """Compliance access from the host: approve an auditor right or a case when no administrator is
@@ -6115,10 +6120,10 @@ class DockVault:
                                                    server_text(g.get("username")),
                                                    "  (the host may approve it)" if g.get("host_may_approve") else ""))
             for c in cases:
-                print("  case   %s  %-10s auditor %s%s" % (server_text(c.get("reference")), server_text(c.get("status")),
-                                                          server_text(c.get("auditor")),
-                                                          "  (the host may approve it)" if c.get("host_may_approve")
-                                                          else ""))
+                print("  case   %s  %-10s auditor %s%s%s" % (
+                    server_text(c.get("reference")), server_text(c.get("status")), server_text(c.get("auditor")),
+                    "  (the host may approve it)" if c.get("host_may_approve") else "",
+                    "  (the host may confirm its legal hold)" if c.get("host_may_confirm") else ""))
             print()
             return
 

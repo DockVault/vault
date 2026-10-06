@@ -466,7 +466,8 @@ def place_hold(body: HoldPlacement, request: Request, current_user: User = Depen
     return _hold_view(db, case, current_user, holds.utcnow())
 
 
-_NOTHING = ("nothing_to_confirm", "nothing_to_release", "nothing_to_review", "nothing_to_undo", "undo_too_late")
+_NOTHING = ("nothing_to_confirm", "confirm_too_late", "nothing_to_release", "nothing_to_review", "nothing_to_undo",
+            "undo_too_late")
 
 
 def _check_decision(case_id, current_user, db, *, action: str, refusal, lock: bool = False):

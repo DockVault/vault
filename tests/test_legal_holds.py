@@ -117,6 +117,12 @@ def _place(db, who, vaults, now=NOW, **kw):
     return case
 
 
+def _totp(db, user):
+    """An authenticator for ``user``: a confirmation asks for its code, so only then can they confirm."""
+    db.add(m.SecondFactorEnrollment(user_id=user.id, method="totp", secret_enc="sealed", status="active"))
+    db.commit()
+
+
 def _refused(fn, *args, **kwargs):
     with pytest.raises(holds.HoldRefused) as refused:
         fn(*args, **kwargs)
@@ -355,8 +361,11 @@ def test_for_an_auditors_case_the_grants_exclusions_decide(db, people, monkeypat
     assert holds.decider_refusal(db, case, people.bob, NOW) == ind.PROPOSED and asked == ["bob"]
 
 
-def test_the_host_confirms_as_the_operator(db, people):
+def test_the_host_confirms_as_the_operator_when_no_administrator_could(db, people):
+    """bob is independent of ada but has no authenticator (the confirmation asks for its code): nobody can
+    confirm on the web, so the server's operator may."""
     case = _place(db, people.ada, [people.v1])
+    assert holds.independent_confirmers(db, case, NOW) == []
     out = host_compliance.CASE_STEPS["confirm-hold"](db, case)
     db.commit()
     assert out["confirmed"] == 1
@@ -366,6 +375,71 @@ def test_the_host_confirms_as_the_operator(db, people):
     from app.core.host_operator import _Answer
     with pytest.raises(_Answer):
         host_compliance.CASE_STEPS["confirm-hold"](db, case)
+
+
+def test_the_host_may_not_confirm_while_an_administrator_could_and_the_refusal_is_recorded(db, people):
+    from app.core.host_operator import _Answer
+    case = _place(db, people.ada, [people.v1])
+    _totp(db, people.ada)        # the placer: never a confirmer
+    _totp(db, people.bob)
+    assert [a.username for a in holds.independent_confirmers(db, case, NOW)] == ["bob"]
+    with pytest.raises(_Answer) as done:
+        host_compliance.CASE_STEPS["confirm-hold"](db, case)
+    assert done.value.code == 2 and "bob" in done.value.obj["error"] and "may not" in done.value.obj["error"]
+    (row,) = holds.standing(db, case.id)
+    assert row.confirmed_at is None
+    (refused,) = [r for r in _rows(db, "hold_confirmed") if r.status == "failure"]
+    assert refused.username == "operator@host" and refused.case_id == case.id
+    assert refused.details["reason"] == holds.INDEPENDENT_ADMIN
+
+
+def test_the_host_list_and_show_say_whether_the_host_may_confirm(db, people):
+    case = _place(db, people.ada, [people.v1, people.v2])
+    summary = host_compliance._case_summary(db, case)
+    assert (summary["holds_to_confirm"], summary["independent_confirmers"], summary["host_may_confirm"]) == \
+        (2, [], True)
+    _totp(db, people.bob)
+    summary = host_compliance._case_summary(db, case)
+    assert (summary["independent_confirmers"], summary["host_may_confirm"]) == (["bob"], False)
+    holds.confirm(db, case, by=people.bob, now=NOW)
+    db.commit()
+    summary = host_compliance._case_summary(db, case)
+    assert (summary["holds_to_confirm"], summary["independent_confirmers"], summary["host_may_confirm"]) == \
+        (0, [], False)
+
+
+def test_past_its_confirm_deadline_a_hold_is_confirmed_by_nobody_before_the_job_lapses_it(db, people, monkeypatch):
+    from app.core.host_operator import _Answer
+    case = _place(db, people.ada, [people.v1])
+    late = NOW + timedelta(days=7)
+    assert holds.confirm_refusal(db, case, people.bob, late - timedelta(seconds=1)) is None
+    assert holds.confirm_refusal(db, case, people.bob, late) == holds.CONFIRM_TOO_LATE
+    assert holds.confirm(db, case, by=people.bob, now=late) == 0
+    monkeypatch.setattr(holds, "utcnow", lambda: late)
+    with pytest.raises(_Answer) as done:
+        host_compliance.CASE_STEPS["confirm-hold"](db, case)
+    assert "passed" in done.value.obj["error"]
+    assert holds.standing(db, case.id)[0].confirmed_at is None
+    assert holds.lapse_due(db, late) == 1
+
+
+def test_run_as_a_program_the_tool_looks_its_case_steps_up_in_the_module_they_register_in():
+    """``python -m app.core.host_compliance`` runs the file as __main__, a second copy of the module, while the
+    modules that own the case steps register them into app.core.host_compliance. The program runs that module's
+    run(), so its steps are found."""
+    import runpy
+    import sys
+    ran = []
+    real = host_compliance.run
+    host_compliance.run = lambda argv=None: ran.append(argv) or 0
+    try:
+        with pytest.raises(SystemExit) as done:
+            runpy.run_module("app.core.host_compliance", run_name="__main__")
+    finally:
+        host_compliance.run = real
+    assert done.value.code == 0 and ran == [None]
+    assert sys.modules["app.core.host_compliance"] is host_compliance
+    assert "confirm-hold" in host_compliance.CASE_STEPS
 
 
 # --------------------------------------------------------------------------- lapsing, and placing again

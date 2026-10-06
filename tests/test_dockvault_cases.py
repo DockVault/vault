@@ -93,6 +93,28 @@ def test_approving_a_case_passes_the_reference(app, monkeypatch, capsys):
     assert "recorded as the host operator's" in capsys.readouterr().out
 
 
+HOLD_CASE = dict(CASE, id="c-2", reference="7d1e0a42", number="C-2026-0001", status="hold_only",
+                 independent_approvers=[], host_may_approve=False)
+
+
+@pytest.mark.parametrize("confirmers, may", [([], True), (["bob"], False)])
+def test_list_and_show_say_whether_the_host_may_confirm_a_legal_hold(app, monkeypatch, capsys, confirmers, may):
+    case = dict(HOLD_CASE, holds_to_confirm=2, independent_confirmers=confirmers, host_may_confirm=may)
+    tool = _Tool({"list": {"ok": True, "grants": [], "cases": [case]}, "show": {"ok": True, "case": case},
+                  "confirm-hold": {"ok": False, "error": "An independent administrator can confirm this hold (bob)"}})
+    monkeypatch.setattr(app, "_run_case_tool", tool)
+    app.cases(_args("--action", "list", "--non-interactive"))
+    out = capsys.readouterr().out
+    assert ("(the host may confirm its legal hold)" in out) is may
+    with pytest.raises(SystemExit):
+        app.cases(_args("--action", "confirm-hold", "--case", "c-2", "--confirm-case", "7d1e0a42",
+                        "--non-interactive"))
+    out = capsys.readouterr()
+    assert "2 vault(s) wait for a confirmation" in out.out
+    assert ("an administrator can confirm it: bob" in out.out) is (not may)
+    assert [c[0] for c in tool.calls] == ["list", "show", "confirm-hold"]
+
+
 def test_turning_a_case_down_needs_a_reason(app, monkeypatch):
     tool = _Tool({"show": {"ok": True, "case": CASE}, "reject": {"ok": True, "case": CASE}})
     monkeypatch.setattr(app, "_run_case_tool", tool)
