@@ -9,34 +9,15 @@ rows, deletes the oldest plain rows and never an administration row; and at the 
 AUDIT_LOG_RETENTION_DAYS waits, as a change the server schedules and seals. test_audit_retention.py covers the
 rules offline.
 """
-import json
-import subprocess
-import uuid
-
 import pytest
 
-from _account_change_helpers import API, psql
+from _throwaway_db import PREAMBLE, run_in, throwaway_database
 
 pytestmark = pytest.mark.integration
 
-HEAD = r'''
-import json, os, sys, uuid
-from datetime import datetime, timedelta, timezone
-name = sys.argv[1]
-os.environ["DATABASE_URL"] = os.environ["DATABASE_URL"].rsplit("/", 1)[0] + "/" + name
-os.environ["AUDIT_CHAIN_HEAD_FILE"] = "/tmp/" + name + "-head.json"
-from app.core.config import bootstrap_entrypoint
-bootstrap_entrypoint("audit-retention-test")
-from sqlalchemy import text
-from app.core.database import SessionLocal, _require_engine, init_db
-init_db()
-from app.core import audit_integrity as ai, audit_retention as ar, retention
+HEAD = PREAMBLE + r'''
+from app.core import audit_retention as ar
 from app.core.models import AuditLog
-engine = _require_engine()
-now = datetime.now(timezone.utc).replace(tzinfo=None)
-with engine.begin() as c:
-    c.execute(text("INSERT INTO system_settings (key, value) VALUES ('audit_name_redaction_purged', '{}') "
-                   "ON CONFLICT DO NOTHING"))
 
 def seed(tag, days, action, n=1, pad_kb=0):
     pad = ("(SELECT string_agg(md5(random()::text || g::text), '') FROM generate_series(1, %d) g)" % (pad_kb * 32)
@@ -54,9 +35,6 @@ def count(tag, action=None):
     with engine.begin() as c:
         return c.execute(text("SELECT count(*) FROM audit_logs WHERE details->>'tag' = '%s'%s" % (tag, extra))).scalar()
 
-st = ai.ChainState()
-ai.set_state(st)
-
 def seal_all():
     for _ in range(100):
         r = ai.seal_pass(SessionLocal, st=st, now=now)
@@ -70,22 +48,11 @@ def prune(numbers):
 
 @pytest.fixture
 def throwaway():
-    name = "retain_" + uuid.uuid4().hex[:12]
-    psql(f"CREATE DATABASE {name}")
-    try:
-        yield name
-    finally:
-        psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}'")
-        psql(f"DROP DATABASE IF EXISTS {name}")
-        subprocess.run(["docker", "exec", API, "sh", "-c", f"rm -f /tmp/{name}-head.json /tmp/{name}-head.json.lock"],
-                       capture_output=True, timeout=30)
+    yield from throwaway_database()
 
 
 def _run(name, body, env=None):
-    args = ["docker", "exec", "-i"] + [f"-e{k}={v}" for k, v in (env or {}).items()] + [API, "python", "-", name]
-    r = subprocess.run(args, input=HEAD + body, capture_output=True, text=True, encoding="utf-8", timeout=600)
-    assert r.returncode == 0, (r.stderr or r.stdout)[-3000:]
-    return json.loads(r.stdout.strip().splitlines()[-1])
+    return run_in(name, HEAD + body, env)
 
 
 def test_the_preview_route_answers_for_administrators(admin):
