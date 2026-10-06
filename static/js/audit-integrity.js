@@ -26,10 +26,12 @@
         box.replaceChildren();
         const failed = (s.failures || []).length > 0;
         const warned = (s.warnings || []).length > 0;
-        box.dataset.state = failed ? 'failed' : (warned ? 'warning' : (s.head ? 'clean' : 'waiting'));
+        const stopped = s.stopped || null;
+        box.dataset.state = (failed || stopped) ? 'failed' : (warned ? 'warning' : (s.head ? 'clean' : 'waiting'));
         const line = el('div', 'act-integrity-line');
         let words;
-        if (!s.head) words = 'The audit log has not been sealed yet. The first seal is written a few minutes after the server starts.';
+        if (stopped) words = 'Sealing of the audit log is stopped until the host operator looks at it.';
+        else if (!s.head) words = 'The audit log has not been sealed yet. The first seal is written a few minutes after the server starts.';
         else if (failed) words = 'The audit log’s integrity check found a problem.';
         else if (warned) words = 'The audit log is sealed; some events need a look.';
         else words = 'The audit log is sealed' + (s.sealed_through ? ' through ' + when(s.sealed_through) : '') + '.';
@@ -50,6 +52,8 @@
             head.appendChild(copy);
             box.appendChild(head);
         }
+        if (stopped) box.appendChild(el('div', 'act-integrity-failure', 'stopped: ' + (stopped.kind || '') + ': ' +
+            (stopped.message || '')));
         [['failures', 'act-integrity-failure'], ['warnings', 'act-integrity-warning']].forEach(([key, cls]) => {
             (s[key] || []).forEach((f) => {
                 box.appendChild(el('div', cls, f.kind + ': ' + (f.message || '') +

@@ -78,6 +78,9 @@ registry.register(registry.SettingSpec(
 # The kinds of seal, and which set an hour's roots.
 KINDS = ("genesis", "policy", "request", "cancel", "hour", "late", "prune", "rewrite", "erase", "archive", "key",
          "ack", "restore")
+# Kinds of seal another writer may not append after the head record in this release: nothing here writes them
+# yet, and the checks of their fields come with their writers.
+UNCHECKED_KINDS = ("archive",)
 ROOT_KINDS = ("hour", "late", "prune", "rewrite")
 BODY_ROOT_KINDS = ("genesis", "hour", "late")
 
@@ -264,14 +267,16 @@ class View:
         self._run_starts: List[datetime] = []
         self.newest_hour_end: Optional[datetime] = None
         self.genesis: Optional[dict] = None
+        self.genesis_root: Optional[RootEntry] = None   # the undated rows' roots
         self.key_history: List[list] = []              # [key_id, from_seq, to_seq or None]
         self.policies: List[tuple] = []                # (seq, detail)
         self.requests: Dict[int, dict] = {}
         self.cancels: Dict[int, int] = {}              # request seq -> cancel seq
+        self.cancel_by: Dict[int, str] = {}            # cancel seq -> who wrote it
         self.applied: Dict[int, int] = {}              # request seq -> seal that acted on it
         self.finals: Dict[int, int] = {}
         self.restores: List[tuple] = []                # (seq, detail)
-        self.acked: Dict[int, int] = {}                # acknowledged seq -> ack seq
+        self.acked: Dict[int, List[int]] = {}          # acknowledged seq -> the ack seals naming it
         self.late_seqs: List[int] = []
         self.erase_through: Dict[int, Any] = {}        # erase request seq -> its run's scope
         self.erased_rows: set = set()
@@ -337,6 +342,8 @@ class View:
         kind = seal.kind
         if kind == "genesis":
             self.genesis = dict(d)
+            self.genesis_root = RootEntry(seal.seq, seal.row_count, seal.row_bytes, _b(seal.root_s) or b"",
+                                          _b(seal.root_c) or b"", _b(seal.ids_digest) or b"", seal.sealed_at, kind)
             self.key_history.append([seal.key_id, seal.seq, None])
         elif kind == "key":
             if self.key_history:
@@ -389,13 +396,14 @@ class View:
         elif kind == "cancel":
             if d.get("cancels") is not None:
                 self.cancels[int(d["cancels"])] = seal.seq
+            self.cancel_by[seal.seq] = d.get("by")
         elif kind == "ack":
             for s in d.get("acknowledges") or []:
-                self.acked[int(s)] = seal.seq
+                self.acked.setdefault(int(s), []).append(seal.seq)
         elif kind == "restore":
             self.restores.append((seal.seq, d))
             for s in d.get("acknowledges") or []:
-                self.acked[int(s)] = seal.seq
+                self.acked.setdefault(int(s), []).append(seal.seq)
 
     def newest_policy(self) -> Optional[tuple]:
         return self.policies[-1] if self.policies else None
@@ -427,6 +435,33 @@ class View:
         return False
 
 
+def foreign_entries(view: View, record: Optional[dict]) -> Dict[int, dict]:
+    """The seals of the view's generation the head record lists as appended by another writer after it, not
+    discarded: {seq: entry}. The list decides, not the recorded head, which later writes move past them."""
+    return {int(e["seq"]): e for e in (record or {}).get("after_record") or []
+            if e.get("generation") == view.generation and not e.get("discarded")}
+
+
+def unacknowledged_foreign(view: View, record: Optional[dict]) -> set:
+    """Another writer's seals the host has not acknowledged yet."""
+    return {seq for seq, e in foreign_entries(view, record).items() if not e.get("acknowledged")}
+
+
+def acknowledged(view: View, record: Optional[dict]) -> set:
+    """The seals an acknowledgment that counts names: an ``ack`` or ``restore`` seal another writer appended
+    after the head record acknowledges nothing, even once the host has acknowledged it."""
+    foreign = set(foreign_entries(view, record))
+    return {seq for seq, by in view.acked.items() if any(a not in foreign for a in by)}
+
+
+def database_seqs(view: View) -> List[int]:
+    """The seals the pruner wrote from the database's values (a veto, a request the database no longer shows
+    pending ended): warnings until the host acknowledges them."""
+    out = [seq for seq, d in view.policies if d.get("cause") == "database"]
+    out += [seq for seq, by in view.cancel_by.items() if by == "database"]
+    return sorted(out)
+
+
 # --------------------------------------------------------------------------- the process's state
 
 class ChainState:
@@ -443,6 +478,10 @@ class ChainState:
         self.clock = clock
         self.stopped: Optional[ChainStopped] = None
         self.started = False
+        # Seals another writer appended after the head record, accepted into the view and not yet listed in
+        # the record: a writer whose own work failed (or whose record write did not happen) leaves them here,
+        # and the next record write lists them.
+        self.pending_after: List[dict] = []
         # The first start's backlog is not sealed yet: the pruner's passes then follow each other closely.
         self.backlog = False
 
@@ -459,6 +498,23 @@ class ChainState:
 
     def current_key(self) -> keys.ChainKey:
         return keys.current(self.cfg())
+
+    def known_record(self) -> Optional[dict]:
+        """The head record as this process knows it: its copy, with the seals it accepted after it and has not
+        written into it yet."""
+        import copy
+        record = copy.deepcopy(self.head_store().memory)
+        if self.pending_after:
+            record = with_pending(record or {}, self.pending_after)
+        return record
+
+
+def with_pending(record: dict, pending: List[dict]) -> dict:
+    after = record.setdefault("after_record", [])
+    for entry in pending:
+        if not any(e.get("generation") == entry["generation"] and e.get("seq") == entry["seq"] for e in after):
+            after.append(dict(entry))
+    return record
 
 
 _state: Optional[ChainState] = None
@@ -570,7 +626,6 @@ class ChainWriter:
         self.db = None
         self.record: Optional[dict] = None
         self.written: List[tuple] = []          # (Seal, link)
-        self.accepted_after: List[dict] = []
         self._mutex_held = False
         self._lock_held = False
 
@@ -619,6 +674,7 @@ class ChainWriter:
                 self.db.execute(text(f"SET LOCAL statement_timeout = {SEAL_STATEMENT_TIMEOUT_MS}"))
             self.check()
         except BaseException:
+            self._list_accepted()
             self._release()
             raise
         return self
@@ -632,14 +688,24 @@ class ChainWriter:
                 self._finish()
             elif exc_type is None and self.commit_without_seal and self.db is not None:
                 self.db.commit()
-                if self.accepted_after:
-                    self._write_record()
-            elif self.db is not None:
-                self.db.rollback()
-                if exc_type is None and self.accepted_after:
-                    self._write_record()
+                self._list_accepted()
+            else:
+                if self.db is not None:
+                    self.db.rollback()
+                self._list_accepted()
         finally:
             self._release()
+
+    def _list_accepted(self) -> None:
+        """Write the seals accepted after the head record into it, whatever became of this writer's own work:
+        a seal in the view that the record does not list would be trusted as this process's own once the next
+        record write moves the head past it. Never raises."""
+        if not self.st.pending_after:
+            return
+        try:
+            self._write_record()
+        except Exception as exc:  # noqa: BLE001 -- they stay pending for the next record write
+            _say(f"Warning: the seals accepted after the head record were not recorded ({type(exc).__name__})")
 
     def _release(self) -> None:
         try:
@@ -673,6 +739,12 @@ class ChainWriter:
             record = store.load()
         except ValueError:
             raise ChainStopped("head-record-missing", "the head record cannot be read: " + store.path)
+        if record is not None and not record.get("link"):
+            # Only findings were kept (before the first seal, or after the record was lost): no head to check
+            # against, and no list of another writer's seals.
+            record = None
+        if record is not None and st.pending_after:
+            record = with_pending(record, st.pending_after)
         self.record = record
         db = self.db
         view = st.view
@@ -686,7 +758,8 @@ class ChainWriter:
                 return            # only now may genesis run
             raise ChainStopped("head-record-missing",
                                f"the audit chain has {newest} seals but no head record at {store.path}; "
-                               "the keys volume was lost or replaced. Run dockvault.py audit accept-database-head")
+                               "the keys volume was lost or replaced. Put the head record back from a backup of "
+                               "the keys volume: sealing stays stopped until then")
         rec_seq = int(record.get("seq") or 0)
         rec_link = bytes.fromhex(record["link"]) if record.get("link") else None
         if newest < rec_seq:
@@ -701,9 +774,9 @@ class ChainWriter:
         held = st.keys_held()
         early: Optional[ChainStopped] = None
         for seal in read_seals(db, view.position):
-            link = fmt.link(view.link_at(seal.seq - 1), seal.body())
             if seal.seq != view.position + 1:
                 raise ChainStopped("seq-gap", f"the seals jump from {view.position} to {seal.seq}")
+            link = fmt.link(view.link_at(seal.seq - 1), seal.body())
             if seal.seq <= rec_seq:
                 # Up to the record, the seals are authenticated by the recorded link alone: a seal edited
                 # anywhere before it changes that link. A break of the key sequence there is reported once
@@ -732,7 +805,7 @@ class ChainWriter:
             if not _record_lists(record, view.generation, seal.seq, link):
                 raise ChainStopped("host-seal-unrecorded",
                                    f"seal {seal.seq} ({seal.kind}) is one only the host writes, and the head record "
-                                   "does not list it. Run dockvault.py audit after-record", seal.seq)
+                                   "does not list it: sealing stays stopped", seal.seq)
             return
         problem = key_sequence_problem(view, seal)
         if problem:
@@ -754,10 +827,12 @@ class ChainWriter:
             problem = face_problem(view, seal, st.clock(), first_acceptance=True)
             if problem:
                 raise ChainStopped("after-record-invalid", f"seal {seal.seq}: {problem}", seal.seq)
-            self.accepted_after.append({"generation": view.generation, "seq": seal.seq, "kind": seal.kind,
-                                        "link": link.hex(), "accepted_at": fmt.time_text(st.clock()),
-                                        "where": "start" if not st.started else "running",
-                                        "acknowledged": False, "discarded": False})
+            entry = {"generation": view.generation, "seq": seal.seq, "kind": seal.kind, "link": link.hex(),
+                     "accepted_at": fmt.time_text(st.clock()), "where": "start" if not st.started else "running",
+                     "acknowledged": False, "discarded": False}
+            st.pending_after.append(entry)
+            if self.record is not None:
+                with_pending(self.record, [entry])
 
     def _check_current_key(self, held) -> None:
         view = self.st.view
@@ -774,14 +849,16 @@ class ChainWriter:
         record = self.record or {}
         if _ever_in_force(record, current.key_id) or view.ever_in_force(current.key_id):
             raise ChainStopped("key-not-current",
-                               f"the current key {current.key_id} is one the chain has left; run dockvault.py "
-                               "audit rekey to return to it")
+                               f"the current key {current.key_id} is one the chain has left; set AUDIT_CHAIN_KEY "
+                               f"back to the key in force ({in_force}): sealing stays stopped until then")
         if in_force in held:
             self.key_move = (held[in_force], current)
             return
         raise ChainStopped("key-change-waiting",
                            f"the chain is under key {in_force}, which this process does not hold, and the current "
-                           f"key {current.key_id} has never been in force: run dockvault.py audit rekey")
+                           f"key {current.key_id} has never been in force: set AUDIT_CHAIN_KEY back to the key in "
+                           "force (this release moves the chain to a new key only from the one derived from "
+                           "ENCRYPTION_KEY)")
 
     key_move = None
     # A change the caller makes to the head record with this writer's own (an acknowledgment marks entries).
@@ -832,7 +909,7 @@ class ChainWriter:
             _say("Warning: the audit chain's lock was lost after a commit; the head record was not written")
 
     def _write_record(self) -> None:
-        st, view, written, accepted = self.st, self.st.view, list(self.written), list(self.accepted_after)
+        st, view, written, accepted = self.st, self.st.view, list(self.written), list(self.st.pending_after)
         now = st.clock()
 
         def change(record):
@@ -868,7 +945,7 @@ class ChainWriter:
             return record
 
         st.head_store().write(change, now)
-        self.accepted_after = []
+        st.pending_after = [e for e in st.pending_after if e not in accepted]
 
 
 def _summarise(record: dict, view: View, seal: Seal) -> None:
@@ -974,31 +1051,12 @@ def face_problem(view: View, seal: Seal, now: datetime, *, first_acceptance: boo
             return "an hour seal with no period"
         if seal.period_end - seal.period_start > HOUR and seal.row_count:
             return "a run of hours with rows"
-    if seal.kind == "late":
-        d = seal.detail or {}
-        try:
-            hour = fmt.parse_time_text(d.get("hour"))
-        except (TypeError, ValueError):
-            return "a late seal with no hour"
-        entry = view.entry_for(hour)
-        if entry is None:
-            return "a late seal for an hour not sealed"
-        prev = entry.roots[-1] if entry.start == hour else entry.roots[0]
-        if d.get("prev_seq") != prev.seq:
-            return "a late seal that does not follow its hour's root seal"
-        if d.get("by") != "host" and seal.sealed_at - prev.sealed_at > LATE_WINDOW:
-            return "a late seal more than 6 hours after its hour's seal"
-    if seal.kind == "policy":
-        from app.core import audit_chain_verify
-        return audit_chain_verify.policy_problem(view, seal)
-    if seal.kind == "request":
-        from app.core import audit_chain_verify
-        return audit_chain_verify.request_problem(view, seal)
-    if seal.kind == "cancel":
-        d = seal.detail or {}
-        if d.get("cancels") not in view.pending_requests():
-            return "a cancel of a request that is not pending"
-    return None
+    if seal.kind in UNCHECKED_KINDS:
+        return f"a {seal.kind} seal, which this release neither writes nor checks"
+    # Every rule audit verify applies to the seal's kind (a late seal's root, a prune's policy seal, an
+    # erase's request and delay, a cancel's pending request, a policy seal's justification).
+    from app.core import audit_chain_verify
+    return audit_chain_verify.justification_problem(view, seal)
 
 
 # --------------------------------------------------------------------------- reading an hour's rows
@@ -1177,9 +1235,9 @@ def write_genesis(w: ChainWriter, now: datetime) -> Seal:
     while through >= (hour_floor(first) if first else through) and not may_seal(through + HOUR, now, open_since)[0]:
         through -= HOUR
     backlog_rows = int(db.query(func.count()).select_from(A).filter(A.timestamp < through + HOUR).scalar() or 0)
-    undated = list(iter_rows(db, None, None))
-    salt = secrets.token_bytes(32) if any(r["seal_nonce"] is None for r in undated) else None
-    fig = hour_figures(undated, salt)
+    salt = secrets.token_bytes(32)
+    fig = hour_figures(iter_rows(db, None, None), salt)
+    salt = salt if fig.nonceless else None
     detail = {"format": fmt.FORMAT, "release": _release(), "first_row_hour": fmt.hour_text(hour_floor(first)) if first else None,
               "backlog_through": fmt.hour_text(through), "backlog_rows": backlog_rows, "undated_rows": fig.count,
               "replaces": None, "grace_until": None}
@@ -1224,9 +1282,10 @@ def seal_hour(w: ChainWriter, start: datetime, now: datetime, open_since: Option
         return w.append("hour", period_start=start, period_end=end, row_count=0, row_bytes=0,
                         root_s=fmt.EMPTY_ROOT, root_c=fmt.EMPTY_ROOT, ids_dig=fmt.ids_digest([]), detail=detail,
                         row_ids=b"" if end - start == HOUR else None)
-    rows = list(iter_rows(db, start, start + HOUR))
-    salt = secrets.token_bytes(32) if any(r["seal_nonce"] is None for r in rows) else None
-    fig = hour_figures(rows, salt)
+    # Streamed: a salt is drawn first, and kept only when a row of the hour has no nonce of its own.
+    salt = secrets.token_bytes(32)
+    fig = hour_figures(iter_rows(db, start, start + HOUR), salt)
+    salt = salt if fig.nonceless else None
     detail = {"open_since": fmt.time_text(open_mark)} if open_mark else {}
     return w.append("hour", period_start=start, period_end=start + HOUR, row_count=fig.count, row_bytes=fig.bytes,
                     root_s=fig.root_s, root_c=fig.root_c, ids_dig=fig.ids_digest, detail=detail, row_ids=fig.ids,
@@ -1255,23 +1314,26 @@ def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) 
     if count <= root.count:
         return None
     wr = working_row(db, hour)
+    # The rows the hour's root seal holds, by its working data: a row it lists is never taken for one added, and
+    # a list changed in the database is caught by the rows it then gives, which must still give the root.
     sealed_ids = bytes(wr.row_ids or b"") if wr is not None else b""
-    if fmt.ids_digest_of_blob(sealed_ids) != root.ids_digest:
-        return None
-    sealed = {fmt.as_uuid(sealed_ids[i:i + 16]) for i in range(0, len(sealed_ids), 16)}
-    rows = list(iter_rows(db, hour, hour + HOUR))
-    added = [r["id"] for r in rows if r["id"] not in sealed]
+    sealed = {sealed_ids[i:i + 16] for i in range(0, len(sealed_ids), 16)}
+    added, nonceless = [], False
+    for r in iter_rows(db, hour, hour + HOUR):       # streamed: only the added rows' ids are kept
+        if r["id"].bytes not in sealed:
+            added.append(r["id"])
+            nonceless = nonceless or r["seal_nonce"] is None
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
     c_prev = erase_c_prev(db, view, own) if own is not None and own.erases else {}
-    before = hour_figures(rows, salt, c_prev, exclude=set(added))
+    before = hour_figures(iter_rows(db, hour, hour + HOUR), salt, c_prev, exclude=set(added))
     if (before.count, before.root_s, before.root_c, before.ids_digest) != (root.count, root.root_s, root.root_c,
                                                                           root.ids_digest):
         return None
-    new_salt = None
-    if salt is None and any(r["seal_nonce"] is None for r in rows if r["id"] in set(added)):
-        new_salt = secrets.token_bytes(32)
+    new_salt = secrets.token_bytes(32) if salt is None and nonceless else None
     use_salt = salt or new_salt
-    after = hour_figures(rows, use_salt, {k: v for k, v in c_prev.items()})
+    # The new roots are over the rows as they are now, erased ones included: the late seal ends the hour's erase
+    # entries, so the next check compares the rows with it alone.
+    after = hour_figures(iter_rows(db, hour, hour + HOUR), use_salt)
     detail = {"hour": fmt.hour_text(hour), "prev_seq": root.seq, "added": [str(a) for a in added], "by": "sealer"}
     seal = w.append("late", period_start=hour, period_end=hour + HOUR, row_count=after.count, row_bytes=after.bytes,
                     root_s=after.root_s, root_c=after.root_c, ids_dig=after.ids_digest, detail=detail,
@@ -1467,38 +1529,49 @@ def status(st: Optional[ChainState] = None) -> dict:
     failure and warning. Read from the head record and the verified view, never from audit rows."""
     st = st or state()
     try:
-        record = st.head_store().load()
+        st.head_store().load()
     except ValueError:
-        record = None
+        pass
+    record = st.known_record()
     view = st.view
     out = {"head": None, "head_at": None, "key_id": None, "sealed_through": None, "check": {}, "failures": {},
            "warnings": {}, "outcome": "not-started", "key_shared": False}
+    if record:
+        # Findings are shown whatever else the record holds: one kept with no head (the record was lost and
+        # sealing stopped) is still a finding.
+        out["failures"] = open_failures(record)
+        out["warnings"] = open_warnings(record)
     if record and record.get("link"):
         out["head"] = fmt.head(int(record["seq"]), bytes.fromhex(record["link"]))
         out["key_id"] = record.get("key_id")
         out["sealed_through"] = record.get("newest_hour_end")
         out["check"] = record.get("check") or {}
-        out["failures"] = open_failures(record)
-        out["warnings"] = open_warnings(record)
-        for e in record.get("after_record") or []:
-            if not e.get("acknowledged") and not e.get("discarded"):
-                out["warnings"].setdefault("after-record", {"message": "seals another writer appended after the "
-                                                                       "head record wait for the host"})
-        late = [s for s in view.late_seqs if s not in view.acked]
+        if unacknowledged_foreign(view, record):
+            out["warnings"].setdefault("after-record", {"message": "seals another writer appended after the "
+                                                                   "head record wait for the host"})
+        done = acknowledged(view, record)
+        late = [s for s in view.late_seqs if s not in done]
         if late:
             out["warnings"]["late"] = {"message": f"{len(late)} late seals wait to be acknowledged",
                                        "seqs": late}
+        vetoes = [s for s in database_seqs(view) if s not in done]
+        if vetoes:
+            out["warnings"]["veto-from-database"] = {
+                "message": f"{len(vetoes)} seals hold back a deletion from the database's values (a value that "
+                           "keeps more, or a waiting change it no longer shows); acknowledge them once seen",
+                "seqs": vetoes}
         out["outcome"] = (record.get("status") or {}).get("outcome") or "clean"
-        if out["failures"]:
-            out["outcome"] = "failed"
         try:
             out["key_shared"] = keys.current(st.cfg()).source == "encryption"
         except Exception:  # noqa: BLE001
             pass
         if st.head_store().unwritable:
             out["warnings"]["head-record-unwritable"] = {"message": st.head_store().unwritable}
+    if out["failures"]:
+        out["outcome"] = "failed"
     if st.stopped is not None:
         out["stopped"] = {"kind": st.stopped.kind, "message": str(st.stopped)}
+        out["outcome"] = "failed" if out["failures"] else "stopped"
     return out
 
 

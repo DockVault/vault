@@ -79,8 +79,14 @@ def chain(request, monkeypatch, tmp_path):
         yield None
         return
     from datetime import datetime, timezone
+    from app.core import audit_chain_policy as pol
     settings = request.getfixturevalue("env")
     request.getfixturevalue("db")
+    # The chain reads the deployment's values from .env as the app's configuration parses them; this test's
+    # own settings are not in that configuration, so the chain is given them as the registry has them.
+    parse = pol.settings_from_inputs
+    monkeypatch.setattr(pol, "settings_from_inputs",
+                        lambda inputs: SimpleNamespace(**{**vars(parse(inputs)), **vars(settings)}))
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     c = Chain(monkeypatch, tmp_path, settings, reg._default_session_factory, now)
     c.seal_all()
@@ -400,3 +406,19 @@ def test_while_sealing_is_stopped_a_reduction_is_refused_and_a_longer_value_is_s
                                      db=db)
     assert out["status"] == "applied"
     assert audit_integrity
+
+
+def test_while_sealing_is_stopped_a_change_is_judged_against_the_chain_not_the_stored_value(env, db, chain):
+    """Sealing stops with the chain's 30 days in force; the database says 1000 (written without the key). 500
+    keeps more than what the pruner acts on, so it is saved at once, though it is lower than the stored 1000."""
+    from app.core.models import AuditSeal
+    assert chain.st.view.newest_state()["keep_days"]["value"] == 30
+    db.add(ManagedSetting(key="keep_days", value=1000, version=1))
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    user = _admin(db)
+    with refused(409):
+        _put(db, user, "keep_days", 10)
+    out = _put(db, user, "keep_days", 500)
+    assert out["status"] == "applied" and out["change"] is None
+    assert db.get(ManagedSetting, "keep_days").value == 500

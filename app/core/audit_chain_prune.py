@@ -43,7 +43,8 @@ class HourNotVerified(Exception):
 
 
 def _verify_hour(w, hour: datetime):
-    """(the hour's root entry, its working row, its salt, the erase commitments) once its rows check out."""
+    """(the hour's root entry, its working row, its salt, the erase commitments) once its rows check out, read
+    streamed."""
     ai = _ai()
     view = w.st.view
     entry = view.entry_for(hour)
@@ -52,23 +53,23 @@ def _verify_hour(w, hour: datetime):
     wr = ai.working_row(w.db, hour)
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
     c_prev = ai.erase_c_prev(w.db, view, own) if own is not None and own.erases else {}
-    rows = list(ai.iter_rows(w.db, hour, hour + ai.HOUR))
-    fig = ai.hour_figures(rows, salt, c_prev)
+    fig = ai.hour_figures(ai.iter_rows(w.db, hour, hour + ai.HOUR), salt, c_prev)
     if (fig.count, fig.root_s, fig.root_c, fig.ids_digest) != (root.count, root.root_s, root.root_c,
                                                                root.ids_digest) or fig.missing_nonce:
         raise HourNotVerified(fmt.hour_text(hour))
-    return root, wr, salt, c_prev, rows
+    return root, wr, salt, c_prev
 
 
-def _materialise(w, rows, salt: Optional[bytes], wr) -> None:
+def _materialise(w, hour: datetime, salt: Optional[bytes], wr) -> None:
     """Write each nonce-less row's derived nonce into the row, then delete the hour's salt."""
     from app.core.models import AuditLog as A
     if salt is None:
         return
-    for row in rows:
-        if row.get("seal_nonce") is None:
-            w.db.query(A).filter(A.id == row["id"]).update({A.seal_nonce: fmt.legacy_nonce(salt, row["id"])},
-                                                          synchronize_session=False)
+    ai = _ai()
+    nonceless = [r["id"] for r in ai.iter_rows(w.db, hour, hour + ai.HOUR) if r.get("seal_nonce") is None]
+    for row_id in nonceless:
+        w.db.query(A).filter(A.id == row_id).update({A.seal_nonce: fmt.legacy_nonce(salt, row_id)},
+                                                    synchronize_session=False)
     if wr is not None:
         wr.legacy_salt = None
 
@@ -103,23 +104,25 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None):
                     skipped.add(hour)
                     continue
                 try:
-                    root, wr, salt, c_prev, rows = _verify_hour(w, hour)
+                    root, wr, salt, c_prev = _verify_hour(w, hour)
                 except HourNotVerified:
                     skipped.add(hour)
                     failures["rows-altered"] = f"the rows of {fmt.hour_text(hour)} no longer give its seal; it was " \
                                                "not pruned"
                     continue
-                gone = [r[0] for r in w.db.query(A.id, A.timestamp).filter(
-                    *conditions, A.timestamp >= hour, A.timestamp < hour + ai.HOUR).all()]
+                found = w.db.query(A.id, A.timestamp).filter(
+                    *conditions, A.timestamp >= hour, A.timestamp < hour + ai.HOUR).all()
+                gone = [r[0] for r in found]
                 if not gone:
                     skipped.add(hour)
                     continue
-                _materialise(w, rows, salt, wr)
-                times = [r["timestamp"] for r in rows if r["id"] in set(gone)]
+                _materialise(w, hour, salt, wr)
+                times = [r[1] for r in found if r[1] is not None]
                 w.db.query(A).filter(A.id.in_(gone)).delete(synchronize_session=False)
                 w.db.flush()
-                kept = [r for r in ai.iter_rows(w.db, hour, hour + ai.HOUR)]
-                fig = ai.hour_figures(kept, None, c_prev)
+                # The new roots are over the rows as they are now: an erase newer than the root seal is
+                # then part of them, and the prune seal ends the erase entries (as a late seal does).
+                fig = ai.hour_figures(ai.iter_rows(w.db, hour, hour + ai.HOUR), None)
                 if wr is not None:
                     wr.row_ids = fig.ids
                 entries.append([fmt.hour_text(hour), root.seq, fig.count, fig.bytes, fig.root_s.hex(),

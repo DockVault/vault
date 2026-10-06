@@ -210,7 +210,9 @@ def policy_problem(view, seal) -> Optional[str]:
         name = asked.get("setting")
         if changed - {name}:
             return "an applies seal that sets more than its request's setting"
-        if req in view.cancels or req in view.applied or req not in view.pending_requests():
+        # A cancelled or applied request is not pending, and neither is one a newer request or change of the
+        # setting superseded: so an applies never replays a request older than the setting's last change.
+        if req not in view.pending_requests():
             return "an applies seal for a request that is not pending"
         try:
             not_before = fmt.parse_time_text(asked.get("not_before"))
@@ -218,8 +220,6 @@ def policy_problem(view, seal) -> Optional[str]:
             return "its request has no not_before"
         if seal.sealed_at < not_before + pol.gaps_after(view.sealed_at, req, seal.sealed_at):
             return "an applies seal before its request's delay has run"
-        if req <= int((prev_state.get(name) or {}).get("request_seq") or 0):
-            return "an applies seal for a request older than the setting's last change"
         ns = pol.settings_from_inputs(inputs)
         from app.core.audit_chain_policy_seals import setting_fields
         want = {**setting_fields(specs[name], asked.get("new"), ns, inputs, req), "set_by": seq}
@@ -316,10 +316,9 @@ def other_problem(view, seal) -> Optional[str]:
         req = view.requests.get(d.get("request_seq"))
         if req is None or req.get("what") != "erase" or req.get("placeholder") != d.get("placeholder"):
             return "an erase seal whose request or placeholder is not its own"
-        if d.get("request_seq") in view.finals:
-            return "an erase seal after its request was completed"
+        # A cancelled request, or one a final erase seal completed, is not pending.
         req_seq = d.get("request_seq")
-        if req_seq in view.cancels or req_seq not in view.pending_requests():
+        if req_seq not in view.pending_requests():
             return "an erase seal for a request that is not pending"
         try:
             not_before = fmt.parse_time_text(req.get("not_before"))
@@ -527,17 +526,22 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
         elif in_force in held:
             report.add(INFO, "key-change-pending", "the sealer will move the chain to the current key")
         else:
-            report.add(WARNING, "key-change-waiting", "the chain's key changed without the old one: run "
-                                                      "dockvault.py audit rekey")
+            report.add(WARNING, "key-change-waiting", "the chain's key changed without the old one: set "
+                                                      "AUDIT_CHAIN_KEY back to the key in force")
     if key_shared:
         report.add(INFO, "key-shared", "the chain's key is derived from ENCRYPTION_KEY; set AUDIT_CHAIN_KEY")
     if not view.position:
         report.add(INFO, "not-started", "the chain has no seal yet")
         return report
     _coverage(view, hour_seals, report, now)
+    done = ai.acknowledged(view, record)
     for seq in view.late_seqs:
-        if seq not in view.acked:
+        if seq not in done:
             report.add(WARNING, "late", f"late seal {seq} waits to be acknowledged", seq)
+    for seq in ai.database_seqs(view):
+        if seq not in done:
+            report.add(WARNING, "veto-from-database", f"seal {seq} holds back a deletion from the database's "
+                                                      "values; it waits to be acknowledged", seq)
     if check_rows:
         _rows(db, view, report, from_hour, to_hour)
     _outside(db, view, report, now)
@@ -604,15 +608,16 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
     ai = _ai()
     own = view.hours.get(hour)
     root = own.root if own is not None else entry.roots[0]
-    rows = list(ai.iter_rows(db, hour, hour + ai.HOUR))
-    report.rows_checked += len(rows)
     wr = ai.working_row(db, hour)
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
     erased = _erase_entries(db, view, own) if own is not None and own.erases else {}
-    fig = ai.hour_figures(rows, salt, {rid: e[0] for rid, e in erased.items()})
+    c_prev = {rid: e[0] for rid, e in erased.items()}
+    # Streamed (the rows are never held as a list): only the ids and the two trees grow with the hour.
+    fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt, c_prev)
+    report.rows_checked += fig.count
     label = fmt.hour_text(hour)
     for rid, (_cp, c_next, placeholder) in erased.items():
-        row = next((r for r in rows if r["id"] == rid), None)
+        row = next((r for r in ai.iter_rows(db, hour, hour + ai.HOUR) if r["id"] == rid), None)
         if row is None:
             continue
         if row.get("username") != placeholder or fmt.commitment(fmt.ZERO_NONCE, row) != c_next:
@@ -625,10 +630,11 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
         return
     sealed_ids = bytes(wr.row_ids or b"") if wr is not None and wr.row_ids is not None else None
     if sealed_ids is not None and fmt.ids_digest_of_blob(sealed_ids) == root.ids_digest:
-        sealed = [fmt.as_uuid(sealed_ids[i:i + 16]) for i in range(0, len(sealed_ids), 16)]
-        now_ids = [r["id"] for r in rows]
-        missing = [str(i) for i in sealed if i not in set(now_ids)]
-        added = [str(i) for i in now_ids if i not in set(sealed)]
+        sealed = [sealed_ids[i:i + 16] for i in range(0, len(sealed_ids), 16)]
+        now_ids = [fig.ids[i:i + 16] for i in range(0, len(fig.ids), 16)]
+        sealed_set, now_set = set(sealed), set(now_ids)
+        missing = [str(fmt.as_uuid(i)) for i in sealed if i not in now_set]
+        added = [str(fmt.as_uuid(i)) for i in now_ids if i not in sealed_set]
         if missing:
             report.add(FAILURE, "rows-missing", f"{len(missing)} sealed rows of {label} are gone: "
                                                 f"{', '.join(missing[:20])}", root.seq, label)
@@ -639,7 +645,7 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
             return
         if added:
             # The rows the seal holds, without the added ones, must still give its roots.
-            kept = ai.hour_figures(rows, salt, {rid: e[0] for rid, e in erased.items()},
+            kept = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt, c_prev,
                                    exclude={fmt.as_uuid(a) for a in added})
             if (kept.root_s, kept.root_c) != (root.root_s, root.root_c):
                 which = "stable fields" if kept.root_s != root.root_s else "personal values"
@@ -674,9 +680,38 @@ def _rows(db, view, report: Report, from_hour, to_hour) -> None:
                 continue
             report.add(FAILURE, "rows-added", f"rows in {fmt.hour_text(hour)}, an hour sealed empty",
                        run.roots[0].seq, fmt.hour_text(hour))
-    genesis_rows = list(ai.iter_rows(db, None, None))
-    if genesis_rows or (view.genesis or {}).get("undated_rows"):
-        pass
+    check_undated(db, view, report)
+
+
+def check_undated(db, view, report: Report) -> None:
+    """The rows with no timestamp, against genesis's roots: genesis sealed them, and no hour holds them."""
+    ai = _ai()
+    from app.core.models import AuditSeal as S
+    root = view.genesis_root
+    if root is None:
+        return
+    got = db.query(S.legacy_salt, S.row_ids).filter(S.seq == 1).first()
+    salt = bytes(got[0]) if got is not None and got[0] is not None else None
+    fig = ai.hour_figures(ai.iter_rows(db, None, None), salt)
+    report.rows_checked += fig.count
+    if (fig.count, fig.root_s, fig.root_c, fig.ids_digest) == (root.count, root.root_s, root.root_c,
+                                                               root.ids_digest):
+        return
+    sealed_ids = bytes(got[1]) if got is not None and got[1] is not None else b""
+    if fmt.ids_digest_of_blob(sealed_ids) == root.ids_digest:
+        sealed = {sealed_ids[i:i + 16] for i in range(0, len(sealed_ids), 16)}
+        now = {fig.ids[i:i + 16] for i in range(0, len(fig.ids), 16)}
+        missing, added = sorted(sealed - now), sorted(now - sealed)
+        if missing:
+            report.add(FAILURE, "rows-missing", f"{len(missing)} undated rows genesis sealed are gone: "
+                                                f"{', '.join(str(fmt.as_uuid(i)) for i in missing[:20])}", 1, "undated")
+        if added:
+            report.add(FAILURE, "rows-added", f"{len(added)} undated rows are not in genesis's seal: "
+                                              f"{', '.join(str(fmt.as_uuid(i)) for i in added[:20])}", 1, "undated")
+        if missing or added:
+            return
+    which = "stable fields" if fig.root_s != root.root_s else "personal values"
+    report.add(FAILURE, "rows-altered", f"undated rows changed in their {which}", 1, "undated")
 
 
 def _outside(db, view, report: Report, now: datetime) -> None:
@@ -756,8 +791,8 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
     finally:
         db.close()
     failures = {f.kind: f.message for f in report.findings if f.severity == FAILURE}
-    warnings = {f.kind: f.message for f in report.findings if f.severity == WARNING and f.kind != "late"
-                and f.kind != "after-record"}
+    warnings = {f.kind: f.message for f in report.findings if f.severity == WARNING
+                and f.kind not in ("late", "after-record", "veto-from-database")}
     ai.report_failures(st, session_factory, failures, warnings, outcome="clean")
 
     def change(rec):
@@ -838,7 +873,8 @@ def main(argv=None) -> int:
     sub.add_parser("head", help="print the head to keep elsewhere")
     a = sub.add_parser("acknowledge", help="acknowledge warnings (by seal) or failures, as the host")
     a.add_argument("--seqs", default="", help="the warning seals to acknowledge, comma-separated")
-    a.add_argument("--failures", action="store_true", help="acknowledge every failure not yet acknowledged")
+    a.add_argument("--failures", action="store_true",
+                   help="acknowledge every failure, and every warning kept by kind, not yet acknowledged")
     a.add_argument("--expect", required=True, help="the head the operator saw (dvchain1:...)")
     args = p.parse_args(argv)
     if args.action == "acknowledge":
@@ -874,6 +910,10 @@ def main(argv=None) -> int:
                     for kind, e in ai.open_failures(record).items():
                         if kind not in report.kinds(FAILURE):
                             report.add(FAILURE, kind, f"{e.get('message', '')} (first seen {e.get('first_seen')}, "
+                                                      "not acknowledged)")
+                    for kind, e in ai.open_warnings(record).items():
+                        if kind not in report.kinds(WARNING):
+                            report.add(WARNING, kind, f"{e.get('message', '')} (first seen {e.get('first_seen')}, "
                                                       "not acknowledged)")
             finally:
                 db.close()

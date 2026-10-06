@@ -174,6 +174,60 @@ def test_an_erase_before_its_delay_is_unjustified(env):
     assert found and "delay" in found[0].message
 
 
+def test_an_erase_then_a_late_seal_in_the_same_hour_keeps_the_chain_valid(env):
+    """The late seal's roots are over the rows as they are now: the erased row counts with its new values."""
+    env.row(T0 - timedelta(hours=3, minutes=10), username="bob")
+    env.run_until_sealed()
+    req, placeholder = _request_erase(env)
+    for _ in range(29):            # the erase's delay runs out
+        env.clock.advance(hours=6)
+        env.seal()
+    env.clock.advance(hours=1)
+    at = env.clock() - timedelta(hours=2, minutes=50)
+    erased = env.row(at, username="eve")
+    env.run_until_sealed()
+    hour = ai.hour_floor(at)
+    assert hour + ai.HOUR <= env.st.view.newest_hour_end
+    _run_erase(env, req, placeholder, hour, [erased])
+    assert failures(env.verify()) == []
+    env.row(hour + timedelta(minutes=40), username="carol")
+    env.clock.advance(minutes=20)
+    assert env.seal().late == 1
+    report = env.verify()
+    assert failures(report) == [], report.findings
+    late = [s for s in env.seals() if s.kind == "late"][-1]
+    with env.session() as db:
+        now = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), None)
+    assert bytes(late.root_c) == now.root_c
+
+
+def test_an_erase_then_a_partial_prune_of_the_same_hour_keeps_the_chain_valid(env, monkeypatch):
+    """An erased person's administration row is kept by its floor while the rest of its hour is pruned: the
+    prune seal's roots are over the rows kept as they are now."""
+    at = T0 - timedelta(days=40)
+    erased = env.row(at + timedelta(minutes=5), username="eve", action="settings_updated")
+    plain = env.row(at + timedelta(minutes=15), username="alice")
+    env.run_until_sealed()
+    req, placeholder = _request_erase(env)
+    for _ in range(30):
+        env.clock.advance(hours=6)
+        env.seal()
+    _run_erase(env, req, placeholder, ai.hour_floor(at), [erased])
+    assert failures(env.verify()) == []
+    monkeypatch.setenv("AUDIT_LOG_RETENTION_DAYS", "30")
+    env.settings.audit_log_retention_days = 30
+    env.clock.advance(minutes=30)
+    retention.run_pass(env.session, now=env.clock())
+    with env.session() as db:
+        left = {r[0] for r in db.query(AuditLog.id).all()}
+    assert plain not in left and erased in left
+    report = env.verify()
+    assert failures(report) == [], report.findings
+    env.clock.advance(minutes=30)
+    retention.run_pass(env.session, now=env.clock())       # the hour still checks out for the next pass
+    assert failures(env.verify()) == []
+
+
 # --------------------------------------------------------------------------- keys
 
 def _shared_then_own_key(env):

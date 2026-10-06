@@ -146,22 +146,24 @@ def _end(change, status, *, by_id, by_name, now, reason) -> None:
     change.decided_at, change.reason = now, reason
 
 
-def request(db, key: str, requested, *, actor, now: Optional[datetime] = None) -> Outcome:
+def request(db, key: str, requested, *, actor, now: Optional[datetime] = None, judge=None) -> Outcome:
     """An administrator's ``requested`` value for ``key`` (None: back to the deployment's value), in ``db``'s
     transaction, with its audit row. It does not commit. The caller checks first that the panel may set
-    the value (managed_settings_router.refusal)."""
+    the value (managed_settings_router.refusal). ``judge`` (app/core/audit_chain_policy_seals.Judge), for a
+    setting the audit chain records, gives the value in force and the change's direction from the chain
+    instead of from the stored value."""
     from app.core.models import ManagedSettingChange as Change
     spec = registry.spec_for(key)
     if spec is None:
         raise registry.SettingRefused(f"{key} is not a setting the panel manages")
     now = now or utcnow()
     _lock(db)
-    stored, old_setting, old_value = in_force(db, spec)
+    stored, old_setting, old_value = judge.in_force() if judge is not None else in_force(db, spec)
     new_setting = requested if requested is not None else registry.deployment_value(spec)[0]
     new_value = resolved(spec, requested)
     waiting = pending_for(db, key)
     base = dict(key=key, old=old_value, new=new_value, setting=requested)
-    if requested == stored:
+    if requested == stored and (judge is None or not judge.alters_chain(requested)):
         if not waiting:
             return Outcome("unchanged", **base)
         rows = []
@@ -176,7 +178,8 @@ def request(db, key: str, requested, *, actor, now: Optional[datetime] = None) -
         _end(change, SUPERSEDED, by_id=actor.id, by_name=actor.username, now=now,
              reason="a newer change of the same setting")
     superseded = [str(c.id) for c in waiting]
-    if not deletes_sooner(spec, old_setting, new_setting):
+    sooner = judge.deletes_sooner(requested) if judge is not None else deletes_sooner(spec, old_setting, new_setting)
+    if not sooner:
         registry.store(db, key, requested, by_id=actor.id, by_name=actor.username, now=now)
         row = _audit(db, CHANGED, user=actor, key=key, details={**base, "superseded": superseded})
         return Outcome("applied", superseded=waiting, audit_row=row, **base)

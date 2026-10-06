@@ -170,11 +170,9 @@ def honoured_state(view, record: Optional[dict]) -> dict:
     appended after the head record (and the host has not acknowledged) set to delete sooner taken from the
     replay without those seals, whichever keeps more."""
     chain = view.newest_state()
-    foreign = set()
-    for e in (record or {}).get("after_record") or []:
-        if e.get("generation") == view.generation and not e.get("acknowledged") and not e.get("discarded"):
-            foreign.add(int(e["seq"]))
-    foreign -= set(view.acked)
+    # Only the head record's list says the host acknowledged a seal: an acknowledgment in another writer's own
+    # ``ack`` seal counts for nothing.
+    foreign = _ai().unacknowledged_foreign(view, record)
     if not foreign:
         return _copy_state(chain)
     replay: dict = {}
@@ -206,7 +204,7 @@ def numbers(st=None) -> Optional[dict]:
     st = st or ai.state()
     if st.stopped is not None or st.view.newest_policy() is None:
         return None
-    record = st.head_store().memory
+    record = st.known_record()
     state = honoured_state(st.view, record)
     out = {name: entry.get("value") for name, entry in state.items()}
     return out
@@ -241,6 +239,69 @@ def _actor_fields(actor) -> dict:
     return {"by": "admin", "user_id": _uuid_text(getattr(actor, "id", None))}
 
 
+class Judge:
+    """An administrator's change of a chain setting, judged against the verified view under the chain lock: the
+    honoured entry (what the pruner acts on) and the chain's (the newest policy seal's). The database's stored
+    value decides nothing here: someone who can write to the database but holds no key could have set it, and
+    an honest raise from that value would then be a reduction applied at once."""
+
+    def __init__(self, view, record, key: str):
+        newest = view.newest_policy()
+        self.spec = registry.spec_for(key)
+        self.inputs = newest[1].get("inputs") or {}
+        self.ns = pol.settings_from_inputs(self.inputs)
+        self.chain = dict((newest[1].get("state") or {}).get(key) or {})
+        self.honoured = dict(honoured_state(view, record).get(key) or {})
+
+    def entry(self, requested) -> dict:
+        """The entry ``requested`` gives (None: back to the deployment's value), under the chain's bounds."""
+        return setting_fields(self.spec, requested, self.ns, self.inputs, None)
+
+    def in_force(self) -> tuple:
+        """(stored, setting, value) as setting_changes.in_force() gives them, from the honoured entry."""
+        h = self.honoured
+        stored = h.get("setting") if h.get("source") not in ("env", "default") else None
+        return stored, (stored if stored is not None else h.get("value")), h.get("value")
+
+    def deletes_sooner(self, requested) -> bool:
+        """Whether the change deletes sooner than the honoured entry or the chain's: then it is a request."""
+        new = self.entry(requested)
+        return pol.deletes_sooner(self.spec, self.honoured, new) or pol.deletes_sooner(self.spec, self.chain, new)
+
+    def alters_chain(self, requested) -> bool:
+        """Whether the change sets a field of the chain's entry (the honoured setting given again after another
+        writer's seal made the chain's lower does)."""
+        new = self.entry(requested)
+        return any(new.get(f) != self.chain.get(f) for f in ("value", "source", "setting"))
+
+
+def judge(view, record, key: str) -> Optional[Judge]:
+    """The judge of a change of ``key``, or None for a setting the chain does not record (or no chain yet)."""
+    if key not in pol.chain_setting_keys() or view.newest_policy() is None:
+        return None
+    return Judge(view, record, key)
+
+
+def change(w, key: str, requested, actor, *, now: Optional[datetime] = None):
+    """An administrator's change of ``key`` in the chain writer ``w``'s transaction: its direction decided
+    against the chain (Judge), the database's rows and audit row (setting_changes.request), and its seals."""
+    from app.core import setting_changes
+    outcome = setting_changes.request(w.db, key, requested, actor=actor, now=now,
+                                      judge=judge(w.st.view, w.record, key))
+    seal_request_outcome(w, outcome, actor)
+    return outcome
+
+
+def honoured_entries(st=None) -> dict:
+    """The honoured state's entries, for the panel (the values the pruner acts on), or {} before the chain's
+    first policy seal."""
+    ai = _ai()
+    st = st or ai.state()
+    if st.view.newest_policy() is None:
+        return {}
+    return honoured_state(st.view, st.known_record())
+
+
 def seal_request_outcome(w, outcome, actor) -> None:
     """The seals of what setting_changes.request() did, in its transaction: a ``policy`` seal of cause
     ``request`` for a change that deletes later, a ``request`` seal for one that deletes sooner, and a
@@ -248,6 +309,8 @@ def seal_request_outcome(w, outcome, actor) -> None:
     view = w.st.view
     spec = registry.spec_for(outcome.key)
     w.commit_without_seal = True
+    if outcome.key not in pol.chain_setting_keys():
+        return                # a setting the chain does not record: no seal
     if outcome.status == "kept":
         for change, row in zip(outcome.superseded, outcome.cancel_rows):
             req = request_seq_for(view, change.id)
@@ -298,12 +361,23 @@ def request_seq_for(view, change_id) -> Optional[int]:
     return None
 
 
-def refuses_while_stopped(db, key: str, requested) -> bool:
-    """Whether a change must be refused because sealing is stopped: one that deletes sooner."""
+def judge_now(key: str, st=None) -> Optional[Judge]:
+    """The judge of a change of ``key`` from this process's view as it stands, without the chain lock: for a
+    change made while sealing is stopped, which writes no seal."""
+    st = st or _ai().state()
+    return judge(st.view, st.known_record(), key)
+
+
+def refuses_while_stopped(db, key: str, requested, st=None) -> bool:
+    """Whether a change must be refused because sealing is stopped: one that deletes sooner than what the chain
+    last gave (the database's value before the chain's first policy seal)."""
     from app.core import setting_changes
     spec = registry.spec_for(key)
     if spec is None:
         return False
+    j = judge_now(key, st)
+    if j is not None:
+        return j.deletes_sooner(requested)
     _stored, old_setting, _old_value = setting_changes.in_force(db, spec)
     new_setting = requested if requested is not None else registry.deployment_value(spec)[0]
     return setting_changes.deletes_sooner(spec, old_setting, new_setting)
@@ -311,13 +385,17 @@ def refuses_while_stopped(db, key: str, requested) -> bool:
 
 # --------------------------------------------------------------------------- applying due requests
 
-def due_requests(view, now: datetime) -> list:
+def due_requests(view, now: datetime, record: Optional[dict] = None) -> list:
     """The pending setting requests whose delay has run, oldest first. A delay counts only time while sealing
     ran: every gap of more than 12 hours between seals after the request adds its length, and while a gap is
-    open (no seal for 12 hours) nothing is due."""
+    open (no seal for 12 hours) nothing is due. A request another writer appended after the head record is due
+    only once the host has acknowledged it, and a delay after the server first accepted it (the honoured
+    delay, plus every gap after that): its own ``sealed_at`` and ``not_before`` are whoever appended it."""
     out = []
     if not view.sealed_at or now - view.sealed_at[-1] > pol.GAP:
         return out
+    foreign = _ai().foreign_entries(view, record)
+    delay = None
     for seq, d in sorted(view.pending_requests().items()):
         if d.get("what") != "setting":
             continue
@@ -325,15 +403,19 @@ def due_requests(view, now: datetime) -> list:
             not_before = fmt.parse_time_text(d.get("not_before"))
         except (TypeError, ValueError):
             continue
-        due = now >= not_before + pol.gaps_after(view.sealed_at, seq, now)
-        if due and seq > _entry_request_seq(view, d.get("setting")):
-            out.append(seq)
+        if now < not_before + pol.gaps_after(view.sealed_at, seq, now):
+            continue
+        entry = foreign.get(seq)
+        if entry is not None:
+            if not entry.get("acknowledged"):
+                continue
+            if delay is None:
+                delay = timedelta(days=pol.delay_days(honoured_state(view, record)))
+            accepted = fmt.parse_time_text(entry["accepted_at"])
+            if now < accepted + delay + pol.gaps_since(view.sealed_at, accepted, now):
+                continue
+        out.append(seq)
     return out
-
-
-def _entry_request_seq(view, setting: str) -> int:
-    entry = view.newest_state().get(setting) or {}
-    return int(entry.get("request_seq") or 0)
 
 
 def apply_due(engine, st, now: datetime) -> list:
@@ -345,11 +427,11 @@ def apply_due(engine, st, now: datetime) -> list:
     ai = _ai()
     done = []
     announcements = []
-    for req in due_requests(st.view, now):
+    for req in due_requests(st.view, now, st.known_record()):
         with ai.ChainWriter(engine, st) as w:
             view = w.st.view
             d = view.requests.get(req)
-            if d is None or req not in view.pending_requests() or req not in due_requests(view, now):
+            if d is None or req not in view.pending_requests() or req not in due_requests(view, now, w.record):
                 continue
             db = w.db
             setting_changes._lock(db)
@@ -441,24 +523,24 @@ def backstop(engine, st, now: datetime, session_factory) -> Dict[str, str]:
         if status_ == setting_changes.PENDING and request_seq_for(view, change_id) is None:
             findings["unjustified-input"] = "a waiting change in the database has no request seal; it is ignored"
     if vetoes and _veto_allowed_today(view, now):
-        with ai.ChainWriter(engine, st) as w:
-            view = w.st.view
-            for key, item in list(vetoes.items()):
-                if isinstance(key, tuple):
-                    req = key[1]
-                    if req in view.pending_requests():
-                        w.append("cancel", detail={"cancels": req, "request": item.get("request"), "audit_row": None,
-                                                   "by": "database", "user_id": None})
-                    del vetoes[key]
-            if vetoes:
-                newest = view.newest_policy()
+        # One seal per transaction (a crash between a commit and the head record's write then leaves at most
+        # one seal unrecorded): each cancel, then the veto of the values.
+        for key, item in sorted((k, v) for k, v in vetoes.items() if isinstance(k, tuple)):
+            with ai.ChainWriter(engine, st) as w:
+                if key[1] in w.st.view.pending_requests():
+                    w.append("cancel", detail={"cancels": key[1], "request": item.get("request"), "audit_row": None,
+                                               "by": "database", "user_id": None})
+            del vetoes[key]
+        if vetoes:
+            with ai.ChainWriter(engine, st) as w:
+                newest = w.st.view.newest_policy()
                 state = _copy_state(newest[1].get("state") or {})
-                seq = view.position + len(w.written) + 1
+                seq = w.st.view.position + 1
                 for key, candidate in vetoes.items():
                     _set(state, key, {**candidate, "request_seq": seq}, seq)
                 w.append("policy", detail=_policy_detail(state, newest[1].get("inputs") or {}, "database",
                                                          by="database"))
-        findings.setdefault("veto-from-database", "a value in the database that keeps more was sealed as a veto")
+    # Each seal written here is a warning until the host acknowledges it (audit_integrity.database_seqs).
     return findings
 
 

@@ -42,8 +42,7 @@ def _admin(env, name="ada"):
 
 def _change(env, actor, key, value):
     with ps.change_transaction(env.engine) as w:
-        outcome = sc.request(w.db, key, value, actor=actor, now=env.clock())
-        ps.seal_request_outcome(w, outcome, actor)
+        outcome = ps.change(w, key, value, actor, now=env.clock())
     return outcome
 
 

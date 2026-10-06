@@ -243,3 +243,16 @@ def gaps_after(sealed_at: list, seq: int, then: Optional[datetime] = None) -> ti
         total += then - sealed_at[-1]
     return total
 
+
+def gaps_since(sealed_at: list, since: datetime, then: Optional[datetime] = None) -> timedelta:
+    """The length of every gap of more than 12 hours in sealed_at that ends after ``since`` (whole, even one
+    that began before it), and of the gap open at ``then``: the time sealing did not run after ``since``."""
+    total = timedelta()
+    for i in range(1, len(sealed_at)):
+        step = sealed_at[i] - sealed_at[i - 1]
+        if step > GAP and sealed_at[i] > since:
+            total += step
+    if then is not None and sealed_at and then - sealed_at[-1] > GAP:
+        total += then - sealed_at[-1]
+    return total
+

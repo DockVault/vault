@@ -466,8 +466,7 @@ def test_a_pass_applies_the_settings_changes_that_are_due(env, factory, monkeypa
     def change(value, at):
         chain.at(at)
         with ps.change_transaction(engine) as w:
-            outcome = sc.request(w.db, retention.HOLD_KEY, value, actor=alice, now=at)
-            ps.seal_request_outcome(w, outcome, alice)
+            outcome = ps.change(w, retention.HOLD_KEY, value, alice, now=at)
         return outcome.status
 
     assert change(True, NOW - timedelta(days=30)) == "applied"

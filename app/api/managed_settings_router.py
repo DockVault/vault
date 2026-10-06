@@ -83,7 +83,7 @@ def get_managed_settings(current_user: User = Depends(require_interactive_admin)
                          db: Session = Depends(get_db)):
     """Every managed setting, from this process's copy, and the changes waiting (read from the table)."""
     limit_statements(db)
-    return {"settings": registry.describe(), "locked": sorted(registry.locked_tokens()),
+    return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
             "pending": [change_dict(c) for c in setting_changes.pending_for(db)]}
 
@@ -95,9 +95,23 @@ def spec_or_404(key: str) -> registry.SettingSpec:
     return spec
 
 
+def with_chain(rows: list) -> list:
+    """Each row of a setting the audit chain records shows, as its value, the one the pruner acts on (the
+    chain's honoured entry), with that entry beside it: the database's stored value alone decides nothing, so
+    a value written into the database without the chain's key is never shown as in force."""
+    entries = chain_seals.honoured_entries()
+    for row in rows:
+        entry = entries.get(row["key"])
+        if entry is None:
+            continue
+        row["value"] = entry.get("value")
+        row["chain"] = {"value": entry.get("value"), "setting": entry.get("setting"), "source": entry.get("source")}
+    return rows
+
+
 def in_force(spec: registry.SettingSpec) -> dict:
     """The one describe() row of ``spec``."""
-    return registry.describe([spec.key])[0]
+    return with_chain(registry.describe([spec.key]))[0]
 
 
 def refusal(spec: registry.SettingSpec, value) -> Optional[str]:
@@ -135,8 +149,7 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
         try:
             with chain_seals.change_transaction(db.get_bind()) as w:
                 limit_statements(w.db)
-                outcome = setting_changes.request(w.db, key, body.value, actor=current_user)
-                chain_seals.seal_request_outcome(w, outcome, current_user)
+                outcome = chain_seals.change(w, key, body.value, current_user)
                 change = change_dict(outcome.change)
         except audit_integrity.ChainStopped as stopped:
             # No seal can be written: a change that deletes sooner waits for sealing; any other is saved, and
@@ -146,7 +159,8 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
                 raise HTTPException(status_code=409, detail=(
                     "This change deletes records sooner, and the audit log's integrity chain is not sealing "
                     f"just now ({stopped.kind}), so it cannot be recorded. Nothing was changed; try again later."))
-            outcome = setting_changes.request(db, key, body.value, actor=current_user)
+            outcome = setting_changes.request(db, key, body.value, actor=current_user,
+                                              judge=chain_seals.judge_now(key))
             change = change_dict(outcome.change)
             db.commit()
     except audit_integrity.ChainBusy:

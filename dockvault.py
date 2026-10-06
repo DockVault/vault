@@ -5894,7 +5894,8 @@ class DockVault:
             self._fail("the chain could not be read: %s" % server_text(seen.get("error")))
         wanted = {int(s) for s in seqs.split(",") if s.strip().isdigit()}
         for f in seen.get("findings") or []:
-            if (f.get("seq") in wanted) or (failures and f.get("severity") == "failure"):
+            kept_by_kind = f.get("severity") == "warning" and not f.get("seq")
+            if (f.get("seq") in wanted) or (failures and (f.get("severity") == "failure" or kept_by_kind)):
                 print("  %-12s %s: %s" % (server_text(f.get("severity")).upper(), server_text(f.get("kind")),
                                           server_text(f.get("message"))))
         print("  Head now: %s" % server_text(seen.get("head")))
@@ -6258,7 +6259,8 @@ def build_parser():
                          "warnings (--seqs) or failures (--failures) once you have looked at them")
     au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
     au.add_argument("--failures", dest="failures", action="store_true",
-                    help="acknowledge: every failure not yet acknowledged")
+                    help="acknowledge: every failure, and every warning kept by kind (not a seal's), not yet "
+                         "acknowledged")
     au.add_argument("--yes", dest="yes", action="store_true", help="acknowledge without asking")
     au.add_argument("--from", dest="audit_from", help="the first hour whose rows are checked (YYYY-MM-DDTHH:00:00Z); "
                                                       "every hour by default")
