@@ -454,6 +454,14 @@ def acknowledged(view: View, record: Optional[dict]) -> set:
     return {seq for seq, by in view.acked.items() if any(a not in foreign for a in by)}
 
 
+def view_warning_seqs(view: View, record: Optional[dict]) -> Dict[str, List[int]]:
+    """The warning seals the view holds that no acknowledgment that counts names: the late seals, and the seals
+    the pruner wrote from the database's values."""
+    done = acknowledged(view, record)
+    return {"late": [s for s in view.late_seqs if s not in done],
+            "veto-from-database": [s for s in database_seqs(view) if s not in done]}
+
+
 def database_seqs(view: View) -> List[int]:
     """The seals the pruner wrote from the database's values (a veto, a request the database no longer shows
     pending ended): warnings until the host acknowledges them."""
@@ -959,6 +967,9 @@ class ChainWriter:
                     after.append(entry)
             if self.after_record_change is not None:
                 record = self.after_record_change(record)
+            # The warnings that come from the seals, as this writer's view gives them: shown from here after a
+            # restart, until the process has read the chain again.
+            record["view_warnings"] = view_warning_seqs(view, record)
             return record
 
         st.head_store().write(change, now)
@@ -1566,12 +1577,14 @@ def status(st: Optional[ChainState] = None) -> dict:
         if unacknowledged_foreign(view, record):
             out["warnings"].setdefault("after-record", {"message": "seals another writer appended after the "
                                                                    "head record wait for the host"})
-        done = acknowledged(view, record)
-        late = [s for s in view.late_seqs if s not in done]
+        # This process reads the chain at the pruner's first pass after it starts; until then, the warnings
+        # from the seals are the ones the last writer recorded.
+        seqs = view_warning_seqs(view, record) if view.position else (record.get("view_warnings") or {})
+        late = list(seqs.get("late") or [])
         if late:
             out["warnings"]["late"] = {"message": f"{len(late)} late seals wait to be acknowledged",
                                        "seqs": late}
-        vetoes = [s for s in database_seqs(view) if s not in done]
+        vetoes = list(seqs.get("veto-from-database") or [])
         if vetoes:
             out["warnings"]["veto-from-database"] = {
                 "message": f"{len(vetoes)} seals hold back a deletion from the database's values (a value that "

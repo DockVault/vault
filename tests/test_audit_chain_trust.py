@@ -563,6 +563,35 @@ def test_a_cancel_the_database_made_is_a_warning_the_host_acknowledges_by_its_se
     assert "veto-from-database" not in env.verify(check_rows=False).kinds("warning")
 
 
+def test_after_a_restart_the_status_shows_the_seals_warnings_before_the_chain_is_read_again(env):
+    """A late seal and a cancel the database made, neither acknowledged: a process that has just started, and
+    has not read the chain yet, shows both from the head record; once the host acknowledges them, neither."""
+    env.row(T0 - timedelta(hours=3, minutes=10))
+    env.run_until_sealed()
+    env.row(ai.hour_floor(T0 - timedelta(hours=3, minutes=10)) + timedelta(minutes=40))
+    env.clock.advance(minutes=20)
+    assert env.seal().late == 1
+    late = env.st.view.late_seqs[-1]
+    outcome = _change(env, _admin(env), "audit_max_days", 400)
+    with env.session() as db:
+        db.query(ManagedSettingChange).filter(ManagedSettingChange.id == outcome.change.id).update(
+            {ManagedSettingChange.status: sc.CANCELLED})
+        db.commit()
+    _passes(env, 6)
+    cancel = env.seals()[-1].seq
+    assert env.seals()[-1].kind == "cancel"
+    shown = ai.status(env.st)["warnings"]
+    assert (shown["late"]["seqs"], shown["veto-from-database"]["seqs"]) == ([late], [cancel])
+    env.fresh_process()
+    assert env.st.view.position == 0
+    shown = ai.status(env.st)["warnings"]
+    assert (shown["late"]["seqs"], shown["veto-from-database"]["seqs"]) == ([late], [cancel])
+    _ack_by_host(env, [late, cancel])
+    env.fresh_process()
+    shown = ai.status(env.st)["warnings"]
+    assert "late" not in shown and "veto-from-database" not in shown
+
+
 def test_warnings_kept_by_kind_are_acknowledged_with_the_failures(env):
     env.run_until_sealed()
     ai.report_failures(env.st, None, {}, {"sealed-at-backwards": "seal 9 steps back",

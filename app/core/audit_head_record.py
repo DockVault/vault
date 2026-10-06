@@ -18,6 +18,9 @@ What it holds:
     hours, days, links      hour summaries of the last 30 days, a digest per older day, every 64th link
     check, status, failures the daily check's positions and outcome, and every failure not yet acknowledged,
                             with when it was first and last seen
+    view_warnings           the late seals and the seals written from the database's values that no
+                            acknowledgment names yet, as the last writer's view gave them: the status shows
+                            them after a restart until the process has read the chain again
 
 Not secret and not MAC'd: whoever can write the file can read .env in the same container.
 
