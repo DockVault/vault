@@ -47,9 +47,11 @@ def _verify_hour(w, hour: datetime):
     streamed."""
     ai = _ai()
     view = w.st.view
-    entry = view.entry_for(hour)
-    own = view.hours.get(hour)
-    root = own.root if own is not None else entry.roots[0]
+    own = view.own_entry(hour)
+    try:
+        root = ai.hour_root(w.db, view, hour)
+    except ai.ChainStopped:
+        raise HourNotVerified(fmt.hour_text(hour))
     wr = ai.working_row(w.db, hour)
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
     c_prev = ai.erase_c_prev(w.db, view, own) if own is not None and own.erases else {}

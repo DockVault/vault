@@ -398,7 +398,7 @@ def due_requests(view, now: datetime, record: Optional[dict] = None) -> list:
     only once the host has acknowledged it, and a delay after the server first accepted it (the honoured
     delay, plus every gap after that): its own ``sealed_at`` and ``not_before`` are whoever appended it."""
     out = []
-    if not view.sealed_at or now - view.sealed_at[-1] > pol.GAP:
+    if not view.position or now - view.newest_at() > pol.GAP:
         return out
     foreign = _ai().foreign_entries(view, record)
     delay = None
@@ -409,7 +409,7 @@ def due_requests(view, now: datetime, record: Optional[dict] = None) -> list:
             not_before = fmt.parse_time_text(d.get("not_before"))
         except (TypeError, ValueError):
             continue
-        if now < not_before + pol.gaps_after(view.sealed_at, seq, now):
+        if now < not_before + pol.gaps_after(view.times, seq, now):
             continue
         entry = foreign.get(seq)
         if entry is not None:
@@ -418,7 +418,7 @@ def due_requests(view, now: datetime, record: Optional[dict] = None) -> list:
             if delay is None:
                 delay = timedelta(days=pol.delay_days(honoured_state(view, record)))
             accepted = fmt.parse_time_text(entry["accepted_at"])
-            if now < accepted + delay + pol.gaps_since(view.sealed_at, accepted, now):
+            if now < accepted + delay + pol.gaps_since(view.times, accepted, now):
                 continue
         out.append(seq)
     return out
@@ -564,6 +564,6 @@ def backstop(engine, st, now: datetime, session_factory) -> Dict[str, str]:
 def _veto_allowed_today(view, now: datetime) -> bool:
     day = now.date()
     for seq, d in view.policies:
-        if d.get("cause") == "database" and view.sealed_at[seq - 1].date() == day:
+        if d.get("cause") == "database" and view.at(seq).date() == day:
             return False
     return True

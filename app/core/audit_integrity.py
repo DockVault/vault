@@ -39,7 +39,6 @@ if __name__ == "__main__":
     from app.core.audit_chain_verify import main as _main
     raise SystemExit(_main())
 
-import bisect
 import secrets
 import threading
 import time
@@ -54,6 +53,7 @@ from app.core import audit_chain_format as fmt
 from app.core import audit_chain_keys as keys
 from app.core import settings_registry as registry
 from app.core.audit_head_record import HeadStore, LINK_EVERY
+from app.core.audit_chain_view import HourEntry, RootEntry, View  # noqa: F401 -- the view's types, as before
 
 # The lock that keeps writers of seals apart, in every process (distinct from every other lock class).
 CHAIN_LOCK = (0x6163, 1)
@@ -225,214 +225,8 @@ def newest_seq(db) -> int:
 
 # --------------------------------------------------------------------------- the verified view
 
-@dataclass
-class RootEntry:
-    seq: int
-    count: int
-    bytes: int
-    root_s: bytes
-    root_c: bytes
-    ids_digest: bytes
-    sealed_at: datetime
-    kind: str
-
-
-@dataclass
-class HourEntry:
-    start: datetime
-    end: datetime
-    roots: List[RootEntry] = field(default_factory=list)
-    erases: List[int] = field(default_factory=list)
-
-    @property
-    def root(self) -> RootEntry:
-        return self.roots[-1]
-
-
-class View:
-    """The seals this process has accepted, with every link recomputed, and the fields the pruner acts on."""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self, generation: int = 1, discards: int = 0) -> None:
-        self.generation = generation
-        self.discards = discards
-        self.links: List[bytes] = []
-        self.kinds: List[str] = []
-        self.sealed_at: List[datetime] = []
-        self.key_ids: List[str] = []
-        self.hours: Dict[datetime, HourEntry] = {}     # single hours
-        self.runs: List[HourEntry] = []                # runs of empty hours, by start
-        self._run_starts: List[datetime] = []
-        self.newest_hour_end: Optional[datetime] = None
-        self.genesis: Optional[dict] = None
-        self.genesis_root: Optional[RootEntry] = None   # the undated rows' roots
-        self.key_history: List[list] = []              # [key_id, from_seq, to_seq or None]
-        self.policies: List[tuple] = []                # (seq, detail)
-        self.requests: Dict[int, dict] = {}
-        self.cancels: Dict[int, int] = {}              # request seq -> cancel seq
-        self.cancel_by: Dict[int, str] = {}            # cancel seq -> who wrote it
-        self.applied: Dict[int, int] = {}              # request seq -> seal that acted on it
-        self.finals: Dict[int, int] = {}
-        self.restores: List[tuple] = []                # (seq, detail)
-        self.acked: Dict[int, List[int]] = {}          # acknowledged seq -> the ack seals naming it
-        self.late_seqs: List[int] = []
-        self.erase_through: Dict[int, Any] = {}        # erase request seq -> its run's scope
-        self.erased_rows: set = set()
-        self.record_seq = 0
-
-    @property
-    def position(self) -> int:
-        return len(self.links)
-
-    def link_at(self, seq: int) -> bytes:
-        return self.links[seq - 1] if seq >= 1 else fmt.LINK_0
-
-    def key_in_force(self) -> Optional[str]:
-        return self.key_history[-1][0] if self.key_history else None
-
-    def ever_in_force(self, key_id: str) -> bool:
-        return any(e[0] == key_id for e in self.key_history)
-
-    def first_hour(self) -> Optional[datetime]:
-        if not self.genesis:
-            return None
-        first = self.genesis.get("first_row_hour")
-        if first:
-            return fmt.parse_time_text(first)
-        return fmt.parse_time_text(self.genesis["backlog_through"]) + HOUR
-
-    def entry_for(self, hour: datetime) -> Optional[HourEntry]:
-        """The index entry of ``hour``: its own, or the run that covers it."""
-        e = self.hours.get(hour)
-        if e is not None:
-            return e
-        i = bisect.bisect_right(self._run_starts, hour) - 1
-        if i >= 0:
-            run = self.runs[i]
-            if run.start <= hour < run.end:
-                return run
-        return None
-
-    def _own_entry(self, hour: datetime) -> HourEntry:
-        """``hour``'s own entry, split out of the run that covers it when it has none."""
-        e = self.hours.get(hour)
-        if e is not None:
-            return e
-        run = self.entry_for(hour)
-        e = HourEntry(hour, hour + HOUR)
-        if run is not None:
-            first = run.roots[0]
-            e.roots.append(RootEntry(first.seq, 0, 0, fmt.EMPTY_ROOT, fmt.EMPTY_ROOT, fmt.ids_digest([]),
-                                     first.sealed_at, first.kind))
-        self.hours[hour] = e
-        return e
-
-    def sealed_hours(self) -> Iterator[HourEntry]:
-        yield from self.hours.values()
-
-    def accept(self, seal: Seal, link: bytes) -> None:
-        assert seal.seq == self.position + 1, (seal.seq, self.position)
-        self.links.append(link)
-        self.kinds.append(seal.kind)
-        self.sealed_at.append(seal.sealed_at)
-        self.key_ids.append(seal.key_id)
-        d = seal.detail if isinstance(seal.detail, dict) else {}
-        kind = seal.kind
-        if kind == "genesis":
-            self.genesis = dict(d)
-            self.genesis_root = RootEntry(seal.seq, seal.row_count, seal.row_bytes, _b(seal.root_s) or b"",
-                                          _b(seal.root_c) or b"", _b(seal.ids_digest) or b"", seal.sealed_at, kind)
-            self.key_history.append([seal.key_id, seal.seq, None])
-        elif kind == "key":
-            if self.key_history:
-                self.key_history[-1][2] = seal.seq - 1
-            self.key_history.append([seal.key_id, seal.seq, None])
-        elif kind == "hour":
-            entry = HourEntry(seal.period_start, seal.period_end)
-            entry.roots.append(RootEntry(seal.seq, seal.row_count, seal.row_bytes, _b(seal.root_s) or b"",
-                                         _b(seal.root_c) or b"", _b(seal.ids_digest) or b"", seal.sealed_at, kind))
-            if seal.period_end - seal.period_start > HOUR:
-                i = bisect.bisect_right(self._run_starts, seal.period_start)
-                self._run_starts.insert(i, seal.period_start)
-                self.runs.insert(i, entry)
-            else:
-                self.hours[seal.period_start] = entry
-            if self.newest_hour_end is None or seal.period_end > self.newest_hour_end:
-                self.newest_hour_end = seal.period_end
-        elif kind == "late":
-            hour = fmt.parse_time_text(d.get("hour")) if d.get("hour") else seal.period_start
-            e = self._own_entry(hour)
-            e.roots.append(RootEntry(seal.seq, seal.row_count, seal.row_bytes, _b(seal.root_s) or b"",
-                                     _b(seal.root_c) or b"", _b(seal.ids_digest) or b"", seal.sealed_at, kind))
-            e.erases = []
-            self.late_seqs.append(seal.seq)
-        elif kind in ("prune", "rewrite"):
-            for h in d.get("hours") or []:
-                hour = fmt.parse_time_text(h[0])
-                e = self._own_entry(hour)
-                e.roots.append(RootEntry(seal.seq, int(h[2]), int(h[3]), bytes.fromhex(h[4]), bytes.fromhex(h[5]),
-                                         bytes.fromhex(h[6]), seal.sealed_at, kind))
-                e.erases = []
-            if d.get("request_seq") is not None and d.get("final"):
-                self.finals[int(d["request_seq"])] = seal.seq
-        elif kind == "erase":
-            if d.get("request_seq") is not None:
-                self.erase_through.setdefault(int(d["request_seq"]), d.get("through"))
-            for row in d.get("rows") or []:
-                if row:
-                    self.erased_rows.add(row[0])
-            if d.get("hour"):
-                self._own_entry(fmt.parse_time_text(d["hour"])).erases.append(seal.seq)
-            if d.get("final") and d.get("request_seq") is not None:
-                self.finals[int(d["request_seq"])] = seal.seq
-        elif kind == "policy":
-            self.policies.append((seal.seq, d))
-            if d.get("cause") == "applies" and d.get("request_seq") is not None:
-                self.applied[int(d["request_seq"])] = seal.seq
-        elif kind == "request":
-            self.requests[seal.seq] = d
-        elif kind == "cancel":
-            if d.get("cancels") is not None:
-                self.cancels[int(d["cancels"])] = seal.seq
-            self.cancel_by[seal.seq] = d.get("by")
-        elif kind == "ack":
-            for s in d.get("acknowledges") or []:
-                self.acked.setdefault(int(s), []).append(seal.seq)
-        elif kind == "restore":
-            self.restores.append((seal.seq, d))
-            for s in d.get("acknowledges") or []:
-                self.acked.setdefault(int(s), []).append(seal.seq)
-
-    def newest_policy(self) -> Optional[tuple]:
-        return self.policies[-1] if self.policies else None
-
-    def newest_state(self) -> dict:
-        p = self.newest_policy()
-        return (p[1].get("state") or {}) if p else {}
-
-    def pending_requests(self) -> Dict[int, dict]:
-        """The requests no cancel, applies, final or newer change has ended."""
-        out = {}
-        for seq, d in self.requests.items():
-            if seq in self.cancels or seq in self.applied or seq in self.finals:
-                continue
-            if d.get("what") == "setting" and self._superseded(seq, d.get("setting")):
-                continue
-            out[seq] = d
-        return out
-
-    def _superseded(self, seq: int, setting: Optional[str]) -> bool:
-        for other, d in self.requests.items():
-            if other > seq and d.get("what") == "setting" and d.get("setting") == setting:
-                return True
-        for pseq, d in self.policies:
-            if pseq > seq and d.get("cause") in ("request", "database", "restore"):
-                entry = (d.get("state") or {}).get(setting) or {}
-                if entry.get("set_by") == pseq:
-                    return True
-        return False
+# The view itself is app/core/audit_chain_view.py: flat arrays, with every hour's roots read again
+# through the link table when they are needed (hour_root below).
 
 
 def foreign_entries(view: View, record: Optional[dict]) -> Dict[int, dict]:
@@ -941,7 +735,7 @@ class ChainWriter:
             if view.position:
                 record["seq"] = view.position
                 record["link"] = view.link_at(view.position).hex()
-                record["key_id"] = view.key_ids[-1]
+                record["key_id"] = view.key_at(view.position)
             record["generation"] = max(int(record.get("generation") or 1), view.generation)
             if view.newest_hour_end is not None:
                 record["newest_hour_end"] = fmt.time_text(view.newest_hour_end)
@@ -1065,7 +859,7 @@ def face_problem(view: View, seal: Seal, now: datetime, *, first_acceptance: boo
         return "a genesis that is not seal 1"
     if seal.format != fmt.FORMAT:
         return f"format {seal.format}"
-    prev_at = view.sealed_at[-1] if view.sealed_at else None
+    prev_at = view.newest_at()
     tol = timedelta(seconds=fmt.BACKWARDS_TOLERANCE_SECONDS)
     if prev_at is not None and seal.sealed_at < prev_at - tol:
         return "its sealed_at steps back more than five minutes"
@@ -1180,6 +974,61 @@ def hour_figures(rows, salt: Optional[bytes] = None, c_prev: Optional[Dict] = No
     return out
 
 
+def read_authenticated(db, view: View, seq: int) -> Seal:
+    """Seal ``seq`` read again, used only when its link, recomputed from the body just read and the view's link
+    for the seal before it, is the view's link for it. Raises ChainStopped (link-broken) otherwise: a seal
+    changed after the view accepted it is never acted on."""
+    seal = read_seal(db, seq)
+    if seal is None or fmt.link(view.link_at(seq - 1), seal.body()) != view.link_at(seq):
+        raise ChainStopped("link-broken", f"seal {seq} changed or went after this process accepted it", seq)
+    return seal
+
+
+def seal_figures(seal: Seal, hour: Optional[datetime]) -> Optional[tuple]:
+    """(count, bytes, root_s, root_c, ids_digest) a seal records for ``hour`` (None: the undated rows of
+    genesis), or None when it records none for it."""
+    kind = seal.kind
+    if hour is None:
+        if kind != "genesis":
+            return None
+        return (seal.row_count, seal.row_bytes, _b(seal.root_s), _b(seal.root_c), _b(seal.ids_digest))
+    if kind == "hour":
+        if seal.period_start is None or seal.period_end is None or not (seal.period_start <= hour < seal.period_end):
+            return None
+        if seal.period_end - seal.period_start > HOUR:
+            return (0, 0, fmt.EMPTY_ROOT, fmt.EMPTY_ROOT, fmt.ids_digest([]))
+        return (seal.row_count, seal.row_bytes, _b(seal.root_s), _b(seal.root_c), _b(seal.ids_digest))
+    if kind == "late":
+        d = seal.detail if isinstance(seal.detail, dict) else {}
+        if d.get("hour") != fmt.hour_text(hour):
+            return None
+        return (seal.row_count, seal.row_bytes, _b(seal.root_s), _b(seal.root_c), _b(seal.ids_digest))
+    if kind in ("prune", "rewrite"):
+        d = seal.detail if isinstance(seal.detail, dict) else {}
+        for h in d.get("hours") or []:
+            if h and h[0] == fmt.hour_text(hour):
+                return (int(h[2]), int(h[3]), bytes.fromhex(h[4]), bytes.fromhex(h[5]), bytes.fromhex(h[6]))
+    return None
+
+
+def hour_root(db, view: View, hour: datetime) -> Optional[RootEntry]:
+    """The newest seal that set ``hour``'s roots, with the roots: from the view when it keeps them, and
+    otherwise read again from the seal and used only when its link is the view's (read_authenticated). None
+    for an hour the view does not hold. Raises ChainStopped (link-broken)."""
+    entry = view.entry_for(hour)
+    if entry is None:
+        return None
+    root = entry.root
+    if root.root_s is not None:
+        return root
+    seal = read_authenticated(db, view, root.seq)
+    figures = seal_figures(seal, hour)
+    if figures is None:
+        raise ChainStopped("link-broken", f"seal {root.seq} holds no figures for {fmt.hour_text(hour)}", root.seq)
+    _count, _bytes, root.root_s, root.root_c, root.ids_digest = figures
+    return root
+
+
 def working_row(db, hour: datetime):
     """The seal row that keeps ``hour``'s working data (row_ids, legacy_salt): its first hour or late seal whose
     period is that one hour."""
@@ -1192,9 +1041,7 @@ def erase_c_prev(db, view: View, entry: HourEntry) -> Dict:
     """For each row an erase changed after the hour's root seal: its commitment before (``c_prev``)."""
     out: Dict = {}
     for seq in entry.erases:
-        seal = read_seal(db, seq)
-        if seal is None or fmt.link(view.link_at(seq - 1), seal.body()) != view.link_at(seq):
-            raise ChainStopped("link-broken", f"erase seal {seq} changed after it was accepted", seq)
+        seal = read_authenticated(db, view, seq)
         for rid, c_prev, _c_next in (seal.detail or {}).get("rows") or []:
             out.setdefault(fmt.as_uuid(rid), bytes.fromhex(c_prev))
     return out
@@ -1322,11 +1169,7 @@ def seal_hour(w: ChainWriter, start: datetime, now: datetime, open_since: Option
 
 def _late_candidates(view: View, now: datetime) -> List[HourEntry]:
     """Hours whose root seal was written within the last 6 hours, and the hours inside such a run."""
-    out = []
-    for e in list(view.hours.values()) + list(view.runs):
-        if now - e.root.sealed_at <= LATE_WINDOW:
-            out.append(e)
-    return out
+    return view.recent_units(now - LATE_WINDOW)
 
 
 def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) -> Optional[Seal]:
@@ -1334,13 +1177,11 @@ def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) 
     unchanged. None when nothing arrived or something else changed (the verifier reports that)."""
     from app.core.models import AuditLog as A
     db, view = w.db, w.st.view
-    root = entry.root if entry.start == hour else entry.roots[0]
-    own = view.hours.get(hour)
-    if own is not None:
-        root = own.root
+    own = view.own_entry(hour)
     count = int(db.query(func.count()).select_from(A).filter(A.timestamp >= hour, A.timestamp < hour + HOUR).scalar() or 0)
-    if count <= root.count:
+    if count <= view.entry_for(hour).root.count:
         return None
+    root = hour_root(db, view, hour)
     wr = working_row(db, hour)
     # The rows the hour's root seal holds, by its working data: a row it lists is never taken for one added, and
     # a list changed in the database is caught by the rows it then gives, which must still give the root.

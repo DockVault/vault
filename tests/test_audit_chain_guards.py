@@ -132,9 +132,14 @@ def _sealed_hours(env):
     assert env.st.view.newest_hour_end is not None
 
 
+def _root(env, hour):
+    """The hour's newest root seal, with its roots read again through the view's links."""
+    with env.session() as db:
+        return ai.hour_root(db, env.st.view, hour)
+
+
 def _hour_entry(env, hour):
-    own = env.st.view.hours.get(hour)
-    root = own.root
+    root = _root(env, hour)
     return [fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(), root.root_c.hex(),
             root.ids_digest.hex()]
 
@@ -171,7 +176,7 @@ def test_a_late_seal_that_does_not_follow_its_hours_root_is_refused_and_unjustif
     env.row(T0 - timedelta(hours=3, minutes=10))
     env.run_until_sealed()
     hour = ai.hour_floor(T0 - timedelta(hours=3, minutes=10))
-    root = env.st.view.hours[hour].root
+    root = _root(env, hour)
     _forge(env, "late", {"hour": fmt.hour_text(hour), "prev_seq": root.seq - 1, "added": [], "by": "sealer"},
            period_start=hour, period_end=hour + ai.HOUR, root_s=root.root_s, root_c=root.root_c,
            ids_digest=root.ids_digest, row_count=root.count)

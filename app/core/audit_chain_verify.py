@@ -199,7 +199,7 @@ def policy_problem(view, seal) -> Optional[str]:
         if cause == "database":
             day = seal.sealed_at.date()
             for pseq, pd in view.policies:
-                if pd.get("cause") == "database" and view.sealed_at[pseq - 1].date() == day:
+                if pd.get("cause") == "database" and view.at(pseq).date() == day:
                     return "a second database seal in one day"
         return None
     if cause == "applies":
@@ -218,7 +218,7 @@ def policy_problem(view, seal) -> Optional[str]:
             not_before = fmt.parse_time_text(asked.get("not_before"))
         except (TypeError, ValueError):
             return "its request has no not_before"
-        if seal.sealed_at < not_before + pol.gaps_after(view.sealed_at, req, seal.sealed_at):
+        if seal.sealed_at < not_before + pol.gaps_after(view.times, req, seal.sealed_at):
             return "an applies seal before its request's delay has run"
         ns = pol.settings_from_inputs(inputs)
         from app.core.audit_chain_policy_seals import setting_fields
@@ -281,7 +281,7 @@ def other_problem(view, seal) -> Optional[str]:
         entry = view.entry_for(hour)
         if entry is None:
             return "a late seal for an hour not sealed"
-        prev = entry.roots[-1] if entry.start == hour else entry.roots[0]
+        prev = entry.root
         if d.get("prev_seq") != prev.seq:
             return "a late seal that does not follow its hour's root seal"
         if d.get("by") != "host" and seal.sealed_at - prev.sealed_at > _ai().LATE_WINDOW:
@@ -300,7 +300,7 @@ def other_problem(view, seal) -> Optional[str]:
             entry = view.entry_for(hour)
             if entry is None:
                 return f"a {seal.kind} of an hour not sealed"
-            prev = (view.hours.get(hour) or entry).roots[-1] if view.hours.get(hour) else entry.roots[0]
+            prev = entry.root
             if h[1] != prev.seq:
                 return f"a {seal.kind} seal whose hour does not follow its root seal"
             if seal.kind == "rewrite" and (bytes.fromhex(h[4]) != prev.root_s or bytes.fromhex(h[6]) != prev.ids_digest):
@@ -325,7 +325,7 @@ def other_problem(view, seal) -> Optional[str]:
         except (TypeError, ValueError):
             return "an erase seal whose request has no not_before"
         first = view.erase_through.get(req_seq)
-        if first is None and seal.sealed_at < not_before + pol.gaps_after(view.sealed_at, req_seq, seal.sealed_at):
+        if first is None and seal.sealed_at < not_before + pol.gaps_after(view.times, req_seq, seal.sealed_at):
             return "an erase before its request's delay has run"
         if first is not None and d.get("through") != first:
             return "an erase seal whose scope is not its run's"
@@ -420,7 +420,7 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
     now = now or ai.utcnow()
     report = Report()
     held = held or {}
-    view = ai.View()
+    view = ai.View(keep_roots=True)
     generation = int((record or {}).get("generation") or 1)
     view.reset(generation, int((record or {}).get("discards") or 0))
     rec_seq = int(record["seq"]) if record and record.get("seq") else None
@@ -447,7 +447,7 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
                        seal.seq)
         if (seal.seq == 1) != (seal.kind == "genesis"):
             report.add(FAILURE, "unjustified", f"seal {seal.seq} is {seal.kind}; only seal 1 is genesis", seal.seq)
-        if view.sealed_at and seal.sealed_at < view.sealed_at[-1] - tol:
+        if view.position and seal.sealed_at < view.newest_at() - tol:
             sev = FAILURE if rec_seq is not None and seal.seq > rec_seq and seal.seq not in after else WARNING
             kind = "after-record-invalid" if sev == FAILURE else "sealed-at-backwards"
             report.add(sev, kind, f"seal {seal.seq}'s sealed_at steps back more than five minutes", seal.seq)
@@ -506,8 +506,8 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
     report.seals = view.position
     if view.position:
         report.head = fmt.head(view.position, view.link_at(view.position))
-        report.head_at = fmt.time_text(view.sealed_at[-1])
-        report.key_id = view.key_ids[-1]
+        report.head_at = fmt.time_text(view.newest_at())
+        report.key_id = view.key_at(view.position)
     if rec_seq is not None and view.position < rec_seq:
         report.add(FAILURE, "head-record-mismatch",
                    f"the database's chain ends at seal {view.position}, before the recorded head {rec_seq}")
@@ -606,8 +606,12 @@ def _erase_entries(db, view, entry):
 def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
     """Steps 5-7 for one hour: rebuild its rows into both roots and compare with its newest root seal."""
     ai = _ai()
-    own = view.hours.get(hour)
-    root = own.root if own is not None else entry.roots[0]
+    own = view.own_entry(hour)
+    try:
+        root = ai.hour_root(db, view, hour)
+    except ai.ChainStopped as stop:
+        report.add(FAILURE, "link-broken", str(stop), stop.seq, fmt.hour_text(hour))
+        return
     wr = ai.working_row(db, hour)
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
     erased = _erase_entries(db, view, own) if own is not None and own.erases else {}
@@ -662,24 +666,23 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
 
 def _rows(db, view, report: Report, from_hour, to_hour) -> None:
     ai = _ai()
-    entries = list(view.hours.values())
-    for entry in entries:
-        if (from_hour and entry.start < from_hour) or (to_hour and entry.start >= to_hour):
+    for hour in list(view.single_hours()):
+        if (from_hour and hour < from_hour) or (to_hour and hour >= to_hour):
             continue
         report.hours_checked += 1
-        check_hour(db, view, entry, entry.start, report)
+        check_hour(db, view, view.entry_for(hour), hour, report)
     from app.core.models import AuditLog as A
-    for run in view.runs:
-        start = max(run.start, from_hour) if from_hour else run.start
-        end = min(run.end, to_hour) if to_hour else run.end
+    for run_start, run_end, run_seq in list(view.runs()):
+        start = max(run_start, from_hour) if from_hour else run_start
+        end = min(run_end, to_hour) if to_hour else run_end
         if start >= end:
             continue
         times = [r[0] for r in db.query(A.timestamp).filter(A.timestamp >= start, A.timestamp < end).all()]
         for hour in sorted({ai.hour_floor(t) for t in times}):
-            if hour in view.hours:
+            if view.has_own(hour):
                 continue
             report.add(FAILURE, "rows-added", f"rows in {fmt.hour_text(hour)}, an hour sealed empty",
-                       run.roots[0].seq, fmt.hour_text(hour))
+                       run_seq, fmt.hour_text(hour))
     check_undated(db, view, report)
 
 
@@ -776,7 +779,7 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
                         from_hour=ai.hour_floor(now) - timedelta(days=7), now=now,
                         key_shared=st.current_key().source == "encryption")
         rolling_from = (record.get("check") or {}).get("rolling_from")
-        older = sorted(h for h in st.view.hours if h < ai.hour_floor(now) - timedelta(days=7))
+        older = [h for h in st.view.single_hours() if h < ai.hour_floor(now) - timedelta(days=7)]
         if older:
             per_day = max(1, len(older) // ROLLING_DAYS + 1)
             start = 0
@@ -784,7 +787,7 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
                 start = bisect_hours(older, fmt.parse_time_text(rolling_from))
             chunk = older[start:start + per_day] or older[:per_day]
             for hour in chunk:
-                check_hour(db, st.view, st.view.hours[hour], hour, report)
+                check_hour(db, st.view, st.view.entry_for(hour), hour, report)
             next_from = chunk[-1] + ai.HOUR if chunk else None
         else:
             next_from = None

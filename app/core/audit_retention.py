@@ -281,10 +281,7 @@ def sealed_bytes(hour: datetime) -> int:
     not sealed yet: what the size cap may count for it."""
     from app.core import audit_integrity
     view = audit_integrity.state().view
-    entry = view.entry_for(hour)
-    if entry is None:
-        return 0
-    own = view.hours.get(hour)
+    own = view.own_entry(hour)
     return int(own.root.bytes) if own is not None else 0
 
 

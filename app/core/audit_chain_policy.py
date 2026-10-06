@@ -228,31 +228,37 @@ def value_of(state: dict, key: str):
 
 
 GAP = timedelta(hours=12)
+_GAP_US = 12 * 3600 * 1000000
 
 
-def gaps_after(sealed_at: list, seq: int, then: Optional[datetime] = None) -> timedelta:
-    """The length of every gap of more than 12 hours in sealed_at between seal ``seq`` and the newest seal,
-    and between the newest and ``then`` (the time of a seal about to be written, or now): the time sealing
-    did not run, which no delay counts."""
-    total = timedelta()
-    for i in range(seq, len(sealed_at)):
-        step = sealed_at[i] - sealed_at[i - 1]
-        if step > GAP:
+def _us(t: datetime) -> int:
+    from app.core.audit_chain_view import to_us
+    return to_us(t)
+
+
+def gaps_after(times, seq: int, then: Optional[datetime] = None) -> timedelta:
+    """The length of every gap of more than 12 hours between seal ``seq`` and the newest seal, and between the
+    newest and ``then`` (the time of a seal about to be written, or now): the time sealing did not run, which
+    no delay counts. ``times`` is every seal's sealed_at in microseconds, by seq (the view's ``times``)."""
+    total = 0
+    for i in range(max(seq, 1), len(times)):
+        step = times[i] - times[i - 1]
+        if step > _GAP_US:
             total += step
-    if then is not None and sealed_at and then - sealed_at[-1] > GAP:
-        total += then - sealed_at[-1]
-    return total
+    if then is not None and len(times) and _us(then) - times[-1] > _GAP_US:
+        total += _us(then) - times[-1]
+    return timedelta(microseconds=total)
 
 
-def gaps_since(sealed_at: list, since: datetime, then: Optional[datetime] = None) -> timedelta:
-    """The length of every gap of more than 12 hours in sealed_at that ends after ``since`` (whole, even one
+def gaps_since(times, since: datetime, then: Optional[datetime] = None) -> timedelta:
+    """The length of every gap of more than 12 hours in ``times`` that ends after ``since`` (whole, even one
     that began before it), and of the gap open at ``then``: the time sealing did not run after ``since``."""
-    total = timedelta()
-    for i in range(1, len(sealed_at)):
-        step = sealed_at[i] - sealed_at[i - 1]
-        if step > GAP and sealed_at[i] > since:
+    total = 0
+    since_us = _us(since)
+    for i in range(1, len(times)):
+        step = times[i] - times[i - 1]
+        if step > _GAP_US and times[i] > since_us:
             total += step
-    if then is not None and sealed_at and then - sealed_at[-1] > GAP:
-        total += then - sealed_at[-1]
-    return total
-
+    if then is not None and len(times) and _us(then) - times[-1] > _GAP_US:
+        total += _us(then) - times[-1]
+    return timedelta(microseconds=total)
