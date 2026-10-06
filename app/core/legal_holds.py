@@ -74,6 +74,7 @@ NOTHING_TO_CONFIRM = "nothing_to_confirm"
 CONFIRM_TOO_LATE = "confirm_too_late"
 INDEPENDENT_ADMIN = "independent_admin"
 NOTHING_TO_RELEASE = "nothing_to_release"
+NO_REASON = "no_reason"
 NOTHING_TO_REVIEW = "nothing_to_review"
 NOTHING_TO_UNDO = "nothing_to_undo"
 UNDO_TOO_LATE = "undo_too_late"
@@ -100,6 +101,7 @@ TEXTS = {
     INDEPENDENT_ADMIN: ("an independent administrator can confirm this hold, so the server's operator may not: the "
                         "host operator has no account the independence rule could check"),
     NOTHING_TO_RELEASE: "no hold of this case stands",
+    NO_REASON: "say why the hold is released",
     NOTHING_TO_REVIEW: "no hold of this case stands",
     NOTHING_TO_UNDO: "no release of this case can be undone",
     UNDO_TOO_LATE: "the purge after that release has begun: it can no longer be undone",
@@ -656,9 +658,18 @@ def undo_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[s
 
 def undo_release(db, case, *, by, now: Optional[datetime] = None) -> int:
     """Restore the holds of the case's last release, with their confirmation, in the caller's transaction (the
-    caller has checked undo_refusal and the SFTP guard). A hold-only case the release closed opens again."""
+    caller has checked undo_refusal and the SFTP guard). A hold-only case the release closed opens again.
+
+    The vaults' rows are locked FOR UPDATE first, as a placing locks them, and the purge time is read again once
+    they are: the purge leaves a vault so locked for its next pass, and a purge that took a vault first has
+    finished with it by then, so its time has come and the undo is refused (UNDO_TOO_LATE). A hold is never
+    restored over kept rows a purge has already taken."""
     now = now or utcnow()
     holds = last_release(db, case.id)
+    _lock_vaults(db, [h.vault_id for h in holds])
+    at = max(now, utcnow())
+    if any(h.purge_after is None or h.purge_after <= at for h in holds):
+        raise HoldRefused(UNDO_TOO_LATE)
     for hold in holds:
         hold.released_at = hold.released_by = hold.released_by_username = None
         hold.release_reason_enc = hold.purge_after = None
@@ -754,9 +765,16 @@ def purge(session_factory, *, now: Optional[datetime] = None, batch: int = 200,
                 limit_statements(db)
             candidates = [r[0] for r in db.query(HeldFile.vault_id).filter(purgeable_vaults_clause(HeldFile, now))
                           .distinct().limit(batch).all()]
-            # The vaults' rows first, as every deleting path takes them: a hold placed meanwhile waits, or is seen.
+            # The vaults' rows first (FOR KEY SHARE, which no deletion waits for): a vault whose row a placing or an
+            # undo holds FOR UPDATE now is left for the next pass, so nothing is purged from under a hold that is
+            # being placed or restored; one that takes the row after this waits for this transaction.
+            locked = []
             for vid in sorted(candidates, key=str):
-                db.query(Vault.id).filter(Vault.id == vid).with_for_update(key_share=True, skip_locked=True).first()
+                got = (db.query(Vault.id).filter(Vault.id == vid)
+                       .with_for_update(key_share=True, skip_locked=True).first())
+                if got is not None or db.query(Vault.id).filter(Vault.id == vid).first() is None:
+                    locked.append(vid)
+            candidates = locked
             rows = (db.query(HeldFile.id, HeldFile.vault_id, HeldFile.storage_path, HeldFile.kept_reason,
                              HeldFile.kept_at)
                     .filter(HeldFile.vault_id.in_(candidates), purgeable_vaults_clause(HeldFile, now))

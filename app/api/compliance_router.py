@@ -537,11 +537,13 @@ def release_hold(case_id: uuid.UUID, body: Reason, request: Request,
     """Release a case's legal hold, with a reason: its auditor, or an independent administrator. What it kept is
     purged after COMPLIANCE_HOLD_PURGE_DELAY_DAYS, unless the release is undone first."""
     from app.core import legal_holds as holds
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail={"reason": holds.NO_REASON, "text": holds.text(holds.NO_REASON)})
     _check_decision(case_id, current_user, db, action="hold_released", refusal=_release_refusal)
     STEP_UP_HOLD_DECIDE(db, current_user, request)
     return _take_decision(case_id, current_user, db, action="hold_released", refusal=_release_refusal,
-                          step=lambda case: holds.release(db, case, by=current_user,
-                                                          reason=body.reason.strip() or "-"))
+                          step=lambda case: holds.release(db, case, by=current_user, reason=reason))
 
 
 @router.post("/compliance/cases/{case_id}/hold/undo-release")

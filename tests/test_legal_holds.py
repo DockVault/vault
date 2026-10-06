@@ -695,6 +695,26 @@ def test_an_independent_administrator_undoes_a_release_before_the_purge(db, peop
     assert holds.undo_refusal(db, case, people.bob, again + timedelta(days=7)) == holds.UNDO_TOO_LATE
 
 
+def test_an_undo_locks_the_vaults_then_reads_the_purge_time_again(db, people, monkeypatch):
+    """The undo takes each vault's row FOR UPDATE, as a placing does (the purge leaves a vault so locked), and
+    reads the purge time once it holds them: an undo checked just before the purge time that gets the lock after
+    it is refused, so no hold is restored over kept rows a purge has taken."""
+    case = _place(db, people.ada, [people.v1])
+    holds.release(db, case, by=people.ada, reason="r", now=NOW)
+    db.commit()
+    purge_at = holds.last_release(db, case.id)[0].purge_after
+    locked = []
+    real = holds._lock_vaults
+    monkeypatch.setattr(holds, "_lock_vaults", lambda db_, ids: locked.append(sorted(map(str, ids))) or real(db_, ids))
+    monkeypatch.setattr(holds, "utcnow", lambda: purge_at)       # the lock came after the purge time
+    just_before = purge_at - timedelta(seconds=1)
+    assert holds.undo_refusal(db, case, people.bob, just_before) is None
+    assert _refused(holds.undo_release, db, case, by=people.bob, now=just_before).reason == holds.UNDO_TOO_LATE
+    assert locked == [[str(people.v1.id)]]
+    db.rollback()
+    assert holds.standing(db, case.id) == []
+
+
 def test_a_lapse_is_not_undone(db, people):
     case = _place(db, people.ada, [people.v1])
     holds.lapse_due(db, NOW + timedelta(days=7))
@@ -857,6 +877,19 @@ def test_a_refused_step_is_recorded_and_asks_for_no_code(db, people, steps):
         cr.place_hold(_body([people.v1]), _request(), people.olga, db)
     assert refused.value.status_code == 403 and _rows(db, "hold_placed")[-1].status == "failure"
     assert steps == [("compliance.hold.place", "ada")]
+
+
+def test_a_release_needs_a_reason_that_is_more_than_spaces(db, people, steps):
+    view = cr.place_hold(_body([people.v1]), _request(), people.ada, db)
+    case_id = uuid.UUID(view["id"])
+    with pytest.raises(HTTPException) as refused:
+        cr.release_hold(case_id, cr.Reason(reason="   "), _request(), people.ada, db)
+    assert refused.value.status_code == 422 and refused.value.detail["reason"] == holds.NO_REASON
+    assert holds.standing(db, case_id) and steps == [("compliance.hold.place", "ada")]
+    view = cr.release_hold(case_id, cr.Reason(reason="  The claim was withdrawn. "), _request(), people.ada, db)
+    (row,) = db.query(m.LegalHoldVault).all()
+    assert open_case_field(case_id, row.release_reason_enc, "release_reason", item_id=row.vault_id) == \
+        "The claim was withdrawn."
 
 
 def test_an_auditor_counts_only_what_their_own_hold_kept(db, people, steps, monkeypatch):

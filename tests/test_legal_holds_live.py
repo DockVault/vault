@@ -476,3 +476,44 @@ def test_an_auditor_whose_right_was_revoked_no_longer_releases_the_hold_alone(ad
         admin.delete_user(uma["id"])
 
 
+_PURGE_LEAVES_A_LOCKED_VAULT = """
+import uuid
+from sqlalchemy import text
+from app.core import legal_holds
+from app.core.database import SessionLocal
+
+def left():
+    with SessionLocal() as s:
+        return s.execute(text("SELECT count(*) FROM held_files WHERE vault_id = :v"), {"v": VAULT_ID}).scalar()
+
+holder = SessionLocal()
+# As a placing or an undo holds it while it writes a hold.
+holder.execute(text("SELECT id FROM vaults WHERE id = :v FOR UPDATE"), {"v": VAULT_ID})
+legal_holds.purge(SessionLocal)
+while_held = left()
+holder.rollback()
+holder.close()
+legal_holds.purge(SessionLocal)
+print("LEFT=%d|%d" % (while_held, left()))
+"""
+
+
+def test_the_purge_leaves_a_vault_whose_row_a_placing_or_an_undo_holds_for_its_next_pass(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    f = _upload(admin, vid, "kept.txt", b"kept until the purge")
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    assert admin.post(f"/vaults/{vid}/files/{f}/delete").status_code == 200
+    assert _kept(f).startswith("deleted|") and _blob_exists(f)
+    path = psql(f"SELECT storage_path FROM held_files WHERE id = '{f}'")
+    r = _decide(admins["bob"], case_id, "release", {"reason": "the matter ended"})
+    assert r.status_code == 200, r.text
+    psql(f"UPDATE legal_hold_vaults SET purge_after = (now() AT TIME ZONE 'utc') - interval '1 minute' "
+         f"WHERE case_id = '{case_id}'")
+    out = in_api_container(f"VAULT_ID = '{vid}'\n" + _PURGE_LEAVES_A_LOCKED_VAULT)
+    line = [ln for ln in out.stdout.splitlines() if ln.startswith("LEFT=")][0]
+    assert line == "LEFT=1|0", (line, out.stderr[-1500:])
+    assert subprocess.run(["docker", "exec", API, "test", "-e", f"storage/{path}"], timeout=30).returncode != 0
