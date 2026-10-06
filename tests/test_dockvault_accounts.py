@@ -238,3 +238,66 @@ def test_the_user_managers_listing_says_when_there_is_nobody(app, monkeypatch, c
     monkeypatch.setattr(app, "_run_account_tool", _Tool({"user-managers": {"ok": True, "accounts": []}}))
     app.accounts(_args("--action", "user-managers", "--non-interactive"))
     assert "Only administrators may view or manage users." in capsys.readouterr().out
+
+
+# --- every menu entry reaches the account tool with its own arguments ---------------------------------------
+# What each entry must send to the tool in the container, given what a run names: by `--action` with its
+# options, or by its number in the menu with the answers to its questions. Every entry of ACCOUNT_ACTIONS needs
+# one here, so an entry added to the menu is checked before it ships.
+NAMED = ["--username", "alice", "--confirm-username", "alice"]
+EXPECTED_CALLS = {
+    "reset-password": (NAMED, ["alice", "alice"],
+                       [["lookup", "--username", "alice"], ["reset-password", *NAMED]]),
+    "reset-second-factor": (NAMED, ["alice", "alice"],
+                            [["lookup", "--username", "alice"], ["reset-second-factor", *NAMED]]),
+    "unlock": (NAMED, ["alice", "alice"], [["lookup", "--username", "alice"], ["unlock", *NAMED]]),
+    "approve": (["--request-id", "r1", "--confirm-username", "alice"], ["r1", "alice"],
+                [["approve", "--request-id", "r1", "--confirm-username", "alice"]]),
+    "list": ([], [], [["list"]]),
+    "user-managers": ([], [], [["user-managers"]]),
+    "regranted-defaults": ([], [], [["regranted-defaults"]]),
+}
+ANSWERS = {
+    "lookup": ACCOUNT,
+    "reset-password": {"ok": True, "account": "alice", "secret": SECRET, "secret_kind": "reset_link",
+                       "expires_in_minutes": 5},
+    "reset-second-factor": {"ok": True, "account": "alice", "had_second_factor": True},
+    "unlock": {"ok": True, "account": "alice", "was_locked": True, "sign_in_locks_cleared": 2},
+    "approve": {"ok": True, "approved": {"label": "Password reset link", "target_username": "alice",
+                                         "requested_by": "bob"}},
+    "list": {"ok": True, "requests": []},
+    "user-managers": {"ok": True, "accounts": []},
+    "regranted-defaults": {"ok": True, "permissions": []},
+}
+MENU_KEYS = [k for k, _ in dv.ACCOUNT_ACTIONS]
+
+
+def test_every_menu_entry_has_its_expected_calls_and_is_an_action_of_the_tool():
+    from app.core import host_operator
+    assert sorted(EXPECTED_CALLS) == sorted(MENU_KEYS), "say what each menu entry must send to the account tool"
+    assert len(set(MENU_KEYS)) == len(MENU_KEYS)
+    for key in MENU_KEYS:
+        assert key in host_operator.ACTIONS, key
+        for call in EXPECTED_CALLS[key][2]:
+            host_operator.build_parser().parse_args(call)     # the tool in the container accepts it
+
+
+@pytest.mark.parametrize("action", MENU_KEYS)
+def test_each_entry_by_its_action_sends_its_arguments(app, monkeypatch, action):
+    options, _typed, calls = EXPECTED_CALLS[action]
+    tool = _Tool(ANSWERS)
+    monkeypatch.setattr(app, "_run_account_tool", tool)
+    app.accounts(_args("--action", action, *options, "--non-interactive"))
+    assert tool.calls == calls
+
+
+@pytest.mark.parametrize("number, action", list(enumerate(MENU_KEYS, 1)))
+def test_each_entry_by_its_number_in_the_menu_sends_its_arguments(app, monkeypatch, number, action):
+    _options, typed, calls = EXPECTED_CALLS[action]
+    tool = _Tool(ANSWERS)
+    monkeypatch.setattr(app, "_run_account_tool", tool)
+    answers = iter([str(number), *typed])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
+    app.accounts(None)
+    assert tool.calls == calls
+    assert next(answers, None) is None, "every answer was asked for"
