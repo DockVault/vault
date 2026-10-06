@@ -3859,11 +3859,10 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     # the keys only .env sets have none: a copy saved here would never be read, and would look as if it
     # had changed something. Refused whatever the key's case.
     from app.core import settings_registry as _registry
-    _refused = _registry.refused_settings_keys()
     for _key in payload:
-        if isinstance(_key, str) and _key.lower() in _refused:
-            raise HTTPException(status_code=400,
-                                detail=f"{_key.lower()} is not saved here: it is a managed setting")
+        _why = _registry.settings_refusal(_key)
+        if _why:
+            raise HTTPException(status_code=400, detail=_why)
 
     # The recording levels keep a table of their own and are saved in Settings -> Activity and records, with
     # the password every time (app/api/recording_levels_router.py): the general settings never hold a copy,
@@ -3891,15 +3890,6 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
                 status_code=400,
                 detail=f"{managed_key} is managed by the deployment environment",
             )
-    # Switches only the host operator may set, in the environment. Nothing reads them from here; the
-    # refusal (whatever the key's case) keeps a settings save from appearing to change one.
-    for env_only_key in ("zk_key_proof_enforce",):
-        if any(isinstance(key, str) and key.lower() == env_only_key for key in payload):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{env_only_key} is managed by the deployment environment",
-            )
-
     # Custom rate-limit overrides (general-API buckets + the login / vault / SFTP throttles) share one
     # uniform bounds check from the registry: an int in [min, max], or the sentinel 0 meaning "clear the
     # override and use the deployment default". An out-of-range / malformed value is refused here, and

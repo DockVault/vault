@@ -23,7 +23,7 @@ deleting the row, so the highest version moves whenever anything changes and a r
 stamp can skip the reload.
 
 ``PUT /settings`` refuses every key the registry holds, and every key in ENV_ONLY_KEYS, so the general
-settings store cannot hold a second copy of them (refused_settings_keys).
+settings store cannot hold a second copy of them (refused_settings_keys, settings_refusal).
 
 check_contract() lists what makes the specs impossible to honour with this deployment's .env: a floor above
 a ceiling, a value of the wrong kind or out of bounds. start() refuses to start the process while there is
@@ -78,8 +78,10 @@ SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setti
                                  "app.core.audit_retention", "app.core.security_records",
                                  "app.core.audit_privacy")
 
-# Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
-ENV_ONLY_KEYS: frozenset[str] = frozenset()
+# Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too (settings_refusal),
+# so a settings save can never look as if it had changed one: nothing reads them from the settings store.
+#   ZK_KEY_PROOF_ENFORCE: whether a key change to a zero-knowledge vault must carry a key proof.
+ENV_ONLY_KEYS: frozenset[str] = frozenset({"ZK_KEY_PROOF_ENFORCE"})
 
 REFRESH_SECONDS = 5.0
 # A bound on each read of the table, so a refresh can never hang on it.
@@ -223,6 +225,19 @@ def refused_settings_keys() -> frozenset[str]:
     """The keys PUT /settings refuses, whatever their case: every registered key and ENV_ONLY_KEYS."""
     _load_spec_modules()
     return frozenset(_SPECS) | frozenset(k.lower() for k in ENV_ONLY_KEYS)
+
+
+def settings_refusal(key) -> Optional[str]:
+    """Why PUT /settings refuses ``key``, whatever its case, or None when it takes it. A key only .env sets
+    is managed by the deployment environment; a registered key is a managed setting, saved by its own route."""
+    if not isinstance(key, str):
+        return None
+    name = key.lower()
+    if name in {k.lower() for k in ENV_ONLY_KEYS}:
+        return f"{name} is managed by the deployment environment"
+    if name in refused_settings_keys():
+        return f"{name} is not saved here: it is a managed setting"
+    return None
 
 
 # --------------------------------------------------------------------------- values
