@@ -315,6 +315,11 @@ def test_a_change_to_another_account_or_by_the_holder_suspends_nothing(db, held,
     db.commit()
     assert _status(db, held.grant) == "active" and world.told == []
     assert db.get(AuditorGrant, held.grant.id).credential_changers == []
+    # A key the holder added to their own account is theirs.
+    db.add(UserSSHKey(user_id=held.uma.id, name="mine", key_type="ssh-ed25519", public_key="ssh-ed25519 CCCC",
+                      fingerprint="SHA256:z", created_by=held.uma.id, created_by_name="uma"))
+    db.commit()
+    assert _live(db, held.uma) is None
 
 
 def test_whoever_changes_the_holders_sign_in_details_joins_the_grants_changers(db, held):
@@ -345,6 +350,36 @@ def test_changes_to_a_proposal_join_its_changers_and_suspend_nothing(db, setting
     grant = db.get(AuditorGrant, grant.id)
     assert grant.status == "proposed" and [c["name"] for c in grant.credential_changers] == ["bob"]
     assert rights.approver_refusal(db, grant, bob) is not None, "the changer may not approve it"
+
+
+def test_a_factor_reset_leaves_a_proposal_to_its_approval(db, settings, world, monkeypatch):
+    monkeypatch.setattr(api, "_revoke_sessions", lambda db, **kw: 0)
+    ada, uma = _user(db, "ada", RoleEnum.ADMIN), _user(db, "uma")
+    grant = rights.propose(db, uma, proposer=ada)
+    db.commit()
+    api._apply_credential_change(db, cc.SECOND_FACTOR, uma, {}, actor_id=ada.id, actor_name="ada")
+    db.commit()
+    assert _status(db, grant) == "proposed", "the approval finds no authenticator and refuses"
+    assert rights.preconditions(db, uma) == [rights.NO_TOTP]
+
+
+def test_the_periodic_job_also_writes_what_time_did(db, held, settings):
+    stale = rights.propose(db, _user(db, "oli"), proposer=held.ada, now=rights.utcnow() - timedelta(days=8))
+    held.grant.expires_at = rights.utcnow() - timedelta(seconds=1)
+    db.commit()
+    assert rights.settle(db) == 2
+    db.commit()
+    assert _status(db, stale) == "lapsed" and _status(db, held.grant) == "expired"
+
+
+def test_the_pruners_job_writes_what_the_hooks_missed(db, held, no_hooks):
+    from app.core import retention
+    held.uma.is_active = False          # deactivated where no hook ran
+    db.commit()
+    p = retention.Pass(sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False))
+    retention.settle_auditor_grants(p)
+    assert _status(db, held.grant) == "suspended"
+    assert db.get(AuditorGrant, held.grant.id).suspend_reason == rights.INACTIVE
 
 
 def test_a_proposer_who_loses_standing_has_their_proposals_withdrawn(db, settings, world):
