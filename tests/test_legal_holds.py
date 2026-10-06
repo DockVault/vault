@@ -341,6 +341,35 @@ def test_who_is_not_independent_of_the_placer_cannot_confirm(db, people, who, re
     assert holds.confirm_refusal(db, case, person, NOW) == reason
 
 
+def test_an_administrator_whose_password_another_set_decides_nothing(db, people):
+    case = _place(db, people.ada, [people.v1])
+    holds.release(db, case, by=people.ada, reason="r", now=NOW + timedelta(hours=1))
+    db.commit()
+    case2 = _place(db, people.ada, [people.v2], now=NOW + timedelta(hours=2))
+    people.bob.password_set_by = people.ada.id
+    people.bob.password_set_by_other_at = NOW
+    db.commit()
+    at = NOW + timedelta(hours=3)
+    assert holds.confirm_refusal(db, case2, people.bob, at) == ind.PASSWORD_NOT_OWN
+    assert holds.release_refusal(db, case2, people.bob, at) == ind.PASSWORD_NOT_OWN
+    assert holds.review_refusal(db, case2, people.bob, at) == ind.PASSWORD_NOT_OWN
+    assert holds.undo_refusal(db, case, people.bob, at) == ind.PASSWORD_NOT_OWN
+
+
+def test_an_administrator_who_changed_the_starters_sign_in_details_decides_nothing(db, people):
+    db.add(m.CredentialChange(target_user_id=people.ada.id, kind="second_factor", status="made",
+                              requested_by_id=people.bob.id, requested_by_name="bob",
+                              requested_at=NOW - timedelta(hours=2), applied_at=NOW - timedelta(hours=2)))
+    db.commit()
+    case = _place(db, people.ada, [people.v1])
+    at = NOW + timedelta(hours=1)
+    assert holds.confirm_refusal(db, case, people.bob, at) == ind.CHANGED_ACCOUNT
+    assert holds.release_refusal(db, case, people.bob, at) == ind.CHANGED_ACCOUNT
+    assert holds.review_refusal(db, case, people.bob, at) == ind.CHANGED_ACCOUNT
+    carl = _user(db, "carl", m.RoleEnum.ADMIN)
+    assert holds.confirm_refusal(db, case, carl, at) is None
+
+
 def test_an_administrator_who_cannot_act_or_an_ordinary_user_decides_nothing(db, people):
     case = _place(db, people.ada, [people.v1])
     gone = _user(db, "gina", m.RoleEnum.ADMIN)
@@ -459,6 +488,8 @@ def test_an_unconfirmed_hold_lapses_at_its_deadline_and_follows_the_release_path
     assert case.records_kept_until == at + timedelta(days=cs.current(cs.RECORD_MIN_DAYS))
     assert _rows(db, "hold_lapsed")[0].case_id == case.id
     assert told[-1]["title"] == "Legal hold lapsed"
+    titles = [n.title for n in db.query(m.Notification).filter(m.Notification.user_id == people.olga.id)]
+    assert titles == ["Legal hold on your vaults", "Legal hold lapsed"], "the owner is told of the lapse"
 
 
 def test_a_confirmed_hold_never_lapses(db, people):
@@ -683,6 +714,7 @@ def test_an_independent_administrator_undoes_a_release_before_the_purge(db, peop
     db.commit()
     (row,) = holds.standing(db, case.id)
     assert row.confirmed_by == people.bob.id and row.purge_after is None and row.release_reason_enc is None
+    assert row.confirmed_at == NOW and row.confirmed_by_username == "bob", "restored with its confirmation"
     assert db.get(m.HeldFile, kept.id).purge_after is None
     db.refresh(case)
     assert case.status == "hold_only" and case.closed_at is None and case.records_kept_until is None
@@ -752,6 +784,27 @@ def test_the_purge_waits_for_every_hold_and_its_delay_then_deletes_records_and_d
     assert ("held_folders", 1) in records and ("held_name_history", 1) in records
     # The hold's own record stays.
     assert db.query(m.LegalHoldVault).count() == 1
+
+
+def test_kept_folders_and_old_names_go_only_with_the_last_kept_file_of_their_vault(db, people):
+    case = _place(db, people.ada, [people.v1])
+    for i in range(3):
+        _keep(db, people.v1, path=f"q{i}")
+    _keep(db, people.v1, folder=True)
+    db.add(m.HeldNameHistory(object_id=uuid.uuid4(), vault_id=people.v1.id, kind="file", name="old.txt"))
+    db.commit()
+    holds.release(db, case, by=people.ada, reason="r", now=NOW)
+    db.commit()
+    db.close = lambda: None
+    passes = iter([True, False])
+    destroyed = []
+    # One batch of two, then out of time: a kept file of the vault is left, so its folders and names stay.
+    assert holds.purge(lambda: db, now=NOW + timedelta(days=8), batch=2, destroy=destroyed.extend,
+                       time_left=lambda: next(passes)) == 2
+    assert db.query(m.HeldFile).count() == 1
+    assert db.query(m.HeldFolder).count() == 1 and db.query(m.HeldNameHistory).count() == 1
+    assert holds.purge(lambda: db, now=NOW + timedelta(days=8), batch=2, destroy=destroyed.extend) == 1
+    assert db.query(m.HeldFolder).count() == 0 and db.query(m.HeldNameHistory).count() == 0
 
 
 def test_a_kept_file_is_not_purged_while_another_hold_stands_on_its_vault(db, people):
@@ -890,6 +943,24 @@ def test_a_release_needs_a_reason_that_is_more_than_spaces(db, people, steps):
     (row,) = db.query(m.LegalHoldVault).all()
     assert open_case_field(case_id, row.release_reason_enc, "release_reason", item_id=row.vault_id) == \
         "The claim was withdrawn."
+
+
+def test_an_auditor_lists_only_the_cases_they_started_and_only_while_their_right_is_in_force(
+        db, people, steps, monkeypatch):
+    uma = _user(db, "uma")
+    state = {"live": True, "why": None}
+    _live_auditor(monkeypatch, uma, state)
+    mine = cr.place_hold(_body([people.v1]), _request(), uma, db)
+    other = cr.place_hold(_body([people.v2]), _request(), people.ada, db)
+    assert [c["id"] for c in cr.list_holds(uma, db)["cases"]] == [mine["id"]]
+    assert sorted(c["id"] for c in cr.list_holds(people.bob, db)["cases"]) == sorted([mine["id"], other["id"]])
+    state.update(live=False, why=auditor_rights.SUSPENDED)
+    with pytest.raises(HTTPException) as refused:
+        cr.list_holds(uma, db)
+    assert refused.value.status_code == 403
+    with pytest.raises(HTTPException) as refused:
+        cr.list_holds(people.olga, db)
+    assert refused.value.status_code == 403
 
 
 def test_an_auditor_counts_only_what_their_own_hold_kept(db, people, steps, monkeypatch):

@@ -180,6 +180,18 @@ def test_the_tables_cannot_be_emptied_while_a_hold_stands(held):
         assert "cannot be emptied" in error, (table, error)
 
 
+def test_nor_while_kept_rows_wait_for_their_purge_once_no_hold_stands(held):
+    vid = held["vault"]
+    psql(f"DELETE FROM files WHERE id = '{held['files'][0]}'")
+    psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE vault_id = '{vid}'")
+    assert psql("SELECT count(*) FROM legal_hold_vaults WHERE released_at IS NULL") == "0", \
+        "no hold may stand anywhere on the stack for this test to mean anything"
+    assert psql(f"SELECT count(*) FROM held_files WHERE vault_id = '{vid}'") == "1"
+    for table in ("files", "folders", "vaults"):
+        error = _sql_error(f"BEGIN; TRUNCATE {table} CASCADE; ROLLBACK;")
+        assert "cannot be emptied" in error, (table, error)
+
+
 def test_a_rename_keeps_the_old_name_which_opens_with_the_objects_id(admin, held):
     f = held["files"][0]
     old = psql(f"SELECT enc_name FROM files WHERE id = '{f}'")
