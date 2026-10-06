@@ -29,6 +29,7 @@ EPOCH = datetime(1970, 1, 1)
 HOUR = timedelta(hours=1)
 _US = timedelta(microseconds=1)
 INT64_MAX = (1 << 63) - 1
+GAP_US = 12 * 3600 * 1000000                       # a gap in the chain's time (app/core/audit_chain_times.py)
 
 KINDS = ("genesis", "policy", "request", "cancel", "hour", "late", "prune", "rewrite", "erase", "archive", "key",
          "ack", "restore")
@@ -107,6 +108,7 @@ class View:
         self._links = bytearray()
         self._at = array("q")
         self._kind = bytearray()
+        self.gap_ends: List[int] = []                  # seqs at which a gap of more than 12 hours ends
         # the hour index: units by start, each with the newest of its root entries
         self._u_start = array("i")
         self._u_end = array("i")
@@ -343,6 +345,8 @@ class View:
         assert seal.seq == self.position + 1, (seal.seq, self.position)
         self._links += link
         at_us = to_us(seal.sealed_at)
+        if self._at and at_us - self._at[-1] > GAP_US:
+            self.gap_ends.append(seal.seq)
         self._at.append(at_us)
         self._kind.append(_CODE.get(seal.kind, _UNKNOWN))
         d = seal.detail if isinstance(seal.detail, dict) else {}

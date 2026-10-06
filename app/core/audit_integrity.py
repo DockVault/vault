@@ -280,6 +280,9 @@ class ChainState:
         self.clock = clock
         self.stopped: Optional[ChainStopped] = None
         self.started = False
+        # When this process started: the head record says which start first accepted each seal another
+        # writer appended (accept-restore acknowledges those of the first start after a restore).
+        self.process_started_at = clock()
         # Seals another writer appended after the head record, accepted into the view and not yet listed in
         # the record: a writer whose own work failed (or whose record write did not happen) leaves them here,
         # and the next record write lists them.
@@ -646,8 +649,16 @@ class ChainWriter:
             problem = face_problem(view, seal, st.clock(), first_acceptance=True)
             if problem:
                 raise ChainStopped("after-record-invalid", f"seal {seal.seq}: {problem}", seal.seq)
+            # The delay honoured when the server first accepted it: a request among them waits that long from
+            # then (plus the gaps after), whatever its own dates say.
+            from app.core import audit_chain_honour as honour
+            try:
+                delay = honour.honoured_delay(view, self.record, st.clock()).days
+            except Exception:  # noqa: BLE001 -- before the first policy seal: the chain's own delay
+                delay = None
             entry = {"generation": view.generation, "seq": seal.seq, "kind": seal.kind, "link": link.hex(),
                      "accepted_at": fmt.time_text(st.clock()), "where": "start" if not st.started else "running",
+                     "process_started_at": fmt.time_text(st.process_started_at), "delay_days": delay,
                      "acknowledged": False, "discarded": False}
             st.pending_after.append(entry)
             if self.record is not None:

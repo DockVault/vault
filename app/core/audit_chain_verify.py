@@ -126,6 +126,23 @@ def _holds_together(state: dict, inputs: dict) -> Optional[str]:
     return None
 
 
+def grace_problem(view, seal) -> Optional[str]:
+    """Why a seal that applies a request, erases or prunes was sealed inside the grace after a restore (a
+    restore seal's grace_until, or a genesis that replaced a lost chain, each plus every gap after it), or
+    None. Judged by the chain's own times, as a check off the server sees them."""
+    from app.core import audit_chain_honour as honour
+    from app.core import audit_chain_times as times
+    terms = honour.grace_terms(view)
+    if not terms:
+        return None
+    tl = times.Timeline(view.times, view.gap_ends)
+    at = times.us(seal.sealed_at)
+    for seq, until in terms:
+        if at < until + tl.after(seq, at):
+            return f"sealed inside the grace after seal {seq} (a restore), which ends at {fmt.time_text(times.dt(until))}"
+    return None
+
+
 def policy_problem(view, seal) -> Optional[str]:
     """Why a policy seal is not justified against the policy seal before it, or None (step 4 above)."""
     d = seal.detail if isinstance(seal.detail, dict) else {}
@@ -220,6 +237,9 @@ def policy_problem(view, seal) -> Optional[str]:
             return "its request has no not_before"
         if seal.sealed_at < not_before + pol.gaps_after(view.times, req, seal.sealed_at):
             return "an applies seal before its request's delay has run"
+        grace = grace_problem(view, seal)
+        if grace:
+            return f"an applies seal {grace}"
         ns = pol.settings_from_inputs(inputs)
         from app.core.audit_chain_policy_seals import setting_fields
         want = {**setting_fields(specs[name], asked.get("new"), ns, inputs, req), "set_by": seq}
@@ -308,6 +328,9 @@ def other_problem(view, seal) -> Optional[str]:
         if len(days) > 1:
             return f"a {seal.kind} seal over more than one day"
         if d.get("reason") != "external":
+            grace = grace_problem(view, seal)
+            if grace:
+                return f"a {seal.kind} seal {grace}"
             p = d.get("policy_seq")
             newest = view.newest_policy()
             if newest is None or p != newest[0]:
@@ -327,6 +350,9 @@ def other_problem(view, seal) -> Optional[str]:
         first = view.erase_through.get(req_seq)
         if first is None and seal.sealed_at < not_before + pol.gaps_after(view.times, req_seq, seal.sealed_at):
             return "an erase before its request's delay has run"
+        grace = grace_problem(view, seal)
+        if grace:
+            return f"an erase seal {grace}"
         if first is not None and d.get("through") != first:
             return "an erase seal whose scope is not its run's"
         if d.get("hour"):

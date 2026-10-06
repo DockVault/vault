@@ -203,8 +203,7 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
         try:
             with chain_seals.change_transaction(db.get_bind()) as w:
                 limit_statements(w.db)
-                change = setting_changes.cancel(w.db, change_id, actor=current_user)
-                chain_seals.seal_cancel(w, change, current_user)
+                change = chain_seals.cancel(w, change_id, current_user)
                 details = {"key": change.key, "old": change.old_value, "new": change.new_value,
                            "requested_by": change.requested_by_name}
                 out = change_dict(change)

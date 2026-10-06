@@ -91,6 +91,7 @@ def acknowledge(engine, st, *, seqs: List[int], failures: bool, expect: str) -> 
             for e in rec.get("after_record") or []:
                 if e.get("generation") == view.generation and int(e.get("seq", 0)) in acked:
                     e["acknowledged"] = True
+                    e.setdefault("acknowledged_at", stamp)
             for table, kind, _f, last in findings:
                 entry = (rec.get(table) or {}).get(kind)
                 if entry is not None and (entry.get("last_seen") or "") <= (last or ""):
