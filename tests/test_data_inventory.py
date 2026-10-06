@@ -64,3 +64,18 @@ def test_the_readme_and_the_security_policy_point_to_it():
     assert "](../docs/data-inventory.md)" in policy
     assert (ROOT / "README.md").parent.joinpath("docs/data-inventory.md").is_file()
     assert (ROOT / ".github").joinpath("../docs/data-inventory.md").resolve().is_file()
+
+
+def test_the_users_row_names_the_columns_added_to_accounts_since_0_33():
+    # Columns a release added to `users` are named in its row by their column names, so an operator can
+    # find them in the database; each name the row gives is a real column of the table.
+    from app.core.models import User
+
+    rows = [line for line in _text().splitlines() if line.startswith("| `users` |")]
+    assert len(rows) == 1
+    named = re.findall(r"`([a-z_]+)`", rows[0].split("|", 2)[2])
+    for column in ("second_factor_reset_at", "permission_defaults_revision", "password_set_by",
+                   "password_set_by_other_at", "privacy_seen_version"):
+        assert column in named, f"the users row does not name {column}"
+    unknown = [n for n in named if n not in User.__table__.c]
+    assert not unknown, f"the users row names columns the table does not have: {unknown}"
