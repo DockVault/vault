@@ -18,6 +18,12 @@ These tests make each order certain rather than hoping for it.
 
 The page clock is installed so the wait for a request that never comes (a minute) can be skipped
 over; it runs at normal speed otherwise.
+
+Chromium only. Run in Firefox, the case where the page gives up hangs until the run's timeout: a stream
+the page errored may end the download there with nothing at all (the comment on the sink's abort() in
+app.js), so Playwright's download.failure() never settles; and the request-first case failed. What this
+file pins is the download as the browser itself records it, which is Chromium's; the page tells the user
+in either browser.
 """
 from __future__ import annotations
 
@@ -30,7 +36,8 @@ from playwright.sync_api import expect
 from conftest import ApiClient, BASE_URL, unique
 from test_ui_e2e import _create_zk_vault_via_ui, _login
 
-pytestmark = pytest.mark.ui
+# Chromium only (see above). pytest-playwright skips the file before any fixture runs under --browser firefox.
+pytestmark = [pytest.mark.ui, pytest.mark.only_browser("chromium")]
 
 # Longer than the page's wait for the browser's request, so its timer is due.
 PAST_THE_CLAIM_WAIT_MS = 61_000
