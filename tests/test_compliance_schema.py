@@ -73,7 +73,7 @@ def test_a_grant_is_bound_to_an_enrollment_and_keeps_its_credential_changers():
     assert not cols["second_factor_enrollment_id"].foreign_keys
     assert set(m.AUDITOR_GRANT_OPEN) == {"proposed", "active", "suspended"}
     assert set(m.AUDITOR_GRANT_STATES) == {"proposed", "active", "suspended", "expired", "revoked", "rejected",
-                                           "lapsed"}
+                                           "lapsed", "ended"}
 
 
 def test_free_text_is_kept_only_in_sealed_columns():

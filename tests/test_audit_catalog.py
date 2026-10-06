@@ -41,6 +41,7 @@ PASS_THROUGH = {
     ("app/sftp/sftp_server.py", "_audit"),
     ("app/services/auth_service.py", "_lock_audit_row"),
     ("app/core/sign_in_lockout.py", "_audit_row"),
+    ("app/core/auditor_rights.py", "_audit"),
 }
 
 # Names built at run time: (file, enclosing function, source of the expression) -> every name it yields.

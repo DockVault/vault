@@ -3107,9 +3107,12 @@ class DataRequirement(Base):
 # is sealed at rest with security.seal_case_field, bound to its row and field; rows carry ids, never names.
 
 # The states of an auditor grant. A grant waiting for its second administrator, one in force and one
-# suspended are open: an account has at most one open grant.
+# suspended are open: an account has at most one open grant. The others are final: expired (its time ran
+# out), revoked (an administrator or the server's operator took it back, or its proposer left), rejected
+# (turned down), lapsed (not approved in time), ended (the second factor it is bound to was reset or removed,
+# or the account was deleted: only a new grant, by two people, gives the right again).
 AUDITOR_GRANT_OPEN = ('proposed', 'active', 'suspended')
-AUDITOR_GRANT_STATES = AUDITOR_GRANT_OPEN + ('expired', 'revoked', 'rejected', 'lapsed')
+AUDITOR_GRANT_STATES = AUDITOR_GRANT_OPEN + ('expired', 'revoked', 'rejected', 'lapsed', 'ended')
 
 
 class AuditorGrant(Base):
@@ -3144,6 +3147,13 @@ class AuditorGrant(Base):
     reject_reason_enc = Column(Text, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     second_factor_enrollment_id = Column(UUID(as_uuid=True), nullable=True)
+    # The account's role when the grant was approved or last reconfirmed: a holder demoted since is suspended.
+    confirmed_role = Column(String(16), nullable=True)
+    # What the independence rule read about the proposal when it was made: the proposer, their lineage (who
+    # made them an administrator, and so on) and who changed the account's sign-in details in the 14 days
+    # before ({"requester", "lineage", "changed"}, ids as text). Demoting or deleting the proposer deletes
+    # their lineage, which the approval must still read.
+    proposal_snapshot = Column(JSON, nullable=True)
     credential_changers = Column(JSON, nullable=False, default=list)
     suspended_at = Column(DateTime, nullable=True)
     suspend_reason = Column(String(64), nullable=True)

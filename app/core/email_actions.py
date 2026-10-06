@@ -183,6 +183,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "auditor_right": {
+        "name": "The auditor right",
+        "subject": "The auditor right on {{vault.name}}",
+        "body_html": (
+            "<h2>The auditor right</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>An auditor can review the activity log and, in a case a second administrator approves, open "
+            "other people's vaults; the owners are told. If you did not expect this, check the Compliance page "
+            "at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "retention_change": {
         "name": "How long records are kept",
         "subject": "A change to how long {{vault.name}} keeps its records",
@@ -229,6 +244,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("ssh_keys_adder_left", "SSH keys an administrator added",
      "Sent to a user when an administrator who added SSH keys to their account is demoted, deactivated, "
      "locked or deleted — names the keys, which still sign in, and links to where they are removed.", SYSTEM),
+    ("auditor_right", "The auditor right",
+     "Sent to every administrator and to the account when the auditor right is proposed, granted, turned down, "
+     "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM),
     ("retention_change", "How long records are kept",
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
