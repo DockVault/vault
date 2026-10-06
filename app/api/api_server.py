@@ -9319,9 +9319,15 @@ async def storage_stats(
     allocated = int(db.query(_f.coalesce(_f.sum(Vault.size_limit), 0)).filter(
         Vault.is_active == True).scalar() or 0)  # noqa: E712
     limit = deployment_storage_limit_bytes(db)
+    # Files a legal hold keeps after their deletion: on this disk, in no vault's counters.
+    from app.core import kept_tables
+    kept = kept_tables.totals(db)
     return {
         "total": total,
         "used": used,
+        "kept_for_cases": kept,
+        # What the vaults' files take on the disk: their counted bytes and the kept ones.
+        "on_disk_bytes": used + kept["bytes"],
         "available": available,
         "allocated_bytes": allocated,
         "limit_bytes": limit,

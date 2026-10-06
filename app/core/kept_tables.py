@@ -393,6 +393,16 @@ def kept_rows(db, rel_paths: Iterable[str]) -> list:
             .filter(HeldFile.storage_path.in_(paths)).all()]
 
 
+def kept_ids(db, file_ids: Iterable) -> set:
+    """The ids, among ``file_ids``, of files a hold kept, as text (in the caller's transaction: what its own
+    deletes kept is there already)."""
+    from app.core.models import HeldFile
+    ids = sorted({uuid.UUID(str(i)) for i in file_ids if i is not None})
+    if not ids or not _readable(db):
+        return set()
+    return {str(r[0]) for r in db.query(HeldFile.id).filter(HeldFile.id.in_(ids)).all()}
+
+
 def vault_keeps(db, vault_id) -> bool:
     """Whether a hold stands on ``vault_id``, or kept rows of it wait for their purge."""
     from app.core.models import HeldFile, HeldFolder, LegalHoldVault
@@ -404,3 +414,15 @@ def vault_keeps(db, vault_id) -> bool:
                                                  LegalHoldVault.released_at.is_(None)),
         db.query(HeldFile.id).filter(HeldFile.vault_id == vid),
         db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
+
+
+def totals(db) -> dict:
+    """What the kept tables hold: {files, folders, bytes}. Kept bytes are on the deployment's disk but in no
+    vault's counters."""
+    from sqlalchemy import func
+    from app.core.models import HeldFile, HeldFolder
+    if not _readable(db):
+        return {"files": 0, "folders": 0, "bytes": 0}
+    files, size = db.query(func.count(HeldFile.id), func.coalesce(func.sum(HeldFile.size_bytes), 0)).one()
+    folders = db.query(func.count(HeldFolder.id)).scalar()
+    return {"files": int(files or 0), "folders": int(folders or 0), "bytes": int(size or 0)}

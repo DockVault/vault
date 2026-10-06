@@ -48,4 +48,32 @@
     }
 
     window.renderFixedStepUps = renderFixedStepUps;
+
+    function sizeText(bytes) {
+        if (typeof window.formatBytes === 'function') return window.formatBytes(bytes || 0);
+        return String(bytes || 0) + ' B';
+    }
+
+    // Settings -> Storage: what legal holds keep after their deletion (GET /storage/stats, kept_for_cases). Those
+    // bytes are on the disk but in no vault's size, so the line says so beside the totals.
+    function renderKeptForCases(stats) {
+        const anchor = document.getElementById('storage-stat-allocated');
+        if (!anchor) return;
+        let line = document.getElementById('storage-stat-kept');
+        const kept = (stats && stats.kept_for_cases) || null;
+        if (!kept || !(kept.files || kept.folders)) {
+            if (line) line.remove();
+            return;
+        }
+        if (!line) {
+            line = el('small', 'text-secondary');
+            line.id = 'storage-stat-kept';
+            line.style.display = 'block';
+            anchor.insertAdjacentElement('afterend', line);
+        }
+        line.textContent = 'Kept for cases: ' + kept.files + (kept.files === 1 ? ' file, ' : ' files, ')
+            + sizeText(kept.bytes) + ' (deleted under a legal hold; on this disk, in no vault\'s size)';
+    }
+
+    window.renderKeptForCases = renderKeptForCases;
 })();

@@ -2472,14 +2472,19 @@ class VaultService:
             kept_tables.mark_deletes(self.db, "expired")
             self.db.query(File).filter(File.id.in_([r.id for r in rows])).delete(
                 synchronize_session=False)
+            # Which of them a legal hold kept: the database's trigger copied them into held_files in
+            # this transaction (app/core/kept_tables.py). For users they are gone all the same.
+            held = kept_tables.kept_ids(self.db, [r.id for r in rows])
             audit = AuditLogger(self.db)
             for r in rows:
                 # Built, not logged: log_action commits on its own, and the audit rows and the
                 # deletions must commit together or not at all. The row carries no name.
+                details = {'vault_id': str(r.vault_id), 'expires_at': r.expires_at.isoformat()}
+                if str(r.id) in held:
+                    details['held_by_case'] = True
                 self.db.add(audit.build_row(
                     action='file_expired', status='success', resource_type='file',
-                    resource_id=str(r.id), timestamp=now,
-                    details={'vault_id': str(r.vault_id), 'expires_at': r.expires_at.isoformat()},
+                    resource_id=str(r.id), timestamp=now, details=details,
                 ))
             self.db.commit()
         except Exception:

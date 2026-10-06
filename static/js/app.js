@@ -9487,6 +9487,8 @@ async function loadStorageStats() {
                 `${formatBytes(stats.allocated_bytes || 0)} allocated across ${stats.vault_count || 0} vault(s)`
                 + (stats.limit_bytes ? ` · limit ${formatBytes(stats.limit_bytes)}` : '');
         }
+        // What legal holds keep after deletion (static/js/compliance.js).
+        if (typeof window.renderKeptForCases === 'function') window.renderKeptForCases(stats);
     } catch (error) {
         console.log('Storage stats endpoint not available');
         // Show defaults
