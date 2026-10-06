@@ -24,16 +24,19 @@
  */
 'use strict';
 
-/** Slots handed out but not yet fetched, and slots currently streaming. */
+/**
+ * Slots handed out whose download the browser has not asked for yet. The browser's request takes
+ * the slot out of here, so each slot serves exactly one request.
+ */
 const PENDING = new Map();
 
 /** The path the page navigates to. Deliberately unlikely to collide with a real route. */
 const SINK_PREFIX = '/__dv_sink__/';
 
 /**
- * A slot expires if the page never navigates to it. Without this, a page that asks for a download
+ * A slot expires if the browser never asks for it. Without this, a page that asks for a download
  * and then errors before triggering it leaks the slot — and with it the port, for as long as the
- * worker lives.
+ * worker lives. A slot the page has finished writing is kept this long after it finished.
  */
 const SLOT_TTL_MS = 60_000;
 
@@ -57,6 +60,18 @@ self.addEventListener('message', event => {
         ? String(data.mime) : 'application/octet-stream';
 
     let controllerRef = null;
+    let slot = null;
+
+    // The page can finish before the browser has asked for the download: a small file is written
+    // and closed at once, while the hidden frame's request for the slot is still on its way. A closed
+    // stream keeps every byte written to it, and an errored one still fails the download it is
+    // handed to, so a finished slot stays until that request takes it, and goes when it expires if
+    // the request never comes.
+    const keepUntilAsked = () => {
+        slot.at = Date.now();
+        setTimeout(() => { if (PENDING.get(id) === slot) PENDING.delete(id); }, SLOT_TTL_MS);
+    };
+
     const stream = new ReadableStream({
         start(controller) { controllerRef = controller; },
         cancel() {
@@ -76,22 +91,26 @@ self.addEventListener('message', event => {
             } else if (message.type === 'done') {
                 controllerRef.close();
                 controllerRef = null;
-                PENDING.delete(id);
+                keepUntilAsked();
             } else if (message.type === 'abort') {
                 // The page failed in a way it cannot resume from. Erroring the stream is what
                 // makes the browser mark the download failed rather than complete-but-short,
                 // which is the difference between a visible failure and a silently truncated file.
                 controllerRef.error(new Error(message.reason || 'aborted'));
                 controllerRef = null;
-                PENDING.delete(id);
+                keepUntilAsked();
             }
         } catch (_) {
             PENDING.delete(id);
         }
     };
 
-    PENDING.set(id, { stream, name, size, mime, at: Date.now() });
-    port.postMessage({ type: 'dv-sink-ready', url: SINK_PREFIX + id });
+    slot = { stream, name, size, mime, port, at: Date.now() };
+    PENDING.set(id, slot);
+    // `reportsTaken` tells the page this worker says when the browser has asked for the slot, so the
+    // page can tell a download that never started from one that did. A page talking to an older
+    // worker, which never says so, must not wait for it.
+    port.postMessage({ type: 'dv-sink-ready', url: SINK_PREFIX + id, reportsTaken: true });
 });
 
 self.addEventListener('fetch', event => {
@@ -110,12 +129,16 @@ self.addEventListener('fetch', event => {
     }
 
     if (!slot) {
-        // A reload of a finished download, or a slot that expired. 404 rather than a hang: the
-        // browser shows a failed download, which is true, instead of waiting forever on a stream
-        // nobody will ever write to.
+        // A second request for a slot already taken (a reload of the download), or a slot that
+        // expired. 404 rather than a hang: the browser shows a failed download, which is true,
+        // instead of waiting forever on a stream nobody will ever write to.
         event.respondWith(new Response('no such download', { status: 404 }));
         return;
     }
+
+    // A stream can be read once, so this request uses the slot up.
+    PENDING.delete(id);
+    try { slot.port.postMessage({ type: 'dv-sink-taken' }); } catch (_) { /* page gone */ }
 
     const headers = {
         'Content-Type': slot.mime,

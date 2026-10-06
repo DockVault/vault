@@ -393,6 +393,7 @@ def test_the_heartbeat_goes_stale_while_the_accept_loop_is_blocked_and_returns_w
     monkeypatch.setattr(mod.settings, "sftp_host_key_path", str(tmp_path / "host_key"))
     monkeypatch.setattr(mod.settings, "sftp_write_progress_timeout_seconds", 0)
 
+    threads_before = set(threading.enumerate())
     server = threading.Thread(target=mod.start_sftp_server, daemon=True)
     server.start()
     try:
@@ -402,6 +403,9 @@ def test_the_heartbeat_goes_stale_while_the_accept_loop_is_blocked_and_returns_w
         turns = set()
         _until(lambda: (turns.add(live._turned.get("accept-loop")), len(turns) >= 4)[1],
                what="an idle accept loop to keep turning")
+        # The server's heartbeat thread, started before its loop first turned.
+        (beater,) = [t for t in threading.enumerate()
+                     if t.name == "sftp-heartbeat" and t not in threads_before]
         time.sleep(live.SILENT_AFTER_SECONDS + 0.3)
         assert live.fault() is None, "an idle server was called dead"
         idle = len(beats)
@@ -416,7 +420,11 @@ def test_the_heartbeat_goes_stale_while_the_accept_loop_is_blocked_and_returns_w
         client = socket.create_connection(("127.0.0.1", port), timeout=5)
         try:
             assert entered.wait(15), "the connection never reached the loop"
-            _until(lambda: live.fault() == "accept-loop-silent", what="the blocked loop to be noticed")
+            # Noticed by the heartbeat thread itself, not only by a check from here: a turn of that
+            # thread that found the server alive just before the limit can write its beat just after
+            # it. Once one of its turns has found the fault, every later turn finds it too.
+            _until(lambda: live._reported == "accept-loop-silent",
+                   what="the heartbeat thread to notice the blocked loop")
             stopped_at = len(beats)
             time.sleep(0.5)                                   # ten beat intervals
             assert len(beats) == stopped_at, "the heartbeat went on while the accept loop was blocked"
@@ -434,7 +442,10 @@ def test_the_heartbeat_goes_stale_while_the_accept_loop_is_blocked_and_returns_w
         next(iter(handlers.values()))(15, None)
         server.join(15)
     assert not server.is_alive(), "the server did not stop"
-    # 4. A server that has stopped stops beating.
+    # 4. A server that has stopped stops beating: its heartbeat thread ends (a turn under way when
+    #    the server stopped may still write its beat first), and nothing beats after that.
+    beater.join(15)
+    assert not beater.is_alive(), "the heartbeat thread went on after the server stopped"
     final = len(beats)
     time.sleep(0.3)
     assert len(beats) == final

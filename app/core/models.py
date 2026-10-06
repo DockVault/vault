@@ -13,8 +13,21 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
 from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.ext.compiler import compiles
 
 Base = declarative_base()
+
+
+@compiles(UUID, "sqlite")
+def _uuid_on_sqlite(type_, compiler, **kw):
+    """How a UUID column is declared on SQLite, which the tests that run without a stack use.
+
+    SQLite gives a column declared ``UUID`` numeric affinity, so an id whose hex reads as a number
+    (only digits, or digits and a single 'e', such as 1e999...) is stored as that number and read
+    back as one -- 1e999 is the float inf. CHAR gives the column text affinity, which keeps what was
+    written. PostgreSQL, the database a deployment runs on, has a UUID type of its own and is not
+    affected."""
+    return "CHAR(32)"
 
 
 class RoleEnum(PyEnum):
