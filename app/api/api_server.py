@@ -7268,28 +7268,10 @@ async def zk_unsealed_count(
     name — enc_name absent or not a client-sealed 'zk1:' blob — i.e. leftover cleartext metadata
     from before client-side name sealing was enforced on the write paths. A healthy deployment
     reports 0. The read guards already MASK such rows from being served, so this is a re-seal
-    to-do list for owners, not a live leak. Admin-only (fleet-wide across all ZK vaults)."""
-    from app.core.models import Vault, File, Folder
-    from sqlalchemy import or_, not_, and_
-    zk_ids = [r[0] for r in db.query(Vault.id).filter(Vault.type == 'zero_knowledge').all()]
-    if not zk_ids:
-        return {"zk_vaults": 0, "files_unsealed": 0, "folders_unsealed": 0, "vaults_affected": 0}
-
-    def _unsealed(col):
-        # NULL (never sealed) OR present-but-not a sealed blob. A sealed row is v1 (zk1:...) OR
-        # v2 (zk2:..., obj-id-bound) — both are excluded from the "unsealed" count.
-        return or_(col.is_(None), and_(not_(col.like('zk1:%')), not_(col.like('zk2:%'))))
-
-    files_unsealed = db.query(File).filter(File.vault_id.in_(zk_ids), _unsealed(File.enc_name)).count()
-    folders_unsealed = db.query(Folder).filter(Folder.vault_id.in_(zk_ids), _unsealed(Folder.enc_name)).count()
-    affected = {r[0] for r in db.query(File.vault_id).filter(File.vault_id.in_(zk_ids), _unsealed(File.enc_name)).distinct()}
-    affected |= {r[0] for r in db.query(Folder.vault_id).filter(Folder.vault_id.in_(zk_ids), _unsealed(Folder.enc_name)).distinct()}
-    return {
-        "zk_vaults": len(zk_ids),
-        "files_unsealed": files_unsealed,
-        "folders_unsealed": folders_unsealed,
-        "vaults_affected": len(affected),
-    }
+    to-do list for owners, not a live leak. Admin-only (fleet-wide across all ZK vaults). The host
+    command's zk-status action reads the same counts (app/core/zk_unsealed.py)."""
+    from app.core import zk_unsealed
+    return zk_unsealed.counts(db)
 
 
 @app.get("/sftp/host-key")

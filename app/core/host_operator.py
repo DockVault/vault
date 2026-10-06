@@ -11,12 +11,16 @@ network::
     python -m app.core.host_operator approve --request-id <id> --confirm-username alice
     python -m app.core.host_operator user-managers
     python -m app.core.host_operator regranted-defaults
+    python -m app.core.host_operator zk-status
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
 none who can sign in, the server's operator acts here. ``unlock`` clears an account's locks (those
 failed sign-ins armed, and an administrator's), for when no administrator can sign in to do it. Each change is recorded, audited and notified
 exactly as an administrator's would be, under the name ``operator@host``.
+
+``zk-status`` is for a managing operator's tooling: the deployment's zero-knowledge state in counts and
+switches, read without an account or a password and without changing anything (see zk_status).
 
 Safety:
   * every change names the account twice (``--username`` or the request's account, and
@@ -34,9 +38,11 @@ import json
 import secrets
 import string
 import sys
+import types
+import uuid
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
-           "regranted-defaults", "unlock")
+           "regranted-defaults", "unlock", "zk-status")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -195,6 +201,38 @@ def regranted_defaults(db):
     return found
 
 
+# A person in no department: the deployment's rule on new vaults is asked for them. No account has this id.
+_NO_DEPARTMENT = types.SimpleNamespace(id=uuid.UUID(int=0))
+
+
+def zk_status(db, api):
+    """The deployment's zero-knowledge state, the facts a managing operator's tooling used to read by
+    signing in as an administrator (GET /zk-enabled and GET /zk/unsealed), read here without an account:
+
+      * ``zero_knowledge_enabled``: zero-knowledge vaults may be made (the plan, the administrators'
+        setting and the allowed vault types together);
+      * ``must_use_zk``: new vaults must be zero-knowledge (by the plan, or by the administrators'
+        setting) for a person in no department; members of the departments the administrators
+        exempted may still make standard vaults;
+      * ``plan_zero_knowledge``, ``max_zk_vaults`` (-1: no limit) and ``zk_vault_count`` (active ones);
+      * ``zk_vaults``, ``files_unsealed``, ``folders_unsealed`` and ``vaults_affected``
+        (app/core/zk_unsealed.py).
+
+    Counts and switches only: never a name, a key or content. Read-only, so it is not audited."""
+    from app.core import zk_unsealed
+    from app.core.config import settings
+    allowed = "zero_knowledge" in api._allowed_vault_types()
+    state = {
+        "zero_knowledge_enabled": bool(api._zk_enabled(db) and allowed),
+        "must_use_zk": bool(allowed and api._user_must_use_zk(db, _NO_DEPARTMENT)),
+        "plan_zero_knowledge": bool(settings.plan_zero_knowledge),
+        "max_zk_vaults": int(settings.plan_max_zk_vaults),
+        "zk_vault_count": int(api._zk_vault_count(db)),
+    }
+    state.update({k: int(v) for k, v in zk_unsealed.counts(db).items()})
+    return state
+
+
 def _find(db, username):
     from app.core.models import User
     return db.query(User).filter(User.username == username).first()
@@ -268,6 +306,9 @@ def _run(args, api) -> int:
 
         if args.action == "regranted-defaults":
             return _answer({"ok": True, "permissions": regranted_defaults(db)})
+
+        if args.action == "zk-status":
+            return _answer({"ok": True, "zero_knowledge": zk_status(db, api)})
 
         if args.action == "approve":
             if not args.request_id:
