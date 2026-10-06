@@ -1448,18 +1448,18 @@ class VaultService:
         """Securely remove on-disk encrypted blobs by storage_path (relative to the storage
         root), except those a legal hold keeps. Best-effort: a failure here only orphans a blob,
         never the committed DB state."""
-        self._destroy_blobs(rel_paths, failure_event='blob.replace-cleanup.failed')
+        self._destroy_blobs(rel_paths, path='replacement')
 
-    def _destroy_blobs(self, rel_paths, *, fallback: bool = False,
-                       failure_event: str = 'blob.remove.failed') -> List[str]:
+    def _destroy_blobs(self, rel_paths, *, fallback: bool = False, path: str = '') -> List[str]:
         """Destroy committed blobs (storage paths relative to the storage root), after their rows'
         deletion committed: every destruction of a committed blob comes here. A blob a legal hold
         keeps (its row is in held_files, app/core/kept_tables.py) is skipped, which is checked
         before secure_delete and its fallback, and its keeping recorded (held_file_kept). When the
         check itself fails, nothing is destroyed: an orphan blob can be cleaned up later, a kept one
         destroyed cannot be brought back. ``fallback``: when secure_delete fails, overwrite and
-        unlink by hand (delete_file's way); otherwise a blob that will not go is logged as
-        ``failure_event`` and left. Returns the paths kept."""
+        unlink by hand (delete_file's way); otherwise a blob that will not go is logged, under the
+        event code of the ``path`` that destroys it (``replacement``, ``expiry``), and left.
+        Returns the paths kept."""
         paths = [str(p) for p in dict.fromkeys(rel_paths or []) if p]
         if not paths:
             return []
@@ -1489,7 +1489,13 @@ class VaultService:
                 # The blob's relative path is a storage path; the exception carries the
                 # ABSOLUTE one on an OSError. Neither belongs in a log an operator pastes.
                 if not fallback:
-                    safe_event(failure_event, e)
+                    # Literal codes only: an event code is never built from a value.
+                    if path == 'replacement':
+                        safe_event('blob.replace-cleanup.failed', e)
+                    elif path == 'expiry':
+                        safe_event('expired-blob.remove.failed', e)
+                    else:
+                        safe_event('blob.remove.failed', e)
                     continue
                 safe_event('blob.secure-delete.failed-using-fallback', e)
                 try:
@@ -2494,7 +2500,7 @@ class VaultService:
         # Rows are durably gone; now securely destroy the blobs (best-effort -- an orphan blob is
         # recoverable, a dangling row is not), except those a legal hold keeps. secure_delete
         # overwrites in bounded 1 MB chunks (+ fsync), so a large blob cannot spike memory.
-        self._destroy_blobs([r.storage_path for r in rows], failure_event='expired-blob.remove.failed')
+        self._destroy_blobs([r.storage_path for r in rows], path='expiry')
         return [{'file_id': r.id, 'vault_id': r.vault_id} for r in rows]
     
     # ---- Move / Copy (files + folders) --------------------------------------------------------

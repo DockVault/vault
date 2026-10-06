@@ -255,6 +255,26 @@ def test_delete_files_fallback_after_a_secure_delete_failure_never_reaches_a_kep
     assert not (world.root / gone_rel).exists(), "the fallback still destroys a blob no hold keeps"
 
 
+def test_a_blob_that_will_not_go_is_logged_under_its_paths_own_code(world, monkeypatch):
+    import app.services.vault_service as vs
+    logged = []
+    monkeypatch.setattr(vs, "safe_event", lambda code, *a, **k: logged.append(code))
+
+    def failing(path):
+        raise OSError("device busy")
+
+    past = datetime.utcnow() - timedelta(days=2)
+    replaced, swept, plain = world.blob(), world.blob(), world.blob()
+    world.file(swept, expires_at=past)
+    svc = world.service(secure_delete=failing)
+    svc._remove_blobs([replaced])
+    svc.cleanup_expired_files()
+    svc._destroy_blobs([plain])
+    assert logged == ["blob.replace-cleanup.failed", "expired-blob.remove.failed", "blob.remove.failed"]
+    for rel in (replaced, swept, plain):
+        assert (world.root / rel).exists(), "left as an orphan, not retried"
+
+
 def test_a_replacements_old_blob_is_kept_when_a_hold_keeps_it(world):
     kept, gone = world.blob(), world.blob()
     world.keep(kept)
