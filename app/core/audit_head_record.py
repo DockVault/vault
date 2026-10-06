@@ -9,13 +9,24 @@ What it holds:
     generation, discards    raised by a restore the host accepts and by each discard of seals after it;
                             records are ordered by (generation, discards, seq), and a writer never writes a
                             record lower than the one on disk
-    seq, link, key_id       the newest seal the server wrote (its link as the server computed it)
+    seq, link, key_id       the newest seal the server wrote (its link as the server computed it), and its
+    sealed_at               sealed_at (a lost seal written long before the newest row was deleted, not lost)
     newest_hour_end         where the newest hour seal ends
     keys                    the key history: each key that has been in force, with the seqs from and to which
                             it was, per generation; and the key seals the host accepted without a proof
     after_record            seals a writer accepted after the record without having written them, with the
-                            time the server first accepted each and whether the host acknowledged it
-    hours, days, links      hour summaries of the last 30 days, a digest per older day, every 64th link
+                            time the server first accepted each, the delay honoured then, the process start
+                            that accepted it, and whether the host acknowledged it (and when)
+    checkpoints             the newest policy seal (seq, link, state, inputs, cause, and every entry where the
+                            honoured state differs, in its honoured form); each cancel with the seq and link of
+                            the request it cancels; each erase or removal a final seal completed, for every
+                            generation
+    hours                   hour summaries of the last 30 days: the seal that last set an hour's roots, its
+                            count, roots, ids digest and salt; and, while sealing is stopped, the hours that
+                            closed, computed from their rows and marked unsealed
+    days, days_through      a digest per day older than the summaries (over every hour's figures, and without the
+                            personal values' root), and the last day digested
+    links                   the link of every 64th seal, by generation ("generation:seq")
     check, status, failures the daily check's positions and outcome, and every failure not yet acknowledged,
                             with when it was first and last seen
     view_warnings           the late seals and the seals written from the database's values that no
@@ -254,6 +265,36 @@ def _merge_lists(old: list, new: list, ident) -> list:
     return sorted(out.values(), key=lambda e: tuple("" if v is None else str(v).zfill(20) for v in ident(e)))
 
 
+def _checkpoint_key(e: Dict[str, Any], *fields) -> tuple:
+    return tuple(e.get(f) for f in fields)
+
+
+def merge_checkpoints(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """The retention checkpoints of two records: the newest policy state of the higher generation (then the
+    higher seq), and every cancel and completed erase either lists (added, never removed). Cancels are kept
+    for the current generation only; completed erases for every generation."""
+    out = copy.deepcopy(old or {})
+    new = new or {}
+    gen = max(int(out.get("generation") or 0), int(new.get("generation") or 0))
+    pol_old, pol_new = out.get("policy"), new.get("policy")
+    candidates = [p for p in (pol_old, pol_new) if p]
+    if candidates:
+        out["policy"] = copy.deepcopy(max(candidates, key=lambda p: (int(p.get("generation") or 0),
+                                                                    int(p.get("seq") or 0))))
+    cancels = {_checkpoint_key(c, "generation", "seq"): c for c in (out.get("cancels") or [])
+               if int(c.get("generation") or 0) == gen}
+    for c in new.get("cancels") or []:
+        if int(c.get("generation") or 0) == gen:
+            cancels.setdefault(_checkpoint_key(c, "generation", "seq"), copy.deepcopy(c))
+    out["cancels"] = [cancels[k] for k in sorted(cancels, key=lambda k: tuple(int(x or 0) for x in k))]
+    erases = {_checkpoint_key(e, "generation", "request_seq"): e for e in (out.get("erases") or [])}
+    for e in new.get("erases") or []:
+        erases.setdefault(_checkpoint_key(e, "generation", "request_seq"), copy.deepcopy(e))
+    out["erases"] = [erases[k] for k in sorted(erases, key=lambda k: tuple(int(x or 0) for x in k))]
+    out["generation"] = gen
+    return out
+
+
 def merge(disk: Optional[Dict[str, Any]], mine: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """``mine`` merged into the record on disk. The higher of the two by (generation, discards, seq) gives the
     head; everything that only grows is unioned."""
@@ -276,6 +317,9 @@ def merge(disk: Optional[Dict[str, Any]], mine: Dict[str, Any], now: datetime) -
         links = dict(other.get("links", {}))
         links.update(base.get("links", {}))
         result["links"] = links
+        result["checkpoints"] = merge_checkpoints(other.get("checkpoints") or {}, base.get("checkpoints") or {})
+        if (other.get("days_through") or "") > (base.get("days_through") or ""):
+            result["days_through"] = other["days_through"]
         result["failures"] = _merge_entries(other.get("failures", {}), base.get("failures", {}))
         result["warnings"] = _merge_entries(other.get("warnings", {}), base.get("warnings", {}))
         check = dict(other.get("check", {}))

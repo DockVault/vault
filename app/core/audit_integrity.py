@@ -165,6 +165,7 @@ class Seal:
     mac: bytes = b""
     link: Optional[bytes] = None        # as stored; never trusted
     detail_text: Optional[str] = None   # as stored
+    salt: Optional[bytes] = None        # the hour's salt for rows without a nonce, when the hour has one
 
     def detail_digest(self) -> bytes:
         if self.detail_text is not None:
@@ -451,6 +452,7 @@ class ChainWriter:
         self.db = None
         self.record: Optional[dict] = None
         self.written: List[tuple] = []          # (Seal, link)
+        self.accepted: List[tuple] = []         # (Seal, link) of the seals another writer appended, accepted here
         self._mutex_held = False
         self._lock_held = False
 
@@ -635,6 +637,9 @@ class ChainWriter:
                 view.accept(seal, link)
                 continue
             self._accept_after_record(seal, link, held)
+            if seal.kind in ROOT_KINDS:
+                seal.salt = _salt_of(db, seal)
+            self.accepted.append((seal, link))
             view.accept(seal, link)
         view.record_seq = rec_seq
         self._check_current_key(held)
@@ -742,6 +747,7 @@ class ChainWriter:
                               sealed_at=sealed_at, mac=seal.mac, link=link, row_ids=row_ids,
                               legacy_salt=legacy_salt))
         self.db.flush()
+        seal.salt = legacy_salt
         self.written.append((seal, link))
         return seal
 
@@ -767,6 +773,7 @@ class ChainWriter:
                 record["seq"] = view.position
                 record["link"] = view.link_at(view.position).hex()
                 record["key_id"] = view.key_at(view.position)
+                record["sealed_at"] = fmt.time_text(view.newest_at())
             record["generation"] = max(int(record.get("generation") or 1), view.generation)
             if view.newest_hour_end is not None:
                 record["newest_hour_end"] = fmt.time_text(view.newest_hour_end)
@@ -781,10 +788,11 @@ class ChainWriter:
                     keys_list.append({"generation": view.generation, "key_id": kid, "from_seq": start,
                                       "to_seq": end, "link": view.link_at(start).hex()})
             links = record.setdefault("links", {})
-            for seal, link in written:
-                if seal.seq % LINK_EVERY == 0:
-                    links[str(seal.seq)] = link.hex()
-                _summarise(record, view, seal)
+            for k in range(LINK_EVERY, view.position + 1, LINK_EVERY):
+                links.setdefault(f"{view.generation}:{k}", view.link_at(k).hex())
+            for seal, _link in list(self.accepted) + written:
+                if seal.seq <= view.position:
+                    _summarise(record, view, seal)
             after = record.setdefault("after_record", [])
             for entry in accepted:
                 if not any(e.get("generation") == entry["generation"] and e.get("seq") == entry["seq"]
@@ -792,6 +800,16 @@ class ChainWriter:
                     after.append(entry)
             if self.after_record_change is not None:
                 record = self.after_record_change(record)
+            # The retention checkpoints (with the honoured state as the record now lists another writer's seals)
+            # and the digests of the days older than the hour summaries.
+            from app.core import audit_head_record as hr
+            record["checkpoints"] = hr.merge_checkpoints(record.get("checkpoints") or {},
+                                                          checkpoints(view, record, now))
+            if self.db is not None:
+                try:
+                    day_digests(self.db, view, record, now, [s for s, _l in list(self.accepted) + written])
+                except Exception as exc:  # noqa: BLE001 -- the next record write computes them
+                    _say(f"Warning: the audit chain's day digests were not computed ({type(exc).__name__})")
             # The warnings that come from the seals, as this writer's view gives them: shown from here after a
             # restart, until the process has read the chain again.
             record["view_warnings"] = view_warning_seqs(view, record)
@@ -799,6 +817,131 @@ class ChainWriter:
 
         st.head_store().write(change, now)
         st.pending_after = [e for e in st.pending_after if e not in accepted]
+
+
+def _salt_of(db, seal: Seal) -> Optional[bytes]:
+    """The salt the hour a root seal covers has (its working row's), or None."""
+    try:
+        if seal.kind in ("hour", "late") and seal.period_start is not None:
+            hour = seal.period_start
+            if seal.kind == "late" and isinstance(seal.detail, dict) and seal.detail.get("hour"):
+                hour = fmt.parse_time_text(seal.detail["hour"])
+            wr = working_row(db, hour)
+            return bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
+    except Exception:  # noqa: BLE001 -- a summary without its salt compares without personal values
+        return None
+    return None
+
+
+def checkpoints(view: View, record: Optional[dict], now: datetime) -> dict:
+    """The retention checkpoints of the view's generation: the newest policy seal (its seq, link, state,
+    inputs and cause) with every entry where the honoured state differs from it in its honoured form; each
+    cancel with the seq and link of the request it cancels; and each erase or removal a final seal completed
+    (ids only). They let the host's restore commands say what a restore lost."""
+    out: dict = {"generation": view.generation}
+    newest = view.newest_policy()
+    if newest is not None:
+        from app.core import audit_chain_honour as honour
+        seq, d = newest
+        state = d.get("state") or {}
+        try:
+            honoured = honour.honoured_state(view, record, now)
+        except Exception:  # noqa: BLE001 -- the chain's form alone, never a guess
+            honoured = state
+        out["policy"] = {"generation": view.generation, "seq": seq, "link": view.link_at(seq).hex(),
+                         "state": state, "inputs": d.get("inputs") or {}, "cause": d.get("cause"),
+                         "honoured": {n: e for n, e in honoured.items() if e != state.get(n)}}
+    out["cancels"] = [{"generation": view.generation, "seq": c, "request_seq": r,
+                       "request_link": view.link_at(r).hex()} for r, c in sorted(view.cancels.items())
+                      if 1 <= r <= view.position]
+    out["erases"] = [{"generation": view.generation, "request_id": (view.requests.get(r) or {}).get("request"),
+                      "request_seq": r, "final_seq": f} for r, f in sorted(view.finals.items())
+                     if (view.requests.get(r) or {}).get("what") in ("erase", "removal")]
+    return out
+
+
+def day_entries(db, view: View, day) -> List[tuple]:
+    """(start, end, count, root_s, root_c, ids_digest, salted) of every hour of ``day`` the chain covers, one
+    entry an hour (a run of empty hours expanded), from the view's root seals read again."""
+    start = datetime(day.year, day.month, day.day)
+    first = view.first_hour()
+    out = []
+    cache: Dict[int, Seal] = {}
+    for i in range(24):
+        h = start + i * HOUR
+        if first is not None and h < first:
+            continue
+        if view.newest_hour_end is None or h >= view.newest_hour_end:
+            break
+        entry = view.entry_for(h)
+        if entry is None:
+            continue
+        seq = entry.root.seq
+        seal = cache.get(seq) or read_authenticated(db, view, seq)
+        cache[seq] = seal
+        figures = seal_figures(seal, h)
+        if figures is None:
+            continue
+        count, _nb, rs, rc, idd = figures
+        out.append((h, h + HOUR, count, rs, rc, idd))
+    return out
+
+
+def day_digest_of(db, view: View, day) -> dict:
+    """The digests of ``day`` the head record keeps once its hour summaries are dropped: over every hour's
+    count, roots and ids digest, and over the same without the personal values' root (``stable``), with
+    whether any hour of it has a salt (rows written without a nonce: their personal values cannot be
+    compared once the salt is lost)."""
+    from app.core.models import AuditSeal as S
+    entries = day_entries(db, view, day)
+    start = datetime(day.year, day.month, day.day)
+    salted = db.query(func.count()).select_from(S).filter(
+        S.kind.in_(("hour", "late")), S.period_start >= start, S.period_start < start + timedelta(days=1),
+        S.legacy_salt.isnot(None)).scalar() or 0
+    return {"full": fmt.day_digest(entries).hex(),
+            "stable": fmt.day_digest([(a, b, c, rs, None, idd) for a, b, c, rs, _rc, idd in entries]).hex(),
+            "hours": len(entries), "salted": bool(salted)}
+
+
+DAY_DIGESTS_PER_WRITE = 31
+
+
+def day_digests(db, view: View, record: dict, now: datetime, seals: List[Seal]) -> None:
+    """Keep a digest per day older than the hour summaries: computed when a day ages past them (a few days per
+    record write, so a long backlog spreads the work), and again when a later seal re-roots one of its
+    hours."""
+    from app.core.audit_head_record import SUMMARY_DAYS
+    if view.newest_hour_end is None or view.first_hour() is None:
+        return
+    cutoff = (now - timedelta(days=SUMMARY_DAYS)).date()
+    sealed_through = (view.newest_hour_end - HOUR).date()
+    last_full = min(cutoff - timedelta(days=1), sealed_through - timedelta(days=1))
+    days = record.setdefault("days", {})
+    through = record.get("days_through")
+    day = (fmt.parse_time_text(through).date() + timedelta(days=1)) if through else view.first_hour().date()
+    done = 0
+    while day <= last_full and done < DAY_DIGESTS_PER_WRITE:
+        days[day.isoformat()] = day_digest_of(db, view, day)
+        record["days_through"] = fmt.time_text(datetime(day.year, day.month, day.day))
+        day += timedelta(days=1)
+        done += 1
+    through = record.get("days_through")
+    if not through:
+        return
+    through_day = fmt.parse_time_text(through).date()
+    touched = set()
+    for seal in seals:
+        if seal.kind not in ("late", "prune", "rewrite"):
+            continue
+        if seal.kind == "late":
+            hours = [fmt.parse_time_text(seal.detail["hour"])] if isinstance(seal.detail, dict) else []
+        else:
+            hours = [fmt.parse_time_text(h[0]) for h in (seal.detail or {}).get("hours") or []]
+        for h in hours:
+            if h.date() <= through_day:
+                touched.add(h.date())
+    for d in sorted(touched):
+        days[d.isoformat()] = day_digest_of(db, view, d)
 
 
 def _summarise(record: dict, view: View, seal: Seal) -> None:
@@ -817,11 +960,14 @@ def _summarise(record: dict, view: View, seal: Seal) -> None:
             entries.append((start, start + HOUR, int(h[2]), bytes.fromhex(h[4]), bytes.fromhex(h[5]),
                             bytes.fromhex(h[6])))
     for start, end, count, rs, rc, idd in entries:
+        salt = seal.salt if seal.kind in ("hour", "late") else None
         hours[fmt.hour_text(start)] = {"end": fmt.hour_text(end), "seq": seal.seq,
                                        "link": view.link_at(seal.seq).hex(), "sealed_at": fmt.time_text(seal.sealed_at),
                                        "count": count, "root_s": _b(rs).hex() if rs else None,
                                        "root_c": _b(rc).hex() if rc else None,
-                                       "ids_digest": _b(idd).hex() if idd else None}
+                                       "ids_digest": _b(idd).hex() if idd else None,
+                                       "salt": salt.hex() if salt else None, "unsealed": False,
+                                       "generation": view.generation}
 
 
 def _mac_ok(key: bytes, link: bytes, mac: bytes) -> bool:
@@ -1239,6 +1385,7 @@ def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) 
     seal = w.append("late", period_start=hour, period_end=hour + HOUR, row_count=after.count, row_bytes=after.bytes,
                     root_s=after.root_s, root_c=after.root_c, ids_dig=after.ids_digest, detail=detail,
                     row_ids=after.ids if wr is None else None, legacy_salt=new_salt if wr is None else None)
+    seal.salt = use_salt
     if wr is not None:
         wr.row_ids = after.ids
         if new_salt is not None:
@@ -1318,6 +1465,10 @@ def seal_pass(session_factory, *, engine=None, st: Optional[ChainState] = None, 
             _key_waiting(st, session_factory, stop)
         else:
             report_failures(st, session_factory, {stop.kind: str(stop)})
+        try:
+            summarise_stopped(session_factory, st, now or st.clock(), left)
+        except Exception as exc:  # noqa: BLE001 -- the next pass tries again
+            _say(f"Warning: the audit hours were not summarised while sealing is stopped ({type(exc).__name__})")
     except ChainBusy:
         result.stopped = "busy"
     except Exception as exc:  # noqa: BLE001 -- the next pass tries again
@@ -1328,6 +1479,60 @@ def seal_pass(session_factory, *, engine=None, st: Optional[ChainState] = None, 
     except Exception as exc:  # noqa: BLE001
         _say(f"Warning: the audit chain's checks failed ({type(exc).__name__})")
     return result
+
+
+def summarise_stopped(session_factory, st: ChainState, now: datetime, time_left=None) -> int:
+    """While sealing is stopped: read each hour that closes (under the same two conditions as sealing, in
+    order) and write its count, roots and ids digest into the head record's hour summaries, marked unsealed.
+    A cut of one seal then opens no unwatched window: the host's acceptance compares these hours too. Rows
+    without a nonce are committed with none (no salt is drawn while nothing is sealed). Returns the hours
+    summarised."""
+    from app.core import audit_head_record as hr
+    record = st.head_store().memory or {}
+    starts = []
+    for key, entry in (record.get("hours") or {}).items():
+        try:
+            starts.append(fmt.parse_time_text(entry.get("end") or key))
+        except (TypeError, ValueError):
+            continue
+    if record.get("newest_hour_end"):
+        starts.append(fmt.parse_time_text(record["newest_hour_end"]))
+    if not starts:
+        return 0
+    start = max(starts)
+    floor = hour_floor(now) - timedelta(days=hr.SUMMARY_DAYS)
+    start = max(start, floor)
+    db = session_factory()
+    found = []
+    rows = 0
+    try:
+        open_since = oldest_open_transaction(db)
+        end = newest_sealable_end(now, open_since)
+        h = start
+        while h < end and rows < ROW_BUDGET and (time_left is None or time_left()):
+            fig = hour_figures(iter_rows(db, h, h + HOUR), None)
+            rows += fig.count
+            found.append((h, fig))
+            h += HOUR
+    finally:
+        db.close()
+    if not found:
+        return 0
+
+    def change(rec):
+        hours = rec.setdefault("hours", {})
+        for h, fig in found:
+            key = fmt.hour_text(h)
+            if key in hours and not hours[key].get("unsealed"):
+                continue
+            hours[key] = {"end": fmt.hour_text(h + HOUR), "seq": None, "link": None, "sealed_at": None,
+                          "count": fig.count, "root_s": fig.root_s.hex(), "root_c": fig.root_c.hex(),
+                          "ids_digest": fig.ids_digest.hex(), "salt": None, "unsealed": True,
+                          "summarised_at": fmt.time_text(now)}
+        return rec
+
+    st.head_store().write(change, now)
+    return len(found)
 
 
 def _clear_stop_warnings(st: ChainState) -> None:
