@@ -284,10 +284,16 @@ the recipients' mailboxes.
 - **Log access**: an administrator's download of the log-access file.
 - **The audit chain's head record** **New in 0.34.0**: a file on the keys volume (`AUDIT_CHAIN_HEAD_FILE`)
   that holds the newest seal's number and hash, the chain's key ids, the hour summaries of the last 30
-  days (counts and hashes), and the integrity check's findings (kinds, times, seal numbers and row ids, never a
-  row's values). Kept with the keys volume, in every backup. **`python dockvault.py audit verify`** prints
-  the findings and the chain's head on the host's terminal; an export of the Activity page ends with that
-  head. **`python dockvault.py audit acknowledge`** writes an acknowledgment, audited as the host operator.
+  days (counts and hashes, and the salt of an hour whose rows have no nonce), a digest per older day, the
+  retention checkpoints (the newest retention state, the cancels, and the ids of completed erases: request
+  ids and seal numbers, never a name), and the integrity check's findings (kinds, times, seal numbers and
+  row ids, never a row's values). Kept with the keys volume, in every backup, which archives the keys volume
+  before the database. A restore of a backup leaves a mark beside it until `python dockvault.py audit
+  accept-restore`. **`python dockvault.py audit verify`** prints the findings and the chain's head on the
+  host's terminal; an export of the Activity page ends with that head. **`python dockvault.py audit
+  acknowledge`** and the other host commands (`rekey`, `after-record`, `accept-database-head`,
+  `accept-restore`, `acknowledge-removed-before`, `change-key`) write their seals audited as the host
+  operator; `after-record --discard` saves the seals it deletes in a file beside the head record.
 - **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.

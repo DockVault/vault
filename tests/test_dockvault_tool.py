@@ -1612,7 +1612,7 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     # The three data volumes are recorded; brand, which genuinely may not exist, is skipped. That
     # skip is the behaviour being pinned -- a bundle that skipped ALL of them is now refused.
-    assert [e["role"] for e in man["volumes"]] == ["pg", "storage", "keys"]
+    assert [e["role"] for e in man["volumes"]] == ["keys", "pg", "storage"]
     assert env["ENCRYPTION_KEY"] not in json.dumps(man)       # no secret in the manifest
     assert (bundle / "env").exists()                          # the paired .env is copied in
     if os.name != "nt":

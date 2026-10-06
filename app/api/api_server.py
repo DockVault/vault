@@ -25307,6 +25307,9 @@ async def lifespan(app: FastAPI):
     # background (app/core/audit_privacy.py).
     from app.core import audit_privacy
     audit_privacy.start()
+    # The SFTP host key, written here so a split layout's SFTP container can mount the keys volume read-only.
+    from app.sftp.host_key import ensure_host_key
+    ensure_host_key(settings.sftp_host_key_path)
     _verify_encryption_key_canary()     # refuse to boot under a mismatched ENCRYPTION_KEY, BEFORE any seal migration
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest

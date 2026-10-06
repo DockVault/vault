@@ -1401,7 +1401,11 @@ def plan_volume_action(choice):
 # bundle is sensitive), a tar.gz per data volume, and manifest.json. The manifest carries NO secret -
 # only a salted one-way commitment over the .env's two random per-set secrets, so restore can confirm
 # the .env in the bundle really is the one those volumes were created with (a swapped/wrong .env fails).
-BACKUP_ROLES = ("pg", "storage", "keys", "brand")   # order restored in; brand is optional
+# The order archived in, and restored in; brand is optional. The keys volume comes first: it holds the audit
+# chain's head record, and a database archived after it can only be ahead of its record (by the seals written
+# meanwhile, which the server lists and the host acknowledges), never behind it, which would stop sealing as a
+# cut tail does. The database is paused while its volume is archived, so the copy is one moment's.
+BACKUP_ROLES = ("keys", "pg", "storage", "brand")
 # The three that carry data. A bundle without them is not a backup, whatever else it contains,
 # and saying so is load-bearing now that an upgrade takes one on the operator's behalf and
 # proceeds with an irreversible change on the strength of it.
@@ -1555,6 +1559,47 @@ def clear_volume(volume, run=subprocess.run):
         r = run(["docker", "run", "--rm", "-v", "%s:/v" % volume, "busybox", "sh", "-c",
                  "rm -rf /v/..?* /v/.[!.]* /v/* 2>/dev/null"],
                 capture_output=True, text=True, timeout=300)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+def chain_head_relpath(env):
+    """Where the audit chain's head record lies inside the keys volume (AUDIT_CHAIN_HEAD_FILE under
+    /app/keys), or None when .env puts it elsewhere (then a restore writes no mark: the operator's path)."""
+    path = (env or {}).get("AUDIT_CHAIN_HEAD_FILE") or "/app/keys/audit-chain-head.json"
+    path = path.strip().strip("'\"")
+    prefix = "/app/keys/"
+    if not path.startswith(prefix) or ".." in path.split("/"):
+        return None
+    rel = path[len(prefix):]
+    return rel if rel and re.match(r"^[A-Za-z0-9._/-]+$", rel) else None
+
+
+def read_volume_json(volume, rel, run=subprocess.run):
+    """The JSON file `rel` inside a docker volume, through a throwaway busybox (read-only mount), or None."""
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/v:ro" % volume, "busybox", "cat", "/v/%s" % rel],
+                capture_output=True, text=True, timeout=120)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    try:
+        data = json.loads(getattr(r, "stdout", "") or "")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_volume_file(volume, rel, text, run=subprocess.run):
+    """Write `text` to `rel` inside a docker volume (mode 600, owned like the volume's top directory, so the
+    app's user reads it), through a throwaway busybox fed on its standard input. True on success."""
+    script = ('cat > "/v/$1.tmp" && chown "$(stat -c %u:%g /v)" "/v/$1.tmp" && chmod 600 "/v/$1.tmp" '
+              '&& mv "/v/$1.tmp" "/v/$1" && sync')
+    try:
+        r = run(["docker", "run", "--rm", "-i", "-v", "%s:/v" % volume, "busybox", "sh", "-c", script, "sh", rel],
+                input=text, capture_output=True, text=True, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return getattr(r, "returncode", 1) == 0
@@ -4624,7 +4669,13 @@ class DockVault:
                 continue                                     # e.g. brand isn't always present
             archive = "%s.tar.gz" % VOLUME_BASENAMES[role]
             print(pal.paint("  archiving %s ..." % vol, "cyan"))
-            if not tar_volume(vol, bundle, archive):
+            paused = self._pause_database() if role == "pg" else False
+            try:
+                archived = tar_volume(vol, bundle, archive)
+            finally:
+                if paused:
+                    self._unpause_database()
+            if not archived:
                 self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
             entries.append({"role": role, "name": vol, "archive": archive})
 
@@ -4674,6 +4725,25 @@ class DockVault:
         else:
             print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
                             "somewhere safe (off-host), or re-run with --lock to seal it. ***\n", "yellow"))
+
+    def _pause_database(self):
+        """Pause the running database container while its volume is archived, so the copy is one moment's (a
+        tar of a running data directory is not: Postgres keeps writing pages behind it). True when paused."""
+        if not container_running(DB_CONTAINER):
+            return False
+        print(self.pal.paint("  pausing the database while its volume is copied ...", "cyan"))
+        try:
+            r = self._run_dc("pause", "vault-db", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return getattr(r, "returncode", 1) == 0
+
+    def _unpause_database(self):
+        try:
+            self._run_dc("unpause", "vault-db", timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(self.pal.paint("  WARNING: the database could not be resumed (%s): run docker compose unpause "
+                                 "vault-db" % type(exc).__name__, "red"))
 
     def _seal_bundle_env(self, bundle, args):
         """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),
@@ -4816,11 +4886,18 @@ class DockVault:
             self._fail("the backup's volume_prefix %r is not a valid name - refusing to restore" % prefix)
         names = set_volume_names(prefix)
         plan = []
+        roles = []
         for e in (manifest.get("volumes") or []):
             role = e.get("role") if isinstance(e, dict) else None
             if role not in VOLUME_BASENAMES:
                 self._fail("the backup manifest lists an unknown volume role %r - refusing to restore" % role)
+            roles.append(role)
+        # Restored in BACKUP_ROLES order whatever order the manifest lists them in (an older bundle archived
+        # the keys volume last): keys first, so the restore mark lands before any other volume.
+        order = {role: i for i, role in enumerate(BACKUP_ROLES)}
+        for role in sorted(roles, key=lambda r: order.get(r, len(order))):
             plan.append((names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]))
+        head_rel = chain_head_relpath(bundle_env)
         force = bool(getattr(args, "force", False)) if args else False
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
@@ -4859,8 +4936,14 @@ class DockVault:
         if container_running(DB_CONTAINER):
             self._fail("could not stop the running deployment before restore (the database is still "
                        "up) - aborting; your data is intact. Stop the stack and retry.")
+        # The head record of the keys volume about to be replaced (a restore over the same set), kept for the
+        # restore mark: what it knew the restore then undoes.
+        replaced_record = None
+        if head_rel and volume_exists(names["keys"]):
+            replaced_record = read_volume_json(names["keys"], head_rel)
         # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
         # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
+        marked = False
         for vol, archive in plan:
             print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
             # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
@@ -4872,6 +4955,20 @@ class DockVault:
             if not untar_volume(vol, bundle, archive):
                 self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
                            "bundle and retry." % (vol, archive))
+            if vol == names["keys"] and head_rel:
+                # Right after the keys volume, before any other volume or .env: the restore mark. While it is
+                # there the audit pruner deletes nothing, until `audit accept-restore` (run below once the
+                # stack is up, or by hand) accepts the restore. A restore stopped part way leaves it in place.
+                restored_record = read_volume_json(vol, head_rel)
+                if restored_record is not None or replaced_record is not None:
+                    import datetime as _dt
+                    mark = {"at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "bundle": os.path.basename(os.path.normpath(bundle)), "record": replaced_record,
+                            "restored_record": restored_record}
+                    if not write_volume_file(vol, head_rel + ".restore-pending", json.dumps(mark)):
+                        self._fail("could not write the restore mark into %s - the deployment is stopped; "
+                                   "retry the restore" % vol)
+                    marked = True
         # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
         # the plaintext was decrypted into memory above; write those exact bytes.
         if sealed_env_bytes is not None:
@@ -4897,8 +4994,19 @@ class DockVault:
             self._tail_logs(self._web_service(profiles))
             print(pal.paint("  Restored and started, but the vault did NOT report healthy yet - "
                             "logs above.\n", "red"))
-        else:
-            print(pal.paint("  Restored and healthy.\n", "green"))
+            if marked:
+                print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: python "
+                                "dockvault.py audit accept-restore\n", "yellow"))
+            return
+        print(pal.paint("  Restored and healthy.\n", "green"))
+        if marked:
+            if interactive:
+                print(pal.paint("  Finishing the restore of the audit log's integrity chain:", "cyan"))
+                self._audit_host_command(argparse.Namespace(no_reseal=False, yes=False, confirm=None,
+                                                            old_key_file=None), "accept-restore")
+            else:
+                print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: python "
+                                "dockvault.py audit accept-restore\n", "yellow"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -5488,6 +5596,8 @@ class DockVault:
                 % (len(legs), "a release" if len(legs) == 2 else "some releases",
                    " -> ".join(legs)), "cyan"))
 
+        self._offer_chain_key(args, interactive, legs[-1])
+
         for index, leg_version in enumerate(legs, start=1):
             leg_tag = leg_version if leg_version.startswith("v") else "v" + leg_version
             if len(legs) > 1:
@@ -5498,6 +5608,31 @@ class DockVault:
         healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
         print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
                         "green" if healthy else "red"))
+
+    def _offer_chain_key(self, args, interactive, target):
+        """Before a release with the audit log's integrity chain first starts: a chain key of its own. Without
+        AUDIT_CHAIN_KEY the chain's key is derived from ENCRYPTION_KEY, which everyone who holds that key holds
+        too. Offered with yes as the default answer; --no-chain-key declines (the status then says key-shared).
+        Set later on an install whose chain already runs, the chain moves to it on its own, with a proof."""
+        pal = self.pal
+        if (self._load_env().get("AUDIT_CHAIN_KEY") or "").strip():
+            return
+        try:
+            if parse_semver(str(target).lstrip("vV")) < parse_semver("0.34.0"):
+                return
+        except (TypeError, ValueError):
+            return
+        if args is not None and getattr(args, "no_chain_key", False):
+            print(pal.paint("  AUDIT_CHAIN_KEY left unset: the audit log's chain key is derived from "
+                            "ENCRYPTION_KEY (the status shows key-shared).", "yellow"))
+            return
+        if interactive and not confirm("Give the audit log's integrity chain a key of its own (AUDIT_CHAIN_KEY, "
+                                       "recommended)?", pal, default=True):
+            print(pal.paint("  Left unset: the chain's key is derived from ENCRYPTION_KEY.", "yellow"))
+            return
+        self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        print(pal.paint("  Wrote AUDIT_CHAIN_KEY to .env (it is in every backup with .env; keep it as you keep "
+                        "ENCRYPTION_KEY).", "green"))
 
     def _downgrade_blockers(self, target):
         """What the running deployment says stops it going back to `target`: (offered, blockers).
@@ -5826,6 +5961,8 @@ class DockVault:
         if action in ("rekey", "after-record", "accept-database-head", "accept-restore",
                       "acknowledge-removed-before"):
             return self._audit_host_command(args, action)
+        if action == "change-key":
+            return self._audit_change_key(args)
         tool_args = ["verify", "--json"]
         for flag, name in (("--from", "audit_from"), ("--to", "audit_to"), ("--anchor", "anchor")):
             value = getattr(args, name, None) if args else None
@@ -5978,6 +6115,51 @@ class DockVault:
             ", ".join(map(str, done.get("acknowledged") or [])) or "none",
             ", ".join(server_text(k) for k in (done.get("failures") or [])) or "none",
             ", ".join(server_text(r) for r in (done.get("rows") or [])) or "none"), "green"))
+
+    def _audit_change_key(self, args):
+        """Give the audit log's integrity chain a new AUDIT_CHAIN_KEY: write it into .env, recreate the stack,
+        and move the chain to it at once with `audit rekey --old-key-stdin --now`, the old key handed over on
+        standard input (never on a command line or in a container's environment, where `ps` or `docker inspect`
+        would show it). Sealing waits only for the seconds between the restart and that command. Until the move
+        is done the old key is kept beside .env (mode 600), and removed once the chain is under the new one."""
+        pal = self.pal
+        env = self._load_env()
+        old = (env.get("AUDIT_CHAIN_KEY") or "").strip()
+        interactive = not getattr(args, "yes", False)
+        if interactive and not confirm("Write a new AUDIT_CHAIN_KEY and move the audit log's chain to it now?", pal,
+                                       default=False):
+            print(pal.paint("  Nothing changed.\n", "yellow"))
+            return
+        kept = None
+        if old:
+            kept = os.path.join(self.root, ".audit-chain-key.previous")
+            try:
+                fd = os.open(kept, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(old + "\n")
+            except OSError as exc:
+                self._fail("could not keep the old key aside before changing it (%s): nothing changed" % exc)
+            tighten_secret_file(kept)
+        self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY; recreating the stack ...", "cyan"))
+        if not self._recreate_stack(build=False):
+            self._fail("the stack did not come up with the new key; the old key is in %s" % (kept or "(none)"))
+        self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
+        if not old:
+            print(pal.paint("  The chain was under the key derived from ENCRYPTION_KEY: it moves to the new key on "
+                            "its own, with a proof, at the next sealing pass.\n", "green"))
+            return
+        done = self._audit_tool("rekey", "--old-key-stdin", "--now", input_text=old + "\n")
+        if not done.get("ok"):
+            print(pal.paint("  The chain was not moved: %s" % server_text(done.get("error")), "red"))
+            print(pal.paint("  Sealing waits until it is: python dockvault.py audit rekey --old-key-file %s\n" % kept,
+                            "yellow"))
+            raise SystemExit(1)
+        try:
+            os.remove(kept)
+        except OSError:
+            pass
+        print(pal.paint("  The chain is under the new key (seal %s).\n" % server_text(done.get("sealed")), "green"))
 
     def _audit_host_command(self, args, action):
         """rekey, after-record, accept-database-head, accept-restore, acknowledge-removed-before: in two steps,
@@ -6334,6 +6516,8 @@ def build_parser():
                          "changed (the older one then starts only with %s=true). Not accepted for a "
                          "version older than %s, which has no such check and would start on that data "
                          "regardless" % (NEWER_DATA_ESCAPE, FIRST_NEWER_DATA_CHECK))
+    up.add_argument("--no-chain-key", dest="no_chain_key", action="store_true",
+                    help="do not write AUDIT_CHAIN_KEY: the audit log's chain key stays derived from ENCRYPTION_KEY")
     up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lp = parsers["logs"]
@@ -6355,13 +6539,14 @@ def build_parser():
     au = parsers["audit"]
     au.add_argument("audit_action", nargs="?", default="verify",
                     choices=("verify", "acknowledge", "rekey", "after-record", "accept-database-head",
-                             "accept-restore", "acknowledge-removed-before"),
+                             "accept-restore", "acknowledge-removed-before", "change-key"),
                     help="verify (the default): check the chain and print its head; acknowledge: acknowledge "
                          "warnings (--seqs), failures (--failures), rows (--rows) or late rows (--late-rows) once "
                          "you have looked at them; rekey: move the chain to the current AUDIT_CHAIN_KEY; "
                          "after-record: accept or discard the seals after the head record; accept-database-head: "
                          "accept a restored database or a lost head record; accept-restore: finish a restore of a "
-                         "backup; acknowledge-removed-before: seal over rows an older release removed by age")
+                         "backup; acknowledge-removed-before: seal over rows an older release removed by age; "
+                         "change-key: give the chain a new AUDIT_CHAIN_KEY")
     au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
     au.add_argument("--failures", dest="failures", action="store_true",
                     help="acknowledge: every failure, and every warning kept by kind (not a seal's), not yet "

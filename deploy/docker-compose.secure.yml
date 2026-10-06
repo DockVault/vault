@@ -322,6 +322,9 @@ services:
       REDIS_PORT: "6379"
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # The audit log's integrity chain is the web server's alone: this process neither seals nor checks it,
+      # so it never holds the chain's key (an empty value here overrides the one in .env).
+      AUDIT_CHAIN_KEY: ""
       # Tie the app's per-upload clamp to the staging tmpfs size below, so it applies exactly when
       # this container backs SFTP staging with a tmpfs (the app default is 0 = unclamped).
       SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
@@ -356,7 +359,9 @@ services:
         condition: service_healthy
     volumes:
       - vault_storage:/app/storage
-      - vault_keys:/app/keys
+      # Read-only here: the keys volume holds the audit chain's head record, which only the web server writes.
+      # The web server writes this container's SSH host key on its first start, before this one starts.
+      - vault_keys:/app/keys:ro
     # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
     # storage/keys are volumes; this service doesn't mount the logs volume, so
     # /app/logs, /app/certs, and /tmp ride tmpfs. (/tmp is also where the healthcheck's
