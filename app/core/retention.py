@@ -286,12 +286,13 @@ def prune_credential_changes(p: Pass) -> JobResult:
 
 
 def settle_auditor_grants(p: Pass) -> JobResult:
-    """Auditor grants whose time ran out: a proposal nobody approved lapses, a grant past its end expires
-    (app/core/auditor_rights.py). Deletes nothing: each grant's row is kept as the record of who held the
-    right."""
+    """Auditor grants whose time ran out (a proposal nobody approved lapses, a grant past its end expires), and
+    what a change to a holder's account calls for when no hook wrote it: a grant whose account no longer stands
+    as it requires is suspended, or ended (app/core/auditor_rights.py, settle). Deletes nothing: each grant's
+    row is kept as the record of who held the right."""
     from app.core import auditor_rights
     with p.transaction() as db:
-        auditor_rights.end_due(db, p.now)
+        auditor_rights.settle(db, p.now)
     return JobResult()
 
 
@@ -349,7 +350,8 @@ JOBS: list[Job] = [
     Job("sessions", "Finished sessions and sign-ins", prune_sessions),
     Job("key_proof_challenges", "Expired key-proof challenges", prune_key_proof_challenges),
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
-    Job("auditor_grants", "Auditor rights whose time ran out", settle_auditor_grants),
+    Job("auditor_grants", "Auditor rights whose time ran out, or whose holder's account changed",
+        settle_auditor_grants),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),

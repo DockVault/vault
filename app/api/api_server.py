@@ -5709,7 +5709,26 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     maker is the account the link is handed to: ``actor_id`` for a change made at once, and for an
     approved request ``link_maker_id``, the approving administrator (None: the server's operator on the
     host), who receives the link to pass on; the one who asked never sees it. The maker's authority is
-    judged again when the link is used (_reset_link_refusal)."""
+    judged again when the link is used (_reset_link_refusal).
+
+    Once the change is made, an auditor right the account holds follows it in the same transaction
+    (app/core/auditor_rights.py, after_credential_change): whoever made it joins the grant's list of
+    changers, and the grant is suspended, or ended for a second-factor reset."""
+    from app.core import auditor_rights
+    result = _make_credential_change(db, kind, target, payload, actor_id=actor_id, actor_name=actor_name,
+                                     request=request, for_someone_else=for_someone_else,
+                                     link_maker_id=link_maker_id)
+    approved = link_maker_id is not _LINK_MAKER_IS_ACTOR
+    auditor_rights.after_credential_change(
+        db, target, kind, actor_id=actor_id, actor_name=actor_name,
+        someone_else=for_someone_else and actor_id != target.id,
+        approved=approved, approver_id=link_maker_id if approved else None)
+    return result
+
+
+def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, request=None,
+                            for_someone_else=True, link_maker_id=_LINK_MAKER_IS_ACTOR) -> dict:
+    """The change itself, for _apply_credential_change, which every caller uses."""
     from app.core import credential_changes as cc
     payload = payload or {}
     if kind == cc.PASSWORD:
@@ -6193,9 +6212,16 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     operator): record who and when, in the caller's transaction, for the two-administrator rule
     (app/core/admin_grants.py), and revoke the open reset links for them that someone who may not make
     one for an administrator made. ``inherited`` is an invitation's kept lineage. Call it only on the
-    change INTO the role."""
-    from app.core import admin_grants
+    change INTO the role.
+
+    Refused (409) while COMPLIANCE_AUDITOR_NOT_ADMIN is on and the account holds the auditor right or a
+    proposal for it (app/core/auditor_rights.py, promotion_refusal): the right is revoked first. Raised in the
+    caller's transaction, before anything of the promotion is committed."""
+    from app.core import admin_grants, auditor_rights
     from app.core import credential_changes as cc
+    refusal = auditor_rights.promotion_refusal(db, user)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
     admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
                         granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR),
                         inherited=inherited)
@@ -6532,10 +6558,14 @@ def _account_lost_standing(db, user, *, actor, because) -> _LostStanding:
     follows from an account losing its standing follows on every route. Call it BEFORE the change to
     ``user`` is made in the session, in the same transaction. What follows: their open requests are
     withdrawn and their pending administrator invitations revoked (_withdraw_requests_of), and the SSH
-    keys an administrator added to other people's accounts are reported (_report_keys_added_by). Returns
-    what _announce_lost_standing tells after the commit."""
+    keys an administrator added to other people's accounts are reported (_report_keys_added_by), and an
+    auditor right they hold is suspended (ended, when the account is deleted) and the auditor rights they
+    proposed are withdrawn (app/core/auditor_rights.py, after_lost_standing; told after the commit).
+    Returns what _announce_lost_standing tells after the commit."""
+    from app.core import auditor_rights
     withdrawn = _withdraw_requests_of(db, user, actor=actor, because=because)
     keys = _report_keys_added_by(db, user, actor=actor, because=because)
+    auditor_rights.after_lost_standing(db, user, actor=actor, because=because)
     return _LostStanding(withdrawn, keys)
 
 
@@ -10334,6 +10364,9 @@ async def disable_second_factor(
         SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
     db.query(SecondFactorEnrollment).filter(
         SecondFactorEnrollment.user_id == current_user.id).delete(synchronize_session=False)
+    # An auditor right bound to this factor ends with it (app/core/auditor_rights.py).
+    from app.core import auditor_rights
+    auditor_rights.after_own_factor_removed(db, current_user)
     db.commit()
     try:
         AuditLogger(db).log_action(action="second_factor_disabled", status="success", user=current_user,

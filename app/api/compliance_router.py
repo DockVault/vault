@@ -18,8 +18,12 @@ The auditor right (app/core/auditor_rights.py has the rules):
     POST   /compliance/auditor-grants                   propose: {user_id, note?}; an administrator
     POST   /compliance/auditor-grants/{id}/approve      an independent administrator
     POST   /compliance/auditor-grants/{id}/reject       {reason}: an administrator other than the proposer
+    POST   /compliance/auditor-grants/{id}/reconfirm    the holder, after a suspension
     DELETE /users/{user_id}/auditor                     revoke (a proposal too): {reason?}; any administrator
     GET    /compliance/me                               the caller's own right, as it stands now
+
+Whether the right is in force is computed on every request (auditor_rights.auditor_live): a route an auditor
+uses depends on require_live_auditor, which refuses (403) a right that is not, whatever the stored state says.
 """
 from __future__ import annotations
 
@@ -69,6 +73,18 @@ async def require_interactive_account(current_user: User = Depends(get_current_u
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail="A temporary credential cannot do this.")
+    return current_user
+
+
+def require_live_auditor(current_user: User = Depends(require_interactive_account),
+                         db: Session = Depends(get_db)) -> User:
+    """An account whose auditor right is in force now, computed from the grant and the account as they stand
+    (app/core/auditor_rights.py, auditor_live): 403 otherwise, with the reason."""
+    standing = rights.auditor_live(db, current_user)
+    if not standing.live:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail={"reason": standing.reason, "text": rights.text(standing.reason)})
+    current_user._auditor_grant_id = standing.grant.id
     return current_user
 
 
@@ -138,11 +154,17 @@ def my_auditor_right(current_user: User = Depends(require_interactive_account), 
     grant = rights.open_grant(db, current_user.id)
     if grant is None:
         return {"grant": None}
+    standing = rights.auditor_live(db, current_user)
+    reconfirm = rights.reconfirm_problem(db, grant, current_user) if grant.status == "suspended" else None
     return {"grant": {"id": str(grant.id), "status": rights.shown_status(grant),
                       "proposed_by": grant.proposed_by_username, "approved_by": grant.approved_by_username,
                       "approved_at": rights._iso(grant.approved_at),
                       "expires_at": rights._iso(rights.effective_expiry(grant)),
-                      "suspend_reason": grant.suspend_reason if grant.status == "suspended" else None}}
+                      "suspend_reason": grant.suspend_reason if grant.status == "suspended" else None,
+                      "live": standing.live, "reason": standing.reason, "reason_text": rights.text(standing.reason),
+                      "may_reconfirm": grant.status == "suspended" and reconfirm is None,
+                      "reconfirm_problem": ({"reason": reconfirm, "text": rights.text(reconfirm)}
+                                            if reconfirm is not None else None)}}
 
 
 # --------------------------------------------------------------------------- the steps
@@ -243,6 +265,32 @@ def reject_auditor_grant(grant_id: uuid.UUID, body: Reason, request: Request,
     rights.reject(db, grant, rejecter=current_user, reason=body.reason.strip() or "-")
     db.commit()
     return rights.grant_dict(db, grant, viewer=current_user)
+
+
+@router.post("/compliance/auditor-grants/{grant_id}/reconfirm")
+def reconfirm_auditor_grant(grant_id: uuid.UUID, request: Request,
+                            current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
+    """The holder confirms their suspended right again, with their password and a code from the authenticator
+    the right is bound to. After an administrator set their password, they set one of their own first; after a
+    second-factor reset or removal the right has ended, and only a new grant gives it."""
+    limit_statements(db)
+    grant = rights.grant_by_id(db, grant_id)
+    if grant is None or grant.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="No such auditor grant.")
+
+    def check(g):
+        problem = rights.reconfirm_problem(db, g, current_user)
+        if problem is not None:
+            _refuse(db, current_user, "reconfirm", problem, code=409, grant=g)
+
+    check(grant)
+    STEP_UP_GRANT_RECONFIRM(db, current_user, request)
+    limit_statements(db)
+    grant = _grant_or_404(db, grant_id, lock=True)
+    check(grant)
+    rights.reconfirm(db, grant, current_user)
+    db.commit()
+    return {"id": str(grant.id), "status": grant.status, "reconfirmed_at": rights._iso(grant.reconfirmed_at)}
 
 
 @router.delete("/users/{user_id}/auditor")

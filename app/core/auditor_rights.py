@@ -30,6 +30,7 @@ told of each step, in the app and by email, after the commit (deliver()).
 from __future__ import annotations
 
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Optional
@@ -532,6 +533,342 @@ def end_due(db, now: Optional[datetime] = None) -> int:
                                                                 "expires_at": _iso(effective_expiry(grant))})
             queue(db, {"event": "expired", "grant_id": str(grant.id),
                        "holder_id": str(grant.user_id) if grant.user_id else None, "holder": grant.username_at_grant})
+            count += 1
+    return count
+
+
+# --------------------------------------------------------------------------- whether it is in force now
+
+# Why the right is not in force for an account now (auditor_live()), besides the preconditions' INACTIVE,
+# LOCKED, ROLE, ADMIN_NOT_ALLOWED and PASSWORD_NOT_OWN.
+TEMPORARY = "temporary"
+NO_GRANT = "no_grant"
+NOT_APPROVED = "not_approved"
+SUSPENDED = "suspended"
+EXPIRED = "expired"
+DISABLED = "compliance_disabled"
+DEMOTED = "demoted"
+SECOND_FACTOR = "second_factor"
+CREDENTIAL_CHANGE = "credential_change"
+SSH_KEY = "ssh_key"
+NOT_SUSPENDED = "not_suspended"
+# Why a grant ended for good: the second factor it is bound to was reset or removed, or the account deleted.
+FACTOR_RESET = "second_factor_reset"
+FACTOR_REMOVED = "second_factor_removed"
+DELETED = "deleted"
+ENDS = (FACTOR_RESET, FACTOR_REMOVED, SECOND_FACTOR, DELETED)
+
+TEXTS.update({
+    TEMPORARY: "a temporary credential holds no auditor right",
+    NO_GRANT: "the account holds no auditor right",
+    NOT_APPROVED: "the auditor right is waiting for its approval",
+    SUSPENDED: "the auditor right is suspended until its holder reconfirms it",
+    EXPIRED: "the auditor right reached its end",
+    DISABLED: "compliance access is turned off on this deployment (COMPLIANCE_ACCESS=disabled)",
+    DEMOTED: "the account is no longer an administrator, as it was when the right was confirmed",
+    SECOND_FACTOR: "the authenticator the right is bound to is no longer the account's: only a new grant gives it",
+    CREDENTIAL_CHANGE: "someone else changed the account's sign-in details since the right was confirmed",
+    SSH_KEY: "someone else added an SSH key to the account since the right was confirmed",
+    NOT_SUSPENDED: "the auditor right is not suspended",
+    FACTOR_RESET: "an administrator reset the authenticator the right is bound to",
+    FACTOR_REMOVED: "the holder removed the authenticator the right is bound to",
+    DELETED: "the account was deleted",
+    cc.PASSWORD: "someone else set the account's password",
+    cc.RESET_LINK: "someone else made a password reset link for the account",
+    cc.EMAIL: "someone else changed the account's email address",
+    cc.SSH_KEY: "someone else added an SSH key to the account",
+    "deactivated": "the account was deactivated",
+    "demoted": "the account was demoted from administrator",
+    "locked": "the account was locked by an administrator",
+})
+
+
+@dataclass(frozen=True)
+class Standing:
+    """Whether an account's auditor right is in force now, and if not, why (a reason of TEXTS)."""
+    live: bool
+    reason: Optional[str] = None
+    grant: object = None
+
+
+def confirmed_at(grant) -> Optional[datetime]:
+    """When the right was last confirmed: its approval, or its holder's last reconfirmation."""
+    times = [t for t in (grant.approved_at, grant.reconfirmed_at) if t is not None]
+    return max(times) if times else None
+
+
+def _changed_since(db, user, since: Optional[datetime]) -> Optional[str]:
+    """CREDENTIAL_CHANGE when someone else's change to the account's sign-in details was applied after
+    ``since`` (the records of the 14 days after a change), SSH_KEY when someone else added an SSH key to it
+    after ``since`` (kept as long as the key), else None."""
+    from sqlalchemy import or_
+    from app.core.models import CredentialChange, UserSSHKey
+    if since is None:
+        return None
+    if db.query(CredentialChange.id).filter(
+            CredentialChange.target_user_id == user.id, CredentialChange.status.in_(cc.APPLIED),
+            CredentialChange.applied_at.isnot(None), CredentialChange.applied_at > since).first() is not None:
+        return CREDENTIAL_CHANGE
+    if db.query(UserSSHKey.id).filter(
+            UserSSHKey.user_id == user.id, UserSSHKey.created_at > since,
+            or_(UserSSHKey.created_by.is_(None), UserSSHKey.created_by != user.id)).first() is not None:
+        return SSH_KEY
+    return None
+
+
+def standing_problem(db, user, grant, *, reconfirming: bool = False) -> Optional[str]:
+    """Why ``user``'s account no longer stands as ``grant`` requires, or None. Read from the account and its
+    records on every call, so a hook that missed a change still refuses. ``reconfirming``: what a holder's
+    reconfirmation may not fix (a demotion and a change by someone else are what it confirms afresh)."""
+    from app.core import password_origin
+    from app.services.auth_service import admin_locked
+    if user.is_active is False:
+        return INACTIVE
+    if admin_locked(user):
+        return LOCKED
+    role = _role(user)
+    if role not in ROLES:
+        return ROLE
+    if role == "admin" and admin_not_allowed():
+        return ADMIN_NOT_ALLOWED
+    if not reconfirming and grant.confirmed_role == "admin" and role != "admin":
+        return DEMOTED
+    totp = active_totp(db, user.id)
+    if totp is None or grant.second_factor_enrollment_id is None or totp.id != grant.second_factor_enrollment_id:
+        return SECOND_FACTOR
+    if password_origin.is_set_by_other(user):
+        return PASSWORD_NOT_OWN
+    if not reconfirming:
+        return _changed_since(db, user, confirmed_at(grant))
+    return None
+
+
+def auditor_live(db, user, now: Optional[datetime] = None) -> Standing:
+    """Whether ``user`` holds the auditor right in force now, computed from the grant, the deployment's
+    settings and the account as they stand: an approved grant, not suspended, before its end, compliance
+    access on, and the account as it was when the right was confirmed (active, not locked by an administrator,
+    an allowed role and not demoted, the same authenticator, its own password, no change to its sign-in details
+    by someone else since). Every compliance request asks this; nothing is cached."""
+    now = now or utcnow()
+    if user is None or getattr(user, "_is_temp_session", False):
+        return Standing(False, TEMPORARY)
+    grant = open_grant(db, user.id)
+    if grant is None:
+        return Standing(False, NO_GRANT)
+    if grant.status == "proposed":
+        return Standing(False, NOT_APPROVED, grant)
+    if grant.status == "suspended":
+        return Standing(False, SUSPENDED, grant)
+    if is_expired(grant, now):
+        return Standing(False, EXPIRED, grant)
+    if not access_enabled():
+        return Standing(False, DISABLED, grant)
+    problem = standing_problem(db, user, grant)
+    if problem is not None:
+        return Standing(False, problem, grant)
+    return Standing(True, None, grant)
+
+
+# --------------------------------------------------------------------------- suspending, ending, reconfirming
+
+def suspend(db, grant, reason: str, *, by_id=None, by_name: Optional[str] = None, now: Optional[datetime] = None):
+    """Suspend the grant in force (``reason``: what happened to the account), in the caller's transaction, with
+    its audit row; the holder and every administrator are told after the commit. A grant already suspended
+    keeps its first suspension and records the new reason. ``by_*``: who made the change that caused it (None
+    and None: the server, on its own)."""
+    if grant.status not in ("active", "suspended"):
+        return grant
+    now = now or utcnow()
+    if grant.status == "active":
+        grant.status, grant.suspended_at = "suspended", now
+    grant.suspend_reason, grant.updated_at = reason, now
+    _audit_by(db, "auditor_suspended", grant, by_id, by_name, {"reason": reason, "outcome": "suspended"})
+    queue(db, {"event": "suspended", "grant_id": str(grant.id), "holder_id": _id_text(grant.user_id),
+               "holder": grant.username_at_grant, "by": by_name, "why": text(reason),
+               "next": RECONFIRM_PASSWORD if reason in (PASSWORD_NOT_OWN, cc.PASSWORD) else RECONFIRM_HOW})
+    return grant
+
+
+def end(db, grant, reason: str, *, by_id=None, by_name: Optional[str] = None, now: Optional[datetime] = None):
+    """End the open grant for good (``reason`` in ENDS): only a new grant, by two people, gives the right again.
+    In the caller's transaction, with its audit row; told after the commit."""
+    from app.core.models import AUDITOR_GRANT_OPEN
+    if grant.status not in AUDITOR_GRANT_OPEN:
+        return grant
+    now = now or utcnow()
+    before = grant.status
+    grant.status, grant.suspend_reason = "ended", reason
+    grant.ended_at = grant.updated_at = now
+    _audit_by(db, "auditor_suspended", grant, by_id, by_name, {"reason": reason, "outcome": "ended", "status": before})
+    queue(db, {"event": "ended", "grant_id": str(grant.id), "holder_id": _id_text(grant.user_id),
+               "holder": grant.username_at_grant, "by": by_name, "why": text(reason)})
+    return grant
+
+
+RECONFIRM_HOW = ("Its holder reconfirms it on the Compliance page with their password and their authenticator "
+                 "code.")
+RECONFIRM_PASSWORD = ("Its holder first sets a password of their own, then reconfirms it on the Compliance page "
+                      "with that password and their authenticator code.")
+
+
+def _id_text(value) -> Optional[str]:
+    return str(value) if value is not None else None
+
+
+def _audit_by(db, action, grant, by_id, by_name, details):
+    """The audit row of a change to a grant that another change caused, by whoever made that one."""
+    from app.services.audit_logger import AuditLogger
+    db.add(AuditLogger(db).build_row(
+        action=action, status="success", user_id=by_id, username=by_name, resource_type="user",
+        resource_id=_id_text(grant.user_id),
+        details={"grant_id": str(grant.id), "target_username": grant.username_at_grant, **details}))
+
+
+def reconfirm_problem(db, grant, holder, now: Optional[datetime] = None) -> Optional[str]:
+    """Why ``holder`` may not reconfirm ``grant`` now, or None. Only a suspended grant before its end, whose
+    account stands again as the grant requires, with the authenticator it is bound to; the step itself asks
+    for the password and a code from that authenticator."""
+    now = now or utcnow()
+    if grant.status != "suspended":
+        return NOT_SUSPENDED
+    if is_expired(grant, now):
+        return EXPIRED
+    return standing_problem(db, holder, grant, reconfirming=True)
+
+
+def reconfirm(db, grant, holder, now: Optional[datetime] = None):
+    """The holder confirms the right again (checked by the caller), in the caller's transaction."""
+    now = now or utcnow()
+    before = grant.suspend_reason
+    grant.status, grant.reconfirmed_at, grant.updated_at = "active", now, now
+    grant.suspended_at, grant.suspend_reason = None, None
+    grant.confirmed_role = _role(holder)
+    _audit(db, "auditor_reconfirmed", grant, actor=holder, details={"reason": before})
+    queue(db, {"event": "reconfirmed", "grant_id": str(grant.id), "holder_id": str(holder.id),
+               "holder": holder.username, "by": holder.username})
+    return grant
+
+
+# --------------------------------------------------------------------------- what follows from a change
+
+_TABLE = "auditor_grants"
+_HAS_TABLE = weakref.WeakSet()
+
+
+def _has_grants(db) -> bool:
+    """Whether the database has the grants table (a database built only with the tables a test needs may not,
+    and a stand-in for a session has no database at all; neither holds a grant). Remembered for the engine once
+    found."""
+    get_bind = getattr(db, "get_bind", None)
+    if get_bind is None:
+        return False
+    bind = get_bind()
+    engine = getattr(bind, "engine", bind)
+    if engine in _HAS_TABLE:
+        return True
+    from sqlalchemy import inspect
+    if inspect(bind).has_table(_TABLE):
+        _HAS_TABLE.add(engine)
+        return True
+    return False
+
+
+def after_credential_change(db, target, kind: str, *, actor_id, actor_name: str, someone_else: bool,
+                            approved: bool = False, approver_id=None) -> None:
+    """A change to ``target``'s sign-in details was just applied, in the caller's transaction (``kind`` is a
+    credential change's kind; ``someone_else`` False when the account changed its own through an
+    administrator's route; ``approved``: a held change ``approver_id`` approved, None for the server's
+    operator). Whoever made it (the one who asked, and the approver) joins the open grant's list of changers,
+    which the independence rule reads for as long as the grant stands. A second-factor reset ends the grant;
+    any other change by someone else suspends it."""
+    if not _has_grants(db):
+        return
+    grant = open_grant(db, target.id, lock=True)
+    if grant is None:
+        return
+    now = utcnow()
+    if someone_else:
+        joined = list(grant.credential_changers or [])
+        joined.append({"id": _id_text(actor_id), "name": actor_name, "kind": kind, "at": _iso(now)})
+        if approved:
+            from app.core.models import User
+            name = (db.query(User.username).filter(User.id == approver_id).scalar() if approver_id is not None
+                    else HOST_OPERATOR)
+            joined.append({"id": _id_text(approver_id), "name": name, "kind": kind, "at": _iso(now)})
+        grant.credential_changers = joined
+    if grant.status == "proposed":
+        return          # its approval checks the account again
+    if kind == cc.SECOND_FACTOR:
+        end(db, grant, FACTOR_RESET if someone_else else FACTOR_REMOVED, by_id=actor_id, by_name=actor_name, now=now)
+    elif someone_else:
+        suspend(db, grant, kind, by_id=actor_id, by_name=actor_name, now=now)
+
+
+def after_lost_standing(db, user, *, actor, because: str) -> None:
+    """``user`` is about to be demoted, deactivated, locked by an administrator or deleted (``because``), by
+    ``actor`` (None: the server's operator), in the caller's transaction. Their right in force is suspended
+    (ended, when the account is deleted), and the proposals they made are withdrawn: a proposal whose proposer
+    can no longer act is never approved."""
+    from app.core.models import AuditorGrant
+    if not _has_grants(db) or user is None or user.id is None:
+        return
+    by_id = actor.id if actor is not None else None
+    by_name = actor.username if actor is not None else HOST_OPERATOR
+    for proposal in (db.query(AuditorGrant).filter(AuditorGrant.proposed_by == user.id,
+                                                   AuditorGrant.status == "proposed").with_for_update().all()):
+        revoke(db, proposal, actor=actor, because=because)
+    grant = open_grant(db, user.id, lock=True)
+    if grant is None:
+        return
+    if because == DELETED:
+        end(db, grant, DELETED, by_id=by_id, by_name=by_name)
+    else:
+        suspend(db, grant, because, by_id=by_id, by_name=by_name)
+
+
+def after_own_factor_removed(db, user) -> None:
+    """The holder removed their own second factor, in the caller's transaction: the grant bound to it ends."""
+    if not _has_grants(db):
+        return
+    grant = open_grant(db, user.id, lock=True)
+    if grant is not None and grant.status != "proposed":
+        end(db, grant, FACTOR_REMOVED, by_id=user.id, by_name=user.username)
+
+
+def promotion_refusal(db, user) -> Optional[str]:
+    """Why ``user`` may not be made an administrator now, or None: while COMPLIANCE_AUDITOR_NOT_ADMIN is on, an
+    account with an open grant (or a proposal) is not promoted until the right is revoked."""
+    if not admin_not_allowed() or user is None or user.id is None or not _has_grants(db):
+        return None
+    if open_grant(db, user.id) is None:
+        return None
+    return (f"{user.username} holds the auditor right, or a proposal for it is waiting, and this deployment does "
+            "not let an administrator hold it (COMPLIANCE_AUDITOR_NOT_ADMIN). Revoke the right first.")
+
+
+def settle(db, now: Optional[datetime] = None) -> int:
+    """What the periodic job writes: end_due(), then what the hooks may have missed. A grant in force whose
+    account no longer stands as it requires is suspended (ended, when its authenticator is not the one it is
+    bound to, or the account is gone); a suspended grant whose account is gone, or whose authenticator is
+    gone, ends. Compliance access turned off is never written: it is computed on each request. In the
+    caller's transaction; returns how many grants changed."""
+    from app.core.models import AuditorGrant, User
+    now = now or utcnow()
+    count = end_due(db, now)
+    db.flush()
+    for grant in (db.query(AuditorGrant).filter(AuditorGrant.status.in_(("active", "suspended")))
+                  .with_for_update(skip_locked=True).all()):
+        user = db.get(User, grant.user_id) if grant.user_id is not None else None
+        if user is None:
+            end(db, grant, DELETED, now=now)
+            count += 1
+            continue
+        problem = standing_problem(db, user, grant)
+        if problem == SECOND_FACTOR:
+            end(db, grant, SECOND_FACTOR, now=now)
+            count += 1
+        elif problem is not None and grant.status == "active":
+            suspend(db, grant, problem, now=now)
             count += 1
     return count
 

@@ -10,44 +10,17 @@ with their password and an authenticator code (app/core/auditor_rights.py, app/a
 
 test_auditor_grants.py covers the rules offline.
 """
-import json
-import time
-
 import pytest
 
-from _account_change_helpers import (in_api_container, make_independent, notifications, own_password, psql,
-                                     second_admin, signed_in)
+from _account_change_helpers import notifications, own_password, psql, second_admin, signed_in
+from _auditor_helpers import audit_rows, compliance_receipt, run_pass
 from _sf_helpers import enroll_totp
 
 pytestmark = pytest.mark.integration
 
 
-def compliance_receipt(client, action, password, codes):
-    """A receipt for a compliance step: the password and a recovery code, both, every time."""
-    r = client.post("/auth/second-factor/step-up", json={"action": action, "method": "recovery",
-                                                         "code": codes.pop(0), "password": password})
-    assert r.status_code == 200, r.text
-    return {"X-Second-Factor": r.json()["receipt"]}
-
-
-def run_pass():
-    """One pass of the pruner in the web container, retried while the web app's own runner holds its lock.
-    Returns {job: whether it ran}."""
-    source = ("import json\n"
-              "from app.core import retention\n"
-              "done = retention.run_pass()\n"
-              "print(json.dumps(None if done is None else {n: r is not None for n, r in done}))\n")
-    for _ in range(30):
-        out = json.loads(in_api_container(source).stdout.strip().splitlines()[-1])
-        if out is not None:
-            return out
-        time.sleep(1)
-    raise AssertionError("the pruner's lock never came free")
-
-
 def _audit(admin, action, uid):
-    rows = admin.get("/audit/log", params={"action": action, "limit": 500}).json()
-    return [a for a in rows if a["resource_id"] == uid]
+    return audit_rows(admin, action, uid)
 
 
 @pytest.fixture
