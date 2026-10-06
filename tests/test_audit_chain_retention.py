@@ -128,6 +128,10 @@ def test_a_first_start_with_a_positive_retention_waits_like_a_request(env, monke
     seals = env.seals()
     assert [s.kind for s in seals[:3]] == ["genesis", "policy", "request"]
     assert seals[1].detail["state"]["audit_max_days"]["source"] == "held"
+    from app.api import managed_settings_router as routes
+    reg.refresh(env.session)
+    (row,) = routes.with_chain(reg.describe(["audit_max_days"]))
+    assert (row["value"], row["source"], row["stored"], row["clamped"]) == (0, "admin", 0, False)
     request = seals[2].detail
     assert (request["by"], request["setting"], request["new"], request["old"]) == ("server", "audit_max_days", 90, 0)
     with env.session() as db:

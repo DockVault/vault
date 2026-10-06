@@ -168,6 +168,14 @@ def test_the_panel_row_shows_the_chains_source_and_setting_and_the_databases_val
     assert row["database_stored"] == 300
 
 
+def test_the_panel_row_of_a_chain_setting_the_deployment_locked_still_says_locked(env):
+    from app.api import managed_settings_router as routes
+    env.run_until_sealed()
+    env.settings.settings_locked_keys = "logs_hold"
+    (row,) = routes.with_chain(reg.describe(["logs_hold"]))
+    assert (row["value"], row["source"], row["stored"], row["chain"]["source"]) == (False, "locked", None, "default")
+
+
 def test_a_change_between_the_honoured_and_the_chains_value_is_a_reduction(env):
     """The chain says 100 days (another writer's seal, set aside); the pruner keeps the log for ever. 200 keeps
     more than the chain's value and deletes sooner than the honoured one: it waits."""
