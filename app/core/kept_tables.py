@@ -114,7 +114,9 @@ def _q(name: str) -> str:
 def keep_function_body(live: str, kept: str, columns: Iterable[str]) -> str:
     """The body of the function that copies the rows deleted from ``live`` into ``kept``: every column of
     ``columns`` (the live table's, in order), the time, the reason and the actor, for the rows of vaults under
-    a hold."""
+    a hold. The time is the deleting statement's (statement_timestamp), not its transaction's start: a deletion
+    waits for the vault's row behind a placing that holds it, so its statement starts after that hold's
+    placed_at, and a case's own kept rows are told from another case's by time."""
     columns = list(columns)
     target = ", ".join(_q(c) for c in columns)
     source = ", ".join("d." + _q(c) for c in columns)
@@ -129,7 +131,7 @@ def keep_function_body(live: str, kept: str, columns: Iterable[str]) -> str:
         f"        why := '{DEFAULT_REASON}';\n"
         "    END IF;\n"
         f"    INSERT INTO {kept} ({target}, kept_at, kept_reason, kept_by)\n"
-        f"    SELECT {source}, (now() AT TIME ZONE 'utc'), why, left(who, 64)\n"
+        f"    SELECT {source}, (statement_timestamp() AT TIME ZONE 'utc'), why, left(who, 64)\n"
         "    FROM deleted d\n"
         f"    WHERE EXISTS ({_LIVE_HOLD.format(vault='d.vault_id')});\n"
         "    RETURN NULL;\n"
@@ -152,7 +154,7 @@ def _name_function_body(kind: str) -> str:
         "        INSERT INTO held_name_history (id, object_id, vault_id, kind, name, enc_name, name_key_version, "
         "renamed_at)\n"
         f"        VALUES (gen_random_uuid(), OLD.id, OLD.vault_id, '{kind}', OLD.name, OLD.enc_name, {epoch}, "
-        "(now() AT TIME ZONE 'utc'));\n"
+        "(statement_timestamp() AT TIME ZONE 'utc'));\n"
         "    END IF;\n"
         "    RETURN NULL;\n"
         "END\n")

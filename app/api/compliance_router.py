@@ -353,19 +353,30 @@ def _is_admin(user) -> bool:
     return getattr(user, "role", None) == RoleEnum.ADMIN
 
 
+def _kept_by(model, rows, viewer):
+    """Which rows of the kept table ``model`` a case's view counts. An administrator sees every case, so every row
+    kept on its vaults; anyone else (the case's auditor) only what was kept while the case's own hold stood on each
+    vault: rows another case kept before it, or after it ended, are another investigation's."""
+    from sqlalchemy import and_, or_
+    if _is_admin(viewer):
+        return model.vault_id.in_([r.vault_id for r in rows])
+    return or_(*[and_(model.vault_id == r.vault_id, model.kept_at >= r.placed_at,
+                      *([model.kept_at <= r.released_at] if r.released_at is not None else []))
+                 for r in rows])
+
+
 def _hold_view(db, case, viewer, now) -> dict:
     """A case's holds, counts and sizes only: per vault its id and the hold's dates and people; what the hold keeps
-    of all its vaults; and what ``viewer`` may do now (with why not)."""
+    of all its vaults (for its auditor, only what it kept itself); and what ``viewer`` may do now (with why not)."""
     from sqlalchemy import func
     from app.core import legal_holds as holds
     from app.core.models import HeldFile, HeldFolder, LegalHoldVault
     rows = (db.query(LegalHoldVault).filter(LegalHoldVault.case_id == case.id)
             .order_by(LegalHoldVault.vault_id).all())
-    vault_ids = [r.vault_id for r in rows]
     kept_files, kept_bytes = (db.query(func.count(HeldFile.id), func.coalesce(func.sum(HeldFile.size_bytes), 0))
-                              .filter(HeldFile.vault_id.in_(vault_ids)).one()) if vault_ids else (0, 0)
-    kept_folders = (db.query(func.count(HeldFolder.id)).filter(HeldFolder.vault_id.in_(vault_ids)).scalar()
-                    if vault_ids else 0)
+                              .filter(_kept_by(HeldFile, rows, viewer)).one()) if rows else (0, 0)
+    kept_folders = (db.query(func.count(HeldFolder.id)).filter(_kept_by(HeldFolder, rows, viewer)).scalar()
+                    if rows else 0)
 
     def may(refusal):
         why = refusal(db, case, viewer, now)

@@ -107,7 +107,8 @@ def test_the_keep_function_copies_every_live_column_in_order_for_held_vaults_onl
     target = ", ".join(f'"{c[0]}"' for c in FILES)
     source = ", ".join(f'd."{c[0]}"' for c in FILES)
     assert f"INSERT INTO held_files ({target}, kept_at, kept_reason, kept_by)" in body
-    assert f"SELECT {source}, (now() AT TIME ZONE 'utc'), why, left(who, 64)" in body
+    # The deleting statement's time, which comes after the vault lock it waits for: not its transaction's start.
+    assert f"SELECT {source}, (statement_timestamp() AT TIME ZONE 'utc'), why, left(who, 64)" in body
     assert "FROM deleted d" in body
     assert ("WHERE EXISTS (SELECT 1 FROM legal_hold_vaults h WHERE h.vault_id = d.vault_id "
             "AND h.released_at IS NULL)") in body

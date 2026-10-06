@@ -859,6 +859,34 @@ def test_a_refused_step_is_recorded_and_asks_for_no_code(db, people, steps):
     assert steps == [("compliance.hold.place", "ada")]
 
 
+def test_an_auditor_counts_only_what_their_own_hold_kept(db, people, steps, monkeypatch):
+    """Rows kept on the same vault under another case, before the auditor's hold or after it ended, are that
+    case's: an administrator sees every case and counts them all; the auditor does not."""
+    uma = _user(db, "uma")
+    _live_auditor(monkeypatch, uma, {"live": True, "why": None})
+    _place(db, people.bob, [people.v1], now=NOW - timedelta(days=1))       # another case, standing throughout
+
+    def kept_at(when, size):
+        row = _keep(db, people.v1, size=size)
+        row.kept_at = when
+        db.commit()
+
+    kept_at(NOW - timedelta(hours=1), 1000)        # before the auditor's hold
+    mine = cr.place_hold(_body([people.v1]), _request(), uma, db)
+    kept_at(NOW + timedelta(hours=1), 7)            # while it stands
+    _keep(db, people.v1, folder=True).kept_at = NOW + timedelta(hours=2)
+    db.commit()
+    cr.release_hold(uuid.UUID(mine["id"]), cr.Reason(reason="done"), _request(), uma, db)
+    db.query(m.LegalHoldVault).filter(m.LegalHoldVault.case_id == uuid.UUID(mine["id"])).update(
+        {m.LegalHoldVault.released_at: NOW + timedelta(hours=3)}, synchronize_session=False)
+    db.commit()
+    kept_at(NOW + timedelta(hours=4), 50)           # after it ended
+    (view,) = [c for c in cr.list_holds(uma, db)["cases"] if c["id"] == mine["id"]]
+    assert view["kept"] == {"files": 1, "bytes": 7, "folders": 1}
+    (admin_view,) = [c for c in cr.list_holds(people.ada, db)["cases"] if c["id"] == mine["id"]]
+    assert admin_view["kept"] == {"files": 3, "bytes": 1057, "folders": 1}
+
+
 def test_a_case_only_shows_counts_and_sizes(db, people, steps):
     view = cr.place_hold(_body([people.v1]), _request(), people.ada, db)
     _keep(db, people.v1, size=123)
