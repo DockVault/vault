@@ -284,10 +284,11 @@ def test_a_value_written_into_the_database_is_neither_shown_nor_followed(admin):
          "DO UPDATE SET value = CAST('10' AS json), version = (SELECT max(version) + 1 FROM managed_settings)")
     change = None
     try:
-        shown = _wait_for(lambda: (lambda r: r if r["stored"] == 10 else None)(
+        shown = _wait_for(lambda: (lambda r: r if r["database_stored"] == 10 else None)(
             {r["key"]: r for r in admin.get("/settings/managed").json()["settings"]}["audit_max_days"]), timeout=30)
         assert shown, "the web process never read the stored value"
         assert shown["value"] == chain_value and shown["chain"]["value"] == chain_value
+        assert shown["stored"] == (state["setting"] if state["source"] in ("setting", "clamped", "held") else None)
         with second_admin(admin) as (account, client):
             r = _put(client, account["_password"], "audit_max_days", wanted)
         assert r.status_code == 200, r.text

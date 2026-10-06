@@ -135,7 +135,8 @@ def test_a_value_written_into_the_database_never_turns_an_admins_raise_into_a_re
         db.commit()
     reg.refresh(env.session)
     (row,) = routes.with_chain(reg.describe(["audit_max_days"]))
-    assert (row["value"], row["chain"]["value"], row["stored"]) == (0, 0, 10)
+    assert (row["value"], row["chain"]["value"], row["stored"], row["database_stored"]) == (0, 0, None, 10)
+    assert (row["source"], row["clamped"]) == (row["chain"]["source"], False)
     outcome = _change(env, _admin(env), "audit_max_days", 400)
     assert outcome.status == "pending" and outcome.old == 0
     assert env.seals()[-1].kind == "request"
@@ -143,6 +144,28 @@ def test_a_value_written_into_the_database_never_turns_an_admins_raise_into_a_re
     with env.session() as db:
         assert db.get(AuditLog, old) is not None
     assert "unjustified" not in failures(env.verify())
+
+
+def test_the_panel_row_shows_the_chains_source_and_setting_and_the_databases_value_apart(env, monkeypatch):
+    """An administrator's 400 days, clamped to 365 by a ceiling .env sets later; then 300 written into the
+    database without the key. The row shows the chain's: 365, set by an administrator as 400, clamped."""
+    from app.api import managed_settings_router as routes
+    env.run_until_sealed()
+    assert _change(env, _admin(env), "audit_max_days", 400).status == "pending"
+    _passes(env, 7 * 24 + 6)
+    monkeypatch.setenv("PLAN_LOG_MAX_DAYS", "365")
+    env.settings.plan_log_max_days = 365
+    env.clock.advance(minutes=5)
+    env.seal()
+    entry = env.st.view.newest_state()["audit_max_days"]
+    assert (entry["value"], entry["source"], entry["setting"]) == (365, "clamped", 400)
+    with env.session() as db:
+        reg.store(db, "audit_max_days", 300)
+        db.commit()
+    reg.refresh(env.session)
+    (row,) = routes.with_chain(reg.describe(["audit_max_days"]))
+    assert (row["value"], row["source"], row["stored"], row["clamped"]) == (365, "admin", 400, True)
+    assert row["database_stored"] == 300
 
 
 def test_a_change_between_the_honoured_and_the_chains_value_is_a_reduction(env):

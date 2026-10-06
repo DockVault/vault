@@ -95,16 +95,27 @@ def spec_or_404(key: str) -> registry.SettingSpec:
     return spec
 
 
+# Where the chain's entry came from, as the panel names where a value came from.
+_CHAIN_SOURCE = {"setting": registry.SOURCE_ADMIN, "clamped": registry.SOURCE_ADMIN, "held": registry.SOURCE_ADMIN,
+                 "env": registry.SOURCE_ENV, "default": registry.SOURCE_DEFAULT}
+
+
 def with_chain(rows: list) -> list:
-    """Each row of a setting the audit chain records shows, as its value, the one the pruner acts on (the
-    chain's honoured entry), with that entry beside it: the database's stored value alone decides nothing, so
-    a value written into the database without the chain's key is never shown as in force."""
+    """Each row of a setting the audit chain records shows what the pruner acts on (the chain's honoured
+    entry): its value, where it came from, the administrator's setting behind it, and the entry itself beside
+    them. The database's stored value alone decides nothing, so a value written into the database without the
+    chain's key is never shown as in force; it is shown apart, as ``database_stored``."""
     entries = chain_seals.honoured_entries()
     for row in rows:
         entry = entries.get(row["key"])
         if entry is None:
             continue
+        row["database_stored"] = row.get("stored")
         row["value"] = entry.get("value")
+        if row.get("source") != registry.SOURCE_LOCKED:
+            row["source"] = _CHAIN_SOURCE.get(entry.get("source"), row.get("source"))
+        row["stored"] = entry.get("setting") if row["source"] == registry.SOURCE_ADMIN else None
+        row["clamped"] = entry.get("source") == "clamped"
         row["chain"] = {"value": entry.get("value"), "setting": entry.get("setting"), "source": entry.get("source")}
     return rows
 
