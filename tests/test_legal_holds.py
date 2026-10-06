@@ -494,6 +494,47 @@ def test_after_a_lapse_its_placer_cannot_place_again_on_those_vaults_for_30_days
     assert _place(db, people.ada, [people.v1], now=NOW + timedelta(days=7 + 30, seconds=1)).status == "hold_only"
 
 
+@pytest.mark.parametrize("by", ["placer", "another"])
+def test_a_hold_released_unconfirmed_blocks_its_placer_as_a_lapse_does(db, people, by):
+    """Releasing one's own unconfirmed hold before it lapses and placing another at once would keep deleted data
+    for good with no second person ever agreeing. A hold that ended unconfirmed, however it ended, blocks its
+    placer on those vaults for 30 days."""
+    case = _place(db, people.ada, [people.v1])
+    released = NOW + timedelta(days=6)
+    holds.release(db, case, by=people.ada if by == "placer" else people.bob, reason="again", now=released)
+    db.commit()
+    assert _refused(holds.place_hold_only, db, people.ada, [people.v1.id], now=released + timedelta(minutes=1),
+                    **TEXT).reason == holds.PLACE_BLOCKED
+    db.rollback()
+    assert _place(db, people.bob, [people.v1], now=released + timedelta(minutes=2)).status == "hold_only"
+    assert _place(db, people.ada, [people.v1], now=released + timedelta(days=30, seconds=1)).status == "hold_only"
+
+
+def test_a_confirmed_hold_released_does_not_block_its_placer(db, people):
+    case = _place(db, people.ada, [people.v1])
+    holds.confirm(db, case, by=people.bob, now=NOW + timedelta(hours=1))
+    holds.release(db, case, by=people.ada, reason="done", now=NOW + timedelta(days=2))
+    db.commit()
+    assert _place(db, people.ada, [people.v1], now=NOW + timedelta(days=2, minutes=1)).status == "hold_only"
+
+
+def test_releasing_and_placing_again_never_keeps_a_deleted_file_past_its_purge(db, people):
+    """The rolling case the block ends: one person cannot carry a kept file forward through unconfirmed holds."""
+    from sqlalchemy.orm import sessionmaker
+    case = _place(db, people.ada, [people.v1])
+    kept = _keep(db, people.v1)
+    kept_id, kept_path = kept.id, kept.storage_path
+    holds.release(db, case, by=people.ada, reason="again", now=NOW + timedelta(days=6))
+    db.commit()
+    assert _refused(holds.place_hold_only, db, people.ada, [people.v1.id], now=NOW + timedelta(days=6, minutes=1),
+                    **TEXT).reason == holds.PLACE_BLOCKED
+    db.rollback()
+    destroyed = []
+    holds.purge(sessionmaker(bind=db.get_bind()), now=NOW + timedelta(days=13), destroy=destroyed.extend)
+    db.expire_all()
+    assert db.get(m.HeldFile, kept_id) is None and destroyed == [kept_path]
+
+
 # --------------------------------------------------------------------------- the review prompt
 
 def test_a_review_is_asked_for_once_per_period_and_answering_starts_the_next(db, people, told):

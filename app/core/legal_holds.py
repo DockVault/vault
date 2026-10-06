@@ -87,8 +87,8 @@ TEXTS = {
     TOO_MANY_VAULTS: "that is more vaults than one case may hold (COMPLIANCE_MAX_CASE_VAULTS)",
     NO_SUCH_VAULT: "one of those vaults does not exist",
     PLACER_CONCERNED: "you own one of those vaults: a hold on it must be placed by someone it does not concern",
-    PLACE_BLOCKED: (f"a hold you placed on one of those vaults lapsed unconfirmed less than {PLACE_BLOCK_DAYS} days "
-                    "ago: another person must place the next one"),
+    PLACE_BLOCKED: (f"a hold you placed on one of those vaults ended unconfirmed (it lapsed, or it was released) "
+                    f"less than {PLACE_BLOCK_DAYS} days ago: another person must place the next one"),
     SFTP_VERSION: "an SFTP server of another version may be running",
     BAD_PURPOSE: "choose what the case is for",
     BAD_BASIS: "choose the case's legal basis",
@@ -382,11 +382,15 @@ def _lock_vaults(db, vault_ids: List[uuid.UUID]) -> list:
 
 
 def _check_block(db, placer, vault_ids, now: datetime) -> None:
+    """Refuse a placing by whoever placed a hold on one of ``vault_ids`` that ended unconfirmed (it lapsed, or it
+    was released before anyone confirmed it) less than PLACE_BLOCK_DAYS ago. Releasing one's own unconfirmed hold
+    and placing another would otherwise keep deleted data for good with no second person ever agreeing."""
     from app.core.models import LegalHoldVault
     since = now - timedelta(days=PLACE_BLOCK_DAYS)
     blocked = (db.query(LegalHoldVault.vault_id)
                .filter(LegalHoldVault.vault_id.in_(vault_ids), LegalHoldVault.placed_by == placer.id,
-                       LegalHoldVault.lapsed_at.isnot(None), LegalHoldVault.lapsed_at > since).first())
+                       LegalHoldVault.confirmed_at.is_(None), LegalHoldVault.released_at.isnot(None),
+                       LegalHoldVault.released_at > since).first())
     if blocked is not None:
         raise HoldRefused(PLACE_BLOCKED)
 

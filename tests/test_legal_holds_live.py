@@ -357,6 +357,23 @@ def test_a_refused_decision_is_recorded_under_its_case(admin, admins, vaults):
                 f"'hold_confirmed' AND case_id = '{case_id}'") == "failure|placer"
 
 
+def test_a_placer_who_releases_their_own_unconfirmed_hold_cannot_place_another_at_once(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+    r = _decide(admins["ada"], r.json()["id"], "release", {"reason": "placing it again"})
+    assert r.status_code == 200, r.text
+    r = _place(admins["ada"], [vid])
+    if r.status_code == 201:
+        cases.append(r.json()["id"])
+    assert r.status_code == 409 and r.json()["detail"]["reason"] == "place_blocked", r.text
+    r = _place(admins["bob"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+
+
 def _host(*args):
     """The host's compliance tool as dockvault.py runs it: python -m, inside the web container."""
     r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.host_compliance", *args],
