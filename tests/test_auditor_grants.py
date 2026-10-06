@@ -281,6 +281,17 @@ def test_a_change_pruned_since_the_proposal_still_refuses_who_made_it(db, people
     assert rights.approver_refusal(db, grant, bob) == ind.CHANGED_ACCOUNT
 
 
+def test_the_changes_are_read_as_they_stand_too_not_only_from_the_snapshot(db, people, settings):
+    ada, bob, uma = people.ada, people.bob, people.uma
+    change = cc.record_made(db, kind=cc.EMAIL, target_id=uma.id, requester_id=bob.id, requester_name="bob")
+    change.applied_at = rights.utcnow() - timedelta(days=10)
+    db.commit()
+    grant = _proposed(db, uma, ada)
+    grant.proposal_snapshot = None
+    db.commit()
+    assert rights.approver_refusal(db, grant, bob) == ind.CHANGED_ACCOUNT
+
+
 def test_an_approver_without_an_authenticator_is_not_counted_independent(db, people, settings):
     grant = _proposed(db, people.uma, people.ada)
     db.query(SecondFactorEnrollment).filter(SecondFactorEnrollment.user_id == people.bob.id).delete()
@@ -542,6 +553,13 @@ def test_only_the_end_of_the_outermost_transaction_drops_the_notices(db, people,
     assert len(db.info[rights._NOTICES]) == 1
     rights._after_transaction_end(db, SimpleNamespace(parent=None))
     assert rights._NOTICES not in db.info
+
+
+def test_the_email_always_goes_and_says_what_changed():
+    from app.core import email_actions
+    spec = email_actions.SPEC_BY_KEY[rights.EMAIL_ACTION]
+    assert spec["category"] == email_actions.SYSTEM, "no switch turns it off"
+    assert "{{action.change}}" in spec["default_body_html"]
 
 
 def test_every_active_administrator_and_the_account_are_told_in_the_app_and_by_email(db, people, monkeypatch):
