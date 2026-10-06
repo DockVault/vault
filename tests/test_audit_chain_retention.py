@@ -294,6 +294,28 @@ def test_an_admins_value_removed_from_the_database_where_the_deployments_keeps_m
     assert failures(env.verify()) == []
 
 
+@pytest.mark.parametrize("stored", [True, None])
+def test_the_database_value_of_a_setting_the_deployment_locked_is_neither_a_veto_nor_a_finding(env, stored):
+    """With the hold switch locked by the deployment, what reads the database ignores its value too: a value
+    there that would keep more is no veto, and none beside the chain's administrator's setting is no finding."""
+    env.run_until_sealed()
+    if stored is None:
+        _change(env, _admin(env), "logs_hold", True)
+    env.settings.settings_locked_keys = "logs_hold"
+    with env.session() as db:                       # straight into the table: the registry refuses a locked key
+        row = db.get(ManagedSetting, "logs_hold")
+        if row is None:
+            db.add(ManagedSetting(key="logs_hold", value=stored, version=99))
+        else:
+            row.value = stored
+        db.commit()
+    reg.refresh(env.session)
+    before = len(env.seals())
+    _passes(env, 12)
+    assert not [s for s in env.seals()[before:] if s.kind == "policy"]
+    assert "unjustified-input" not in (env.st.head_store().load().get("failures") or {})
+
+
 def test_no_value_in_the_database_beside_a_chain_entry_with_no_setting_is_no_finding(env):
     env.run_until_sealed()
     _passes(env, 12)

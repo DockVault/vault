@@ -600,6 +600,24 @@ def test_after_a_restart_the_status_shows_the_seals_warnings_before_the_chain_is
     assert "late" not in shown and "veto-from-database" not in shown
 
 
+def test_while_the_head_record_cannot_be_written_the_status_takes_the_seals_warnings_from_the_view(env, monkeypatch):
+    """A late seal committed while its head record write fails: the record's copy of the warnings lacks it,
+    and the status, from a process that has read the chain, shows it all the same."""
+    env.row(T0 - timedelta(hours=3, minutes=10))
+    env.run_until_sealed()
+    env.row(ai.hour_floor(T0 - timedelta(hours=3, minutes=10)) + timedelta(minutes=40))
+
+    def refuse(self):
+        raise RuntimeError("the head record could not be written")
+    with monkeypatch.context() as m:
+        m.setattr(ai.ChainWriter, "_write_record", refuse)
+        env.clock.advance(minutes=20)
+        env.seal()
+    late = env.st.view.late_seqs[-1]
+    assert late not in ((env.st.head_store().load().get("view_warnings") or {}).get("late") or [])
+    assert ai.status(env.st)["warnings"]["late"]["seqs"] == [late]
+
+
 def test_warnings_kept_by_kind_are_acknowledged_with_the_failures(env):
     env.run_until_sealed()
     ai.report_failures(env.st, None, {}, {"sealed-at-backwards": "seal 9 steps back",
