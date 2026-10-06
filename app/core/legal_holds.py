@@ -78,6 +78,7 @@ NOTHING_TO_REVIEW = "nothing_to_review"
 NOTHING_TO_UNDO = "nothing_to_undo"
 UNDO_TOO_LATE = "undo_too_late"
 PLACER = "placer"
+STARTER_CHANGED = "starter_changed"
 
 TEXTS = {
     ACCESS_OFF: "compliance access is turned off on this deployment (COMPLIANCE_ACCESS=disabled)",
@@ -103,6 +104,8 @@ TEXTS = {
     NOTHING_TO_UNDO: "no release of this case can be undone",
     UNDO_TOO_LATE: "the purge after that release has begun: it can no longer be undone",
     PLACER: "the person who placed the hold cannot confirm it",
+    STARTER_CHANGED: ("someone else changed your sign-in details, or added an SSH key to your account, since the "
+                      "case started: an independent administrator must do this"),
     # The independence rule's reasons, said of a case (whoever started it: its auditor, or the administrator who
     # placed a hold-only case).
     "not_able": "only an active administrator who is not locked can do this",
@@ -217,6 +220,27 @@ def decider_refusal(db, case, person, now: Optional[datetime] = None) -> Optiona
 
 def is_case_auditor(case, person) -> bool:
     return person is not None and str(getattr(person, "id", "")) == str(case.auditor_id)
+
+
+def starter_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[str]:
+    """Why ``person``, who started ``case`` (its auditor, or the administrator who placed a hold-only case), may
+    not review or release its holds on their own now, or None. They may while they still stand as they did: an
+    auditor whose right is in force (auditor_rights.auditor_live), or an administrator able to act
+    (credential_changes.can_approve) whose password is their own and whose sign-in details nobody else has changed
+    since the case started. A starter who lost that standing, or whoever took over their account, does not end a
+    hold alone: an independent administrator does (decider_refusal)."""
+    from app.core import auditor_rights, credential_changes as cc, password_origin
+    now = now or utcnow()
+    standing_now = auditor_rights.auditor_live(db, person, now)
+    if standing_now.live:
+        return None
+    if not cc.can_approve(person):
+        return standing_now.reason if case.grant_id is not None else "not_able"
+    if password_origin.is_set_by_other(person):
+        return ind.PASSWORD_NOT_OWN
+    if auditor_rights._changed_since(db, person, case.requested_at) is not None:
+        return STARTER_CHANGED
+    return None
 
 
 # --------------------------------------------------------------------------- the SFTP guard
@@ -486,6 +510,15 @@ def confirm(db, case, *, by=None, now: Optional[datetime] = None) -> int:
 
 # --------------------------------------------------------------------------- reviewing
 
+def review_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[str]:
+    """Why ``person`` may not say that ``case``'s hold is still needed, or None: as for a release."""
+    if not standing(db, case.id):
+        return NOTHING_TO_REVIEW
+    if is_case_auditor(case, person):
+        return starter_refusal(db, case, person, now)
+    return decider_refusal(db, case, person, now)
+
+
 def review(db, case, *, by, now: Optional[datetime] = None) -> int:
     """Record that the hold is still needed (``hold_reviewed``). Returns how many holds."""
     now = now or utcnow()
@@ -527,10 +560,12 @@ def prompt_reviews(db, now: Optional[datetime] = None) -> int:
 # --------------------------------------------------------------------------- releasing and undoing
 
 def release_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[str]:
+    """Why ``person`` may not release ``case``'s holds, or None: the case's starter while they stand as they did
+    (starter_refusal), or an independent administrator (decider_refusal)."""
     if not standing(db, case.id):
         return NOTHING_TO_RELEASE
     if is_case_auditor(case, person):
-        return None
+        return starter_refusal(db, case, person, now)
     return decider_refusal(db, case, person, now)
 
 

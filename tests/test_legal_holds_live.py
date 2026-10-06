@@ -396,3 +396,66 @@ def test_the_host_confirms_a_hold_only_when_no_administrator_can(admin, admins, 
                 f"AND case_id = '{case_id}'") == "operator@host"
 
 
+def _release_as(account, codes, case_id, reason):
+    client = signed_in_with_code(account, codes)
+    return client, client.post(f"/compliance/cases/{case_id}/hold/release", json={"reason": reason},
+                               headers=compliance_receipt(client, "compliance.hold.decide", account["_password"],
+                                                          codes))
+
+
+def test_a_demoted_placer_no_longer_releases_the_hold_alone(admin, admins, vaults):
+    made, cases = vaults
+    ada, _ada_c, ada_codes = admins["ada"]
+    r = _place(admins["ada"], [made[0]["id"]])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    r = admin.patch(f"/api/user-management/users/{ada['id']}/role", json={"new_role": "user"})
+    assert r.status_code == 200, r.text
+    try:
+        _client, r = _release_as(ada, ada_codes, case_id, "no longer an administrator")
+        assert r.status_code == 403 and r.json()["detail"]["reason"] == "not_able", r.text
+    finally:
+        admin.patch(f"/api/user-management/users/{ada['id']}/role", json={"new_role": "admin"})
+    assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' AND released_at IS NULL") == "1"
+    assert psql(f"SELECT status FROM compliance_cases WHERE id = '{case_id}'") == "hold_only"
+    assert psql(f"SELECT status || '|' || (details::jsonb ->> 'reason') FROM audit_logs WHERE action = "
+                f"'hold_released' AND case_id = '{case_id}'") == "failure|not_able"
+    r = _decide(admins["bob"], case_id, "release", {"reason": "an independent administrator releases it"})
+    assert r.status_code == 200, r.text
+
+
+def test_an_auditor_whose_right_was_revoked_no_longer_releases_the_hold_alone(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    uma, _uma_c, uma_codes = new_auditor_account(admin)
+    try:
+        grant_right(admins, uma["id"])
+        client = signed_in_with_code(uma, uma_codes)
+        r = client.post("/compliance/holds", json={"vault_ids": [vid], **TEXT},
+                        headers=compliance_receipt(client, "compliance.hold.place", uma["_password"], uma_codes))
+        assert r.status_code == 201, r.text
+        case_id = r.json()["id"]
+        cases.append(case_id)
+        # An auditor lists only the cases they started: not an administrator's hold on another vault.
+        r = _place(admins["ada"], [made[1]["id"]])
+        assert r.status_code == 201, r.text
+        cases.append(r.json()["id"])
+        assert [c["id"] for c in client.get("/compliance/holds").json()["cases"]] == [case_id]
+        assert r.json()["id"] in [c["id"] for c in admin.get("/compliance/holds").json()["cases"]]
+        r = admin.delete(f"/users/{uma['id']}/auditor")
+        assert r.status_code == 200, r.text
+        client, r = _release_as(uma, uma_codes, case_id, "my right was revoked")
+        assert client.get("/compliance/holds").status_code == 403
+        assert r.status_code == 403 and r.json()["detail"]["reason"] == "no_grant", r.text
+        assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' AND released_at IS NULL") == "1"
+        assert psql(f"SELECT status FROM compliance_cases WHERE id = '{case_id}'") == "hold_only"
+    finally:
+        # The case names uma (its auditor): the cases go first, then the account can.
+        psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE vault_id = '{vid}' AND released_at IS NULL")
+        for cid in list(cases):
+            psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
+        forget_grants(uma["id"])
+        admin.delete_user(uma["id"])
+
+

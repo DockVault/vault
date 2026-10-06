@@ -546,6 +546,78 @@ def test_the_placer_or_an_independent_administrator_releases_with_a_reason(db, p
     assert titles == ["Legal hold on your vaults", "Legal hold released"]
 
 
+def _live_auditor(monkeypatch, person, state):
+    """``person`` holds an auditor right in force while state["live"] (else the reason in state["why"])."""
+    grant = SimpleNamespace(id=uuid.uuid4())
+    real = auditor_rights.auditor_live
+
+    def live(db_, user, now=None):
+        if user is not None and user.id == person.id:
+            return auditor_rights.Standing(state["live"], None if state["live"] else state["why"], grant)
+        return real(db_, user, now)
+    monkeypatch.setattr(auditor_rights, "auditor_live", live)
+
+
+def test_an_auditor_who_started_the_case_releases_and_reviews_it_only_while_their_right_is_in_force(
+        db, people, monkeypatch):
+    uma = _user(db, "uma")
+    state = {"live": True, "why": None}
+    _live_auditor(monkeypatch, uma, state)
+    case = _place(db, uma, [people.v1])
+    assert case.grant_id is not None
+    for refusal in (holds.release_refusal, holds.review_refusal, cr._release_refusal, cr._review_refusal):
+        assert refusal(db, case, uma, NOW) is None
+    state.update(live=False, why=auditor_rights.NO_GRANT)        # revoked
+    for refusal in (holds.release_refusal, holds.review_refusal, cr._release_refusal, cr._review_refusal):
+        assert refusal(db, case, uma, NOW) == auditor_rights.NO_GRANT
+    state.update(why=auditor_rights.SUSPENDED)
+    assert holds.release_refusal(db, case, uma, NOW) == auditor_rights.SUSPENDED
+
+
+def _changed_by(db, target, by, at):
+    db.add(m.CredentialChange(target_user_id=target.id, kind="password", status="made", requested_by_id=by.id,
+                              requested_by_name=by.username, requested_at=at, applied_at=at))
+    db.commit()
+
+
+@pytest.mark.parametrize("vector", ["demoted", "deactivated", "locked", "password_set_by_other",
+                                    "sign_in_changed_by_other", "ssh_key_added_by_other"])
+def test_an_administrator_who_placed_a_hold_ends_it_alone_only_while_they_stand_as_they_did(db, people, vector):
+    case = _place(db, people.ada, [people.v1])
+    after = NOW + timedelta(hours=1)
+    ada = people.ada
+    assert holds.release_refusal(db, case, ada, after) is None and holds.review_refusal(db, case, ada, after) is None
+    expected = "not_able"
+    if vector == "demoted":
+        ada.role = m.RoleEnum.USER
+    elif vector == "deactivated":
+        ada.is_active = False
+    elif vector == "locked":
+        ada.is_locked, ada.locked_until = True, None        # an administrator's lock: no end time
+    elif vector == "password_set_by_other":
+        ada.password_set_by, ada.password_set_by_other_at = people.bob.id, after
+        expected = ind.PASSWORD_NOT_OWN
+    elif vector == "sign_in_changed_by_other":
+        _changed_by(db, ada, people.bob, after)
+        expected = holds.STARTER_CHANGED
+    else:
+        db.add(m.UserSSHKey(user_id=ada.id, name="k", public_key="ssh-ed25519 AAAA test", fingerprint="SHA256:x",
+                            created_by=people.bob.id, created_at=after))
+        expected = holds.STARTER_CHANGED
+    db.commit()
+    at = after + timedelta(minutes=1)
+    assert holds.release_refusal(db, case, ada, at) == expected
+    assert holds.review_refusal(db, case, ada, at) == expected
+    carl = _user(db, "carl", m.RoleEnum.ADMIN)
+    assert holds.release_refusal(db, case, carl, at) is None, "an independent administrator still may"
+
+
+def test_a_change_to_the_starters_sign_in_details_before_the_case_started_does_not_count(db, people):
+    _changed_by(db, people.ada, people.bob, NOW - timedelta(days=1))
+    case = _place(db, people.ada, [people.v1])
+    assert holds.release_refusal(db, case, people.ada, NOW + timedelta(hours=1)) is None
+
+
 def test_a_raised_purge_delay_counts_and_a_lowered_one_does_not(db, people, settings):
     case = _place(db, people.ada, [people.v1])
     settings[cs.HOLD_PURGE_DELAY_DAYS] = 10

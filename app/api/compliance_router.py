@@ -390,7 +390,8 @@ def _hold_view(db, case, viewer, now) -> dict:
 
 
 # Who may take each step (a refusal reason, or None). Only an administrator confirms or undoes a release; the
-# case's own auditor (or the administrator who placed a hold-only case) may also review and release it.
+# case's own auditor (or the administrator who placed a hold-only case) may also review and release it, while
+# they still stand as they did when they started it (legal_holds.starter_refusal).
 
 def _confirm_refusal(db, case, person, now=None):
     from app.core import legal_holds as holds
@@ -399,11 +400,9 @@ def _confirm_refusal(db, case, person, now=None):
 
 def _review_refusal(db, case, person, now=None):
     from app.core import legal_holds as holds
-    if not holds.standing(db, case.id):
-        return holds.NOTHING_TO_REVIEW
-    if holds.is_case_auditor(case, person):
-        return None
-    return holds.decider_refusal(db, case, person, now) if _is_admin(person) else holds.NOT_ALLOWED
+    if not _is_admin(person) and not holds.is_case_auditor(case, person):
+        return holds.NOT_ALLOWED
+    return holds.review_refusal(db, case, person, now)
 
 
 def _release_refusal(db, case, person, now=None):
