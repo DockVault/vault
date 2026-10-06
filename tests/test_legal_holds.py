@@ -562,6 +562,35 @@ def test_a_kept_file_waits_for_the_latest_release_of_its_vault(db, people):
     assert _purge(db, NOW + timedelta(days=12), destroyed)[0] == 1
 
 
+# --------------------------------------------------------------------------- the rollback marker
+
+def _marker(db):
+    return db.execute(__import__("sqlalchemy").text(
+        "SELECT requires_at_least, reason, undo FROM data_requirements WHERE key = 'legal-holds'")).first()
+
+
+def test_the_marker_follows_the_holds_and_the_kept_rows(db, people):
+    from app.core import legal_hold_marker
+    assert legal_hold_marker.sync(db) is False and _marker(db) is None
+    case = _place(db, people.ada, [people.v1])
+    row = _marker(db)
+    assert row is not None and "Legal holds keep files deleted from vaults" in row[1] and "Release every" in row[2]
+    _keep(db, people.v1)
+    holds.release(db, case, by=people.ada, reason="r", now=NOW)
+    db.commit()
+    assert _marker(db) is not None, "kept rows wait for their purge"
+    db.close = lambda: None
+    _purge(db, NOW + timedelta(days=7), [])
+    assert _marker(db) is None
+
+
+def test_releasing_a_hold_that_kept_nothing_removes_the_marker_at_once(db, people):
+    case = _place(db, people.ada, [people.v1])
+    holds.release(db, case, by=people.ada, reason="r", now=NOW)
+    db.commit()
+    assert _marker(db) is None
+
+
 # --------------------------------------------------------------------------- the routes
 
 @pytest.fixture

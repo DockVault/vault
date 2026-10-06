@@ -24966,6 +24966,9 @@ END $$;""",
                 kept_tables.install(db)
                 db.commit()
                 recorder.record(kept_step, SchemaStep.OUTCOME_APPLIED)
+                # While holds stand or kept rows remain, an older release must not start on this data.
+                from app.core import legal_hold_marker
+                legal_hold_marker.check_at_start()
             except Exception as e:
                 db.rollback()
                 print(f"⚠ Legal hold tables and triggers skipped: {e}")

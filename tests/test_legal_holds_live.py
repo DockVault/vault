@@ -1,0 +1,349 @@
+"""Legal holds on a running stack (app/core/legal_holds.py, the hold routes in app/api/compliance_router.py, the blob
+gate in app/services/vault_service.py, app/core/legal_hold_marker.py).
+
+  * the full flow: an administrator places a hold on a vault with the password and an authenticator code, an
+    independent one confirms it; every way the web app deletes a file (a delete, a folder's delete, a same-name
+    replacement, a cross-vault move, the expiry sweep) and the SFTP server's remove keep the row and the stored
+    bytes, which still decrypt, while for the vault's people the file is gone; the owner is told; the storage page
+    counts what is kept; an older release is kept from starting (the marker row, and the host's
+    downgrade-blockers); release, undo, release again, then the purge secure-deletes and records each file;
+  * a hold placed while a deletion holds the vault's row waits for it, and the next deletion is kept;
+  * a hold nobody confirms lapses, and its placer cannot place another on that vault for 30 days;
+  * a hold is refused while an SFTP server of another version may be running;
+  * a refused step is recorded under its case.
+
+test_legal_holds.py, test_blob_gate.py, test_kept_storage.py and test_legal_hold_marker.py cover the rules
+offline; test_kept_tables_live.py the triggers.
+"""
+import os
+import subprocess
+import time
+import uuid
+
+import pytest
+
+from _account_change_helpers import API, DB, in_api_container, notifications, psql
+from _auditor_helpers import compliance_receipt, run_pass, two_admins
+from conftest import ADMIN_PASS, ADMIN_USER, unique
+
+pytestmark = pytest.mark.integration
+
+SFTP_HOST = os.environ.get("VAULT_SFTP_HOST", "127.0.0.1")
+SFTP_PORT = int(os.environ.get("VAULT_SFTP_PORT", "2322"))
+TEXT = {"purpose": "litigation_hold", "legal_basis": "legal_obligation",
+        "justification": "Preserve the records named in the claim served last week.",
+        "owner_note": "Files deleted from your vault are kept for a legal matter."}
+
+
+def _upload(client, vid, name, content, folder_id=None):
+    r = client.post(f"/vaults/{vid}/files", files=[("files", (name, content, "text/plain"))],
+                    params={"folder_id": folder_id} if folder_id else None)
+    r.raise_for_status()
+    return r.json()["files"][0]["id"]
+
+
+def _folder(client, vid, name):
+    r = client.post(f"/vaults/{vid}/folders", json={"name": name, "parent_folder_id": None})
+    r.raise_for_status()
+    return r.json()["folder"]["id"]
+
+
+def _place(who, vault_ids):
+    account, client, codes = who
+    return client.post("/compliance/holds", json={"vault_ids": vault_ids, **TEXT},
+                       headers=compliance_receipt(client, "compliance.hold.place", account["_password"], codes))
+
+
+def _decide(who, case_id, step, body=None):
+    account, client, codes = who
+    return client.post(f"/compliance/cases/{case_id}/hold/{step}", json=body,
+                       headers=compliance_receipt(client, "compliance.hold.decide", account["_password"], codes))
+
+
+def _kept(file_id):
+    return psql(f"SELECT kept_reason || '|' || coalesce(kept_by, '') FROM held_files WHERE id = '{file_id}'")
+
+
+_OPEN = """
+import uuid
+from app.core.authorization import PermissionService
+from app.core.database import get_db_context
+from app.core.models import HeldFile, Vault
+from app.services.vault_service import VaultService
+with get_db_context() as db:
+    kept = db.get(HeldFile, uuid.UUID(FILE_ID))
+    vault = db.get(Vault, kept.vault_id)
+    data, name, _mime = VaultService(db, PermissionService(db))._open_stored_file(kept, vault, kept.id)
+    print("OPEN=" + data.decode() + "|" + name)
+"""
+
+
+def _open_kept(file_id):
+    out = in_api_container(f"FILE_ID = '{file_id}'\n" + _OPEN)
+    return [ln for ln in out.stdout.splitlines() if ln.startswith("OPEN=")][0][5:]
+
+
+def _blob_exists(file_id):
+    path = psql(f"SELECT storage_path FROM held_files WHERE id = '{file_id}'") or \
+        psql(f"SELECT storage_path FROM files WHERE id = '{file_id}'")
+    return subprocess.run(["docker", "exec", API, "test", "-f", f"storage/{path}"], timeout=30).returncode == 0
+
+
+def _forget(case_ids, vault_ids):
+    """Release and purge, straight in the database, what a test left (its records are otherwise kept)."""
+    for vid in vault_ids:
+        psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE vault_id = '{vid}' AND released_at IS NULL")
+        for table in ("held_files", "held_folders", "held_name_history"):
+            psql(f"DELETE FROM {table} WHERE vault_id = '{vid}'")
+    for cid in case_ids:
+        psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
+    in_api_container("from app.core import legal_hold_marker\nlegal_hold_marker.check_at_start()\n")
+
+
+@pytest.fixture
+def admins(admin):
+    with two_admins(admin) as people:
+        yield people
+
+
+@pytest.fixture
+def vaults(admin):
+    """Two vaults of the session's administrator: the one held, and another to move into."""
+    made = [admin.create_vault(name=unique("held")), admin.create_vault(name=unique("other"))]
+    cases = []
+    try:
+        yield made, cases
+    finally:
+        _forget(cases, [v["id"] for v in made])
+        for v in made:
+            admin.delete_vault(v["id"])
+
+
+def test_the_full_flow_keeps_every_deletion_until_the_purge(admin, admins, vaults):
+    made, cases = vaults
+    vid, other = made[0]["id"], made[1]["id"]
+    deleted = _upload(admin, vid, "deleted.txt", b"deleted bytes")
+    folder = _folder(admin, vid, unique("dir"))
+    inner = _upload(admin, vid, "inner.txt", b"inner bytes", folder_id=folder)
+    replaced = _upload(admin, vid, "same.txt", b"first version")
+    moved = _upload(admin, vid, "moved.txt", b"moved bytes")
+    me = admin.get("/users/me").json()
+
+    # Without the code and the password, nothing is placed.
+    ada, ada_c, _codes = admins["ada"]
+    assert ada_c.post("/compliance/holds", json={"vault_ids": [vid], **TEXT}).status_code == 403
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    case = r.json()
+    cases.append(case["id"])
+    assert case["status"] == "hold_only" and case["number"].startswith("C-")
+    assert case["you_may"]["confirm"]["why_not"]["reason"] == "placer"
+    # The owner is told at once, with the case's number and no name or justification.
+    told = [n for n in notifications(admin, "legal_hold") if case["number"] in (n.get("body") or "")]
+    assert told and TEXT["justification"] not in told[0]["body"]
+    r = _decide(admins["bob"], case["id"], "confirm")
+    assert r.status_code == 200 and r.json()["holds"][0]["confirmed_by"] == admins["bob"][0]["_username"], r.text
+
+    # Every way the web app deletes: for the vault's people the file is gone; the hold keeps it.
+    assert admin.post(f"/vaults/{vid}/files/{deleted}/delete").status_code == 200
+    assert admin.get(f"/vaults/{vid}/files/{deleted}/download").status_code == 404
+    assert _kept(deleted) == f"deleted|{me['id']}"
+    assert admin.post(f"/vaults/{vid}/folders/{folder}/delete").status_code == 200
+    assert _kept(inner) == f"deleted|{me['id']}"
+    assert psql(f"SELECT count(*) FROM held_folders WHERE id = '{folder}'") == "1"
+    _upload(admin, vid, "same.txt", b"second version")
+    assert _kept(replaced) == f"replaced|{me['id']}"
+    r = admin.post(f"/vaults/{vid}/files/{moved}/move", json={"dest_vault_id": other})
+    assert r.status_code == 200, r.text
+    assert _kept(moved) == f"moved|{me['id']}"
+    # The stored bytes stay, and decrypt to what was uploaded, under the kept name.
+    for file_id, content, name in ((deleted, "deleted bytes", "deleted.txt"), (inner, "inner bytes", "inner.txt"),
+                                   (replaced, "first version", "same.txt"), (moved, "moved bytes", "moved.txt")):
+        assert _blob_exists(file_id), file_id
+        assert _open_kept(file_id) == f"{content}|{name}"
+    assert psql(f"SELECT count(*) FROM audit_logs WHERE action = 'held_file_kept' AND resource_id IN "
+                f"('{deleted}', '{inner}', '{replaced}', '{moved}')") == "4"
+
+    # The storage page counts what is kept; an older release is kept from starting.
+    stats = admin.get("/storage/stats").json()
+    assert stats["kept_for_cases"]["files"] >= 4 and stats["on_disk_bytes"] >= stats["used"] + 4 * 10
+    assert psql("SELECT requires_at_least FROM data_requirements WHERE key = 'legal-holds'") != ""
+    out = subprocess.run(["docker", "exec", API, "python", "-m", "app.core.host_operator", "downgrade-blockers",
+                          "--target", "0.33.1"], capture_output=True, text=True, timeout=180)
+    assert '"legal-holds"' in out.stdout.strip().splitlines()[-1], out.stdout[-500:]
+
+    # The vault cannot be deleted while it keeps them; nothing of it is lost by trying.
+    assert admin.delete_vault(vid).status_code != 200
+    assert psql(f"SELECT count(*) FROM vaults WHERE id = '{vid}'") == "1" and _blob_exists(deleted)
+
+    # Release, undo, release again: the purge waits for the delay.
+    r = _decide(admins["ada"], case["id"], "release", {"reason": "The claim was withdrawn."})
+    assert r.status_code == 200 and r.json()["status"] == "closed", r.text
+    r = _decide(admins["bob"], case["id"], "undo-release")
+    assert r.status_code == 200 and r.json()["holds"][0]["standing"] is True, r.text
+    r = _decide(admins["bob"], case["id"], "release", {"reason": "Settled."})
+    assert r.status_code == 200, r.text
+    assert run_pass()["legal_holds"] is True
+    assert _kept(deleted) != "" and _blob_exists(deleted), "the delay is not over"
+    psql(f"UPDATE legal_hold_vaults SET purge_after = (now() AT TIME ZONE 'utc') - interval '1 minute' "
+         f"WHERE case_id = '{case['id']}'")
+    assert run_pass()["legal_holds"] is True
+    for file_id in (deleted, inner, replaced, moved):
+        assert _kept(file_id) == "" and not _blob_exists(file_id), file_id
+    assert psql(f"SELECT count(*) FROM held_folders WHERE id = '{folder}'") == "0"
+    assert psql(f"SELECT count(*) FROM audit_logs WHERE action = 'held_file_purged' AND resource_id IN "
+                f"('{deleted}', '{inner}', '{replaced}', '{moved}')") == "4"
+    assert psql("SELECT count(*) FROM data_requirements WHERE key = 'legal-holds'") == "0" or \
+        psql("SELECT count(*) FROM legal_hold_vaults WHERE released_at IS NULL") != "0"
+    # Every step is on record under the case.
+    actions = psql(f"SELECT string_agg(DISTINCT action, ',') FROM audit_logs WHERE case_id = '{case['id']}'")
+    for action in ("hold_placed", "hold_confirmed", "hold_released", "hold_release_undone", "case_closed"):
+        assert action in actions.split(","), action
+
+
+def test_expiry_under_a_hold_is_kept_and_marked_held_by_case(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    r = admin.patch(f"/vaults/{vid}/settings", json={"expire_files_after_days": 1, "expire_files_unit": "days"})
+    assert r.status_code == 200, r.text
+    f = _upload(admin, vid, "expiring.txt", b"expiring bytes")
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+    psql(f"UPDATE files SET expires_at = (now() AT TIME ZONE 'utc') - interval '1 minute' WHERE id = '{f}'")
+    in_api_container("from app.core.authorization import PermissionService\n"
+                     "from app.core.database import get_db_context\n"
+                     "from app.services.vault_service import VaultService\n"
+                     "with get_db_context() as db:\n"
+                     "    print(VaultService(db, PermissionService(db)).cleanup_expired_files())\n")
+    assert psql(f"SELECT count(*) FROM files WHERE id = '{f}'") == "0"
+    assert _kept(f) == "expired|system"
+    assert psql(f"SELECT details::jsonb ->> 'held_by_case' FROM audit_logs WHERE action = 'file_expired' "
+                f"AND resource_id = '{f}'") == "true"
+    assert _blob_exists(f) and _open_kept(f) == "expiring bytes|expiring.txt"
+
+
+@pytest.mark.sftp
+def test_the_sftp_servers_remove_and_replacement_are_kept(admin, admins, vaults):
+    paramiko = pytest.importorskip("paramiko")
+    if not ADMIN_PASS:
+        pytest.skip("No admin password (set VAULT_ADMIN_PASS)")
+    made, cases = vaults
+    vid, vname = made[0]["id"], made[0]["name"]
+    removed = _upload(admin, vid, "sftp-removed.txt", b"sftp removed")
+    replaced = _upload(admin, vid, "sftp-same.txt", b"sftp first")
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+    transport.banner_timeout = 30
+    try:
+        transport.connect(username=ADMIN_USER, password=ADMIN_PASS)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        sftp.remove(f"/{vname}/sftp-removed.txt")
+        with sftp.open(f"/{vname}/sftp-same.txt", "wb") as fh:
+            fh.write(b"sftp second")
+        sftp.close()
+    finally:
+        transport.close()
+    assert _kept(removed).startswith("deleted|") and _kept(replaced).startswith("replaced|")
+    assert _open_kept(removed) == "sftp removed|sftp-removed.txt"
+    assert _open_kept(replaced) == "sftp first|sftp-same.txt"
+
+
+def test_a_hold_placed_while_a_delete_holds_the_vault_waits_and_the_next_delete_is_kept(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    f = _upload(admin, vid, "after.txt", b"after the hold")
+    ada, ada_c, ada_codes = admins["ada"]
+    receipt = compliance_receipt(ada_c, "compliance.hold.place", ada["_password"], ada_codes)
+    # A deletion's transaction holds the vault's row (FOR NO KEY UPDATE, as every deleting path takes it).
+    holder = subprocess.Popen(["docker", "exec", DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-Atc",
+                               f"BEGIN; SELECT id FROM vaults WHERE id = '{vid}' FOR NO KEY UPDATE; "
+                               "SELECT pg_sleep(3); COMMIT;"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and psql(
+                "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(3)%' AND state = 'active' "
+                "AND pid <> pg_backend_pid()") == "0":
+            time.sleep(0.1)
+        started = time.monotonic()
+        r = ada_c.post("/compliance/holds", json={"vault_ids": [vid], **TEXT}, headers=receipt)
+        waited = time.monotonic() - started
+    finally:
+        holder.wait(timeout=30)
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+    assert waited >= 1.5, f"the placing did not wait for the deletion's lock ({waited:.2f}s)"
+    assert admin.post(f"/vaults/{vid}/files/{f}/delete").status_code == 200
+    assert _kept(f).startswith("deleted|")
+
+
+def test_an_unconfirmed_hold_lapses_and_its_placer_waits_30_days(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    psql("UPDATE legal_hold_vaults SET placed_at = (now() AT TIME ZONE 'utc') - interval '8 days', "
+         "confirm_by_deadline = (now() AT TIME ZONE 'utc') - interval '1 day' "
+         f"WHERE case_id = '{case_id}'")
+    assert run_pass()["legal_holds"] is True
+    assert psql(f"SELECT (lapsed_at IS NOT NULL) || '|' || (released_at IS NOT NULL) FROM legal_hold_vaults "
+                f"WHERE case_id = '{case_id}'") == "true|true"
+    assert psql(f"SELECT status FROM compliance_cases WHERE id = '{case_id}'") == "closed"
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 409 and r.json()["detail"]["reason"] == "place_blocked", r.text
+    assert psql("SELECT count(*) FROM audit_logs WHERE action = 'hold_placed' AND status = 'failure' "
+                f"AND user_id = '{admins['ada'][0]['id']}'") != "0"
+    r = _place(admins["bob"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+
+
+def test_a_hold_is_refused_while_an_sftp_server_of_another_version_runs(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    fake = str(uuid.uuid4())
+    psql(f"INSERT INTO sftp_processes (id, version, host, started_at, seen_at) VALUES ('{fake}', '0.32.9', "
+         "'old-sftp', now() AT TIME ZONE 'utc', now() AT TIME ZONE 'utc')")
+    try:
+        r = _place(admins["ada"], [vid])
+        assert r.status_code == 409 and r.json()["detail"]["reason"] == "sftp_version", r.text
+        assert "0.32.9" in r.json()["detail"]["text"]
+        assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE vault_id = '{vid}'") == "0"
+    finally:
+        psql(f"DELETE FROM sftp_processes WHERE id = '{fake}'")
+    # With SFTP on and no server that has said its version lately, it is refused too. (The stack's own server
+    # says it again within 30 seconds; a placing that raced it is tried again.)
+    for _ in range(3):
+        psql("UPDATE sftp_processes SET seen_at = (now() AT TIME ZONE 'utc') - interval '10 minutes'")
+        r = _place(admins["ada"], [vid])
+        if r.status_code != 201:
+            break
+        cases.append(r.json()["id"])
+        psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE case_id = '{r.json()['id']}'")
+    assert r.status_code == 409 and r.json()["detail"]["reason"] == "sftp_version", r.text
+    assert "has reported its version" in r.json()["detail"]["text"]
+    # This stack's own SFTP server reports this version, so once it has, the hold is placed.
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline and psql(
+            "SELECT count(*) FROM sftp_processes WHERE seen_at > (now() AT TIME ZONE 'utc') - interval '1 minute'") == "0":
+        time.sleep(2)
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+
+
+def test_a_refused_decision_is_recorded_under_its_case(admin, admins, vaults):
+    made, cases = vaults
+    r = _place(admins["ada"], [made[0]["id"]])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    ada, ada_c, _codes = admins["ada"]
+    r = ada_c.post(f"/compliance/cases/{case_id}/hold/confirm")
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "placer", r.text
+    assert psql(f"SELECT status || '|' || (details::jsonb ->> 'reason') FROM audit_logs WHERE action = "
+                f"'hold_confirmed' AND case_id = '{case_id}'") == "failure|placer"

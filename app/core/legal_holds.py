@@ -440,6 +440,7 @@ def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basi
           f"{placer.username} placed a legal hold under case {case.number} on {len(vaults)} vault"
           f"{'' if len(vaults) == 1 else 's'}. Another administrator must confirm it by {deadline:%Y-%m-%d}, "
           "or it lapses.")
+    _sync_marker(db)
     return case
 
 
@@ -571,6 +572,7 @@ def release(db, case, *, by=None, reason: str, now: Optional[datetime] = None) -
         _tell(db, case, "Legal hold released",
               f"{name} released the legal hold of case {case.number}. What it kept is purged after "
               f"{purge_at:%Y-%m-%d}, unless an administrator undoes the release first.")
+    _sync_marker(db)
     return len(holds)
 
 
@@ -627,6 +629,7 @@ def undo_release(db, case, *, by, now: Optional[datetime] = None) -> int:
                        "undone: the hold stands again.")
         _tell(db, case, "Legal hold restored",
               f"{by.username} undid the release of the legal hold of case {case.number}: it stands again.")
+    _sync_marker(db)
     return len(holds)
 
 
@@ -666,6 +669,8 @@ def lapse_due(db, now: Optional[datetime] = None) -> int:
         _tell(db, case, "Legal hold lapsed",
               f"Nobody confirmed the legal hold of case {case.number} in time, so it lapsed. Its placer cannot "
               f"place another unconfirmed hold on those vaults for {PLACE_BLOCK_DAYS} days.")
+    if count:
+        _sync_marker(db)
     return count
 
 
@@ -740,6 +745,7 @@ def purge(session_factory, *, now: Optional[datetime] = None, batch: int = 200,
                     .delete(synchronize_session=False))
             if gone and record:
                 record(db, gone, model.__tablename__)
+        _sync_marker(db)
         db.commit()
     except BaseException:
         db.rollback()
@@ -757,6 +763,11 @@ def _destroy_blobs(paths) -> None:
     from app.services.vault_service import VaultService
     with get_db_context() as db:
         VaultService(db, PermissionService(db))._destroy_blobs(paths)
+
+
+def _sync_marker(db) -> None:
+    from app.core import legal_hold_marker
+    legal_hold_marker.sync(db)
 
 
 # --------------------------------------------------------------------------- the host
