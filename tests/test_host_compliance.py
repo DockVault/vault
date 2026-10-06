@@ -374,3 +374,28 @@ def test_the_host_operator_answers_downgrade_blockers_as_dockvault_update_reads_
     spec.loader.exec_module(dv)
     assert dv.parse_downgrade_blockers(done.value.obj) == [
         {"key": "levels", "requires_at_least": "0.34.0", "reason": "Recording levels", "undo": None}]
+
+
+def test_the_account_tool_run_as_a_program_refuses_a_bad_version_with_its_own_answer(db, monkeypatch):
+    """Run as a program, the account tool is __main__: a refusal raised by another module's copy of it would not
+    be the answer its run() catches, and the process would die with a traceback instead of answering."""
+    import importlib.util
+    from contextlib import contextmanager
+    from app.core import audit_privacy, database
+    spec = importlib.util.spec_from_file_location("host_operator_as_a_program",
+                                                  Path(__file__).resolve().parent.parent / "app" / "core" /
+                                                  "host_operator.py")
+    program = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(program)
+
+    @contextmanager
+    def same_db():
+        yield db
+
+    monkeypatch.setattr(database, "get_db_context", same_db)
+    monkeypatch.setattr(audit_privacy, "require", lambda: None)
+    for target in ("next", None):
+        argv = ["downgrade-blockers"] + (["--target", target] if target else [])
+        with pytest.raises(program._Answer) as done:
+            program._run(program.build_parser().parse_args(argv), None)
+        assert done.value.code == 2 and "--target" in done.value.obj["error"]
