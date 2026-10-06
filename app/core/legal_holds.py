@@ -9,8 +9,9 @@ reading, uploading and deleting, and for them a deletion is done.
 Placing. A hold-only case (no content, no names: counts and sizes only) is placed by a live auditor or an
 administrator who is not a person the case concerns (an owner of one of its vaults), with the compliance
 step-up, and takes effect at once: each vault's row is locked FOR UPDATE first, which waits for a deletion that
-holds the vault's row lock, so the hold covers every deletion that commits after it. The owner of each vault is
-told in the placing transaction; the administrators after it.
+holds the vault's row lock, so the hold covers every deletion that commits after it. It is refused while an SFTP
+server of another version may run (sftp_guard): an older SFTP server's own delete would destroy the blob the
+trigger keeps the row of. The owner of each vault is told in the placing transaction; the administrators after it.
 
 Confirming. A different person, independent of the one who placed it by the one rule every two-person step uses
 (app/core/independence.py), confirms it within COMPLIANCE_HOLD_CONFIRM_DAYS, or the server's operator does on the
@@ -62,6 +63,7 @@ TOO_MANY_VAULTS = "too_many_vaults"
 NO_SUCH_VAULT = "no_such_vault"
 PLACER_CONCERNED = "placer_concerned"
 PLACE_BLOCKED = "place_blocked"
+SFTP_VERSION = "sftp_version"
 BAD_PURPOSE = "bad_purpose"
 BAD_BASIS = "bad_basis"
 NO_LIA_REFERENCE = "no_lia_reference"
@@ -83,6 +85,7 @@ TEXTS = {
     PLACER_CONCERNED: "you own one of those vaults: a hold on it must be placed by someone it does not concern",
     PLACE_BLOCKED: (f"a hold you placed on one of those vaults lapsed unconfirmed less than {PLACE_BLOCK_DAYS} days "
                     "ago: another person must place the next one"),
+    SFTP_VERSION: "an SFTP server of another version may be running",
     BAD_PURPOSE: "choose what the case is for",
     BAD_BASIS: "choose the case's legal basis",
     NO_LIA_REFERENCE: "legitimate interests need the reference of the balancing test",
@@ -208,6 +211,17 @@ def decider_refusal(db, case, person, now: Optional[datetime] = None) -> Optiona
 
 def is_case_auditor(case, person) -> bool:
     return person is not None and str(getattr(person, "id", "")) == str(case.auditor_id)
+
+
+# --------------------------------------------------------------------------- the SFTP guard
+
+def sftp_guard(db) -> None:
+    """Refuse a step that makes a hold stand while an SFTP server of another version may run: an SFTP
+    server older than the triggers' release deletes a held file's blob even though the trigger keeps its row."""
+    from app.core.sftp_versions import sftp_same_version
+    check = sftp_same_version(db)
+    if not check.ok:
+        raise HoldRefused(SFTP_VERSION, detail=check.explain())
 
 
 # --------------------------------------------------------------------------- recording and telling
@@ -392,6 +406,7 @@ def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basi
     owners = {str(v.owner_id) for v in vaults if v.owner_id is not None}
     if str(placer.id) in owners:
         raise HoldRefused(PLACER_CONCERNED, code=403)
+    sftp_guard(db)
     _check_block(db, placer, ids, now)
 
     standing_grant = auditor_rights.auditor_live(db, placer)

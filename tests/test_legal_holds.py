@@ -62,6 +62,19 @@ def told(monkeypatch):
     return out
 
 
+@pytest.fixture(autouse=True)
+def sftp_same(monkeypatch):
+    """Every SFTP server runs this version, unless a test sets ``check`` (an answer) or clears it (the real check,
+    against SftpProcess rows and the environment ``env``)."""
+    from app.core import sftp_versions
+    real = sftp_versions.sftp_same_version
+    state = {"check": sftp_versions.VersionCheck(True, sftp_versions.SAME, ("0.34.0",)), "env": {}}
+    monkeypatch.setattr(sftp_versions, "sftp_same_version",
+                        lambda db_, **_k: state["check"] if state["check"] is not None
+                        else real(db_, environ=state["env"], version="0.34.0"))
+    return state
+
+
 @pytest.fixture
 def settings(monkeypatch):
     values = {key: cs.current(key) for key in cs.KEYS}
@@ -232,6 +245,58 @@ def test_each_vault_is_locked_for_update_before_its_hold_is_written(db, people, 
     import inspect
     source = inspect.getsource(real)
     assert ".with_for_update()" in source and "key_share" not in source
+
+
+# --------------------------------------------------------------------------- the SFTP guard
+
+@pytest.fixture
+def sftp_real(sftp_same):
+    """The real check; returns the environment it reads."""
+    sftp_same["check"] = None
+    return sftp_same["env"]
+
+
+def _sftp(db, version, *, seen=None):
+    db.add(m.SftpProcess(id=str(uuid.uuid4()), version=version, host="sftp", started_at=NOW,
+                         seen_at=seen or datetime.utcnow()))
+    db.commit()
+
+
+def test_a_hold_is_refused_while_an_sftp_server_of_another_version_runs(db, people, sftp_real):
+    _sftp(db, "0.33.2")
+    refused = _refused(holds.place_hold_only, db, people.ada, [people.v1.id], **TEXT)
+    assert refused.reason == holds.SFTP_VERSION and "0.33.2" in refused.detail
+    assert db.query(m.LegalHoldVault).count() == 0 and db.query(m.ComplianceCase).count() == 0
+
+
+def test_a_hold_is_refused_while_sftp_is_on_and_no_server_has_said_its_version(db, people, sftp_real):
+    _sftp(db, "0.34.0", seen=datetime.utcnow() - timedelta(minutes=10))   # long gone
+    refused = _refused(holds.place_hold_only, db, people.ada, [people.v1.id], **TEXT)
+    assert refused.reason == holds.SFTP_VERSION and "has reported its version" in refused.detail
+
+
+def test_a_hold_is_placed_when_every_sftp_server_runs_this_version_or_none_runs(db, people, sftp_real):
+    _sftp(db, "0.34.0")
+    assert _place(db, people.ada, [people.v1], now=datetime.utcnow()).status == "hold_only"
+    db.query(m.SftpProcess).delete()
+    db.commit()
+    sftp_real["VAULT_COMBINED_SFTP"] = "off"
+    assert _place(db, people.bob, [people.v2], now=datetime.utcnow()).status == "hold_only"
+
+
+def test_undoing_a_release_is_refused_by_the_same_guard(db, people, sftp_same, monkeypatch):
+    from app.core import sftp_versions
+    case = _place(db, people.ada, [people.v1])
+    holds.release(db, case, by=people.ada, reason="settled", now=NOW + timedelta(days=1))
+    db.commit()
+    sftp_same["check"] = sftp_versions.VersionCheck(False, sftp_versions.OTHER_VERSION, ("0.33.2",))
+    monkeypatch.setattr(cr, "STEP_UP_HOLD_DECIDE", lambda *_a: None)
+    monkeypatch.setattr(holds, "utcnow", lambda: NOW + timedelta(days=2))
+    with pytest.raises(HTTPException) as refused:
+        cr.undo_hold_release(case.id, SimpleNamespace(headers={}), people.bob, db)
+    assert refused.value.status_code == 409 and refused.value.detail["reason"] == holds.SFTP_VERSION
+    assert holds.standing(db, case.id) == []
+    assert _rows(db, "hold_release_undone")[-1].status == "failure"
 
 
 # --------------------------------------------------------------------------- confirming

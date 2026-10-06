@@ -484,12 +484,14 @@ def _check_decision(case_id, current_user, db, *, action: str, refusal, lock: bo
     return case
 
 
-def _take_decision(case_id, current_user, db, *, action: str, refusal, step):
-    """Under the case's lock, the refusal checked again, then the step taken and committed. Every refusal is
-    recorded."""
+def _take_decision(case_id, current_user, db, *, action: str, refusal, step, guard: bool = False):
+    """Under the case's lock, the refusal checked again, then the step taken and committed (the SFTP guard first
+    with ``guard``). Every refusal is recorded."""
     from app.core import legal_holds as holds
     case = _check_decision(case_id, current_user, db, action=action, refusal=refusal, lock=True)
     try:
+        if guard:
+            holds.sftp_guard(db)
         step(case)
         db.commit()
     except holds.HoldRefused as refused:
@@ -535,9 +537,9 @@ def release_hold(case_id: uuid.UUID, body: Reason, request: Request,
 def undo_hold_release(case_id: uuid.UUID, request: Request, current_user: User = Depends(require_interactive_admin),
                       db: Session = Depends(get_db)):
     """Undo the release of a case's legal hold before what it kept is purged: the same holds stand again, with
-    their confirmation. An independent administrator."""
+    their confirmation. An independent administrator. Refused while an SFTP server of another version may run."""
     from app.core import legal_holds as holds
     _check_decision(case_id, current_user, db, action="hold_release_undone", refusal=_undo_refusal)
     STEP_UP_HOLD_DECIDE(db, current_user, request)
     return _take_decision(case_id, current_user, db, action="hold_release_undone", refusal=_undo_refusal,
-                          step=lambda case: holds.undo_release(db, case, by=current_user))
+                          guard=True, step=lambda case: holds.undo_release(db, case, by=current_user))
