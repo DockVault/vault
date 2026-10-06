@@ -29,6 +29,7 @@ told of each step, in the app and by email, after the commit (deliver()).
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Optional
@@ -221,16 +222,14 @@ def proposal_snapshot(db, *, proposer_id, subject_id, at: datetime) -> dict:
 
 
 def approver_refusal(db, grant, approver, now: Optional[datetime] = None) -> Optional[str]:
-    """Why ``approver`` (an account) may not approve or turn down ``grant`` as the independent second
-    administrator, or None when they may."""
+    """Why ``approver`` (an account) may not approve ``grant`` as the independent second administrator, or None
+    when they may."""
     from app.core import admin_grants, password_origin
     from app.core.models import User
     now = now or utcnow()
     if not cc.can_approve(approver):
         return NOT_ABLE
     proposer = db.get(User, grant.proposed_by) if grant.proposed_by is not None else None
-    if approver.id == grant.proposed_by:
-        return ind.ASKED
     if proposer is None or not cc.can_approve(proposer):
         return PROPOSER_GONE
     subject = db.get(User, grant.user_id) if grant.user_id is not None else None
@@ -428,7 +427,6 @@ def propose(db, user, *, proposer, note: Optional[str] = None, now: Optional[dat
     The caller has checked the preconditions; the one-open-grant index refuses a second open grant."""
     from app.core.models import AuditorGrant
     from app.core.security import seal_case_field
-    import uuid
     now = now or utcnow()
     grant = AuditorGrant(id=uuid.uuid4(), user_id=user.id, username_at_grant=user.username, status="proposed",
                          proposed_by=proposer.id, proposed_by_username=proposer.username, proposed_at=now,
@@ -634,7 +632,7 @@ def deliver(notices: Iterable[dict]) -> None:
             people = {str(a.id): a for a in admins}
             holder_id = notice.get("holder_id")
             if holder_id:
-                holder = db.query(User).filter(User.id == holder_id).first()
+                holder = db.query(User).filter(User.id == uuid.UUID(str(holder_id))).first()
                 if holder is not None:
                     people.setdefault(str(holder.id), holder)
             api._notify_users(list(people), NOTICE_TYPE, title=title, body=body, target="#compliance")

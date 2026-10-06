@@ -37,6 +37,8 @@ from app.core.security import open_case_field  # noqa: E402
 pytestmark = pytest.mark.unit
 
 OLD = timedelta(days=400)
+# The real delivery, before the fixture below stands in for it.
+DELIVER = rights.deliver
 
 
 @pytest.fixture
@@ -322,6 +324,7 @@ def test_an_account_has_one_open_grant(db, people, settings, steps):
     refused = _refused(_propose, db, people.uma, people.bob)
     assert refused.status_code == 409 and refused.detail["reason"] == rights.OPEN_GRANT
     assert db.query(AuditorGrant).count() == 1
+    assert ("compliance.grant.propose", "bob") not in steps, "refused before any code is asked for"
 
 
 def test_nothing_is_proposed_or_approved_while_compliance_access_is_off(db, people, settings, steps):
@@ -402,6 +405,9 @@ def test_a_proposal_lapses_after_seven_days(db, people, settings, steps):
     assert refused.status_code == 409 and refused.detail["reason"] == rights.LAPSED
     young = _proposed(db, people.bob, people.ada, at=rights.utcnow() - timedelta(days=6, hours=23))
     assert rights.is_lapsed(young) is False
+    # To the second: the proposal lapses at seven days exactly.
+    assert rights.is_lapsed(young, young.proposed_at + timedelta(days=7)) is True
+    assert rights.is_lapsed(young, young.proposed_at + timedelta(days=7, seconds=-1)) is False
 
 
 def test_turning_a_proposal_down(db, people, settings, steps, told):
@@ -416,6 +422,15 @@ def test_turning_a_proposal_down(db, people, settings, steps, told):
     assert open_case_field(grant.id, grant.reject_reason_enc, "grant_reject_reason") == "Not needed this year"
     assert [n["event"] for n in told] == ["rejected"]
     assert _refused(_approve, db, out["id"], people.bob).detail["reason"] == rights.NOT_PROPOSED
+
+
+def test_the_account_a_proposal_is_for_cannot_turn_it_down(db, people, settings, steps):
+    out = _propose(db, people.bob, people.ada)
+    refused = _refused(cr.reject_auditor_grant, uuid.UUID(out["id"]), cr.Reason(reason="no"), _request(),
+                       current_user=people.bob, db=db)
+    assert refused.status_code == 403 and refused.detail["reason"] == ind.OWN_ACCOUNT
+    assert db.get(AuditorGrant, uuid.UUID(out["id"])).status == "proposed"
+    assert ("compliance.grant.approve", "bob") not in steps
 
 
 def test_revoking_takes_one_administrator_and_ends_a_proposal_too(db, people, settings, steps, told):
@@ -527,6 +542,33 @@ def test_only_the_end_of_the_outermost_transaction_drops_the_notices(db, people,
     assert len(db.info[rights._NOTICES]) == 1
     rights._after_transaction_end(db, SimpleNamespace(parent=None))
     assert rights._NOTICES not in db.info
+
+
+def test_every_active_administrator_and_the_account_are_told_in_the_app_and_by_email(db, people, monkeypatch):
+    from contextlib import contextmanager
+    from app.api import api_server as api
+    from app.core import database
+    gone = _user(db, "gil", RoleEnum.ADMIN)
+    gone.is_active = False
+    db.commit()
+    sent = {}
+
+    @contextmanager
+    def same_db():
+        yield db
+
+    monkeypatch.setattr(database, "get_db_context", same_db)
+    monkeypatch.setattr(api, "_notify_users", lambda ids, ntype, title, body, target: sent.setdefault(
+        "app", []).append((sorted(ids), ntype, title, target)))
+    monkeypatch.setattr(api, "_fire_action_email_bulk", lambda db_, key, recipients, ctx: sent.setdefault(
+        "email", []).append((key, sorted(recipients), ctx["change"])))
+    DELIVER([{"event": "granted", "holder_id": str(people.uma.id), "holder": "uma", "by": "bob",
+              "proposed_by": "ada", "expires_at": "2027-10-06T00:00:00Z"}])
+    expected = sorted(str(u.id) for u in (people.ada, people.bob, people.uma))
+    assert sent["app"] == [(expected, "auditor_right", "Auditor right granted", "#compliance")]
+    key, recipients, change = sent["email"][0]
+    assert key == "auditor_right" and change.startswith("uma now holds the auditor right")
+    assert recipients == sorted((u.email, u.username) for u in (people.ada, people.bob, people.uma))
 
 
 @pytest.mark.parametrize("event", ["proposed", "granted", "rejected", "revoked", "lapsed", "expired", "suspended",
