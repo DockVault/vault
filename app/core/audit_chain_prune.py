@@ -66,7 +66,7 @@ def _materialise(w, hour: datetime, salt: Optional[bytes], wr) -> None:
     if salt is None:
         return
     ai = _ai()
-    nonceless = [r["id"] for r in ai.iter_rows(w.db, hour, hour + ai.HOUR) if r.get("seal_nonce") is None]
+    nonceless = [row["id"] for row in ai.iter_rows(w.db, hour, hour + ai.HOUR) if row["seal_nonce"] is None]
     for row_id in nonceless:
         w.db.query(A).filter(A.id == row_id).update({A.seal_nonce: fmt.legacy_nonce(salt, row_id)},
                                                     synchronize_session=False)
