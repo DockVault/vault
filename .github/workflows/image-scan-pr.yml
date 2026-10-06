@@ -89,7 +89,7 @@ jobs:
       # (a base-image update, or the build's `apk upgrade` taking a newer package), the statement
       # suppresses nothing and only misleads; the check says what to remove, or to review again.
       - name: Generate the SPDX SBOM (amd64)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/dockvault/vault:v0.0.0-amd64
           format: spdx-json
@@ -123,7 +123,7 @@ jobs:
             --source-revision "$SOURCE_REVISION"
 
       - name: Scan the built image (amd64)
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: ghcr.io/dockvault/vault:v0.0.0-amd64
           grype-version: v0.112.0
