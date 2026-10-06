@@ -304,6 +304,26 @@ class ChainState:
     def current_key(self) -> keys.ChainKey:
         return keys.current(self.cfg())
 
+    def restore_mark(self) -> Optional[dict]:
+        """The restore mark beside the head record (a restore of a whole backup not finished), or None."""
+        from app.core import audit_head_record
+        try:
+            return audit_head_record.read_mark(self.head_store().path)
+        except Exception:  # noqa: BLE001 -- a path that cannot be looked at holds no mark
+            return None
+
+    def holds_deletion(self) -> Optional[str]:
+        """Why the pruner may delete, erase or rewrite nothing now, or None: a restore of a whole backup not
+        finished (its mark), or the grace after a restore still running."""
+        if self.restore_mark() is not None:
+            return "a restore is not finished: run dockvault.py audit accept-restore"
+        if self.view.position:
+            from app.core import audit_chain_honour as honour
+            until = honour.grace_until(self.view, self.known_record(), self.clock())
+            if until is not None:
+                return f"the grace after a restore runs until {fmt.time_text(until)}"
+        return None
+
     def known_record(self) -> Optional[dict]:
         """The head record as this process knows it: its copy, with the seals it accepted after it and has not
         written into it yet."""
@@ -646,7 +666,7 @@ class ChainWriter:
                                    seal.seq)
         listed = _record_lists(record, view.generation, seal.seq, link)
         if not listed:
-            problem = face_problem(view, seal, st.clock(), first_acceptance=True)
+            problem = face_problem(view, seal, st.clock(), first_acceptance=True, record=self.record)
             if problem:
                 raise ChainStopped("after-record-invalid", f"seal {seal.seq}: {problem}", seal.seq)
             # The delay honoured when the server first accepted it: a request among them waits that long from
@@ -862,7 +882,8 @@ def key_sequence_problem(view: View, seal: Seal) -> Optional[str]:
     return None
 
 
-def face_problem(view: View, seal: Seal, now: datetime, *, first_acceptance: bool = False) -> Optional[str]:
+def face_problem(view: View, seal: Seal, now: datetime, *, first_acceptance: bool = False,
+                 record: Optional[dict] = None) -> Optional[str]:
     """Why a seal another writer appended is refused on its face, judged by the chain up to it, or None."""
     if seal.kind not in KINDS:
         return f"unknown kind {seal.kind!r}"
@@ -889,7 +910,7 @@ def face_problem(view: View, seal: Seal, now: datetime, *, first_acceptance: boo
     # Every rule audit verify applies to the seal's kind (a late seal's root, a prune's policy seal, an
     # erase's request and delay, a cancel's pending request, a policy seal's justification).
     from app.core import audit_chain_verify
-    return audit_chain_verify.justification_problem(view, seal)
+    return audit_chain_verify.justification_problem(view, seal, record)
 
 
 # --------------------------------------------------------------------------- reading an hour's rows
@@ -1449,6 +1470,11 @@ def status(st: Optional[ChainState] = None) -> dict:
             pass
         if st.head_store().unwritable:
             out["warnings"]["head-record-unwritable"] = {"message": st.head_store().unwritable}
+    mark = st.restore_mark()
+    if mark is not None:
+        out["warnings"]["restore-pending"] = {
+            "message": "a restore of a backup is not finished: nothing is deleted until the host operator runs "
+                       "dockvault.py audit accept-restore", "first_seen": mark.get("at")}
     if out["failures"]:
         out["outcome"] = "failed"
     if st.stopped is not None:

@@ -423,9 +423,10 @@ def test_the_hold_switch_stops_the_log_jobs_and_not_the_working_records(env, fac
     db.commit()
     done = _pass(factory)
     # The database's hold kept more than the audit chain's state, so the pass sealed it as a veto: clearing
-    # the database's value afterwards does not release the audit rows (only an administrator's change,
-    # sealed and waited for, does); the security records, outside the chain, follow the database.
-    assert done["audit_logs"].deleted == 0 and done["security_alerts"].deleted == 1
+    # the database's value afterwards releases neither the audit rows nor the security records (only an
+    # administrator's change, sealed and waited for, does): every job over logs reads the chain's hold too.
+    assert done["audit_logs"] is None and done["security_alerts"] is None
+    assert _count(factory, SecurityAlert) == 1
     vetoes = [s for s in factory().query(AuditSeal).filter(AuditSeal.kind == "policy").all()
               if s.detail["cause"] == "database"]
     assert len(vetoes) == 1 and vetoes[0].detail["state"]["logs_hold"]["value"] is True

@@ -287,8 +287,8 @@ def request_problem(view, seal) -> Optional[str]:
     return None
 
 
-def other_problem(view, seal) -> Optional[str]:
-    """Step 4 for the kinds other than policy and request."""
+def other_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
+    """Step 4 for the kinds other than policy and request. ``record``: the head record, on the server."""
     d = seal.detail if isinstance(seal.detail, dict) else {}
     if seal.kind == "cancel":
         if d.get("cancels") not in view.pending_requests():
@@ -335,6 +335,11 @@ def other_problem(view, seal) -> Optional[str]:
             newest = view.newest_policy()
             if newest is None or p != newest[0]:
                 return f"a {seal.kind} seal that does not name the policy seal in force"
+            if seal.kind == "prune" and d.get("reason") == "size-cap":
+                from app.core import audit_chain_size
+                problem = audit_chain_size.size_problem(view, seal, record=record)
+                if problem:
+                    return problem
     elif seal.kind == "erase":
         req = view.requests.get(d.get("request_seq"))
         if req is None or req.get("what") != "erase" or req.get("placeholder") != d.get("placeholder"):
@@ -369,12 +374,12 @@ def other_problem(view, seal) -> Optional[str]:
     return None
 
 
-def justification_problem(view, seal) -> Optional[str]:
+def justification_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
     if seal.kind == "policy":
         return policy_problem(view, seal)
     if seal.kind == "request":
         return request_problem(view, seal)
-    return other_problem(view, seal)
+    return other_problem(view, seal, record)
 
 
 # --------------------------------------------------------------------------- hooks on the audit tables
@@ -505,7 +510,7 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
                     report.add(FAILURE, "key-unverified", f"key seal {seal.seq}'s proof does not verify", seal.seq)
             if ok and k is not None and ai._mac_ok(k, link, seal.mac):
                 uncovered = []        # a verified key seal covers every MAC before it
-        problem = justification_problem(view, seal)
+        problem = justification_problem(view, seal, record)
         if problem == "stable-changed":
             report.add(FAILURE, "stable-changed", f"rewrite seal {seal.seq} changes a stable root or the ids", seal.seq)
         elif problem:

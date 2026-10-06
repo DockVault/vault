@@ -136,6 +136,29 @@ def _prune(factory, numbers, now=NOW):
     return ar.prune(retention.Pass(factory, now=now), numbers)
 
 
+# The size cap counts an hour's bytes only once a delay of sealing has passed since its seal: the rows seeded
+# at NOW are sealed then, and count from a week on.
+AFTER_DELAY = NOW + timedelta(days=7, hours=2)
+
+
+def _age_chain(until):
+    """Sealing runs every six hours (no gap) until ``until``."""
+    c = _CHAIN[-1]
+    c.seal_all(c.clock())
+    for _ in range(3):                       # hourly at first: the newest hours are sealed as they close
+        if c.clock() + timedelta(hours=1) <= until:
+            c.seal_all(c.clock() + timedelta(hours=1))
+    while c.clock() + timedelta(hours=6) <= until:
+        c.seal_all(c.clock() + timedelta(hours=6))
+    c.seal_all(until)
+
+
+def _prune_sized(factory, numbers, now=AFTER_DELAY):
+    """The audit job with these numbers once a delay of sealing has run since the seeded rows were sealed."""
+    _age_chain(now)
+    return ar.prune(retention.Pass(factory, now=now), numbers)
+
+
 def _numbers(max_days=0, min_days=0, admin_min_days=365, max_mb=0):
     return ar.Numbers(max_days, min_days, admin_min_days, max_mb)
 
@@ -270,6 +293,8 @@ def test_the_size_cap_deletes_the_oldest_rows_that_do_not_fit(env, factory):
     db = factory()
     rows = [_big(db, 30 + n) for n in range(8)]            # 2 MB, newest first
     _prune(factory, _numbers(max_mb=1))
+    assert set(rows) <= _left(factory)                       # sealed now: they count from a week on
+    _prune_sized(factory, _numbers(max_mb=1))
     left = _left(factory)
     assert [r in left for r in rows] == [True, True, True, True, False, False, False, False]
 
@@ -279,37 +304,47 @@ def test_the_size_cap_never_deletes_administration_or_security_rows(env, factory
     admin = [_big(db, 30 + n, ADMIN_ACTION) for n in range(3)]
     security = [_big(db, 40 + n, SECURITY_ACTION) for n in range(2)]
     plain = [_big(db, 50 + n) for n in range(3)]
-    _prune(factory, _numbers(max_mb=1, admin_min_days=0))
+    _prune_sized(factory, _numbers(max_mb=1, admin_min_days=0))
     left = _left(factory)
     assert set(admin + security) <= left
     assert not set(plain) & left
 
 
-def test_rows_younger_than_the_delay_neither_count_nor_go(env, factory):
+def test_rows_sealed_less_than_a_delay_ago_neither_count_nor_go(env, factory):
     db = factory()
-    fresh = [_big(db, 0, hours=n) for n in range(8)]        # 2 MB written today
     old = [_big(db, 20 + n) for n in range(3)]
-    _prune(factory, _numbers(max_mb=1))
-    left = _left(factory)
-    assert set(fresh) <= left and set(old) <= left          # the 0.75 MB counted fits
+    _prune_sized(factory, _numbers(max_mb=1))
+    assert set(old) <= _left(factory)                       # the 0.75 MB counted fits
+    # 2 MB written in the two hours after AFTER_DELAY: sealed then, so they count nothing yet.
+    fresh = [_row(db, 0, size=MB // 4 - 200, hours=-(7 * 24 + 2 + n / 4)) for n in range(8)]
+    _prune_sized(factory, _numbers(max_mb=1), now=AFTER_DELAY + timedelta(hours=4))
+    assert set(fresh + old) <= _left(factory)
     env.retention_reduction_delay_days = 1
     _CHAIN[-1].setenv("RETENTION_REDUCTION_DELAY_DAYS", 1)   # .env's delay, which the chain seals first
-    later = NOW + timedelta(days=2)
-    _prune(factory, _numbers(max_mb=1), now=later)
+    later = AFTER_DELAY + timedelta(days=2)
+    _prune_sized(factory, _numbers(max_mb=1), now=later)
     assert len(set(fresh + old) & _left(factory)) == 4       # newest 1 MB of the counted rows
 
 
-def test_the_hour_the_cap_cuts_through_keeps_its_rows_younger_than_the_delay(env, factory):
-    # The delay ends at 12:14 seven days ago. The rows of 12:00 to 12:14 that day are counted and overflow
-    # the cap, so their hour goes; a row of 12:59 in that hour is younger than the delay, and stays.
-    now = NOW + timedelta(minutes=14)
+def test_an_hour_sealed_inside_the_window_counts_nothing_and_its_rows_stay(env, factory):
+    # Five rows of a quarter of a megabyte in the hour before NOW, sealed after it closes: at a week and
+    # fourteen minutes on, the window starts before that seal, so the hour counts nothing and nothing goes.
     db = factory()
-    counted = [_big(db, 7, hours=-(4 + n) / 60) for n in range(5)]
-    young = _row(db, 7, hours=-59 / 60)
-    shown = ar.preview(factory(), now, _numbers(max_mb=1))
+    counted = [_big(db, 0, hours=(4 + n) / 60) for n in range(5)]
+    first = NOW + timedelta(days=7, minutes=14)
+    _age_chain(first)
+    shown = ar.preview(factory(), first, _numbers(max_mb=1))
+    assert shown["by_size"]["rows"] == 0
+    ar.prune(retention.Pass(factory, now=first), _numbers(max_mb=1))
+    assert set(counted) <= _left(factory)
+    # Two hours on, the seal lies before the window: the hour counts, and its rows go; a row younger than
+    # the window's start stays, whatever the cap.
+    later = first + timedelta(hours=2)
+    young = _row(db, 0, hours=-(7 * 24 + 1.5), size=MB // 4 - 200)
+    _age_chain(later)
+    shown = ar.preview(factory(), later, _numbers(max_mb=1))
     assert shown["by_size"]["rows"] == 5
-    assert shown["by_size"]["newest"] <= (now - timedelta(days=7)).isoformat() + "Z"
-    _prune(factory, _numbers(max_mb=1), now=now)
+    ar.prune(retention.Pass(factory, now=later), _numbers(max_mb=1))
     left = _left(factory)
     assert young in left and not set(counted) & left
 
@@ -317,7 +352,7 @@ def test_the_hour_the_cap_cuts_through_keeps_its_rows_younger_than_the_delay(env
 def test_rows_younger_than_the_minimum_are_never_deleted_by_size(env, factory):
     db = factory()
     rows = [_big(db, 30 + n) for n in range(8)]
-    _prune(factory, _numbers(max_mb=1, min_days=60))
+    _prune_sized(factory, _numbers(max_mb=1, min_days=60))
     assert set(rows) <= _left(factory)
 
 
@@ -328,10 +363,10 @@ def test_when_the_protected_rows_alone_do_not_fit_they_stay_and_the_administrato
     db = factory()
     admin = [_big(db, 30 + n, ADMIN_ACTION) for n in range(6)]
     plain = [_big(db, 40 + n) for n in range(2)]
-    _prune(factory, _numbers(max_mb=1, admin_min_days=0))
+    _prune_sized(factory, _numbers(max_mb=1, admin_min_days=0))
     assert set(admin) <= _left(factory) and not set(plain) & _left(factory)
     assert len(told) == 1 and told[0][0] > MB
-    _prune(factory, _numbers(max_mb=2, admin_min_days=0))
+    _prune_sized(factory, _numbers(max_mb=2, admin_min_days=0))
     assert len(told) == 1
 
 
@@ -374,8 +409,9 @@ def test_the_preview_is_what_the_job_deletes(env, factory, numbers):
         _big(db, 20 + 7 * n)
         _big(db, 21 + 7 * n, ADMIN_ACTION)
     before = _left(factory)
-    shown = ar.preview(factory(), NOW, numbers)
-    result = _prune(factory, numbers)
+    _age_chain(AFTER_DELAY)
+    shown = ar.preview(factory(), AFTER_DELAY, numbers)
+    result = ar.prune(retention.Pass(factory, now=AFTER_DELAY), numbers)
     gone = before - _left(factory)
     assert shown["by_age"]["rows"] + shown["by_size"]["rows"] == len(gone) == result.deleted
 

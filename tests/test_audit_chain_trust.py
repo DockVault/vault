@@ -667,6 +667,9 @@ def test_the_size_cap_still_deletes_by_the_bytes_the_chain_sealed(env, monkeypat
     env.clock.advance(minutes=30)
     retention.run_pass(env.session, now=env.clock())
     with env.session() as db:
+        assert db.query(AuditLog).filter(AuditLog.id.in_(old)).count() == 4    # counted from a week on
+    _run_to(env, T0 + timedelta(days=7, hours=2))
+    with env.session() as db:
         left = db.query(AuditLog).filter(AuditLog.id.in_(old)).count()
     assert 0 < left < 4
     assert failures(env.verify()) == []

@@ -76,9 +76,12 @@ def _materialise(w, hour: datetime, salt: Optional[bytes], wr) -> None:
         wr.legacy_salt = None
 
 
-def prune(p, conditions, *, reason: str, size: Optional[dict] = None):
+def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None):
     """Delete the audit rows meeting ``conditions`` in sealed hours, oldest first, one day of hours per
-    ``prune`` seal and transaction, while the pass has time. Returns a retention.JobResult."""
+    ``prune`` seal and transaction, while the pass has time. ``plan(writer)``, when given, decides each
+    transaction's (conditions, size) under the chain lock from the view as it stands, or None to stop: the
+    size cap's, whose total each seal records as of its own place. Nothing is deleted while a restore is not
+    finished or its grace runs. Returns a retention.JobResult."""
     from app.core import retention
     from app.core.models import AuditLog as A
     ai = _ai()
@@ -93,6 +96,13 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None):
             newest = view.newest_policy()
             if newest is None or view.newest_hour_end is None:
                 break
+            if w.st.holds_deletion():
+                break
+            if plan is not None:
+                planned = plan(w)
+                if planned is None:
+                    break
+                conditions, size = planned
             hours = [h for h in _hours_matching(w.db, conditions, view.newest_hour_end, 200) if h not in skipped]
             if not hours:
                 break

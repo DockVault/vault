@@ -44,6 +44,47 @@ from typing import Any, Dict, Optional
 VERSION = 1
 SUMMARY_DAYS = 30
 LINK_EVERY = 64
+# Beside the record while a restore of a whole backup is not finished: written by dockvault.py restore right
+# after it restores the keys volume, removed by ``audit accept-restore``. While it is there the pruner deletes,
+# erases and rewrites nothing.
+MARK_SUFFIX = ".restore-pending"
+
+
+def mark_path(path: str) -> str:
+    return path + MARK_SUFFIX
+
+
+def read_mark(path: str) -> Optional[Dict[str, Any]]:
+    """The restore mark beside the record at ``path``, or None when there is none. A mark that cannot be read
+    is still a mark: {"unreadable": reason}."""
+    try:
+        with open(mark_path(path), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        return {"unreadable": type(exc).__name__}
+    return data if isinstance(data, dict) else {"unreadable": "not an object"}
+
+
+def write_mark(path: str, mark: Dict[str, Any]) -> None:
+    _write_file(mark_path(path), mark)
+
+
+def remove_mark(path: str) -> None:
+    try:
+        os.unlink(mark_path(path))
+    except FileNotFoundError:
+        return
+    directory = os.path.dirname(path) or "."
+    try:
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
 
 
 def empty() -> Dict[str, Any]:

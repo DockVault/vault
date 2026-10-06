@@ -444,6 +444,8 @@ def apply_due(engine, st, now: datetime) -> list:
     ai = _ai()
     done = []
     announcements = []
+    if st.restore_mark() is not None:
+        return done           # a restore not finished: nothing applies until the host accepts it
     for req in due_requests(st.view, now, st.known_record()):
         with ai.ChainWriter(engine, st) as w:
             view = w.st.view

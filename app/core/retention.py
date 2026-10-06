@@ -91,7 +91,28 @@ def utcnow() -> datetime:
 
 
 def hold_in_force() -> bool:
+    """The hold switch as the stored settings give it (the database's value, or the deployment's)."""
     return bool(registry.resolve(HOLD_KEY))
+
+
+def chain_holds() -> bool:
+    """Whether the audit chain holds every job over logs back: its honoured hold switch (a hold turned on in
+    the chain counts at once, whatever the database says), a restore of a whole backup not finished, or the
+    grace after a restore. Read together with hold_in_force(): the pruner takes the more conservative, so
+    neither the database nor the chain alone can let records go. Holds when it cannot tell."""
+    try:
+        from app.core import audit_chain_honour as honour
+        from app.core import audit_integrity
+        st = audit_integrity.state()
+        if st.holds_deletion():
+            return True
+        if st.view.newest_policy() is None:
+            return False
+        state = honour.honoured_state(st.view, st.known_record(), st.clock())
+        return bool((state.get(HOLD_KEY) or {}).get("value"))
+    except Exception as exc:  # noqa: BLE001 -- keeping records is the safe side
+        _say(f"Warning: the audit chain's hold could not be read ({type(exc).__name__}); the jobs over logs wait")
+        return True
 
 
 def _say(message: str) -> None:
@@ -421,7 +442,7 @@ def run_pass(session_factory: Optional[Callable] = None, *, engine=None, now: Op
         # The settings as they stand now, not as this process's copy had them up to seconds ago: a hold
         # turned on stops the very next pass.
         registry.refresh(session_factory)
-        hold = hold_in_force()
+        hold = hold_in_force() or chain_holds()
         done = []
         for job in JOBS:
             if not p.time_left():

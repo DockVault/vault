@@ -194,7 +194,8 @@ kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_
 kept for ever. A positive value makes the pruner delete rows older than that many days, on a timer, unless
 the hold switch is on (`RETENTION_HOLD`, or the panel). Administration and security rows are kept at least
 `AUDIT_PROTECTED_MIN_DAYS` (365 days by default) whatever the maximum, and a size cap (`AUDIT_LOG_MAX_MB`)
-never deletes them. An administrator can change the maximum, the minimums and the cap in the panel,
+never deletes them. The size cap counts each hour's bytes as the integrity chain sealed them, and only once
+`RETENTION_REDUCTION_DELAY_DAYS` of running time have passed since the hour was sealed. An administrator can change the maximum, the minimums and the cap in the panel,
 within the limits `.env` sets; a change that deletes sooner waits `RETENTION_REDUCTION_DELAY_DAYS` and
 every administrator is told. After an upgrade from a release that deleted only when an administrator's
 dashboard loaded, a positive `AUDIT_LOG_RETENTION_DAYS` first waits in the same way. The application only
