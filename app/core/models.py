@@ -2006,6 +2006,8 @@ _sa_event.listen(Note, 'refresh', _decrypt_note_fields)
 _sa_event.listen(NoteLink, 'load', _decrypt_notelink_snapshot)
 _sa_event.listen(NoteLink, 'refresh', _decrypt_notelink_snapshot)
 _sa_event.listen(_SaSessionForNoteSeal, 'before_flush', _seal_note_content_before_flush)
+# The one after-commit dispatcher, installed with the models: before any session exists (see its docstring).
+from app.core import after_commit as _after_commit  # noqa: E402,F401
 
 
 class RateLimitRecord(Base):

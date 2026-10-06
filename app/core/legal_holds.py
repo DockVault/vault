@@ -37,6 +37,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, List, Optional
 
+from app.core import after_commit
 from app.core import compliance_settings as cs
 from app.core import independence as ind
 from app.core.case_context import acting_for
@@ -255,8 +256,9 @@ def record_refusal(db, action: str, case, *, actor, reason: str) -> None:
         db.rollback()
 
 
-_NOTICES = "_legal_hold_notices"
-_INSTALLED = "_legal_hold_notices_installed"
+# What is told after a commit goes through the one after-commit dispatcher (app/core/after_commit.py): a listener
+# this module added on its first import broke the commit whenever that import happened inside another commit.
+_NOTICES = "legal_hold_notices"
 
 
 def _owner_notices(db, case, vault_owner_pairs, title: str, body: str) -> None:
@@ -274,31 +276,14 @@ def _owner_notices(db, case, vault_owner_pairs, title: str, body: str) -> None:
 def queue(db, notice: dict) -> None:
     """Tell the administrators (and the case's auditor) once the caller's transaction commits; nothing when it
     rolls back."""
-    db.info.setdefault(_NOTICES, []).append(notice)
+    after_commit.later(db, _NOTICES, notice)
 
 
-def _after_commit(session):
-    notices = session.info.pop(_NOTICES, None)
-    if notices:
-        try:
-            deliver(notices)
-        except Exception as exc:  # noqa: BLE001 -- a notice never undoes the step
-            print(f"Warning: a legal hold notice was not sent ({type(exc).__name__})")
-
-
-def _after_transaction_end(session, transaction):
-    if transaction.parent is None:
-        session.info.pop(_NOTICES, None)
-
-
-def install() -> None:
-    from sqlalchemy import event
-    from sqlalchemy.orm import Session
-    if getattr(Session, _INSTALLED, False):
-        return
-    event.listen(Session, "after_commit", _after_commit)
-    event.listen(Session, "after_transaction_end", _after_transaction_end)
-    setattr(Session, _INSTALLED, True)
+def _deliver_notices(notices) -> None:
+    try:
+        deliver(notices)
+    except Exception as exc:  # noqa: BLE001 -- a notice never undoes the step
+        print(f"Warning: a legal hold notice was not sent ({type(exc).__name__})")
 
 
 def deliver(notices: Iterable[dict]) -> None:
@@ -319,7 +304,7 @@ def _tell(db, case, title: str, body: str) -> None:
     queue(db, {"title": title, "body": body, "auditor_id": str(case.auditor_id)})
 
 
-install()
+after_commit.handler(_NOTICES, _deliver_notices)
 
 
 # --------------------------------------------------------------------------- placing

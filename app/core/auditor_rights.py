@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Optional
 
+from app.core import after_commit
 from app.core import compliance_settings as cs
 from app.core import credential_changes as cc
 from app.core import independence as ind
@@ -875,39 +876,24 @@ def settle(db, now: Optional[datetime] = None) -> int:
 
 # --------------------------------------------------------------------------- telling people
 
-_NOTICES = "_auditor_right_notices"
-_INSTALLED = "_auditor_right_notices_installed"
+# What is told after a commit goes through the one after-commit dispatcher (app/core/after_commit.py), never
+# through a listener of this module's own: a listener added while a commit runs its listeners breaks that commit.
+_NOTICES = "auditor_right_notices"
 
 
 def queue(db, notice: dict) -> None:
     """Tell of ``notice`` once the caller's transaction commits (deliver()); nothing when it rolls back."""
-    db.info.setdefault(_NOTICES, []).append(notice)
+    after_commit.later(db, _NOTICES, notice)
 
 
-def _after_commit(session):
-    notices = session.info.pop(_NOTICES, None)
-    if notices:
-        try:
-            deliver(notices)
-        except Exception as exc:  # noqa: BLE001 -- a notice never undoes the change
-            print(f"Warning: an auditor right notice was not sent ({type(exc).__name__})")
+def _deliver_notices(notices) -> None:
+    try:
+        deliver(notices)
+    except Exception as exc:  # noqa: BLE001 -- a notice never undoes the change
+        print(f"Warning: an auditor right notice was not sent ({type(exc).__name__})")
 
 
-def _after_transaction_end(session, transaction):
-    # The outermost transaction ended without the commit taking the notices: they were never committed.
-    if transaction.parent is None:
-        session.info.pop(_NOTICES, None)
-
-
-def install() -> None:
-    """Listen on every session for the commits that carry notices. Idempotent."""
-    from sqlalchemy import event
-    from sqlalchemy.orm import Session
-    if getattr(Session, _INSTALLED, False):
-        return
-    event.listen(Session, "after_commit", _after_commit)
-    event.listen(Session, "after_transaction_end", _after_transaction_end)
-    setattr(Session, _INSTALLED, True)
+after_commit.handler(_NOTICES, _deliver_notices)
 
 
 def _who(name: Optional[str]) -> str:
@@ -976,6 +962,3 @@ def deliver(notices: Iterable[dict]) -> None:
             api._fire_action_email_bulk(db, EMAIL_ACTION, [(p.email, p.username) for p in people.values()],
                                         {"change": body, "by": _who(notice.get("by")),
                                          "when": api._change_time_text()})
-
-
-install()

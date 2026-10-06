@@ -549,10 +549,11 @@ def test_a_notice_goes_after_the_commit_and_never_after_a_rollback(db, people, s
 def test_only_the_end_of_the_outermost_transaction_drops_the_notices(db, people, settings, told):
     rights.propose(db, people.uma, proposer=people.ada)
     # A savepoint ending (its transaction has a parent) keeps them; the outermost one ending drops them.
-    rights._after_transaction_end(db, SimpleNamespace(parent=object()))
-    assert len(db.info[rights._NOTICES]) == 1
-    rights._after_transaction_end(db, SimpleNamespace(parent=None))
-    assert rights._NOTICES not in db.info
+    from app.core import after_commit
+    after_commit._after_transaction_end(db, SimpleNamespace(parent=object()))
+    assert len(after_commit.pending(db, rights._NOTICES)) == 1
+    after_commit._after_transaction_end(db, SimpleNamespace(parent=None))
+    assert after_commit.pending(db, rights._NOTICES) == []
 
 
 def test_the_email_always_goes_and_says_what_changed():
