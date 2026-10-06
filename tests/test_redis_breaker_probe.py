@@ -103,6 +103,28 @@ def _raise_down():
     raise RuntimeError("redis down")
 
 
+# Every wait on a thread waits for its state, never for a fixed few seconds: it ends as soon as the state is
+# reached, fails at once when the thread ended without reaching it, and gives up only after HANG_LIMIT, so
+# that a run cannot hang. A thread that is only slow to be scheduled, on a loaded machine, is waited for.
+HANG_LIMIT = 60.0
+
+
+def _ended(thread, what="the probe thread never ended"):
+    """Until ``thread`` has ended (what a state check after it relies on)."""
+    assert thread is not None, "there is no thread to wait for"
+    thread.join(timeout=HANG_LIMIT)
+    assert not thread.is_alive(), what
+
+
+def _until(event, thread, what):
+    """Until ``thread`` sets ``event``. Fails at once if the thread ended without setting it."""
+    assert thread is not None, "there is no thread to wait for"
+    deadline = time.monotonic() + HANG_LIMIT
+    while not event.wait(0.05):
+        assert thread.is_alive() or event.is_set(), f"{what}: the thread ended first"
+        assert time.monotonic() < deadline, what
+
+
 class _RecordingRedis:
     """A backend that RECORDS each script call and returns a healthy result. Recording (not raising)
     is the reliable signal: a raise from eval is swallowed by the fail-open handler, so it could not
@@ -161,7 +183,7 @@ def test_opening_starts_one_background_probe_that_closes_on_recovery(monkeypatch
     def _blocking_ping():
         pings.append(threading.current_thread().name)
         started.set()
-        assert release.wait(5), "probe ping was never released"
+        assert release.wait(HANG_LIMIT), "probe ping was never released"
         # returning (no raise) means Redis is healthy
 
     monkeypatch.setattr(R, "_cb_probe_sleep", lambda _s: None)
@@ -169,16 +191,15 @@ def test_opening_starts_one_background_probe_that_closes_on_recovery(monkeypatch
 
     R._cb_record_failure(time.time())               # opens the breaker and starts the probe
     assert R._cb_is_open(time.time()) is True
-    assert started.wait(5), "the background probe never ran"
     first = R._cb_probe_thread
+    _until(started, first, "the background probe never ran")
     assert first is not None and first.is_alive() and first.name == "redis-cb-probe"
 
     R._cb_record_failure(time.time())               # a second open must not start a second probe
     assert R._cb_probe_thread is first
 
     release.set()
-    first.join(timeout=5)
-    assert not first.is_alive()
+    _ended(first)
     assert R._cb_open is False                       # the probe's success closed it
     assert len(pings) == 1                           # exactly one probe ran
 
@@ -213,8 +234,7 @@ def test_a_failure_racing_a_probe_success_does_not_strand_the_breaker_open(monke
     R._cb_record_failure(time.time())  # opens and starts the probe
     thread = R._cb_probe_thread
     assert thread is not None
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    _ended(thread)
     assert R._cb_open is False          # not stranded; the second success closed it
     assert R._cb_probe_thread is None   # same thread throughout; a clean close freed the slot
 
@@ -242,7 +262,7 @@ def test_a_failed_probe_start_does_not_escape_and_the_backstop_heals(monkeypatch
     assert R._cb_is_open(time.time()) is True    # backstop restarts the probe and keeps skipping
     thread = R._cb_probe_thread
     assert thread is not None
-    thread.join(timeout=5)
+    _ended(thread)
     assert R._cb_open is False                    # the restarted probe healed it
 
 
@@ -264,15 +284,14 @@ def test_a_dead_probe_is_restarted_by_the_staleness_backstop(monkeypatch, clock)
     R._cb_record_failure(time.time())            # opens; probe #1 crashes on entry
     first = R._cb_probe_thread
     assert first is not None
-    first.join(timeout=5)
-    assert not first.is_alive()
+    _ended(first)
     assert R._cb_open is True                     # a crashed probe closed nothing
 
     _go_stale(clock)
     assert R._cb_is_open(time.time()) is True     # dead slot -> backstop restarts, stays open
     second = R._cb_probe_thread
     assert second is not None and second is not first
-    second.join(timeout=5)
+    _ended(second)
     assert R._cb_open is False                     # the restarted (real) probe healed it
 
 
@@ -299,7 +318,7 @@ class _Parking:
             entered = self.entered.setdefault(me, threading.Event())
             gate = self.gates.setdefault(me, threading.Event())
         entered.set()
-        assert gate.wait(30), "a parked probe was never released"
+        assert gate.wait(HANG_LIMIT), "a parked probe was never released"
         if self.outcome.get(me) == "down":
             raise RuntimeError("redis down")
 
@@ -310,10 +329,7 @@ class _Parking:
         assert thread is not None, "there is no probe to wait for"
         with self.lock:
             ev = self.entered.setdefault(thread, threading.Event())
-        deadline = time.monotonic() + 60
-        while not ev.wait(0.05):
-            assert thread.is_alive() or ev.is_set(), "the probe ended without reaching its ping"
-            assert time.monotonic() < deadline, "the probe never reached its ping"
+        _until(ev, thread, "the probe never reached its ping")
 
     def release(self, thread, outcome="healthy"):
         with self.lock:
@@ -322,15 +338,25 @@ class _Parking:
         gate.set()
 
 
-def _is_open_from_another_thread():
+def _is_open_from_another_thread(park):
     """'No request path probes in the foreground', as a deterministic shape rather than a timing
     measurement: ask the breaker from a thread that is not the probe, and return exactly what a
-    request would be told."""
+    request would be told. A caller that probed in the foreground would reach the parked ping itself,
+    which fails here at once; a check that is only slow to be scheduled is waited for."""
     out = []
     t = threading.Thread(target=lambda: out.append(R._cb_is_open(time.time())))
     t.start()
-    t.join(timeout=5)
-    assert not t.is_alive(), "the is-open check itself stalled -- a caller probed in the foreground"
+    deadline = time.monotonic() + HANG_LIMIT
+    while True:
+        with park.lock:
+            reached = park.entered.get(t)
+        assert not (reached is not None and reached.is_set()), (
+            "the is-open check reached the ping -- a caller probed in the foreground")
+        if not t.is_alive():
+            break
+        assert time.monotonic() < deadline, "the is-open check never answered"
+        t.join(0.05)
+    assert out, "the is-open check ended without an answer"
     return out[0]
 
 
@@ -343,27 +369,27 @@ def test_a_hung_probe_is_replaced_and_no_caller_is_ever_told_to_reprobe(monkeypa
     park.wait_entered(first)
 
     _go_stale(clock)
-    assert _is_open_from_another_thread() is True   # alive-but-stale: STILL skipping ...
+    assert _is_open_from_another_thread(park) is True   # alive-but-stale: STILL skipping ...
     second = R._cb_probe_thread
     assert second is not None and second is not first and second.is_alive()  # ... a replacement owns the slot
     park.wait_entered(second)
     # Every later caller, in every state the slot can be in (fresh; stale with a replacement still
     # possible; stale at the ceiling), is told to skip -- never False.
     for _ in range(3):
-        assert _is_open_from_another_thread() is True
+        assert _is_open_from_another_thread(park) is True
         _go_stale(clock)
-        assert _is_open_from_another_thread() is True
+        assert _is_open_from_another_thread(park) is True
 
     replacements = [t for t in R._cb_probe_threads if t is not first]
     for t in replacements:                        # the replacements find Redis back ...
         park.wait_entered(t)
         park.release(t, "healthy")
     for t in replacements:
-        t.join(timeout=5)
+        _ended(t)
     assert R._cb_open is False                    # ... and heal the breaker
     park.release(first, "down")                   # the stuck one finally wakes to a still-failing ping
-    first.join(timeout=5)
-    assert not first.is_alive() and R._cb_open is False and R._cb_probe_thread is None
+    _ended(first)
+    assert R._cb_open is False and R._cb_probe_thread is None
 
 
 def test_a_superseded_probe_neither_clears_the_slot_nor_keeps_probing(monkeypatch, clock):
@@ -383,12 +409,11 @@ def test_a_superseded_probe_neither_clears_the_slot_nor_keeps_probing(monkeypatc
     park.wait_entered(second)                     # the replacement is parked too: the slot stays held
 
     park.release(first, "down")                   # the stuck one wakes to a failing ping, breaker still open
-    first.join(timeout=5)
-    assert not first.is_alive(), "a superseded probe kept looping beside its replacement"
+    _ended(first, "a superseded probe kept looping beside its replacement")
     assert R._cb_probe_thread is second, "a superseded probe cleared a slot it no longer owned"
     assert R._cb_open is True
     park.release(second, "healthy")
-    second.join(timeout=5)
+    _ended(second)
     assert R._cb_open is False and R._cb_probe_thread is None
 
 
@@ -435,7 +460,7 @@ def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog,
     for t in threads:
         park.release(t, "healthy")
     for t in threads:
-        t.join(timeout=5)
+        _ended(t)
     assert R._cb_open is False and R._cb_probe_thread is None
     # A later open period logs the ceiling again -- once is per open period, not per process.
     with caplog.at_level(logging.WARNING, logger="app.core.rate_limiter"):
@@ -446,10 +471,11 @@ def test_replacements_are_capped_and_the_cap_is_logged_once(monkeypatch, caplog,
             assert R._cb_is_open(time.time()) is True
             park.wait_entered(R._cb_probe_thread)
     assert sum(1 for rec in caplog.records if "ceiling" in rec.getMessage()) == 2
-    for t in list(R._cb_probe_threads):
+    last = list(R._cb_probe_threads)
+    for t in last:
         park.release(t, "healthy")
-    for t in list(R._cb_probe_threads):
-        t.join(timeout=5)
+    for t in last:
+        _ended(t)
     assert R._cb_open is False
 
 
@@ -486,10 +512,10 @@ def test_a_failed_replacement_start_keeps_skipping_and_the_next_period_heals(mon
     assert second is not first
     park.wait_entered(second)
     park.release(second, "healthy")
-    second.join(timeout=5)
+    _ended(second)
     assert R._cb_open is False                    # ... and heals
     park.release(first, "down")
-    first.join(timeout=5)
+    _ended(first)
 
 
 # --- the staleness stamp is monotonic ------------------------------------------------------------
@@ -512,7 +538,7 @@ def test_a_wall_clock_jump_forward_does_not_fake_a_stale_probe(monkeypatch):
     assert R._cb_probe_thread is first, "a wall-clock step started a needless replacement"
     assert len(R._cb_probe_threads) == 1
     park.release(first, "healthy")
-    first.join(timeout=5)
+    _ended(first)
     assert R._cb_open is False
 
 
@@ -558,14 +584,14 @@ def test_a_wall_clock_jump_backward_does_not_hide_a_dead_probe(monkeypatch, cloc
     monkeypatch.setattr(R, "_cb_ping", lambda: None)
     R._cb_record_failure(time.time())
     first = R._cb_probe_thread
-    first.join(timeout=5)
-    assert not first.is_alive() and R._cb_open is True
+    _ended(first)
+    assert R._cb_open is True
     _go_stale(clock)                                   # the monotonic stamp says: stale
     far_past = time.time() - 10 * R._CB_PROBE_STALE_SECONDS
     assert R._cb_is_open(far_past) is True       # a backward wall-clock step must not suppress the backstop
     second = R._cb_probe_thread
     assert second is not None and second is not first, "a wall-clock step hid a dead probe"
-    second.join(timeout=5)
+    _ended(second)
     assert R._cb_open is False
 
 
