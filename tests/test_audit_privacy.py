@@ -177,6 +177,29 @@ def _spreads_into_a_write(trees):
     return out
 
 
+def _assigned(fn):
+    """name -> what a function puts under it: ``name = value``; ``name["key"] = value`` (as ``{"key": value}``);
+    and ``name.update(...)``: its dict arguments, its keywords and what it spreads in (``**{...}``)."""
+    assigned = collections.defaultdict(list)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned[target.id].append(node.value)
+                elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                      and isinstance(target.slice, ast.Constant)):
+                    assigned[target.value.id].append(ast.Dict(keys=[target.slice], values=[node.value]))
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "update"
+              and isinstance(node.func.value, ast.Name)):
+            name = node.func.value.id
+            assigned[name] += node.args
+            if node.keywords:
+                assigned[name].append(ast.Dict(
+                    keys=[ast.Constant(kw.arg) if kw.arg else None for kw in node.keywords],
+                    values=[kw.value for kw in node.keywords]))
+    return assigned
+
+
 def _returned_dicts(trees):
     """function name -> the dict expressions it returns (directly, or through a name it assigned one to)."""
     out = collections.defaultdict(list)
@@ -184,12 +207,7 @@ def _returned_dicts(trees):
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            assigned = collections.defaultdict(list)
-            for node in ast.walk(fn):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            assigned[target.id].append(node.value)
+            assigned = _assigned(fn)
             for node in ast.walk(fn):
                 if isinstance(node, ast.Return) and node.value is not None:
                     value = node.value
@@ -210,6 +228,8 @@ def _paths(node, prefix=""):
         for kw in node.keywords:
             if kw.arg:
                 yield prefix + kw.arg
+            else:
+                yield from _paths(kw.value, prefix)       # dict(**{...}): the keys it spreads in
     elif isinstance(node, ast.DictComp) and len(node.generators) == 1:
         # {k: v for k, v in (("key", value), ...)}: the pairs' first items; {k: f(k) for k in ("key", ...)}: the
         # names it iterates.
@@ -225,7 +245,8 @@ def _paths(node, prefix=""):
 
 def detail_paths(trees, root=ROOT):
     """path -> where it is written, for every literal detail key reachable from an audit write: a dict passed
-    as details, or assigned (or subscript-assigned) to the name passed, in the same function."""
+    as details, or assigned (or subscript-assigned, or added with ``.update(...)``) to the name passed, in the
+    same function."""
     wrappers = _wrappers(trees)
     kwargs_wrappers, imports = _kwargs_wrappers(trees, wrappers, root)
     returned = _returned_dicts(trees)
@@ -234,15 +255,7 @@ def detail_paths(trees, root=ROOT):
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            assigned = collections.defaultdict(list)
-            for node in ast.walk(fn):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            assigned[target.id].append(node.value)
-                        elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
-                              and isinstance(target.slice, ast.Constant)):
-                            assigned[target.value.id].append(ast.Dict(keys=[target.slice], values=[node.value]))
+            assigned = _assigned(fn)
             for call in ast.walk(fn):
                 if not isinstance(call, ast.Call):
                     continue
@@ -343,6 +356,46 @@ def test_the_scan_finds_a_key_through_a_variable_and_a_wrapper_and_reports_it(tm
                           "fourth_made_up", "fifth_made_up", "fifth_made_up.sixth_made_up", "seventh_made_up",
                           "eighth_made_up"}
     assert [p for p in found if ap.kind_of(p) is not None] == []
+
+
+def test_the_scan_reads_keys_added_with_update_and_spread_in(tmp_path):
+    source = textwrap.dedent('''
+        def route(db, actor):
+            details = {"first_made_up": 1}
+            details.update(update_keyword_made_up=1, nested_made_up={"inner_update_made_up": 2})
+            details.update({"update_dict_made_up": 2})
+            details.update(**{"update_spread_made_up": 3})
+            AuditLogger(db).log_action(action="x", status="success", details=details)
+            extra = dict(**{"dict_spread_made_up": 4}, plain_made_up=5)
+            AuditLogger(db).log_action(action="y", status="success", details=extra)
+            AuditLogger(db).log_action(action="z", status="success", details={**{"literal_spread_made_up": 6}})
+
+        def builds(kind):
+            out = {"kind_made_up": kind}
+            out.update(returned_update_made_up=1)
+            return out
+
+        def other_route(db):
+            AuditLogger(db).log_action(action="w", status="success", details=builds("a"))
+
+        def unrelated(db, rows):
+            rows.update(not_a_detail=1)
+            AuditLogger(db).log_action(action="v", status="success", details={"last_made_up": 1})
+    ''')
+    found = detail_paths({tmp_path / "fake.py": ast.parse(source)}, root=tmp_path)
+    assert set(found) == {"first_made_up", "update_keyword_made_up", "nested_made_up",
+                          "nested_made_up.inner_update_made_up", "update_dict_made_up", "update_spread_made_up",
+                          "dict_spread_made_up", "plain_made_up", "literal_spread_made_up", "kind_made_up",
+                          "returned_update_made_up", "last_made_up"}
+    # The application's own: a refused key proof adds the challenge's mode and epochs with details.update.
+    router = (APP / "api" / "ecc_router.py").read_text(encoding="utf-8").splitlines()
+    line = 1 + next(i for i, text in enumerate(router)
+                    if '_audit_zk(db, user, "zk_key_proof_failed", resource_id=vault_id, details=details' in text)
+    assert any("details.update(mode=ch.mode, dek_epoch=ch.dek_epoch, team_epoch=ch.team_epoch)" in text
+               for text in router[line - 4:line])
+    paths = detail_paths(_trees())
+    for key in ("mode", "dek_epoch", "team_epoch"):
+        assert f"app/api/ecc_router.py:{line}" in paths[key], key
 
 
 def test_a_helper_that_spreads_its_keyword_arguments_into_a_write_is_reported(tmp_path):
