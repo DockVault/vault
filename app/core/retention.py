@@ -296,6 +296,27 @@ def settle_auditor_grants(p: Pass) -> JobResult:
     return JobResult()
 
 
+def run_legal_holds(p: Pass) -> JobResult:
+    """The legal holds' clock (app/core/legal_holds.py): holds nobody confirmed in time lapse, those due a review
+    ask for one, and what released holds kept is purged once their delay is over (a batch per transaction, each
+    file's held_file_purged row in it, the blobs secure-deleted after its commit). Not stopped by the hold switch:
+    a hold's purge is the end of what a case kept, not a log."""
+    from app.core import legal_holds
+    with p.transaction() as db:
+        legal_holds.lapse_due(db, p.now)
+        legal_holds.prompt_reviews(db, p.now)
+    done = JobResult()
+
+    def record(db, count, table):
+        batch = JobResult(deleted=count)
+        p.record(db, batch, table)
+        done.add(count)
+
+    legal_holds.purge(p.session_factory, now=p.now, batch=p.batch_rows, time_left=p.time_left, record=record,
+                      limit_statements=limit_statements)
+    return done
+
+
 def prune_rate_limit_records(p: Pass) -> JobResult:
     """The sign-in throttle's fallback rows (written only while Redis is down), an hour after their window."""
     from app.core.models import RateLimitRecord
@@ -352,6 +373,8 @@ JOBS: list[Job] = [
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
     Job("auditor_grants", "Auditor rights whose time ran out, or whose holder's account changed",
         settle_auditor_grants),
+    Job("legal_holds", "Legal holds: lapses, review prompts, and the purge of what released holds kept",
+        run_legal_holds),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),

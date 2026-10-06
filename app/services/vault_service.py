@@ -1060,6 +1060,7 @@ class VaultService:
         # commit the dir is safely orphaned and best-effort removed. The database refuses to delete a
         # vault a legal hold keeps anything of (app/core/kept_tables.py); the directory's removal
         # checks it again.
+        kept_tables.mark_deletes(self.db, "deleted", user)
         self.db.delete(vault)
         self.db.commit()
         self._destroy_vault_dir(vault_id)
@@ -1391,7 +1392,8 @@ class VaultService:
     def _stage_same_name_replacement(self, vault, vault_id, folder_id, *,
                                      filename: Optional[str] = None,
                                      name_bi: Optional[str] = None,
-                                     name_bi_candidates: Optional[list] = None) -> List[str]:
+                                     name_bi_candidates: Optional[list] = None,
+                                     actor=None) -> List[str]:
         """Mark prior same-name File rows in (vault, folder) for deletion as part of the
         CALLER's open transaction (NO commit here) and return their on-disk blob paths,
         decrementing vault stats for each.
@@ -1401,7 +1403,8 @@ class VaultService:
         (vault_id, folder_id, name_bi) unique index, while a rollback still leaves the old
         file fully intact (its blob is only removed from disk by _remove_blobs AFTER the
         commit succeeds). Zero-knowledge matches on the client blind index; Standard matches
-        the per-vault blind index OR the plaintext column (un-backfilled legacy rows)."""
+        the per-vault blind index OR the plaintext column (un-backfilled legacy rows). Under a legal
+        hold the replaced row is kept as ``replaced`` by ``actor`` (app/core/kept_tables.py)."""
         candidate_vals = [c for c in dict.fromkeys(name_bi_candidates or []) if isinstance(c, str)]
         if candidate_vals:
             # Delete every prior row whose index is in the match set, not just the one at the
@@ -1427,6 +1430,8 @@ class VaultService:
             File.folder_id == folder_id,
             match,
         ).with_for_update(of=File).all():
+            if not paths:
+                kept_tables.mark_deletes(self.db, "replaced", actor)
             paths.append(ex.storage_path)
             self._adjust_vault_totals(vault, -(ex.size_bytes or 0), -1)
             self.db.delete(ex)
@@ -1629,6 +1634,7 @@ class VaultService:
                 filename=None if is_zk else file_info['original_name'],
                 name_bi=zk_name_bi if is_zk else None,
                 name_bi_candidates=zk_name_bi_candidates if is_zk else None,
+                actor=file_info.get('uploaded_by'),
             )
 
         # Create file record
@@ -2061,13 +2067,15 @@ class VaultService:
             file.original_name, mime, file.checksum_sha256,
             content_mac=_etag_mac)
     
-    def delete_file(self, file_id: uuid.UUID, user: User):
+    def delete_file(self, file_id: uuid.UUID, user: User, *, reason: str = "deleted"):
         """
         Securely delete a file.
 
         Args:
             file_id: File UUID
             user: User deleting file
+            reason: why, as a legal hold keeps it (``deleted``, or ``moved`` for a cross-vault move's
+                source; app/core/kept_tables.py)
         """
         file = self.db.query(File).filter(File.id == file_id).first()
         
@@ -2098,6 +2106,7 @@ class VaultService:
         # the blob AFTER a successful commit leaves at most a recoverable/GC-able orphan on failure
         # (mirrors the _remove_blobs-after-commit ordering in finalize_streaming_upload).
         self._adjust_vault_totals_by_id(vault_id, -(locked.size_bytes or 0), -1)
+        kept_tables.mark_deletes(self.db, reason, user)
         self.db.delete(file)
         self.db.commit()
 
@@ -2166,6 +2175,7 @@ class VaultService:
                 self.db.rollback()
                 return FolderDeletion(deleted, left, False)
             # A bulk delete, so the ORM's own cascade from Folder.files is not run either.
+            kept_tables.mark_deletes(self.db, "deleted", user)
             self.db.query(Folder).filter(Folder.id.in_(tree)).delete(synchronize_session=False)
             self.db.commit()
         except Exception as e:  # noqa: BLE001
@@ -2459,6 +2469,7 @@ class VaultService:
                 per_vault[r.vault_id] = (size + (r.size_bytes or 0), count + 1)
             for vault_id, (size, count) in per_vault.items():
                 self._adjust_vault_totals_by_id(vault_id, -size, -count)
+            kept_tables.mark_deletes(self.db, "expired")
             self.db.query(File).filter(File.id.in_([r.id for r in rows])).delete(
                 synchronize_session=False)
             audit = AuditLogger(self.db)
@@ -2643,7 +2654,7 @@ class VaultService:
         )
         # Copy is durable before the source is removed: a failure here leaves a copy (safe), never a
         # hole. delete_file re-checks DELETE and securely destroys the source blob.
-        self.delete_file(file_id, user)
+        self.delete_file(file_id, user, reason="moved")
         return new_file
 
     def move_folder(self, folder_id, user, dest_vault_id, dest_parent_folder_id=None):

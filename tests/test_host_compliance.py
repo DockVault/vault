@@ -133,7 +133,7 @@ def test_a_case_is_named_by_its_reference_typed_again():
 # The case steps the host takes are run by the modules that own them, which register here. Those not written
 # yet are listed; writing one fails this test until it leaves the list, which is empty when compliance access
 # is complete.
-STEPS_TO_COME = {"approve", "reject", "confirm-hold"}
+STEPS_TO_COME = {"approve", "reject"}
 
 
 def test_each_case_step_is_registered_by_its_module_or_still_to_come(monkeypatch):

@@ -3356,8 +3356,9 @@ class ComplianceNoticeOutbox(Base):
 
 class LegalHoldVault(Base):
     """A legal hold a case keeps on one vault: placed, confirmed by a second administrator (or lapsed),
-    reviewed, released. While it stands, what is deleted from the vault is kept, until ``purge_after``
-    once it is released. No foreign key to the vault: the record outlives it."""
+    reviewed, released. While it stands (``released_at`` NULL: a lapse sets it too), what is deleted from the
+    vault is kept (app/core/kept_tables.py), until ``purge_after`` once it is released. No foreign key to the
+    vault: the record outlives it."""
     __tablename__ = 'legal_hold_vaults'
 
     case_id = Column(UUID(as_uuid=True), ForeignKey('compliance_cases.id', ondelete='CASCADE'), primary_key=True)
@@ -3376,6 +3377,9 @@ class LegalHoldVault(Base):
     released_by_username = Column(String(255), nullable=True)
     release_reason_enc = Column(Text, nullable=True)
     purge_after = Column(DateTime, nullable=True)
+    # When the auditor and the administrators were last asked whether the hold is still needed (every
+    # COMPLIANCE_HOLD_REVIEW_DAYS); answering sets last_reviewed_at.
+    review_prompted_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         Index('idx_legal_hold_vault_open', 'vault_id',

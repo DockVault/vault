@@ -25275,6 +25275,9 @@ def _add_name_uniqueness():
                 if dup_groups:
                     vs = VaultService(db, PermissionService(db))
                     stale_blobs, removed = [], 0
+                    # What a legal hold keeps of these is kept as a duplicate the start removed.
+                    from app.core import kept_tables
+                    kept_tables.mark_deletes(db, "duplicate")
                     for grp in dup_groups:
                         for fid in list(grp.ids)[1:]:  # keep newest (index 0); delete the rest
                             f = db.query(File).filter(File.id == fid).first()
