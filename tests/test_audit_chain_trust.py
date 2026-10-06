@@ -156,6 +156,27 @@ def test_a_change_between_the_honoured_and_the_chains_value_is_a_reduction(env):
     assert outcome.status == "pending" and env.seals()[-1].kind == "request"
 
 
+def test_asking_for_the_value_another_writers_set_aside_seal_put_in_the_chain_is_a_request(env):
+    """Another writer applied a reduction from "for ever" to 400 days, in the chain and in the database, and the
+    host has not seen its seal: the pruner keeps the log for ever. 400 asked for again changes what is in force:
+    a request from "for ever" that waits, not "unchanged"."""
+    env.run_until_sealed()
+    _foreign_applies(env, 400)
+    with env.session() as db:
+        reg.store(db, "audit_max_days", 400)
+        db.query(ManagedSettingChange).filter(ManagedSettingChange.status == sc.PENDING).update(
+            {ManagedSettingChange.status: sc.APPLIED})
+        db.commit()
+    reg.refresh(env.session)
+    env.clock.advance(minutes=30)
+    env.seal()
+    assert env.st.view.newest_state()["audit_max_days"]["setting"] == 400
+    assert ar.chain_numbers()[0].max_days == 0
+    outcome = _change(env, _admin(env), "audit_max_days", 400)
+    assert (outcome.status, outcome.old) == ("pending", 0)
+    assert env.seals()[-1].kind == "request" and env.seals()[-1].detail["old"] == 0
+
+
 def test_the_honoured_setting_given_again_after_another_writers_seal_is_sealed_at_once(env):
     """Another writer applied a due reduction (30 to 10 days) the host has not seen: the pruner keeps 30. The
     administrator's 30 given again deletes sooner than neither, and the server's seal puts it back."""
@@ -278,6 +299,61 @@ def test_another_writers_request_counts_a_delay_from_the_servers_acceptance_once
     assert ar.chain_numbers()[0].max_days == 30
 
 
+def _accepted_at(env, seq):
+    return fmt.parse_time_text([e for e in env.st.head_store().load()["after_record"]
+                                if e["seq"] == seq][0]["accepted_at"])
+
+
+def _run_to(env, when):
+    """The pruner every 6 hours, then every hour, until the clock reaches ``when``."""
+    while env.clock() + timedelta(hours=6) <= when:
+        env.clock.advance(hours=6)
+        retention.run_pass(env.session, now=env.clock())
+    while env.clock() < when:
+        env.clock.advance(hours=1)
+        retention.run_pass(env.session, now=env.clock())
+
+
+def test_another_writers_request_adds_a_stop_after_the_servers_acceptance(env):
+    """Appended 11 hours before the server first reads it (sealing ran: no gap), then a stop of two days: due
+    once seven days of sealing have run since the acceptance, so at the acceptance + 9 days, not 11 hours sooner
+    as it would be from its own sealed_at."""
+    env.run_until_sealed()
+    forged_at = env.clock()
+    req = _foreign_request(env)
+    env.clock.advance(hours=11)
+    retention.run_pass(env.session, now=env.clock())      # the server accepts it here
+    accepted = _accepted_at(env, req)
+    assert accepted - forged_at == timedelta(hours=11)
+    _ack_by_host(env, [req])
+    _run_to(env, forged_at + timedelta(days=3))
+    env.clock.advance(days=2)                               # the server was stopped
+    retention.run_pass(env.session, now=env.clock())
+    _run_to(env, accepted + timedelta(days=9, hours=-1))
+    assert req in env.st.view.pending_requests() and req not in env.st.view.applied
+    assert ar.chain_numbers()[0].max_days == 0
+    _run_to(env, accepted + timedelta(days=9, hours=1))
+    assert req in env.st.view.applied
+    assert ar.chain_numbers()[0].max_days == 30
+
+
+def test_another_writers_request_counts_no_stop_from_before_the_servers_acceptance(env):
+    """A stop of two days long before another writer's request: due seven days after the server accepted the
+    request; a stop that ended before the acceptance moves nothing."""
+    env.run_until_sealed()
+    env.clock.advance(days=2)                               # the server was stopped
+    _run_to(env, env.clock() + timedelta(days=1))
+    req = _foreign_request(env)
+    _passes(env, 1, step=1)                                 # the server accepts it here
+    accepted = _accepted_at(env, req)
+    _ack_by_host(env, [req])
+    _run_to(env, accepted + timedelta(days=7, hours=-1))
+    assert req not in env.st.view.applied
+    _run_to(env, accepted + timedelta(days=7, hours=1))
+    assert req in env.st.view.applied
+    assert ar.chain_numbers()[0].max_days == 30
+
+
 def test_an_acknowledgment_in_another_writers_own_ack_seal_counts_for_nothing(env):
     old = env.row(T0 - timedelta(days=450))
     env.run_until_sealed()
@@ -357,6 +433,8 @@ def test_seals_accepted_while_the_record_could_not_be_written_stay_another_write
         env.seal()
     assert [e["seq"] for e in env.st.pending_after] == [lowered]
     assert ar.chain_numbers()[0].max_days == 0
+    assert lowered not in _listed(env)
+    assert "after-record" in ai.status(env.st)["warnings"]      # from the seals the record does not list yet
     outcome = _change(env, _admin(env), "audit_max_days", 500)     # more than the chain's 400, less than for ever
     assert outcome.status == "pending"
     assert lowered in _listed(env) and env.st.pending_after == []

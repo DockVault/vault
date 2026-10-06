@@ -318,12 +318,25 @@ def test_a_genuine_env_change_of_the_delay_still_sets_it(env, monkeypatch):
 
 # --------------------------------------------------------------------------- applies, from the chain alone
 
-def test_verify_rejects_an_applies_seal_early_after_a_cancel_or_twice(env):
+@pytest.mark.parametrize("case", ["early", "after a cancel", "twice"])
+def test_verify_rejects_an_applies_seal_early_after_a_cancel_or_twice(env, case):
+    """An applies seal another writer appends for a reduction to 400 days: before its delay has run, after an
+    administrator cancelled the request, or a second time after the request applied and a raise to 500
+    followed. Off the server, verify finds it unjustified; on the server, the next writer stops on it."""
     env.seal()
     ada = _admin(env)
     outcome = _change(env, ada, "audit_max_days", 400)
     request = [s for s in env.seals() if s.kind == "request"][-1]
     newest = _newest_policy(env)
+    if case == "after a cancel":
+        _cancel(env, ada, outcome.change.id)
+        _passes(env, 8 * 24)
+        assert request.seq in env.st.view.cancels
+    elif case == "twice":
+        _passes(env, 8 * 24)
+        assert request.seq in env.st.view.applied
+        assert _change(env, ada, "audit_max_days", 500).status == "applied"
+    assert (request.seq in env.st.view.pending_requests()) == (case == "early")
 
     def applies():
         state = {k: dict(v) for k, v in _newest_policy(env).detail["state"].items()}
@@ -334,10 +347,14 @@ def test_verify_rejects_an_applies_seal_early_after_a_cancel_or_twice(env):
                                       "request_seq": request.seq, "request": str(outcome.change.id),
                                       "audit_row": None, "by": "server", "user_id": None})
 
-    early = applies()
+    forged = applies()
     with env.session() as db:
         report = verify_mod.verify(db, record=None, held={}, now=env.clock(), check_rows=False)
-    assert any(f.kind == "unjustified" and f.seq == early and "delay" in f.message for f in report.findings)
+    found = [f.message for f in report.findings if f.kind == "unjustified" and f.seq == forged]
+    why = "delay" if case == "early" else "a request that is not pending"
+    assert found and why in found[0], [(f.kind, f.seq, f.message) for f in report.findings]
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "after-record-invalid"
 
 
 def test_the_database_turning_the_hold_off_does_not_release_the_audit_rows(env, monkeypatch):
