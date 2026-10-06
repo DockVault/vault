@@ -244,6 +244,62 @@ def test_a_value_written_into_the_database_that_keeps_more_is_sealed_as_a_veto(e
     assert failures(env.verify()) == []
 
 
+def _clear_in_database(env, key, how):
+    with env.session() as db:
+        q = db.query(ManagedSetting).filter(ManagedSetting.key == key)
+        if how == "removed":
+            q.delete()
+        else:
+            q.update({ManagedSetting.value: None if how == "null" else "not a value"})
+        db.commit()
+    reg.refresh(env.session)
+
+
+@pytest.mark.parametrize("how", ["null", "removed", "not usable"])
+def test_an_admins_value_removed_from_the_database_where_the_deployments_deletes_sooner_is_refused(env, how):
+    """The chain holds the hold switch on, set by an administrator; the database's value is cleared without the
+    key, so what reads the database gets the deployment's (off): a finding, and the chain keeps holding."""
+    env.run_until_sealed()
+    _change(env, _admin(env), "logs_hold", True)
+    _passes(env, 6)
+    assert "unjustified-input" not in (env.st.head_store().load().get("failures") or {})
+    _clear_in_database(env, "logs_hold", how)
+    before = len(env.seals())
+    _passes(env, 6)
+    found = env.st.head_store().load()["failures"]
+    assert "unjustified-input" in found and "no value for logs_hold" in found["unjustified-input"]["message"]
+    assert ar.chain_numbers()[2] is True
+    assert not [s for s in env.seals()[before:] if s.kind == "policy"]
+
+
+def test_an_admins_value_removed_from_the_database_where_the_deployments_keeps_more_is_a_veto(env):
+    """The chain holds 400 days, set by an administrator; the database's row is removed, so what reads it gets
+    the deployment's "for ever": sealed as a veto with no setting, which verify accepts."""
+    env.seal()
+    _change(env, _admin(env), "audit_max_days", 400)
+    _passes(env, 7 * 24 + 6)
+    assert ar.chain_numbers()[0].max_days == 400
+    _clear_in_database(env, "audit_max_days", "removed")
+    _passes(env, 6)
+    seal = _newest_policy(env)
+    entry = seal.detail["state"]["audit_max_days"]
+    assert seal.detail["cause"] == "database"
+    assert (entry["value"], entry["setting"], entry["source"], entry["request_seq"]) == (0, None, "default", seal.seq)
+    assert ar.chain_numbers()[0].max_days == 0
+    assert "unjustified-input" not in (env.st.head_store().load().get("failures") or {})
+    assert failures(env.verify()) == []
+
+
+def test_no_value_in_the_database_beside_a_chain_entry_with_no_setting_is_no_finding(env):
+    env.run_until_sealed()
+    _passes(env, 12)
+    with env.session() as db:
+        assert db.query(ManagedSetting).count() == 0
+    assert all(e.get("setting") is None for name, e in env.st.view.newest_state().items())
+    assert "unjustified-input" not in (env.st.head_store().load().get("failures") or {})
+    assert [s.detail["cause"] for s in env.seals() if s.kind == "policy"] == ["genesis"]
+
+
 def test_a_request_row_written_into_the_database_is_ignored(env):
     env.seal()
     with env.session() as db:

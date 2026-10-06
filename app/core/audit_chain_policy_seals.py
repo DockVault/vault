@@ -483,7 +483,9 @@ def apply_due(engine, st, now: datetime) -> list:
 def backstop(engine, st, now: datetime, session_factory) -> Dict[str, str]:
     """Compare what the database holds with the chain. A stored value that keeps more is honoured and sealed
     as a veto (cause ``database``, at most one such seal a day, which supersedes a pending reduction of that
-    setting); one that deletes sooner is refused: ``unjustified-input``. A pending change row with no request
+    setting); one that deletes sooner is refused: ``unjustified-input``. No stored value (no row, a NULL, or a
+    value the registry cannot use) stands for the deployment's value and is judged the same way, so removing an
+    administrator's value is refused when the deployment's deletes sooner. A pending change row with no request
     seal is ignored, and so is a cancelled one whose request is still pending (it is sealed as a cancel by the
     database). Returns the findings."""
     from app.core import setting_changes
@@ -506,16 +508,25 @@ def backstop(engine, st, now: datetime, session_factory) -> Dict[str, str]:
     vetoes = {}
     for spec in pol.chain_specs():
         entry = state.get(spec.key) or {}
-        value = stored.get(spec.key)
-        if value is None or registry.check_value(spec, value) is not None or registry.is_locked(spec):
+        if registry.is_locked(spec):
             continue
-        resolved, source = pol.resolve_setting(spec, value, ns)
-        candidate = {"value": resolved, "source": source, "setting": value}
+        value = stored.get(spec.key)
+        if value is not None and registry.check_value(spec, value) is not None:
+            value = None          # the settings registry reads no valid value there either
+        if value is None:
+            # No value stored, or none it can use: what reads the database gets the deployment's value, the
+            # entry with no setting. Removing an administrator's value can delete sooner like any other.
+            candidate = pol.input_entry(spec, ns, inputs)
+            shown = f"no value for {spec.key} (the deployment's {candidate['value']} applies)"
+        else:
+            resolved, source = pol.resolve_setting(spec, value, ns)
+            candidate = {"value": resolved, "source": source, "setting": value}
+            shown = f"{spec.key} = {value}"
         if all(candidate.get(f) == entry.get(f) for f in ("value", "setting")):
             continue
         if pol.deletes_sooner(spec, entry, candidate):
-            findings["unjustified-input"] = (f"managed_settings holds {spec.key} = {value}, which deletes sooner "
-                                             "than the chain allows; it is not acted on")
+            findings["unjustified-input"] = (f"managed_settings holds {shown}, which deletes sooner than the chain "
+                                             "allows; it is not acted on")
             continue
         if not pol.deletes_sooner(spec, candidate, entry):
             continue     # the chain's value keeps as much: nothing to hold back
