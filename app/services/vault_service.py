@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
 from app.core import file_expiry
+from app.core import kept_tables
 from app.core.safe_log import safe_event
 from app.core.security import (
     encrypt_file_content, decrypt_file_content,
@@ -1054,17 +1055,14 @@ class VaultService:
             from app.core.authorization import PermissionDeniedError
             raise PermissionDeniedError("Only the vault owner or an admin can delete this vault")
         
-        vault_dir = self._get_vault_path(vault_id)
         # Commit the DB delete (cascade) BEFORE removing the physical dir: a rmtree sequenced before a
         # FAILED commit would zombify the whole vault (rows survive, files gone). After a successful
-        # commit the dir is safely orphaned and best-effort removed.
+        # commit the dir is safely orphaned and best-effort removed. The database refuses to delete a
+        # vault a legal hold keeps anything of (app/core/kept_tables.py); the directory's removal
+        # checks it again.
         self.db.delete(vault)
         self.db.commit()
-        if vault_dir.exists():
-            try:
-                shutil.rmtree(vault_dir)
-            except Exception as _e:
-                safe_event('vault.dir-removal.failed', _e)
+        self._destroy_vault_dir(vault_id)
     
     def create_folder(
         self,
@@ -1443,16 +1441,118 @@ class VaultService:
 
     def _remove_blobs(self, rel_paths: List[str]) -> None:
         """Securely remove on-disk encrypted blobs by storage_path (relative to the storage
-        root). Best-effort: a failure here only orphans a blob, never the committed DB state."""
-        for rel in rel_paths:
+        root), except those a legal hold keeps. Best-effort: a failure here only orphans a blob,
+        never the committed DB state."""
+        self._destroy_blobs(rel_paths, failure_event='blob.replace-cleanup.failed')
+
+    def _destroy_blobs(self, rel_paths, *, fallback: bool = False,
+                       failure_event: str = 'blob.remove.failed') -> List[str]:
+        """Destroy committed blobs (storage paths relative to the storage root), after their rows'
+        deletion committed: every destruction of a committed blob comes here. A blob a legal hold
+        keeps (its row is in held_files, app/core/kept_tables.py) is skipped, which is checked
+        before secure_delete and its fallback, and its keeping recorded (held_file_kept). When the
+        check itself fails, nothing is destroyed: an orphan blob can be cleaned up later, a kept one
+        destroyed cannot be brought back. ``fallback``: when secure_delete fails, overwrite and
+        unlink by hand (delete_file's way); otherwise a blob that will not go is logged as
+        ``failure_event`` and left. Returns the paths kept."""
+        paths = [str(p) for p in dict.fromkeys(rel_paths or []) if p]
+        if not paths:
+            return []
+        try:
+            kept = kept_tables.kept_rows(self.db, paths)
+        except Exception as e:  # noqa: BLE001
+            safe_event('blob.keep-check.failed', e)
             try:
-                p = self.storage_path / rel
-                if p.exists():
-                    self.encrypted_storage.secure_delete(p)
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return paths
+        kept_paths = {row[2] for row in kept}
+        for rel in paths:
+            if rel in kept_paths:
+                continue
+            try:
+                blob = self.storage_path / rel
+                if not blob.exists():
+                    continue
+            except Exception as e:  # noqa: BLE001
+                safe_event('blob.remove.failed', e)
+                continue
+            try:
+                self.encrypted_storage.secure_delete(blob)
             except Exception as e:  # noqa: BLE001
                 # The blob's relative path is a storage path; the exception carries the
                 # ABSOLUTE one on an OSError. Neither belongs in a log an operator pastes.
-                safe_event('blob.replace-cleanup.failed', e)
+                if not fallback:
+                    safe_event(failure_event, e)
+                    continue
+                safe_event('blob.secure-delete.failed-using-fallback', e)
+                try:
+                    file_size = blob.stat().st_size
+                    with open(blob, 'wb') as f:
+                        # Overwrite in bounded 1 MB chunks (mirrors secure_delete) so a large blob
+                        # can't spike memory the way a single os.urandom(file_size) allocation would.
+                        remaining = file_size
+                        while remaining > 0:
+                            n = min(1024 * 1024, remaining)
+                            f.write(os.urandom(n))
+                            remaining -= n
+                        f.flush()
+                        os.fsync(f.fileno())
+                    blob.unlink()
+                except Exception as fallback_error:  # noqa: BLE001
+                    safe_event('blob.fallback-delete.failed', fallback_error)
+                    # Last resort: just delete (best-effort -- the row is already gone)
+                    try:
+                        blob.unlink()
+                    except Exception:  # noqa: BLE001
+                        pass
+        if kept:
+            self._record_kept(kept)
+        return sorted(kept_paths)
+
+    def _record_kept(self, kept) -> None:
+        """One held_file_kept audit row per kept file, in a transaction of its own (its deletion has
+        committed). Best-effort: the file is kept whether or not its row is written."""
+        from app.services.audit_logger import AuditLogger
+        try:
+            audit = AuditLogger(self.db)
+            for file_id, vault_id, _path, reason in kept:
+                self.db.add(audit.build_row(
+                    action='held_file_kept', status='success', resource_type='file',
+                    resource_id=str(file_id),
+                    details={'vault_id': str(vault_id), 'kept_reason': reason}))
+            self.db.commit()
+        except Exception as e:  # noqa: BLE001
+            safe_event('held-file-kept.audit.failed', e)
+            try:
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _destroy_vault_dir(self, vault_id) -> bool:
+        """Remove a deleted vault's directory, unless a legal hold keeps anything of the vault (the
+        vaults trigger refuses such a vault's deletion; this is the gate behind it). Fails closed:
+        when that cannot be checked, the directory stays. Returns whether it was removed."""
+        vault_dir = self._get_vault_path(vault_id)
+        try:
+            if kept_tables.vault_keeps(self.db, vault_id):
+                return False
+        except Exception as e:  # noqa: BLE001
+            safe_event('vault.keep-check.failed', e)
+            try:
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        if not vault_dir.exists():
+            return False
+        try:
+            shutil.rmtree(vault_dir)
+        except Exception as _e:  # noqa: BLE001
+            safe_event('vault.dir-removal.failed', _e)
+            return False
+        return True
 
     def _adjust_vault_totals(self, vault, size_delta, count_delta):
         """Move a vault's size and file counters by a delta, atomically and never below zero.
@@ -1964,7 +2064,7 @@ class VaultService:
     def delete_file(self, file_id: uuid.UUID, user: User):
         """
         Securely delete a file.
-        
+
         Args:
             file_id: File UUID
             user: User deleting file
@@ -1991,7 +2091,6 @@ class VaultService:
                   .filter(File.id == file_id).with_for_update().first())
         if locked is None:
             raise FileNotFoundError(f"File not found: {file_id}")
-        storage_path = self.storage_path / locked.storage_path
 
         # Update stats, delete the row, and COMMIT before touching the blob. An irreversible
         # secure_delete sequenced BEFORE the commit would, on a commit failure, leave a live row
@@ -2002,33 +2101,9 @@ class VaultService:
         self.db.delete(file)
         self.db.commit()
 
-        if storage_path.exists():
-            try:
-                # Secure delete with overwrite
-                self.encrypted_storage.secure_delete(storage_path)
-            except Exception as e:
-                # Fallback to manual overwrite if secure delete fails
-                safe_event('blob.secure-delete.failed-using-fallback', e)
-                try:
-                    file_size = storage_path.stat().st_size
-                    with open(storage_path, 'wb') as f:
-                        # Overwrite in bounded 1 MB chunks (mirrors secure_delete) so a large blob
-                        # can't spike memory the way a single os.urandom(file_size) allocation would.
-                        remaining = file_size
-                        while remaining > 0:
-                            n = min(1024 * 1024, remaining)
-                            f.write(os.urandom(n))
-                            remaining -= n
-                        f.flush()
-                        os.fsync(f.fileno())
-                    storage_path.unlink()
-                except Exception as fallback_error:
-                    safe_event('blob.fallback-delete.failed', fallback_error)
-                    # Last resort: just delete (best-effort — the row is already gone)
-                    try:
-                        storage_path.unlink()
-                    except Exception:
-                        pass
+        # Secure delete with overwrite, falling back to a manual overwrite -- unless a legal hold
+        # keeps the file, which _destroy_blobs checks before either.
+        self._destroy_blobs([locked.storage_path], fallback=True)
 
     def delete_folder_tree(self, vault_id: uuid.UUID, folder_id: uuid.UUID,
                            user: User) -> "FolderDeletion":
@@ -2401,15 +2476,9 @@ class VaultService:
             raise
 
         # Rows are durably gone; now securely destroy the blobs (best-effort -- an orphan blob is
-        # recoverable, a dangling row is not). secure_delete overwrites in bounded 1 MB chunks
-        # (+ fsync), so a large blob cannot spike memory.
-        for r in rows:
-            try:
-                blob = self.storage_path / r.storage_path
-                if blob.exists():
-                    self.encrypted_storage.secure_delete(blob)
-            except Exception as e:  # noqa: BLE001
-                safe_event('expired-blob.remove.failed', e, file=r.id)
+        # recoverable, a dangling row is not), except those a legal hold keeps. secure_delete
+        # overwrites in bounded 1 MB chunks (+ fsync), so a large blob cannot spike memory.
+        self._destroy_blobs([r.storage_path for r in rows], failure_event='expired-blob.remove.failed')
         return [{'file_id': r.id, 'vault_id': r.vault_id} for r in rows]
     
     # ---- Move / Copy (files + folders) --------------------------------------------------------

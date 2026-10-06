@@ -9,7 +9,8 @@ row removed by any path is kept, those with no Python site to hook included: the
 ``files.folder_id`` and ``folders.parent_folder_id``, the ORM's delete-orphan cascades, a bulk delete, the
 expiry sweep, a cross-vault move, a same-name replacement, the start's duplicate collapse, the SFTP server, and
 any path written later. For the people using the vault the deletion is done: the row is gone from ``files``,
-the vault's counters drop, links and shares on it go.
+the vault's counters drop, links and shares on it go. The stored bytes stay on disk: every destruction of a
+committed blob asks the kept table first (kept_rows, from VaultService._destroy_blobs).
 
 The kept tables are built from the live ones (``CREATE TABLE held_files (LIKE files)``: every column, no
 foreign key, no unique index), not from the models, because the start adds columns to ``files`` and
@@ -359,3 +360,47 @@ def mark_deletes(db, reason: str, actor=None) -> None:
         return
     db.execute(text(f"SELECT set_config('{REASON_SETTING}', :why, true), set_config('{ACTOR_SETTING}', :who, true)"),
                {"why": reason, "who": actor_text(actor)})
+
+
+# --------------------------------------------------------------------------- reading what is kept
+
+def _has_kept_tables(db) -> bool:
+    """On a database other than Postgres (the tests' SQLite), whether the kept tables were made there."""
+    try:
+        from sqlalchemy import inspect
+        return inspect(db.get_bind()).has_table("held_files")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _readable(db) -> bool:
+    """Whether ``db`` can hold kept rows: Postgres always (a failing read there is raised, never taken for
+    "nothing kept"); another database only when the kept tables were made in it; a stand-in session never."""
+    dialect = _dialect(db)
+    if dialect == "postgresql":
+        return True
+    return dialect is not None and _has_kept_tables(db)
+
+
+def kept_rows(db, rel_paths: Iterable[str]) -> list:
+    """[(id, vault_id, storage_path, kept_reason)] of the kept files stored at ``rel_paths``. On Postgres an
+    error is raised to the caller, which then keeps every blob (VaultService._destroy_blobs)."""
+    from app.core.models import HeldFile
+    paths = sorted({str(p) for p in rel_paths if p})
+    if not paths or not _readable(db):
+        return []
+    return [tuple(r) for r in db.query(HeldFile.id, HeldFile.vault_id, HeldFile.storage_path, HeldFile.kept_reason)
+            .filter(HeldFile.storage_path.in_(paths)).all()]
+
+
+def vault_keeps(db, vault_id) -> bool:
+    """Whether a hold stands on ``vault_id``, or kept rows of it wait for their purge."""
+    from app.core.models import HeldFile, HeldFolder, LegalHoldVault
+    if not _readable(db):
+        return False
+    vid = uuid.UUID(str(vault_id))
+    return any(q.first() is not None for q in (
+        db.query(LegalHoldVault.vault_id).filter(LegalHoldVault.vault_id == vid,
+                                                 LegalHoldVault.released_at.is_(None)),
+        db.query(HeldFile.id).filter(HeldFile.vault_id == vid),
+        db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
