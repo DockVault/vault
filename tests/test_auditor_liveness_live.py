@@ -18,9 +18,9 @@ import struct
 import pytest
 
 from conftest import unique
-from _account_change_helpers import notifications, psql, signed_in
+from _account_change_helpers import notifications, psql
 from _auditor_helpers import (audit_rows, compliance_receipt, forget_grants, grant_right, new_auditor_account,
-                              run_pass, two_admins)
+                              run_pass, signed_in_with_code, two_admins)
 from _sf_helpers import step_up_receipt
 
 pytestmark = pytest.mark.integration
@@ -93,7 +93,7 @@ def test_after_an_administrator_sets_the_password_the_holder_sets_their_own_firs
     assert r.status_code == 200, r.text
     assert _status(holder) == "suspended|password"
     uma["_password"] = "Chosen-By-Admin-8x!"
-    holder["uma_c"] = signed_in(uma)          # the change ended the holder's sessions
+    holder["uma_c"] = signed_in_with_code(uma, holder["codes"])     # the change ended the holder's sessions
     me = _me(holder["uma_c"])
     assert me["may_reconfirm"] is False and me["reconfirm_problem"]["reason"] == "password_not_own"
     r = holder["uma_c"].post(f"/compliance/auditor-grants/{holder['grant']}/reconfirm")
@@ -101,6 +101,7 @@ def test_after_an_administrator_sets_the_password_the_holder_sets_their_own_firs
     r = holder["uma_c"].patch("/users/me", json={"current_password": uma["_password"], "new_password": "Own-Again-9x!"})
     assert r.status_code == 200, r.text
     uma["_password"] = "Own-Again-9x!"
+    holder["uma_c"] = signed_in_with_code(uma, holder["codes"])
     r = _reconfirm(holder)
     assert r.status_code == 200 and r.json()["status"] == "active", r.text
     assert _me(holder["uma_c"])["live"] is True
@@ -111,8 +112,8 @@ def test_a_second_factor_reset_ends_the_right(admin, holder):
     r = admin.post(f"/users/{uid}/second-factor/reset")
     assert r.status_code == 200, r.text
     assert _status(holder) == "ended|second_factor_reset"
-    client = signed_in(holder["uma"])
-    assert client.get("/compliance/me").json() == {"grant": None}
+    listed = {g["id"]: g for g in admin.get("/compliance/auditors").json()["grants"]}
+    assert listed[holder["grant"]]["status"] == "ended"
     rows = audit_rows(admin, "auditor_suspended", uid)
     assert rows and rows[0]["details"]["outcome"] == "ended"
     assert "Auditor right ended" in [n["title"] for n in notifications(admin, "auditor_right")]
@@ -132,7 +133,7 @@ def test_deactivation_suspends_and_the_holder_reconfirms_once_active_again(admin
     assert admin.post(f"/api/user-management/users/{uid}/toggle-active").status_code == 200
     assert _status(holder) == "suspended|deactivated"
     assert admin.post(f"/api/user-management/users/{uid}/toggle-active").status_code == 200
-    holder["uma_c"] = signed_in(holder["uma"])
+    holder["uma_c"] = signed_in_with_code(holder["uma"], holder["codes"])
     assert _me(holder["uma_c"])["reason"] == "suspended"
     r = _reconfirm(holder)
     assert r.status_code == 200 and r.json()["status"] == "active", r.text

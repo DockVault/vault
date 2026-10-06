@@ -17,6 +17,23 @@ def compliance_receipt(client, action, password, codes):
     return {"X-Second-Factor": r.json()["receipt"]}
 
 
+def signed_in_with_code(user, codes):
+    """A client signed in as ``user``, whose account has an authenticator: the password, then one of its
+    recovery codes (``codes``, consumed)."""
+    from conftest import ApiClient, BASE_URL
+    client = ApiClient(BASE_URL)
+    r = client.session.post(f"{BASE_URL}/auth/login",
+                            json={"username": user["_username"], "password": user["_password"]}, timeout=15)
+    assert r.status_code == 200 and r.json().get("second_factor_required"), r.text
+    pre = {"Authorization": f"Bearer {r.json()['pre_auth_token']}"}
+    r = client.session.post(f"{BASE_URL}/auth/second-factor/verify", headers=pre,
+                            json={"method": "recovery", "code": codes.pop(0)}, timeout=15)
+    assert r.status_code == 200, r.text
+    client.token = r.json()["access_token"]
+    client.session.headers.update({"Authorization": f"Bearer {client.token}"})
+    return client
+
+
 def run_pass():
     """One pass of the pruner in the web container, retried while the web app's own runner holds its lock.
     Returns {job: whether it ran}."""
