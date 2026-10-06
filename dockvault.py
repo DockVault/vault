@@ -53,6 +53,7 @@ MENU = [
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
     ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
+    ("cases", "Cases - compliance access: approve an auditor right or a case when no administrator can"),
 ]
 
 
@@ -3025,6 +3026,27 @@ def server_text(value, default=""):
     return clean_matrix_text(value if isinstance(value, str) else str(value))
 
 
+# --- cases (compliance access, from the host) ------------------------------------------------------
+CASE_ACTIONS = (
+    ("list", "List the auditor rights and the cases that are open"),
+    ("show", "Show an auditor right or a case"),
+    ("grant-approve", "Approve an auditor right (only when no administrator can)"),
+    ("revoke-auditor", "Revoke an account's auditor right"),
+    ("approve", "Approve a case (only when no administrator can)"),
+    ("reject", "Turn a case down"),
+    ("confirm-hold", "Confirm a case's legal hold (only when no administrator can)"),
+    ("downgrade-blockers", "List what stops going back to an older version"),
+)
+
+
+def case_reference_problem(typed):
+    """Why a case step must not go ahead: no reference typed back. None when one was. The container checks
+    that it matches the case."""
+    if not (typed or "").strip():
+        return "type the case's reference again with --confirm-case (list shows it)"
+    return None
+
+
 def username_confirmation_problem(username, typed_again):
     """Why an account change must not go ahead: the username was not given, or not typed again
     exactly. None when it may. The container checks the same again."""
@@ -5994,6 +6016,194 @@ class DockVault:
             "    " + (answer.get("secret") or ""),
             pal.paint("  " + advice, "yellow")]))
 
+    def _run_case_tool(self, *tool_args):
+        """Run `python -m app.core.host_compliance ...` inside the running web container and return its JSON
+        answer (the one-container layout names the service `vault`, the split one `vault-api`)."""
+        ok, why = docker_available()
+        if not ok:
+            self._fail("Docker is not available: %s" % why)
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.host_compliance",
+                                 *tool_args, timeout=180)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("could not run the compliance tool: %s" % type(exc).__name__)
+            answer = parse_operator_answer(getattr(r, "stdout", ""))
+            if answer is not None:
+                return answer
+        self._fail("the compliance tool did not answer. Is the deployment running, on a version with compliance "
+                   "access? (python dockvault.py status)")
+
+    def _show_grant(self, g):
+        pal = self.pal
+        print(pal.paint("\n  Auditor right of %s: %s" % (server_text(g.get("username")), server_text(g.get("status"))),
+                        "cyan"))
+        print("  proposed by %s on %s%s" % (server_text(g.get("proposed_by")), server_text(g.get("proposed_at"))[:10],
+                                            "; lapses %s" % server_text(g.get("lapses_at"))[:10]
+                                            if g.get("lapses_at") else ""))
+        if g.get("approved_by"):
+            print("  approved by %s; ends %s" % (server_text(g.get("approved_by")),
+                                                 server_text(g.get("expires_at"))[:10]))
+        prov = g.get("provenance") or {}
+        if prov:
+            print("  account created %s by %s; password %s; authenticator %s" % (
+                server_text(prov.get("created_at"))[:10], server_text(prov.get("created_by"), "nobody recorded"),
+                "set by %s" % server_text(prov.get("password_set_by")) if prov.get("password_set_by_other")
+                else "its own", "set up" if prov.get("authenticator") else "NOT set up"))
+        for p in g.get("problems") or []:
+            print(pal.paint("  cannot hold it: %s" % server_text(p.get("text")), "yellow"))
+        if g.get("independent_approvers"):
+            print(pal.paint("  an administrator can approve it: %s" % ", ".join(
+                server_text(a) for a in g["independent_approvers"]), "yellow"))
+
+    def _show_case(self, c):
+        pal = self.pal
+        print(pal.paint("\n  Case %s (%s): %s" % (server_text(c.get("number") or c.get("reference")),
+                                                 server_text(c.get("reference")), server_text(c.get("status"))), "cyan"))
+        print("  auditor %s; asked %s; purpose %s; legal basis %s; %s vault(s)" % (
+            server_text(c.get("auditor")), server_text(c.get("requested_at"))[:10], server_text(c.get("purpose")),
+            server_text(c.get("legal_basis")), server_text(c.get("vaults"))))
+        if c.get("justification"):
+            print("  why: %s" % server_text(c.get("justification")))
+        if c.get("independent_approvers"):
+            print(pal.paint("  an administrator can approve it: %s" % ", ".join(
+                server_text(a) for a in c["independent_approvers"]), "yellow"))
+
+    def cases(self, args=None):
+        """Compliance access from the host: approve an auditor right or a case when no administrator is
+        independent enough to (the approval is recorded as the host operator's), revoke a right, or list what is
+        open. Approving is refused while an administrator who can approve exists. An auditor right is approved
+        by typing the account's username again, a case by typing its reference again."""
+        pal = self.pal
+        interactive = not (args and getattr(args, "non_interactive", False))
+        action = getattr(args, "case_action", None) if args else None
+        if action is None:
+            if not interactive:
+                self._fail("say what to do with --action (%s)" % ", ".join(k for k, _ in CASE_ACTIONS))
+            print(pal.paint("\n  Cases", "cyan"))
+            for i, (_key, label) in enumerate(CASE_ACTIONS, 1):
+                print("  %s) %s" % (pal.paint(str(i), "bold"), label))
+            try:
+                choice = parse_menu_choice(input(pal.paint("\nChoose: ", "cyan")), len(CASE_ACTIONS))
+            except EOFError:
+                choice = 0
+            if not choice:
+                print(pal.paint("  Left unchanged.\n", "yellow"))
+                return
+            action = CASE_ACTIONS[choice - 1][0]
+
+        def given(name, prompt):
+            value = getattr(args, name, None) if args else None
+            if value is None and interactive:
+                value = ask(prompt, pal)
+            return value
+
+        def answered(*tool_args):
+            answer = self._run_case_tool(*tool_args)
+            if not answer.get("ok"):
+                self._fail(server_text(answer.get("error")) or "nothing was changed")
+            return answer
+
+        if action == "list":
+            answer = answered("list")
+            grants, cases = answer.get("grants") or [], answer.get("cases") or []
+            if not grants and not cases:
+                print(pal.paint("  No auditor right and no case is open.\n", "green"))
+                return
+            for g in grants:
+                print("  right  %s  %-10s %s%s" % (server_text(g.get("id")), server_text(g.get("status")),
+                                                   server_text(g.get("username")),
+                                                   "  (the host may approve it)" if g.get("host_may_approve") else ""))
+            for c in cases:
+                print("  case   %s  %-10s auditor %s%s" % (server_text(c.get("reference")), server_text(c.get("status")),
+                                                          server_text(c.get("auditor")),
+                                                          "  (the host may approve it)" if c.get("host_may_approve")
+                                                          else ""))
+            print()
+            return
+
+        if action == "downgrade-blockers":
+            target = given("target", "Version to go back to (X.Y.Z)")
+            if not target:
+                self._fail("name the version with --target")
+            blockers = answered("downgrade-blockers", "--target", target).get("blockers") or []
+            if not blockers:
+                print(pal.paint("  Nothing stops going back to %s.\n" % server_text(target), "green"))
+                return
+            for b in blockers:
+                print(pal.paint("  needs %s or later: %s" % (server_text(b.get("requires_at_least")),
+                                                              server_text(b.get("reason"))), "yellow"))
+                if b.get("undo"):
+                    print("    to undo it first: %s" % server_text(b.get("undo")))
+            print()
+            return
+
+        if action == "show":
+            grant, case = (getattr(args, "grant", None), getattr(args, "case", None)) if args else (None, None)
+            if not grant and not case and interactive:
+                grant = ask("Auditor right id (leave empty for a case)", pal) or None
+                case = None if grant else ask("Case id", pal)
+            if grant:
+                self._show_grant(answered("show", "--grant", grant)["grant"])
+            elif case:
+                self._show_case(answered("show", "--case", case)["case"])
+            else:
+                self._fail("name what to show with --grant or --case")
+            print()
+            return
+
+        if action == "grant-approve":
+            grant = given("grant", "Auditor right id (see: List)")
+            if not grant:
+                self._fail("name the auditor right with --grant")
+            shown = answered("show", "--grant", grant)["grant"]
+            self._show_grant(shown)
+            typed = given("confirm_username", "Type the account's username again to approve")
+            if not (typed or "").strip():
+                self._fail("type the account's username with --confirm-username to confirm")
+            answer = answered("grant-approve", "--grant", grant, "--confirm-username", typed)
+            g = answer.get("granted") or {}
+            print(pal.paint("  Approved: %s holds the auditor right until %s, recorded as the host operator's "
+                            "approval. Every administrator and the account were told." % (
+                                server_text(g.get("username")), server_text(g.get("expires_at"))[:10]), "green"))
+            return
+
+        if action == "revoke-auditor":
+            username = given("username", "Username")
+            if not username:
+                self._fail("name the account with --username")
+            typed = given("confirm_username", "Type the username again to confirm")
+            problem = username_confirmation_problem(username, typed)
+            if problem:
+                self._fail(problem)
+            tool_args = ["revoke-auditor", "--username", username, "--confirm-username", typed]
+            reason = getattr(args, "reason", None) if args else None
+            if reason:
+                tool_args += ["--reason", reason]
+            answered(*tool_args)
+            print(pal.paint("  Revoked the auditor right of %s, recorded as the host operator's." % username, "green"))
+            return
+
+        if action not in ("approve", "reject", "confirm-hold"):
+            self._fail("unknown action: %s" % action)
+        case = given("case", "Case id (see: List)")
+        if not case:
+            self._fail("name the case with --case")
+        self._show_case(answered("show", "--case", case)["case"])
+        typed = given("confirm_case", "Type the case's reference again to confirm")
+        problem = case_reference_problem(typed)
+        if problem:
+            self._fail(problem)
+        tool_args = [action, "--case", case, "--confirm-case", typed]
+        if action == "reject":
+            reason = given("reason", "Why (the auditor sees it)")
+            if not (reason or "").strip():
+                self._fail("say why with --reason")
+            tool_args += ["--reason", reason]
+        answered(*tool_args)
+        print(pal.paint("  Done: %s, recorded as the host operator's." % dict(CASE_ACTIONS)[action].split(" (")[0],
+                        "green"))
+
     def handler(self, key):
         """Resolve a menu/command key to its bound handler, or None if unknown. A hyphenated command
         (e.g. change-passphrase) maps to the underscore method name."""
@@ -6167,6 +6377,20 @@ def build_parser():
     ac.add_argument("--temporary-password", dest="temporary_password", action="store_true",
                     help="reset-password: set a temporary password instead of creating a reset link")
     ac.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    cs = parsers["cases"]
+    cs.add_argument("--action", dest="case_action", choices=[k for k, _ in CASE_ACTIONS],
+                    help=" | ".join(k for k, _ in CASE_ACTIONS))
+    cs.add_argument("--grant", dest="grant", help="show, grant-approve: the auditor right's id (see --action list)")
+    cs.add_argument("--case", dest="case", help="show, approve, reject, confirm-hold: the case's id")
+    cs.add_argument("--confirm-case", dest="confirm_case",
+                    help="the case's reference typed again (list shows it); nothing changes unless it matches")
+    cs.add_argument("--username", dest="username", help="revoke-auditor: the account")
+    cs.add_argument("--confirm-username", dest="confirm_username",
+                    help="the account's username typed again; nothing changes unless it matches")
+    cs.add_argument("--reason", dest="reason", help="reject: why (the auditor sees it); revoke-auditor: optional")
+    cs.add_argument("--target", dest="target", help="downgrade-blockers: the version to go back to (X.Y.Z)")
+    cs.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lk = parsers["lock"]
     lk.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")
