@@ -312,11 +312,7 @@ def seal_request_outcome(w, outcome, actor) -> None:
     if outcome.key not in pol.chain_setting_keys():
         return                # a setting the chain does not record: no seal
     if outcome.status == "kept":
-        for change, row in zip(outcome.superseded, outcome.cancel_rows):
-            req = request_seq_for(view, change.id)
-            if req is not None and req in view.pending_requests():
-                w.append("cancel", detail={"cancels": req, "request": str(change.id), "audit_row": str(row.id),
-                                           **_actor_fields(actor)})
+        _cancel_superseded(w, outcome.superseded, outcome.cancel_rows, actor)
         return
     if outcome.status == "applied":
         newest = view.newest_policy()
@@ -340,6 +336,16 @@ def seal_request_outcome(w, outcome, actor) -> None:
             str(change.id), outcome.key, old, outcome.setting, delay,
             _uuid_text(getattr(outcome.audit_row, "id", None)), **_actor_fields(actor)))
         change.effective_at = fmt.parse_time_text(seal.detail["not_before"])
+
+
+def _cancel_superseded(w, superseded, rows, actor) -> None:
+    """A cancel seal for each change ``superseded`` whose request seal is still pending, naming its audit row."""
+    view = w.st.view
+    for change, row in zip(superseded, rows):
+        req = request_seq_for(view, change.id)
+        if req is not None and req in view.pending_requests():
+            w.append("cancel", detail={"cancels": req, "request": str(change.id),
+                                       "audit_row": _uuid_text(getattr(row, "id", None)), **_actor_fields(actor)})
 
 
 def seal_cancel(w, change, actor) -> None:

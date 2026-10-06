@@ -187,6 +187,32 @@ def test_the_honoured_setting_given_again_after_another_writers_seal_is_sealed_a
     assert ps.numbers()["security_record_days"] == 40
 
 
+def test_a_value_the_database_lost_is_put_right_by_asking_for_it_again(env):
+    """The chain holds the hold switch on; the database's value was cleared without the key. Asking for it
+    again stores it (other jobs read the database), and its policy seal supersedes the request waiting to turn
+    it off."""
+    env.run_until_sealed()
+    ada = _admin(env)
+    assert _change(env, ada, "logs_hold", True).status == "applied"
+    waiting = _change(env, ada, "logs_hold", False)
+    assert waiting.status == "pending"
+    req = [s for s in env.seals() if s.kind == "request"][-1].seq
+    with env.session() as db:
+        db.query(ManagedSetting).filter(ManagedSetting.key == "logs_hold").update({ManagedSetting.value: None})
+        db.commit()
+    before = len(env.seals())
+    again = _change(env, ada, "logs_hold", True)
+    assert again.status == "applied"
+    with env.session() as db:
+        assert db.get(ManagedSetting, "logs_hold").value is True
+        assert db.get(ManagedSettingChange, waiting.change.id).status == sc.SUPERSEDED
+    added = env.seals()[before:]
+    assert [s.kind for s in added] == ["policy"] and added[0].detail["cause"] == "request"
+    assert added[0].detail["state"]["logs_hold"]["value"] is True
+    assert req not in env.st.view.pending_requests()
+    assert failures(env.verify()) == []
+
+
 def test_a_setting_the_chain_does_not_record_writes_no_seal(env):
     env.run_until_sealed()
     before = len(env.seals())

@@ -158,12 +158,15 @@ def request(db, key: str, requested, *, actor, now: Optional[datetime] = None, j
         raise registry.SettingRefused(f"{key} is not a setting the panel manages")
     now = now or utcnow()
     _lock(db)
+    db_stored = in_force(db, spec)[0]
     stored, old_setting, old_value = judge.in_force() if judge is not None else in_force(db, spec)
     new_setting = requested if requested is not None else registry.deployment_value(spec)[0]
     new_value = resolved(spec, requested)
     waiting = pending_for(db, key)
     base = dict(key=key, old=old_value, new=new_value, setting=requested)
-    if requested == stored and (judge is None or not judge.alters_chain(requested)):
+    # With the chain's judge, the value in force is the chain's, and the database must hold it too: a value
+    # the database lost, or one written into it without the chain's key, is put right by storing the request.
+    if requested == stored and (judge is None or (requested == db_stored and not judge.alters_chain(requested))):
         if not waiting:
             return Outcome("unchanged", **base)
         rows = []

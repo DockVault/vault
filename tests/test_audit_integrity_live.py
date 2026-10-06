@@ -279,9 +279,9 @@ def test_a_value_written_into_the_database_is_neither_shown_nor_followed(admin):
     if chain_value != 0 and wanted >= chain_value:
         pytest.skip("the chain's maximum is already at its floor")
     before = psql("SELECT value::text FROM managed_settings WHERE key = 'audit_max_days'")
-    psql("INSERT INTO managed_settings (key, value, version) VALUES ('audit_max_days', CAST('10' AS json), "
-         "(SELECT coalesce(max(version), 0) + 1 FROM managed_settings)) ON CONFLICT (key) DO UPDATE SET "
-         "value = CAST('10' AS json), version = (SELECT max(version) + 1 FROM managed_settings)")
+    psql("INSERT INTO managed_settings (key, value, version, updated_at) VALUES ('audit_max_days', "
+         "CAST('10' AS json), (SELECT coalesce(max(version), 0) + 1 FROM managed_settings), now()) ON CONFLICT (key) "
+         "DO UPDATE SET value = CAST('10' AS json), version = (SELECT max(version) + 1 FROM managed_settings)")
     change = None
     try:
         shown = _wait_for(lambda: (lambda r: r if r["stored"] == 10 else None)(
