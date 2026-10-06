@@ -687,14 +687,31 @@ class ChainWriter:
             if exc_type is None and self.written:
                 self._finish()
             elif exc_type is None and self.commit_without_seal and self.db is not None:
-                self.db.commit()
+                self._commit()
                 self._list_accepted()
             else:
-                if self.db is not None:
-                    self.db.rollback()
-                self._list_accepted()
+                self._abandon()
         finally:
             self._release()
+
+    def _commit(self) -> None:
+        try:
+            self.db.commit()
+        except BaseException:
+            self._abandon()
+            raise
+
+    def _abandon(self) -> None:
+        """Roll this writer's own work back. Its seals never reached the table, so nothing of them goes into
+        the head record; the seals it accepted from another writer are listed all the same."""
+        try:
+            if self.db is not None:
+                self.db.rollback()
+        except Exception as exc:  # noqa: BLE001 -- the transaction is gone with the connection
+            _say(f"Warning: the audit chain's transaction was not rolled back cleanly ({type(exc).__name__})")
+        finally:
+            self.written = []
+            self._list_accepted()
 
     def _list_accepted(self) -> None:
         """Write the seals accepted after the head record into it, whatever became of this writer's own work:
@@ -897,7 +914,7 @@ class ChainWriter:
 
     def _finish(self) -> None:
         st = self.st
-        self.db.commit()
+        self._commit()
         for seal, link in self.written:
             st.own[seal.seq] = link
             st.view.accept(seal, link)

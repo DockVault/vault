@@ -409,6 +409,38 @@ def test_a_writer_whose_own_work_fails_still_lists_the_seals_it_accepted(env):
     assert "after-record" in ai.status(env.st)["warnings"]
 
 
+@pytest.mark.parametrize("fails", ["after its own seal", "at its commit"])
+def test_a_writer_whose_own_seal_is_rolled_back_lists_the_seals_it_accepted_and_nothing_of_its_own(env, fails):
+    """A writer reads another writer's seal, seals an hour of its own, then its work or its commit fails: on its
+    way out the head record lists the accepted seal, and holds no summary or link of the seal rolled back."""
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    foreign = _hold_on_elsewhere(env)
+    env.clock.advance(hours=2)
+    head = env.st.head_store().load()
+    own = None
+    with pytest.raises(RuntimeError):
+        with ai.ChainWriter(env.engine, env.st) as w:
+            assert w.st.view.position == foreign
+            own = ai.seal_hour(w, w.st.view.newest_hour_end, env.clock(), None)
+            if fails == "after its own seal":
+                raise RuntimeError("its own work failed")
+
+            def refuse():
+                raise RuntimeError("the commit failed")
+            w.db.commit = refuse
+    assert own is not None and own.seq == foreign + 1
+    with env.session() as db:
+        assert db.query(AuditSeal).filter(AuditSeal.seq == own.seq).count() == 0
+    record = env.st.head_store().load()
+    assert foreign in _listed(env) and env.st.pending_after == []
+    assert record.get("hours") == head.get("hours") and record.get("links") == head.get("links")
+    assert record["seq"] == foreign
+    env.clock.advance(minutes=5)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
+
+
 def test_a_writer_whose_check_stops_after_accepting_a_seal_still_lists_it(env):
     env.row(T0 - timedelta(hours=5))
     env.run_until_sealed()
