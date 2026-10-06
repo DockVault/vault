@@ -38,6 +38,7 @@ The deleting code says why and as whom through two transaction-local settings (m
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from typing import Iterable, Optional
 
@@ -307,6 +308,9 @@ def problems(db) -> list:
             found.append(f"the trigger {trigger.name} does not read the deleted rows as {trigger.old_table}")
         if trigger.columns and f"UPDATE OF {', '.join(trigger.columns)} " not in (definition or ""):
             found.append(f"the trigger {trigger.name} does not fire on a change of {', '.join(trigger.columns)}")
+        if trigger.when and when_text(_when_of(definition)) != when_text(trigger.when):
+            found.append(f"the trigger {trigger.name} does not fire on every change of a name (its WHEN clause "
+                         "is not the one install() writes)")
     if all(live_columns.values()):
         expected = function_bodies(live_columns)
         have = dict(db.execute(text(_FUNCTION_SQL), {"names": sorted(expected)}).fetchall())
@@ -314,6 +318,24 @@ def problems(db) -> list:
             if have.get(name) != body:
                 found.append(f"the function {name} is missing, or was not made for the columns its table has now")
     return found
+
+
+def _when_of(definition: Optional[str]) -> Optional[str]:
+    """The WHEN clause of a trigger as pg_get_triggerdef prints it, or None when it has none."""
+    if not definition or " WHEN " not in definition:
+        return None
+    return definition.split(" WHEN ", 1)[1].rsplit(" EXECUTE ", 1)[0]
+
+
+def when_text(clause: Optional[str]) -> Optional[str]:
+    """A WHEN clause reduced for comparison: lower case, without the casts to text Postgres adds when it prints
+    it, its parentheses and its spaces. The clause install() writes has only IS DISTINCT FROM between names and OR
+    between those, on columns that are not boolean, so no other grouping of the same words is a valid clause:
+    two clauses with the same reduced text fire on the same changes."""
+    if clause is None:
+        return None
+    reduced = re.sub(r"::(text|character varying)\b", "", clause.lower())
+    return re.sub(r"[\s()]", "", reduced)
 
 
 def verify(db) -> None:

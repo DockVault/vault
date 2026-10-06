@@ -76,9 +76,15 @@ class _Catalog:
         return _Rows([])
 
 
-def _definition(t):
+# How Postgres prints the rename triggers' WHEN clause (pg_get_triggerdef): casts to text, more parentheses.
+PRINTED_WHEN = ("(((old.name)::text IS DISTINCT FROM (new.name)::text) OR "
+                "(old.enc_name IS DISTINCT FROM new.enc_name))")
+
+
+def _definition(t, when=None):
     columns = f"UPDATE OF {', '.join(t.columns)} " if t.columns else ""
-    return f"CREATE TRIGGER {t.name} AFTER {columns}ON public.{t.table} EXECUTE FUNCTION {t.function}()"
+    clause = f"FOR EACH ROW WHEN {when or PRINTED_WHEN} " if t.when else ""
+    return f"CREATE TRIGGER {t.name} AFTER {columns}ON public.{t.table} {clause}EXECUTE FUNCTION {t.function}()"
 
 
 def _healthy_triggers():
@@ -244,6 +250,28 @@ def test_a_trigger_that_is_not_enable_always_is_a_problem(trigger, state):
 def test_a_trigger_on_the_wrong_table_calling_another_function_or_of_the_wrong_kind_is_a_problem(change, words):
     problems = kt.problems(_Catalog(triggers=_with("trg_files_keep", **change)))
     assert any("trg_files_keep" in p and words in p for p in problems), problems
+
+
+@pytest.mark.parametrize("when", ["(false)", "((old.name)::text IS DISTINCT FROM (new.name)::text)",
+                                  "(((old.name)::text IS DISTINCT FROM (new.name)::text) AND "
+                                  "(old.enc_name IS DISTINCT FROM new.enc_name))",
+                                  "((((old.name)::text IS DISTINCT FROM (new.name)::text) OR "
+                                  "(old.enc_name IS DISTINCT FROM new.enc_name)) AND false)", None])
+def test_a_rename_trigger_whose_when_clause_is_not_the_one_install_writes_is_a_problem(when):
+    """Same table, kind, columns and function, ENABLE ALWAYS: only the WHEN clause differs (or is gone), and a
+    rename would then keep no old name."""
+    trigger = next(t for t in kt.TRIGGERS if t.name == "trg_files_keep_name")
+    definition = _definition(trigger, when) if when else _definition(trigger).replace(f"WHEN {PRINTED_WHEN} ", "")
+    found = kt.problems(_Catalog(triggers=_with("trg_files_keep_name", definition=definition)))
+    assert any("trg_files_keep_name" in p and "WHEN clause" in p for p in found), found
+
+
+def test_the_when_clause_install_writes_and_the_one_postgres_prints_compare_equal():
+    for trigger in (t for t in kt.TRIGGERS if t.when):
+        assert kt.when_text(PRINTED_WHEN) == kt.when_text(trigger.when)
+        assert kt._when_of(_definition(trigger)) == PRINTED_WHEN
+    assert kt.when_text("(false)") != kt.when_text(kt.TRIGGERS[3].when)
+    assert kt._when_of("CREATE TRIGGER x AFTER DELETE ON public.files EXECUTE FUNCTION f()") is None
 
 
 def test_a_rename_trigger_on_other_columns_is_a_problem():

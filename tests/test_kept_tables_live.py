@@ -224,7 +224,12 @@ def test_the_starts_check_refuses_a_missing_disabled_or_stale_trigger_each_in_a_
                ("disabled", "ALTER TABLE vaults DISABLE TRIGGER trg_vaults_hold"),
                ("noop", "CREATE OR REPLACE FUNCTION dv_keep_files() RETURNS trigger LANGUAGE plpgsql AS "
                         "$f$ BEGIN RETURN NULL; END $f$"),
-               ("new column", "ALTER TABLE files ADD COLUMN probe_after_start text")]
+               ("new column", "ALTER TABLE files ADD COLUMN probe_after_start text"),
+               # The rename trigger made again with the same table, kind, columns and function, ENABLE ALWAYS:
+               # only its WHEN clause changed.
+               ("when false", "CREATE OR REPLACE TRIGGER trg_files_keep_name AFTER UPDATE OF name, enc_name ON files "
+                              "FOR EACH ROW WHEN (false) EXECUTE FUNCTION dv_keep_file_name(); "
+                              "ALTER TABLE files ENABLE ALWAYS TRIGGER trg_files_keep_name")]
     out = in_api_container("CHANGES = " + repr(changes) + "\n" + _CHECK)
     found = json.loads([ln for ln in out.stdout.splitlines() if ln.startswith("OUT=")][0][4:])
     assert "trg_files_keep is missing" in found["dropped"]
@@ -232,6 +237,8 @@ def test_the_starts_check_refuses_a_missing_disabled_or_stale_trigger_each_in_a_
     assert "trg_vaults_hold is not ENABLE ALWAYS" in found["disabled"]
     assert "dv_keep_files" in found["noop"]
     assert "held_files.probe_after_start" in found["new column"] and "dv_keep_files" in found["new column"]
+    assert "trg_files_keep_name does not fire on every change of a name" in found["when false"]
+    assert "trg_files_keep_name" not in (found["dropped"] or ""), "the WHEN clause Postgres prints passes"
 
 
 _START = """
