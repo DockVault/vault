@@ -169,6 +169,27 @@ def test_the_panel_row_shows_the_chains_source_and_setting_and_the_databases_val
     assert row["database_stored"] == 300
 
 
+def test_the_panel_row_of_an_entry_from_env_says_env_whatever_the_database_stores(env, monkeypatch):
+    """.env sets 400 days for administration rows before the chain starts: the chain's entry came from .env.
+    500 written into the database without the key would make the registry say an administrator set it; the row
+    says what the chain honours: 400, from .env, with no administrator's setting behind it."""
+    from app.api import managed_settings_router as routes
+    monkeypatch.setenv("AUDIT_PROTECTED_MIN_DAYS", "400")
+    env.settings.audit_protected_min_days = 400
+    env.run_until_sealed()
+    entry = env.st.view.newest_state()["audit_admin_min_days"]
+    assert (entry["value"], entry["source"], entry["setting"]) == (400, "env", None)
+    (row,) = routes.with_chain(reg.describe(["audit_admin_min_days"]))
+    assert (row["value"], row["source"], row["stored"], row["clamped"]) == (400, "env", None, False)
+    with env.session() as db:
+        reg.store(db, "audit_admin_min_days", 500)
+        db.commit()
+    reg.refresh(env.session)
+    assert reg.describe(["audit_admin_min_days"])[0]["source"] == "admin"
+    (row,) = routes.with_chain(reg.describe(["audit_admin_min_days"]))
+    assert (row["value"], row["source"], row["stored"], row["database_stored"]) == (400, "env", None, 500)
+
+
 def test_the_panel_row_of_a_chain_setting_the_deployment_locked_still_says_locked(env):
     from app.api import managed_settings_router as routes
     env.run_until_sealed()
