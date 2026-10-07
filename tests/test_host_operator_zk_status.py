@@ -253,6 +253,7 @@ def test_the_readme_and_the_inventory_say_how_to_run_it_and_what_it_prints():
                            "deployment's zero-knowledge state"):]
     said = said[:said.index(" ### ")]
     for claim in ("no account and no password", "for someone in no department", "(`-1` for none)",
-                  "never a name, a key or content", "It is not audited"):
+                  "never a name, a key or content", "It is not audited",
+                  'it still prints one JSON object, `{"ok": false, ...}`, exits with status 1'):
         assert claim in said, claim
     assert inventory.count("`python -m app.core.host_operator zk-status`") == 1

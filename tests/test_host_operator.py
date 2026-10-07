@@ -152,3 +152,48 @@ def test_the_host_tool_writes_the_recording_alerts_its_rows_raised_before_it_exi
     finally:
         ap._reset_for_tests()
         engine.dispose()
+
+
+STOPPED = {"ok": False, "error": "The account tool stopped before it could answer."}
+
+
+class _StartUpExits:
+    """An import finder that answers for the web app the way its start-up does when it refuses this
+    container's configuration: a message on standard error, then SystemExit(1)."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "app.api.api_server":
+            import sys
+            print("DockVault API startup failed [made-up]: refused at db.example.internal", file=sys.stderr)
+            raise SystemExit(1)
+        return None
+
+
+WHAT_STOPPED = {"while it imports": "ModuleNotFoundError", "when its start-up exits": "SystemExit",
+                "while it works": "RuntimeError"}
+
+
+@pytest.mark.parametrize("where", list(WHAT_STOPPED))
+def test_the_host_tool_answers_once_when_something_unexpected_stops_it(monkeypatch, capsys, where):
+    # Its answer is one JSON object on standard output, which the tooling reads. Something nothing expected
+    # (the database out of reach, say) used to escape, so nothing at all was printed there: the answer kept
+    # for that case was never written. Now it is, with exit status 1, and what happened is on standard error.
+    import json
+    import sys
+    from app.core import host_operator
+    if where == "while it imports":
+        # Importing the web app is the first thing it does; a module set to None cannot be imported.
+        monkeypatch.setitem(sys.modules, "app.api.api_server", None)
+    elif where == "when its start-up exits":
+        monkeypatch.delitem(sys.modules, "app.api.api_server", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [_StartUpExits(), *sys.meta_path])
+    else:
+        def stops(args, api):
+            raise RuntimeError("the database at db.example.internal is out of reach")
+        monkeypatch.setattr(host_operator, "_run", stops)
+    code = host_operator.run(["zk-status"])
+    out, err = capsys.readouterr()
+    assert code == 1
+    assert [json.loads(line) for line in out.splitlines() if line.strip()] == [STOPPED]
+    assert "Traceback" in err and WHAT_STOPPED[where] in err
+    assert "db.example.internal" not in out

@@ -31,7 +31,8 @@ Safety:
     logged, stored in plain text, or put in the audit log.
 
 Answers are one JSON object on standard output; the exit status is 0 when it succeeded, 2 when it was
-refused (the answer's ``error`` says why).
+refused (the answer's ``error`` says why), and 1 when something unexpected stopped it (the answer says
+it stopped; what happened is on standard error).
 """
 import argparse
 import json
@@ -268,17 +269,24 @@ def run(argv=None) -> int:
     answer = {"ok": False, "error": "The account tool stopped before it could answer."}
     code = 1
     with contextlib.redirect_stdout(sys.stderr):
-        # Importing the web app sets up the configuration, the database and the cache exactly as the
-        # server does, from this container's own environment. Threads it starts on import are its
-        # own; only those this run starts afterwards (the emails) are waited for.
-        import app.api.api_server as api
-        started_before = set(threading.enumerate())
         try:
-            _run(args, api)
-        except _Answer as done:
-            answer, code = done.obj, done.code
-        finally:
-            _wait_for_background_work(started_before)
+            # Importing the web app sets up the configuration, the database and the cache exactly as the
+            # server does, from this container's own environment. Threads it starts on import are its
+            # own; only those this run starts afterwards (the emails) are waited for.
+            import app.api.api_server as api
+            started_before = set(threading.enumerate())
+            try:
+                _run(args, api)
+            except _Answer as done:
+                answer, code = done.obj, done.code
+            finally:
+                _wait_for_background_work(started_before)
+        except (Exception, SystemExit):  # noqa: BLE001 - whatever stopped it, the caller still gets one answer
+            # Something nothing here expected (the database out of reach, say, or a start-up that refused this
+            # container's configuration and exited): the answer above says the tool stopped, with exit status 1,
+            # and what happened goes to standard error, never into it.
+            import traceback
+            traceback.print_exc()
     sys.stdout.write(json.dumps(answer) + "\n")
     sys.stdout.flush()
     return code

@@ -271,7 +271,9 @@ zero-knowledge (for someone in no department; members of departments an administ
 make standard vaults), the plan's limit (`-1` for none) and how many active zero-knowledge vaults there are,
 and how many zero-knowledge files and folders still carry a name that was never sealed (left from before
 sealing was required; 0 on a healthy deployment). Counts and switches only, never a name, a key or content.
-It is not audited, since it changes nothing.
+It is not audited, since it changes nothing. When something stops it, the database out of reach for one, it
+still prints one JSON object, `{"ok": false, ...}`, exits with status 1 and says what happened on standard
+error.
 
 ### Sealing credentials at rest (optional)
 

@@ -186,3 +186,27 @@ def test_a_force_kept_after_the_plan_dropped_zero_knowledge_refuses_no_standard_
              "WHERE key = 'global'")
     assert _saved_force() == before
 
+
+@pytest.mark.parametrize("setting, said", [
+    # The database refuses the connection.
+    ("DATABASE_URL=postgresql://sftp_user:{made_up}@127.0.0.1:1/sftp_db", "127.0.0.1"),
+    # The web app's start-up refuses the configuration and exits.
+    ("ENCRYPTION_KEY={made_up}", "encryption-key-invalid"),
+])
+def test_when_something_stops_it_it_still_prints_one_answer(setting, said):
+    # The action cannot answer, and says so in the one JSON line the tooling reads, with exit status 1. What
+    # happened is on standard error; the made-up value given to it is in neither stream.
+    made_up = "Not-A-Real-Value-" + secrets.token_hex(8)
+    cmd = ["docker", "exec", "-i", "-e", setting.format(made_up=made_up),
+           API, "python", "-m", "app.core.host_operator", "zk-status"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker unavailable: {exc}")
+    skip_if_container_absent(r, API)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    assert [json.loads(ln) for ln in lines] == [
+        {"ok": False, "error": "The account tool stopped before it could answer."}], (r.stdout, r.stderr[-800:])
+    assert r.returncode == 1
+    assert "Traceback" in r.stderr and said in r.stderr, r.stderr[-800:]
+    assert made_up not in r.stdout and made_up not in r.stderr
