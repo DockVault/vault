@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from app.core import audit_chain_format as fmt
@@ -78,7 +78,7 @@ def rekey(engine, st, *, old_key: Optional[bytes] = None, accept_unverified: boo
           one_step: bool = False) -> dict:
     """Move the chain to the current key (see the module's docstring). Raises Refused."""
     ai = _ai()
-    with ai.ChainWriter(engine, st, wait=30, writer="host", check_key=False) as w:
+    with ai.ChainWriter(engine, st, wait=30, writer="host", check_key=False, snapshot=True) as w:
         view, record = w.st.view, w.record or {}
         if not view.position:
             raise Refused("the chain has no seal yet")
@@ -246,7 +246,7 @@ def after_record(engine, st, *, discard: bool = False, discard_from: Optional[in
     """Accept, or discard, the seals after the head record (see the module's docstring). Raises Refused."""
     ai = _ai()
     from app.core.models import AuditSeal as S
-    with ai.ChainWriter(engine, st, wait=30, writer="host", check_chain=False) as w:
+    with ai.ChainWriter(engine, st, wait=30, writer="host", check_chain=False, snapshot=True) as w:
         record = w.record
         if not record or not record.get("link"):
             raise Refused("there is no head record to accept seals after: use accept-database-head")
@@ -260,7 +260,7 @@ def after_record(engine, st, *, discard: bool = False, discard_from: Optional[in
         lines = ["Seals after the head record:" if seals else "No seal after the head record."]
         for s in seals:
             lines += ["  " + ln for ln in s["lines"]]
-            lines += [f"    accepted by a writer already (listed in the head record)"] if s["listed"] else []
+            lines += ["    accepted by a writer already (listed in the head record)"] if s["listed"] else []
             lines += [f"    NOTE: {n}" for n in s["notes"]]
             lines += [f"    REFUSED: {p}" for p in s["problems"]]
         listed_seqs = [s["seq"] for s in seals if s["listed"]]

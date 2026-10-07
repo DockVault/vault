@@ -40,7 +40,6 @@ and removes the mark.
 """
 from __future__ import annotations
 
-import copy
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -391,8 +390,7 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
     """See the module's docstring. Raises Refused."""
     ai = _ai()
     from app.core.audit_chain_recovery import _held
-    with ai.ChainWriter(engine, st, wait=30, writer="host", check_chain=False) as w:
-        host.repeatable_read(w.db)
+    with ai.ChainWriter(engine, st, wait=30, writer="host", check_chain=False, snapshot=True) as w:
         now = w.st.clock()
         record = w.record if (w.record and w.record.get("link")) else None
         try:
@@ -608,8 +606,7 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
     """See the module's docstring. Raises Refused."""
     ai = _ai()
     from app.core import audit_head_record as hr
-    with ai.ChainWriter(engine, st, wait=30, writer="host", check_key=False) as w:
-        host.repeatable_read(w.db)
+    with ai.ChainWriter(engine, st, wait=30, writer="host", check_key=False, snapshot=True) as w:
         now = w.st.clock()
         mark = w.st.restore_mark()
         if mark is None:

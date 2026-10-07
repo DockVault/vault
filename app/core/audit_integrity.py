@@ -42,7 +42,6 @@ if __name__ == "__main__":
 import secrets
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -446,11 +445,15 @@ class ChainWriter:
     record's write. ``wait`` is how long to wait for the lock (ChainBusy after it)."""
 
     def __init__(self, engine, st: Optional[ChainState] = None, *, wait: float = 30.0, writer: str = "pruner",
-                 check_key: bool = True, check_chain: bool = True):
+                 check_key: bool = True, check_chain: bool = True, snapshot: bool = False):
         self.engine = engine
         self.st = st or state()
         self.wait = wait
         self.writer = writer
+        # The host's commands read everything their write phase compares with what the read phase showed in one
+        # snapshot (repeatable read), which Postgres takes only as the transaction's first statement: before the
+        # head record check reads the chain.
+        self.snapshot = snapshot
         # The host's commands that resolve a stop run less of the check: rekey all of it but the key's step,
         # after-record and the restore commands none of it (they build and judge their own view).
         self.check_key = check_key
@@ -504,8 +507,7 @@ class ChainWriter:
             self.conn = self.engine.connect()
             self._take_advisory()
             self.db = Session(bind=self.conn, expire_on_commit=False)
-            if _is_pg(self.engine):
-                self.db.execute(text(f"SET LOCAL statement_timeout = {SEAL_STATEMENT_TIMEOUT_MS}"))
+            self._begin(self.db)
             if self.check_chain:
                 self.check()
             else:
@@ -518,6 +520,13 @@ class ChainWriter:
             self._release()
             raise
         return self
+
+    def _begin(self, db) -> None:
+        """The transaction's settings, before any statement reads: the statement timeout, and the snapshot."""
+        if _is_pg(self.engine):
+            db.execute(text(f"SET LOCAL statement_timeout = {SEAL_STATEMENT_TIMEOUT_MS}"))
+            if self.snapshot:
+                db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
 
     # Set by a caller whose transaction must commit even when it wrote no seal (a change that alters no entry).
     commit_without_seal = False

@@ -1,7 +1,7 @@
 """The host's acknowledgments of the audit chain, in two phases (app/core/audit_chain_host.py), offline:
 
 - every command reads first and prints the state it saw; the write refuses when the chain or the rows changed
-  in between;
+  in between, and reads all it compares in one snapshot, taken before it reads anything;
 - acknowledging another writer's seal first says what it starts: an applies' due date, what the pruner then
   acts on;
 - ``--rows``: a row holding a value no release writes is a failure until the host has looked at it, then
@@ -135,3 +135,68 @@ def test_a_late_row_in_an_hour_inside_a_run_is_sealed_by_the_host(env):
     with env.session() as db:
         assert ai.working_row(db, hour).legacy_salt is not None
     assert added is not None
+
+
+# --------------------------------------------------------------------------- one snapshot
+
+class _Recorder:
+    def __init__(self):
+        self.executed = []
+
+    def execute(self, statement, *args, **kw):
+        self.executed.append(str(statement))
+
+
+def test_a_host_writer_takes_its_snapshot_before_it_reads_anything(env, monkeypatch):
+    """Postgres takes REPEATABLE READ only as a transaction's first statement: the host's writer sets it right
+    after the statement timeout, before the head record check reads the chain; the server's writers do not."""
+    with monkeypatch.context() as m:
+        m.setattr(ai, "_is_pg", lambda bind: True)
+        db = _Recorder()
+        ai.ChainWriter(env.engine, env.st, snapshot=True)._begin(db)
+        assert db.executed == [f"SET LOCAL statement_timeout = {ai.SEAL_STATEMENT_TIMEOUT_MS}",
+                               "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"]
+        db = _Recorder()
+        ai.ChainWriter(env.engine, env.st)._begin(db)
+        assert db.executed == [f"SET LOCAL statement_timeout = {ai.SEAL_STATEMENT_TIMEOUT_MS}"]
+    order = []
+    real_check = ai.ChainWriter.check
+    with monkeypatch.context() as m:
+        m.setattr(ai.ChainWriter, "_begin", lambda self, db: order.append("begin"))
+        m.setattr(ai.ChainWriter, "check", lambda self: (order.append("check"), real_check(self))[1])
+        with ai.ChainWriter(env.engine, env.st, snapshot=True):
+            pass
+    assert order == ["begin", "check"]
+
+
+def test_every_host_command_reads_its_write_phase_in_one_snapshot(env, monkeypatch):
+    from app.core import audit_chain_external as external
+    from app.core import audit_chain_recovery as recovery
+    from app.core import audit_chain_restore as restore
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    opened = []
+    real = ai.ChainWriter.__init__
+
+    def init(self, *args, **kw):
+        opened.append(kw.get("snapshot", False))
+        real(self, *args, **kw)
+    monkeypatch.setattr(ai.ChainWriter, "__init__", init)
+    commands = [
+        lambda: host.acknowledge(env.engine, env.st, seqs=[], failures=False, read=True),
+        lambda: host.seal_late_rows(env.engine, env.st, T0 + timedelta(days=1), read=True),
+        lambda: external.acknowledge_removed_before(env.engine, env.st, T0, retention_days=7, read=True),
+        lambda: recovery.rekey(env.engine, env.st, read=True),
+        lambda: recovery.after_record(env.engine, env.st, read=True),
+        lambda: restore.accept_database_head(env.engine, env.st, read=True),
+        lambda: restore.accept_restore(env.engine, env.st, read=True),
+    ]
+    for command in commands:
+        opened.clear()
+        with pytest.raises(host.Refused):
+            command()
+        assert opened == [True], opened
+    opened.clear()
+    env.clock.advance(hours=1)
+    env.seal()
+    assert opened and not any(opened)

@@ -82,14 +82,6 @@ def check_expected(state: dict, expect: Optional[str]) -> None:
                       "it shows now; nothing was written")
 
 
-def repeatable_read(db) -> None:
-    """Read every row of the write phase in one snapshot (Postgres)."""
-    bind = db.get_bind()
-    if bind is not None and bind.dialect.name == "postgresql":
-        from sqlalchemy import text
-        db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-
-
 def host_audit_row(db, action: str, details: dict, status: str = "success"):
     from app.core.credential_changes import HOST_OPERATOR
     from app.services.audit_logger import AuditLogger
@@ -289,8 +281,7 @@ def acknowledge(engine, st, *, seqs: List[int], failures: bool, expect: Optional
     writes the host's ``ack`` seal, refusing unless the state is the one ``expect`` names. Raises Refused."""
     ai = _ai()
     rows = rows or []
-    with ai.ChainWriter(engine, st, wait=30, writer="host") as w:
-        repeatable_read(w.db)
+    with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
         view, record = w.st.view, w.record or {}
         plan = acknowledge_plan(w.db, view, record, seqs=seqs, failures=failures, rows=rows, now=w.st.clock())
         if read:
@@ -371,8 +362,7 @@ def seal_late_rows(engine, st, hour: datetime, *, expect: Optional[str] = None, 
     """``acknowledge --late-rows <hour>`` in either phase: the write phase writes a late seal by the host over
     the hour's rows as they are now, which counts as acknowledged. Raises Refused."""
     ai = _ai()
-    with ai.ChainWriter(engine, st, wait=30, writer="host") as w:
-        repeatable_read(w.db)
+    with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
         view, record = w.st.view, w.record or {}
         plan = late_rows_plan(w.db, view, record, hour)
         if read:

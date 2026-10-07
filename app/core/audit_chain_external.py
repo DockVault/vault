@@ -23,7 +23,6 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from app.core import audit_chain_format as fmt
-from app.core import audit_chain_host as host
 from app.core import audit_chain_times as times
 from app.core.audit_chain_host import Refused, chain_state, check_expected, host_audit_row, token
 
@@ -132,8 +131,7 @@ def acknowledge_removed_before(engine, st, before: datetime, *, retention_days: 
     """See the module's docstring. Raises Refused."""
     ai = _ai()
     sealed: List[int] = []
-    with ai.ChainWriter(engine, st, wait=30, writer="host") as w:
-        host.repeatable_read(w.db)
+    with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
         plan = removal_plan(w.db, w.st.view, w.record or {}, before, retention_days)
         if read:
             return {"state": token(plan["state"]), "lines": plan["lines"]}
@@ -145,8 +143,7 @@ def acknowledge_removed_before(engine, st, before: datetime, *, retention_days: 
     cutoff = {"hour": fmt.hour_text(plan["cutoff"]), "first_kept": plan["first_kept"], "retention_days": retention_days,
               "not_sealing_until": fmt.time_text(plan["stop_end"])}
     for day in sorted(by_day):
-        with ai.ChainWriter(engine, st, wait=30, writer="host") as w:
-            host.repeatable_read(w.db)
+        with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
             entries = []
             for h in by_day[day]:
                 s = _hour_state(w.db, w.st.view, h)
