@@ -29,8 +29,11 @@ Legal holds (app/core/legal_holds.py has the rules): placing one, as a hold-only
 releasing and undoing the release of a case's holds. Their routes follow the auditor right's.
 
 Cases (app/core/cases.py has the steps, app/core/case_rules.py the rules): asking for one, approving and turning it
-down, withdrawing, extending, closing, narrowing, recording an objection, and the vault picker. Their routes are at
-the end of this module.
+down, withdrawing, extending, closing, narrowing, recording an objection, and the vault picker. Their routes follow
+the holds'.
+
+A vault's owner (app/core/owner_access.py): Access to my vaults, the banner's "I've read it", and unlocking a
+password-protected vault's names on that page. Their routes are at the end of this module.
 """
 from __future__ import annotations
 
@@ -878,3 +881,100 @@ def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
                                      resource_type="user", resource_id=str(person.id), details={"vaults": len(out)}))
     db.commit()
     return {"owner": {"id": str(person.id), "username": person.username}, "vaults": out}
+
+
+# --------------------------------------------------------------------------- a vault's owner
+# (app/core/owner_access.py)
+#
+#     GET  /me/compliance-access                          the cases on the caller's vaults; X-Owner-Unlock: vault=receipt,...
+#     POST /me/compliance-access/seen                     "I've read it" for the banner after sign-in
+#     POST /me/compliance-access/vaults/{id}/unlock       {password}: a 15-minute receipt for that vault's names here
+
+class SeenThrough(BaseModel):
+    through: Optional[datetime] = None
+
+
+class OwnerUnlock(BaseModel):
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+def _owner_receipts(header: Optional[str]) -> dict:
+    """{vault id: receipt} of an X-Owner-Unlock header ("vault=receipt", comma-separated)."""
+    out = {}
+    for part in (header or "").split(",")[:100]:
+        vid, _, receipt = part.strip().partition("=")
+        if vid and receipt:
+            out[vid] = receipt
+    return out
+
+
+@router.get("/me/compliance-access")
+def my_compliance_access(request: Request, x_owner_unlock: Optional[str] = Header(default=None),
+                         current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
+    """Access to my vaults: every case that told the caller about one of their vaults, what it covers of them, the
+    files it opened there (names read now, as the caller could read them in the vault), its exports, and the notices
+    not yet read. Never the justification, the people named, or another owner's vaults."""
+    from app.api.api_server import _current_session_hash
+    from app.core import owner_access
+    limit_statements(db)
+    unlocked = owner_access.unlocked_vaults(db, current_user, _current_session_hash(request),
+                                            _owner_receipts(x_owner_unlock))
+    return owner_access.page(db, current_user, unlocked=unlocked)
+
+
+@router.post("/me/compliance-access/seen")
+def my_compliance_notices_seen(body: Optional[SeenThrough] = Body(default=None),
+                               current_user: User = Depends(require_interactive_account),
+                               db: Session = Depends(get_db)):
+    """The caller has read their notices (up to ``through``): the banner goes; the notices and the page stay."""
+    from app.core import owner_access
+    limit_statements(db)
+    count = owner_access.mark_seen(db, current_user, through=_naive(body.through) if body is not None else None)
+    db.commit()
+    return {"seen": count}
+
+
+@router.post("/me/compliance-access/vaults/{vault_id}/unlock")
+def unlock_my_vault_names(vault_id: uuid.UUID, body: OwnerUnlock, request: Request,
+                          current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
+    """A receipt that shows, for 15 minutes, the names of the files a case opened in one of the caller's own
+    password-protected vaults. The password counts on the vault-password throttle every check of it by the caller
+    uses, and is never recorded."""
+    from app.api.api_server import _current_session_hash
+    from app.core import owner_access
+    from app.core import vault_unlock_receipts as receipts
+    from app.core.models import Vault
+    from app.services.audit_logger import AuditLogger
+    limit_statements(db)
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    problem = owner_access.unlock_problem(db, current_user, vault)
+    if problem is not None:
+        raise HTTPException(status_code=problem[0], detail=problem[1])
+    session_hash = _current_session_hash(request)
+    if not session_hash:
+        raise HTTPException(status_code=403, detail="A receipt is given only to a signed-in session.")
+
+    def record(status_: str, details: dict) -> None:
+        db.add(AuditLogger(db).build_row(action="owner_access_unlocked", status=status_, user=current_user,
+                                         resource_type="vault", resource_id=str(vault.id),
+                                         details={"vault_id": str(vault.id), **details}))
+        db.commit()
+
+    try:
+        receipts.check_password(current_user, vault, body.password)
+    except receipts.UnlockRefused as refused:
+        if refused.status == 403:
+            try:
+                record("failure", {"reason": "wrong password"})
+            except Exception:  # noqa: BLE001 -- the refusal stands without its row
+                db.rollback()
+        raise HTTPException(status_code=refused.status, detail=refused.detail)
+    receipt, expires = receipts.issue(purpose=receipts.PURPOSE_OWNER, session_hash=session_hash, vault_id=vault.id,
+                                      user_id=current_user.id, credential=receipts.credential_digest(vault.password_hash))
+    try:
+        record("success", {"expires_at": expires.isoformat() + "Z"})
+    except Exception:  # noqa: BLE001 -- no receipt without its audit row
+        db.rollback()
+        raise HTTPException(status_code=503, detail="The names were not unlocked: the audit record could not be "
+                                                    "written.")
+    return {"vault_id": str(vault.id), "receipt": receipt, "expires_at": expires.isoformat() + "Z"}

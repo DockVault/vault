@@ -7028,6 +7028,10 @@ function handleSocketFrame(data) {
             if (ev.notification_type === 'recording_levels_changed') {
                 try { window.dispatchEvent(new CustomEvent('dockvault:recording-levels')); } catch (_) {}
             }
+            // A notice about access to my vaults: its banner checks again (static/js/compliance.js).
+            if (ev.notification_type === 'compliance_access') {
+                try { window.dispatchEvent(new CustomEvent('dockvault:compliance-access')); } catch (_) {}
+            }
         }
         return;
     }
@@ -10591,6 +10595,8 @@ async function openVault(vaultId, options) {
             descEl.textContent = vault.description || '';
             descEl.style.display = vault.description ? '' : 'none';  // no "No description" filler
         }
+        // The neutral banner of a vault under an authorised review (static/js/compliance.js).
+        if (typeof window.renderVaultReview === 'function') window.renderVaultReview(vault);
         window.scrollTo({ top: 0 });  // open a vault at the top, not at the grid's scroll position
         
         const lockIcon = document.getElementById('vault-view-lock-icon');

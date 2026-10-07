@@ -1396,6 +1396,9 @@ class VaultResponse(BaseModel):
     # requester and never anyone else's activity — distinct from last_accessed above, which is
     # the last access by any member.
     last_viewed_at: Optional[datetime] = None
+    # While an approved investigation covers the vault: until when, and whether deleted files are kept. Neutral:
+    # no case number, purpose, auditor or person concerned (app/core/owner_access.py, member_review).
+    compliance_review: Optional[dict] = None
 
     class Config:
         from_attributes = True
@@ -17077,6 +17080,7 @@ async def get_vault(
     for as long as the tab lived. A caller can only ever suppress their OWN bookmark by sending it,
     so a header needs no stronger guarantee than this.
     """
+    from app.core import owner_access as _owner_access
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
 
@@ -17148,6 +17152,8 @@ async def get_vault(
             'my_permission': _effective_vault_permission(vault, base_perms, current_user),
             'is_favorite': _is_vault_favorite(db, current_user.id, vault.id),
             'last_viewed_at': _vault_view_times(db, current_user, vault.id).get(vault.id),
+            # Here, never in VaultService.get_vault (which downloads, file operations and SFTP run too).
+            'compliance_review': _owner_access.member_review_shown(db, vault.id),
         }
         # Opening the detail view IS the view. Stamped after the payload is built, so the value
         # returned is the PREVIOUS visit rather than the current instant — otherwise every read

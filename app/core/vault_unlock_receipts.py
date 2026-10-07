@@ -1,15 +1,15 @@
 """Unlocking a password-protected vault's names for a while, with the vault password once: a signed receipt.
 
-An administrator looking at the Activity page (and, later, an auditor working a case) can see a vault's file and
-folder names only where they could see them in the vault itself, and a vault with a vault password asks for that
-password. Rather than send the password with every request, they give it once (POST .../unlock): it is checked
+An administrator looking at the Activity page (and, later, an auditor working a case, and a vault's owner reading
+what a case opened in their vaults) can see a vault's file and folder names only where they could see them in the
+vault itself, and a vault with a vault password asks for that password. Rather than send the password with every request, they give it once (POST .../unlock): it is checked
 on the vault-password throttle every other check of that vault's password uses, and the answer is a receipt good
 for 15 minutes, sent back with each request after.
 
 Nothing is stored. The receipt is the expiry and an HMAC-SHA-256 under a key derived from ENCRYPTION_KEY for
 this purpose alone, over, in order (each value tagged and length-prefixed, so no two lists give the same bytes):
 
-    the purpose ("activity" or "case"), the session that asked, the case (none for the Activity page), the
+    the purpose ("activity", "case" or "owner"), the session that asked, the case (none for the Activity page), the
     vault, the account, the expiry, and a digest of the vault's password hash as it is now.
 
 So a receipt serves only the session, account, vault and purpose it was given for; it ends when the session
@@ -33,7 +33,9 @@ from typing import Optional, Tuple
 
 PURPOSE_ACTIVITY = "activity"
 PURPOSE_CASE = "case"
-PURPOSES = (PURPOSE_ACTIVITY, PURPOSE_CASE)
+# A vault's owner reading the names of their own files opened under a case, on Access to my vaults.
+PURPOSE_OWNER = "owner"
+PURPOSES = (PURPOSE_ACTIVITY, PURPOSE_CASE, PURPOSE_OWNER)
 LIFETIME = timedelta(minutes=15)
 PREFIX = "dvr1"
 _LABEL = b"dvunlock-receipt-v1\x00"

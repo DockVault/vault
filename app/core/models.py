@@ -3337,7 +3337,8 @@ class ComplianceNoticeOutbox(Base):
     sent afterwards, with retries (app/core/owner_notices.py). The address is sealed as it was when the row was
     written, with the one before when an administrator changed it recently, so a later change cannot reroute it.
     ``dedup_key`` is unique per event and owner. ``details`` holds the counts and dates the notice says (never a
-    name); ``sent_to`` which of the two addresses it has reached, so a retry sends only to the other."""
+    name); ``sent_to`` which of the two addresses it has reached, so a retry sends only to the other. One row per
+    notice and owner, so it is also what the owner's banner counts until ``seen_at``."""
     __tablename__ = 'compliance_notice_outbox'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -3355,8 +3356,11 @@ class ComplianceNoticeOutbox(Base):
     last_error_class = Column(String(64), nullable=True)
     sent_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # When the owner said, on the banner after sign-in, that they have read it (app/core/owner_access.py).
+    seen_at = Column(DateTime, nullable=True)
 
-    __table_args__ = (Index('idx_compliance_outbox_due', 'status', 'next_attempt_at'),)
+    __table_args__ = (Index('idx_compliance_outbox_due', 'status', 'next_attempt_at'),
+                      Index('idx_compliance_outbox_owner', 'user_id', 'seen_at'))
 
 
 class LegalHoldVault(Base):

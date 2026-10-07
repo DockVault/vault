@@ -200,3 +200,38 @@ def wait_for(fn, *, timeout=90.0, every=1.0):
         if value or time.time() >= deadline:
             return value
         time.sleep(every)
+
+
+CASE_TEXT = {"purpose": "internal_investigation", "legal_basis": "legal_obligation",
+             "justification": "Suspected exfiltration of client records, ticket SEC-2041.",
+             "owner_note": "Your vault is part of an internal review; nothing is changed in it."}
+
+
+def approved_case(admins, auditor, vault_ids, **extra):
+    """A case the auditor (account, client, recovery codes) asks for on ``vault_ids``, approved by bob, the
+    independent administrator of ``admins`` (_auditor_helpers.two_admins). Returns the case as bob sees it."""
+    from _auditor_helpers import compliance_receipt
+    uma, uma_c, codes = auditor
+    r = uma_c.post("/compliance/cases", json={"scope": [{"kind": "vault", "target_id": v} for v in vault_ids],
+                                              **CASE_TEXT, **extra},
+                   headers=compliance_receipt(uma_c, "compliance.case.request", uma["_password"], codes))
+    assert r.status_code == 201, r.text
+    bob, bob_c, bob_codes = admins["bob"]
+    headers = compliance_receipt(bob_c, "compliance.case.approve", bob["_password"], bob_codes)
+    headers["If-Match"] = '"1"'
+    r = bob_c.post(f"/compliance/cases/{r.json()['id']}/approve", headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def forget_cases(case_ids, vault_ids):
+    """Release and remove, straight in the database, the cases a test made and what their holds kept."""
+    from _account_change_helpers import in_api_container
+    for cid in case_ids:
+        psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE case_id = '{cid}' AND released_at IS NULL")
+    for vid in vault_ids:
+        for table in ("held_files", "held_folders", "held_name_history"):
+            psql(f"DELETE FROM {table} WHERE vault_id = '{vid}'")
+    for cid in case_ids:
+        psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
+    in_api_container("from app.core import legal_hold_marker\nlegal_hold_marker.check_at_start()\n")

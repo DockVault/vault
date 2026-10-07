@@ -345,6 +345,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("hold_blocked_delete", "compliance", "Deletion refused under a legal hold", "warning"),
     AuditAction("audit_name_revealed", "compliance", "Recorded name revealed", "warning"),
     AuditAction("owner_notice_written", "compliance", "Owner told of compliance access", "info"),
+    AuditAction("owner_notice_seen", "compliance", "Owner read the notices of compliance access", "info"),
+    AuditAction("owner_access_unlocked", "compliance", "Owner unlocked a vault's names on Access to my vaults",
+                "info"),
     AuditAction("owner_notice_email_sent", "compliance", "Owner notice emailed", "info", automatic=True),
     AuditAction("owner_notice_email_failed", "compliance", "Owner notice email failed", "warning", automatic=True),
 )
