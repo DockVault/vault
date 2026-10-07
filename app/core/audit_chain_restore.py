@@ -607,10 +607,14 @@ def _new_generation(view, summaries: Dict[str, dict], carried: List[dict], now: 
 
 # --------------------------------------------------------------------------- accept-restore
 
-def first_start_entries(record: dict, mark_at: datetime, generation: int) -> List[int]:
+def first_start_entries(record: dict, mark_at: datetime, generation: int, restored: Optional[set] = None) -> List[int]:
     """The seals after the restored record that the first start after the mark accepted (the web process's start
-    walk; or this command's own acceptance, when no process has read the chain since the mark)."""
+    walk; or this command's own acceptance, when no process has read the chain since the mark). ``restored``:
+    the (generation, seq) of the seals the restored record already listed, which are never the first start's,
+    whatever the clocks of the host (the mark's time) and the server (the acceptance's) say."""
+    restored = restored or set()
     entries = [e for e in record.get("after_record") or [] if e.get("generation") == generation
+               and (e.get("generation"), e.get("seq")) not in restored
                and not e.get("discarded") and e.get("accepted_at")
                and fmt.parse_time_text(e["accepted_at"]) >= mark_at]
     starts = [e for e in entries if e.get("where") in ("start", "host") and e.get("process_started_at")]
@@ -641,8 +645,7 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
         # The seals the restored record did not list, accepted at the first start after the mark (or now).
         before = {(e.get("generation"), e.get("seq")) for e in ((mark.get("restored_record") or {}).get("after_record")
                                                                   or [])}
-        window = [s for s in first_start_entries(record, mark_at, view.generation)
-                  if (view.generation, s) not in before]
+        window = first_start_entries(record, mark_at, view.generation, before)
         lines = [f"The restore of {mark.get('bundle') or 'a backup'} (marked {mark.get('at')})."]
         if window:
             lines.append("Seals written between the backup's keys archive and its database part, which this "
@@ -678,10 +681,11 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
         lines.append(f"Nothing is deleted for {grace} days of running time after the restore seal.")
         lines.append("The restored chain's retention state:")
         lines += retention_lines(view)
+        from app.core import audit_chain_honour as honour
         for seq, d in sorted(view.pending_requests().items()):
-            from app.core import audit_chain_honour as honour
+            due = max(honour.effective_not_before(view, record, seq, now), now + timedelta(days=grace))
             lines.append(f"  pending request {seq}: {d.get('what')} {d.get('setting') or ''} -> {d.get('new')!r}, "
-                         f"from {fmt.time_text(max(honour.effective_not_before(view, record, seq, now), now + timedelta(days=grace)))}")
+                         f"from {fmt.time_text(due)}")
         state = {"chain": host.chain_state(view, record), "command": "accept-restore", "mark": mark.get("at"),
                  "window": window, "kept": kept, "under": under, "lost": lost,
                  "reseal": [sorted(settings.items()), cancels]}
