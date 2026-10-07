@@ -505,3 +505,27 @@ def test_a_seal_the_restored_record_listed_is_not_the_first_starts_whatever_the_
     seen = restore.accept_restore(env.engine, _host(env), read=True)
     done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
     assert window in done["acknowledged"] and listed not in done["acknowledged"], done
+
+
+def test_a_cut_hour_whose_summary_holds_no_salt_is_compared_by_its_stable_root(env):
+    """An hour whose summary holds no salt (as a prune's re-rooting leaves it) and whose rows have no nonce: its
+    personal values cannot be compared, so an untouched hour is no change; a stable value edited is one."""
+    ids = [env.row(T0 - timedelta(hours=10, minutes=-m * 10), nonce=False) for m in range(3)]
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(hours=12))
+    hour = ai.hour_floor(T0 - timedelta(hours=10))
+    record = env.st.head_store().load()
+    record["hours"][fmt.hour_text(hour)]["salt"] = None
+    _cut_from(env, env.st.view.entry_for(hour).root.seq)
+    held = _host(env).keys_held()
+
+    def changed():
+        with env.session() as db:
+            view, problems = restore.database_chain(db, held, 2)
+            assert problems == []
+            return [c[0] for c in restore.lost_hours(db, view, record, env.clock())["changed"]]
+    assert changed() == []
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == ids[0]).update({AuditLog.action: "logout"})
+        db.commit()
+    assert changed() == [fmt.hour_text(hour)]
