@@ -50,7 +50,7 @@ from sqlalchemy.orm import Session
 from app.api.user_management_api import get_current_user, require_interactive_admin
 from app.core import auditor_rights as rights
 from app.core import fixed_step_up
-from app.core import cases  # noqa: F401 -- registers the host's approve and reject steps
+from app.core import cases as _cases  # noqa: F401 -- registers the host's approve and reject steps
 from app.core import legal_holds  # noqa: F401 -- registers the host's confirm-hold step
 from app.core.database import get_db
 from app.core.models import User
@@ -809,7 +809,7 @@ def close_case(case_id: uuid.UUID, body: Reason, request: Request,
                current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
     """Close a case with a reason: its auditor or an independent administrator. Its legal holds are released (with
     the step-up a release asks for); the owners are told with a summary."""
-    from app.core import cases, legal_holds
+    from app.core import cases
     reason = body.reason.strip()
     if not reason:
         raise HTTPException(status_code=422, detail={"reason": cases.NO_REASON, "text": cases.text(cases.NO_REASON)})

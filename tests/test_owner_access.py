@@ -23,7 +23,6 @@ from app.core import admin_grants  # noqa: E402
 from app.core import after_commit  # noqa: E402
 from app.core import auditor_rights as rights  # noqa: E402
 from app.core import cases  # noqa: E402
-from app.core import compliance_settings as cs  # noqa: E402
 from app.core import credential_changes as cc  # noqa: E402
 from app.core import legal_holds as holds  # noqa: E402
 from app.core import models as m  # noqa: E402
@@ -151,9 +150,8 @@ def test_a_case_waiting_for_approval_is_not_on_the_page(db, people):
 
 
 def test_a_hold_only_case_is_on_the_page(db, people):
-    case = holds.place_hold_only(db, people.ada, [people.v1.id], purpose="litigation_hold",
-                                 legal_basis="legal_obligation", justification=TEXT["justification"],
-                                 owner_note="Kept for a legal matter.")
+    holds.place_hold_only(db, people.ada, [people.v1.id], purpose="litigation_hold", legal_basis="legal_obligation",
+                          justification=TEXT["justification"], owner_note="Kept for a legal matter.")
     db.commit()
     (seen,) = oa.page(db, people.olga)["cases"]
     assert seen["hold_only"] and seen["placed_by"] == "ada" and seen["auditor"] is None

@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Mapping, Optional
+from typing import Iterable, Optional
 
 from app.core import after_commit
 from app.core import case_rules as rules

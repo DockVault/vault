@@ -34,7 +34,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Callable, Iterable, List, Mapping, Optional
 
 from sqlalchemy import or_, text
 
@@ -203,7 +203,7 @@ def notice_text(f: Facts) -> tuple:
         lines += ["Every file opened is listed on Access to my vaults, as it happens.", contact]
         return f"An investigation can open {your}", lines
     if f.kind == EXTENSION:
-        return (f"An investigation of your vaults was extended",
+        return ("An investigation of your vaults was extended",
                 [f"{case}: {_who(f.auditor)} (auditor) can view files until {_when(f.ends_at)}. Extended by "
                  f"{_who(f.by)}.", contact])
     if f.kind == SCOPE_REMOVED:
