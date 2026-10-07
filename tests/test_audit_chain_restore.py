@@ -25,7 +25,7 @@ from app.core import audit_chain_policy_seals as ps
 from app.core import audit_chain_restore as restore
 from app.core import audit_head_record as hr
 from app.core import audit_integrity as ai
-from app.core.models import AuditLog, AuditSeal
+from app.core.models import AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange
 from test_audit_chain_trust import _admin, _change, _run_to
 
 pytestmark = pytest.mark.unit
@@ -297,6 +297,31 @@ def test_a_whole_backup_restored_holds_deletion_until_accepted_and_names_what_it
     assert seal.detail["cause"] == "backup" and seal.detail["grace_until"]
     retention.run_pass(env.session, now=env.clock() + timedelta(minutes=30))
     assert req not in env.st.view.pending_requests()
+    assert failures(env.verify()) == []
+    # The change row the restored database showed waiting again is ended with its cancel.
+    with env.session() as db:
+        change = db.get(ManagedSettingChange, outcome.change.id)
+        assert (change.status, change.decided_by_name) == ("cancelled", "operator@host")
+
+
+def test_a_raise_a_whole_backup_restore_undid_is_sealed_again_and_stored(env):
+    env.row(T0 - timedelta(days=60))
+    env.run_until_sealed()
+    admin = _admin(env)
+    snap = _snapshot(env)
+    assert _change(env, admin, "audit_admin_min_days", 400).status == "applied"
+    env.clock.advance(hours=1)
+    env.seal()
+    _restore_bundle(env, snap)
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+    done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    assert done["resealed"] == ["audit_admin_min_days"]
+    with env.session() as db:
+        assert db.get(ManagedSetting, "audit_admin_min_days").value == 400
+    from app.core import retention
+    retention.run_pass(env.session, now=env.clock() + timedelta(minutes=30))
+    assert env.st.view.newest_state()["audit_admin_min_days"]["value"] == 400
+    assert "unjustified-input" not in ai.status(env.st)["failures"]
     assert failures(env.verify()) == []
 
 

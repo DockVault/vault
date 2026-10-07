@@ -516,8 +516,12 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
 
 def _append_restore_policy(w, settings: Dict[str, object], key) -> None:
     """A policy seal of cause restore by the host, right after the restore seal, setting the lost values that
-    keep more."""
+    keep more; and each value stored in managed_settings in the same transaction, as after any change: the
+    restored database's own value, older and deleting sooner, would otherwise be one the chain does not allow
+    (unjustified-input)."""
     from app.core import audit_chain_policy_seals as ps
+    from app.core import settings_registry as registry
+    from app.core.credential_changes import HOST_OPERATOR
     view = w.st.view
     newest = view.newest_policy()
     state = {n: dict(e) for n, e in (newest[1].get("state") or {}).items()}
@@ -528,11 +532,21 @@ def _append_restore_policy(w, settings: Dict[str, object], key) -> None:
     for name, setting in settings.items():
         ps._set(state, name, ps.setting_fields(specs[name], setting, ns, inputs, seq), seq)
     w.append("policy", detail=ps._policy_detail(state, inputs, "restore", by="host"), key=key)
+    for name, setting in settings.items():
+        try:
+            registry.store(w.db, name, setting, by_name=HOST_OPERATOR, now=w.st.clock())
+        except registry.SettingRefused:
+            continue      # one .env now locks or keeps from the panel: the chain's entry holds it alone
 
 
 def _reseal_cancels(engine, st, requests: List[int]) -> None:
     """The lost cancels sealed again by the host, one per transaction, under the key in force (which may be one
-    the chain is to move off: rekey then follows)."""
+    the chain is to move off: rekey then follows), each with its change row ended in the same transaction: the
+    restored database shows it waiting again, and a row left waiting would be offered for a cancel the chain
+    no longer accepts."""
+    from app.core import setting_changes
+    from app.core.credential_changes import HOST_OPERATOR
+    from app.core.models import ManagedSettingChange as Change
     ai = _ai()
     for r in requests:
         with ai.ChainWriter(engine, st, wait=30, writer="host", check_key=False) as w:
@@ -542,6 +556,10 @@ def _reseal_cancels(engine, st, requests: List[int]) -> None:
             key = w.st.keys_held().get(w.st.view.key_in_force())
             w.append("cancel", detail={"cancels": r, "request": d.get("request"), "audit_row": None, "by": "host",
                                        "user_id": None}, key=key)
+            change = w.db.get(Change, fmt.as_uuid(d.get("request"))) if d.get("request") else None
+            if change is not None and change.status == setting_changes.PENDING:
+                setting_changes._end(change, setting_changes.CANCELLED, by_id=None, by_name=HOST_OPERATOR,
+                                     now=w.st.clock(), reason="cancelled again after a restore")
 
 
 def _carried_after_record(record: dict, view) -> List[dict]:
