@@ -245,9 +245,12 @@ def test_the_readme_and_the_inventory_say_how_to_run_it_and_what_it_prints():
     readme = (root / "README.md").read_text(encoding="utf-8")
     inventory = (root / "docs" / "data-inventory.md").read_text(encoding="utf-8")
     assert readme.count("docker exec vault python -m app.core.host_operator zk-status   # vault-api in the split") == 1
-    said = readme[readme.index("also reads the deployment's zero-knowledge"):]
-    said = said[:said.index("\n### ")]
+    # The section as one line, so a sentence is found wherever the file wraps it.
+    flat = " ".join(readme.split())
+    said = flat[flat.index("The tool that `dockvault.py accounts` runs in the web container also reads the "
+                           "deployment's zero-knowledge state"):]
+    said = said[:said.index(" ### ")]
     for claim in ("no account and no password", "for someone in no department", "(`-1` for none)",
                   "never a name, a key or content", "It is not audited"):
-        assert claim in " ".join(said.split()), claim
+        assert claim in said, claim
     assert inventory.count("`python -m app.core.host_operator zk-status`") == 1

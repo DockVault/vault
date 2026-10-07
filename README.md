@@ -258,9 +258,9 @@ Permissions button on the Users page, which removes Manage Users with it (revoki
 leaves View Users). To keep a leftover one, revoke it and then grant it, so that it records who granted
 it: granting it while the account still holds it does nothing.
 
-The tool `dockvault.py accounts` runs in the web container also reads the deployment's zero-knowledge
-state, for a managing operator's tooling or a monitoring script, with no account and no password, and
-changes nothing:
+The tool that `dockvault.py accounts` runs in the web container also reads the deployment's
+zero-knowledge state, for a managing operator's tooling or a monitoring script, with no account and no
+password, and changes nothing:
 
 ```bash
 docker exec vault python -m app.core.host_operator zk-status   # vault-api in the split layout
