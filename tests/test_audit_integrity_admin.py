@@ -146,3 +146,14 @@ def test_the_step_up_is_fixed_and_the_page_builds_the_list_without_inner_html():
     assert "innerHTML" not in js and "/settings/audit-integrity/acknowledge" in js
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     assert 'id="integrity-warnings-card"' in html and "/static/js/settings-integrity.js?v=" in html
+
+
+def test_a_late_seal_another_writer_appended_is_not_offered_to_administrators(env):
+    """Another writer's seals after the head record are the host operator's to acknowledge."""
+    seq, _added = _late(env)
+    view, record = env.st.view, env.st.known_record()
+    assert seq in routes.admin_warnings(view, record)["late"]
+    listed = dict(record, after_record=list(record.get("after_record") or []) + [{
+        "generation": view.generation, "seq": seq, "link": view.link_at(seq).hex(), "acknowledged": False,
+        "discarded": False, "accepted_at": "2026-01-01T00:00:00.000000Z", "where": "running"}])
+    assert seq not in routes.admin_warnings(view, listed)["late"]

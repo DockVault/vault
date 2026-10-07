@@ -309,3 +309,31 @@ def test_a_pass_decides_the_hold_after_reading_what_another_process_sealed(env, 
     done = _pass(factory, now=NOW + timedelta(minutes=30))
     assert done["security_alerts"] is None, done
     assert _count(factory, SecurityAlert) == 1
+
+
+def test_verify_rejects_a_prune_sealed_after_the_grace_says_but_inside_it_with_the_gaps_after(env, factory):
+    """A stop of two days during the grace moves its end on by two days, as verify sees it too."""
+    db = factory()
+    _audit(db, OLD, n=2)
+    _retention_days(env, 30)
+    _CHAIN[-1].seal_all(NOW)
+    _seq, grace = _restore_seal()
+    c = _CHAIN[-1]
+    t = NOW + timedelta(hours=6)
+    while t <= NOW + timedelta(days=3):
+        c.seal_all(t)
+        t += timedelta(hours=6)
+    t = NOW + timedelta(days=5)                          # stopped for two days
+    while t <= grace + timedelta(hours=12):
+        c.seal_all(t)
+        t += timedelta(hours=6)
+    c.at(grace + timedelta(hours=13))
+    newest = c.st.view.newest_policy()
+    hour = next(iter(c.st.view.single_hours()))
+    root = ai.hour_root(db, c.st.view, hour)
+    with ai.ChainWriter(ai._engine_of(c.factory), c.st) as w:
+        w.append("prune", detail={"reason": "retention", "policy_seq": newest[0], "request_seq": None,
+                                  "hours": [[fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(),
+                                             root.root_c.hex(), root.ids_digest.hex()]]})
+    found = [f.message for f in _verify_off(factory).findings if f.kind == "unjustified"]
+    assert any("inside the grace" in m for m in found), found

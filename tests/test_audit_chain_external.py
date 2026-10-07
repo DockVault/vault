@@ -136,3 +136,53 @@ def test_with_no_stop_in_the_chain_nothing_is_acknowledged(env):
     with pytest.raises(host.Refused, match="no period in which no seal was written"):
         external.acknowledge_removed_before(env.engine, _host(env), T0 - timedelta(days=5, hours=3),
                                             retention_days=1, read=True)
+
+
+def test_a_row_added_to_a_sealed_hour_is_no_removal(env):
+    _ids, cutoff = _rolled_back(env)
+    env.row(T0 - timedelta(days=30, hours=3, minutes=-20))
+    with pytest.raises(host.Refused, match="holds rows its seal does not"):
+        external.acknowledge_removed_before(env.engine, _host(env), _first_kept_time(env, cutoff),
+                                            retention_days=34, read=True)
+
+
+def test_rows_missing_from_the_middle_of_the_cutoff_hour_are_no_time_cutoff(env):
+    first = env.row(T0 - timedelta(days=33, hours=3))
+    middle = env.row(T0 - timedelta(days=33, hours=3, minutes=-10))
+    env.row(T0 - timedelta(days=33, hours=3, minutes=-20))
+    env.row(T0 - timedelta(days=32, hours=3))
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=1))
+    env.clock.advance(days=2)
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == middle).delete()
+        db.commit()
+    env.seal()
+    with pytest.raises(host.Refused, match="not its first ones"):
+        external.acknowledge_removed_before(env.engine, _host(env), T0 - timedelta(days=33, hours=3),
+                                            retention_days=30, read=True)
+    assert first is not None
+
+
+def test_rows_changed_between_the_days_of_the_write_stop_it(env, monkeypatch):
+    """The write seals one day per transaction, each reading its hours again: a row put into an hour of the last
+    day after the first day's seal makes that day refuse, naming the seals written so far."""
+    _ids, cutoff = _rolled_back(env)
+    before = _first_kept_time(env, cutoff)
+    seen = external.acknowledge_removed_before(env.engine, _host(env), before, retention_days=34, read=True)
+    real = external.host_audit_row
+    calls = []
+
+    def after_the_first_day(db, action, details, status="success"):
+        calls.append(details["day"])
+        if len(calls) == 1:
+            env.row(T0 - timedelta(days=31, hours=3, minutes=-5))      # an hour of the last day
+        return real(db, action, details, status)
+    monkeypatch.setattr(external, "host_audit_row", after_the_first_day)
+    with pytest.raises(host.Refused, match="changed while its removal was being sealed"):
+        external.acknowledge_removed_before(env.engine, _host(env), before, retention_days=34,
+                                            expect=seen["state"])
+    prunes = [s for s in env.seals() if s.kind == "prune"]
+    assert len(calls) >= 1 and len(prunes) == len(calls)
+    last_hour = fmt.hour_text(ai.hour_floor(T0 - timedelta(days=31, hours=3)))
+    assert not any(h[0] == last_hour for p in prunes for h in p.detail["hours"])
