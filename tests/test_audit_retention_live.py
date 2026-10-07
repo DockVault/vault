@@ -5,7 +5,8 @@ a throwaway database of its own per test, seeded with old rows before the audit 
 before the chain's first hour are never sealed, so never pruned: the stack's own log cannot be seeded with old
 rows). The audit job deletes through the chain: the preview says what it deletes, and it deletes exactly that;
 a 7-day maximum leaves administration rows younger than 365 days; the size cap, measured as Postgres stores the
-rows, deletes the oldest plain rows and never an administration row; and at the first start a positive
+rows and counted once a delay of sealing has run since their seal, deletes the oldest plain rows and never an
+administration row; and at the first start a positive
 AUDIT_LOG_RETENTION_DAYS waits, as a change the server schedules and seals. test_audit_retention.py covers the
 rules offline.
 """
@@ -35,11 +36,27 @@ def count(tag, action=None):
     with engine.begin() as c:
         return c.execute(text("SELECT count(*) FROM audit_logs WHERE details->>'tag' = '%s'%s" % (tag, extra))).scalar()
 
-def seal_all():
+# The chain's clock, which seals are dated by: now, unless a test runs sealing over the days before it.
+clock = [now]
+st = ai.ChainState(clock=lambda: clock[0])
+ai.set_state(st)
+
+def seal_all(at=None):
+    clock[0] = at or now
     for _ in range(100):
-        r = ai.seal_pass(SessionLocal, st=st, now=now)
+        r = ai.seal_pass(SessionLocal, st=st, now=clock[0])
         if r.stopped or not r.sealed:
             return r.stopped
+
+def age_chain(days):
+    """Sealing that ran every six hours (no gap) from ``days`` before now until now: an hour's bytes count
+    toward the size cap only once a delay of sealing has run since the seal that took its rows in."""
+    t = now - timedelta(days=days)
+    seal_all(t)
+    while t + timedelta(hours=6) <= now:
+        t += timedelta(hours=6)
+        seal_all(t)
+    return seal_all(now)
 
 def prune(numbers):
     return ar.prune(retention.Pass(SessionLocal, now=now), ar.Numbers(*numbers)).deleted
@@ -103,7 +120,7 @@ def test_the_size_cap_deletes_the_oldest_plain_rows_and_never_administration_row
 tag = uuid.uuid4().hex
 seed(tag, 30, "settings_updated", n=2, pad_kb=300)
 seed(tag, 40, "file_upload", n=6, pad_kb=300)
-seal_all()
+age_chain(8)
 before = count(tag, "file_upload")
 prune([0, 0, 365, 1])
 with engine.begin() as c:
