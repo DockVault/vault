@@ -78,12 +78,11 @@ def removal_plan(db, view, record: Optional[dict], before: datetime, retention_d
     for h in hours:
         if states[h]["added"]:
             raise Refused(f"{fmt.hour_text(h)} holds rows its seal does not: this is not a removal")
+    # The cutoff hour is the first hour that kept a row: every hour before it lost all of its rows.
     kept = [h for h in hours if states[h]["present"]]
     cutoff = kept[0] if kept else ai.hour_floor(before)
     for h in hours:
         s = states[h]
-        if h < cutoff and s["present"]:
-            raise Refused(f"{fmt.hour_text(h)}, before the cutoff hour, kept rows: not a time cutoff")
         if h > cutoff and s["missing"]:
             raise Refused(f"{fmt.hour_text(h)}, after the cutoff hour, lost rows: not a time cutoff")
         if h == cutoff and s["missing"] != s["sealed"][:len(s["missing"])]:
