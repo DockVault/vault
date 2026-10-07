@@ -121,10 +121,12 @@ SAVED = (None, True, False)
 
 @pytest.mark.parametrize("plan_zk, plan_force, force, enabled",
                          list(itertools.product((True, False), (True, False), SAVED, SAVED)))
-def test_no_mix_of_plan_and_saved_settings_leaves_no_vault_to_make(db, monkeypatch, plan_zk, plan_force,
-                                                                   force, enabled):
-    """Whatever the plan and the saved switches say, someone in no department can make a vault of some kind,
-    and someone told to use zero-knowledge can make a zero-knowledge vault."""
+def test_no_mix_of_zero_knowledge_switches_leaves_no_vault_to_make(db, monkeypatch, plan_zk, plan_force,
+                                                                    force, enabled):
+    """With every vault type allowed and no cap on zero-knowledge vaults, no mix of the plan's two
+    zero-knowledge settings and the two saved switches leaves someone in no department without a vault to
+    make, and someone told to use zero-knowledge can make a zero-knowledge vault. The allowed types and the
+    cap stay fixed here, so this says nothing about mixes that change them."""
     monkeypatch.setattr(settings, "plan_zero_knowledge", plan_zk)
     monkeypatch.setattr(settings, "plan_force_zero_knowledge", plan_force)
     saved = {"force_zero_knowledge": force, "zero_knowledge_enabled": enabled}
