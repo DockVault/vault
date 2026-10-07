@@ -83,3 +83,12 @@ def test_a_refused_write_fails_the_command(tmp_path, monkeypatch):
                         {"ok": False, "error": "the chain changed since you looked"})
     with pytest.raises(SystemExit):
         tool.audit(_args("acknowledge", "--failures", "--yes"))
+
+
+def test_a_name_typed_wrong_writes_nothing_even_when_yes_follows(tmp_path, monkeypatch):
+    read = {"ok": True, "state": "dvstate1:s", "lines": [], "confirm": ["deleted-through-12"]}
+    tool, calls = _tool(tmp_path, monkeypatch, read, {"ok": True, "restored": 13})
+    answers = iter(["deleted-through-1", "yes"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    tool.audit(_args("accept-database-head"))
+    assert [c[0][-1] for c in calls.calls] == ["--read"]
