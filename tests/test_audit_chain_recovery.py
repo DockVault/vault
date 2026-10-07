@@ -88,6 +88,24 @@ def test_a_lost_old_key_is_accepted_without_its_proof_and_reported_for_good(env)
     assert failures(report) == [] and "key-accepted-unverified" in report.kinds("information")
 
 
+def test_rekey_refuses_a_newest_seal_that_does_not_verify_under_the_old_key(env):
+    _key_changed_without_the_old_one(env)
+    newest = env.seals()[-1].seq
+    with env.session() as db:
+        db.query(AuditSeal).filter(AuditSeal.seq == newest).update({AuditSeal.mac: b"\x00" * 32})
+        db.commit()
+    with pytest.raises(host.Refused, match="does not verify"):
+        recovery.rekey(env.engine, _host(env), old_key=fmt.chain_key(KEY_TEXT), read=True)
+    assert env.seals()[-1].kind != "key"
+
+
+def test_a_lost_key_is_never_accepted_in_one_step(env):
+    _key_changed_without_the_old_one(env)
+    with pytest.raises(host.Refused, match="never written in one step"):
+        recovery.rekey(env.engine, _host(env), accept_unverified=True, one_step=True)
+    assert env.seals()[-1].kind != "key"
+
+
 def _shared_then_own(env):
     env.settings.audit_chain_key = ""
     env.run_until_sealed()

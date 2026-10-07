@@ -19,7 +19,6 @@ import pytest
 from _audit_chain_env import Env, T0, failures
 from app.core import audit_chain_format as fmt
 from app.core import audit_chain_size as size
-from app.core import audit_chain_verify as v
 from app.core import audit_integrity as ai
 from app.core import retention
 from app.core.models import AuditLog, AuditSeal
@@ -267,3 +266,35 @@ def test_a_size_cap_prune_as_the_chain_gives_it_verifies(env):
     _seal_to(env, T0 + timedelta(days=8))
     _size_cap_prune(env)
     assert failures(env.verify()) == [] and failures(_off(env)) == []
+
+
+# --------------------------------------------------------------------------- the window
+
+def test_the_window_takes_in_a_gap_still_open(env):
+    """Three days with no seal at all (a stop not yet over): the window reaches back the delay and the stop."""
+    from app.core.audit_chain_view import from_us
+    _big(env, T0 - timedelta(days=20), 100)
+    env.run_until_sealed()
+    view, record = env.st.view, env.st.known_record()
+    now = view.newest_at() + timedelta(days=3)
+    start = from_us(size.window_start(view, record, now, timedelta(days=7)))
+    assert abs(start - (now - timedelta(days=10))) < timedelta(minutes=1)
+
+
+def test_the_servers_window_takes_in_a_stop_another_writers_seals_hid(env):
+    """Hour seals another writer appended across a ten-day stop, each dated within 12 hours of the last: the
+    chain's own window sees seven days of sealing inside the stop; the server's, with the seals placed where it
+    first accepted them (the restart), reaches back before the stop."""
+    from app.core.audit_chain_view import from_us
+    from test_audit_chain_dates import _forge_hours_across
+    _big(env, T0 - timedelta(days=20), 100)
+    env.run_until_sealed()
+    stop_start = env.clock()
+    _forge_hours_across(env, env.clock() + timedelta(days=10))
+    retention.run_pass(env.session, now=env.clock())     # the restart accepts them
+    view, record = env.st.view, env.st.known_record()
+    now = env.clock()
+    chain_only = from_us(size.window_start(view, record, now, timedelta(days=7), server=False))
+    servers = from_us(size.window_start(view, record, now, timedelta(days=7)))
+    assert chain_only > stop_start
+    assert servers <= stop_start

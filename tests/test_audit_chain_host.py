@@ -73,6 +73,29 @@ def test_a_value_no_release_writes_is_a_failure_until_the_host_acknowledges_the_
     assert failures(report) == [] and "value-not-writable" in report.kinds("information")
 
 
+def test_only_the_hosts_ack_acknowledges_a_row(env):
+    """An ack seal naming a row acknowledges it only when the host wrote it: one by an administrator leaves the
+    value no release writes a failure."""
+    odd = _unwritable_row(env, T0 - timedelta(hours=6))
+    env.run_until_sealed()
+    with ai.ChainWriter(env.engine, env.st) as w:
+        w.append("ack", detail={"acknowledges": [], "failures": [], "rows": [str(odd)], "discarded": [],
+                                "by": "admin", "user_id": None, "request": None})
+    assert str(odd) not in env.st.view.acked_rows
+    assert any("value-not-writable" in f.message for f in env.verify().findings if f.kind == "rows-altered")
+
+
+def test_a_row_changed_between_the_phases_makes_the_rows_acknowledgment_refuse(env):
+    odd = _unwritable_row(env, T0 - timedelta(hours=6))
+    env.run_until_sealed()
+    seen = host.acknowledge(env.engine, env.st, seqs=[], failures=False, rows=[str(odd)], read=True)
+    with env.engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE audit_logs SET username = ? WHERE id = ?", ("mallory", odd.hex))
+    with pytest.raises(host.Refused, match="changed since you looked"):
+        host.acknowledge(env.engine, env.st, seqs=[], failures=False, rows=[str(odd)], expect=seen["state"])
+    assert env.seals()[-1].kind != "ack"
+
+
 def _late_after_window(env):
     """A row added to an hour sealed more than 6 hours before: a failure, not a late seal."""
     env.row(T0 - timedelta(hours=10))

@@ -141,3 +141,28 @@ def test_every_64th_link_is_kept_by_generation(env):
     assert env.st.view.position >= 64
     assert links["1:64"] == env.st.view.link_at(64).hex()
     assert all(k.startswith("1:") for k in links)
+
+
+def test_the_day_digests_are_computed_a_month_at_a_time(env):
+    """A long history is digested 31 days per record write, so a backlog spreads the work; the next write goes
+    on from the day the last one reached."""
+    env.row(T0 - timedelta(days=90))
+    env.run_until_sealed()
+    record = {}
+    with env.session() as db:
+        ai.day_digests(db, env.st.view, record, env.clock(), [])
+        assert len(record["days"]) == ai.DAY_DIGESTS_PER_WRITE
+        first_through = record["days_through"]
+        ai.day_digests(db, env.st.view, record, env.clock(), [])
+    assert len(record["days"]) > ai.DAY_DIGESTS_PER_WRITE and record["days_through"] > first_through
+
+
+def test_the_summaries_hold_the_seals_another_writer_appended_once_accepted(env):
+    from test_audit_chain_dates import _forge_hours_across
+    env.run_until_sealed()
+    _forge_hours_across(env, env.clock() + timedelta(days=1))
+    forged = [s for s in env.seals() if s.kind == "hour"][-1]
+    with ai.ChainWriter(env.engine, env.st):
+        pass                                   # the server reads the chain and accepts them
+    summary = env.st.head_store().load()["hours"][fmt.hour_text(forged.period_start)]
+    assert summary["seq"] == forged.seq and summary["unsealed"] is False

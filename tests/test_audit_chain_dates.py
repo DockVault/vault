@@ -21,14 +21,14 @@ from app.core import audit_chain_format as fmt
 from app.core import audit_chain_honour as honour
 from app.core import audit_chain_policy as pol
 from app.core import audit_chain_policy_seals as ps
+from app.core import audit_chain_times as times
 from app.core import audit_integrity as ai
-from app.core import audit_retention as ar
 from app.core import retention
 from app.core import setting_changes as sc
 from app.core import settings_registry as reg
 from app.core.models import AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange
 from test_audit_chain_guards import _forge
-from test_audit_chain_trust import _ack_by_host, _admin, _change, _newest_policy, _run_to
+from test_audit_chain_trust import _ack_by_host, _admin, _change, _run_to
 
 pytestmark = pytest.mark.unit
 
@@ -315,3 +315,71 @@ def test_a_cancel_of_a_request_another_writers_applies_applied_is_refused_and_th
     _run_to(env, env.clock() + timedelta(days=8))
     assert _honoured_max_days(env) == 0
     assert failures(env.verify()) == []
+
+
+# --------------------------------------------------------------------------- where another writer's seals sit
+
+def test_a_discarded_seal_and_one_of_another_generation_are_placed_nowhere():
+    at = "2026-09-01T10:00:00.000000Z"
+    record = {"after_record": [
+        {"generation": 1, "seq": 5, "accepted_at": at},
+        {"generation": 1, "seq": 6, "accepted_at": at, "discarded": True},
+        {"generation": 2, "seq": 7, "accepted_at": at},
+        {"generation": 1, "seq": 8, "accepted_at": None}]}
+    assert sorted(times.placements(record, 1)) == [5]
+
+
+def test_another_writers_request_waits_the_delay_in_force_when_the_server_accepted_it(env):
+    """A request another writer appended is due a delay after the server first accepted it, with the delay
+    honoured then: a longer delay .env sets afterwards does not move it."""
+    env.run_until_sealed()
+    req = _request_after(env, 30, 7)
+    retention.run_pass(env.session, now=env.clock())     # accepted here, under seven days
+    entry = [e for e in env.st.head_store().load()["after_record"] if e["seq"] == req][0]
+    accepted = fmt.parse_time_text(entry["accepted_at"])
+    assert entry["delay_days"] == 7
+    _set_input(env, "RETENTION_REDUCTION_DELAY_DAYS", 30)
+    env.clock.advance(hours=1)
+    retention.run_pass(env.session, now=env.clock())     # the env seal: thirty days from now on
+    assert pol.delay_days(env.st.view.newest_state()) == 30
+    _ack_by_host(env, [req])
+    due = honour.effective_not_before(env.st.view, env.st.known_record(), req, env.clock())
+    assert abs(due - (accepted + timedelta(days=7))) < timedelta(minutes=1)
+
+
+def test_another_writers_applies_keeps_its_due_date_once_sealing_has_run_past_it(env):
+    """The date the pruner itself could first have applied the request is fixed once sealing has run past it:
+    a stop of two days after it moves it no more."""
+    env.run_until_sealed()
+    env_seal = _env_seal_elsewhere(env, RETENTION_REDUCTION_DELAY_DAYS=1)
+    req = _request_after(env, 30, 1)
+    retention.run_pass(env.session, now=env.clock())
+    _run_to(env, env.clock() + timedelta(days=1, hours=1))
+    applies = _applies_of(env, req, 30)
+    retention.run_pass(env.session, now=env.clock())
+    _ack_by_host(env, [env_seal, req, applies])
+    due = honour.request_due(env.st.view, env.st.known_record(), req, env.clock())
+    _run_to(env, due + timedelta(hours=2))
+    env.clock.advance(days=2)                            # stopped for two days, after the due date
+    retention.run_pass(env.session, now=env.clock())
+    again = honour.request_due(env.st.view, env.st.known_record(), req, env.clock())
+    assert abs(again - due) < timedelta(minutes=1)
+    assert honour.counts_from(env.st.view, env.st.known_record(), applies, env.clock()) <= due + timedelta(hours=1)
+
+
+def test_nothing_is_due_while_a_gap_is_open_on_the_servers_timeline(env):
+    """Another writer's seal dated four minutes ahead (within what the server accepts), accepted at once: twelve
+    hours and two minutes later the chain's own timeline has no gap open, the server's (the seal placed where it
+    was accepted) has, and no request is due."""
+    env.run_until_sealed()
+    req = _admin_reduction_due(env, 90)
+    record = env.st.known_record()
+    assert req in ps.due_requests(env.st.view, env.clock(), record)
+    accepted_at = env.clock()
+    _forge(env, "ack", {"acknowledges": [], "failures": [], "rows": [], "discarded": [], "by": "admin",
+                        "user_id": None, "request": None}, sealed_at=accepted_at + timedelta(minutes=4))
+    _accept(env)
+    later = accepted_at + timedelta(hours=12, minutes=2)
+    chain, server = times.timelines(env.st.view, env.st.known_record())
+    assert chain.open_gap(times.us(later)) == 0 and server.open_gap(times.us(later)) > 0
+    assert ps.due_requests(env.st.view, later, env.st.known_record()) == []
