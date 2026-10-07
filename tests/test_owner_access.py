@@ -360,9 +360,15 @@ def test_the_app_hands_the_vault_and_the_notice_to_the_page():
 
 def test_the_owners_files_opened_are_found_among_many_of_other_owners(db, people):
     case = _case(db, people, [people.v1, people.v2])
+    mine = _file(db, people.v1, "mine.txt")
     others = _file(db, people.v2, "others.txt")
-    for _ in range(oa.OPENED_SHOWN + 50):
-        _viewed(db, case, people.v2, others.id)
-    _viewed(db, case, people.v1, _file(db, people.v1, "mine.txt").id)
+    start = case.approved_at
+    rows = [(people.v1, mine, start)] + [(people.v2, others, start + timedelta(seconds=1 + i))
+                                         for i in range(oa.OPENED_SHOWN * 5)]
+    for vault, f, at in rows:
+        db.add(m.AuditLog(action="case_file_viewed", status="success", user_id=case.auditor_id, username="uma",
+                          resource_type="file", resource_id=str(f.id), case_id=case.id, timestamp=at,
+                          details={"vault_id": str(vault.id)}))
+    db.commit()
     (seen,) = oa.page(db, people.olga)["cases"]
-    assert [o["name"] for o in seen["opened"]] == ["mine.txt"]
+    assert [o["name"] for o in seen["opened"]] == ["mine.txt"], "the owner's one, older than a thousand others"
