@@ -258,6 +258,23 @@ Permissions button on the Users page, which removes Manage Users with it (revoki
 leaves View Users). To keep a leftover one, revoke it and then grant it, so that it records who granted
 it: granting it while the account still holds it does nothing.
 
+The tool that `dockvault.py accounts` runs in the web container also reads the deployment's
+zero-knowledge state, for a managing operator's tooling or a monitoring script, with no account and no
+password, and changes nothing:
+
+```bash
+docker exec vault python -m app.core.host_operator zk-status   # vault-api in the split layout
+```
+
+It prints one JSON object: whether zero-knowledge vaults can be made, whether new vaults must be
+zero-knowledge (for someone in no department; members of departments an administrator exempted may still
+make standard vaults), the plan's limit (`-1` for none) and how many active zero-knowledge vaults there are,
+and how many zero-knowledge files and folders still carry a name that was never sealed (left from before
+sealing was required; 0 on a healthy deployment). Counts and switches only, never a name, a key or content.
+It is not audited, since it changes nothing. When something stops it, the database out of reach for one, it
+still prints one JSON object, `{"ok": false, ...}`, exits with status 1 and says what happened on standard
+error.
+
 ### Sealing credentials at rest (optional)
 
 `.env` holds every secret (including `ENCRYPTION_KEY`). You can seal it while the deployment is off:

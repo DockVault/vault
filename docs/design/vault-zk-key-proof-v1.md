@@ -218,7 +218,8 @@ verifier, not merely filtered out):
   a planted plaintext row never verifies.
 - **Up to 32 live challenges per account.** A bulk share asks for one challenge per person, in parallel, so they
   must not evict one another. Issuing the 33rd deletes the oldest; issuance is serialized on the account's row
-  and deletes the account's expired challenges, and the periodic session-data cleanup sweeps the rest.
+  and deletes the account's expired challenges, and the pruner's `key_proof_challenges` job deletes the rest
+  once they have expired.
 
 ### 3.5 The key check (direct vaults)
 

@@ -3859,11 +3859,10 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
     # the keys only .env sets have none: a copy saved here would never be read, and would look as if it
     # had changed something. Refused whatever the key's case.
     from app.core import settings_registry as _registry
-    _refused = _registry.refused_settings_keys()
     for _key in payload:
-        if isinstance(_key, str) and _key.lower() in _refused:
-            raise HTTPException(status_code=400,
-                                detail=f"{_key.lower()} is not saved here: it is a managed setting")
+        _why = _registry.settings_refusal(_key)
+        if _why:
+            raise HTTPException(status_code=400, detail=_why)
 
     # The recording levels keep a table of their own and are saved in Settings -> Activity and records, with
     # the password every time (app/api/recording_levels_router.py): the general settings never hold a copy,
@@ -3891,15 +3890,6 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
                 status_code=400,
                 detail=f"{managed_key} is managed by the deployment environment",
             )
-    # Switches only the host operator may set, in the environment. Nothing reads them from here; the
-    # refusal (whatever the key's case) keeps a settings save from appearing to change one.
-    for env_only_key in ("zk_key_proof_enforce",):
-        if any(isinstance(key, str) and key.lower() == env_only_key for key in payload):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{env_only_key} is managed by the deployment environment",
-            )
-
     # Custom rate-limit overrides (general-API buckets + the login / vault / SFTP throttles) share one
     # uniform bounds check from the registry: an int in [min, max], or the sentinel 0 meaning "clear the
     # override and use the deployment default". An out-of-range / malformed value is refused here, and
@@ -7268,28 +7258,10 @@ async def zk_unsealed_count(
     name — enc_name absent or not a client-sealed 'zk1:' blob — i.e. leftover cleartext metadata
     from before client-side name sealing was enforced on the write paths. A healthy deployment
     reports 0. The read guards already MASK such rows from being served, so this is a re-seal
-    to-do list for owners, not a live leak. Admin-only (fleet-wide across all ZK vaults)."""
-    from app.core.models import Vault, File, Folder
-    from sqlalchemy import or_, not_, and_
-    zk_ids = [r[0] for r in db.query(Vault.id).filter(Vault.type == 'zero_knowledge').all()]
-    if not zk_ids:
-        return {"zk_vaults": 0, "files_unsealed": 0, "folders_unsealed": 0, "vaults_affected": 0}
-
-    def _unsealed(col):
-        # NULL (never sealed) OR present-but-not a sealed blob. A sealed row is v1 (zk1:...) OR
-        # v2 (zk2:..., obj-id-bound) — both are excluded from the "unsealed" count.
-        return or_(col.is_(None), and_(not_(col.like('zk1:%')), not_(col.like('zk2:%'))))
-
-    files_unsealed = db.query(File).filter(File.vault_id.in_(zk_ids), _unsealed(File.enc_name)).count()
-    folders_unsealed = db.query(Folder).filter(Folder.vault_id.in_(zk_ids), _unsealed(Folder.enc_name)).count()
-    affected = {r[0] for r in db.query(File.vault_id).filter(File.vault_id.in_(zk_ids), _unsealed(File.enc_name)).distinct()}
-    affected |= {r[0] for r in db.query(Folder.vault_id).filter(Folder.vault_id.in_(zk_ids), _unsealed(Folder.enc_name)).distinct()}
-    return {
-        "zk_vaults": len(zk_ids),
-        "files_unsealed": files_unsealed,
-        "folders_unsealed": folders_unsealed,
-        "vaults_affected": len(affected),
-    }
+    to-do list for owners, not a live leak. Admin-only (fleet-wide across all ZK vaults). The host
+    command's zk-status action reads the same counts (app/core/zk_unsealed.py)."""
+    from app.core import zk_unsealed
+    return zk_unsealed.counts(db)
 
 
 @app.get("/sftp/host-key")
@@ -16373,19 +16345,23 @@ def _user_must_use_zk(db, user) -> bool:
 
     Force comes from EITHER the plan (an Enterprise plan mandates ZK — a floor the
     local toggle can't drop below) OR the local admin 'force_zero_knowledge' setting
-    (which additionally requires the local 'zero_knowledge_enabled' toggle). The
-    department whitelist (standard_vault_allowed_groups) exempts members of listed
-    groups in both cases. On a read error, fails toward the plan-imposed floor:
-    permissive (False) for non-forced plans, forced (True) for plan-forced ones —
-    and _zk_enabled short-circuits ZK on for plan-forced deployments, so the user is
-    never boxed into 'must use ZK but ZK is off'."""
+    (which additionally requires the local 'zero_knowledge_enabled' toggle, and a plan
+    that includes zero-knowledge). The department whitelist (standard_vault_allowed_groups)
+    exempts members of listed groups in both cases. On a read error, fails toward the
+    plan-imposed floor: permissive (False) for non-forced plans, forced (True) for
+    plan-forced ones — and _zk_enabled short-circuits ZK on for plan-forced deployments,
+    so the user is never boxed into 'must use ZK but ZK is off'."""
     plan_force = settings.plan_force_zero_knowledge and settings.plan_zero_knowledge
     try:
         from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
-        setting_force = bool(val.get("force_zero_knowledge") and val.get("zero_knowledge_enabled"))
+        # The administrators' force holds only where the plan lets zero-knowledge vaults be made at all
+        # (_zk_enabled). Saved before the plan dropped zero-knowledge, it would otherwise refuse a standard
+        # vault while the zero-knowledge one is refused as not enabled: no vault could be made.
+        setting_force = bool(settings.plan_zero_knowledge and val.get("force_zero_knowledge")
+                             and val.get("zero_knowledge_enabled"))
         if not (plan_force or setting_force):
             return False
         allowed = {str(g) for g in (val.get("standard_vault_allowed_groups") or [])}

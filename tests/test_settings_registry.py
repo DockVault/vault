@@ -338,6 +338,31 @@ def test_put_settings_refuses_a_key_only_env_sets(clean, monkeypatch):
     assert refused is not None and refused.status_code == 400
 
 
+@pytest.mark.parametrize("spelled", ["zk_key_proof_enforce", "ZK_KEY_PROOF_ENFORCE", "Zk_Key_Proof_Enforce"])
+def test_the_switches_only_env_sets_are_refused_by_the_registry_with_their_own_reason(clean, spelled):
+    # One mechanism refuses every key only .env sets: ENV_ONLY_KEYS. The refusal is the one these switches
+    # always had, a 400 that says the deployment environment manages them.
+    assert "zk_key_proof_enforce" in {k.lower() for k in reg.ENV_ONLY_KEYS}
+    assert "zk_key_proof_enforce" in reg.refused_settings_keys()
+    for value in (False, True, "false", 0, None):
+        refused = _refused({spelled: value})
+        assert refused is not None and refused.status_code == 400
+        assert refused.detail == "zk_key_proof_enforce is managed by the deployment environment"
+
+
+def test_every_key_only_env_sets_is_a_setting_and_is_not_registered(clean):
+    from app.core.config import Settings
+    for key in reg.ENV_ONLY_KEYS:
+        assert key.lower() in Settings.model_fields, f"{key} is not a setting of this deployment"
+        assert reg.spec_for(key.lower()) is None, f"{key} is registered, so it is not only set by .env"
+        assert key.lower() not in {listed.key for listed in reg.all_listed()}, f"{key} is listed in the registry"
+    # No second list of them is kept where the settings are saved.
+    import inspect
+    source = inspect.getsource(api._validate_settings_payload)
+    assert "env_only_key" not in source and "zk_key_proof_enforce" not in source
+    assert source.count("_registry.settings_refusal(_key)") == 1
+
+
 def test_put_settings_still_takes_other_keys(clean):
     with registered(_days()):
         assert _refused({"sharing_enabled": True}) is None

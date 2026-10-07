@@ -86,6 +86,17 @@ def test_the_challenges_lifetime_cap_and_budget_are_the_codes():
     assert f"{per} per minute per account" in doc
 
 
+def test_the_document_names_what_deletes_expired_challenges():
+    # Issuance deletes the account's own expired challenges; the pruner deletes the rest. The periodic
+    # session-data cleanup did once, and no longer does.
+    from app.core import retention
+    doc = " ".join(_doc().split())
+    job = next(j for j in retention.JOBS if j.name == "key_proof_challenges")
+    assert job.run is retention.prune_key_proof_challenges
+    assert "deletes the account's expired challenges, and the pruner's `key_proof_challenges` job deletes the rest" in doc
+    assert "session-data cleanup" not in doc
+
+
 def test_the_refusal_table_is_the_codes():
     table = _section(_doc(), "### 5.7 Refusal contract")
     rows = {}

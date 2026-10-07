@@ -286,7 +286,9 @@ the recipients' mailboxes.
   can list the permissions an administrator revoked that a restart before 0.33.1 granted again (usernames,
   roles, the permission, and when it was revoked and granted again, read from the audit log), not
   audited either, and unlock an account (its automatic locks and an administrator's lock), audited as
-  the host operator.
+  the host operator. **New in 0.34.0:** `python -m app.core.host_operator zk-status`, run in the web
+  container, prints the deployment's zero-knowledge counts and switches (no personal data: no names,
+  keys or content), not audited.
 
 ## The browser
 

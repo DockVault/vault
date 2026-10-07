@@ -582,3 +582,58 @@ def test_the_key_proof_outcome_is_the_probes_last_line(out, outcome):
 def test_an_unusable_key_proof_outcome_is_a_harness_error(out, message):
     with pytest.raises(pm.HarnessError, match=message):
         pm.key_proof_outcome(out)
+
+
+# --- the run itself, with the probes stubbed --------------------------------------------------------------
+
+PROBE_METHODS = {"address": "probe_address", "scheme": "probe_scheme", "budget": "probe_budget",
+                 "log": "probe_log", "key-proof": "probe_key_proof"}
+
+
+def _stubbed_matrix(addr, ipv6_published):
+    """A Matrix whose API start and probes only record what they were asked: each probe answers what its
+    check expects, so a check sent to the wrong probe is seen by name, not by a failed judgement."""
+    m = pm.Matrix.__new__(pm.Matrix)
+    m.addr, m.results, m.ipv6_published, m.log = addr, [], ipv6_published, lambda _line: None
+    m.calls = []
+    m.start_api = lambda config: m.calls.append(("start", config.key))
+
+    def probe(kind):
+        def run(check):
+            m.calls.append((kind, check))
+            if kind == "budget":
+                return pm.Result(check, "5", "5", True)
+            return pm.expected_value(check, addr)
+        return run
+
+    for kind, method in PROBE_METHODS.items():
+        setattr(m, method, probe(kind))
+    return m
+
+
+def test_the_table_uses_every_probe_and_no_other():
+    assert {c.probe for c in pm.CHECKS} == set(PROBE_METHODS)
+    assert {c.config for c in pm.CHECKS} <= {c.key for c in pm.CONFIGS}
+    assert any(c.ipv6 for c in pm.CHECKS)
+
+
+@pytest.mark.parametrize("ipv6_published", [True, False])
+def test_each_check_is_run_by_the_probe_its_row_names(addr, ipv6_published):
+    m = _stubbed_matrix(addr, ipv6_published)
+    results = m.run_checks()
+    ordered = [c for config in pm.CONFIGS for c in pm.CHECKS if c.config == config.key]
+    probed = [call for call in m.calls if call[0] != "start"]
+    assert probed == [(c.probe, c) for c in ordered if ipv6_published or not c.ipv6]
+    # The API starts once per trust setting that has checks, before them, in the table's order.
+    starts = [call[1] for call in m.calls if call[0] == "start"]
+    assert starts == [c.key for c in pm.CONFIGS if any(ch.config == c.key for ch in pm.CHECKS)]
+    current = None
+    for call in m.calls:
+        if call[0] == "start":
+            current = call[1]
+        else:
+            assert call[1].config == current, (call, current)
+    # Every check has a result, in that order: passed, or skipped when the host relays no IPv6.
+    assert results is m.results and [r.check for r in results] == ordered
+    assert all(r.ok for r in results if not r.skipped)
+    assert [r.check for r in results if r.skipped] == ([] if ipv6_published else [c for c in ordered if c.ipv6])

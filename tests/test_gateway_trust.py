@@ -199,6 +199,23 @@ def test_the_example_no_longer_suggests_a_range_that_covers_the_gateway():
     assert "\nWEB_BIND=\n" in text
 
 
+def test_the_readme_says_what_to_set_behind_a_proxy_and_it_is_what_the_code_does(trust):
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    start = text.index("- **Behind a reverse proxy, name it in `TRUSTED_PROXIES`**")
+    bullet = " ".join(text[start:text.index("\n- **", start + 1)].split())
+    assert text.count("- **Behind a reverse proxy, name it in `TRUSTED_PROXIES`**") == 1
+    assert f"or `{net_utils.GATEWAY_TOKEN}` for a proxy on the same host together with `WEB_BIND=127.0.0.1`" in bullet
+    assert "A range never trusts the Docker gateway" in bullet
+    assert "\nWEB_BIND=\n" in (ROOT / ".env.example").read_text(encoding="utf-8")
+    # The token trusts the gateway; a range that covers it does not; a proxy container's address does.
+    trust(net_utils.GATEWAY_TOKEN)
+    assert net_utils.client_ip(_request(GATEWAY, FORGED)) == FORGED
+    trust("172.16.0.0/12")
+    assert net_utils.client_ip(_request(GATEWAY, FORGED)) == GATEWAY
+    trust(PROXY)
+    assert net_utils.client_ip(_request(PROXY, FORGED)) == FORGED
+
+
 def test_the_image_empties_uvicorns_own_trusted_list():
     assert (ROOT / "Dockerfile").read_text(encoding="utf-8").count('\nENV FORWARDED_ALLOW_IPS=""\n') == 1
 
