@@ -677,11 +677,12 @@ def narrow(db, case, *, by, scope, files_from=None, files_to=None, keep_range: b
 # --------------------------------------------------------------------------- objections
 
 def owns_a_vault_in(db, case, person) -> bool:
-    """Whether ``person`` owns a vault of ``case``, as its records say (an owner the case concerns)."""
-    from app.core.models import ComplianceCasePerson
-    return db.query(ComplianceCasePerson).filter(ComplianceCasePerson.case_id == case.id,
-                                                 ComplianceCasePerson.user_id == person.id,
-                                                 ComplianceCasePerson.why == "owner").first() is not None
+    """Whether ``person`` owns a vault of ``case`` and was told of it: a case nobody approved yet, or that told
+    others only, does not exist for them."""
+    from app.core.models import ComplianceCaseVault
+    return db.query(ComplianceCaseVault).filter(ComplianceCaseVault.case_id == case.id,
+                                                ComplianceCaseVault.owner_id_at_approval == person.id,
+                                                ComplianceCaseVault.notice_written_at.isnot(None)).first() is not None
 
 
 def objection_refusal(db, case, person) -> Optional[str]:
@@ -862,17 +863,18 @@ def _open(case, column: str, field: str) -> Optional[str]:
         return None
 
 
-def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool = False) -> dict:
+def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool = False, light: bool = False) -> dict:
     """``case`` as ``viewer`` (its auditor or an administrator) may see it. The justification only for the auditor
     and an administrator who could approve it; the people named only for those the case does not concern. Never a
-    vault, file or folder name."""
+    vault, file or folder name. ``light`` (a list of cases): only what the list shows, without the texts, what each
+    step would allow and the vaults' figures, which the case's own page reads."""
     from app.core import auditor_rights as rights
     from app.core import legal_holds
     from app.core.models import ComplianceCasePerson, User
     now = now or utcnow()
     admin = is_admin(viewer)
     own = is_auditor_of(case, viewer)
-    eligible = admin and approver_refusal(db, case, viewer, now) is None
+    eligible = admin and not light and approver_refusal(db, case, viewer, now) is None
     people = db.query(ComplianceCasePerson).filter(ComplianceCasePerson.case_id == case.id).all()
     concerned = any(str(p.user_id) == str(viewer.id) for p in people)
     names = {}
@@ -892,7 +894,7 @@ def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool 
                  "folders": len(row.folder_ids or []), "owner": names.get(row.owner_id_at_approval),
                  "exists": facts is not None, "has_password": bool(facts and facts.has_password),
                  "owner_told_at": _iso(row.notice_written_at)}
-        if admin and facts is not None:
+        if admin and facts is not None and not light:
             entry.update(_vault_numbers(db, row.vault_id))
             entry["you_are_member"] = _is_member(db, viewer, row.vault_id, facts.owner_id)
         vaults.append(entry)
@@ -913,13 +915,15 @@ def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool 
         "owners_told": {"at": _iso(case.notice_written_at), "email": case.notice_email_status},
         "closed_at": _iso(case.closed_at), "closed_by": case.closed_by_username, "vaults": vaults,
         "holds_standing": len(legal_holds.standing(db, case.id)),
-        "you_may": {"approve": may(lambda d, c, p, n: decision_refusal(d, c, p, n) if admin else NOT_ALLOWED),
+    }
+    if light:
+        return out
+    out["you_may"] = {"approve": may(lambda d, c, p, n: decision_refusal(d, c, p, n) if admin else NOT_ALLOWED),
                     "reject": may(lambda d, c, p, n: decision_refusal(d, c, p, n) if admin else NOT_ALLOWED),
                     "extend": may(extend_refusal), "narrow": may(narrow_refusal), "close": may(close_refusal),
                     "withdraw": may(lambda d, c, p, n: (None if is_auditor_of(c, p) and c.status == rules.PENDING
                                                         else NOT_ALLOWED)),
-                    "objection": may(lambda d, c, p, n: objection_refusal(d, c, p))},
-    }
+                    "objection": may(lambda d, c, p, n: objection_refusal(d, c, p))}
     if own or eligible:
         out["justification"] = _open(case, "justification_enc", "justification")
     if own or admin:

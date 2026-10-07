@@ -816,3 +816,23 @@ def test_the_tool_records_its_refusal_to_approve_and_approves_when_nobody_else_c
     assert code == 0 and answer["case"]["status"] == "active"
     db.refresh(case)
     assert case.approved_by_operator and case.notice_written_at is not None
+
+
+def test_the_list_shows_no_texts_and_the_case_page_does(db, people):
+    case = _ask(db, people.uma, _vaults(people.v1))
+    listed = cr.list_cases(current_user=people.bob, db=db)["cases"][0]
+    assert "justification" not in listed and "you_may" not in listed and "owner_note" not in listed
+    assert "file_count" not in listed["vaults"][0]
+    page = cases.case_view(db, case, people.bob)
+    assert page["justification"] == TEXT["justification"] and "you_may" in page
+
+
+def test_an_owner_not_told_yet_finds_no_case(db, people):
+    case = _ask(db, people.uma, _vaults(people.v1))
+    assert not cases.owns_a_vault_in(db, case, people.olga)
+    _, err = _call(cr.record_case_objection, case.id, cr.ObjectionIn(text="I object."), current_user=people.olga, db=db)
+    assert err.status_code == 404, "a pending case does not exist for its owners"
+    _approve(db, case, people.bob)
+    assert cases.owns_a_vault_in(db, case, people.olga)
+    out = cr.record_case_objection(case.id, cr.ObjectionIn(text="I object."), current_user=people.olga, db=db)
+    assert out["objections"] == 1

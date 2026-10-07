@@ -101,9 +101,12 @@ def opened(db, case, vault_ids, *, unlocked: set) -> list:
     could read it now."""
     from app.core.models import AuditLog
     wanted = {str(v) for v in vault_ids}
+    if not wanted:
+        return []
     rows = (db.query(AuditLog).filter(AuditLog.case_id == case.id, AuditLog.action == "case_file_viewed",
-                                      AuditLog.status == "success")
-            .order_by(AuditLog.timestamp.desc()).limit(OPENED_SHOWN * 4).all())
+                                      AuditLog.status == "success",
+                                      AuditLog.details["vault_id"].as_string().in_(sorted(wanted)))
+            .order_by(AuditLog.timestamp.desc()).limit(OPENED_SHOWN).all())
     facts = {}
     out = []
     for row in rows:

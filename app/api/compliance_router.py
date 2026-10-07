@@ -657,7 +657,7 @@ def list_cases(current_user: User = Depends(require_interactive_account), db: Se
         q = q.filter(ComplianceCase.auditor_id == current_user.id)
     now = cases.utcnow()
     rows = q.order_by(ComplianceCase.requested_at.desc()).limit(ENDED_SHOWN).all()
-    return {"cases": [cases.case_view(db, c, current_user, now=now) for c in rows],
+    return {"cases": [cases.case_view(db, c, current_user, now=now, light=True) for c in rows],
             "access_enabled": rights.access_enabled(), "max_open_cases": cases.rules.MAX_OPEN_CASES}
 
 
