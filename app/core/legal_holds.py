@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, List, Optional
 
 from app.core import after_commit
+from app.core import case_rules
 from app.core import compliance_settings as cs
 from app.core import independence as ind
 from app.core.case_context import acting_for
@@ -48,13 +49,12 @@ NOTICE_TYPE = "legal_hold"
 TARGET = "#compliance"
 # After a lapse, the person who placed the hold cannot place another unconfirmed one on its vaults this long.
 PLACE_BLOCK_DAYS = 30
-JUSTIFICATION_MIN = 30
-TEXT_MAX = 4000
-
-# What a hold-only case is for and on what basis. The case rules (cases with access) use the same lists.
-PURPOSES = ("internal_investigation", "litigation_hold", "regulator_request", "data_subject_request",
-            "security_incident", "other")
-LEGAL_BASES = ("legal_obligation", "public_task", "legitimate_interests")
+# What a hold-only case is for and on what basis, and the least its justification says: the case rules' own (one
+# list for every case).
+JUSTIFICATION_MIN = case_rules.JUSTIFICATION_MIN
+TEXT_MAX = case_rules.TEXT_MAX
+PURPOSES = case_rules.PURPOSES
+LEGAL_BASES = case_rules.LEGAL_BASES
 
 # Why a step is refused.
 ACCESS_OFF = "compliance_disabled"
@@ -65,11 +65,11 @@ NO_SUCH_VAULT = "no_such_vault"
 PLACER_CONCERNED = "placer_concerned"
 PLACE_BLOCKED = "place_blocked"
 SFTP_VERSION = "sftp_version"
-BAD_PURPOSE = "bad_purpose"
-BAD_BASIS = "bad_basis"
-NO_LIA_REFERENCE = "no_lia_reference"
-SHORT_JUSTIFICATION = "short_justification"
-NO_OWNER_NOTE = "no_owner_note"
+BAD_PURPOSE = case_rules.BAD_PURPOSE
+BAD_BASIS = case_rules.BAD_BASIS
+NO_LIA_REFERENCE = case_rules.NO_LIA_REFERENCE
+SHORT_JUSTIFICATION = case_rules.SHORT_JUSTIFICATION
+NO_OWNER_NOTE = case_rules.NO_OWNER_NOTE
 NOTHING_TO_CONFIRM = "nothing_to_confirm"
 CONFIRM_TOO_LATE = "confirm_too_late"
 INDEPENDENT_ADMIN = "independent_admin"
@@ -345,16 +345,11 @@ def _clean(value: Optional[str]) -> str:
 
 
 def check_case_text(purpose, legal_basis, lia_reference, justification, owner_note) -> None:
-    if purpose not in PURPOSES:
-        raise HoldRefused(BAD_PURPOSE, code=422)
-    if legal_basis not in LEGAL_BASES:
-        raise HoldRefused(BAD_BASIS, code=422)
-    if legal_basis == "legitimate_interests" and not _clean(lia_reference):
-        raise HoldRefused(NO_LIA_REFERENCE, code=422)
-    if len(_clean(justification)) < JUSTIFICATION_MIN:
-        raise HoldRefused(SHORT_JUSTIFICATION, code=422)
-    if not _clean(owner_note):
-        raise HoldRefused(NO_OWNER_NOTE, code=422)
+    """Refuse (422) text the case rules do not accept, with the first reason (case_rules.text_problems)."""
+    problems = case_rules.text_problems(purpose=purpose, legal_basis=legal_basis, lia_reference=lia_reference,
+                                        justification=justification, owner_note=owner_note)
+    if problems:
+        raise HoldRefused(problems[0], code=422)
 
 
 def may_place(db, person) -> Optional[str]:
