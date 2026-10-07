@@ -9793,48 +9793,57 @@ function buildActionRow(a, templates) {
 
     const head = document.createElement('div'); head.className = 'ear-head';
     const nm = document.createElement('span'); nm.className = 'ear-name'; nm.textContent = a.name; head.appendChild(nm);
+    const locked = a.category === 'locked';
     const badge = document.createElement('span');
-    badge.className = 'ear-badge ' + (a.category === 'system' ? 'ear-badge-system' : 'ear-badge-optional');
-    badge.textContent = a.category === 'system' ? 'System' : 'Optional';
+    badge.className = 'ear-badge ' + (a.category === 'optional' ? 'ear-badge-optional' : 'ear-badge-system');
+    badge.textContent = locked ? 'Locked' : (a.category === 'system' ? 'System' : 'Optional');
+    if (locked) badge.title = 'Its wording is fixed and it is always sent: it cannot be changed or turned off.';
     head.appendChild(badge);
     row.appendChild(head);
 
     const desc = document.createElement('div'); desc.className = 'ear-desc'; desc.textContent = a.description || ''; row.appendChild(desc);
 
     const controls = document.createElement('div'); controls.className = 'ear-controls';
-    // template picker
-    const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
-    tplWrap.appendChild(document.createTextNode('Template'));
-    const sel = document.createElement('select'); sel.className = 'form-control ear-template';
-    const optDefault = document.createElement('option');
-    optDefault.value = '';
-    optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
-    sel.appendChild(optDefault);
-    templates.forEach(t => {
-        const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
-        if (a.template_id === t.id) o.selected = true;
-        sel.appendChild(o);
-    });
-    sel.addEventListener('change', () => {
-        const picked = sel.value || null;
-        // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
-        // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
-        // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
-        if (!picked) {
-            const swCb = controls.querySelector('.ear-notify input');
-            if (swCb) {
-                swCb.checked = false; swCb.disabled = true;
-                const st = controls.querySelector('.ear-notify-state');
-                if (st) st.textContent = _earNotifyLabel(swCb);
+    if (locked) {
+        // Read-only: no template can be bound and nothing turns it off; only a test send is offered.
+        const fixed = document.createElement('span'); fixed.className = 'ear-field ear-locked';
+        fixed.textContent = 'Template: built-in wording (cannot be changed)';
+        controls.appendChild(fixed);
+    } else {
+        // template picker
+        const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
+        tplWrap.appendChild(document.createTextNode('Template'));
+        const sel = document.createElement('select'); sel.className = 'form-control ear-template';
+        const optDefault = document.createElement('option');
+        optDefault.value = '';
+        optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
+        sel.appendChild(optDefault);
+        templates.forEach(t => {
+            const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
+            if (a.template_id === t.id) o.selected = true;
+            sel.appendChild(o);
+        });
+        sel.addEventListener('change', () => {
+            const picked = sel.value || null;
+            // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
+            // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
+            // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
+            if (!picked) {
+                const swCb = controls.querySelector('.ear-notify input');
+                if (swCb) {
+                    swCb.checked = false; swCb.disabled = true;
+                    const st = controls.querySelector('.ear-notify-state');
+                    if (st) st.textContent = _earNotifyLabel(swCb);
+                }
             }
-        }
-        saveAction(a.key, { template_id: picked });
-    });
-    tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+            saveAction(a.key, { template_id: picked });
+        });
+        tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+    }
 
     // Notify switch (optional actions only): a clear on/off, DISABLED until a template is chosen —
     // an email with no template has nothing to send, so it can't be turned on.
-    if (a.category !== 'system') {
+    if (a.category === 'optional') {
         const hasTpl = !!a.template_id;
         const field = document.createElement('div'); field.className = 'ear-notify';
         const sw = document.createElement('label'); sw.className = 'dv-switch';

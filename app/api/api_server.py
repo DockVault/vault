@@ -3736,12 +3736,13 @@ def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=No
     has no switch, and an admin who resets its template to "Built-in default" leaves it unbound, which
     send_action_email answers with the built-in body. Only an optional action is gated here."""
     try:
-        from app.core.email_actions import OPTIONAL, SPEC_BY_KEY, SYSTEM
+        from app.core.email_actions import ALWAYS_ON, OPTIONAL, SPEC_BY_KEY
         from app.core.models import EmailAction
         a = db.get(EmailAction, key)
         category = a.category if a is not None else SPEC_BY_KEY.get(key, {}).get("category", OPTIONAL)
-        # An optional action only sends when explicitly enabled AND bound to a template.
-        if category != SYSTEM and not (a is not None and a.enabled and a.template_id is not None):
+        # An optional action only sends when explicitly enabled AND bound to a template; a system or locked one
+        # always does.
+        if category not in ALWAYS_ON and not (a is not None and a.enabled and a.template_id is not None):
             return
         pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
         if not pairs:

@@ -4,7 +4,12 @@ An *email action* is a stable key (e.g. ``password_reset``) that application cod
 flow needs to send mail. Each action is bound to an :class:`EmailTemplate`. A ``system`` action is
 one the vault must be able to send — its bound template can't be deleted and it's always on. An
 ``optional`` action is opt-in per admin via a "notify by email" switch (``enabled``), the hook a
-future trigger (file share, vault-member add, …) consults before sending.
+future trigger (file share, vault-member add, …) consults before sending. A ``locked`` action is
+always on and always sends its built-in subject and body: a template bound to it is ignored and none
+can be bound (Email Studio shows it read-only), so no administrator can change what it says. Only the
+brand (``{{vault.name}}``) and the sending profile are the deployment's. The notice that tells a
+vault's owner about compliance access to their vaults is one: an administrator must not be able to
+soften or empty it.
 
 Delivery and dynamic-token injection live in ONE place — :func:`send_action_email`. A trigger only
 supplies the action key, the recipient, and any per-send context (a link / code / expiry). No trigger
@@ -24,6 +29,9 @@ from sqlalchemy.orm import Session
 
 SYSTEM = "system"
 OPTIONAL = "optional"
+LOCKED = "locked"
+# The actions that always send, whatever an administrator chose.
+ALWAYS_ON = (SYSTEM, LOCKED)
 
 # --------------------------------------------------------------------------------------------------
 # Built-in default templates. `name`/`subject`/`body_html` seed a real EmailTemplate row per action
@@ -264,7 +272,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("compliance_access_notice", "Access to your vaults",
      "Sent to a vault's owner when an investigation may open their vaults, is extended, narrowed, ends or is "
      "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "
-     "are exported -- says what, when and by whom, never a vault, file or folder name.", SYSTEM),
+     "are exported -- says what, when and by whom, never a vault, file or folder name. Its wording is fixed: "
+     "it cannot be changed or turned off.", LOCKED),
     ("retention_change", "How long records are kept",
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
@@ -358,11 +367,15 @@ def seed_email_actions(db: Session) -> int:
         action = db.get(EmailAction, spec["key"])
         if action is None:
             db.add(EmailAction(key=spec["key"], name=spec["name"], description=spec["description"],
-                               category=spec["category"], enabled=(spec["category"] == SYSTEM)))
+                               category=spec["category"], enabled=(spec["category"] in ALWAYS_ON)))
             created += 1
             changed = True
         elif (action.name, action.description, action.category) != (spec["name"], spec["description"], spec["category"]):
             action.name, action.description, action.category = spec["name"], spec["description"], spec["category"]
+            changed = True
+        if action is not None and spec["category"] == LOCKED and (action.template_id is not None or not action.enabled):
+            # A locked action is always on and bound to nothing (what it sends is its built-in wording).
+            action.template_id, action.enabled = None, True
             changed = True
     if changed:
         db.commit()
@@ -385,6 +398,8 @@ def seed_default_templates(db: Session) -> int:
     created = 0
     healed = 0
     for key, spec in DEFAULT_TEMPLATES.items():
+        if SPEC_BY_KEY.get(key, {}).get("category") == LOCKED:
+            continue   # a locked action's wording is fixed: no template is made for it, none is bound
         # A default row already exists (this boot or a prior one) -> leave the ROW alone (never revive an
         # admin's customization), but SELF-HEAL a SYSTEM action that is still unbound: bind it to its
         # existing default so editing that template actually changes the sent email. Without this, a boot
@@ -491,12 +506,15 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
         return False
     # An OPTIONAL action is off unless explicitly enabled — including the brief pre-seed window where
     # its DB row doesn't exist yet (default to the catalog category, disabled). System actions are on.
-    category = action.category if action is not None else spec.get("category", OPTIONAL)
-    enabled = action.enabled if action is not None else (category == SYSTEM)
+    # A locked action's category is the catalog's, whatever its row says.
+    category = spec.get("category") if spec.get("category") == LOCKED else (
+        action.category if action is not None else spec.get("category", OPTIONAL))
+    enabled = action.enabled if action is not None else (category in ALWAYS_ON)
     if category == OPTIONAL and not enabled and not force:
         return False
 
-    template = action.template if action is not None else None
+    # A locked action sends its built-in wording, whatever template a row binds it to.
+    template = action.template if action is not None and category != LOCKED else None
     # Defense in depth: an optional action with no bound template has nothing to send. The write paths
     # (update_action's force-off + the delete guard) already prevent enabling one, but guard at the point
     # of use too — so even a direct DB write that left (enabled=True, template_id=NULL) can't cause an

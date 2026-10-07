@@ -68,12 +68,13 @@ def test_seed_catalog_is_present_and_shaped(admin):
         assert a["enabled"] is True                 # system actions are always on
     opt = acts[_OPTIONAL_SAMPLE]
     assert opt["category"] == "optional" and opt["enabled"] is False   # opt-in, off by default
-    # Every action ships with a built-in DEFAULT template (seeded as a real row, is_default + permanent).
-    # There is one default per action and nothing else after _clean (which drops user templates only).
-    from app.core.email_actions import ACTION_CATALOG
+    # Every action ships with a built-in DEFAULT template (seeded as a real row, is_default + permanent),
+    # except a locked one, whose wording is fixed and which no template can change. There is one default per
+    # such action and nothing else after _clean (which drops user templates only).
+    from app.core.email_actions import ACTION_CATALOG, LOCKED
     tpls = admin.get("/email/templates").json()["templates"]
     assert all(t["is_default"] for t in tpls), "only built-in defaults should remain after _clean"
-    assert {t["default_key"] for t in tpls} == {a["key"] for a in ACTION_CATALOG}   # one per action
+    assert {t["default_key"] for t in tpls} == {a["key"] for a in ACTION_CATALOG if a["category"] != LOCKED}
 
 
 def test_seed_created_exactly_the_catalog_no_duplicates(admin):
