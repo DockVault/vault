@@ -76,6 +76,7 @@ def test_a_cut_tail_is_accepted_and_the_server_takes_the_new_generation(env):
     seal = env.seals()[-1]
     assert seal.kind == "restore" and seal.detail["cause"] == "database"
     assert seal.detail["lost_through_seq"] == newest and seal.detail["grace_until"]
+    assert fmt.parse_time_text(seal.detail["grace_until"]) - seal.sealed_at == timedelta(days=done["grace_days"])
     assert done["generation"] == 2
     env.clock.advance(hours=1)
     assert env.seal().stopped is None                    # the same process, no restart
@@ -351,3 +352,156 @@ def test_the_backup_windows_seals_are_acknowledged_and_a_later_one_is_not(env):
     env.clock.advance(minutes=30)
     env.seal()
     assert later in ai.unacknowledged_foreign(env.st.view, env.st.head_store().load())
+
+
+# --------------------------------------------------------------------------- what a restore compares
+
+def test_a_row_added_to_a_cut_hour_is_named_as_a_change_made_while_its_seal_was_missing(env):
+    """The hour of the database's newest row may hold fewer rows than its lost seal summarised (an older copy);
+    more is a change."""
+    _sealed_day(env)
+    hour = ai.hour_floor(T0 - timedelta(hours=10))
+    _cut_from(env, env.st.view.entry_for(hour).root.seq)
+    env.row(hour + timedelta(minutes=59))
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    seen = restore.accept_database_head(env.engine, _host(env), read=True)
+    assert any(fmt.hour_text(hour) in ln and "a change made while its seal was missing" in ln
+               for ln in seen["lines"]), seen["lines"]
+
+
+def test_a_stable_value_edited_in_a_cut_hour_is_named(env):
+    ids = _sealed_day(env)
+    hour = ai.hour_floor(T0 - timedelta(hours=10))
+    _cut_from(env, env.st.view.entry_for(hour).root.seq)
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == ids[0]).update({AuditLog.action: "logout"})
+        db.commit()
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    seen = restore.accept_database_head(env.engine, _host(env), read=True)
+    assert any(fmt.hour_text(hour) in ln for ln in seen["lines"]), seen["lines"]
+
+
+def test_a_cut_day_of_rows_without_a_nonce_is_compared_by_its_stable_digest(env):
+    """A day older than the hour summaries whose rows have no nonce: its personal values cannot be compared
+    once its salt is gone with the cut, so the day is compared by its stable digest, and an untouched day is no
+    change."""
+    env.row(T0 - timedelta(days=40, hours=5), nonce=False)
+    env.row(T0 - timedelta(days=39, hours=5))
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=2))
+    day = (T0 - timedelta(days=40, hours=5)).date()
+    assert env.st.head_store().load()["days"][day.isoformat()]["salted"] is True
+    hour = ai.hour_floor(T0 - timedelta(days=40, hours=5))
+    _cut_from(env, env.st.view.entry_for(hour).root.seq)
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    seen = restore.accept_database_head(env.engine, _host(env), read=True)
+    assert not any(day.isoformat() in ln and "no longer give the digest" in ln for ln in seen["lines"]), \
+        seen["lines"]
+
+
+def test_the_grace_takes_the_longest_delay_the_chain_and_the_head_records_give(env):
+    """The checkpoint a record kept: the chain's state with a one-day delay (another writer's, set aside) and
+    its honoured form with nine days. The grace is the honoured nine, longer than the accepted chain's seven
+    and the state's one."""
+    env.run_until_sealed()
+    assert restore.grace_days(env.st.view) == 7
+    record = {"checkpoints": {"policy": {"state": {"reduction_delay_days": {"value": 1}},
+                                         "honoured": {"reduction_delay_days": {"value": 9}}}}}
+    assert restore.grace_days(env.st.view, record) == 9
+    assert restore.grace_days(env.st.view, None, record) == 9
+
+
+def test_a_lost_cancel_is_not_offered_for_another_request_at_its_seq(env):
+    """The database's seal at the cancelled request's seq is another request (its link is not the one the record
+    kept): the cancel is not offered for it."""
+    from test_audit_chain_guards import _forge
+    env.row(T0 - timedelta(days=60))
+    env.run_until_sealed()
+    admin = _admin(env)
+    outcome = _change(env, admin, "audit_max_days", 30)
+    req = [s for s in env.seals() if s.kind == "request"][-1].seq
+    with ps.change_transaction(env.engine) as w:
+        ps.cancel(w, outcome.change.id, admin)
+    env.clock.advance(hours=1)
+    env.seal()
+    _cut_from(env, req)
+    other = _forge(env, "request", lambda seq, at: {
+        "what": "setting", "request": str(uuid.uuid4()), "setting": "audit_max_days", "old": 0, "new": 60,
+        "subject": None, "placeholder": None, "not_before": fmt.time_text(at + timedelta(days=7)),
+        "audit_row": None, "by": "admin", "user_id": None})
+    assert other == req
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    seen = restore.accept_database_head(env.engine, _host(env), read=True)
+    assert not any("Lost: the cancel" in ln for ln in seen["lines"]), seen["lines"]
+
+
+# --------------------------------------------------------------------------- accept-restore
+
+def test_accept_restore_raises_the_generation(env):
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    snap = _snapshot(env)
+    env.clock.advance(hours=2)
+    env.seal()
+    _restore_bundle(env, snap)
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+    restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    assert env.st.head_store().load()["generation"] == 2
+
+
+def test_a_key_history_only_the_replaced_record_held_is_kept_and_the_left_key_named(env):
+    """The chain moved to AUDIT_CHAIN_KEY after the backup: the restored chain is under the key it left. The
+    restore says so, and the replaced record's key history stays in the record."""
+    env.settings.audit_chain_key = ""
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    snap = _snapshot(env)
+    env.settings.audit_chain_key = KEY_TEXT
+    env.clock.advance(hours=1)
+    env.seal()
+    moved_to = env.st.current_key().key_id
+    assert any(e["key_id"] == moved_to for e in env.st.head_store().load()["keys"])
+    _restore_bundle(env, snap)
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+    assert any("WHICH THE REPLACED RECORD HAD LEFT" in ln for ln in seen["lines"]), seen["lines"]
+    restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    assert any(e["key_id"] == moved_to for e in env.st.head_store().load()["keys"])
+
+
+def test_a_seal_the_restored_record_listed_is_not_the_first_starts_whatever_the_marks_clock(env):
+    """The host's clock behind the server's: the mark's time comes before the first start that accepted another
+    writer's seal before the backup. That seal stays the restored record's (a warning), and the first start after
+    the restore is the one whose seals the restore acknowledges."""
+    from app.core import retention
+    from test_audit_chain_guards import _forge
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    mark_at = env.clock()
+    listed = _forge(env, "ack", {"acknowledges": [], "failures": [], "rows": [], "discarded": [], "by": "admin",
+                                 "user_id": None, "request": None})
+    env.clock.advance(minutes=10)
+    env.fresh_process()
+    retention.run_pass(env.session, now=env.clock())          # a start accepts it: listed, not acknowledged
+    copy_db, _rec = _snapshot(env)
+    record_at_keys = env.st.head_store().load()
+    env.clock.advance(hours=2)
+    env.seal()                                                # a seal of the backup's window
+    window = env.seals()[-1].seq
+    env.engine.dispose()
+    shutil.copyfile(env.engine.url.database, copy_db)
+    path = env.st.head_store().path
+    replaced = hr.read_file(path)
+    shutil.copyfile(copy_db, env.engine.url.database)
+    hr._write_file(path, record_at_keys)
+    hr.write_mark(path, {"at": fmt.time_text(mark_at), "bundle": "dockvault-test-1", "record": replaced,
+                         "restored_record": record_at_keys})
+    env.fresh_process()
+    env.clock.advance(minutes=10)
+    retention.run_pass(env.session, now=env.clock())          # the first start after the restore
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+    done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    assert window in done["acknowledged"] and listed not in done["acknowledged"], done

@@ -211,6 +211,51 @@ def test_a_discard_that_fails_leaves_the_seals_and_writes_no_ack(env, monkeypatc
     assert env.st.head_store().load()["discards"] == 0
 
 
+def test_rekey_writes_only_the_state_its_read_printed(env):
+    _key_changed_without_the_old_one(env)
+    old = fmt.chain_key(KEY_TEXT)
+    with pytest.raises(host.Refused, match="changed since you looked"):
+        recovery.rekey(env.engine, _host(env), old_key=old, expect="dvstate1:" + "0" * 64)
+    assert env.seals()[-1].kind != "key"
+
+
+def test_a_seal_after_the_record_whose_mac_does_not_verify_is_never_accepted(env):
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    seq = _forge(env, "ack", {"acknowledges": [], "failures": [], "rows": [], "discarded": [], "by": "admin",
+                              "user_id": None, "request": None})
+    with env.session() as db:
+        db.query(AuditSeal).filter(AuditSeal.seq == seq).update({AuditSeal.mac: b"\x00" * 32})
+        db.commit()
+    seen = recovery.after_record(env.engine, _host(env), read=True)
+    assert any("REFUSED: its MAC does not verify" in ln for ln in seen["lines"]), seen["lines"]
+    with pytest.raises(host.Refused, match="cannot be accepted"):
+        recovery.after_record(env.engine, _host(env), expect=seen["state"])
+    assert env.seals()[-1].seq == seq
+
+
+def _unproven_key_seal(env):
+    """A key seal another writer appended with no proof (accepted_unverified), under a new current key."""
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    old_id = env.st.view.key_in_force()
+    env.settings.audit_chain_key = "e" * 64
+    new = env.st.current_key()
+    return _forge(env, "key", {"old_key_id": old_id, "new_key_id": new.key_id, "old_key_proof": None,
+                               "accepted_unverified": True, "by": "host"}, key=new)
+
+
+def test_a_key_seal_with_no_proof_is_accepted_only_when_the_host_says_it_wrote_it(env):
+    seq = _unproven_key_seal(env)
+    seen = recovery.after_record(env.engine, _host(env), read=True)
+    assert any("--confirm-unverified" in ln for ln in seen["lines"]), seen["lines"]
+    with pytest.raises(host.Refused, match="cannot be accepted"):
+        recovery.after_record(env.engine, _host(env), expect=seen["state"])
+    seen = recovery.after_record(env.engine, _host(env), read=True, confirm_unverified=True)
+    done = recovery.after_record(env.engine, _host(env), expect=seen["state"], confirm_unverified=True)
+    assert seq in done["accepted"]
+
+
 def test_a_seal_a_writer_accepted_is_never_discarded(env):
     env.row(T0 - timedelta(hours=5))
     env.run_until_sealed()
