@@ -29,14 +29,12 @@ Times are microseconds since the epoch (app/core/audit_chain_view.py), as the vi
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from app.core.audit_chain_view import from_us, to_us
 
-GAP = timedelta(hours=12)
 GAP_US = 12 * 3600 * 1000000
-DAY_US = 24 * 3600 * 1000000
 
 
 class Timeline:
@@ -96,32 +94,6 @@ class Timeline:
             total += self.open_gap(now_us)
         return total
 
-    def since(self, since_us: int, now_us: Optional[int] = None) -> int:
-        """The length of every gap that ends after ``since`` (whole, even one that began before it), and the
-        one open at ``now``."""
-        total = sum(b - a for g, a, b in self._gaps if b > since_us)
-        if now_us is not None:
-            total += self.open_gap(now_us)
-        return total
-
-    def push(self, base_us: int, *, after_seq: int = 0, since_us: Optional[int] = None,
-             now_us: Optional[int] = None) -> int:
-        """``base`` moved on by every gap after seal ``after_seq`` (or ending after ``since``) that opens before
-        the date as it moves: the date something waiting from then on could first come, with the gaps that
-        open after it left out. With ``now``, the gap open at ``now`` counts too when it opened before the
-        date."""
-        date = base_us
-        for g, a, b in sorted(self._gaps, key=lambda x: x[1]):
-            if g <= after_seq or (since_us is not None and b <= since_us):
-                continue
-            if a < date:
-                date += b - a
-        if now_us is not None:
-            newest = self.newest()
-            if newest is not None and now_us - newest > GAP_US and newest < date:
-                date += now_us - newest
-        return date
-
     def window_start(self, now_us: int, length_us: int) -> int:
         """The start of a window that reaches back from ``now`` over ``length`` of time while sealing ran: the
         length, plus every gap inside the window, an open gap included, each gap it takes in lengthening it
@@ -132,21 +104,6 @@ class Timeline:
             if b > start:
                 start -= b - a
         return start
-
-    def running_between(self, start_us: int, end_us: int) -> int:
-        """The time while sealing ran in [start, end]: its length less every gap that lies in it (a gap that
-        crosses an end counts for the part inside)."""
-        total = end_us - start_us
-        for g, a, b in self._gaps:
-            lo, hi = max(a, start_us), min(b, end_us)
-            if hi > lo:
-                total -= hi - lo
-        newest = self.newest()
-        if newest is not None and end_us - newest > GAP_US:
-            lo = max(newest, start_us)
-            if end_us > lo:
-                total -= end_us - lo
-        return total
 
 
 def gap_ends(times) -> List[int]:
