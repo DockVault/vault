@@ -8,6 +8,7 @@ logs (app/core/audit_integrity.py ChainState.holds_deletion, app/core/retention.
 - the hold switch in the chain holds the security jobs too, whatever the database says.
 
 Runs on a throwaway SQLite database (the fixtures of tests/test_retention.py)."""
+import os
 import uuid
 from datetime import timedelta
 
@@ -149,3 +150,61 @@ def test_the_chains_hold_holds_the_security_jobs_whatever_the_database_says(env,
     done = _pass(factory, now=NOW + timedelta(minutes=30))
     assert done["security_alerts"] is None
     assert _count(factory, SecurityAlert) == 1
+
+
+# --------------------------------------------------------------------------- a process that has just started
+
+def _fresh_process():
+    """The same database and head record, read by a process that has just started: its view is empty until a
+    pass reads the chain."""
+    c = _CHAIN[-1]
+    c.st = ai.ChainState(settings=c.st.settings, clock=c.clock)
+    ai.set_state(c.st)
+    return c.st
+
+
+def test_a_process_that_has_just_started_holds_the_log_jobs_during_a_grace(env, factory):
+    db = factory()
+    _alert(db, OLD, True)
+    _CHAIN[-1].seal_all(NOW)
+    _restore_seal()
+    assert _fresh_process().view.position == 0
+    done = _pass(factory, now=NOW + timedelta(minutes=30))
+    assert done["security_alerts"] is None and done["audit_logs"] is None, done
+    assert _count(factory, SecurityAlert) == 1
+
+
+def test_a_process_that_has_just_started_holds_the_log_jobs_by_the_chains_hold(env, factory):
+    db = factory()
+    _alert(db, OLD, True)
+    _CHAIN[-1].seal_all(NOW)
+    from app.core import audit_chain_policy_seals as ps
+    from app.core.models import RoleEnum, User
+    admin = User(id=uuid.uuid4(), username="ada", email="ada@x.org", password_hash="x", role=RoleEnum.ADMIN,
+                 is_active=True)
+    db.add(admin)
+    db.commit()
+    with ps.change_transaction(ai._engine_of(factory)) as w:
+        assert ps.change(w, retention.HOLD_KEY, True, admin, now=NOW).status == "applied"
+    reg.store(db, retention.HOLD_KEY, False)     # the database says off, without a seal
+    db.commit()
+    _fresh_process()
+    done = _pass(factory, now=NOW + timedelta(minutes=30))
+    assert done["security_alerts"] is None, done
+    assert _count(factory, SecurityAlert) == 1
+
+
+def test_a_chain_this_process_cannot_read_holds_the_log_jobs_and_one_not_started_holds_nothing(env, factory):
+    db = factory()
+    _alert(db, OLD, True)
+    _CHAIN[-1].seal_all(NOW)
+    os.remove(_CHAIN[-1].st.head_store().path)       # the head record lost: sealing stops before reading
+    st = _fresh_process()
+    done = _pass(factory, now=NOW + timedelta(minutes=30))
+    assert st.stopped is not None and st.view.position == 0
+    assert done["security_alerts"] is None, done
+    assert _count(factory, SecurityAlert) == 1
+    assert retention._chain_in_database(factory) is True
+    db.query(AuditSeal).delete()
+    db.commit()
+    assert retention._chain_in_database(factory) is False

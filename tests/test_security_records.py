@@ -29,8 +29,8 @@ set_bare_api_env()
 from app.core import retention  # noqa: E402
 from app.core import security_records as srec  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, ManagedSetting, ManagedSettingChange, RoleEnum, SecurityAlert,  # noqa: E402
-                             SecurityRecord, SystemSetting, User)
+from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, RoleEnum,  # noqa: E402
+                             SecurityAlert, SecurityRecord, SystemSetting, User)
 from app.services import audit_logger, audit_row_hooks  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -57,7 +57,9 @@ def factory(monkeypatch):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'records.db'}")
         copies = sa.MetaData()
-        for model in (User, AuditLog, SecurityRecord, SecurityAlert, ManagedSetting, ManagedSettingChange,
+        # The audit chain's table too, empty: the pruner holds the jobs over logs when it cannot tell whether a
+        # chain it has not read holds them.
+        for model in (User, AuditLog, AuditSeal, SecurityRecord, SecurityAlert, ManagedSetting, ManagedSettingChange,
                       SystemSetting):
             columns = [sa.Column(c.name, c.type, primary_key=c.primary_key, nullable=c.nullable)
                        for c in model.__table__.columns]
