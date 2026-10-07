@@ -690,6 +690,19 @@ def test_a_change_to_the_starters_sign_in_details_before_the_case_started_does_n
     assert holds.release_refusal(db, case, people.ada, NOW + timedelta(hours=1)) is None
 
 
+def test_a_starter_whose_auditor_right_is_in_force_ends_the_hold_alone_as_its_auditor(db, people, monkeypatch):
+    """An administrator who started the case and holds an auditor right in force (reconfirmed with their own
+    password and authenticator after someone else changed their sign-in details) stands as an auditor, which is
+    enough; as an administrator alone that change would refuse them."""
+    case = _place(db, people.ada, [people.v1])
+    _changed_by(db, people.ada, people.bob, NOW + timedelta(hours=1))
+    at = NOW + timedelta(hours=2)
+    assert holds.release_refusal(db, case, people.ada, at) == holds.STARTER_CHANGED
+    _live_auditor(monkeypatch, people.ada, {"live": True, "why": None})
+    assert holds.release_refusal(db, case, people.ada, at) is None
+    assert holds.review_refusal(db, case, people.ada, at) is None
+
+
 def test_a_raised_purge_delay_counts_and_a_lowered_one_does_not(db, people, settings):
     case = _place(db, people.ada, [people.v1])
     settings[cs.HOLD_PURGE_DELAY_DAYS] = 10
