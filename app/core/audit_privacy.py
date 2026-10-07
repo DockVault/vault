@@ -172,6 +172,10 @@ _IDENTIFIER_KEYS = (
     # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes
     # to the address before an administrator's change, and why a send failed (a category, never a server's answer)
     "email_status", "copy_to_previous", "send_error",
+    # a case's steps: what it is for (a code), its days of access and their end, whether it holds, whether the
+    # server's operator approved it, how an objection came (from an owner or an administrator), whether its access
+    # ended, and a hold placed and confirmed by an approval
+    "purpose", "days", "ends_at", "hold", "by_operator", "by_owner", "access_ended", "by_approval",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

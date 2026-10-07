@@ -250,6 +250,8 @@ def _act(db, args) -> None:
         from app.core import case_eligibility
         independent = case_eligibility.independent_approvers(db, case)
         if independent:
+            from app.core import legal_holds
+            legal_holds.record_refusal(db, "case_approved", case, actor=None, reason="independent_admin")
             return _refuse("An independent administrator can approve this case "
                            f"({', '.join(sorted(a.username for a in independent))}), so the server's operator may "
                            "not: the host operator has no account the approval rule could check.")

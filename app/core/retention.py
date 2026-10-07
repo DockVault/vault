@@ -296,6 +296,17 @@ def settle_auditor_grants(p: Pass) -> JobResult:
     return JobResult()
 
 
+def run_compliance_cases(p: Pass) -> JobResult:
+    """The compliance cases' clock (app/core/cases.py): a case nobody approved within 7 days expires, and a case
+    whose access reached its end closes or keeps only its legal hold, its owners told in the same transaction.
+    Deletes nothing: a case's rows are its record. Not stopped by the hold switch."""
+    from app.core import cases
+    with p.transaction() as db:
+        cases.expire_pending(db, p.now)
+        cases.end_due(db, p.now)
+    return JobResult()
+
+
 def run_legal_holds(p: Pass) -> JobResult:
     """The legal holds' clock (app/core/legal_holds.py): holds nobody confirmed in time lapse, those due a review
     ask for one, and what released holds kept is purged once their delay is over (a batch per transaction, each
@@ -373,6 +384,8 @@ JOBS: list[Job] = [
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
     Job("auditor_grants", "Auditor rights whose time ran out, or whose holder's account changed",
         settle_auditor_grants),
+    Job("compliance_cases", "Compliance cases: those unapproved in time expire, access that ended closes them",
+        run_compliance_cases),
     Job("legal_holds", "Legal holds: lapses, review prompts, and the purge of what released holds kept",
         run_legal_holds),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),

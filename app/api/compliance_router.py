@@ -26,14 +26,19 @@ Whether the right is in force is computed on every request (auditor_rights.audit
 uses depends on require_live_auditor, which refuses (403) a right that is not, whatever the stored state says.
 
 Legal holds (app/core/legal_holds.py has the rules): placing one, as a hold-only case, and confirming, reviewing,
-releasing and undoing the release of a case's holds. Their routes are at the end of this module.
+releasing and undoing the release of a case's holds. Their routes follow the auditor right's.
+
+Cases (app/core/cases.py has the steps, app/core/case_rules.py the rules): asking for one, approving and turning it
+down, withdrawing, extending, closing, narrowing, recording an objection, and the vault picker. Their routes are at
+the end of this module.
 """
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +47,7 @@ from sqlalchemy.orm import Session
 from app.api.user_management_api import get_current_user, require_interactive_admin
 from app.core import auditor_rights as rights
 from app.core import fixed_step_up
+from app.core import cases  # noqa: F401 -- registers the host's approve and reject steps
 from app.core import legal_holds  # noqa: F401 -- registers the host's confirm-hold step
 from app.core.database import get_db
 from app.core.models import User
@@ -556,3 +562,319 @@ def undo_hold_release(case_id: uuid.UUID, request: Request, current_user: User =
     STEP_UP_HOLD_DECIDE(db, current_user, request)
     return _take_decision(case_id, current_user, db, action="hold_release_undone", refusal=_undo_refusal,
                           guard=True, step=lambda case: holds.undo_release(db, case, by=current_user))
+
+
+# --------------------------------------------------------------------------- cases
+# (app/core/cases.py has the steps, app/core/case_rules.py the rules; the content routes come with the case resolver)
+#
+#     GET   /compliance/cases                         the caller's cases (an auditor's own; every case for an admin)
+#     POST  /compliance/cases                         ask for one: a live auditor, with the step-up
+#     GET   /compliance/cases/{id}                    one case, as the caller may see it; its version in ETag
+#     POST  /compliance/cases/{id}/approve            an independent administrator, step-up, If-Match: version
+#     POST  /compliance/cases/{id}/reject             {reason}: as for approving
+#     POST  /compliance/cases/{id}/withdraw           the auditor, while it waits
+#     POST  /compliance/cases/{id}/extend             {days}: an independent administrator, step-up, If-Match
+#     POST  /compliance/cases/{id}/close              {reason}: the auditor or an independent administrator
+#     POST  /compliance/cases/{id}/objection          {text}: an owner of one of its vaults, or an administrator
+#     PATCH /compliance/cases/{id}/scope              narrow only: the auditor or an independent administrator
+#     GET   /compliance/vault-picker?owner=           one owner's vaults, names only where already readable
+
+class ScopeItemIn(BaseModel):
+    kind: str = Field(..., max_length=16)
+    target_id: uuid.UUID
+
+
+class CaseRequest(BaseModel):
+    purpose: str = Field(..., max_length=32)
+    legal_basis: str = Field(..., max_length=32)
+    lia_reference: Optional[str] = Field(default=None, max_length=255)
+    special_category: bool = False
+    art9_condition: Optional[str] = Field(default=None, max_length=32)
+    criminal_offence: bool = False
+    justification: str = Field(..., max_length=4000)
+    owner_note: str = Field(..., max_length=4000)
+    named_user_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+    scope: list[ScopeItemIn] = Field(..., min_length=1, max_length=1000)
+    files_from: Optional[datetime] = None
+    files_to: Optional[datetime] = None
+    access_days: Optional[int] = None
+    can_export: bool = False
+    password_override: bool = False
+    hold: Optional[bool] = None
+
+
+class Extension(BaseModel):
+    days: int
+
+
+class ObjectionIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)
+
+
+class Narrowing(BaseModel):
+    scope: list[ScopeItemIn] = Field(..., min_length=1, max_length=1000)
+    files_from: Optional[datetime] = None
+    files_to: Optional[datetime] = None
+
+
+def _naive(value: Optional[datetime]) -> Optional[datetime]:
+    """A time as the database keeps it: UTC, without a zone."""
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+
+def _case_refused(db, action: str, case, actor, refused, *, record: bool = True):
+    """Record a refused case step (unless the request was only malformed or out of date) and raise its answer."""
+    from app.core import cases
+    if record:
+        cases.record_refusal(db, action, case, actor=actor, reason=refused.reason)
+    raise HTTPException(status_code=refused.code, detail={
+        "reason": refused.reason, "text": refused.detail or cases.text(refused.reason)})
+
+
+def _visible_case(db, case_id, viewer, *, lock: bool = False):
+    """The case, when ``viewer`` may see it (its auditor or an administrator); not found otherwise."""
+    from app.core import cases
+    case = _case_or_404(db, case_id, lock=lock)
+    if not cases.may_see(case, viewer):
+        raise HTTPException(status_code=404, detail="No such case.")
+    return case
+
+
+@router.get("/compliance/cases")
+def list_cases(current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
+    """The cases with access the caller may see, newest first: every one for an administrator, the ones they asked
+    for otherwise (an empty list for anyone else). Hold-only cases are listed with the holds."""
+    from app.core import cases
+    from app.core.models import ComplianceCase
+    limit_statements(db)
+    q = db.query(ComplianceCase).filter(ComplianceCase.access_days > 0)
+    if not _is_admin(current_user):
+        q = q.filter(ComplianceCase.auditor_id == current_user.id)
+    now = cases.utcnow()
+    rows = q.order_by(ComplianceCase.requested_at.desc()).limit(ENDED_SHOWN).all()
+    return {"cases": [cases.case_view(db, c, current_user, now=now) for c in rows],
+            "access_enabled": rights.access_enabled(), "max_open_cases": cases.rules.MAX_OPEN_CASES}
+
+
+@router.post("/compliance/cases", status_code=201)
+def request_case(body: CaseRequest, request: Request, current_user: User = Depends(require_live_auditor),
+                 db: Session = Depends(get_db)):
+    """Ask for a case: what it is for and why, what it covers, for how long. An independent administrator
+    approves it; until then nothing is readable and the owners are not told."""
+    from app.core import cases
+    limit_statements(db)
+    args = dict(purpose=body.purpose, legal_basis=body.legal_basis, lia_reference=body.lia_reference,
+                special_category=body.special_category, art9_condition=body.art9_condition,
+                criminal_offence=body.criminal_offence, justification=body.justification,
+                owner_note=body.owner_note, named_user_ids=body.named_user_ids,
+                scope=[{"kind": s.kind, "target_id": s.target_id} for s in body.scope],
+                files_from=_naive(body.files_from), files_to=_naive(body.files_to), access_days=body.access_days,
+                can_export=body.can_export, password_override=body.password_override, hold=body.hold)
+    # Checked before the code is asked for (a request that cannot be made costs no code), and again after.
+    try:
+        cases.request_case(db, current_user, **args)
+    except cases.CaseRefused as refused:
+        _case_refused(db, "case_requested", None, current_user, refused, record=refused.code != 422)
+    db.rollback()
+    STEP_UP_CASE_REQUEST(db, current_user, request)
+    limit_statements(db)
+    try:
+        case = cases.request_case(db, current_user, **args)
+        db.commit()
+    except cases.CaseRefused as refused:
+        _case_refused(db, "case_requested", None, current_user, refused, record=refused.code != 422)
+    return cases.case_view(db, case, current_user)
+
+
+@router.get("/compliance/cases/{case_id}")
+def get_case(case_id: uuid.UUID, response: Response, current_user: User = Depends(require_interactive_account),
+             db: Session = Depends(get_db)):
+    """One case as the caller may see it, with where the auditor's account came from for an administrator. Its
+    version is the ETag an approval or an extension sends back in If-Match."""
+    from app.core import cases
+    limit_statements(db)
+    case = _visible_case(db, case_id, current_user)
+    response.headers["ETag"] = f'"{case.version}"'
+    return cases.case_view(db, case, current_user, detail=True)
+
+
+# Refusals about the case's state (409); the others are about the person (403).
+_CASE_STATE = ("not_now", "expired_unapproved", "access_ended", "compliance_disabled", "independent_admin")
+
+
+def _case_check(db, case, current_user, *, action: str, refusal, versioned: bool = False, if_match=None) -> None:
+    """Refuse (recorded, but for an out-of-date or missing version) what ``refusal`` refuses, and with
+    ``versioned`` a case that changed since the caller read it."""
+    from app.core import cases
+    try:
+        if versioned:
+            cases.check_version(case, if_match)
+        why = refusal(db, case, current_user)
+        if why is not None:
+            raise cases.CaseRefused(why, code=409 if why in _CASE_STATE else 403)
+    except cases.CaseRefused as refused:
+        _case_refused(db, action, case, current_user, refused, record=refused.code not in (412, 428))
+
+
+def _check_case(case_id, current_user, db, **kw):
+    """The case, once the step is allowed (before the step-up is asked for)."""
+    limit_statements(db)
+    case = _visible_case(db, case_id, current_user)
+    _case_check(db, case, current_user, **kw)
+    return case
+
+
+def _take_case_step(case_id, current_user, db, *, step, **kw):
+    """Under the case's lock, the step checked again, taken and committed (every refusal recorded); the case as the
+    caller now sees it."""
+    from app.core import cases
+    limit_statements(db)
+    case = _visible_case(db, case_id, current_user, lock=True)
+    _case_check(db, case, current_user, **kw)
+    try:
+        step(case)
+        db.commit()
+    except cases.CaseRefused as refused:
+        _case_refused(db, kw["action"], case, current_user, refused, record=refused.code not in (412, 428))
+    db.refresh(case)
+    return cases.case_view(db, case, current_user, detail=True)
+
+
+@router.post("/compliance/cases/{case_id}/approve")
+def approve_case(case_id: uuid.UUID, request: Request, if_match: Optional[str] = Header(default=None),
+                 current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """Approve a case, as an administrator independent of its auditor, with the step-up and the version read
+    (If-Match). The access, the hold and every owner's notice commit together, or nothing does."""
+    from app.core import cases
+
+    def refusal(db_, case, person, now=None):
+        return cases.rules.ACCESS_OFF if not cases.access_enabled() else cases.decision_refusal(db_, case, person, now)
+    kw = dict(action="case_approved", refusal=refusal, versioned=True, if_match=if_match)
+    _check_case(case_id, current_user, db, **kw)
+    STEP_UP_CASE_APPROVE(db, current_user, request)
+    return _take_case_step(case_id, current_user, db, step=lambda case: cases.approve(db, case, approver=current_user),
+                           **kw)
+
+
+@router.post("/compliance/cases/{case_id}/reject")
+def reject_case(case_id: uuid.UUID, body: Reason, request: Request,
+                current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """Turn a case down, with a reason its auditor reads: the administrators who could approve it."""
+    from app.core import cases
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail={"reason": cases.NO_REASON, "text": cases.text(cases.NO_REASON)})
+    kw = dict(action="case_rejected", refusal=cases.decision_refusal)
+    _check_case(case_id, current_user, db, **kw)
+    STEP_UP_CASE_APPROVE(db, current_user, request)
+    return _take_case_step(case_id, current_user, db,
+                           step=lambda case: cases.reject(db, case, by=current_user, reason=reason), **kw)
+
+
+@router.post("/compliance/cases/{case_id}/withdraw")
+def withdraw_case(case_id: uuid.UUID, current_user: User = Depends(require_interactive_account),
+                  db: Session = Depends(get_db)):
+    """The auditor withdraws their case while it waits for approval. It only removes power: no code."""
+    from app.core import cases
+
+    def refusal(db_, case, person, now=None):
+        if not cases.is_auditor_of(case, person):
+            return cases.NOT_ALLOWED
+        return cases.rules.step_refusal(case.status, cases.rules.WITHDRAW)
+    return _take_case_step(case_id, current_user, db, action="case_withdrawn", refusal=refusal,
+                           step=lambda case: cases.withdraw(db, case, by=current_user))
+
+
+@router.post("/compliance/cases/{case_id}/extend")
+def extend_case(case_id: uuid.UUID, body: Extension, request: Request,
+                if_match: Optional[str] = Header(default=None),
+                current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """Extend a case's access by ``days``, as an independent administrator, with the step-up and the version read.
+    Its owners are told."""
+    from app.core import cases
+    kw = dict(action="case_extended", refusal=cases.extend_refusal, versioned=True, if_match=if_match)
+    _check_case(case_id, current_user, db, **kw)
+    STEP_UP_CASE_APPROVE(db, current_user, request)
+    return _take_case_step(case_id, current_user, db,
+                           step=lambda case: cases.extend(db, case, by=current_user, days=body.days), **kw)
+
+
+@router.post("/compliance/cases/{case_id}/close")
+def close_case(case_id: uuid.UUID, body: Reason, request: Request,
+               current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
+    """Close a case with a reason: its auditor or an independent administrator. Its legal holds are released (with
+    the step-up a release asks for); the owners are told with a summary."""
+    from app.core import cases, legal_holds
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail={"reason": cases.NO_REASON, "text": cases.text(cases.NO_REASON)})
+    kw = dict(action="case_closed", refusal=cases.close_refusal)
+    case = _check_case(case_id, current_user, db, **kw)
+    if legal_holds.standing(db, case.id):
+        STEP_UP_HOLD_DECIDE(db, current_user, request)
+    return _take_case_step(case_id, current_user, db,
+                           step=lambda c: cases.close(db, c, by=current_user, reason=reason), **kw)
+
+
+@router.post("/compliance/cases/{case_id}/objection")
+def record_case_objection(case_id: uuid.UUID, body: ObjectionIn,
+                          current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
+    """Record an owner's objection on a case (the owner, or an administrator for them). Kept sealed; whoever extends
+    the case reads it."""
+    from app.core import cases
+    limit_statements(db)
+    case = _case_or_404(db, case_id, lock=True)
+    if not (cases.may_see(case, current_user) or cases.owns_a_vault_in(db, case, current_user)):
+        raise HTTPException(status_code=404, detail="No such case.")
+    try:
+        cases.record_objection(db, case, by=current_user, text_=body.text)
+        db.commit()
+    except cases.CaseRefused as refused:
+        _case_refused(db, "case_objection_recorded", case, current_user, refused, record=refused.code != 422)
+    return {"id": str(case.id), "objections": len(cases.objections(case))}
+
+
+@router.patch("/compliance/cases/{case_id}/scope")
+def narrow_case(case_id: uuid.UUID, body: Narrowing, current_user: User = Depends(require_interactive_account),
+                db: Session = Depends(get_db)):
+    """Narrow a case: its auditor or an independent administrator, no approval. Anything wider is refused (409):
+    it needs a new case."""
+    from app.core import cases
+    fields = body.model_fields_set
+    scope = [{"kind": s.kind, "target_id": s.target_id} for s in body.scope]
+    return _take_case_step(case_id, current_user, db, action="case_scope_narrowed", refusal=cases.narrow_refusal,
+                           step=lambda case: cases.narrow(db, case, by=current_user, scope=scope,
+                                                          files_from=_naive(body.files_from),
+                                                          files_to=_naive(body.files_to),
+                                                          keep_range=not ({"files_from", "files_to"} & fields)))
+
+
+@router.get("/compliance/vault-picker")
+def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
+                 current_user: User = Depends(require_live_auditor), db: Session = Depends(get_db)):
+    """One owner's vaults for a case (by account id or username): type, size, file count, creation date and id; a
+    name only where the auditor can already read the vault. Each query is recorded."""
+    from app.core import cases
+    from app.core.authorization import PermissionService
+    from app.core.models import Vault
+    from app.services.audit_logger import AuditLogger
+    limit_statements(db)
+    person_id = cases.rules.as_id(owner)
+    person = db.get(User, person_id) if person_id is not None else (
+        db.query(User).filter(User.username == owner.strip()).first())
+    if person is None:
+        raise HTTPException(status_code=404, detail="No such account.")
+    permissions = PermissionService(db)
+    out = []
+    for v in db.query(Vault).filter(Vault.owner_id == person.id).order_by(Vault.created_at, Vault.id).all():
+        readable = (v.type != "zero_knowledge" and v.password_hash is None
+                    and permissions.get_vault_permissions(current_user, v.id) is not None)
+        out.append({"id": str(v.id), "type": v.type or "standard", "has_password": v.password_hash is not None,
+                    "file_count": int(v.file_count or 0), "bytes": int(v.total_size_bytes or 0),
+                    "created_at": rights._iso(v.created_at), "name": v.name if readable else None})
+    db.add(AuditLogger(db).build_row(action="case_picker_viewed", status="success", user=current_user,
+                                     resource_type="user", resource_id=str(person.id), details={"vaults": len(out)}))
+    db.commit()
+    return {"owner": {"id": str(person.id), "username": person.username}, "vaults": out}

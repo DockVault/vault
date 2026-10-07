@@ -322,6 +322,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("case_closed", "compliance", "Case closed", "notice"),
     AuditAction("case_scope_narrowed", "compliance", "Case scope narrowed", "info"),
     AuditAction("case_expired_unapproved", "compliance", "Case expired before approval", "info", automatic=True),
+    AuditAction("case_access_ended", "compliance", "Case access ended", "info", automatic=True),
     AuditAction("case_picker_viewed", "compliance", "Vaults listed for a case", "info"),
     AuditAction("case_objection_recorded", "compliance", "Objection recorded on a case", "notice"),
     AuditAction("case_folder_listed", "compliance", "Folder listed in a case", "info"),
