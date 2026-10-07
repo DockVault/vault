@@ -16345,19 +16345,23 @@ def _user_must_use_zk(db, user) -> bool:
 
     Force comes from EITHER the plan (an Enterprise plan mandates ZK — a floor the
     local toggle can't drop below) OR the local admin 'force_zero_knowledge' setting
-    (which additionally requires the local 'zero_knowledge_enabled' toggle). The
-    department whitelist (standard_vault_allowed_groups) exempts members of listed
-    groups in both cases. On a read error, fails toward the plan-imposed floor:
-    permissive (False) for non-forced plans, forced (True) for plan-forced ones —
-    and _zk_enabled short-circuits ZK on for plan-forced deployments, so the user is
-    never boxed into 'must use ZK but ZK is off'."""
+    (which additionally requires the local 'zero_knowledge_enabled' toggle, and a plan
+    that includes zero-knowledge). The department whitelist (standard_vault_allowed_groups)
+    exempts members of listed groups in both cases. On a read error, fails toward the
+    plan-imposed floor: permissive (False) for non-forced plans, forced (True) for
+    plan-forced ones — and _zk_enabled short-circuits ZK on for plan-forced deployments,
+    so the user is never boxed into 'must use ZK but ZK is off'."""
     plan_force = settings.plan_force_zero_knowledge and settings.plan_zero_knowledge
     try:
         from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
-        setting_force = bool(val.get("force_zero_knowledge") and val.get("zero_knowledge_enabled"))
+        # The administrators' force holds only where the plan lets zero-knowledge vaults be made at all
+        # (_zk_enabled). Saved before the plan dropped zero-knowledge, it would otherwise refuse a standard
+        # vault while the zero-knowledge one is refused as not enabled: no vault could be made.
+        setting_force = bool(settings.plan_zero_knowledge and val.get("force_zero_knowledge")
+                             and val.get("zero_knowledge_enabled"))
         if not (plan_force or setting_force):
             return False
         allowed = {str(g) for g in (val.get("standard_vault_allowed_groups") or [])}

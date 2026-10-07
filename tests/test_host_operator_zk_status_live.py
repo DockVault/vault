@@ -5,9 +5,12 @@ tooling runs it (docker exec <web container> python -m app.core.host_operator zk
     never sealed included, and nothing name-like;
   * it needs no password: the answer is the same whatever ADMIN_USERNAME and ADMIN_PASSWORD hold in its
     environment, with none at all, and when no account is an administrator;
-  * it changes nothing and writes no audit row.
+  * it changes nothing and writes no audit row;
+  * an administrators' force kept after the plan dropped zero-knowledge forces nothing: the server's own
+    create check makes a standard vault, and the action says no one must use zero-knowledge.
 
-test_host_operator_zk_status.py covers the answer's shape offline.
+test_host_operator_zk_status.py covers the answer's shape offline, and test_zk_force_follows_the_plan.py the
+force against the plan.
 """
 import json
 import secrets
@@ -113,3 +116,73 @@ def test_it_changes_nothing_and_writes_no_audit_row(admin):
     zk_status()
     zk_status(env=NO_CREDENTIALS)
     assert snapshot() == before
+
+
+# The server's own create check, asked inside the web container for someone in no department: what it answers
+# a request to make each kind of vault. It decides before anything is written, so nothing is made.
+CREATE_CHECK = """
+import contextlib, json, sys, types, uuid
+with contextlib.redirect_stdout(sys.stderr):
+    import app.api.api_server as api
+    from fastapi import HTTPException
+    from app.core.database import get_db_context
+    made = {}
+    with get_db_context() as db:
+        for kind in ("standard", "zero_knowledge"):
+            try:
+                made[kind] = api._resolve_vault_type_for_create(types.SimpleNamespace(id=uuid.UUID(int=0)), kind, db)
+            except HTTPException as exc:
+                made[kind] = exc.detail
+        db.rollback()
+print(json.dumps(made))
+"""
+REQUIRED = "This organization requires zero-knowledge vaults. Choose the Zero-knowledge type."
+NOT_ENABLED = "Zero-knowledge vaults are not enabled on this deployment."
+FORCE_KEYS = ("zero_knowledge_enabled", "force_zero_knowledge", "standard_vault_allowed_groups")
+
+
+def _create_check(env=()):
+    cmd = ["docker", "exec", "-i"]
+    for name, value in env:
+        cmd += ["-e", f"{name}={value}"]
+    cmd += [API, "python", "-c", CREATE_CHECK]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker unavailable: {exc}")
+    skip_if_container_absent(r, API)
+    assert r.returncode == 0, (r.stdout[-800:], (r.stderr or "")[-800:])
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def _saved_force():
+    raw = psql("SELECT value::text FROM system_settings WHERE key = 'global'")
+    saved = json.loads(raw) if raw else {}
+    return {key: saved[key] for key in FORCE_KEYS if key in saved}
+
+
+def test_a_force_kept_after_the_plan_dropped_zero_knowledge_refuses_no_standard_vault(admin):
+    before = _saved_force()
+    try:
+        saved = admin.put("/settings", json={"zero_knowledge_enabled": True, "force_zero_knowledge": True,
+                                             "standard_vault_allowed_groups": []})
+        assert saved.status_code == 200, saved.text
+        # As deployed, the plan includes zero-knowledge: the administrators' force holds.
+        state, _ = zk_status()
+        assert (state["zero_knowledge_enabled"], state["must_use_zk"]) == (True, True)
+        assert _create_check() == {"standard": REQUIRED, "zero_knowledge": "zero_knowledge"}
+        # A plan without zero-knowledge, the force still saved: standard vaults can be made, and the
+        # host command says no one must use zero-knowledge.
+        no_zk = (("PLAN_ZERO_KNOWLEDGE", "false"),)
+        state, _ = zk_status(env=no_zk)
+        assert (state["plan_zero_knowledge"], state["zero_knowledge_enabled"], state["must_use_zk"]) == (
+            False, False, False)
+        assert _create_check(env=no_zk) == {"standard": "standard", "zero_knowledge": NOT_ENABLED}
+    finally:
+        # The three switches as they were saved, an absent one removed rather than saved as its default.
+        drop = "".join(f" - '{key}'" for key in FORCE_KEYS)
+        keep = json.dumps(before).replace("'", "''")
+        psql(f"UPDATE system_settings SET value = ((value::jsonb{drop}) || '{keep}'::jsonb)::json "
+             "WHERE key = 'global'")
+    assert _saved_force() == before
+

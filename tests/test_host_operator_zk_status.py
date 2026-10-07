@@ -202,6 +202,8 @@ def test_the_counts_are_the_administrators_route_counts(db, capsys):
     (True, True, "", {"zero_knowledge_enabled": False}, True, True),                   # the plan forces it
     (True, False, "", {"zero_knowledge_enabled": True, "force_zero_knowledge": True}, True, True),
     (True, False, "", {"zero_knowledge_enabled": False, "force_zero_knowledge": True}, False, False),
+    # Forced here while the plan had zero-knowledge, kept after it lost it: nothing can be forced.
+    (False, False, "", {"zero_knowledge_enabled": True, "force_zero_knowledge": True}, False, False),
     (True, True, "standard", {}, False, False),                                        # not an allowed type
     (True, False, "zero_knowledge", {}, True, False),
 ])
