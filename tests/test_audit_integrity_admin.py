@@ -61,6 +61,19 @@ def test_the_warnings_show_each_late_seal_with_the_rows_it_added(env, admin):
     assert w["rows"][0]["id"] == str(added) and w["rows"][0]["account"] == "carol"
 
 
+def test_the_warnings_show_a_late_seal_another_process_wrote_since_this_one_read_the_chain(env, admin):
+    env.row(T0 - timedelta(hours=3, minutes=10))
+    env.run_until_sealed()
+    added = env.row(ai.hour_floor(T0 - timedelta(hours=3)) + timedelta(minutes=20), username="carol")
+    env.clock.advance(hours=1)
+    other = ai.ChainState(settings=env.settings, clock=env.clock)      # a pass run in a process of its own
+    ai.seal_pass(env.session, engine=env.engine, st=other, now=env.clock())
+    late = [s.seq for s in env.seals() if s.kind == "late"]
+    assert late and env.st.view.position < late[0]
+    (w,) = routes.get_warnings(current_user=admin, db=env.session())["warnings"]
+    assert w["seq"] == late[0] and w["rows"][0]["id"] == str(added)
+
+
 def test_an_acknowledgment_asks_for_the_step_up_and_writes_an_ack_seal_naming_the_administrator(env, admin,
                                                                                                 monkeypatch):
     seq, _added = _late(env)

@@ -82,11 +82,24 @@ def _rows(db, ids: List[str]) -> list:
              "account": r[3], "resource": " ".join(x for x in (r[4], r[5]) if x)} for r in rows]
 
 
+def current_view(db):
+    """The verified view and the head record with every seal written since this process last read the chain,
+    read under the chain lock (a short wait): what another process wrote meanwhile (the host's commands, a pass
+    run by hand) is shown at once, not after the pruner's next pass. Busy, stopped or failing: the view as this
+    process holds it."""
+    ai = audit_integrity
+    st = ai.state()
+    try:
+        with ai.ChainWriter(db.get_bind(), st, wait=2.0, writer="admin") as w:
+            return w.st.view, w.record
+    except Exception:  # noqa: BLE001 -- the view as it stands; the acknowledgment checks again under the lock
+        return st.view, st.known_record()
+
+
 @router.get("/settings/audit-integrity/warnings")
 def get_warnings(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """The warnings an administrator may acknowledge, with what each is."""
-    st = audit_integrity.state()
-    view, record = st.view, st.known_record()
+    view, record = current_view(db)
     found = admin_warnings(view, record)
     out = []
     for seq in found["late"]:
