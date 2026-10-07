@@ -169,6 +169,9 @@ _IDENTIFIER_KEYS = (
     "grant_id", "proposed_by",
     # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)
     "case_number", "confirm_by", "hold_only", "purge_after", "by_release", "kept_reason", "kept_at", "held_by_case",
+    # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes
+    # to the address before an administrator's change, and why a send failed (a category, never a server's answer)
+    "email_status", "copy_to_previous", "send_error",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

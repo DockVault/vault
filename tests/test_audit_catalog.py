@@ -45,6 +45,7 @@ PASS_THROUGH = {
     ("app/core/auditor_rights.py", "_audit_by"),
     ("app/core/legal_holds.py", "_audit"),
     ("app/core/legal_holds.py", "record_refusal"),
+    ("app/core/owner_notices.py", "_audit"),
 }
 
 # Names built at run time: (file, enclosing function, source of the expression) -> every name it yields.

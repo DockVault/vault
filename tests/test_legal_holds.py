@@ -165,11 +165,13 @@ def test_placing_opens_a_numbered_hold_only_case_holding_each_vault_at_once(db, 
     placed = _rows(db, "hold_placed")
     assert [r.case_id for r in placed] == [case.id, case.id]
     assert {r.details["vault_id"] for r in placed} == {str(people.v1.id), str(people.v2.id)}
-    # The owner is told in the placing transaction (one notice for both vaults); the administrators after it.
-    notes = db.query(m.Notification).filter(m.Notification.type == "legal_hold").all()
+    # The owner is told in the placing transaction (one notice for both vaults, in the app and through the email
+    # outbox); the administrators after it.
+    notes = db.query(m.Notification).filter(m.Notification.type == "compliance_access").all()
     assert [(n.user_id, n.title) for n in notes] == [(people.olga.id, "Legal hold on your vaults")]
     assert "2 vaults" in notes[0].body and case.number in notes[0].body
     assert TEXT["justification"] not in notes[0].body and TEXT["owner_note"] not in notes[0].body
+    assert [(o.user_id, o.kind) for o in db.query(m.ComplianceNoticeOutbox)] == [(people.olga.id, "hold_placed")]
     assert [n["title"] for n in told] == ["Legal hold placed"]
 
 

@@ -147,7 +147,7 @@ def test_the_full_flow_keeps_every_deletion_until_the_purge(admin, admins, vault
     assert case["status"] == "hold_only" and case["number"].startswith("C-")
     assert case["you_may"]["confirm"]["why_not"]["reason"] == "placer"
     # The owner is told at once, with the case's number and no name or justification.
-    told = [n for n in notifications(admin, "legal_hold") if case["number"] in (n.get("body") or "")]
+    told = [n for n in notifications(admin, "compliance_access") if case["number"] in (n.get("body") or "")]
     assert told and TEXT["justification"] not in told[0]["body"]
     r = _decide(admins["bob"], case["id"], "confirm")
     assert r.status_code == 200 and r.json()["holds"][0]["confirmed_by"] == admins["bob"][0]["_username"], r.text

@@ -198,6 +198,20 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "compliance_access_notice": {
+        "name": "Access to your vaults",
+        "subject": "Access to your vaults: case {{action.code}}",
+        "body_html": (
+            "<h2>Access to your vaults</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>Every file opened in your vaults under this case is listed on Access to my vaults in "
+            "{{vault.name}}, as it happens.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "retention_change": {
         "name": "How long records are kept",
         "subject": "A change to how long {{vault.name}} keeps its records",
@@ -247,6 +261,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("auditor_right", "The auditor right",
      "Sent to every administrator and to the account when the auditor right is proposed, granted, turned down, "
      "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM),
+    ("compliance_access_notice", "Access to your vaults",
+     "Sent to a vault's owner when an investigation may open their vaults, is extended, narrowed, ends or is "
+     "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "
+     "are exported -- says what, when and by whom, never a vault, file or folder name.", SYSTEM),
     ("retention_change", "How long records are kept",
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",

@@ -11,7 +11,8 @@ administrator who is not a person the case concerns (an owner of one of its vaul
 step-up, and takes effect at once: each vault's row is locked FOR UPDATE first, which waits for a deletion that
 holds the vault's row lock, so the hold covers every deletion that commits after it. It is refused while an SFTP
 server of another version may run (sftp_guard): an older SFTP server's own delete would destroy the blob the
-trigger keeps the row of. The owner of each vault is told in the placing transaction; the administrators after it.
+trigger keeps the row of. The owner of each vault is told in the placing transaction, in the app and by email
+through the outbox (app/core/owner_notices.py), as for every later step of the hold; the administrators after it.
 
 Confirming. A different person, independent of the one who placed it by the one rule every two-person step uses
 (app/core/independence.py), confirms it within COMPLIANCE_HOLD_CONFIRM_DAYS, or the server's operator does on the
@@ -292,16 +293,17 @@ def record_refusal(db, action: str, case, *, actor, reason: str) -> None:
 _NOTICES = "legal_hold_notices"
 
 
-def _owner_notices(db, case, vault_owner_pairs, title: str, body: str) -> None:
-    """The owners' in-app notices, in the caller's transaction: they exist exactly when the step does."""
-    from app.core.models import Notification
+def _owner_notices(db, case, vault_owner_pairs, kind: str, now: datetime, **details) -> None:
+    """Tell the owners of the vaults in ``vault_owner_pairs`` of ``kind``, in the caller's transaction, in the app
+    and through the email outbox (app/core/owner_notices.py): the notices exist exactly when the step does, and
+    a failure to write them fails the step."""
+    from app.core import owner_notices
     by_owner = {}
     for vault_id, owner_id in vault_owner_pairs:
         if owner_id is not None:
-            by_owner.setdefault(str(owner_id), []).append(vault_id)
-    for owner_id, vaults in by_owner.items():
-        db.add(Notification(user_id=uuid.UUID(owner_id), type=NOTICE_TYPE, title=title,
-                            body=body.format(n=len(vaults), s="" if len(vaults) == 1 else "s"), target=TARGET))
+            by_owner.setdefault(str(owner_id), set()).add(str(vault_id))
+    owner_notices.tell_owners(db, case, kind, {owner: {"vaults": len(vaults)} for owner, vaults in by_owner.items()},
+                              now=now, details=details)
 
 
 def queue(db, notice: dict) -> None:
@@ -448,9 +450,7 @@ def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basi
                details={"confirm_by": _iso(deadline), "hold_only": True})
     for owner in owners:
         db.add(ComplianceCasePerson(case_id=case.id, user_id=uuid.UUID(owner), why="owner"))
-    _owner_notices(db, case, [(v.id, v.owner_id) for v in vaults], "Legal hold on your vaults",
-                   f"A legal hold under case {case.number} keeps what is deleted from {{n}} vault{{s}} you own, "
-                   "until it is released. You can go on using them as before. See Access to my vaults.")
+    _owner_notices(db, case, [(v.id, v.owner_id) for v in vaults], "hold_placed", now)
     _tell(db, case, "Legal hold placed",
           f"{placer.username} placed a legal hold under case {case.number} on {len(vaults)} vault"
           f"{'' if len(vaults) == 1 else 's'}. Another administrator must confirm it by {deadline:%Y-%m-%d}, "
@@ -498,12 +498,15 @@ def confirm(db, case, *, by=None, now: Optional[datetime] = None) -> int:
     now = now or utcnow()
     name = by.username if by is not None else HOST_OPERATOR
     count = 0
+    confirmed = []
     for hold in confirmable(db, case, now):
         hold.confirmed_at, hold.confirmed_by_username = now, name
         hold.confirmed_by = by.id if by is not None else None
         _audit(db, "hold_confirmed", case, actor=by, actor_name=name, vault_id=hold.vault_id)
+        confirmed.append(hold)
         count += 1
     if count:
+        _owner_notices(db, case, _owners(db, case, confirmed), "hold_confirmed", now, by=name)
         _tell(db, case, "Legal hold confirmed",
               f"{name} confirmed the legal hold of case {case.number}. It stands until it is released.")
     return count
@@ -592,10 +595,11 @@ def _set_kept_purge(db, vault_ids, when: Optional[datetime]) -> None:
                                                                  synchronize_session=False)
 
 
-def release(db, case, *, by=None, reason: str, now: Optional[datetime] = None) -> int:
+def release(db, case, *, by=None, reason: str, now: Optional[datetime] = None, tell_owners: bool = True) -> int:
     """Release every hold of ``case`` that stands, as ``by`` (None: the server's operator), with ``reason``, in
     the caller's transaction. What they kept is purged COMPLIANCE_HOLD_PURGE_DELAY_DAYS later, unless the release
-    is undone first. Returns how many holds."""
+    is undone first. The owners are told, unless the caller tells them itself (``tell_owners`` False: closing a
+    case says so in its own notice). Returns how many holds."""
     from app.core.security import seal_case_field
     now = now or utcnow()
     name = by.username if by is not None else HOST_OPERATOR
@@ -612,9 +616,8 @@ def release(db, case, *, by=None, reason: str, now: Optional[datetime] = None) -
     _set_kept_purge(db, [h.vault_id for h in holds if h.vault_id not in still_held], purge_at)
     _close_hold_only(db, case, by=by, by_name=name, reason=reason, now=now)
     if holds:
-        _owner_notices(db, case, _owners(db, case, holds), "Legal hold released",
-                       f"The legal hold under case {case.number} on {{n}} vault{{s}} you own was released. What it "
-                       f"kept is deleted after {purge_at:%Y-%m-%d}.")
+        if tell_owners:
+            _owner_notices(db, case, _owners(db, case, holds), "hold_released", now, purge_after=purge_at)
         _tell(db, case, "Legal hold released",
               f"{name} released the legal hold of case {case.number}. What it kept is purged after "
               f"{purge_at:%Y-%m-%d}, unless an administrator undoes the release first.")
@@ -679,9 +682,7 @@ def undo_release(db, case, *, by, now: Optional[datetime] = None) -> int:
         case.version = (case.version or 1) + 1
         case.updated_at = now
     if holds:
-        _owner_notices(db, case, _owners(db, case, holds), "Legal hold restored",
-                       f"The release of the legal hold under case {case.number} on {{n}} vault{{s}} you own was "
-                       "undone: the hold stands again.")
+        _owner_notices(db, case, _owners(db, case, holds), "hold_restored", now)
         _tell(db, case, "Legal hold restored",
               f"{by.username} undid the release of the legal hold of case {case.number}: it stands again.")
     _sync_marker(db)
@@ -718,9 +719,7 @@ def lapse_due(db, now: Optional[datetime] = None) -> int:
                                                               LegalHoldVault.lapsed_at == now).all()]
         _set_kept_purge(db, [h.vault_id for h in lapsed if h.vault_id not in still_held], lapsed[0].purge_after)
         _close_hold_only(db, case, by=None, by_name=SYSTEM, reason=None, now=now)
-        _owner_notices(db, case, _owners(db, case, lapsed), "Legal hold lapsed",
-                       f"The legal hold under case {case.number} on {{n}} vault{{s}} you own lapsed: nobody "
-                       "confirmed it in time.")
+        _owner_notices(db, case, _owners(db, case, lapsed), "hold_lapsed", now)
         _tell(db, case, "Legal hold lapsed",
               f"Nobody confirmed the legal hold of case {case.number} in time, so it lapsed. Its placer cannot "
               f"place another unconfirmed hold on those vaults for {PLACE_BLOCK_DAYS} days.")

@@ -25427,6 +25427,12 @@ async def lifespan(app: FastAPI):
     from app.core import retention
     retention_task = asyncio.create_task(retention.run_forever())
 
+    # The sender of the email notices that tell vaults' owners about compliance access to their vaults: written
+    # in the step's own transaction, sent from an outbox on a thread of its own, one process at a time, with
+    # retries. Only this process runs it. See app/core/owner_notices.py.
+    from app.core import owner_notices
+    owner_notices.start()
+
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.
     _install_access_log_redaction()

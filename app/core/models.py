@@ -3334,9 +3334,10 @@ class ComplianceReveal(Base):
 
 class ComplianceNoticeOutbox(Base):
     """An email notice to a vault's owner, written in the transaction that grants the access it tells of and
-    sent afterwards, with retries. The address is sealed as it was when the row was written, with the one
-    before when an administrator changed it recently, so a later change cannot reroute it. ``dedup_key``
-    makes a retry of the transaction write it once."""
+    sent afterwards, with retries (app/core/owner_notices.py). The address is sealed as it was when the row was
+    written, with the one before when an administrator changed it recently, so a later change cannot reroute it.
+    ``dedup_key`` is unique per event and owner. ``details`` holds the counts and dates the notice says (never a
+    name); ``sent_to`` which of the two addresses it has reached, so a retry sends only to the other."""
     __tablename__ = 'compliance_notice_outbox'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -3344,8 +3345,10 @@ class ComplianceNoticeOutbox(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     kind = Column(String(32), nullable=False)
     dedup_key = Column(String(255), nullable=False, unique=True)
+    details = Column(JSON, nullable=True)
     address_enc = Column(Text, nullable=True)
     previous_address_enc = Column(Text, nullable=True)
+    sent_to = Column(JSON, nullable=True)
     status = Column(String(16), nullable=False, default='pending')
     attempts = Column(Integer, nullable=False, default=0, server_default='0')
     next_attempt_at = Column(DateTime, nullable=True)
