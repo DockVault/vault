@@ -1428,13 +1428,23 @@ def test_the_list_says_which_pending_cases_this_administrator_may_decide(db, peo
     assert "you_may_approve" not in cr.list_cases(current_user=people.bob, db=db)["cases"][0]
 
 
+def _named(db, view):
+    return [p.user_id for p in db.query(m.ComplianceCasePerson).filter(
+        m.ComplianceCasePerson.case_id == uuid.UUID(view["id"]), m.ComplianceCasePerson.why == "named")]
+
+
 def test_people_are_named_by_username_case_aside(db, people, no_codes):
     body = cr.CaseRequest(scope=[cr.ScopeItemIn(kind="vault", target_id=people.v1.id)],
-                          named_usernames=[" CARL ", "carl", ""], named_user_ids=[people.carl.id], **TEXT)
+                          named_usernames=[" CARL ", "carl", ""], **TEXT)
     view = cr.request_case(body, request=None, current_user=people.uma, db=db)
-    named = db.query(m.ComplianceCasePerson).filter(m.ComplianceCasePerson.case_id == uuid.UUID(view["id"]),
-                                                    m.ComplianceCasePerson.why == "named").all()
-    assert [p.user_id for p in named] == [people.carl.id]
+    assert _named(db, view) == [people.carl.id]
+
+
+def test_a_person_named_by_id_and_by_username_is_named_once(db, people, no_codes):
+    body = cr.CaseRequest(scope=[cr.ScopeItemIn(kind="vault", target_id=people.v1.id)],
+                          named_usernames=["carl", "Carl"], named_user_ids=[people.carl.id], **TEXT)
+    view = cr.request_case(body, request=None, current_user=people.uma, db=db)
+    assert _named(db, view) == [people.carl.id]
 
 
 def test_a_username_that_names_no_account_is_refused_as_an_unknown_person_and_recorded(db, people, no_codes):

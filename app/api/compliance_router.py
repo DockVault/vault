@@ -748,7 +748,9 @@ def request_case(body: CaseRequest, request: Request, current_user: User = Depen
         if by_name is None:
             _case_refused(db, "case_requested", None, current_user,
                           cases.CaseRefused(cases.rules.NO_SUCH_PERSON, code=404))
-        named += [i for i in by_name if i not in named]
+        for person in by_name:
+            if person not in named:
+                named.append(person)
     args = dict(purpose=body.purpose, legal_basis=body.legal_basis, lia_reference=body.lia_reference,
                 special_category=body.special_category, art9_condition=body.art9_condition,
                 criminal_offence=body.criminal_offence, justification=body.justification,
