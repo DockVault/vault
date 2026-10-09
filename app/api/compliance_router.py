@@ -367,6 +367,20 @@ def _is_admin(user) -> bool:
     return getattr(user, "role", None) == RoleEnum.ADMIN
 
 
+def _seen_by(db, q, viewer):
+    """``q`` (cases) narrowed to those ``viewer`` may see (cases.may_see): an administrator every case that does not
+    concern them, anyone else the cases they started."""
+    from sqlalchemy import and_, or_
+    from app.core.models import ComplianceCase, ComplianceCasePerson, ComplianceCaseVault, Vault
+    if not _is_admin(viewer):
+        return q.filter(ComplianceCase.auditor_id == viewer.id)
+    named = db.query(ComplianceCasePerson.case_id).filter(ComplianceCasePerson.user_id == viewer.id)
+    owning = (db.query(ComplianceCaseVault.case_id).join(Vault, Vault.id == ComplianceCaseVault.vault_id)
+              .filter(Vault.owner_id == viewer.id))
+    return q.filter(or_(ComplianceCase.auditor_id == viewer.id,
+                        and_(ComplianceCase.id.notin_(named), ComplianceCase.id.notin_(owning))))
+
+
 def _kept_by(model, rows, viewer):
     """Which rows of the kept table ``model`` a case's view counts. An administrator sees every case, so every row
     kept on its vaults; anyone else (the case's auditor) only what was kept while the case's own hold stood on each
@@ -444,16 +458,15 @@ def _undo_refusal(db, case, person, now=None):
 
 @router.get("/compliance/holds")
 def list_holds(current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
-    """The cases with legal holds the caller may see: every one for an administrator, the ones they started for an
-    auditor. Newest first."""
+    """The cases with legal holds the caller may see: for an administrator every one that does not concern them, the
+    ones they started for an auditor. Newest first."""
     from app.core import legal_holds as holds
     from app.core.models import ComplianceCase, LegalHoldVault
     limit_statements(db)
     if not _is_admin(current_user) and not rights.auditor_live(db, current_user).live:
         raise HTTPException(status_code=403, detail="Only an administrator or an auditor can see legal holds.")
-    q = db.query(ComplianceCase).filter(ComplianceCase.id.in_(db.query(LegalHoldVault.case_id)))
-    if not _is_admin(current_user):
-        q = q.filter(ComplianceCase.auditor_id == current_user.id)
+    q = _seen_by(db, db.query(ComplianceCase).filter(ComplianceCase.id.in_(db.query(LegalHoldVault.case_id))),
+                 current_user)
     now = holds.utcnow()
     cases = q.order_by(ComplianceCase.requested_at.desc()).limit(ENDED_SHOWN).all()
     return {"cases": [_hold_view(db, c, current_user, now) for c in cases],
@@ -497,10 +510,11 @@ _NOTHING = ("nothing_to_confirm", "confirm_too_late", "nothing_to_release", "not
 def _check_decision(case_id, current_user, db, *, action: str, refusal, lock: bool = False):
     """The case, once ``refusal`` lets ``current_user`` take the step (recorded and refused otherwise); under the
     case's lock with ``lock``. A case the caller may not see is not found."""
+    from app.core import cases
     from app.core import legal_holds as holds
     limit_statements(db)
     case = _case_or_404(db, case_id, lock=lock)
-    if not _is_admin(current_user) and str(case.auditor_id) != str(current_user.id):
+    if not cases.may_see(db, case, current_user):
         raise HTTPException(status_code=404, detail="No such case.")
     why = refusal(db, case, current_user)
     if why is not None:
@@ -642,24 +656,25 @@ def _case_refused(db, action: str, case, actor, refused, *, record: bool = True)
 
 
 def _visible_case(db, case_id, viewer, *, lock: bool = False):
-    """The case, when ``viewer`` may see it (its auditor or an administrator); not found otherwise."""
+    """The case, when ``viewer`` may see it (its auditor, or an administrator it does not concern); not found
+    otherwise, as for anyone else: an administrator a case concerns sees it only as an owner does, on Access to my
+    vaults."""
     from app.core import cases
     case = _case_or_404(db, case_id, lock=lock)
-    if not cases.may_see(case, viewer):
+    if not cases.may_see(db, case, viewer):
         raise HTTPException(status_code=404, detail="No such case.")
     return case
 
 
 @router.get("/compliance/cases")
 def list_cases(current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
-    """The cases with access the caller may see, newest first: every one for an administrator, the ones they asked
-    for otherwise (an empty list for anyone else). Hold-only cases are listed with the holds."""
+    """The cases with access the caller may see, newest first: for an administrator every one that does not concern
+    them, the ones they asked for otherwise (an empty list for anyone else). Hold-only cases are listed with the
+    holds."""
     from app.core import cases
     from app.core.models import ComplianceCase
     limit_statements(db)
-    q = db.query(ComplianceCase).filter(ComplianceCase.access_days > 0)
-    if not _is_admin(current_user):
-        q = q.filter(ComplianceCase.auditor_id == current_user.id)
+    q = _seen_by(db, db.query(ComplianceCase).filter(ComplianceCase.access_days > 0), current_user)
     now = cases.utcnow()
     rows = q.order_by(ComplianceCase.requested_at.desc()).limit(ENDED_SHOWN).all()
     return {"cases": [cases.case_view(db, c, current_user, now=now, light=True) for c in rows],
@@ -841,7 +856,7 @@ def record_case_objection(case_id: uuid.UUID, body: ObjectionIn,
     from app.core import cases
     limit_statements(db)
     case = _case_or_404(db, case_id, lock=True)
-    if not (cases.may_see(case, current_user) or cases.owns_a_vault_in(db, case, current_user)):
+    if not (cases.may_see(db, case, current_user) or cases.owns_a_vault_in(db, case, current_user)):
         raise HTTPException(status_code=404, detail="No such case.")
     try:
         cases.record_objection(db, case, by=current_user, text_=body.text)

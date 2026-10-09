@@ -36,6 +36,8 @@ from app.core import models as m  # noqa: E402
 from app.core import owner_notices as on  # noqa: E402
 from app.core.security import open_case_field  # noqa: E402
 
+REAL_HOLDS_DELIVER = holds.deliver
+
 pytestmark = pytest.mark.unit
 
 OLD = timedelta(days=400)
@@ -612,7 +614,7 @@ def test_an_owner_records_an_objection_sealed_and_shown_to_whoever_extends(db, p
     assert [(e["by"], e["as"], e["text"]) for e in entries] == [("olga", "owner", "I object under Art. 21."),
                                                                 ("carl", "administrator", "Answer sent on 3 Nov.")]
     assert cases.case_view(db, case, people.carl)["objections"] == entries
-    assert not cases.may_see(case, people.olga), "an owner reads the case on their own page, not here"
+    assert not cases.may_see(db, case, people.olga), "an owner reads the case on their own page, not here"
     assert [r.details["by_owner"] for r in _rows(db, "case_objection_recorded")] == [True, False]
 
 
@@ -700,7 +702,7 @@ def test_who_sees_the_justification_and_the_people_named(db, people):
         view = cases.case_view(db, case, viewer)
         assert ("justification" in view and view["justification"] == TEXT["justification"]) is justification, viewer
         assert ("people" in view) is named, viewer.username
-    assert not cases.may_see(case, people.olga) and cases.may_see(case, people.carl)
+    assert not cases.may_see(db, case, people.olga) and cases.may_see(db, case, people.carl)
 
 
 def test_an_administrator_is_told_of_their_own_membership(db, people, monkeypatch):
@@ -1116,15 +1118,139 @@ def test_an_administrator_the_case_concerns_reads_no_reason_and_no_objection(db,
     assert cases.case_view(db, closed, people.uma)["close_reason"] == "Concluded: otto cleared."
 
 
-def test_the_case_page_route_hides_them_from_a_concerned_administrator(db, people):
-    otto_admin = people.otto
-    otto_admin.role = m.RoleEnum.ADMIN
+def _sees(db, case, viewer):
+    """Whether the cases list, the case's page and the holds list show ``case`` to ``viewer``, each said apart."""
+    listed = str(case.id) in {c["id"] for c in cr.list_cases(current_user=viewer, db=db)["cases"]}
+    held = str(case.id) in {c["id"] for c in cr.list_holds(current_user=viewer, db=db)["cases"]}
+    page, err = _call(cr.get_case, case.id, SimpleNamespace(headers={}), current_user=viewer, db=db)
+    assert page is not None or err.status_code == 404, err
+    return {"listed": listed, "page": page is not None, "holds": held}
+
+
+NOTHING = {"listed": False, "page": False, "holds": False}
+
+
+@pytest.fixture
+def otto_admin(db, people):
+    """otto, who owns v3, made an independent administrator long ago."""
+    otto = people.otto
+    otto.role = m.RoleEnum.ADMIN
     db.commit()
-    case = _ask(db, people.uma, _vaults(people.v3))
-    cases.reject(db, case, by=people.bob, reason="Insufficient grounds against otto.")
+    admin_grants.record(db, otto.id, granted_by_id=None, granted_by_name=cc.HOST_OPERATOR,
+                        now=rights.utcnow() - OLD)
     db.commit()
-    page = cr.get_case(case.id, SimpleNamespace(headers={}), current_user=otto_admin, db=db)
-    assert "reject_reason" not in page and "Insufficient" not in str(page)
+    return otto
+
+
+def _steps_not_found(db, case, viewer, no_codes):
+    """Every step of the case answers ``viewer`` as it answers anyone who may not see it: not found, with no
+    record and no code asked."""
+    before = db.query(m.AuditLog).count()
+    asked = list(no_codes)
+    calls = [
+        (cr.approve_case, dict(request=None, if_match=f'"{case.version}"')),
+        (cr.reject_case, dict(body=cr.Reason(reason="No."), request=None)),
+        (cr.extend_case, dict(body=cr.Extension(days=1), request=None, if_match=f'"{case.version}"')),
+        (cr.close_case, dict(body=cr.Reason(reason="Done."), request=None)),
+        (cr.withdraw_case, {}),
+        (cr.narrow_case, dict(body=cr.Narrowing(scope=[cr.ScopeItemIn(kind="vault",
+                                                                       target_id=uuid.uuid4())]))),
+        (cr.confirm_hold, dict(request=None)),
+        (cr.review_hold, {}),
+        (cr.release_hold, dict(body=cr.Reason(reason="Done."), request=None)),
+        (cr.undo_hold_release, dict(request=None)),
+    ]
+    for fn, kw in calls:
+        _, err = _call(fn, case.id, current_user=viewer, db=db, **kw)
+        assert err is not None and err.status_code == 404, (fn.__name__, err and err.detail)
+        db.rollback()
+    assert db.query(m.AuditLog).count() == before and no_codes == asked
+
+
+def test_a_named_administrator_sees_nothing_of_a_case_pending_or_active(db, people, otto_admin, told, no_codes):
+    """An administrator a case names, who owns none of its vaults, sees it only as an owner does: an owner of none
+    of its vaults sees nothing. Not while it waits for approval (before the owners are told and before its hold),
+    nor once it is active: no list entry, no page, no step (not found, as for anyone else, never that it concerns
+    them), no administrators' notice, and nothing on their own page. Another administrator sees it."""
+    from app.core import owner_access
+    case = _ask(db, people.uma, _vaults(people.v1), named_user_ids=[otto_admin.id], hold=True)
+    assert _sees(db, case, otto_admin) == NOTHING
+    assert _sees(db, case, people.carl) == {"listed": True, "page": True, "holds": False}
+    _steps_not_found(db, case, otto_admin, no_codes)
+    told.cases.clear()
+    _approve(db, case, people.bob)
+    assert case.status == "active" and holds.standing(db, case.id)
+    assert _sees(db, case, otto_admin) == NOTHING
+    assert _sees(db, case, people.carl) == {"listed": True, "page": True, "holds": True}
+    _steps_not_found(db, case, otto_admin, no_codes)
+    assert owner_access.page(db, otto_admin)["cases"] == []
+    approved = [n for n in told.cases if n["title"] == "Case approved"]
+    assert approved and all(str(otto_admin.id) not in n["people"] for n in approved)
+    assert str(people.carl.id) in approved[0]["people"]
+
+
+def test_an_administrator_who_owns_a_vault_in_the_case_sees_it_only_on_their_own_page(db, people, otto_admin,
+                                                                                    no_codes):
+    """otto owns v3: nothing while the case waits (an owner is not told yet); once it is active, his own page shows
+    what any owner sees (its number and purpose, no justification, no people named), and the Compliance page still
+    shows him nothing. He may record an objection on it, as an owner."""
+    from app.core import owner_access
+    case = _ask(db, people.uma, _vaults(people.v1, people.v3), named_user_ids=[people.carl.id])
+    assert _sees(db, case, otto_admin) == NOTHING
+    assert owner_access.page(db, otto_admin)["cases"] == []
+    _approve(db, case, people.bob)
+    assert _sees(db, case, otto_admin) == NOTHING
+    _steps_not_found(db, case, otto_admin, no_codes)
+    (mine,) = owner_access.page(db, otto_admin)["cases"]
+    assert mine["number"] == case.number and mine["purpose"] == TEXT["purpose"]
+    assert [v["vault_id"] for v in mine["vaults"]] == [str(people.v3.id)]
+    assert "justification" not in mine and "people" not in mine and "carl" not in str(mine)
+    out = cr.record_case_objection(case.id, cr.ObjectionIn(text="I object."), current_user=otto_admin, db=db)
+    assert out["objections"] == 1
+
+
+def test_an_administrator_a_vault_came_to_after_the_request_no_longer_sees_the_case(db, people, no_codes):
+    """A vault of a waiting case that came to an administrator concerns them at once, before the approval reads
+    its owners again: carl no longer sees the case, and is not among those who could approve it."""
+    case = _ask(db, people.uma, _vaults(people.v1))
+    assert _sees(db, case, people.carl)["page"]
+    assert people.carl.id in {a.id for a in cases.independent_approvers(db, case)}
+    people.v1.owner_id = people.carl.id
+    db.commit()
+    assert _sees(db, case, people.carl) == NOTHING
+    assert people.carl.id not in {a.id for a in cases.independent_approvers(db, case)}
+    _steps_not_found(db, case, people.carl, no_codes)
+
+
+def test_a_hold_only_case_shows_an_administrator_it_concerns_nothing(db, people, otto_admin, told, no_codes):
+    """A hold placed on otto's vault: he is told as its owner, the holds list does not show it to him, confirming it
+    answers not found, unrecorded, and the administrators' notice of the hold leaves him out."""
+    from app.core import owner_access
+    case = holds.place_hold_only(db, people.uma, [people.v3.id], **TEXT)
+    db.commit()
+    assert _sees(db, case, otto_admin) == NOTHING
+    assert _sees(db, case, people.carl)["holds"]
+    _steps_not_found(db, case, otto_admin, no_codes)
+    assert [c["id"] for c in owner_access.page(db, otto_admin)["cases"]] == [str(case.id)]
+    assert told.holds and all(n["concerned"] == [str(otto_admin.id)] for n in told.holds)
+
+
+def test_the_administrators_notice_of_a_hold_leaves_out_those_it_concerns(db, people, otto_admin, monkeypatch):
+    """legal_holds.deliver tells every active administrator and the auditor, but for the ones a notice says the case
+    concerns."""
+    from contextlib import contextmanager
+    sent = []
+
+    @contextmanager
+    def same_db():
+        yield db
+    monkeypatch.setattr("app.core.database.get_db_context", same_db)
+    monkeypatch.setattr(api, "_notify_users", lambda people_, *a, **k: sent.append(sorted(people_)))
+    REAL_HOLDS_DELIVER([{"title": "t", "body": "b", "auditor_id": str(people.uma.id),
+                         "concerned": [str(otto_admin.id)]}])
+    (to,) = sent
+    assert str(otto_admin.id) not in to
+    assert {str(people.ada.id), str(people.bob.id), str(people.carl.id), str(people.uma.id)} <= set(to)
 
 
 # --------------------------------------------------------------------------- closing while a release is undone

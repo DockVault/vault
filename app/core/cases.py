@@ -273,9 +273,15 @@ def _deliver(notices) -> None:
 after_commit.handler(_NOTICES, _deliver)
 
 
-def _admins(db) -> list:
+def _admins(db, case) -> list:
+    """The active administrators to tell of a step on ``case``, but for those it concerns: they learn of it only as
+    its owners do."""
+    from app.core import case_eligibility
     from app.core.models import RoleEnum, User
-    return [r[0] for r in db.query(User.id).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True))]
+    db.flush()  # the case's people as the step left them (the session does not flush on its own)
+    concerned = {str(p) for p in case_eligibility.concerned(db, case)}
+    return [r[0] for r in db.query(User.id).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True))
+            if str(r[0]) not in concerned]
 
 
 def reference(case) -> str:
@@ -389,7 +395,7 @@ def request_case(db, auditor, *, purpose, legal_basis, justification, owner_note
            details={"purpose": purpose, "vaults": len(resolution.vaults), "days": days,
                     "hold": case.hold_requested})
     approvers = [a.id for a in independent_approvers(db, case, now)]
-    _tell(db, approvers or _admins(db), "A case waits for approval",
+    _tell(db, approvers or _admins(db, case), "A case waits for approval",
           f"{auditor.username} asked for case {reference(case)} ({len(resolution.vaults)} vault"
           f"{'' if len(resolution.vaults) == 1 else 's'}, {days} days). "
           + ("An independent administrator approves or turns it down on the Compliance page."
@@ -535,7 +541,7 @@ def approve(db, case, *, approver=None, now: Optional[datetime] = None):
     owner_notices.tell_owners(db, case, owner_notices.ACTIVATION, _owner_counts(db, case, rows,
                                                                                hold=case.hold_requested), now=now)
     case.notice_written_at = now
-    _tell(db, [case.auditor_id] + _admins(db), "Case approved",
+    _tell(db, [case.auditor_id] + _admins(db, case), "Case approved",
           f"{_who(name)} approved case {case.number}: {case.auditor_username} can open {len(rows)} vault"
           f"{'' if len(rows) == 1 else 's'} until {case.access_ends_at:%Y-%m-%d %H:%M} UTC. Their owners were told.")
     return case
@@ -739,7 +745,7 @@ def record_objection(db, case, *, by, text_: str, now: Optional[datetime] = None
     case.version = (case.version or 1) + 1
     case.updated_at = now
     _audit(db, "case_objection_recorded", case, actor=by, details={"by_owner": as_owner})
-    _tell(db, [a for a in _admins(db) if str(a) != str(by.id)] + [case.auditor_id], "Objection recorded",
+    _tell(db, [a for a in _admins(db, case) if str(a) != str(by.id)] + [case.auditor_id], "Objection recorded",
           f"An objection was recorded on case {reference(case)}. Whoever extends the case reads it first.")
     return case
 
@@ -808,7 +814,7 @@ def close(db, case, *, by, reason: str, now: Optional[datetime] = None):
     _audit(db, "case_closed", case, actor=by)
     owner_notices.tell_owners(db, case, owner_notices.CLOSED, _summary_counts(db, case, held=set()), now=now,
                               details={"by": by.username})
-    _tell(db, [case.auditor_id] + _admins(db), "Case closed", f"{by.username} closed case {reference(case)}.")
+    _tell(db, [case.auditor_id] + _admins(db, case), "Case closed", f"{by.username} closed case {reference(case)}.")
     return case
 
 
@@ -861,8 +867,21 @@ def end_due(db, now: Optional[datetime] = None) -> int:
 
 # --------------------------------------------------------------------------- what a viewer sees
 
-def may_see(case, viewer) -> bool:
-    return is_admin(viewer) or is_auditor_of(case, viewer)
+def concerns(db, case, person) -> bool:
+    """Whether ``case`` concerns ``person``: an owner of one of its vaults (recorded, or now), a custodian, or
+    someone it names (case_eligibility.concerned)."""
+    from app.core import case_eligibility
+    pid = getattr(person, "id", None)
+    return pid is not None and str(pid) in {str(p) for p in case_eligibility.concerned(db, case)}
+
+
+def may_see(db, case, viewer) -> bool:
+    """Whether ``viewer`` may see ``case`` on the Compliance page: its auditor, or an administrator it does not
+    concern. An administrator a case concerns sees it only as an owner does (Access to my vaults): nothing before
+    it tells them, and nothing at all when they own none of its vaults."""
+    if is_auditor_of(case, viewer):
+        return True
+    return is_admin(viewer) and not concerns(db, case, viewer)
 
 
 def _open(case, column: str, field: str) -> Optional[str]:
@@ -877,9 +896,10 @@ def _open(case, column: str, field: str) -> Optional[str]:
 
 
 def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool = False, light: bool = False) -> dict:
-    """``case`` as ``viewer`` (its auditor or an administrator) may see it. The justification only for the auditor
-    and an administrator who could approve it; the people named, the reasons it was turned down or closed and the
-    owners' objections only for those the case does not concern. Never a vault, file or folder name. ``light`` (a
+    """``case`` as ``viewer`` (its auditor, or an administrator it does not concern: may_see) may see it. The
+    justification only for the auditor and an administrator who could approve it; the people named, the reasons it
+    was turned down or closed and the owners' objections never to anyone the case concerns (the routes show such an
+    administrator nothing here; this holds should one reach it). Never a vault, file or folder name. ``light`` (a
     list of cases): only what the list shows, without the texts, what each step would allow and the vaults'
     figures, which the case's own page reads."""
     from app.core import auditor_rights as rights
@@ -890,7 +910,7 @@ def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool 
     own = is_auditor_of(case, viewer)
     eligible = admin and not light and approver_refusal(db, case, viewer, now) is None
     people = db.query(ComplianceCasePerson).filter(ComplianceCasePerson.case_id == case.id).all()
-    concerned = any(str(p.user_id) == str(viewer.id) for p in people)
+    concerned = concerns(db, case, viewer)
     names = {}
     ids = {p.user_id for p in people} | {r.owner_id_at_approval for r in vault_rows(db, case)}
     for uid, username in db.query(User.id, User.username).filter(User.id.in_([i for i in ids if i is not None])):

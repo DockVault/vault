@@ -33,7 +33,7 @@ from app.core import host_operator  # noqa: E402
 from app.core import independence as ind  # noqa: E402
 from app.core.models import (AdminGrant, AuditLog, AuditorGrant, ComplianceCase, ComplianceCasePerson,  # noqa: E402
                              ComplianceCaseVault, CredentialChange, DataRequirement, LegalHoldVault, RoleEnum,
-                             SecondFactorEnrollment, User)
+                             SecondFactorEnrollment, User, Vault)
 from app.core.security import seal_case_field  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -47,7 +47,8 @@ def db():
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'host.db'}")
         copies = sa.MetaData()
         for model in (User, AdminGrant, CredentialChange, AuditLog, AuditorGrant, SecondFactorEnrollment,
-                      ComplianceCase, ComplianceCasePerson, ComplianceCaseVault, DataRequirement, LegalHoldVault):
+                      ComplianceCase, ComplianceCasePerson, ComplianceCaseVault, DataRequirement, LegalHoldVault,
+                      Vault):
             table = model.__table__.to_metadata(copies)
             for column in table.columns:
                 if column.server_default is not None and "now()" in str(getattr(column.server_default, "arg", "")):

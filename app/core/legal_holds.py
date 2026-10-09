@@ -373,8 +373,8 @@ def _deliver_notices(notices) -> None:
 
 
 def deliver(notices: Iterable[dict]) -> None:
-    """Every active administrator and the case's auditor, in the app, after the commit. Never a vault, file or
-    folder name, the justification or a person named."""
+    """Every active administrator the case does not concern, and the case's auditor, in the app, after the commit.
+    Never a vault, file or folder name, the justification or a person named."""
     from app.api import api_server as api
     from app.core.database import get_db_context
     from app.core.models import RoleEnum, User
@@ -382,12 +382,17 @@ def deliver(notices: Iterable[dict]) -> None:
         admins = [str(a[0]) for a in db.query(User.id).filter(User.role == RoleEnum.ADMIN,
                                                                 User.is_active.is_(True)).all()]
     for notice in notices:
-        people = admins + ([str(notice["auditor_id"])] if notice.get("auditor_id") else [])
+        # An administrator the case concerns learns of it only as its owners do (their own notices).
+        left_out = set(notice.get("concerned") or ())
+        people = [a for a in admins if a not in left_out] + (
+            [str(notice["auditor_id"])] if notice.get("auditor_id") else [])
         api._notify_users(people, NOTICE_TYPE, title=notice["title"], body=notice["body"], target=TARGET)
 
 
 def _tell(db, case, title: str, body: str) -> None:
-    queue(db, {"title": title, "body": body, "auditor_id": str(case.auditor_id)})
+    db.flush()  # the case's people as the step left them (the session does not flush on its own)
+    queue(db, {"title": title, "body": body, "auditor_id": str(case.auditor_id),
+               "concerned": sorted(concerned(db, case))})
 
 
 after_commit.handler(_NOTICES, _deliver_notices)

@@ -30,9 +30,15 @@ def utcnow() -> datetime:
 
 
 def concerned(db, case) -> list:
-    """The ids of the people the case concerns: the owners of its vaults, custodians, and people named."""
-    from app.core.models import ComplianceCasePerson
-    return [row[0] for row in db.query(ComplianceCasePerson.user_id).filter(ComplianceCasePerson.case_id == case.id)]
+    """The ids of the people the case concerns: the owners of its vaults (as recorded, and whoever owns one now: a
+    vault that changed hands concerns its new owner at once, before the approval reads the owners again),
+    custodians, and people named."""
+    from app.core.models import ComplianceCasePerson, ComplianceCaseVault, Vault
+    people = [row[0] for row in db.query(ComplianceCasePerson.user_id).filter(ComplianceCasePerson.case_id == case.id)]
+    owners = [row[0] for row in db.query(Vault.owner_id)
+              .join(ComplianceCaseVault, ComplianceCaseVault.vault_id == Vault.id)
+              .filter(ComplianceCaseVault.case_id == case.id, Vault.owner_id.isnot(None))]
+    return list(dict.fromkeys(people + owners))
 
 
 def approver_refusal(db, case, approver, now: Optional[datetime] = None) -> Optional[str]:
