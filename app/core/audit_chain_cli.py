@@ -1,7 +1,7 @@
 """The host's command line for the audit chain: ``python -m app.core.audit_integrity <command>``, which
 ``dockvault.py audit`` runs in the web container (the ``accounts`` pattern).
 
-    verify [--from H] [--to H] [--anchor dvchain1:...] [--json] [--old-key-file F]
+    verify [--from H] [--to H] [--anchor dvchain1:...] [--no-key] [--json] [--old-key-file F]
     head
     acknowledge (--seqs ... | --failures | --rows ... | --late-rows H) (--read | --expect dvstate1:...)
     rekey [--old-key-file F | --old-key-stdin] [--accept-unverified-history] [--confirm-return]
@@ -176,6 +176,12 @@ def _verify(args) -> int:
             try:
                 if args.action == "head":
                     report = v.verify(db, record=record, check_rows=False)
+                elif getattr(args, "no_key", False):
+                    # As an auditor off the server sees it: no key and no head record. With --anchor, the seals up
+                    # to it are authenticated by their links, and a later change to an hour it covered is a warning.
+                    report = v.verify(db, record=None, held={}, anchor=args.anchor,
+                                      from_hour=fmt.parse_time_text(args.from_) if args.from_ else None,
+                                      to_hour=fmt.parse_time_text(args.to) if args.to else None)
                 else:
                     held = {k: c.key for k, c in st.keys_held().items()}
                     old = _old_key(args)
@@ -226,6 +232,8 @@ def main(argv=None) -> int:
     v.add_argument("--from", dest="from_", help="first hour to rebuild from its rows (YYYY-MM-DDTHH:00:00Z)")
     v.add_argument("--to", dest="to", help="hour to stop before")
     v.add_argument("--anchor", help="a head kept elsewhere (dvchain1:...)")
+    v.add_argument("--no-key", dest="no_key", action="store_true",
+                   help="check as an auditor holding no key and no head record would (with --anchor)")
     v.add_argument("--json", action="store_true", help="print the report as JSON")
     v.add_argument("--old-key-file", help="a file holding an earlier AUDIT_CHAIN_KEY, to check seals under it")
     v.add_argument("--old-key-stdin", action="store_true", help=argparse.SUPPRESS)

@@ -69,6 +69,8 @@ def test_typing_anything_but_yes_writes_nothing(tmp_path, monkeypatch):
     (["accept-restore", "--no-reseal"], ["accept-restore", "--no-reseal"]),
     (["acknowledge-removed-before", "--before", "2026-09-19T18:00:00Z", "--retention-days", "34"],
      ["acknowledge-removed-before", "2026-09-19T18:00:00Z", "--retention-days", "34"]),
+    (["verify", "--acknowledge-removed-before", "2026-09-19T18:00:00Z", "--retention-days", "34"],
+     ["acknowledge-removed-before", "2026-09-19T18:00:00Z", "--retention-days", "34"]),
     (["rekey", "--accept-unverified-history"], ["rekey", "--accept-unverified-history"]),
 ])
 def test_each_command_hands_the_tool_its_arguments(tmp_path, monkeypatch, argv, tool_args):
@@ -92,3 +94,21 @@ def test_a_name_typed_wrong_writes_nothing_even_when_yes_follows(tmp_path, monke
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     tool.audit(_args("accept-database-head"))
     assert [c[0][-1] for c in calls.calls] == ["--read"]
+
+
+@pytest.mark.parametrize("argv,extra", [
+    ([], []),
+    (["--anchor", "dvchain1:7:ab"], ["--anchor", "dvchain1:7:ab"]),
+    (["--anchor", "dvchain1:7:ab", "--no-key"], ["--anchor", "dvchain1:7:ab", "--no-key"]),
+])
+def test_verify_hands_the_check_its_anchor_and_the_keyless_flag(tmp_path, monkeypatch, argv, extra):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    seen = []
+
+    class _Done:
+        stdout = '{"ok": true, "head": "dvchain1:9:cd", "seals": 9, "exit_code": 0, "findings": []}\n'
+
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(tool, "_run_dc", lambda *args, **kw: seen.append(list(args)) or _Done())
+    tool.audit(_args("verify", *argv))
+    assert seen[0][seen[0].index("app.core.audit_integrity") + 1:] == ["verify", "--json", *extra]

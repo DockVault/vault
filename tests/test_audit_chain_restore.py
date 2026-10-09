@@ -120,6 +120,8 @@ def test_deleted_seals_with_their_rows_left_alone_are_named_and_confirmed_by_nam
     restore.accept_database_head(env.engine, _host(env), expect=seen["state"], confirm=seen["confirm"])
     seal = [s for s in env.seals() if s.kind == "restore"][0]
     assert seal.detail["hours"]["deleted_through_seq"] == int(seen["confirm"][0].split("-")[-1])
+    told = [f for f in env.verify().findings if f.kind == "resealed-after-restore"]
+    assert told and f"seals through {seal.detail['hours']['deleted_through_seq']} were deleted" in told[0].message
 
 
 def test_a_cut_reaching_back_more_than_30_days_names_the_changed_day(env):
@@ -248,6 +250,9 @@ def test_a_chain_ending_under_a_key_the_recorded_one_left_needs_rekey(env):
     assert [s for s in env.seals() if s.kind == "restore"][0].detail["under_left_key"]
     env.clock.advance(hours=1)
     assert env.seal().stopped == "key-not-current"
+    # Reported for good, whatever the host does next.
+    told = [f for f in env.verify().findings if f.kind == "restored-under-left-key"]
+    assert told and told[0].severity == "information" and "anyone holding it could have written it" in told[0].message
 
 
 # --------------------------------------------------------------------------- accept-restore

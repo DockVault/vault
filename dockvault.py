@@ -5956,6 +5956,10 @@ class DockVault:
         before it then shows. Exit status: 0 clean, 1 failures or warnings, 2 the check could not run."""
         pal = self.pal
         action = getattr(args, "audit_action", "verify") if args is not None else "verify"
+        if action == "verify" and getattr(args, "acknowledge_removed_before", None):
+            # The same command, spelled as a check's option: audit verify --acknowledge-removed-before <time>.
+            args.before = args.acknowledge_removed_before
+            action = "acknowledge-removed-before"
         if action == "acknowledge":
             return self._audit_acknowledge(args)
         if action in ("rekey", "after-record", "accept-database-head", "accept-restore",
@@ -5968,6 +5972,8 @@ class DockVault:
             value = getattr(args, name, None) if args else None
             if value:
                 tool_args += [flag, value]
+        if args is not None and getattr(args, "no_key", False):
+            tool_args.append("--no-key")
         ok, why = docker_available()
         if not ok:
             self._fail("Docker is not available: %s" % why)
@@ -6571,6 +6577,9 @@ def build_parser():
     au.add_argument("--confirm", dest="confirm", action="append",
                     help="what the read asks to confirm by name (otherwise it is asked for)")
     au.add_argument("--before", dest="before", help="acknowledge-removed-before: the removal's cutoff time")
+    au.add_argument("--acknowledge-removed-before", dest="acknowledge_removed_before", metavar="TIME",
+                    help="verify: seal over rows an older release removed by age before TIME (the same as "
+                         "acknowledge-removed-before --before TIME; needs --retention-days)")
     au.add_argument("--retention-days", dest="retention_days", type=int,
                     help="acknowledge-removed-before: the AUDIT_LOG_RETENTION_DAYS the older release ran with")
     au.add_argument("--yes", dest="yes", action="store_true", help="write without asking (confirmations by name "
@@ -6580,6 +6589,9 @@ def build_parser():
     au.add_argument("--to", dest="audit_to", help="the hour the row check stops before")
     au.add_argument("--anchor", dest="anchor", help="a head you kept elsewhere (dvchain1:...): the seals up to it "
                                                     "must be the ones it names")
+    au.add_argument("--no-key", dest="no_key", action="store_true",
+                    help="verify: check as an auditor without the key would (no key, no head record); with --anchor, "
+                         "a later change to an hour the anchor covered shows as not authenticated")
 
     lk = parsers["lock"]
     lk.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")

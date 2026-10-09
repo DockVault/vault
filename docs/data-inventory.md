@@ -290,7 +290,9 @@ the recipients' mailboxes.
   row ids, never a row's values). Kept with the keys volume, in every backup, which archives the keys volume
   before the database. A restore of a backup leaves a mark beside it until `python dockvault.py audit
   accept-restore`. **`python dockvault.py audit verify`** prints the findings and the chain's head on the
-  host's terminal; an export of the Activity page ends with that head. **`python dockvault.py audit
+  host's terminal; an export of the Activity page ends with that head. A head kept elsewhere is checked with
+  `audit verify --anchor <head>`, and `--no-key` checks as someone holding no key would (reading nothing
+  beyond the database's own tables). **`python dockvault.py audit
   acknowledge`** and the other host commands (`rekey`, `after-record`, `accept-database-head`,
   `accept-restore`, `acknowledge-removed-before`, `change-key`) write their seals audited as the host
   operator; `after-record --discard` saves the seals it deletes in a file beside the head record.

@@ -23,7 +23,13 @@ The algorithm, in order:
 8. outside the chain: rows naming an account that is not theirs, account rows unlinked from an account that
    still exists, rows before the chain's first hour or dated ahead, undated rows, and hooks on the tables.
 
-With ``--anchor dvchain1:...`` and no key, the links up to the anchor authenticate every seal up to it.
+With ``--anchor dvchain1:...`` and no key, the links up to the anchor authenticate every seal up to it; a later
+prune, rewrite or erase that changes an hour the anchor covered is reported as not authenticated (a warning),
+and an anchor whose seal a restore lost is reported against that restore seal.
+
+Information, for good: what each prune, rewrite, erase, acknowledgment and restore did, the hours a restore
+sealed again and the ones it found changed, a restore that accepted history under a key the chain had left,
+and each gap of more than 12 hours in the seals' times with the requests it pushed back.
 """
 from __future__ import annotations
 
@@ -441,9 +447,12 @@ def _record_after(record, generation) -> Dict[int, dict]:
 
 def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, current_key_id: Optional[str] = None,
            anchor: Optional[str] = None, from_hour: Optional[datetime] = None, to_hour: Optional[datetime] = None,
-           check_rows: bool = True, now: Optional[datetime] = None, key_shared: bool = False) -> Report:
+           check_rows: bool = True, now: Optional[datetime] = None, key_shared: bool = False,
+           information: bool = True) -> Report:
     """Verify the chain in ``db``. ``record`` is the head record (None off the server); ``held`` the keys
-    this verifier holds, by id. Rows are rebuilt for the hours in [from_hour, to_hour) (all when None)."""
+    this verifier holds, by id. Rows are rebuilt for the hours in [from_hour, to_hour) (all when None).
+    ``information`` False leaves out what each seal did (the daily check keeps only failures and warnings, and
+    a long chain holds a prune seal for nearly every hour)."""
     ai = _ai()
     now = now or ai.utcnow()
     report = Report()
@@ -457,6 +466,9 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
     anchor_seq = anchor_link = None
     if anchor:
         anchor_seq, anchor_link = fmt.parse_head(anchor)
+    anchor_bad: Optional[str] = None       # "differs" or "short": judged once every restore seal is known
+    anchor_covers = None                   # the end of the newest hour sealed at the anchor, when it matched
+    verified: set = set()                  # the seals whose MAC this check verified
     uncovered: List[int] = []
     prev_link = fmt.LINK_0
     expected = 1
@@ -486,6 +498,8 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
         if k is not None:
             if not ai._mac_ok(k, link, seal.mac):
                 report.add(FAILURE, "mac-invalid", f"seal {seal.seq}'s MAC does not verify", seal.seq)
+            else:
+                verified.add(seal.seq)
         else:
             uncovered.append(seal.seq)
         if seal.kind == "key":
@@ -519,7 +533,7 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
             report.add(FAILURE, "head-record-mismatch", f"seal {rec_seq} is not the one the head record holds",
                        seal.seq)
         if anchor_seq is not None and seal.seq == anchor_seq and link != anchor_link:
-            report.add(FAILURE, "anchor-mismatch", f"seal {anchor_seq} is not the one the anchor names", seal.seq)
+            anchor_bad = "differs"
         if rec_seq is not None and seal.seq > rec_seq:
             entry = after.get(seal.seq)
             if ai.is_host_kind(seal) and entry is None:
@@ -532,8 +546,18 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
                            "waits for the host", seal.seq)
         if seal.kind == "hour":
             hour_seals.append(seal)
+        if anchor_covers is not None and seal.seq not in verified:
+            for hour in changed_hours(seal):
+                if hour < anchor_covers:
+                    report.add(WARNING, "changed-after-anchor",
+                               f"hour {fmt.hour_text(hour)} changed after the anchor by seal {seal.seq} ({seal.kind}, "
+                               "not authenticated)", seal.seq, fmt.hour_text(hour))
+        if information:
+            _event(view, seal, report)
         view.accept(seal, link)
         prev_link = link
+        if anchor_seq is not None and seal.seq == anchor_seq and anchor_bad is None:
+            anchor_covers = view.newest_hour_end or datetime.min
     report.seals = view.position
     if view.position:
         report.head = fmt.head(view.position, view.link_at(view.position))
@@ -545,7 +569,15 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
     if record is None and rec_seq is None and view.position and anchor is None:
         pass
     if anchor_seq is not None and view.position < anchor_seq:
-        report.add(FAILURE, "anchor-mismatch", f"the chain ends at seal {view.position}, before the anchor's seal")
+        anchor_bad = "short"
+    if anchor_bad:
+        _anchor_lost(view, report, anchor_seq, anchor_link, anchor_bad, verified)
+    elif anchor_seq is not None:
+        # The links authenticate every seal up to a matching anchor.
+        uncovered = [s for s in uncovered if s > anchor_seq]
+    if information:
+        _restore_findings(view, report)
+        _gap_findings(view, record, report)
     if uncovered:
         report.add(FAILURE if held else INFO, "key-unverified" if held else "not-checked",
                    f"{len(uncovered)} seals are under a key this check does not hold, and no later verified key "
@@ -577,6 +609,152 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
         _rows(db, view, report, from_hour, to_hour)
     _outside(db, view, report, now)
     return report
+
+
+def changed_hours(seal) -> List[datetime]:
+    """The hours a prune, rewrite or erase seal changes."""
+    d = seal.detail or {}
+    if seal.kind in ("prune", "rewrite"):
+        out = []
+        for h in d.get("hours") or []:
+            try:
+                out.append(fmt.parse_time_text(h[0]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+    if seal.kind == "erase" and d.get("hour"):
+        try:
+            return [fmt.parse_time_text(d["hour"])]
+        except (TypeError, ValueError):
+            return []
+    return []
+
+
+def _event(view, seal, report: Report) -> None:
+    """Information, for good: what a prune, rewrite, erase or acknowledgment did (read before ``view`` accepts
+    it, so a prune's removed rows are counted against the hour's root before it)."""
+    d = seal.detail or {}
+    when = fmt.time_text(seal.sealed_at)
+    if seal.kind in ("prune", "rewrite"):
+        hours = d.get("hours") or []
+        removed = 0
+        for h in hours:
+            try:
+                entry = view.entry_for(fmt.parse_time_text(h[0]))
+                if entry is not None and not entry.is_run:
+                    removed += max(0, int(entry.root.count) - int(h[2]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if seal.kind == "prune":
+            report.add(INFO, "pruned", f"seal {seal.seq} on {when}: {d.get('reason')} prune of {len(hours)} hours, "
+                                       f"{removed} rows removed", seal.seq)
+        else:
+            report.add(INFO, "rewritten", f"seal {seal.seq} on {when}: a rewrite of {len(hours)} hours "
+                                          f"({d.get('reason')})", seal.seq)
+    elif seal.kind == "erase":
+        report.add(INFO, "erased", f"seal {seal.seq} on {when}: {len(d.get('rows') or [])} rows of hour "
+                                   f"{d.get('hour')} erased for request {d.get('request_seq')}"
+                                   + (" (its last)" if d.get("final") else ""), seal.seq)
+    elif seal.kind == "ack":
+        parts = []
+        if d.get("acknowledges"):
+            parts.append("seals " + ", ".join(map(str, d["acknowledges"])))
+        if d.get("failures"):
+            parts.append("failures " + ", ".join(str(f[0] if isinstance(f, list) else f) for f in d["failures"]))
+        if d.get("rows"):
+            parts.append(f"{len(d['rows'])} rows")
+        if d.get("discarded"):
+            parts.append("discarded seals " + ", ".join(str(x[0] if isinstance(x, list) else x)
+                                                        for x in d["discarded"]))
+        report.add(INFO, "acknowledged", f"seal {seal.seq} on {when}, by {d.get('by')}: "
+                                         + ("; ".join(parts) or "nothing"), seal.seq)
+
+
+def _anchor_lost(view, report: Report, seq: int, link: bytes, how: str, verified: set) -> None:
+    """An anchor whose seal the chain no longer holds: reported against the restore seal whose lost range takes it
+    in (as not authenticated when this check could not verify that restore seal), or a failure."""
+    for rseq, d in view.restores:
+        try:
+            first, last = int(d.get("lost_from_seq")), int(d.get("lost_through_seq"))
+        except (TypeError, ValueError):
+            continue
+        if not first <= seq <= last:
+            continue
+        if seq == last and d.get("lost_head"):
+            try:
+                if fmt.parse_head(d["lost_head"])[1] != link:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        sure = rseq in verified
+        report.add(INFO if sure else WARNING, "anchor-lost",
+                   f"the anchor's seal {seq} was lost when the database went back: restore seal {rseq} "
+                   f"({d.get('cause')}) on {fmt.time_text(view.at(rseq))} lost seals {first}-{last}"
+                   + ("" if sure else " (not authenticated)"), rseq)
+        return
+    if how == "short":
+        report.add(FAILURE, "anchor-mismatch", f"the chain ends at seal {view.position}, before the anchor's seal")
+    else:
+        report.add(FAILURE, "anchor-mismatch", f"seal {seq} is not the one the anchor names", seq)
+
+
+def _restore_findings(view, report: Report) -> None:
+    """Information, for good, from each restore seal: what it lost, what it sealed again, and its key."""
+    for seq, d in view.restores:
+        when = fmt.time_text(view.at(seq))
+        lost = (f"seals {d.get('lost_from_seq')}-{d.get('lost_through_seq')} lost"
+                if d.get("lost_from_seq") is not None else "no seal it could name lost")
+        acks = d.get("acknowledges") or []
+        report.add(INFO, "restored",
+                   f"seal {seq}: a {d.get('cause')} restore accepted by the host operator on {when}: {lost}"
+                   + (", the head record missing" if d.get("record_missing") else "")
+                   + (f", seals {', '.join(map(str, acks))} of the backup's window acknowledged" if acks else "")
+                   + f"; nothing deleted until {d.get('grace_until')}", seq)
+        hours = d.get("hours") or {}
+        if (hours.get("lost") or hours.get("changed") or hours.get("days_changed")
+                or hours.get("deleted_through_seq") is not None):
+            parts = []
+            if hours.get("lost"):
+                parts.append(f"hours {hours['lost'][0]} to {hours['lost'][1]} sealed again from their rows")
+            if hours.get("changed"):
+                parts.append("changed: " + ", ".join(f"{h} ({a} rows recorded, {b} now)"
+                                                     for h, a, b in hours["changed"]))
+            if hours.get("days_changed"):
+                parts.append("days changed: " + ", ".join(map(str, hours["days_changed"])))
+            parts.append(f"compared from {hours.get('compared_from') or 'nothing'}")
+            if hours.get("deleted_through_seq") is not None:
+                parts.append(f"seals through {hours['deleted_through_seq']} were deleted, not lost with an older "
+                             "copy")
+            report.add(INFO, "resealed-after-restore", f"restore seal {seq}: " + "; ".join(parts), seq)
+        under = d.get("under_left_key")
+        if under:
+            first = d.get("lost_from_seq") or seq
+            report.add(INFO, "restored-under-left-key",
+                       f"history from seal {first} was accepted by the host operator on {when} from a database whose "
+                       f"chain ended under key {under.get('key_id')}, which the chain had left at seal "
+                       f"{under.get('left_at_seq')}; anyone holding it could have written it", seq)
+
+
+def _gap_findings(view, record: Optional[dict], report: Report) -> None:
+    """Information: each gap of more than 12 hours in the seals' times, with the requests it pushed back; on the
+    server, also each gap that shows only once another writer's seals sit where the server first accepted them."""
+    from app.core import audit_chain_times as times
+    chain, server = times.timelines(view, record)
+    seen = set()
+    for label, timeline in (("", chain), (" (another writer's seals placed where the server accepted them)", server)):
+        for g, a, b in timeline.gaps:
+            if (a, b) in seen:
+                continue
+            seen.add((a, b))
+            pushed = []
+            for r in sorted(view.requests):
+                ends = [e for e in (view.cancels.get(r), view.applied.get(r), view.finals.get(r)) if e is not None]
+                if r < g and (not ends or min(ends) >= g):
+                    pushed.append(r)
+            hours = (b - a) / 3_600_000_000
+            report.add(INFO, "gap", f"no seal from {fmt.time_text(times.dt(a))} to {fmt.time_text(times.dt(b))} "
+                                    f"({hours:.1f} hours){label}; requests pushed back by it: "
+                                    + (", ".join(map(str, pushed)) or "none"), g)
 
 
 def _coverage(view, hour_seals, report: Report, now: datetime) -> None:
@@ -820,7 +998,7 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
         keys_held = {k: v.key for k, v in st.keys_held().items()}
         report = verify(db, record=record, held=keys_held, current_key_id=st.current_key().key_id,
                         from_hour=ai.hour_floor(now) - timedelta(days=7), now=now,
-                        key_shared=st.current_key().source == "encryption")
+                        key_shared=st.current_key().source == "encryption", information=False)
         rolling_from = (record.get("check") or {}).get("rolling_from")
         older = [h for h in st.view.single_hours() if h < ai.hour_floor(now) - timedelta(days=7)]
         if older:

@@ -78,6 +78,13 @@ def test_a_rollback_prune_is_sealed_over_once_its_shape_and_age_check_out(env):
          "retention_days": 34} for p in prunes]
     report = env.verify()
     assert failures(report) == []
+    # Reported for good, each prune with its reason and what it removed.
+    pruned = [f for f in report.findings if f.kind == "pruned"]
+    assert [f.seq for f in pruned] == [p.seq for p in prunes]
+    assert all(f.severity == "information" and "external prune of" in f.message for f in pruned)
+    with env.session() as db:
+        gone = len(_ids) - db.query(AuditLog).filter(AuditLog.id.in_(_ids)).count()
+    assert gone and sum(int(f.message.split(" rows removed")[0].split(", ")[-1]) for f in pruned) == gone
     env.clock.advance(hours=1)
     assert env.seal().stopped is None
 

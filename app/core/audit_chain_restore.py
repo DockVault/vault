@@ -147,6 +147,22 @@ def parting(view, record: dict) -> dict:
             "prefix": first_mismatch is None}
 
 
+def lost_range(view, record: Optional[dict]) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """(lost_from_seq, lost_through_seq, lost_head): the recorded seals the database's chain does not hold. When
+    the database's chain is a prefix of the recorded one, from the seal after its newest; when the two part, from
+    the seal after the last recorded link that still matches (the parting point lies after it, and no seal
+    before it differs), through the recorded head. (None, None, head) when nothing recorded is lost."""
+    if not record or not record.get("seq") or not record.get("link"):
+        return None, None, None
+    seq = int(record["seq"])
+    head = fmt.head(seq, bytes.fromhex(record["link"]))
+    part = parting(view, record)
+    first = view.position + 1 if part["prefix"] else (part["last_match"] or 0) + 1
+    if first > seq:
+        return None, None, head
+    return first, seq, head
+
+
 def left_key(view, record: dict) -> Optional[dict]:
     """The key the database's chain ends under, when the recorded chain had left it (in any generation)."""
     kid = view.key_in_force()
@@ -478,10 +494,9 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
         missing = _confirm_missing(needed, confirm)
         if missing:
             raise Refused("confirm by name first: " + ", ".join(missing))
-        restored = {"cause": "database",
-                    "lost_from_seq": view.position + 1 if record and int(record["seq"]) > view.position else None,
-                    "lost_through_seq": int(record["seq"]) if record and int(record["seq"]) > view.position else None,
-                    "lost_head": fmt.head(int(record["seq"]), bytes.fromhex(record["link"])) if record else None,
+        lost_from, lost_through, lost_head = lost_range(view, record)
+        restored = {"cause": "database", "lost_from_seq": lost_from, "lost_through_seq": lost_through,
+                    "lost_head": lost_head,
                     "record_missing": record is None, "under_left_key": under, "acknowledges": [],
                     "hours": {"lost": hours["lost"], "compared_from": hours["compared_from"],
                               "changed": hours["changed"], "days_changed": hours["days_changed"],
@@ -695,7 +710,11 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
         host_audit_row(w.db, RESTORED_ACTION, {"cause": "backup", "bundle": mark.get("bundle"),
                                                "acknowledges": window})
         new_generation = max(int(record.get("generation") or 1), int((replaced or {}).get("generation") or 1)) + 1
-        detail = {"cause": "backup", "lost_from_seq": None, "lost_through_seq": None, "lost_head": None,
+        # The replaced record's seals the restored database does not hold: an anchor taken from them is
+        # reported against this seal.
+        lost_from, lost_through, lost_head = lost_range(view, replaced)
+        detail = {"cause": "backup", "lost_from_seq": lost_from, "lost_through_seq": lost_through,
+                  "lost_head": lost_head,
                   "record_missing": False, "under_left_key": under, "acknowledges": window,
                   "hours": {"lost": None, "compared_from": None, "changed": [], "days_changed": [],
                             "deleted_through_seq": None},

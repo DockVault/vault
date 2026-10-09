@@ -197,7 +197,10 @@ def test_a_seal_refused_on_its_face_is_discarded_with_its_rows_saved(env):
     # The server's process, which read the chain before, rebuilds its view from the higher discard count.
     env.clock.advance(hours=1)
     assert env.seal().stopped is None
-    assert failures(env.verify()) == []
+    report = env.verify()
+    assert failures(report) == []
+    told = [f for f in report.findings if f.kind == "acknowledged" and f.seq == ack.seq]
+    assert told and "by host" in told[0].message and f"discarded seals {seq}" in told[0].message
 
 
 def test_a_discard_that_fails_leaves_the_seals_and_writes_no_ack(env, monkeypatch):
@@ -286,4 +289,6 @@ def test_after_record_accepts_another_writers_listed_seals_for_good(env):
     env.clock.advance(minutes=30)
     env.seal()
     assert seq not in ai.unacknowledged_foreign(env.st.view, env.st.head_store().load())
-    assert "after-record" not in env.verify().kinds("warning")
+    report = env.verify()
+    assert "after-record" not in report.kinds("warning")
+    assert any(f.kind == "acknowledged" and f"by host: seals {seq}" in f.message for f in report.findings)
