@@ -181,6 +181,9 @@ _IDENTIFIER_KEYS = (
     # a listing or a search under a case: the folder listed, and of a search the query's length (never its text),
     # how many names it read, whether it stopped early, and how many matched
     "folder_id", "query_length", "scanned", "truncated", "matches",
+    # an export from a case: its id, how many files were exported, missing, unreadable or did not match their
+    # stored checksum, and the SHA-256 of its manifest (a digest of the export's own list, never of a file)
+    "export_id", "file_count", "manifest_sha256", "missing", "unreadable", "mismatched",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

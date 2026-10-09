@@ -161,6 +161,9 @@ ROUTE_RULES: Sequence[Tuple[Tuple[str, ...], str, BodyRule, str]] = (
     (_POST, "/compliance/cases/{case_id}/vaults/{vault_id}/unlock",
      BodyRule("case_query", PUBLIC_LIMIT, needs_session=True),
      "a vault password, to unlock that vault in a case"),
+    (_POST, "/compliance/cases/{case_id}/exports",
+     BodyRule("case_export_request", 512 * KiB, needs_session=True),
+     "the ids of at most 10,000 files to export from a case, about 40 bytes each"),
 ) + tuple((m, t, PUBLIC, "a public route: a handful of short fields") for m, t in _PUBLIC_ROUTES)
 
 

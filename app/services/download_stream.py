@@ -117,6 +117,16 @@ class BoundedDownload:
         """The plaintext, one piece at a time, with the checksum enforced before the last one."""
         return verified_stream(self._chunks, self.checksum)
 
+    def pieces(self):
+        """The plaintext, one piece at a time, WITHOUT the checksum check.
+
+        For a caller that compares the checksum itself and records the answer instead of stopping: a compliance
+        case's export writes every stored byte into its archive and says in its manifest whether they match what
+        was stored (`checksum`), where a download would cut the response short. Record-level authentication still
+        applies, inside the reader. Everyone else uses :meth:`chunks`.
+        """
+        return iter(self._chunks)
+
     def verify_now(self):
         """Consume the whole stream and check it, before any response exists.
 

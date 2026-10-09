@@ -376,7 +376,7 @@ def test_search_reads_at_most_its_cap_of_names_and_says_so(db, people, storage, 
 # --------------------------------------------------------------------------- every refusal, recorded
 
 def _every_route(db, people, case, f):
-    """Each reading route of the case, as a call."""
+    """Each reading route of the case (and the export's two), as a call."""
     return {
         "tree": lambda who: _tree(db, people, case, people.v1, who=who),
         "vaults": lambda who: _tree(db, people, case, who=who),
@@ -388,6 +388,11 @@ def _every_route(db, people, case, f):
                                                    current_user=who, db=db),
         "search": lambda who: cr.search_case(case.id, cr.CaseSearch(q="m"), _request(), x_case_unlock=None,
                                              current_user=who, db=db),
+        # Exporting checks the case first too, before anything else (and before any code is asked for).
+        "export": lambda who: cr.prepare_case_export(case.id, cr.ExportRequest(all=True), _request(),
+                                                     x_case_unlock=None, current_user=who, db=db),
+        "fetch": lambda who: cr.fetch_case_export(case.id, uuid.uuid4(), _request(), x_case_unlock=None,
+                                                  current_user=who, db=db),
     }
 
 

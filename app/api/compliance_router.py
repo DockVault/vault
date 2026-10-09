@@ -37,7 +37,8 @@ password-protected vault's names on that page. Their routes follow the cases'.
 
 Reading a case (app/core/case_access.py, the only code that opens a file for a case): its vaults and folders, a
 file's metadata, content and rendered preview, unlocking a password-protected vault with its password, and
-searching file names. Their routes are at the end of this module; each asks for no endpoint group and no
+searching file names; and exporting its files (app/core/case_export.py), prepared with the step-up and fetched
+once as a streamed archive. Their routes are at the end of this module; each asks for no endpoint group and no
 permission, and records what it reads and every refusal.
 """
 from __future__ import annotations
@@ -1301,3 +1302,99 @@ def search_case(case_id: uuid.UUID, body: CaseSearch, request: Request,
                                   unlocked=unlocked)
     except case_access.Refused as refused:
         _read_refused(db, case_id, current_user, refused, resource_type="case", resource_id=case_id)
+
+
+# --------------------------------------------------------------------------- exporting from a case
+# (app/core/case_export.py)
+#
+#     POST /compliance/cases/{id}/exports                {file_ids} or {all: true}, with the step-up: an export id
+#     GET  /compliance/cases/{id}/exports/{export_id}    the archive, streamed, once, by the auditor who made it
+
+
+class ExportRequest(BaseModel):
+    file_ids: Optional[list[uuid.UUID]] = Field(default=None, max_length=10_000)
+    all: bool = False
+
+
+@router.post("/compliance/cases/{case_id}/exports", status_code=201)
+def prepare_case_export(case_id: uuid.UUID, body: ExportRequest, request: Request,
+                        x_case_unlock: Optional[str] = Header(default=None),
+                        current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Prepare an export of the case's files (or of the ones named), with the compliance step-up: checked as reading
+    each one is, before the code is asked for (a refused export costs no code) and again after. Returns the id to
+    fetch it with, once."""
+    from app.core import case_access
+    from app.core import case_export
+
+    def chosen():
+        case, unlocked = _reader(case_id, current_user, db, request, x_case_unlock)
+        case_export.check(case)
+        return case, unlocked, case_export.choose(db, case, file_ids=body.file_ids, every=body.all,
+                                                  unlocked=unlocked)
+
+    limit_statements(db)
+    try:
+        chosen()
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="case", resource_id=case_id)
+    db.rollback()
+    STEP_UP_CASE_EXPORT(db, current_user, request)
+    limit_statements(db)
+    try:
+        case, unlocked, found = chosen()
+        export = case_export.prepare(db, case, current_user, found, unlocked=unlocked)
+        db.commit()
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="case", resource_id=case_id)
+    return {"export_id": str(export.id), "files": export.file_count, "bytes": export.total_bytes,
+            "expires_at": export.expires_at.isoformat() + "Z"}
+
+
+def _stream_sessions(db: Session):
+    """New sessions on the request's database, each with the statement timeout: what an export's stream reads with
+    while the request's own session may be gone."""
+    from sqlalchemy.orm import sessionmaker
+    make = sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)
+
+    def session():
+        s = make()
+        limit_statements(s)
+        return s
+    return session
+
+
+@router.get("/compliance/cases/{case_id}/exports/{export_id}")
+def fetch_case_export(case_id: uuid.UUID, export_id: uuid.UUID, request: Request,
+                      x_case_unlock: Optional[str] = Header(default=None),
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """The export's archive, streamed as it is built (ZIP64): once, by the auditor who prepared it, with their own
+    session (no link to leak). Each owner is told before the first byte; the end, or a stop before it, is
+    recorded."""
+    import anyio
+    from fastapi.responses import StreamingResponse
+    from starlette.concurrency import iterate_in_threadpool
+    from app.api.api_server import _current_session_hash
+    from app.core import case_access
+    from app.core import case_export
+    limit_statements(db)
+    try:
+        case, export, entries = case_export.claim(db, case_id, export_id, current_user,
+                                                  unlocked_given=case_access.parse_unlock_header(x_case_unlock),
+                                                  session_hash=_current_session_hash(request))
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="case", resource_id=case_id)
+    name = f"case-{case.number or 'export'}-{str(export.id)[:8]}.zip"
+    parts = case_export.ExportStream(_stream_sessions(db), case.id, export.id, current_user.id, entries)
+
+    async def body():
+        try:
+            async for piece in iterate_in_threadpool(parts):
+                if piece:
+                    yield piece
+        finally:
+            # A stream stopped by the client, or never started, ends here too: recorded, off the event loop.
+            await anyio.to_thread.run_sync(parts.close)
+
+    return StreamingResponse(body(), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{name}"',
+                                      "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
