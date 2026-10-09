@@ -808,9 +808,10 @@ def purge(session_factory, *, now: Optional[datetime] = None, batch: int = 200,
                 limit_statements(db)
             candidates = [r[0] for r in db.query(HeldFile.vault_id).filter(purgeable_vaults_clause(HeldFile, now))
                           .distinct().limit(batch).all()]
-            # The vaults' rows first (FOR KEY SHARE, which no deletion waits for): a vault whose row a placing or an
-            # undo holds FOR UPDATE now is left for the next pass, so nothing is purged from under a hold that is
-            # being placed or restored; one that takes the row after this waits for this transaction.
+            # The vaults' rows first (FOR NO KEY UPDATE, SKIP LOCKED: the mode a deletion in the vault takes too): a
+            # vault whose row a placing or an undo holds FOR UPDATE now, or a deletion holds, is left for the next
+            # pass, so nothing is purged from under a hold that is being placed or restored; one that takes the row
+            # after this waits for this transaction.
             locked = []
             for vid in sorted(candidates, key=str):
                 got = (db.query(Vault.id).filter(Vault.id == vid)
