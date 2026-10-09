@@ -3569,15 +3569,22 @@ async function showCreateVault() {
             const allowed = Array.isArray(f && f.allowed_vault_types) ? f.allowed_vault_types : [];
             const standardBlocked = allowed.length > 0 && !allowed.includes('standard');
             const forceZk = must || (on && standardBlocked);
+            // A plan cap of 0 zero-knowledge vaults, or an allowlist without them, is not
+            // something an administrator can switch on in Settings (the switches are locked
+            // there), so the note names the plan or the deployment instead.
+            const planAllowsNone = !!f && f.max_zk_vaults === 0;
+            const zkBlocked = allowed.length > 0 && !allowed.includes('zero_knowledge');
 
             if (!on && !must) {
-                // Zero-knowledge not offered — standard only. Say WHY (plan vs admin
+                // Zero-knowledge not offered — standard only. Say WHY (plan, deployment or admin
                 // toggle) instead of silently omitting the option (textContent, no HTML).
                 grp.style.display = 'none';
                 if (note) {
-                    note.textContent = planHasZk
-                        ? 'Zero-knowledge vaults are turned off for this workspace. An administrator can enable them in Settings.'
-                        : 'Zero-knowledge vaults are not available on your current plan.';
+                    note.textContent = (!planHasZk || planAllowsNone)
+                        ? 'Zero-knowledge vaults are not available on your current plan.'
+                        : zkBlocked
+                            ? 'Zero-knowledge vaults are not allowed on this deployment.'
+                            : 'Zero-knowledge vaults are turned off for this workspace. An administrator can enable them in Settings.';
                     note.style.display = '';
                 }
             } else if (forceZk) {

@@ -130,3 +130,35 @@ def test_zero_knowledge_unavailable_hides_chooser_and_shows_password(logged_in: 
     expect(page.locator("#zk-unavailable-note")).to_be_visible()
     expect(page.locator("#vault-password-group")).to_be_visible()
     assert page.evaluate("effectiveVaultType()") == "standard"
+
+
+# What /zk-enabled answers where zero-knowledge cannot be made, and the reason the form gives. Only the
+# administrators' own switch can be turned on in Settings; a plan without zero-knowledge, a plan cap of 0
+# and an allowlist without it lock the switches there, so the form names the plan or the deployment.
+# test_zero_knowledge_settings_save.py checks that the server answers these four cases this way.
+UNAVAILABLE = {
+    "switched off": ({"plan_zero_knowledge": True, "max_zk_vaults": -1,
+                      "allowed_vault_types": ["standard", "zero_knowledge"]},
+                     "Zero-knowledge vaults are turned off for this workspace. "
+                     "An administrator can enable them in Settings."),
+    "a plan without it": ({"plan_zero_knowledge": False, "max_zk_vaults": -1,
+                           "allowed_vault_types": ["standard", "zero_knowledge"]},
+                          "Zero-knowledge vaults are not available on your current plan."),
+    "a plan cap of 0": ({"plan_zero_knowledge": True, "max_zk_vaults": 0,
+                         "allowed_vault_types": ["standard", "zero_knowledge"]},
+                        "Zero-knowledge vaults are not available on your current plan."),
+    "an allowlist without it": ({"plan_zero_knowledge": True, "max_zk_vaults": -1,
+                                 "allowed_vault_types": ["standard"]},
+                                "Zero-knowledge vaults are not allowed on this deployment."),
+}
+
+
+@pytest.mark.parametrize("case", list(UNAVAILABLE))
+def test_the_form_says_why_zero_knowledge_is_unavailable(logged_in: Page, case):
+    page = logged_in
+    fields, reason = UNAVAILABLE[case]
+    _stub_zk_enabled(page, {"zero_knowledge_enabled": False, "must_use_zk": False, **fields})
+    _open_create_vault(page)
+    expect(page.locator("#vault-type-group")).to_be_hidden()
+    expect(page.locator("#zk-unavailable-note")).to_have_text(reason)
+    assert page.evaluate("effectiveVaultType()") == "standard"

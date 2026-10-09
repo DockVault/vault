@@ -283,3 +283,24 @@ def test_the_vault_form_is_told_a_cap_of_none_is_no_zero_knowledge(db, monkeypat
         (False, False, False)
     assert got["max_zk_vaults"] == 0
 
+@pytest.mark.parametrize("plan, saved, fields", [
+    ({}, {"zero_knowledge_enabled": False},
+     {"plan_zero_knowledge": True, "max_zk_vaults": -1, "allowed_vault_types": ["standard", "zero_knowledge"]}),
+    ({"plan_zero_knowledge": False}, {},
+     {"plan_zero_knowledge": False, "max_zk_vaults": -1, "allowed_vault_types": ["standard", "zero_knowledge"]}),
+    ({"plan_max_zk_vaults": 0}, {},
+     {"plan_zero_knowledge": True, "max_zk_vaults": 0, "allowed_vault_types": ["standard", "zero_knowledge"]}),
+    ({"plan_allowed_vault_types": "standard"}, {},
+     {"plan_zero_knowledge": True, "max_zk_vaults": -1, "allowed_vault_types": ["standard"]}),
+])
+def test_the_vault_form_is_told_why_zero_knowledge_is_unavailable(db, monkeypatch, plan, saved, fields):
+    """The four answers test_ui_create_vault_modal.py gives the vault form to name the reason (the
+    administrators' switch, a plan without zero-knowledge, a cap of 0, an allowlist without it) are the
+    server's own."""
+    if saved:
+        _put(db, saved)
+    for name, value in plan.items():
+        monkeypatch.setattr(settings, name, value)
+    got = _zk_enabled_route(db, _person(db))
+    assert (got["zero_knowledge_enabled"], got["must_use_zk"]) == (False, False)
+    assert {k: got[k] for k in fields} == fields
