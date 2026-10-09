@@ -23,9 +23,10 @@ The rules, so that no mix of them leaves a person with no vault type to make:
   and nobody must make one, whatever the plan's force or the administrators' switches say.
 - The two switches change something only where the plan offers zero-knowledge without forcing it and both
   types are allowed. Elsewhere they are locked: GET /settings says why, the settings page shows them
-  disabled and does not send them, and a save that tries to change one is refused with that reason. Their
-  saved values are kept, and apply again when the plan or the allowed types change back: a save made while
-  the plan lacked zero-knowledge no longer switches it off for good.
+  disabled and does not send them, and a save never stores one: a value a settings page may be showing for
+  it (an older page among them) is taken out, and any other value is refused with that reason. Their saved
+  values are kept, and apply again when the plan or the allowed types change back: a save made while the
+  plan lacked zero-knowledge no longer switches it off for good.
 
 A zero-knowledge cap that is reached is not a lock: it is a quota, refused at create with its own message
 (the plan's N vaults are in use), and lifted by deleting one or a larger plan.
@@ -116,19 +117,29 @@ def switch_lock(allowed: Set[str]) -> Optional[str]:
 
 
 def settle_switches(payload: Mapping, stored: Mapping, allowed: Set[str]) -> dict:
-    """The payload a settings save may store, as to the two switches. Where the switches are locked, a value
-    equal to the saved one is taken out (nothing changes, and a switch never saved stays never saved); a
-    different value is refused with the reason (ValueError). Where they are not locked, the payload is
-    unchanged."""
+    """The payload a settings save may store, as to the two switches. Where they are not locked, the payload
+    is unchanged. Where they are locked, a switch is never stored: a value a settings page may be showing
+    for it is taken out (nothing changes, and a switch never saved stays never saved), and any other value
+    is refused with the reason (ValueError).
+
+    A page may be showing a locked switch as saved, or as in effect (this page shows it in effect). A page
+    loaded before the switches could be locked sends both on every save, as it showed them: as saved, and
+    both on wherever the plan sets its force with zero-knowledge, whatever its cap or the allowed types (it
+    was told then that the plan forces zero-knowledge). Refusing those would refuse the whole save of such a
+    page, which the desktop app bundles and a tab left open across an upgrade still runs."""
     out = dict(payload or {})
     reason = switch_lock(allowed)
     if reason is None:
         return out
-    saved = {"zero_knowledge_enabled": switch_on(stored), "force_zero_knowledge": force_on(stored)}
+    shown = {"zero_knowledge_enabled": {switch_on(stored), in_effect(stored, allowed)},
+             "force_zero_knowledge": {force_on(stored), force_in_effect(stored, allowed)}}
+    if settings.plan_force_zero_knowledge and settings.plan_zero_knowledge:
+        for values in shown.values():
+            values.add(True)
     for key in SWITCHES:
         if key not in out:
             continue
-        if bool(out[key]) != saved[key]:
+        if bool(out[key]) not in shown[key]:
             raise ValueError(f"The zero-knowledge settings cannot be changed now: {reason} They are kept as "
                              "saved and apply again when that changes.")
         del out[key]

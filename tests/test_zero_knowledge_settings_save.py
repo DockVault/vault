@@ -7,9 +7,10 @@ back, an administrator had to switch them on again.
 
 Now GET /settings reports the switches as saved, what is in effect beside them, and why they are locked
 when they cannot change anything (the plan lacks or requires zero-knowledge, its cap is 0, or one vault
-type alone is allowed). A save that sends a locked switch at its saved value changes nothing; one that would
-change it is refused with that reason; and the page leaves locked switches out. The round trips below run
-the server's own GET and PUT on a throwaway SQLite database.
+type alone is allowed). A save never stores a locked switch: one sent as a settings page may be showing it
+(as saved, as in effect, or as a page from before the lock showed it) changes nothing, and any other value
+is refused with that reason; and the page leaves locked switches out. The round trips below run the
+server's own GET and PUT on a throwaway SQLite database.
 """
 import itertools
 import re
@@ -128,9 +129,9 @@ def test_a_save_while_the_plan_lacks_zero_knowledge_keeps_the_switches_for_when_
     _put(db, _page_payload(got))                                          # a save sends it back: nothing changes
     _put(db, {"directory_search_scope": "deployment"})                    # the page now leaves them out
     assert _stored(db) == {"zero_knowledge_enabled": True, "force_zero_knowledge": True}
-    # What the page used to send back (what was in effect) would change them: refused, with the reason.
-    detail = _refused(db, {"zero_knowledge_enabled": False, "force_zero_knowledge": False})
-    assert "cannot be changed now" in detail and "does not include zero-knowledge" in detail
+    # What a page loaded before the change sends back (what was in effect then) is taken out too: it used to
+    # store zero-knowledge off for good, and refusing it would refuse that page's whole save.
+    _put(db, {"zero_knowledge_enabled": False, "force_zero_knowledge": False, "directory_search_scope": "deployment"})
     assert _stored(db) == {"zero_knowledge_enabled": True, "force_zero_knowledge": True}
     assert _create(db, person, "standard") == "standard"
 
@@ -158,26 +159,36 @@ def test_while_the_plan_requires_zero_knowledge_the_administrators_choice_is_kep
     assert got["zero_knowledge_switches_locked"] == "This deployment's plan requires zero-knowledge vaults."
     assert (got["zero_knowledge_in_effect"], got["force_zero_knowledge_in_effect"]) == (True, True)
     _put(db, _page_payload(got))
-    assert "requires zero-knowledge" in _refused(db, {"zero_knowledge_enabled": True, "force_zero_knowledge": True})
+    # What a page from before the change sends under the plan's force (both on) is taken out, not stored
+    # and not refused; switching zero-knowledge off, which no page shows here, is refused with the reason.
+    _put(db, {"zero_knowledge_enabled": True, "force_zero_knowledge": True})
+    assert _stored(db) == {"zero_knowledge_enabled": True, "force_zero_knowledge": False}
+    assert "requires zero-knowledge" in _refused(db, {"zero_knowledge_enabled": False})
     monkeypatch.setattr(settings, "plan_force_zero_knowledge", False)
     assert _stored(db) == {"zero_knowledge_enabled": True, "force_zero_knowledge": False}
     assert _create(db, _person(db), "standard") == "standard"
 
 
-@pytest.mark.parametrize("name, value, reason", [
-    ("plan_max_zk_vaults", 0, "This deployment's plan allows no zero-knowledge vaults."),
-    ("plan_allowed_vault_types", "standard", "This deployment does not allow zero-knowledge vaults."),
+@pytest.mark.parametrize("name, value, reason, change", [
+    ("plan_max_zk_vaults", 0, "This deployment's plan allows no zero-knowledge vaults.",
+     {"force_zero_knowledge": True}),
+    ("plan_allowed_vault_types", "standard", "This deployment does not allow zero-knowledge vaults.",
+     {"force_zero_knowledge": True}),
     ("plan_allowed_vault_types", "zero_knowledge",
-     "This deployment allows only zero-knowledge vaults, so they cannot be turned off."),
+     "This deployment allows only zero-knowledge vaults, so they cannot be turned off.",
+     {"zero_knowledge_enabled": False}),
 ])
-def test_every_lock_keeps_the_saved_switches(db, monkeypatch, name, value, reason):
+def test_every_lock_keeps_the_saved_switches(db, monkeypatch, name, value, reason, change):
+    """Saved zero-knowledge on, force off. A save sending the switches as saved or as in effect changes
+    nothing; a value that is neither is refused with the reason."""
     _put(db, {"zero_knowledge_enabled": True, "force_zero_knowledge": False})
     monkeypatch.setattr(settings, name, value)
     got = _get(db)
     assert got["zero_knowledge_switches_locked"] == reason
     _put(db, _page_payload(got))
-    assert reason in _refused(db, {"zero_knowledge_enabled": False})
-    assert reason in _refused(db, {"force_zero_knowledge": True})
+    _put(db, {"zero_knowledge_enabled": got["zero_knowledge_in_effect"],
+              "force_zero_knowledge": got["force_zero_knowledge_in_effect"]})
+    assert reason in _refused(db, change)
     assert _stored(db) == {"zero_knowledge_enabled": True, "force_zero_knowledge": False}
 
 
@@ -307,3 +318,70 @@ def test_the_vault_form_is_told_why_zero_knowledge_is_unavailable(db, monkeypatc
     got = _zk_enabled_route(db, _person(db))
     assert (got["zero_knowledge_enabled"], got["must_use_zk"]) == (False, False)
     assert {k: got[k] for k in fields} == fields
+
+
+def _older_page_payload(got, zk_state):
+    """The two switches as the settings page before this release sends them (static/js/app.js up to 0.33.3,
+    which the desktop app's 0.2.0 previews bundle): each box checked when GET /settings said true, both
+    checked when /zk-enabled said the plan forces zero-knowledge, and both sent as shown, disabled or not."""
+    forced = zk_state.get("plan_force_zero_knowledge") is True
+    return {"zero_knowledge_enabled": forced or got.get("zero_knowledge_enabled") is True,
+            "force_zero_knowledge": forced or got.get("force_zero_knowledge") is True}
+
+
+def _what_the_previous_release_told_the_page(saved):
+    """What GET /settings and /zk-enabled answered before this release, for a tab loaded then and saved after
+    the upgrade: zero-knowledge as in effect by the rule of the time (off without the plan, on under its
+    force, else the switch, never saved counting as on), the force as saved, and the plan's force wherever the
+    plan set it together with zero-knowledge, whatever its cap or the allowed types."""
+    plan_zk, plan_force = bool(settings.plan_zero_knowledge), bool(settings.plan_force_zero_knowledge)
+    switch = saved.get("zero_knowledge_enabled")
+    zk = plan_zk and (plan_force or switch is None or bool(switch))
+    return ({"zero_knowledge_enabled": zk, "force_zero_knowledge": saved.get("force_zero_knowledge")},
+            {"plan_force_zero_knowledge": plan_force and plan_zk})
+
+
+def test_a_settings_page_from_before_this_release_still_saves(db, monkeypatch):
+    """A settings page from before this release (the desktop app's previews bundle one; a tab can stay open
+    across an upgrade) sends both switches on every save, as it showed them. For every mix of the plan, the
+    allowed types and the two saved switches, and both for such a page reading this server and for a tab
+    loaded before the upgrade, its save is accepted with the rest of the page's settings; where the switches
+    are locked nothing about them changes (a switch never saved stays never saved), and where they are not
+    they are saved as sent. Under the plan's force such a page sends both switches on, which used to refuse
+    the whole save wherever the administrators had not saved both on themselves."""
+    person = _person(db)
+    refused = []
+    for plan_zk, plan_force, cap, allowed, force, enabled in itertools.product(
+            (True, False), (True, False), (-1, 0, 2), ("", "standard", "zero_knowledge", "standard,zero_knowledge"),
+            (None, True, False), (None, True, False)):
+        mix = dict(plan_zk=plan_zk, plan_force=plan_force, cap=cap, allowed=allowed, force=force, enabled=enabled)
+        for name, value in (("plan_zero_knowledge", plan_zk), ("plan_force_zero_knowledge", plan_force),
+                            ("plan_max_zk_vaults", cap), ("plan_allowed_vault_types", allowed)):
+            monkeypatch.setattr(settings, name, value)
+        saved = {k: v for k, v in (("force_zero_knowledge", force), ("zero_knowledge_enabled", enabled))
+                 if v is not None}
+        db.execute(sa.delete(SystemSetting.__table__))
+        db.execute(sa.insert(SystemSetting.__table__).values(key="global", value=dict(saved)))
+        db.commit()
+        got = _get(db)
+        locked = got["zero_knowledge_switches_locked"] is not None
+        pages = {"this release": _older_page_payload(got, _zk_enabled_route(db, person)),
+                 "the previous release": _older_page_payload(*_what_the_previous_release_told_the_page(saved))}
+        for source, payload in pages.items():
+            db.execute(sa.delete(SystemSetting.__table__))
+            db.execute(sa.insert(SystemSetting.__table__).values(key="global", value=dict(saved)))
+            db.commit()
+            try:
+                _put(db, {**payload, "directory_search_scope": "same_department"})
+            except HTTPException as exc:
+                refused.append((mix, source, payload, exc.detail))
+                continue
+            db.expire_all()
+            assert db.get(SystemSetting, "global").value.get("directory_search_scope") == "same_department", mix
+            if locked:
+                assert _stored(db) == {k: saved.get(k) for k in SWITCHES}, (mix, source, payload)
+            else:
+                assert _stored(db) == payload, (mix, source, payload)
+    plans = sorted({(source, tuple(mix[k] for k in ("plan_zk", "plan_force", "cap", "allowed")))
+                    for mix, source, _payload, _detail in refused})
+    assert not refused, f"{len(refused)} saves refused, under {plans}; e.g. {refused[:2]}"

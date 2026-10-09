@@ -130,13 +130,45 @@ def test_a_save_of_a_locked_switch_keeps_it_as_saved(plan):
     plan(zk=False)
     stored = {"zero_knowledge_enabled": True}
     payload = {"zero_knowledge_enabled": True, "force_zero_knowledge": False, "other": 1}
-    assert R.settle_switches(payload, stored, BOTH) == {"other": 1}     # equal: taken out, nothing changes
+    assert R.settle_switches(payload, stored, BOTH) == {"other": 1}     # as saved: taken out, nothing changes
     assert payload == {"zero_knowledge_enabled": True, "force_zero_knowledge": False, "other": 1}
-    for change in ({"zero_knowledge_enabled": False}, {"force_zero_knowledge": True}):
-        with pytest.raises(ValueError, match="cannot be changed now: This deployment's plan does not include"):
-            R.settle_switches(change, stored, BOTH)
+    assert R.settle_switches({"zero_knowledge_enabled": False}, stored, BOTH) == {}   # as in effect: the same
+    with pytest.raises(ValueError, match="cannot be changed now: This deployment's plan does not include"):
+        R.settle_switches({"force_zero_knowledge": True}, stored, BOTH)
     plan(zk=True)
     assert R.settle_switches({"zero_knowledge_enabled": False}, stored, BOTH) == {"zero_knowledge_enabled": False}
+
+
+OFF = {"zero_knowledge_enabled": False, "force_zero_knowledge": False}
+
+
+@pytest.mark.parametrize("plan_args, allowed, stored, takes_out", [
+    # Each lock with each switch's saved value and value in effect; a value outside them is refused.
+    ({"zk": False}, BOTH, {"zero_knowledge_enabled": True}, ({True, False}, {False})),
+    ({"cap": 0}, BOTH, OFF, ({False}, {False})),
+    ({"force": True}, BOTH, {"zero_knowledge_enabled": True}, ({True}, {True, False})),
+    ({}, ZK_ONLY, {"zero_knowledge_enabled": True}, ({True}, {True, False})),
+    ({}, ZK_ONLY, OFF, ({True, False}, {True, False})),
+    ({}, STANDARD_ONLY, OFF, ({False}, {False})),
+    ({}, STANDARD_ONLY, {}, ({True, False}, {False})),
+    # Wherever the plan sets its force with zero-knowledge, a page from before the switches could be locked
+    # showed both on, whatever the cap or the allowed types: on is taken out as well.
+    ({"force": True}, STANDARD_ONLY, OFF, ({True, False}, {True, False})),
+    ({"force": True, "cap": 0}, BOTH, OFF, ({True, False}, {True, False})),
+    # Not where the plan sets its force without zero-knowledge: nothing was shown on there.
+    ({"zk": False, "force": True}, BOTH, OFF, ({False}, {False})),
+])
+def test_a_locked_switch_takes_out_what_a_page_may_show_and_refuses_the_rest(plan, plan_args, allowed, stored,
+                                                                             takes_out):
+    plan(**plan_args)
+    assert R.switch_lock(allowed) is not None
+    for key, accepted in zip(R.SWITCHES, takes_out):
+        for value in (True, False):
+            if value in accepted:
+                assert R.settle_switches({key: value, "other": 1}, stored, allowed) == {"other": 1}, (key, value)
+            else:
+                with pytest.raises(ValueError, match="cannot be changed now"):
+                    R.settle_switches({key: value, "other": 1}, stored, allowed)
 
 
 def test_the_server_reads_zero_knowledge_off_where_the_plan_offers_none_even_when_the_store_fails(plan):
