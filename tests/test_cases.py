@@ -778,6 +778,47 @@ def test_closing_with_a_standing_hold_asks_for_the_release_code(db, people, no_c
     assert no_codes == ["STEP_UP_HOLD_DECIDE"], "closing only removes power: no code"
 
 
+def test_an_auditor_whose_right_was_revoked_closes_alone_only_a_case_whose_hold_no_longer_stands(db, people,
+                                                                                               no_codes):
+    """Closing a case whose hold stands releases the hold: its auditor does that alone only while their right is in
+    force, as for a release; the refusal is recorded and asks for no code. Closing a case without a standing hold
+    only takes power away, so they still may; an independent administrator closes the other."""
+    held = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    unheld = _approve(db, _ask(db, people.uma, _vaults(people.v2), hold=False), people.bob)
+    rights.revoke(db, people.grant, actor=people.ada, reason="Left the team.")
+    db.commit()
+    assert cases.close_refusal(db, held, people.uma) == rights.NO_GRANT
+    with pytest.raises(HTTPException) as refused:
+        cr.close_case(held.id, cr.Reason(reason="Concluded."), request=None, current_user=people.uma, db=db)
+    assert refused.value.status_code == 403 and refused.value.detail["reason"] == rights.NO_GRANT
+    assert no_codes == [] and holds.standing(db, held.id) and held.status == "active"
+    assert _rows(db, "case_closed", "failure")[-1].details["reason"] == rights.NO_GRANT
+    assert cases.close_refusal(db, unheld, people.uma) is None
+    cr.close_case(unheld.id, cr.Reason(reason="Concluded."), request=None, current_user=people.uma, db=db)
+    assert unheld.status == "closed" and no_codes == []
+    assert cases.close_refusal(db, held, people.carl) is None
+
+
+def test_an_extension_once_access_ended_is_refused_before_any_code_and_the_case_says_so(db, people, no_codes,
+                                                                                        monkeypatch):
+    """Between the end of access and the clock's pass the case is still active: an extension then is refused for
+    the end of access (409) before the code is asked for, and the case page tells the administrator so."""
+    case = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    ended = case.access_ends_at
+    monkeypatch.setattr(cases, "utcnow", lambda: ended)
+    assert case.status == "active" and cases.extend_refusal(db, case, people.carl) == rules.ACCESS_ENDED
+    you_may = cases.case_view(db, case, people.carl, now=ended, detail=True)["you_may"]["extend"]
+    assert you_may["may"] is False and you_may["why_not"]["reason"] == rules.ACCESS_ENDED
+    with pytest.raises(HTTPException) as refused:
+        cr.extend_case(case.id, cr.Extension(days=1), request=None, if_match=f'"{case.version}"',
+                       current_user=people.carl, db=db)
+    assert refused.value.status_code == 409 and refused.value.detail["reason"] == rules.ACCESS_ENDED
+    assert no_codes == []
+    assert _rows(db, "case_extended", "failure")[-1].details["reason"] == rules.ACCESS_ENDED
+    db.expire_all()
+    assert case.access_ends_at == ended
+
+
 def test_the_vault_picker_names_only_what_the_auditor_can_already_read(db, people, monkeypatch):
     from app.core.authorization import PermissionService
     zk = _vault(db, people.olga, kind="zero_knowledge")
