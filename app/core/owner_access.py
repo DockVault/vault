@@ -32,6 +32,7 @@ OPENED_SHOWN = 200
 NAME_HIDDEN_PASSWORD = "password"
 NAME_HIDDEN_ZERO_KNOWLEDGE = "zero_knowledge"
 NAME_HIDDEN_GONE = "gone"
+NAME_HIDDEN_NOT_OWNER = "not_owner"
 
 
 def utcnow() -> datetime:
@@ -74,15 +75,19 @@ def _kept(db, case_id, vault_id) -> int:
 
 
 def _vault_facts(db, vault_id):
+    """(id, type, password hash, owner) of the vault now, or None when it is gone."""
     from app.core.models import Vault
-    return db.query(Vault.id, Vault.type, Vault.password_hash).filter(Vault.id == vault_id).first()
+    return db.query(Vault.id, Vault.type, Vault.password_hash, Vault.owner_id).filter(Vault.id == vault_id).first()
 
 
-def _file_name(db, file_id, vault, *, unlocked: bool) -> tuple:
-    """(name, why it is hidden) of a file opened under a case, read now as the owner could read it in the vault."""
+def _file_name(db, file_id, vault, *, unlocked: bool, owner_id) -> tuple:
+    """(name, why it is hidden) of a file opened under a case, read now as the owner ``owner_id`` could read it in
+    the vault: never once the vault is no longer theirs."""
     from app.core.models import File, HeldFile
     if vault is None:
         return None, NAME_HIDDEN_GONE
+    if str(vault[3]) != str(owner_id):
+        return None, NAME_HIDDEN_NOT_OWNER
     if (vault[1] or "standard") == "zero_knowledge":
         return None, NAME_HIDDEN_ZERO_KNOWLEDGE
     if vault[2] is not None and not unlocked:
@@ -96,9 +101,9 @@ def _file_name(db, file_id, vault, *, unlocked: bool) -> tuple:
     return row.name, None
 
 
-def opened(db, case, vault_ids, *, unlocked: set) -> list:
+def opened(db, case, vault_ids, *, unlocked: set, owner_id) -> list:
     """Files opened under ``case`` in ``vault_ids`` (its audit rows), newest first, each name read as the owner
-    could read it now."""
+    ``owner_id`` could read it now."""
     from app.core.models import AuditLog
     wanted = {str(v) for v in vault_ids}
     if not wanted:
@@ -113,7 +118,7 @@ def opened(db, case, vault_ids, *, unlocked: set) -> list:
         vid = str((row.details or {}).get("vault_id") or "")
         if vid not in facts:
             facts[vid] = _vault_facts(db, rules.as_id(vid))
-        name, hidden = _file_name(db, row.resource_id, facts[vid], unlocked=vid in unlocked)
+        name, hidden = _file_name(db, row.resource_id, facts[vid], unlocked=vid in unlocked, owner_id=owner_id)
         out.append({"at": _iso(row.timestamp), "vault_id": vid, "file_id": row.resource_id, "name": name,
                     "name_hidden": hidden})
         if len(out) >= OPENED_SHOWN:
@@ -129,7 +134,7 @@ def _exports(db, case) -> int:
                                                         AuditLog.status == "success").scalar() or 0)
 
 
-def case_for_owner(db, case, rows, *, unlocked: set, now: datetime) -> dict:
+def case_for_owner(db, case, rows, *, unlocked: set, now: datetime, owner_id) -> dict:
     from app.core import cases as case_steps
     from app.core import legal_holds
     from app.core.security import is_case_sealed, open_case_field
@@ -159,7 +164,7 @@ def case_for_owner(db, case, rows, *, unlocked: set, now: datetime) -> dict:
         "access_ends_at": _iso(case.access_ends_at), "closed_at": _iso(case.closed_at),
         "can_export": bool(case.can_export), "password_override": bool(case.password_override),
         "note": note, "vaults": vaults, "exports": _exports(db, case),
-        "opened": opened(db, case, [r.vault_id for r in rows], unlocked=unlocked),
+        "opened": opened(db, case, [r.vault_id for r in rows], unlocked=unlocked, owner_id=owner_id),
     }
 
 
@@ -175,7 +180,8 @@ def unseen(db, user) -> list:
 def page(db, user, *, unlocked: Optional[set] = None, now: Optional[datetime] = None) -> dict:
     now = now or utcnow()
     unlocked = unlocked or set()
-    return {"cases": [case_for_owner(db, c, rows, unlocked=unlocked, now=now) for c, rows in owner_rows(db, user)],
+    return {"cases": [case_for_owner(db, c, rows, unlocked=unlocked, now=now, owner_id=user.id)
+                      for c, rows in owner_rows(db, user)],
             "unseen": unseen(db, user)}
 
 

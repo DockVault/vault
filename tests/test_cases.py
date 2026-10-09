@@ -1027,6 +1027,19 @@ def test_the_approval_writes_the_rollback_marker_with_its_hold(db, people):
     assert db.execute(sql(marker)).scalar() == 1
 
 
+def test_a_vault_that_came_to_the_auditor_since_the_request_refuses_the_approval(db, people):
+    """The owners are read again at the approval: an auditor who now owns a vault of the case is a person it
+    concerns, and an auditor does not investigate themselves."""
+    case = _ask(db, people.uma, _vaults(people.v1))
+    people.v1.owner_id = people.uma.id
+    db.commit()
+    refused = _refused(cases.approve, db, case, approver=people.bob)
+    assert refused.reason == rules.AUDITOR_CONCERNED and refused.code == 403
+    db.rollback()
+    db.refresh(case)
+    assert case.status == "pending" and db.query(m.LegalHoldVault).count() == 0
+
+
 # --------------------------------------------------------------------------- what each step records and asks
 
 def test_turning_down_and_closing_each_write_their_success_row_under_the_case(db, people):

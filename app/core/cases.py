@@ -456,7 +456,7 @@ def approve(db, case, *, approver=None, now: Optional[datetime] = None):
     """Approve ``case`` as ``approver`` (None: the server's operator), in the caller's transaction, the case locked
     by the caller. Everything the approval gives, and every owner's notice of it, is written here or nothing is.
     Raises CaseRefused."""
-    from app.core import case_numbers, legal_holds
+    from app.core import case_eligibility, case_numbers, legal_holds
     from app.core.models import LegalHoldVault
     now = now or utcnow()
     if not access_enabled():
@@ -474,6 +474,10 @@ def approve(db, case, *, approver=None, now: Optional[datetime] = None):
         legal_holds._lock_vaults(db, [row.vault_id for row in vault_rows(db, case, covering_only=True)],
                                  missing_ok=True)
     _refresh_owners(db, case)
+    # Again, now that the owners are read afresh: a vault that came to the auditor concerns them.
+    why = rules.auditor_refusal(case.auditor_id, {p: None for p in case_eligibility.concerned(db, case)})
+    if why:
+        raise CaseRefused(why, code=403)
     if approver is not None:
         why = approver_refusal(db, case, approver, now)   # again, now that the owners are read afresh
         if why:

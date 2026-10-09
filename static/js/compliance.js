@@ -229,7 +229,8 @@
             let name = f.name;
             if (!name) {
                 name = f.name_hidden === 'zero_knowledge' ? '(zero-knowledge: the name cannot be shown)'
-                    : f.name_hidden === 'password' ? '(name hidden until the vault is unlocked)' : '(no longer there)';
+                    : f.name_hidden === 'password' ? '(name hidden until the vault is unlocked)'
+                    : f.name_hidden === 'not_owner' ? '(the vault is no longer yours)' : '(no longer there)';
             }
             line.appendChild(el('span', 'my-access-when', when(f.at)));
             line.appendChild(el('span', null, ' ' + vaultName(f.vault_id) + ': ' + name));

@@ -391,3 +391,17 @@ def test_one_owners_banner_never_lists_another_owners_notices(db, people):
     assert oa.unseen(db, people.olga) == []
     assert len(oa.unseen(db, people.otto)) == 1, "olga's reading leaves otto's notice unread"
     assert oa.unseen(db, people.mallory) == [] and oa.unseen(db, people.uma) == []
+
+
+def test_a_vault_no_longer_the_owners_shows_them_no_file_name(db, people):
+    """The page lists what was opened in the owner's vaults; once a vault is someone else's, the names of the files
+    opened in it are no longer theirs to read."""
+    case = _case(db, people, [people.v1])
+    _viewed(db, case, people.v1, _file(db, people.v1, "plain.txt").id)
+    (seen,) = oa.page(db, people.olga)["cases"]
+    assert [(o["name"], o["name_hidden"]) for o in seen["opened"]] == [("plain.txt", None)]
+    people.v1.owner_id = people.otto.id
+    db.commit()
+    (seen,) = oa.page(db, people.olga)["cases"]
+    assert [(o["name"], o["name_hidden"]) for o in seen["opened"]] == [(None, oa.NAME_HIDDEN_NOT_OWNER)]
+    assert oa.page(db, people.otto)["cases"] == [], "the new owner was never told of this case"
