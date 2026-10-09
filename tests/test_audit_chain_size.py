@@ -123,6 +123,29 @@ def test_a_late_row_in_an_hour_sealed_recently_counts_nothing_before_the_delay(e
     assert len(_kept(env, old)) == 1 and late in _kept(env, [late])
 
 
+def test_a_late_row_in_an_empty_hour_of_the_backlogs_run_counts_nothing_before_the_delay(env):
+    """A row put straight into the table, into an empty hour that the first start's backlog sealed as part of a
+    run a few minutes before: that hour alone is re-rooted by a late seal, and its bytes wait a delay too."""
+    genuine = [env.row(T0 - timedelta(days=30, hours=h)) for h in range(5)]
+    env.run_until_sealed()
+    assert any(s.period_end - s.period_start > ai.HOUR for s in env.seals() if s.kind == "hour")
+    env.clock.advance(minutes=30)
+    retention.run_pass(env.session, now=env.clock())
+    assert _kept(env, genuine) == set(genuine)
+    hour = ai.hour_floor(T0 - timedelta(days=10))
+    bulky = _big(env, hour + timedelta(minutes=5), 2000)
+    env.clock.advance(minutes=30)
+    retention.run_pass(env.session, now=env.clock())
+    late = [s for s in env.seals() if s.kind == "late"]
+    assert late and late[-1].period_start == hour
+    assert _kept(env, genuine) == set(genuine) and _kept(env, [bulky]) == {bulky}
+    sealed = late[-1].sealed_at
+    _run_to(env, sealed + timedelta(days=7, hours=-1))
+    assert _kept(env, genuine) == set(genuine)
+    _run_to(env, sealed + timedelta(days=7, hours=2))
+    assert _kept(env, genuine) == set()                   # oldest first, once the delay has run
+
+
 def _inflate(env, hour, nbytes):
     """Another writer's prune seal for ``hour`` that keeps its roots and records ``nbytes``."""
     with env.session() as db:
