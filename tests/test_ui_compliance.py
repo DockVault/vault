@@ -128,6 +128,13 @@ def _fits(page: Page):
     assert sizes["doc"] <= sizes["view"], (sizes, page.evaluate(_WIDE))
 
 
+def _awake(*clients):
+    """Drop the pooled connections of API clients left idle while a browser worked: the server closes an idle
+    keep-alive connection, and a POST sent on one just as it closes is lost rather than retried."""
+    for client in clients:
+        client.session.close()
+
+
 def _upload(client, vid, name, data, mime):
     r = client.post(f"/vaults/{vid}/files", files=[("files", (name, data, mime))])
     assert r.status_code in (200, 201), r.text
@@ -448,6 +455,7 @@ def test_the_badge_and_the_nav_for_each_kind_of_account(browser: Browser, world)
     # An administrator: Compliance, with the count of what waits for their approval.
     bob, _bob_c, bob_codes = world["admins"]["bob"]
     uma_c = world["uma_c"]
+    _awake(uma_c)
     r = uma_c.post("/compliance/cases", json={"scope": [{"kind": "vault", "target_id": world["vid"]}], **CASE_TEXT},
                    headers=compliance_receipt(uma_c, "compliance.case.request", world["uma"]["_password"],
                                               world["codes"]))
@@ -461,11 +469,13 @@ def test_the_badge_and_the_nav_for_each_kind_of_account(browser: Browser, world)
         assert _errors(page) == [], _errors(page)
     finally:
         _close(page)
-        world["uma_c"].post(f"/compliance/cases/{waiting}/withdraw")
+        _awake(uma_c)
+        uma_c.post(f"/compliance/cases/{waiting}/withdraw")
 
 
 def test_a_password_vault_opens_in_the_workspace_with_its_password(browser: Browser, world):
     olga_c = world["olga_c"]
+    _awake(olga_c, world["uma_c"], *[c for _a, c, _codes in world["admins"].values()])
     pv = olga_c.create_vault(password="Vault-Pass-2026!")["id"]
     r = olga_c.post(f"/vaults/{pv}/files", files=[("files", ("secret-plan.txt", b"the plan", "text/plain"))],
                     headers={"X-Vault-Password": "Vault-Pass-2026!"})
@@ -494,6 +504,7 @@ def test_a_password_vault_opens_in_the_workspace_with_its_password(browser: Brow
     finally:
         _close(page)
         forget_cases([case["id"]], [pv])
+        _awake(olga_c)
         olga_c.delete_vault(pv, vault_password="Vault-Pass-2026!")
 
 
@@ -501,6 +512,7 @@ def test_a_legal_hold_is_placed_confirmed_and_released_in_the_browser(browser: B
     ada, _ada_c, ada_codes = world["admins"]["ada"]
     bob, _bob_c, bob_codes = world["admins"]["bob"]
     olga, olga_c = world["olga"], world["olga_c"]
+    _awake(olga_c)
     held = olga_c.create_vault()["id"]
     pages = []
     try:
@@ -545,4 +557,5 @@ def test_a_legal_hold_is_placed_confirmed_and_released_in_the_browser(browser: B
             _close(p)
         cid = psql(f"SELECT coalesce(string_agg(case_id::text, ','), '') FROM legal_hold_vaults WHERE vault_id = '{held}'")
         forget_cases([c for c in cid.split(",") if c], [held])
+        _awake(olga_c)
         olga_c.delete_vault(held)
