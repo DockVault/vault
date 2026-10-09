@@ -1284,3 +1284,81 @@ def test_a_block_keeping_a_salt_of_an_hour_it_does_not_hold_is_refused(env):
         named = ArchivePart(1, part.first_hour, part.last_hour, part.rows, len(payload), af.digest(payload))
         with pytest.raises(arc.NotVerified, match="salt of an hour it does not hold"):
             arc.PartReader(db, env.st.view, DAY, named).finish()
+
+
+def test_accepting_a_database_that_lost_an_archive_seal_names_its_blocks(env):
+    """A tail cut back to before an archive seal leaves its blocks bound by no seal: the read phase of
+    accept-database-head names them (verify then reports them)."""
+    from app.core import audit_chain_restore as restore
+    from app.core.models import AuditSeal
+    _sealed_day(env)
+    _archive(env)
+    (seal,) = _archive_seals(env)
+    with env.session() as db:
+        db.query(AuditSeal).filter(AuditSeal.seq >= seal.seq).delete()
+        db.commit()
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    host_st = ai.ChainState(settings=env.settings, clock=env.clock)
+    host_st.process_kind = "host"
+    seen = restore.accept_database_head(env.engine, host_st, read=True)
+    lines = "\n".join(seen["lines"])
+    assert "archive blocks are not the ones the accepted chain's archive seals name" in lines
+    assert f"{DAY.isoformat()} part 1" in lines
+
+
+def test_a_block_of_the_day_no_seal_names_stops_its_change_and_its_unarchive(env):
+    _sealed_day(env)
+    _archive(env)
+    block = _blocks(env)[0]
+    with env.session() as db:
+        db.add(AuditArchiveBlock(day=block.day, part=9, first_hour=block.first_hour, last_hour=block.last_hour,
+                                 row_count=block.row_count, codec="zstd", format=1, payload=block.payload,
+                                 raw_bytes=block.raw_bytes, aggregates=block.aggregates, created_at=T0))
+        db.commit()
+    before = len(env.seals())
+    ar.prune(_pass(env), _numbers())
+    assert len(env.seals()) == before and len(_blocks(env)) == 2
+    assert "block-unsealed" in ai.open_failures(env.st.head_store().load())
+    seen = arc.unarchive(env.engine, env.st, None, None, read=True)
+    with pytest.raises(arc.NotVerified) as why:
+        arc.unarchive(env.engine, env.st, None, None, expect=seen["state"])
+    assert why.value.kind == "block-unsealed" and _hot(env) == 0
+
+
+def test_a_rewritten_block_stored_wrong_changes_nothing(env, monkeypatch):
+    """A block written anew is checked as the table stores it before the change commits."""
+    _day_rows(env, {3: 2, 4: 3})
+    env.row(at(6), action=ar.protected_actions()[0])
+    env.run_until_sealed()
+    _archive(env)
+    real_add = af.BlockWriter.add
+
+    def add(self, row):
+        real_add(self, row)
+        self.identity.update(b"x")
+    monkeypatch.setattr(af.BlockWriter, "add", add)
+    before = len(env.seals())
+    payload = _blocks(env)[0].payload
+    ar.prune(_pass(env), _numbers(admin_min=365))
+    assert len(env.seals()) == before and _blocks(env)[0].payload == payload
+    assert "block-altered" in ai.open_failures(env.st.head_store().load())
+
+
+def test_unarchive_refuses_a_day_with_a_row_put_back_into_its_archived_hours(env):
+    _sealed_day(env)
+    _archive(env)
+    env.row(at(4, 30))
+    seen = arc.unarchive(env.engine, env.st, None, None, read=True)
+    with pytest.raises(arc.NotVerified) as why:
+        arc.unarchive(env.engine, env.st, None, None, expect=seen["state"])
+    assert why.value.kind == "row-in-archived-day" and _hot(env) == 1 and len(_blocks(env)) == 1
+
+
+def test_the_protected_share_never_exceeds_the_parts_count_whatever_its_aggregates_say():
+    part = ArchivePart(1, at(3), at(4), 2, 100, "ab" * 32)
+    inflated = arc.PartFigures(rows=(1, 1), stored=(50, 50), protected_rows=99, protected_stored=10 ** 9)
+    assert arc.protected_share(part, 70, inflated, T0, 0) == 70
+    young = arc.PartFigures(rows=(1, 1), stored=(50, 50), protected_rows=0, protected_stored=0)
+    assert arc.protected_share(part, 70, young, at(3) + timedelta(days=1), 30) == 70
+    assert arc.protected_share(part, 70, None, T0, 0) == 0

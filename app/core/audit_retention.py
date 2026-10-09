@@ -191,7 +191,7 @@ def _as_time(hour) -> datetime:
 
 @dataclass
 class SizePlan:
-    counted_bytes: int = 0          # what the cap counts: every sealed hour's lagged bytes (the chain's total)
+    counted_bytes: int = 0          # what the cap counts (the chain's total): hot hours' lagged bytes, archived parts
     protected_bytes: int = 0        # of those, rows the cap may never delete
     cutoff: Optional[datetime] = None   # delete the unprotected counted rows older than this
     met: bool = True                # whether what is left fits under the cap
