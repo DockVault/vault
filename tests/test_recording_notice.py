@@ -331,3 +331,63 @@ def test_the_catalogue_and_the_inventory():
     assert audit_catalog.lookup("privacy_notice_seen") is not None
     text = (ROOT / "docs" / "data-inventory.md").read_text(encoding="utf-8")
     assert "privacy_seen_version" in text
+
+
+# --------------------------------------------------------------------------- compliance access
+
+@pytest.fixture
+def compliance(monkeypatch):
+    from app.core import compliance_settings as cs
+    values = {key: cs.current(key) for key in cs.KEYS}
+    monkeypatch.setattr(cs, "current", lambda key: values[key])
+    return values
+
+
+def test_the_notice_says_what_compliance_access_lets_an_auditor_do_as_configured(factory, compliance):
+    from app.core import compliance_settings as cs
+    db = factory()
+    compliance.update({cs.MAX_ACCESS_DAYS: 21, cs.RECORD_MIN_DAYS: 2555, cs.AUDITOR_GRANT_DAYS: 180})
+    out = rn.build_notice(db)
+    text = " ".join(out["compliance"]["lines"])
+    assert out["compliance"]["enabled"] is True
+    assert "for 21 days at most at a time and export copies of them" in text
+    assert "lasts 180 days at most" in text and "at least 2555 days after a case closes" in text
+    assert "owner is told at once, in the app and by email, and sees every file opened" in text
+    assert "never opens a zero-knowledge vault" in text and rn.PASSWORD_WORDS["with_password"] in text
+    assert rn.AUDITORS_CAN_SEE in out["who_can_see"]
+    store = next(s for s in out["stores"] if s["key"] == "compliance")
+    assert "at least 2555 days after a case closes" in store["kept"]
+    compliance.update({cs.EXPORT: cs.DISABLED, cs.PASSWORD_VAULTS: "override"})
+    text = " ".join(rn.build_notice(db)["compliance"]["lines"])
+    assert "exports are turned off on this server" in text and rn.PASSWORD_WORDS["override"] in text
+    compliance[cs.PASSWORD_VAULTS] = "refuse"
+    assert rn.PASSWORD_WORDS["refuse"] in " ".join(rn.build_notice(db)["compliance"]["lines"])
+
+
+def test_with_compliance_access_off_the_notice_says_so_and_no_auditor_sees_anything(factory, compliance):
+    from app.core import compliance_settings as cs
+    compliance[cs.ACCESS] = cs.DISABLED
+    out = rn.build_notice(factory())
+    assert out["compliance"] == {"enabled": False, "lines": [rn.COMPLIANCE_OFF]}
+    assert rn.AUDITORS_CAN_SEE not in out["who_can_see"]
+
+
+def test_a_compliance_setting_that_cannot_be_read_leaves_the_notice_standing(factory, monkeypatch):
+    from app.core import compliance_settings as cs
+
+    def broken(key):
+        raise RuntimeError("the registry is not ready")
+    monkeypatch.setattr(cs, "current", broken)
+    out = rn.build_notice(factory())
+    assert out["compliance"]["enabled"] is None and "Ask the operator" in out["compliance"]["lines"][0]
+    assert rn.AUDITORS_CAN_SEE not in out["who_can_see"]
+    assert next(s for s in out["stores"] if s["key"] == "compliance")["kept"] == "See the operator."
+
+
+def test_the_page_shows_the_compliance_section_from_the_notice():
+    page = (ROOT / "static" / "recording.html").read_text(encoding="utf-8")
+    assert page.count('id="compliance-notice-section" hidden') == 1 and page.count('id="compliance-notice"') == 1
+    script = (ROOT / "static" / "js" / "recording.js").read_text(encoding="utf-8")
+    part = script[script.index("const compliance = data.compliance;"):script.index("byId('basis')")]
+    assert "compliance.lines.forEach((line) => list.appendChild(el('li', null, line)))" in part
+    assert "show('compliance-notice-section')" in part
