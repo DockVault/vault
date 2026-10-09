@@ -1315,6 +1315,20 @@ def test_a_hold_only_case_shows_an_administrator_it_concerns_nothing(db, people,
     assert told.holds and all(n["concerned"] == [str(otto_admin.id)] for n in told.holds)
 
 
+def test_an_auditor_who_is_an_administrator_still_sees_a_case_that_came_to_concern_them(db, people, no_codes):
+    """uma, an administrator as well, asked for a case on olga's vault, which then came to her: she still finds her
+    case in her list and on its page (to withdraw it); its approval refuses her as concerned."""
+    people.uma.role = m.RoleEnum.ADMIN
+    db.commit()
+    case = _ask(db, people.uma, _vaults(people.v1))
+    people.v1.owner_id = people.uma.id
+    db.commit()
+    assert _sees(db, case, people.uma) == {"listed": True, "page": True, "holds": False}
+    assert _sees(db, case, people.carl)["page"]
+    out = cr.withdraw_case(case.id, current_user=people.uma, db=db)
+    assert out["status"] == "withdrawn"
+
+
 def test_whom_a_step_concerns_is_read_with_what_the_step_added_but_not_yet_wrote(db, people, monkeypatch):
     """The session does not write on its own before a query: the administrators' notices read the people a step has
     just added (a named person, an owner read again) before leaving them out."""
