@@ -470,3 +470,44 @@ def test_joining_watches_the_shares_addressed_to_the_department_too():
     body = _route("add_group_members")
     assert re.search(r"Share\.audience_department_ids\.contains\(\[str\(group_id\)\]\)", body)
     assert body.index("reach.watch_share(") < body.index("user_groups.insert()")
+
+
+# --------------------------------------------------------------------------- how long the notices are kept
+
+def test_notices_outside_a_case_go_once_done_with_and_past_the_record_floor(db, cast, monkeypatch):
+    """The pruner's owner_notices job: a notice with no case, delivered, given up or with no address, and older than
+    COMPLIANCE_RECORD_MIN_DAYS, is deleted (with its retention_pruned row); one still pending or retrying, a younger
+    one, and a case's notice stay."""
+    from app.core import compliance_settings as cs
+    from app.core import retention
+    monkeypatch.setattr(cs, "current", lambda key: 400 if key == cs.RECORD_MIN_DAYS else cs.registry.resolve(key))
+    monkeypatch.setattr(retention, "KEEP_RULES", {})
+    case = m.ComplianceCase(id=uuid.uuid4(), purpose="internal_investigation", legal_basis="legal_obligation",
+                            justification_enc="sealed", owner_note_enc="sealed", auditor_id=cast.ada.id,
+                            auditor_username="ada")
+    db.add(case)
+    db.commit()
+    old, young = NOW - timedelta(days=401), NOW - timedelta(days=399)
+    rows = {}
+    for name, status, when, case_id in (("sent", on.SENT, old, None), ("failed", on.FAILED, old, None),
+                                        ("none", on.NO_ADDRESS, old, None), ("pending", on.PENDING, old, None),
+                                        ("retrying", on.RETRYING, old, None), ("young", on.SENT, young, None),
+                                        ("case", on.SENT, old, case.id)):
+        row = m.ComplianceNoticeOutbox(id=uuid.uuid4(), case_id=case_id, user_id=cast.olga.id, kind=an.KIND,
+                                       dedup_key=f"test:{name}", details={}, status=status, attempts=1,
+                                       created_at=when, sent_to=[])
+        db.add(row)
+        rows[name] = row.id
+    db.commit()
+    bind = db.get_bind()
+    from sqlalchemy.orm import sessionmaker
+    p = retention.Pass(sessionmaker(bind=bind), now=NOW, batch_rows=2)
+    p.job_name = "owner_notices"
+    done = on.prune(p)
+    assert done.deleted == 3
+    db.expire_all()
+    left = {n for n, i in rows.items() if db.get(m.ComplianceNoticeOutbox, i) is not None}
+    assert left == {"pending", "retrying", "young", "case"}
+    pruned = [r.details for r in db.query(m.AuditLog).filter(m.AuditLog.action == "retention_pruned")]
+    assert sum(d["deleted"] for d in pruned) == 3 and {d["job"] for d in pruned} == {"owner_notices"}
+    assert [j.held for j in retention.JOBS if j.name == "owner_notices"] == [True]

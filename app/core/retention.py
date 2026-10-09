@@ -328,6 +328,14 @@ def run_legal_holds(p: Pass) -> JobResult:
     return done
 
 
+def prune_owner_notices(p: Pass) -> JobResult:
+    """The notices to vaults' owners outside a case (a recorded name revealed, someone else giving access), once
+    delivered or given up, COMPLIANCE_RECORD_MIN_DAYS after they were written (app/core/owner_notices.py). A
+    case's notices stay with the case. Stopped by the hold switch: they are records."""
+    from app.core import owner_notices
+    return owner_notices.prune(p)
+
+
 def prune_rate_limit_records(p: Pass) -> JobResult:
     """The sign-in throttle's fallback rows (written only while Redis is down), an hour after their window."""
     from app.core.models import RateLimitRecord
@@ -388,6 +396,8 @@ JOBS: list[Job] = [
         run_compliance_cases),
     Job("legal_holds", "Legal holds: lapses, review prompts, and the purge of what released holds kept",
         run_legal_holds),
+    Job("owner_notices", "Notices to vaults' owners outside a case, once delivered and past the record floor",
+        prune_owner_notices, held=True),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),

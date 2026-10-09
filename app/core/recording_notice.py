@@ -65,7 +65,8 @@ def _compliance_kept() -> str:
     from app.core import compliance_settings as cs
     return (f"The records of auditor rights, cases and legal holds for ever; their events at least "
             f"{_days(cs.current(cs.RECORD_MIN_DAYS))} after a case closes, whatever the activity log's own retention "
-            f"says; what a legal hold keeps, until {_days(cs.current(cs.HOLD_PURGE_DELAY_DAYS))} after it is released.")
+            f"says; notices to owners outside a case as long; what a legal hold keeps, until "
+            f"{_days(cs.current(cs.HOLD_PURGE_DELAY_DAYS))} after it is released.")
 
 
 def _sessions_kept() -> str:

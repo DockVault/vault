@@ -589,6 +589,26 @@ def _attempt(db, row, now: datetime, send: Callable) -> str:
     return row.status
 
 
+# --------------------------------------------------------------------------- how long they are kept
+
+# What a row that is done with looks like: delivered, given up, or never sendable. A row still pending or retrying
+# is kept whatever its age.
+DONE = (SENT, FAILED, NO_ADDRESS)
+
+
+def prune(p):
+    """The pruner's owner_notices job (app/core/retention.py): the outbox rows of notices outside a case that are
+    done with (DONE) and older than COMPLIANCE_RECORD_MIN_DAYS, in batches. Their usernames and dates are personal
+    data kept as the record that the owner was told, as long as that record is (the audit rows of the same
+    notice are kept as long). A case's rows stay with the case."""
+    from app.core import compliance_settings as cs
+    from app.core import retention
+    from app.core.models import ComplianceNoticeOutbox as O
+    days = int(cs.current(cs.RECORD_MIN_DAYS))
+    return p.delete_in_batches(O, retention.deletable(O, p.now, O.case_id.is_(None), O.status.in_(DONE),
+                                                      O.created_at < p.now - timedelta(days=days)), O.created_at)
+
+
 def due_query(db, now: datetime):
     """The rows due to be sent, oldest first, each locked for the transaction that reads it; a row another sender
     holds is skipped (SKIP LOCKED), not waited for. The sender's advisory lock already keeps a second sender out;
