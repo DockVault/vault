@@ -284,6 +284,10 @@ def test_after_record_accepts_another_writers_listed_seals_for_good(env):
     env.clock.advance(minutes=30)
     env.seal()
     assert seq in ai.unacknowledged_foreign(env.st.view, env.st.head_store().load())
+    # Listed by the head record and not acknowledged: verify's own report warns of it, and exits 1.
+    report = env.verify()
+    assert [(f.severity, f.seq) for f in report.findings if f.kind == "after-record"] == [("warning", seq)]
+    assert report.exit_code == 1
     _two(env, recovery.after_record)
     assert host_rows(env, recovery.ACCEPTED_ACTION) == [{"seals": [seq], "failures": []}]
     env.clock.advance(minutes=30)

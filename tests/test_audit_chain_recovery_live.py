@@ -226,6 +226,9 @@ out["status"] = sorted(ai.status(st)["warnings"])
 ''')
     assert first["after"] is None and first["foreign"] == [first["forged"]], first
     assert "after-record" in first["status"], first
+    code, found, _answer = _verify(throwaway)
+    waiting = [(f["severity"], f["seq"]) for f in found.get("after-record") or []]
+    assert code == 1 and waiting == [("warning", first["forged"])], found
     seen, done = _two(throwaway, "after-record")
     assert first["forged"] in done["accepted"], done
     after = _script(throwaway, r'''
@@ -237,6 +240,8 @@ out["status"] = sorted(ai.status(st)["warnings"])
     assert after["stopped"] is None and after["foreign"] == [], after
     _clean(after["report"])
     assert "after-record" not in after["status"], after
+    _code, found, _answer = _verify(throwaway)
+    assert "after-record" not in found, found
 
 
 def test_a_seal_refused_on_its_face_is_discarded_with_its_rows_saved(throwaway):

@@ -535,16 +535,18 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
                        seal.seq)
         if anchor_seq is not None and seal.seq == anchor_seq and link != anchor_link:
             anchor_bad = "differs"
-        if rec_seq is not None and seal.seq > rec_seq:
-            entry = after.get(seal.seq)
-            if ai.is_host_kind(seal) and entry is None:
-                report.add(FAILURE, "host-seal-unrecorded",
-                           f"seal {seal.seq} ({seal.kind}) is one only the host writes, and the head record does not "
-                           "list it", seal.seq)
-            elif entry is None or not entry.get("acknowledged"):
-                report.add(WARNING, "after-record",
-                           f"seal {seal.seq} ({seal.kind}) was appended after the head record by another writer; it "
-                           "waits for the host", seal.seq)
+        # Another writer's seals: those after the recorded head, and those the record lists as accepted after it,
+        # wherever its head has moved since (the list decides, as the server's status does).
+        entry = after.get(seal.seq)
+        if rec_seq is not None and seal.seq > rec_seq and ai.is_host_kind(seal) and entry is None:
+            report.add(FAILURE, "host-seal-unrecorded",
+                       f"seal {seal.seq} ({seal.kind}) is one only the host writes, and the head record does not "
+                       "list it", seal.seq)
+        elif (entry is not None or (rec_seq is not None and seal.seq > rec_seq)) and \
+                (entry is None or not entry.get("acknowledged")):
+            report.add(WARNING, "after-record",
+                       f"seal {seal.seq} ({seal.kind}) was appended after the head record by another writer; it "
+                       "waits for the host", seal.seq)
         if seal.kind == "hour":
             hour_seals.append(seal)
         if anchor_covers is not None and seal.seq not in verified:
