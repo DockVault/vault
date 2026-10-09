@@ -82,3 +82,28 @@ def test_a_vault_with_a_password_is_refused_and_only_an_auditor_reveals(world, l
     assert admin.post(f"/activity/events/{row}/reveal", json=body).status_code == 403, "an administrator: no right"
     assert olga_c.post(f"/activity/events/{row}/reveal", json=body).status_code == 403
     olga_c.delete(f"/vaults/{pv}", headers={"X-Vault-Password": "Vault-Pass-2026!"})
+
+
+def test_reveals_at_once_in_one_vault_tell_its_owner_once_and_all_succeed(world, levels_restored):
+    """Reveals of one auditor run one at a time (their account row is locked for each): six at once in a vault, the
+    first of the day there, each succeed, and the owner gets one notice."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import requests
+
+    from conftest import BASE_URL
+    uma, uma_c, _codes = world["uma"]
+    olga, olga_c, vid = world["olga"]
+    version = store(dict(levels_restored, names="full"))
+    rows = [_upload_row(olga_c, vid, version, f"race-{uuid.uuid4().hex}.txt") for _ in range(6)]
+    body = {"reason_category": "internal_investigation", "reason_text": REASON}
+
+    def reveal(row):
+        return requests.post(f"{BASE_URL}/activity/events/{row}/reveal", json=body, timeout=60,
+                             headers={"Authorization": f"Bearer {uma_c.token}"}).status_code
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        statuses = list(pool.map(reveal, rows))
+    assert statuses == [200] * 6, statuses
+    assert psql(f"SELECT count(*) FROM compliance_notice_outbox WHERE case_id IS NULL AND kind = 'reveal' "
+                f"AND user_id = '{olga['id']}'") == "1"
+    assert psql(f"SELECT count(*) FROM compliance_reveals WHERE auditor_id = '{uma['id']}'") == "6"
