@@ -153,7 +153,9 @@ def test_with_scripts_off_the_browser_sends_the_sign_in_nowhere(browser, base_ur
     context, page, home, sent, moves, policy = _scripts_off_sign_in(browser, base_url)
     try:
         assert "form-action 'none'" in policy[0].split("; "), policy
-        page.click("#login-form button[type=submit]")
+        # The browser schedules the submission and the policy then refuses it, so the navigation the click
+        # started never finishes: the click must not wait for it.
+        page.click("#login-form button[type=submit]", no_wait_after=True)
         page.wait_for_timeout(1500)  # time for a submission the browser might start
         assert [(m, u) for m, u, _ in sent if m != "GET"] == []
         assert [(m, u) for m, u, body in sent if any(t in u or t in body for t in TYPED)] == []
