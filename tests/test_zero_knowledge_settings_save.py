@@ -213,3 +213,27 @@ def test_the_settings_page_leaves_a_locked_switch_out_of_a_save():
     assert "if (!el || el.disabled) delete settings[key];" in save
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     assert html.count('id="zk-switches-locked-note"') == 1
+
+
+def _zk_enabled_route(db, person):
+    from starlette.requests import Request
+    request = Request({"type": "http", "method": "GET", "path": "/zk-enabled", "raw_path": b"/zk-enabled",
+                       "query_string": b"", "headers": [(b"host", b"vault.example")],
+                       "client": ("198.51.100.20", 5000), "server": ("vault.example", 443), "scheme": "https",
+                       "root_path": ""})
+    return run_coroutine(api.get_zk_enabled(request=request, current_user=person, db=db))
+
+
+def test_the_vault_form_is_told_a_cap_of_none_is_no_zero_knowledge(db, monkeypatch):
+    """/zk-enabled, which the vault form reads: with a cap of 0 neither zero-knowledge nor the force (the
+    plan's or the administrators') is reported, and the settings page is not told the plan forces it."""
+    _put(db, {"zero_knowledge_enabled": True, "force_zero_knowledge": True})
+    person = _person(db)
+    monkeypatch.setattr(settings, "plan_force_zero_knowledge", True)
+    got = _zk_enabled_route(db, person)
+    assert (got["zero_knowledge_enabled"], got["must_use_zk"], got["plan_force_zero_knowledge"]) == (True, True, True)
+    monkeypatch.setattr(settings, "plan_max_zk_vaults", 0)
+    got = _zk_enabled_route(db, person)
+    assert (got["zero_knowledge_enabled"], got["must_use_zk"], got["plan_force_zero_knowledge"]) == \
+        (False, False, False)
+    assert got["max_zk_vaults"] == 0
