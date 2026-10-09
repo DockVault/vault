@@ -2499,8 +2499,11 @@ async def search_audit_log(
     return [_audit_row_to_dict(r) for r in rows]
 
 
+from app.api.activity_viewer import require_activity_viewer  # noqa: E402
+
+
 @app.get("/activity/catalog")
-def activity_catalog(current_user: User = Depends(require_interactive_admin)):
+def activity_catalog(current_user: User = Depends(require_activity_viewer)):
     """What the Events filters offer: the categories and their events, the channels and the statuses,
     and which events the summary band counts as each sign-in outcome (so a click on one of its rows
     filters the list to exactly the events it counted)."""
@@ -2545,13 +2548,15 @@ def activity_events(
     ids: List[str] = Query([], max_length=8000),
     count_only: bool = False,
     limit: int = 50,
+    case: Optional[str] = Query(None, max_length=64),
     request: Request = None,
-    current_user: User = Depends(require_interactive_admin),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
     """The Activity page's Events list: the audit log filtered by category, event, channel, status,
     user (containing or exactly), rows under no account, IP or CIDR, text (which also matches the
-    events' labels), temporary credential (by id or name), vault and time (admin only).
+    events' labels), temporary credential (by id or name), vault, time and compliance case (an
+    administrator, or an auditor: app/api/activity_viewer.py).
 
     Four ways to read it, which never mix:
     - numbered pages: `page` and `limit` (the page size), with the total and the page count. The page
@@ -2577,12 +2582,14 @@ def activity_events(
     from app.services import activity_events as ev
     limit = max(1, min(limit, ev.MAX_PAGE))
     wanted_ids = ev.split_ids(ids)
+    selection = _activity_case(db, current_user, case, request)
     base = ev.build_events_query(
         db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
         actions=action, username=user, user_exact=(user_match == "exact"), no_account=no_account,
         ip=ip, text=q, temp_credential_id=temp_credential_id, temp_credential=temp_credential,
         vault_id=vault_id, ids=wanted_ids,
-        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date),
+        **_case_filters(selection))
     newest_first = (AuditLog.timestamp.desc(), AuditLog.id.desc())
     out = {"events": [], "next_cursor": None, "total": None}
 
@@ -2644,6 +2651,7 @@ def activity_events(
         event["recorded_names"] = recorded
     show_unlocked(events, unlocked)
     temp_credential_names(db, events)
+    _case_names(db, selection, current_user, events, rows)
     out["events"] = events
     # The recording levels in force, so the page can mark a row recorded under other ones.
     from app.core import audit_privacy
@@ -2658,16 +2666,20 @@ def activity_events(
 
 @app.get("/activity/events/{event_id}")
 def activity_event(event_id: str,
+                   case: Optional[str] = Query(None, max_length=64),
                    request: Request = None,
-                   current_user: User = Depends(require_interactive_admin),
+                   current_user: User = Depends(require_activity_viewer),
                    db: Session = Depends(get_db)):
-    """One event, as the Events list shows it (admin only): for a copied link to an event."""
+    """One event, as the Events list shows it (an administrator, or an auditor): for a copied link to an event.
+    With a case selected, only an event of the case, with the names the case lets its auditor read."""
     from app.core.models import AuditLog
     from app.services import activity_events as ev
     from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
                                              unlocked_vaults)
+    selection = _activity_case(db, current_user, case, request)
     try:
-        row = db.query(AuditLog).filter(AuditLog.id == uuid.UUID(event_id)).first()
+        row = ev.build_events_query(db.query(AuditLog), AuditLog, **_case_filters(selection)).filter(
+            AuditLog.id == uuid.UUID(event_id)).first()
     except ValueError:
         row = None
     if row is None:
@@ -2678,14 +2690,38 @@ def activity_event(event_id: str,
     event["recorded_names"] = recorded_names_for(db, current_user, [row], unlocked)[0]
     show_unlocked([event], unlocked)
     temp_credential_names(db, [event])
+    _case_names(db, selection, current_user, [event], [row])
     return event
+
+
+def _activity_case(db, viewer, case, request):
+    """The compliance case selected on the Activity page (app/services/activity_case.py), or None. A route called as
+    a function (the search routes call these) may leave ``case`` as its Query default: no case."""
+    if not isinstance(case, str) or not case:
+        return None
+    from app.services import activity_case
+    return activity_case.select(db, viewer, case, unlock_header=request.headers.get("X-Case-Unlock") if request
+                                else None, session_hash=_current_session_hash(request) if request else None)
+
+
+def _case_filters(selection) -> dict:
+    return {} if selection is None else {"case_id": selection.case.id, "case_vaults": selection.vault_ids}
+
+
+def _case_names(db, selection, viewer, events, rows) -> None:
+    """With a case selected by its auditor, the names it lets them read, recorded before they are sent."""
+    if selection is None or not selection.names or not events:
+        return
+    from app.services import activity_case
+    shown = activity_case.case_names(db, selection, events, rows)
+    activity_case.note_names_viewed(db, selection, viewer, events, shown)
 
 
 @app.get("/activity/usernames")
 def activity_usernames(
     q: str = Query("", max_length=64),
     limit: int = Query(10, ge=1, le=20),
-    current_user: User = Depends(require_interactive_admin),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
     """Accounts whose username starts with `q`, for the Events filter's typeahead (admin only), each
@@ -2766,7 +2802,7 @@ def _set_default_saved_search(db, user, row) -> None:
 
 
 @app.get("/activity/saved-searches")
-def list_saved_searches(current_user: User = Depends(require_interactive_admin),
+def list_saved_searches(current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """The caller's own saved searches, by name, and how many one person may keep (admin only)."""
     return _saved_searches_payload(db, current_user)
@@ -2774,7 +2810,7 @@ def list_saved_searches(current_user: User = Depends(require_interactive_admin),
 
 @app.post("/activity/saved-searches")
 def create_saved_search(body: SavedSearchCreate,
-                        current_user: User = Depends(require_interactive_admin),
+                        current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """Save the Events filters under a name, optionally as the search the page opens with."""
     from app.core.models import ActivitySavedSearch
@@ -2808,7 +2844,7 @@ def create_saved_search(body: SavedSearchCreate,
 
 @app.patch("/activity/saved-searches/{search_id}")
 def update_saved_search(search_id: str, body: SavedSearchUpdate,
-                        current_user: User = Depends(require_interactive_admin),
+                        current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """Rename a saved search, replace its filters, or both."""
     rules = _saved_search_rules()
@@ -2837,7 +2873,7 @@ def update_saved_search(search_id: str, body: SavedSearchUpdate,
 
 @app.delete("/activity/saved-searches/{search_id}")
 def delete_saved_search(search_id: str,
-                        current_user: User = Depends(require_interactive_admin),
+                        current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """Delete a saved search. Deleting the default leaves the page opening on the plain list."""
     row = _own_saved_search(db, current_user, search_id)
@@ -2848,7 +2884,7 @@ def delete_saved_search(search_id: str,
 
 @app.post("/activity/saved-searches/{search_id}/default")
 def set_default_saved_search(search_id: str,
-                             current_user: User = Depends(require_interactive_admin),
+                             current_user: User = Depends(require_activity_viewer),
                              db: Session = Depends(get_db)):
     """Make a saved search the one the Activity page opens with; the previous default stops being one."""
     _lock_owner(db, current_user)
@@ -2860,7 +2896,7 @@ def set_default_saved_search(search_id: str,
 
 @app.delete("/activity/saved-searches/{search_id}/default")
 def clear_default_saved_search(search_id: str,
-                               current_user: User = Depends(require_interactive_admin),
+                               current_user: User = Depends(require_activity_viewer),
                                db: Session = Depends(get_db)):
     """Stop a saved search being the default; the page then opens on the plain list."""
     row = _own_saved_search(db, current_user, search_id)
@@ -2890,12 +2926,13 @@ def activity_summary(
     vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
-    current_user: User = Depends(require_interactive_admin),
+    case: Optional[str] = Query(None, max_length=64),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
-    """The Activity page's summary band, in one request (admin only): the events in each bucket of the
-    range by category, the category mix, sign-in outcomes, the most active usernames and addresses, and
-    what is happening now (signed-in sessions, web transfers).
+    """The Activity page's summary band, in one request (an administrator, or an auditor): the events in each
+    bucket of the range by category, the category mix, sign-in outcomes, the most active usernames and addresses,
+    and, for an administrator, what is happening now (signed-in sessions, web transfers).
 
     The range is the last 24 hours, 7 days or 30 days; a range the viewer chose (`range=custom`, from
     `range_from` to `range_to`, or to now without one); or all time (`range=all`, charted from the oldest
@@ -2922,7 +2959,8 @@ def activity_summary(
     filters = dict(categories=category, channels=channel, statuses=status, actions=action[:ev.MAX_ACTIONS],
                    username=user, user_exact=(user_match == "exact"), no_account=no_account, ip=ip, text=q,
                    temp_credential_id=temp_credential_id, temp_credential=temp_credential, vault_id=vault_id,
-                   start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+                   start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date),
+                   **_case_filters(_activity_case(db, current_user, case, None)))
     win = since = until = None
     if range_ in summary.RANGES:
         win = summary.window(range_, now, tz_offset, zone)
@@ -2955,7 +2993,8 @@ def activity_summary(
     band, age = summary.cached(key, range_, compute)
     out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1),
            "fresh_seconds": round(summary.fresh_for(range_, age), 1)}
-    out["now"] = summary.now_panel(db, now, _activity_transfers())
+    # Live sessions and transfers are an administrator's, not log review.
+    out["now"] = summary.now_panel(db, now, _activity_transfers()) if current_user.role == RoleEnum.ADMIN else None
     return out
 
 
@@ -3009,11 +3048,13 @@ def activity_export(
     vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
+    case: Optional[str] = Query(None, max_length=64),
     request: Request = None,
-    current_user: User = Depends(require_interactive_admin),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
-    """The Events list's rows as a CSV or NDJSON download, with the same filters (admin only).
+    """The Events list's rows as a CSV or NDJSON download, with the same filters (an administrator, or an
+    auditor). Names as the viewer could read them in the vaults themselves: never a name only a case shows.
 
     Streamed a batch at a time, each batch in its own short database session, so a large export neither
     holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
@@ -3024,13 +3065,15 @@ def activity_export(
     from app.core.models import AuditLog
     from app.services import activity_events as ev
     from app.services.activity_names import recorded_names_for, show_unlocked, temp_credential_names, unlocked_vaults
+    case = case if isinstance(case, str) and case else None        # a direct call leaves its Query default
     unlocked = unlocked_vaults(db, current_user, request)
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
         statuses=status, actions=action, username=user, user_exact=(user_match == "exact"),
         no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
-        temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date))
+        temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date),
+        **_case_filters(_activity_case(db, current_user, case, None)))
     total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
     # Recorded before a row is sent, and required: an export of up to EXPORT_CAP rows of personal data
     # that left no trace would be a gap in the log's own account of who read it. So when the row cannot
@@ -3047,7 +3090,8 @@ def activity_export(
                                               ("no_account", no_account), ("ip", ip), ("q", q),
                                               ("temp_credential_id", temp_credential_id),
                                               ("temp_credential", temp_credential), ("vault_id", vault_id),
-                                              ("from_date", from_date), ("to_date", to_date)) if v},
+                                              ("from_date", from_date), ("to_date", to_date),
+                                              ("case", case)) if v},
             })
     except Exception as e:                                   # noqa: BLE001 - refused below, whatever it was
         print(f"⚠ export refused: its audit row could not be written ({type(e).__name__})")
@@ -9388,19 +9432,23 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
 
 def _ws_sees_activity(user_id: str, is_temporary: bool) -> bool:
     """Whether a live socket's session may receive the Activity signal: an administrator's own
-    interactive session, the same rule as the Activity page (require_interactive_admin). A temporary
-    credential is not, even an administrator's. Fails closed on an error."""
+    interactive session, or an auditor's whose right is in force, the same rule as the Activity page
+    (app/api/activity_viewer.py). A temporary credential is not, even an administrator's. Fails closed
+    on an error."""
     if is_temporary:
         return False
     try:
+        from app.core import auditor_rights
         from app.core.database import SessionLocal
         from app.core.models import User as _U
         db = SessionLocal()
         try:
-            role = db.query(_U.role).filter(_U.id == uuid.UUID(str(user_id))).scalar()
+            user = db.query(_U).filter(_U.id == uuid.UUID(str(user_id))).first()
+            if user is None:
+                return False
+            return user.role == RoleEnum.ADMIN or auditor_rights.auditor_live(db, user).live
         finally:
             db.close()
-        return role == RoleEnum.ADMIN
     except Exception as e:  # noqa: BLE001
         print(f"[WS] activity access check failed (no signal): {type(e).__name__}")
         return False

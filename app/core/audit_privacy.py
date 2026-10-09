@@ -184,6 +184,8 @@ _IDENTIFIER_KEYS = (
     # an export from a case: its id, how many files were exported, missing, unreadable or did not match their
     # stored checksum, and the SHA-256 of its manifest (a digest of the export's own list, never of a file)
     "export_id", "file_count", "manifest_sha256", "missing", "unreadable", "mismatched",
+    # names shown on the Activity page because of a case: how many events, and a digest of their ids (never a name)
+    "events", "events_digest",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
@@ -237,7 +239,7 @@ DETAIL_KEYS.update({
     "filters.category": IDENTIFIER, "filters.channel": IDENTIFIER, "filters.status": IDENTIFIER,
     "filters.action": IDENTIFIER, "filters.user_match": IDENTIFIER, "filters.no_account": IDENTIFIER,
     "filters.temp_credential_id": IDENTIFIER, "filters.vault_id": IDENTIFIER, "filters.from_date": IDENTIFIER,
-    "filters.to_date": IDENTIFIER,
+    "filters.to_date": IDENTIFIER, "filters.case": IDENTIFIER,
     "filters.user": SIGNIN_NAME, "filters.q": SIGNIN_NAME, "filters.temp_credential": SIGNIN_NAME,
     "filters.ip": ADDRESS,
 })

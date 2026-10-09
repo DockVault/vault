@@ -92,8 +92,11 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
                        temp_credential_id: Optional[str] = None, temp_credential: Optional[str] = None,
                        ids: Sequence[str] = (), actions: Sequence[str] = (), user_exact: bool = False,
                        no_account: bool = False, vault_id: Optional[str] = None,
-                       start: Optional[datetime] = None, end: Optional[datetime] = None):
-    """Apply the Events filters to a query over AuditLog. Unknown choices are ignored, never errors."""
+                       start: Optional[datetime] = None, end: Optional[datetime] = None,
+                       case_id=None, case_vaults: Sequence[str] = ()):
+    """Apply the Events filters to a query over AuditLog. Unknown choices are ignored, never errors. A case
+    selected (``case_id``, with ``case_vaults`` its vaults' ids, app/services/activity_case.py) keeps its own rows
+    and the events on its vaults."""
     from sqlalchemy import String, and_, case, cast, false, literal, or_, select
 
     if categories:
@@ -141,6 +144,12 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
     if actions:
         wanted = stored_action_names(actions)
         q = q.filter(AuditLog.action.in_(wanted) if wanted else false())
+
+    if case_id is not None:
+        vids = sorted({str(v) for v in case_vaults or ()})
+        q = q.filter(or_(AuditLog.case_id == case_id,
+                         and_(AuditLog.resource_type == "vault", AuditLog.resource_id.in_(vids)),
+                         AuditLog.details["vault_id"].as_string().in_(vids)))
 
     if vault_id:
         try:
