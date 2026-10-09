@@ -1,7 +1,7 @@
 /*
  * The audit log's integrity status on the Activity page (GET /activity/integrity,
  * app/api/audit_integrity_router.py): the chain's head, the line to keep somewhere else, how far the hours
- * are sealed, the last check, and every failure and warning not yet acknowledged.
+ * are sealed, the last check, every failure and warning not yet acknowledged, and what the archive holds.
  *
  * Shown under the Activity page's header each time the page opens. Uses app.js's apiRequest; builds the
  * strip with createElement and textContent only.
@@ -20,6 +20,19 @@
         if (!text) return '';
         const d = new Date(text);
         return isNaN(d.getTime()) ? text : d.toLocaleString();
+    }
+
+    // The archive (app/core/audit_archive.py summary): when it starts, and the days it holds.
+    function archiveText(a) {
+        if (!a || !a.hot_days) return '';
+        if (a.days) {
+            return 'Audit days older than ' + a.hot_days + ' days are kept compressed: ' + a.days + ' days, ' +
+                a.oldest_day + ' to ' + a.newest_day + '.';
+        }
+        if (a.starts_on) {
+            return 'From ' + when(a.starts_on) + ', audit days older than ' + a.hot_days + ' days are kept compressed.';
+        }
+        return '';
     }
 
     function render(box, s) {
@@ -64,6 +77,8 @@
             box.appendChild(el('div', 'text-secondary text-sm',
                 'The chain’s key is derived from ENCRYPTION_KEY; set AUDIT_CHAIN_KEY to give it a key of its own.'));
         }
+        const archive = archiveText(s.archive);
+        if (archive) box.appendChild(el('div', 'text-secondary text-sm act-integrity-archive', archive));
         if (s.claim) box.appendChild(el('div', 'text-secondary text-sm', s.claim));
         box.hidden = false;
     }

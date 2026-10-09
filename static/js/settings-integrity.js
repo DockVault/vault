@@ -1,7 +1,7 @@
 /*
  * Settings -> Activity and records: the audit log's integrity warnings an administrator acknowledges once seen
  * (GET /settings/audit-integrity/warnings, POST /settings/audit-integrity/acknowledge,
- * app/api/audit_integrity_router.py).
+ * app/api/audit_integrity_router.py), and when the archive starts and what it holds.
  *
  * Each late seal is shown with the rows it added (time, action, account, resource), so an administrator
  * acknowledges what they have seen, not a count; each seal written from the database's values says what it
@@ -85,6 +85,23 @@
         button.disabled = S.busy || S.chosen.size === 0;
     }
 
+    // The archive (app/core/audit_archive.py summary): when archiving starts, the row window, and the days held.
+    function renderArchive(a) {
+        const box = byId('integrity-archive');
+        if (!box) return;
+        box.replaceChildren();
+        if (!a || !a.hot_days) { box.hidden = true; return; }
+        let text = 'Audit days older than ' + a.hot_days + ' days are moved into compressed daily blocks, each ' +
+            'checked against the seals first; nothing is deleted by it. ';
+        if (a.starts_on) text += 'Archiving ' + (new Date(a.starts_on) > new Date() ? 'starts' : 'started') + ' on ' +
+            when(a.starts_on) + '. ';
+        else text += 'Archiving starts ' + a.start_after_days + ' days after the log is first sealed. ';
+        text += a.days ? (a.days + ' days are archived, ' + a.oldest_day + ' to ' + a.newest_day + '.')
+            : 'No day is archived yet.';
+        box.appendChild(el('span', null, text));
+        box.hidden = false;
+    }
+
     async function load() {
         if (!byId('integrity-warnings-list')) return;
         try {
@@ -92,6 +109,7 @@
             S.warnings = out.warnings || [];
             S.chosen = new Set([...S.chosen].filter((s) => S.warnings.some((w) => w.seq === s)));
             render();
+            renderArchive(out.archive);
         } catch (e) {
             showToast(`The audit log's warnings could not be read: ${e.message}`, 'error');
         }
