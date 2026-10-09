@@ -315,3 +315,48 @@ def test_an_administrator_made_by_whoever_created_the_auditors_account_may_not_a
                 psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
             forget_grants(uma["id"])
             admin.delete_user(bea["id"])
+
+
+def test_an_administrator_the_case_names_sees_nothing_of_it_pending_or_active(world, admin):
+    """An administrator a case names, who owns none of its vaults, sees it only as an owner does: nothing. Not while
+    it waits for approval (before its owner is told and before its hold), nor once it is active; every step is not
+    found, unrecorded, and the administrators' notice of its approval leaves them out."""
+    from _account_change_helpers import second_admin
+    with second_admin(admin, independent=True) as (otto, otto_c):
+        case = _ask(world, named_user_ids=[otto["id"]], hold=True)
+        for when in ("pending", "active"):
+            assert case["id"] not in {c["id"] for c in otto_c.get("/compliance/cases").json()["cases"]}, when
+            assert otto_c.get(f"/compliance/cases/{case['id']}").status_code == 404, when
+            assert case["id"] not in {c["id"] for c in otto_c.get("/compliance/holds").json()["cases"]}, when
+            r = otto_c.post(f"/compliance/cases/{case['id']}/approve", headers={"If-Match": '"1"'})
+            assert r.status_code == 404 and "concerns" not in r.text, when
+            assert otto_c.post(f"/compliance/cases/{case['id']}/hold/confirm").status_code == 404, when
+            if when == "pending":
+                _bob, bob_c, _ = _as(world, "bob")
+                assert bob_c.get(f"/compliance/cases/{case['id']}").status_code == 200
+                assert _approve(world, "bob", case["id"], 1).status_code == 200
+        assert otto_c.get("/me/compliance-access").json()["cases"] == []
+        assert psql(f"SELECT count(*) FROM audit_logs WHERE user_id = '{otto['id']}' AND status = 'failure' "
+                    f"AND resource_id = '{case['id']}'") == "0"
+        assert psql(f"SELECT count(*) FROM notifications WHERE user_id = '{otto['id']}' "
+                    "AND title = 'Case approved'") == "0"
+
+
+def test_an_administrator_the_proposer_made_may_not_approve_the_auditors_case(world, admin):
+    """ada proposed uma's right; bea, whom ada made an administrator (of long standing, with an authenticator),
+    is refused on uma's case, recorded, and the case waits."""
+    from _account_change_helpers import make_independent, second_admin
+    ada = world["admins"]["ada"][0]
+    with second_admin(admin) as (bea, bea_c):
+        make_independent(bea["id"])
+        psql(f"UPDATE admin_grants SET granted_by_id = '{ada['id']}', granted_by_name = '{ada['_username']}', "
+             f"lineage = '[\"{ada['id']}\"]' WHERE user_id = '{bea['id']}'")
+        _s, bea_codes = enroll_totp(bea, bea_c)
+        case = _ask(world)
+        headers = compliance_receipt(bea_c, "compliance.case.approve", bea["_password"], bea_codes)
+        headers["If-Match"] = '"1"'
+        r = bea_c.post(f"/compliance/cases/{case['id']}/approve", headers=headers)
+        assert r.status_code == 403 and r.json()["detail"]["reason"] == "made_by_proposer", r.text
+        assert _failures("case_approved", case["id"]) == "made_by_proposer"
+        _bob, bob_c, _ = _as(world, "bob")
+        assert bob_c.get(f"/compliance/cases/{case['id']}").json()["status"] == "pending"
