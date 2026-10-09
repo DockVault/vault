@@ -3044,6 +3044,17 @@ def parse_operator_answer(stdout):
     return answer if isinstance(answer, dict) and "ok" in answer else None
 
 
+def parse_df_available(stdout):
+    """The available bytes `df -Pk <path>` prints for its one filesystem, or None."""
+    lines = [ln.split() for ln in (stdout or "").splitlines() if ln.strip()]
+    if len(lines) < 2 or len(lines[-1]) < 4:
+        return None
+    try:
+        return int(lines[-1][3]) * 1024
+    except ValueError:
+        return None
+
+
 def server_text(value, default=""):
     """A string the account tool read from the server, made safe to print on this terminal.
 
@@ -5970,6 +5981,10 @@ class DockVault:
             return self._audit_host_command(args, action)
         if action == "change-key":
             return self._audit_change_key(args)
+        if action == "unarchive":
+            return self._audit_unarchive(args)
+        if action == "compact":
+            return self._audit_compact(args)
         tool_args = ["verify", "--json"]
         for flag, name in (("--from", "audit_from"), ("--to", "audit_to"), ("--anchor", "anchor")):
             value = getattr(args, name, None) if args else None
@@ -6052,10 +6067,11 @@ class DockVault:
             self._fail("%s is empty" % path)
         return text + "\n"
 
-    def _audit_two_phase(self, args, tool_args, what):
+    def _audit_two_phase(self, args, tool_args, what, check=None):
         """Every host command that writes a seal runs in two steps: read the chain and show what will be
         written, ask, then write with the state that was shown, so nothing changed in between is written over
-        unseen. What the read asks to confirm by name must be typed (or given with --confirm)."""
+        unseen. What the read asks to confirm by name must be typed (or given with --confirm). ``check``, when
+        given, sees the read's answer before anything is asked, and may refuse."""
         pal = self.pal
         key = self._audit_old_key(args)
         extra = ["--old-key-stdin"] if key is not None else []
@@ -6064,6 +6080,8 @@ class DockVault:
             self._fail(server_text(seen.get("error")) or "the chain could not be read")
         for line in seen.get("lines") or []:
             print("  " + server_text(line))
+        if check is not None:
+            check(seen)
         given = list(getattr(args, "confirm", None) or [])
         interactive = not getattr(args, "yes", False)
         for name in seen.get("confirm") or []:
@@ -6169,6 +6187,73 @@ class DockVault:
         except OSError:
             pass
         print(pal.paint("  The chain is under the new key (seal %s).\n" % server_text(done.get("sealed")), "green"))
+
+    def _db_free_bytes(self):
+        """The free space of the database volume, in bytes, as the database container sees it, or None."""
+        try:
+            r = self._run_dc("exec", "-T", DB_CONTAINER, "df", "-Pk", "/var/lib/postgresql/data", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return parse_df_available(getattr(r, "stdout", "") or "")
+
+    def _audit_unarchive(self, args):
+        """unarchive: restore archived audit days as rows (--from and --to, days), once they fit. The read says
+        how much the days take restored, 7 to 12 times their compressed size; this refuses, with the numbers,
+        unless the larger figure fits in the database volume's free space. Then the two steps of every host
+        command that writes a seal."""
+        pal = self.pal
+        tool = ["unarchive"]
+        for flag, name in (("--from", "audit_from"), ("--to", "audit_to")):
+            value = (getattr(args, name, None) or "").strip() if args else ""
+            if value:
+                tool += [flag, value[:10]]
+
+        def fits(seen):
+            est = seen.get("estimate") or {}
+            need = int(est.get("restored_high_bytes") or 0)
+            free = self._db_free_bytes()
+            if free is None:
+                self._fail("could not read the free space of the database volume (df in %s): nothing restored"
+                           % DB_CONTAINER)
+            print("  The database volume has %s free; restored, these days take about %s to %s."
+                  % (format_bytes(free), format_bytes(int(est.get("restored_low_bytes") or 0)), format_bytes(need)))
+            if need > free:
+                print(pal.paint("  That would not fit: up to %s needed, %s free. Free some space, or restore fewer "
+                                "days with --from and --to; nothing restored." % (format_bytes(need),
+                                                                                  format_bytes(free)), "red"))
+                raise SystemExit(1)
+
+        done = self._audit_two_phase(args, tool, "Restore these days as rows", check=fits)
+        if done is None:
+            return
+        days = done.get("days") or []
+        print(pal.paint("  Restored %s rows of %s days: %s" % (
+            server_text(done.get("rows")), len(days), ", ".join(server_text(d) for d in days) or "none"), "green"))
+
+    def _audit_compact(self, args):
+        """compact: VACUUM FULL of the audit tables, which gives their free space back to the system. It locks
+        them while it runs: audit writes wait, and fail after a few seconds."""
+        pal = self.pal
+        print(pal.paint("  audit compact rewrites audit_logs and audit_archive_blocks to give their free space back "
+                        "to the system. While it runs both tables are locked: every action the vault records "
+                        "waits and then fails, sign-ins and file actions included. Run it when nobody uses the "
+                        "vault.", "yellow"))
+        if not getattr(args, "yes", False):
+            try:
+                answer = input(pal.paint("  Compact the audit tables now? Type yes: ", "cyan"))
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() != "yes":
+                print(pal.paint("  Nothing done.", "yellow"))
+                return
+        done = self._audit_tool("compact")
+        if not done.get("ok"):
+            self._fail(server_text(done.get("error")) or "the audit tables were not compacted")
+        for t in done.get("tables") or []:
+            before, after = t.get("before_bytes"), t.get("after_bytes")
+            print(pal.paint("  %s: %s -> %s" % (server_text(t.get("table")),
+                                               format_bytes(before) if isinstance(before, int) else "?",
+                                               format_bytes(after) if isinstance(after, int) else "?"), "green"))
 
     def _audit_host_command(self, args, action):
         """rekey, after-record, accept-database-head, accept-restore, acknowledge-removed-before: in two steps,
@@ -6548,14 +6633,16 @@ def build_parser():
     au = parsers["audit"]
     au.add_argument("audit_action", nargs="?", default="verify",
                     choices=("verify", "acknowledge", "rekey", "after-record", "accept-database-head",
-                             "accept-restore", "acknowledge-removed-before", "change-key"),
+                             "accept-restore", "acknowledge-removed-before", "change-key", "unarchive", "compact"),
                     help="verify (the default): check the chain and print its head; acknowledge: acknowledge "
                          "warnings (--seqs), failures (--failures), rows (--rows) or late rows (--late-rows) once "
                          "you have looked at them; rekey: move the chain to the current AUDIT_CHAIN_KEY; "
                          "after-record: accept or discard the seals after the head record; accept-database-head: "
                          "accept a restored database or a lost head record; accept-restore: finish a restore of a "
                          "backup; acknowledge-removed-before: seal over rows an older release removed by age; "
-                         "change-key: give the chain a new AUDIT_CHAIN_KEY")
+                         "change-key: give the chain a new AUDIT_CHAIN_KEY; unarchive: restore archived days as "
+                         "rows (--from, --to: days) once they fit in the database volume; compact: give the audit "
+                         "tables' free space back to the system (locks them while it runs)")
     au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
     au.add_argument("--failures", dest="failures", action="store_true",
                     help="acknowledge: every failure, and every warning kept by kind (not a seal's), not yet "
@@ -6587,9 +6674,11 @@ def build_parser():
                     help="acknowledge-removed-before: the AUDIT_LOG_RETENTION_DAYS the older release ran with")
     au.add_argument("--yes", dest="yes", action="store_true", help="write without asking (confirmations by name "
                                                                     "still need --confirm)")
-    au.add_argument("--from", dest="audit_from", help="the first hour whose rows are checked (YYYY-MM-DDTHH:00:00Z); "
-                                                      "every hour by default")
-    au.add_argument("--to", dest="audit_to", help="the hour the row check stops before")
+    au.add_argument("--from", dest="audit_from", help="verify: the first hour whose rows are checked "
+                                                      "(YYYY-MM-DDTHH:00:00Z), every hour by default; unarchive: "
+                                                      "the first day (YYYY-MM-DD), the oldest by default")
+    au.add_argument("--to", dest="audit_to", help="verify: the hour the row check stops before; unarchive: the "
+                                                  "last day, the newest by default")
     au.add_argument("--anchor", dest="anchor", help="a head you kept elsewhere (dvchain1:...): the seals up to it "
                                                     "must be the ones it names")
     au.add_argument("--no-key", dest="no_key", action="store_true",

@@ -112,3 +112,64 @@ def test_verify_hands_the_check_its_anchor_and_the_keyless_flag(tmp_path, monkey
     monkeypatch.setattr(tool, "_run_dc", lambda *args, **kw: seen.append(list(args)) or _Done())
     tool.audit(_args("verify", *argv))
     assert seen[0][seen[0].index("app.core.audit_integrity") + 1:] == ["verify", "--json", *extra]
+
+
+# --------------------------------------------------------------------------- unarchive and compact
+
+def _df(free_kb):
+    class _Done:
+        stdout = ("Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+                  f"/dev/sda1         1000000    1000 {free_kb}      1% /var/lib/postgresql/data\n")
+    return _Done()
+
+
+def _unarchive_tool(tmp_path, monkeypatch, free_kb, high=12000):
+    read = {"ok": True, "state": "dvstate1:u", "lines": ["2 archived days"],
+            "estimate": {"restored_low_bytes": 7000, "restored_high_bytes": high}}
+    tool, calls = _tool(tmp_path, monkeypatch, read, {"ok": True, "days": ["2026-07-01"], "rows": 3})
+    asked = []
+    monkeypatch.setattr(tool, "_run_dc", lambda *args, **kw: asked.append(list(args)) or _df(free_kb))
+    return tool, calls, asked
+
+
+def test_unarchive_reads_checks_the_free_space_then_writes(tmp_path, monkeypatch):
+    tool, calls, asked = _unarchive_tool(tmp_path, monkeypatch, free_kb=100)
+    tool.audit(_args("unarchive", "--from", "2026-07-01", "--to", "2026-07-02T00:00:00Z", "--yes"))
+    assert calls.calls[0][0] == ["unarchive", "--from", "2026-07-01", "--to", "2026-07-02", "--read"]
+    assert calls.calls[1][0] == ["unarchive", "--from", "2026-07-01", "--to", "2026-07-02", "--expect", "dvstate1:u"]
+    assert asked == [["exec", "-T", dv.DB_CONTAINER, "df", "-Pk", "/var/lib/postgresql/data"]]
+
+
+def test_unarchive_refuses_with_the_numbers_when_the_days_would_not_fit(tmp_path, monkeypatch, capsys):
+    tool, calls, _asked = _unarchive_tool(tmp_path, monkeypatch, free_kb=10, high=12000)    # 10 KB free
+    with pytest.raises(SystemExit) as stop:
+        tool.audit(_args("unarchive", "--yes"))
+    assert stop.value.code == 1
+    assert [c[0][-1] for c in calls.calls] == ["--read"]
+    out = capsys.readouterr().out
+    assert "would not fit" in out and dv.format_bytes(12000) in out and dv.format_bytes(10 * 1024) in out
+
+
+def test_unarchive_refuses_when_the_free_space_cannot_be_read(tmp_path, monkeypatch):
+    tool, calls, _asked = _unarchive_tool(tmp_path, monkeypatch, free_kb=100)
+    monkeypatch.setattr(tool, "_db_free_bytes", lambda: None)
+    with pytest.raises(SystemExit):
+        tool.audit(_args("unarchive", "--yes"))
+    assert [c[0][-1] for c in calls.calls] == ["--read"]
+
+
+def test_df_output_is_read_for_its_available_bytes():
+    assert dv.parse_df_available(_df(2048).stdout) == 2048 * 1024
+    assert dv.parse_df_available("") is None
+    assert dv.parse_df_available("Filesystem 1024-blocks Used Available\n/dev/x 1 2 lots\n") is None
+
+
+def test_compact_warns_and_asks_first(tmp_path, monkeypatch, capsys):
+    tool, calls = _tool(tmp_path, monkeypatch, {}, {"ok": True, "tables": [
+        {"table": "audit_logs", "before_bytes": 4096, "after_bytes": 2048}]})
+    monkeypatch.setattr("builtins.input", lambda prompt="": "no")
+    tool.audit(_args("compact"))
+    assert calls.calls == [] and "locked" in capsys.readouterr().out
+    monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+    tool.audit(_args("compact"))
+    assert calls.calls[0][0] == ["compact"]
