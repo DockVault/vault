@@ -4,9 +4,10 @@
 browser's own submission, so the browser never needs to send one. A form that escapes its handler (scripts
 off, a script that never loaded, injected markup) then sends nothing, to this origin or any other.
 
-Pinned here: the header the middleware sets on an HTML response carries exactly one form-action directive,
-and it is 'none'; and every form on every served page has a submit handler in the page's own scripts that
-calls preventDefault, so nothing the pages do relies on the browser sending a form.
+Pinned here: the header the middleware sets on an HTML response, over http and over https (TLS in the server
+or at a trusted proxy), carries exactly one form-action directive, and it is 'none'; and every form on every
+served page has a submit handler in the page's own scripts that calls preventDefault, so nothing the pages do
+relies on the browser sending a form.
 tests/test_csp_form_action_live.py and tests/test_ui_forms_before_the_app_loads.py check it in a browser.
 """
 import pathlib
@@ -25,15 +26,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 
 
-def _csp_for_html():
+def _csp_for_html(scheme="http", headers=(), peer="198.51.100.20"):
     from starlette.requests import Request
     from starlette.responses import HTMLResponse
     from app.api import api_server as A
 
     mw = A.SecurityHeadersMiddleware(app=None)
     request = Request({"type": "http", "method": "GET", "path": "/", "raw_path": b"/", "query_string": b"",
-                       "headers": [(b"host", b"vault.example")], "client": ("198.51.100.20", 5000),
-                       "server": ("vault.example", 80), "scheme": "http", "root_path": ""})
+                       "headers": [(b"host", b"vault.example"), *headers], "client": (peer, 5000),
+                       "server": ("vault.example", 443 if scheme == "https" else 80), "scheme": scheme,
+                       "root_path": ""})
 
     async def call_next(_request):
         return HTMLResponse("<!doctype html><title>x</title>")
@@ -42,8 +44,31 @@ def _csp_for_html():
     return response.headers["Content-Security-Policy"]
 
 
-def test_the_page_lets_the_browser_send_no_form():
-    directives = [d.strip() for d in _csp_for_html().split(";")]
+@pytest.fixture
+def trusted_proxy(monkeypatch):
+    from app.core import net_utils
+    monkeypatch.setattr(net_utils.settings, "trusted_proxies", "10.0.0.0/8", raising=False)
+    monkeypatch.setattr(net_utils.settings, "trust_all_proxies", False, raising=False)
+    net_utils._trusted_networks.cache_clear()
+    yield
+    net_utils._trusted_networks.cache_clear()
+
+
+# How the page reaches the browser: plain http; https with TLS in the server; and https ended at a trusted
+# reverse proxy, which says so in X-Forwarded-Proto (the way production serves it). Over https the policy
+# gains upgrade-insecure-requests, which shows the https branch ran.
+TRANSPORTS = {
+    "http": ({}, False),
+    "https in the server": ({"scheme": "https"}, True),
+    "https at a trusted proxy": ({"headers": ((b"x-forwarded-proto", b"https"),), "peer": "10.0.0.5"}, True),
+}
+
+
+@pytest.mark.parametrize("transport", list(TRANSPORTS))
+def test_the_page_lets_the_browser_send_no_form(trusted_proxy, transport):
+    request, https = TRANSPORTS[transport]
+    directives = [d.strip() for d in _csp_for_html(**request).split(";")]
+    assert ("upgrade-insecure-requests" in directives) is https, directives
     form_action = [d for d in directives if d.split(" ", 1)[0] == "form-action"]
     assert form_action == ["form-action 'none'"], directives
 
