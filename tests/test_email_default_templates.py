@@ -236,11 +236,20 @@ def _all_actions_unbound():
     return {k: _FakeAction(k) for k in ea.DEFAULT_TEMPLATES}
 
 
+def _seeded_keys():
+    """The actions a default template row is made for: every one but a locked one, whose wording is fixed."""
+    return [k for k in ea.DEFAULT_TEMPLATES if ea.SPEC_BY_KEY[k]["category"] != ea.LOCKED]
+
+
 def test_seed_creates_all_defaults_and_binds_unbound_actions():
     sess = _FakeSession(actions=_all_actions_unbound())
     n = ea.seed_default_templates(sess)
-    assert n == len(ea.DEFAULT_TEMPLATES)                       # one default row per action
-    for key in ea.DEFAULT_TEMPLATES:
+    assert n == len(_seeded_keys())                             # one default row per action but a locked one
+    locked = [k for k in ea.DEFAULT_TEMPLATES if k not in _seeded_keys()]
+    assert locked == ["compliance_access_notice"]
+    for key in locked:
+        assert key not in sess.templates and sess.actions[key].template_id is None
+    for key in _seeded_keys():
         tpl = sess.templates[key]
         assert tpl.default_key == key
         assert tpl.body_html == es.sanitize_email_html(ea.DEFAULT_TEMPLATES[key]["body_html"])
@@ -295,8 +304,8 @@ def test_seed_never_rebinds_an_action_the_admin_already_set():
     sess = _FakeSession(actions=actions)
     ea.seed_default_templates(sess)
     assert sess.actions["login_alert"].template_id == chosen           # admin choice respected
-    # every other action was bound to its freshly-created default
-    for key in ea.DEFAULT_TEMPLATES:
+    # every other action but a locked one was bound to its freshly-created default
+    for key in _seeded_keys():
         if key == "login_alert":
             continue
         assert sess.actions[key].template_id == sess.templates[key].id
@@ -307,9 +316,9 @@ def test_seed_skips_a_conflicting_default_without_double_binding():
     # skip it (the winner binds that action) and still create+bind every other default.
     sess = _FakeSession(actions=_all_actions_unbound(), fail_keys={"share_created"})
     n = ea.seed_default_templates(sess)
-    assert n == len(ea.DEFAULT_TEMPLATES) - 1                       # the conflicting one wasn't created here
+    assert n == len(_seeded_keys()) - 1                             # the conflicting one wasn't created here
     assert sess.actions["share_created"].template_id is None        # not bound by us — no double-bind
-    for key in ea.DEFAULT_TEMPLATES:
+    for key in _seeded_keys():
         if key == "share_created":
             continue
         assert sess.actions[key].template_id == sess.templates[key].id
