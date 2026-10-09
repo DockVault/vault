@@ -1,0 +1,273 @@
+"""The audit log's archive on a running stack's Postgres (app/core/audit_archive.py): each case runs on a throwaway
+database of its own, with the web image's code in the web container (tests/_throwaway_db.py), the server's passes
+run as scripts whose clock can be set, and the host's commands as ``python -m app.core.audit_integrity`` in a
+process of their own, in their two phases:
+
+- a sealed day older than the row window moves into a block: stored without Postgres's compression once the
+  background step has run (its length read without reading it), the data marker kept while a block exists, the
+  chain clean; ``audit unarchive`` puts back rows identical in every column, JSON text and JSONB included, and the
+  marker goes with the last block;
+- the audit job deletes archived rows through the block-rewrite primitive (the conditions run over a temporary
+  table shaped like audit_logs), keeping the protected ones; the size cap counts an archived part by its bound
+  length once a delay of sealing has passed, and verify recomputes a size-cap prune's total;
+- a block changed, removed or added in the database, and a row put back into an archived hour, are found;
+- ``audit compact`` runs VACUUM FULL over both audit tables; ``df`` in the database container gives the free space
+  dockvault.py checks before an unarchive.
+
+test_audit_archive.py covers the rules offline.
+"""
+import json
+import subprocess
+
+import pytest
+
+from _account_change_helpers import API, DB
+from _throwaway_db import PREAMBLE, run_in, throwaway_database
+
+pytestmark = pytest.mark.integration
+
+KEY = "k" * 64
+
+SCRIPT = PREAMBLE + r'''
+import hashlib
+from app.core import audit_archive as arc, audit_chain_format as fmt, audit_chain_verify as v
+from app.core import audit_retention as ar, background_maintenance as bm
+out = {}
+real_now = now
+clock = [real_now]
+st = ai.ChainState(clock=lambda: clock[0])
+ai.set_state(st)
+DAY = (real_now - timedelta(days=100)).date()
+
+
+def at(hour, minute=0, day=None):
+    d = day or DAY
+    return datetime(d.year, d.month, d.day, hour, minute)
+
+
+def add_row(t, nonce=True, details=None, action="file_uploaded", recorded=None, agent="Mozilla/5.0 test"):
+    rid = uuid.uuid4()
+    with engine.begin() as c:
+        c.execute(text(
+            "INSERT INTO audit_logs (id, action, status, timestamp, username, ip_address, user_agent, endpoint, "
+            "details, recorded, seal_nonce, privacy_version) VALUES (:id, :a, 'success', :t, 'carol', "
+            "'203.0.113.5', :ua, '/api/files/{id}', CAST(:d AS json), CAST(:r AS jsonb), :n, 3)"),
+            {"id": rid, "a": action, "t": t, "ua": agent, "d": details or json.dumps({"n": 1}),
+             "r": recorded, "n": os.urandom(16) if nonce else None})
+    return str(rid)
+
+
+def passes(when=None):
+    clock[0] = when or clock[0]
+    r = None
+    for _ in range(400):
+        r = ai.seal_pass(SessionLocal, st=st, now=clock[0])
+        if r.stopped or not r.sealed:
+            break
+    return r.stopped if r else None
+
+
+def run_days(days):
+    end = clock[0] + timedelta(days=days)
+    while clock[0] + timedelta(hours=6) <= end:
+        clock[0] += timedelta(hours=6)
+        passes()
+
+
+def report(**kw):
+    db = SessionLocal()
+    try:
+        held = {k: c.key for k, c in st.keys_held().items()}
+        rep = v.verify(db, record=st.head_store().load(), held=held, current_key_id=st.current_key().key_id,
+                       now=clock[0], **kw)
+        return {s: sorted({f.kind for f in rep.findings if f.severity == s})
+                for s in ("failure", "warning", "information")}
+    finally:
+        db.close()
+
+
+def archive():
+    return arc.archive_job(retention.Pass(SessionLocal, now=clock[0]))
+
+
+def q(sql, **params):
+    with engine.begin() as c:
+        res = c.execute(text(sql), params)
+        return [list(r) for r in res] if res.returns_rows else []
+
+
+def dump():
+    """Every column of every row of the archived day, as the database gives its text."""
+    return q("SELECT id::text, user_id::text, username, action, resource_type, resource_id, "
+             "to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS.US'), ip_address, user_agent, method, endpoint, channel, "
+             "status, details::text, error_message, encode(seal_nonce, 'hex'), privacy_version, recorded::text, "
+             "ip_via, case_id::text FROM audit_logs WHERE timestamp < :end ORDER BY timestamp, id",
+             end=at(0) + timedelta(days=1))
+'''
+
+
+@pytest.fixture
+def throwaway():
+    yield from throwaway_database()
+
+
+def _script(name, body):
+    return run_in(name, SCRIPT + body + "\nprint(json.dumps(out, default=str))\n",
+                  env={"AUDIT_CHAIN_KEY": KEY, "AUDIT_ARCHIVE_START_AFTER_DAYS": "0"})
+
+
+def _url(name):
+    base = subprocess.run(["docker", "exec", API, "printenv", "DATABASE_URL"], capture_output=True, text=True,
+                          timeout=60).stdout.strip()
+    return base.rsplit("/", 1)[0] + "/" + name
+
+
+def _cli(name, *args):
+    """The host's command in a process of its own in the web container, on the throwaway database."""
+    env = {"DATABASE_URL": _url(name), "AUDIT_CHAIN_HEAD_FILE": f"/tmp/{name}-head.json", "AUDIT_CHAIN_KEY": KEY,
+           "AUDIT_ARCHIVE_START_AFTER_DAYS": "0"}
+    cmd = ["docker", "exec", "-i"] + [f"-e{k}={v}" for k, v in env.items()] + \
+        [API, "python", "-m", "app.core.audit_integrity", *args]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=900)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    answer = json.loads(lines[-1]) if lines and lines[-1].startswith("{") else None
+    return r.returncode, answer, r.stderr
+
+
+def _two(name, *args):
+    code, seen, err = _cli(name, *args, "--read")
+    assert code == 0 and seen and seen["ok"], (seen, err[-3000:])
+    code, done, err = _cli(name, *args, "--expect", seen["state"])
+    assert code == 0 and done and done["ok"], (done, err[-3000:])
+    return seen, done
+
+
+def test_a_day_moves_into_a_block_on_postgres_and_comes_back_identical(throwaway):
+    first = _script(throwaway, r'''
+for h in (3, 4, 6):
+    for i in range(3):
+        add_row(at(h, i), nonce=(i != 1), details='{ "b" : [1, 2.50, "x"],  "a": null }' if i == 0 else None,
+                recorded='{"ip": "shortened", "n": [1, 2.5]}' if i == 2 else None,
+                agent="Mozilla/5.0 (X11; Linux x86_64) é" if h == 4 else "curl/8.5")
+out["stopped"] = passes()
+out["before"] = dump()
+out["storage"] = bm.run_steps(engine, [s for s in bm.STEPS if s.name == "audit_archive_blocks_storage"])
+archive()
+out["after_rows"] = q("SELECT count(*) FROM audit_logs WHERE timestamp < :t", t=at(0) + timedelta(days=1))[0][0]
+out["blocks"] = q("SELECT day::text, part, row_count, octet_length(payload), encode(sha256(payload), 'hex') "
+                  "FROM audit_archive_blocks ORDER BY day, part")
+out["attstorage"] = q("SELECT a.attstorage FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                      "WHERE c.relname = 'audit_archive_blocks' AND a.attname = 'payload'")[0][0]
+out["seal"] = q("SELECT detail::text FROM audit_seals WHERE kind = 'archive' ORDER BY seq")
+out["marker"] = q("SELECT key, requires_at_least FROM data_requirements")
+out["report"] = report()
+''')
+    assert first["stopped"] is None, first
+    assert first["storage"] == {"audit_archive_blocks_storage": "applied"} and first["attstorage"] == "e"
+    assert first["after_rows"] == 0 and len(first["before"]) == 9
+    ((day, part, rows, length, digest),) = first["blocks"]
+    (detail,) = [json.loads(d[0]) for d in first["seal"]]
+    assert detail["parts"] == [[1, detail["parts"][0][1], detail["parts"][0][2], 9, length, digest]] and rows == 9
+    assert detail["complete"] is True and day == detail["day"]
+    assert any(m[0] == "archived-audit-history" for m in first["marker"]), first["marker"]
+    assert first["report"]["failure"] == [], first["report"]
+    seen, done = _two(throwaway, "unarchive")
+    assert seen["estimate"]["rows"] == 9 and done["rows"] == 9 and done["days"] == [day]
+    second = _script(throwaway, r'''
+out["after"] = dump()
+out["blocks"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+out["marker"] = q("SELECT key FROM data_requirements")
+out["report"] = report()
+''')
+    assert second["after"] == first["before"]
+    assert second["blocks"] == 0 and ["archived-audit-history"] not in second["marker"]
+    assert second["report"]["failure"] == [], second["report"]
+    assert "unarchived" in second["report"]["information"]
+
+
+def test_archived_rows_are_pruned_through_their_blocks_and_counted_by_the_size_cap(throwaway):
+    # The chain starts nine days back, so that a delay of sealing has passed after the archived hours' seals by the
+    # time the clock reaches now (the rows the app writes itself are dated now).
+    done = _script(throwaway, r'''
+protected = ar.protected_actions()[0]
+for h in (3, 9):
+    add_row(at(h), details=json.dumps({"blob": os.urandom(15000).hex()}))
+keep = add_row(at(10), action=protected)
+add_row(at(11))
+clock[0] = real_now - timedelta(days=9)
+out["stopped"] = passes()
+archive()
+run_days(9)
+db = SessionLocal()
+try:
+    from app.core import audit_chain_size as size
+    start = size.window_start(st.view, st.known_record(), clock[0], timedelta(days=7))
+    hot, parts = size.counted(st.view, start, size.held_back(st.view, st.known_record(), start))
+finally:
+    db.close()
+(_d, part, counted, hours), = parts
+out["counted"] = [counted, part.length, sum(hours.values())]
+p = retention.Pass(SessionLocal, now=clock[0])
+ar.prune(p, ar.Numbers(95, 0, 365, 0))
+out["kept"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+db = SessionLocal()
+try:
+    from app.core.models import AuditArchiveBlock
+    from app.core import audit_archive_format as af
+    payload = db.query(AuditArchiveBlock.payload).scalar()
+    out["rows"] = [str(r["id"]) for r in af.open_block(payload).rows()]
+finally:
+    db.close()
+out["keep"] = keep
+out["last"] = q("SELECT kind, detail->>'cause' FROM audit_seals ORDER BY seq DESC LIMIT 2")
+out["report"] = report()
+''')
+    assert done["stopped"] is None, done
+    counted, length, lagged = done["counted"]
+    assert counted == min(length, lagged) and 0 < counted
+    assert done["rows"] == [done["keep"]] and done["kept"] == 1
+    assert done["last"] == [["archive", "rewrite"], ["prune", None]]
+    assert done["report"]["failure"] == [], done["report"]
+
+
+def test_a_changed_removed_or_added_block_and_a_row_put_back_are_found(throwaway):
+    done = _script(throwaway, r'''
+for h in (3, 4):
+    add_row(at(h))
+out["stopped"] = passes()
+archive()
+q("UPDATE audit_archive_blocks SET payload = overlay(payload placing decode('00', 'hex') from 20 for 1)")
+out["altered"] = report()["failure"]
+q("DELETE FROM audit_archive_blocks")
+out["missing"] = report()["failure"]
+q("INSERT INTO audit_archive_blocks (day, part, first_hour, last_hour, row_count, codec, format, payload, "
+  "raw_bytes, aggregates, created_at) VALUES (:d, 7, :f, :l, 0, 'zstd', 1, 'x', 0, '{}', now())",
+  d=DAY, f=at(0), l=at(1))
+out["unsealed"] = report()["failure"]
+add_row(at(3, 30))
+out["put_back"] = report()["failure"]
+''')
+    assert done["stopped"] is None, done
+    assert "block-altered" in done["altered"]
+    assert "block-missing" in done["missing"]
+    assert "block-unsealed" in done["unsealed"]
+    assert "row-in-archived-day" in done["put_back"]
+
+
+def test_compact_runs_and_unarchive_with_nothing_archived_is_refused(throwaway):
+    _script(throwaway, 'add_row(at(5)); out["stopped"] = passes()\n')
+    code, answer, err = _cli(throwaway, "compact")
+    assert code == 0 and answer["ok"], (answer, err[-2000:])
+    assert [t["table"] for t in answer["tables"]] == ["audit_logs", "audit_archive_blocks"]
+    assert all(isinstance(t["before_bytes"], int) and isinstance(t["after_bytes"], int) for t in answer["tables"])
+    code, refused, _err = _cli(throwaway, "unarchive", "--read")
+    assert code == 2 and "no archived day" in refused["error"], refused
+
+
+def test_the_database_containers_free_space_is_read_as_dockvault_reads_it():
+    import dockvault
+    r = subprocess.run(["docker", "exec", DB, "df", "-Pk", "/var/lib/postgresql/data"], capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stderr
+    free = dockvault.parse_df_available(r.stdout)
+    assert isinstance(free, int) and free > 0, r.stdout
