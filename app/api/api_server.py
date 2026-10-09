@@ -5717,16 +5717,19 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
 
     Once the change is made, an auditor right the account holds follows it in the same transaction
     (app/core/auditor_rights.py, after_credential_change): whoever made it joins the grant's list of
-    changers, and the grant is suspended, or ended for a second-factor reset."""
-    from app.core import auditor_rights
+    changers, and the grant is suspended, or ended for a second-factor reset. A change by someone else is
+    also kept on every compliance case the account started (app/core/legal_holds.py, after_starter_change)."""
+    from app.core import auditor_rights, legal_holds
     result = _make_credential_change(db, kind, target, payload, actor_id=actor_id, actor_name=actor_name,
                                      request=request, for_someone_else=for_someone_else,
                                      link_maker_id=link_maker_id)
     approved = link_maker_id is not _LINK_MAKER_IS_ACTOR
+    someone_else = for_someone_else and actor_id != target.id
     auditor_rights.after_credential_change(
-        db, target, kind, actor_id=actor_id, actor_name=actor_name,
-        someone_else=for_someone_else and actor_id != target.id,
+        db, target, kind, actor_id=actor_id, actor_name=actor_name, someone_else=someone_else,
         approved=approved, approver_id=link_maker_id if approved else None)
+    if someone_else:
+        legal_holds.after_starter_change(db, target, kind)
     return result
 
 
@@ -6867,10 +6870,12 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     user.password_hash = hash_password(body.new_password)
     # Whose password it now is: a link another account made could have been used by its maker, so the
     # password counts as theirs; one the person asked for (or the host operator made) is the person's own.
-    from app.core import password_origin
+    from app.core import legal_holds, password_origin
     made_by_other = _reset_link_made_by_other(r)
     if made_by_other:
         password_origin.set_by_other(user, r.created_by)
+        # Kept on the compliance cases the account started, after the flag above clears.
+        legal_holds.after_starter_change(db, user, "password")
     else:
         password_origin.set_by_self(user)
     db.commit()

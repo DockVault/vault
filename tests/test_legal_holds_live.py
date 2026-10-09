@@ -13,7 +13,8 @@ gate in app/services/vault_service.py, app/core/legal_hold_marker.py).
   * the server's operator confirms a hold on the host (python -m app.core.host_compliance, as dockvault.py runs
     it) only while no administrator could, and a refusal is recorded;
   * the person who started a case releases its hold alone only while they stand as they did: not once demoted,
-    nor once their auditor right is revoked; an auditor lists only the cases they started;
+    nor once their auditor right is revoked, nor after someone else changed their sign-in details, even once that
+    change's own record is gone; an auditor lists only the cases they started;
   * the purge leaves a vault whose row a placing or an undo holds for its next pass;
   * a hold is refused while an SFTP server of another version may be running;
   * a refused step is recorded under its case.
@@ -474,6 +475,39 @@ def test_an_auditor_whose_right_was_revoked_no_longer_releases_the_hold_alone(ad
             psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
         forget_grants(uma["id"])
         admin.delete_user(uma["id"])
+
+
+def test_a_change_to_the_placers_sign_in_details_by_someone_else_outlives_its_record(admin, admins, vaults):
+    """Another administrator sets the placer's password. The placer's account then sets "its own" password, and the
+    change's record goes 14 days after it applied (credential_changes.prune_done, run by the pruner; here its one
+    deletion is made at once): the case kept the change, so the account still does not release the hold alone."""
+    made, cases = vaults
+    ada, _ada_c, ada_codes = admins["ada"]
+    _bob, bob_c, _bob_codes = admins["bob"]
+    r = _place(admins["ada"], [made[0]["id"]])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    chosen = "Chosen-By-Another-" + uuid.uuid4().hex[:8] + "x!"
+    r = bob_c.patch(f"/users/{ada['id']}", json={"password": chosen})
+    assert r.status_code == 200, r.text
+    ada["_password"] = chosen
+    assert psql(f"SELECT starter_changed_kind FROM compliance_cases WHERE id = '{case_id}'") == "password"
+    _client, r = _release_as(ada, ada_codes, case_id, "taken over")
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "password", r.text
+    own = chosen + "-own"
+    client = signed_in_with_code(ada, ada_codes)
+    r = client.patch("/users/me", json={"current_password": chosen, "new_password": own})
+    assert r.status_code == 200, r.text
+    ada["_password"] = own
+    _client, r = _release_as(ada, ada_codes, case_id, "within the 14 days")
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "starter_changed", r.text
+    assert psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id = '{ada['id']}'") != "0"
+    psql(f"DELETE FROM credential_changes WHERE target_user_id = '{ada['id']}'")
+    _client, r = _release_as(ada, ada_codes, case_id, "after the record went")
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "starter_changed", r.text
+    assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' AND released_at IS NULL") == "1"
+    assert psql(f"SELECT status FROM compliance_cases WHERE id = '{case_id}'") == "hold_only"
 
 
 _PURGE_LEAVES_A_LOCKED_VAULT = """

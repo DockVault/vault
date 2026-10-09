@@ -705,6 +705,151 @@ def test_a_starter_whose_auditor_right_is_in_force_ends_the_hold_alone_as_its_au
     assert holds.review_refusal(db, case, people.ada, at) is None
 
 
+# --------------------------------------------------------------------------- a change kept on the case
+
+@pytest.fixture
+def changing(monkeypatch):
+    """The credential-change routes' own helper (api_server._credential_change), with what is not the database left
+    out: a reset link is made without the reset machinery, no session is ended, nothing is told."""
+    from app.api import api_server as api
+    monkeypatch.setattr(api, "_mint_reset_link",
+                        lambda db_, user, base_url, *, created_by_id, made_by_other=False: "https://v.test/?reset=x")
+    monkeypatch.setattr(api, "_password_reset_policy", lambda db_: (True, 30))
+    monkeypatch.setattr(api, "_revoke_sessions", lambda db_, **kw: 0)
+    monkeypatch.setattr(auditor_rights, "deliver", lambda notices: None)
+    return api
+
+
+CHANGES = {
+    cc.PASSWORD: {"password_hash": "set-by-bob"},
+    cc.EMAIL: {"email": "ada.elsewhere@example.test"},
+    cc.RESET_LINK: {"delivery": "copy"},
+    cc.SSH_KEY: {"name": "k", "key_type": "ssh-ed25519", "public_key": "ssh-ed25519 AAAA", "fingerprint": "SHA256:k"},
+    cc.SECOND_FACTOR: {},
+}
+
+
+def _undone_by_the_account(db, ada, kind):
+    """What the account's controller does afterwards so that nothing on the account itself shows the change: their
+    own password, the key removed, an authenticator enrolled again."""
+    from app.core import password_origin
+    password_origin.set_by_self(ada)
+    if kind == cc.SSH_KEY:
+        db.query(m.UserSSHKey).filter(m.UserSSHKey.user_id == ada.id).delete()
+    if kind == cc.SECOND_FACTOR:
+        ada.second_factor_reset_at = None
+        _totp(db, ada)
+    db.commit()
+
+
+@pytest.mark.parametrize("kind", list(CHANGES))
+def test_a_change_by_someone_else_still_refuses_the_starter_after_its_record_is_pruned(db, people, changing, kind):
+    """Another administrator changes the sign-in details of the administrator who placed a hold. The account's own
+    flags clear once it sets its own password or enrolls again, and the change's record is deleted 14 days after it
+    applied: the case keeps the change, so whoever holds the account still does not end the hold alone."""
+    start = holds.utcnow() - timedelta(hours=2)
+    case = _place(db, people.ada, [people.v1], now=start)
+    ada = people.ada
+    changing._credential_change(db, people.bob, ada, kind, summary=kind, payload=dict(CHANGES[kind]))
+    db.commit()
+    db.expire_all()
+    assert (case.starter_changed_at, case.starter_changed_kind) != (None, None) and case.starter_changed_kind == kind
+    _undone_by_the_account(db, ada, kind)
+    soon = holds.utcnow() + timedelta(minutes=1)
+    assert holds.release_refusal(db, case, ada, soon) == holds.STARTER_CHANGED
+    later = holds.utcnow() + cc.WINDOW + timedelta(days=1)
+    cc.prune_done(db, later)
+    db.commit()
+    assert db.query(m.CredentialChange).filter(m.CredentialChange.target_user_id == ada.id).count() == 0
+    for refusal in (holds.release_refusal, holds.review_refusal, cr._release_refusal, cr._review_refusal):
+        assert refusal(db, case, ada, later) == holds.STARTER_CHANGED, refusal
+    from app.core import cases
+    assert cases.close_refusal(db, case, ada, later) == holds.STARTER_CHANGED
+    # An independent administrator still ends it.
+    assert holds.release_refusal(db, case, people.bob, later) is None
+
+
+def test_the_change_is_kept_on_every_case_the_account_started_and_only_the_first_one(db, people, changing):
+    start = holds.utcnow() - timedelta(hours=2)
+    one = _place(db, people.ada, [people.v1], now=start)
+    other = _place(db, people.ada, [people.v2], now=start)
+    bobs = _place(db, people.bob, [_vault(db, people.olga)], now=start)
+    changing._credential_change(db, people.bob, people.ada, cc.EMAIL, summary="e", payload=dict(CHANGES[cc.EMAIL]))
+    db.commit()
+    db.expire_all()
+    first = one.starter_changed_at
+    assert first is not None and other.starter_changed_at == first and bobs.starter_changed_at is None
+    assert holds.after_starter_change(db, people.ada, cc.PASSWORD, now=first + timedelta(days=3)) == 0
+    db.commit()
+    db.expire_all()
+    assert (one.starter_changed_at, one.starter_changed_kind) == (first, cc.EMAIL)
+
+
+def test_the_accounts_own_change_through_an_administrators_route_is_not_kept(db, people, changing):
+    case = _place(db, people.ada, [people.v1], now=holds.utcnow() - timedelta(hours=2))
+    changing._credential_change(db, people.ada, people.ada, cc.EMAIL, summary="e", payload=dict(CHANGES[cc.EMAIL]))
+    db.commit()
+    db.expire_all()
+    assert case.starter_changed_at is None
+    assert holds.release_refusal(db, case, people.ada, holds.utcnow()) is None
+
+
+def test_a_change_before_the_case_started_is_not_kept_on_it(db, people, changing):
+    changing._credential_change(db, people.bob, people.ada, cc.EMAIL, summary="e", payload=dict(CHANGES[cc.EMAIL]))
+    db.commit()
+    case = _place(db, people.ada, [people.v1], now=holds.utcnow() + timedelta(seconds=1))
+    assert case.starter_changed_at is None
+    assert holds.release_refusal(db, case, people.ada, holds.utcnow() + timedelta(minutes=1)) is None
+
+
+def test_a_change_while_the_case_is_closed_counts_once_an_undo_opens_it_again(db, people, changing):
+    """The administrator who placed a hold releases it (the case closes); someone else then changes their sign-in
+    details; an independent administrator undoes the release. The case kept the change while closed."""
+    cara = _user(db, "cara", m.RoleEnum.ADMIN)
+    case = _place(db, people.ada, [people.v1], now=holds.utcnow() - timedelta(hours=2))
+    holds.release(db, case, by=people.ada, reason="done")
+    db.commit()
+    assert case.status == "closed"
+    changing._credential_change(db, people.bob, people.ada, cc.EMAIL, summary="e", payload=dict(CHANGES[cc.EMAIL]))
+    db.commit()
+    assert holds.undo_refusal(db, case, cara) is None
+    holds.undo_release(db, case, by=cara)
+    db.commit()
+    assert case.status == "hold_only"
+    later = holds.utcnow() + cc.WINDOW + timedelta(days=1)
+    cc.prune_done(db, later)
+    db.commit()
+    assert holds.release_refusal(db, case, people.ada, later) == holds.STARTER_CHANGED
+
+
+def test_a_link_someone_else_made_before_the_case_and_used_after_it_is_kept_on_it(db, people, monkeypatch):
+    """A reset link another administrator made before the case started, used after it: the password the link set is
+    theirs, and the case keeps that once the account sets its own password again."""
+    from _async_run import run_coroutine
+    from app.api import api_server as api
+    from app.core import password_origin, password_reset, rate_limiter
+    pepper = "r" * 48 + ":password_reset"
+    monkeypatch.setattr(api, "_reset_pepper", lambda: pepper)
+    monkeypatch.setattr(password_reset, "pepper_ok", lambda value: True)
+    monkeypatch.setattr(rate_limiter.rate_limiter, "check_rate_limit", lambda **kw: (True, 0, 0))
+    monkeypatch.setattr(api, "_validate_password_policy", lambda db_, pw: None)
+    monkeypatch.setattr(api, "_revoke_sessions", lambda db_, **kw: 0)
+    monkeypatch.setattr(api, "_password_reset_policy", lambda db_: (False, 15))
+    link = api._mint_reset_link(db, people.ada, "https://vault.example.com", created_by_id=people.bob.id,
+                                made_by_other=True)
+    case = _place(db, people.ada, [people.v1], now=holds.utcnow())
+    assert case.starter_changed_at is None
+    run_coroutine(api.do_reset(token=link.split("?reset=")[1],
+                               body=api.ResetPasswordRequest(new_password="Set-Through-Bobs-Link-1!"),
+                               request=SimpleNamespace(headers={}, client=SimpleNamespace(host="192.0.2.9")), db=db))
+    db.expire_all()
+    assert case.starter_changed_kind == cc.PASSWORD
+    password_origin.set_by_self(people.ada)
+    db.commit()
+    later = holds.utcnow() + cc.WINDOW + timedelta(days=1)
+    assert holds.release_refusal(db, case, people.ada, later) == holds.STARTER_CHANGED
+
+
 def test_a_raised_purge_delay_counts_and_a_lowered_one_does_not(db, people, settings):
     case = _place(db, people.ada, [people.v1])
     settings[cs.HOLD_PURGE_DELAY_DAYS] = 10

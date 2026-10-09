@@ -35,6 +35,7 @@ The timers (the lapse, the review prompt, the purge) run as the pruner's job ``l
 from __future__ import annotations
 
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, List, Optional
 
@@ -230,8 +231,10 @@ def starter_refusal(db, case, person, now: Optional[datetime] = None) -> Optiona
     not review or release its holds on their own now, or None. They may while they still stand as they did: an
     auditor whose right is in force (auditor_rights.auditor_live), or an administrator able to act
     (credential_changes.can_approve) whose password is their own and whose sign-in details nobody else has changed
-    since the case started. A starter who lost that standing, or whoever took over their account, does not end a
-    hold alone: an independent administrator does (decider_refusal)."""
+    since the case started. A change by someone else is kept on the case (after_starter_change), so it counts for
+    as long as the case is kept, not only while the change's own record lives. A starter who lost that standing, or
+    whoever took over their account, does not end a hold alone: an independent administrator does
+    (decider_refusal)."""
     from app.core import auditor_rights, credential_changes as cc, password_origin
     now = now or utcnow()
     standing_now = auditor_rights.auditor_live(db, person, now)
@@ -241,9 +244,52 @@ def starter_refusal(db, case, person, now: Optional[datetime] = None) -> Optiona
         return standing_now.reason if case.grant_id is not None else "not_able"
     if password_origin.is_set_by_other(person):
         return ind.PASSWORD_NOT_OWN
+    if case.starter_changed_at is not None:
+        return STARTER_CHANGED
     if auditor_rights._changed_since(db, person, case.requested_at) is not None:
         return STARTER_CHANGED
     return None
+
+
+_HAS_CASES = weakref.WeakSet()
+
+
+def _has_cases(db) -> bool:
+    """Whether the database has the cases table (a database built only with the tables a test needs may not, and
+    a stand-in for a session has no database at all; neither holds a case). Remembered for the engine once found."""
+    get_bind = getattr(db, "get_bind", None)
+    if get_bind is None:
+        return False
+    bind = get_bind()
+    engine = getattr(bind, "engine", bind)
+    if engine in _HAS_CASES:
+        return True
+    from sqlalchemy import inspect
+    if inspect(bind).has_table("compliance_cases"):
+        _HAS_CASES.add(engine)
+        return True
+    return False
+
+
+def after_starter_change(db, target, kind: str, now: Optional[datetime] = None) -> int:
+    """Someone else just changed ``target``'s sign-in details (``kind``: a credential change's kind), in the caller's
+    transaction. Every case ``target`` started keeps the first such change from then on (starter_changed_at and
+    starter_changed_kind), which starter_refusal reads: the change's own record is deleted 14 days after it
+    applied, and the account's own flags clear when it sets its own password or enrolls an authenticator again,
+    while the case and its holds may stand for years. Every case the account started began before now, so each
+    one is marked, closed ones too (an undone release reopens a case). Returns how many cases were marked."""
+    from app.core.models import ComplianceCase
+    if target is None or getattr(target, "id", None) is None or not _has_cases(db):
+        return 0
+    now = now or utcnow()
+    marked = 0
+    for case in (db.query(ComplianceCase).filter(ComplianceCase.auditor_id == target.id,
+                                                 ComplianceCase.starter_changed_at.is_(None))
+                 .with_for_update().all()):
+        case.starter_changed_at = now
+        case.starter_changed_kind = str(kind)[:16]
+        marked += 1
+    return marked
 
 
 # --------------------------------------------------------------------------- the SFTP guard

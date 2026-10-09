@@ -3213,6 +3213,11 @@ class ComplianceCase(Base):
     auditor_username = Column(String(255), nullable=False)
     grant_id = Column(UUID(as_uuid=True), ForeignKey('auditor_grants.id', ondelete='SET NULL'), nullable=True)
     requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # When someone else first changed the sign-in details of the account that started the case, after it started,
+    # and how (legal_holds.after_starter_change): kept with the case, so it outlives the change's own record
+    # (deleted 14 days after it applied) and the account's flags (cleared when it sets its own password again).
+    starter_changed_at = Column(DateTime, nullable=True)
+    starter_changed_kind = Column(String(16), nullable=True)
     # What was asked for, before an approval decides it.
     access_days = Column(Integer, nullable=True)
     hold_requested = Column(Boolean, nullable=False, default=False, server_default='false')
