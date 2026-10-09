@@ -7032,6 +7032,10 @@ function handleSocketFrame(data) {
             if (ev.notification_type === 'compliance_access') {
                 try { window.dispatchEvent(new CustomEvent('dockvault:compliance-access')); } catch (_) {}
             }
+            // A notice about the auditor right: what this account may do may have changed (static/js/compliance.js).
+            if (ev.notification_type === 'auditor_right') {
+                try { window.dispatchEvent(new CustomEvent('dockvault:auditor-right')); } catch (_) {}
+            }
         }
         return;
     }
@@ -21703,6 +21707,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadGroups().catch(err => console.error('Failed to load groups:', err));
                 } else if (section === 'activity') {
                     if (typeof initActivity === 'function') initActivity();
+                } else if (section === 'compliance') {
+                    if (typeof initCompliance === 'function') initCompliance();
                 } else if (section === 'settings') {
                     initSettings();
                 } else if (section === 'dashboard') {

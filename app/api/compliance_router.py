@@ -619,6 +619,9 @@ class CaseRequest(BaseModel):
     justification: str = Field(..., max_length=4000)
     owner_note: str = Field(..., max_length=4000)
     named_user_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+    # The people named, by username (the screen's way: an auditor cannot browse the directory). Each must name one
+    # account exactly (case aside); one that does not is refused as an unknown person is, and recorded.
+    named_usernames: list[str] = Field(default_factory=list, max_length=100)
     scope: list[ScopeItemIn] = Field(..., min_length=1, max_length=1000)
     files_from: Optional[datetime] = None
     files_to: Optional[datetime] = None
@@ -680,8 +683,56 @@ def list_cases(current_user: User = Depends(require_interactive_account), db: Se
     q = _seen_by(db, db.query(ComplianceCase).filter(ComplianceCase.access_days > 0), current_user)
     now = cases.utcnow()
     rows = q.order_by(ComplianceCase.requested_at.desc()).limit(ENDED_SHOWN).all()
-    return {"cases": [cases.case_view(db, c, current_user, now=now, light=True) for c in rows],
-            "access_enabled": rights.access_enabled(), "max_open_cases": cases.rules.MAX_OPEN_CASES}
+    counts = _case_counts(db, [c.id for c in rows])
+    out = []
+    for c in rows:
+        view = cases.case_view(db, c, current_user, now=now, light=True)
+        view["files_opened"], view["exports"] = counts.get(c.id, (0, 0))
+        # What the list's "Waiting for my approval" and the sidebar's count read: a pending case this administrator
+        # may decide.
+        if c.status == cases.rules.PENDING and _is_admin(current_user):
+            view["you_may_approve"] = cases.decision_refusal(db, c, current_user, now) is None
+        out.append(view)
+    return {"cases": out, "access_enabled": rights.access_enabled(), "max_open_cases": cases.rules.MAX_OPEN_CASES}
+
+
+def _case_counts(db, case_ids) -> dict:
+    """{case id: (files opened, exports)} under each case, as its owners' summary counts them, in one query: the
+    distinct files of its case_file_viewed rows and its case_export_completed rows."""
+    from sqlalchemy import func
+    from app.core.models import AuditLog
+    if not case_ids:
+        return {}
+    out = {}
+    rows = (db.query(AuditLog.case_id, AuditLog.action, func.count(func.distinct(AuditLog.resource_id)),
+                     func.count(AuditLog.id))
+            .filter(AuditLog.case_id.in_(list(case_ids)),
+                    AuditLog.action.in_(("case_file_viewed", "case_export_completed")), AuditLog.status == "success")
+            .group_by(AuditLog.case_id, AuditLog.action).all())
+    for case_id, action, distinct, total in rows:
+        opened, exports = out.get(case_id, (0, 0))
+        if action == "case_file_viewed":
+            opened = int(distinct or 0)
+        else:
+            exports = int(total or 0)
+        out[case_id] = (opened, exports)
+    return out
+
+
+def _named_by_username(db, usernames) -> Optional[list]:
+    """The ids of the accounts ``usernames`` name (each exactly, case aside), or None when one names no account or
+    several."""
+    from sqlalchemy import func
+    ids = []
+    for name in usernames:
+        name = (name or "").strip()
+        if not name:
+            continue
+        found = db.query(User.id).filter(func.lower(User.username) == name.lower()).limit(2).all()
+        if len(found) != 1:
+            return None
+        ids.append(found[0][0])
+    return ids
 
 
 @router.post("/compliance/cases", status_code=201)
@@ -691,10 +742,17 @@ def request_case(body: CaseRequest, request: Request, current_user: User = Depen
     approves it; until then nothing is readable and the owners are not told."""
     from app.core import cases
     limit_statements(db)
+    named = list(body.named_user_ids)
+    if body.named_usernames:
+        by_name = _named_by_username(db, body.named_usernames)
+        if by_name is None:
+            _case_refused(db, "case_requested", None, current_user,
+                          cases.CaseRefused(cases.rules.NO_SUCH_PERSON, code=404))
+        named += [i for i in by_name if i not in named]
     args = dict(purpose=body.purpose, legal_basis=body.legal_basis, lia_reference=body.lia_reference,
                 special_category=body.special_category, art9_condition=body.art9_condition,
                 criminal_offence=body.criminal_offence, justification=body.justification,
-                owner_note=body.owner_note, named_user_ids=body.named_user_ids,
+                owner_note=body.owner_note, named_user_ids=named,
                 scope=[{"kind": s.kind, "target_id": s.target_id} for s in body.scope],
                 files_from=_naive(body.files_from), files_to=_naive(body.files_to), access_days=body.access_days,
                 can_export=body.can_export, password_override=body.password_override, hold=body.hold)

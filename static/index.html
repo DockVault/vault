@@ -25,6 +25,7 @@
     <link rel="stylesheet" href="/static/css/redesign.css?v=20260929a" id="skin-v1" disabled>
     <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260929a" id="skin-v2">
     <link rel="stylesheet" href="/static/css/activity.css?v=20260929a">
+    <link rel="stylesheet" href="/static/css/compliance.css?v=20261009a">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260929a">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
@@ -375,6 +376,11 @@
                     <a href="#" class="sidebar-item admin-only" data-section="activity" style="display: none;">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-activity"/></svg></span>
                         <span class="sidebar-text">Activity</span>
+                    </a>
+                    <a href="#" class="sidebar-item" data-section="compliance" id="nav-compliance" style="display: none;">
+                        <span class="sidebar-icon"><svg class="icon"><use href="#i-shield"/></svg></span>
+                        <span class="sidebar-text">Compliance</span>
+                        <span class="sidebar-count" id="nav-compliance-count" hidden></span>
                     </a>
                     <a href="#" class="sidebar-item admin-only" data-section="settings" style="display: none;">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-settings"/></svg></span>
@@ -1565,6 +1571,11 @@
                     </div>
                     <div class="sr-only" id="act-announce" aria-live="polite"></div>
                     <div class="sr-only" id="act-announce-new" aria-live="polite"></div>
+                </div>
+
+                <!-- Compliance: cases, legal holds and the auditor right (static/js/compliance.js builds it) -->
+                <div id="compliance-section" class="content-section compliance">
+                    <div id="cmp-root"></div>
                 </div>
 
                 <!-- Settings Section -->

@@ -1389,3 +1389,64 @@ def test_a_close_that_asked_no_code_is_refused_when_a_hold_stands_again_under_th
     monkeypatch.setattr(cr, "_take_case_step", real)
     out = cr.close_case(case.id, cr.Reason(reason="Concluded."), request=None, current_user=people.carl, db=db)
     assert out["status"] == "closed" and no_codes == ["STEP_UP_HOLD_DECIDE"]
+
+
+# --------------------------------------------------------------------------- what the Compliance page reads
+
+def _viewed(db, case, file_id, action="case_file_viewed", status="success"):
+    db.add(m.AuditLog(action=action, status=status, case_id=case.id, resource_type="file",
+                      resource_id=str(file_id), username="uma", timestamp=rights.utcnow()))
+    db.commit()
+
+
+def test_the_list_counts_files_opened_and_exports_per_case_as_the_owners_summary_does(db, people):
+    one = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    two = _approve(db, _ask(db, people.uma, _vaults(people.v3)), people.bob)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    _viewed(db, one, a)
+    _viewed(db, one, a)                          # the same file twice: one file opened
+    _viewed(db, one, b)
+    _viewed(db, one, uuid.uuid4(), status="failure")
+    _viewed(db, one, uuid.uuid4(), action="case_export_completed")
+    _viewed(db, two, uuid.uuid4(), action="case_export_completed")
+    _viewed(db, two, uuid.uuid4(), action="case_export_completed")
+    listed = {c["id"]: c for c in cr.list_cases(current_user=people.uma, db=db)["cases"]}
+    assert (listed[str(one.id)]["files_opened"], listed[str(one.id)]["exports"]) == cases._counts_since_approval(db, one) == (2, 1)
+    assert (listed[str(two.id)]["files_opened"], listed[str(two.id)]["exports"]) == (0, 2)
+    assert cr._case_counts(db, []) == {}
+
+
+def test_the_list_says_which_pending_cases_this_administrator_may_decide(db, people):
+    case = _ask(db, people.uma, _vaults(people.v1))
+    by_bob = cr.list_cases(current_user=people.bob, db=db)["cases"]
+    assert [c["you_may_approve"] for c in by_bob] == [True]
+    # ada proposed the auditor's right: she may not decide it, and the list says so.
+    assert [c["you_may_approve"] for c in cr.list_cases(current_user=people.ada, db=db)["cases"]] == [False]
+    # The auditor's own list has no such flag; nor has a case no longer pending.
+    assert "you_may_approve" not in cr.list_cases(current_user=people.uma, db=db)["cases"][0]
+    _approve(db, case, people.bob)
+    assert "you_may_approve" not in cr.list_cases(current_user=people.bob, db=db)["cases"][0]
+
+
+def test_people_are_named_by_username_case_aside(db, people, no_codes):
+    body = cr.CaseRequest(scope=[cr.ScopeItemIn(kind="vault", target_id=people.v1.id)],
+                          named_usernames=[" CARL ", "carl", ""], named_user_ids=[people.carl.id], **TEXT)
+    view = cr.request_case(body, request=None, current_user=people.uma, db=db)
+    named = db.query(m.ComplianceCasePerson).filter(m.ComplianceCasePerson.case_id == uuid.UUID(view["id"]),
+                                                    m.ComplianceCasePerson.why == "named").all()
+    assert [p.user_id for p in named] == [people.carl.id]
+
+
+def test_a_username_that_names_no_account_is_refused_as_an_unknown_person_and_recorded(db, people, no_codes):
+    body = cr.CaseRequest(scope=[cr.ScopeItemIn(kind="vault", target_id=people.v1.id)],
+                          named_usernames=["carl", "nobody-here"], **TEXT)
+    _, err = _call(cr.request_case, body, request=None, current_user=people.uma, db=db)
+    assert err.status_code == 404 and err.detail["reason"] == rules.NO_SUCH_PERSON and no_codes == []
+    assert _rows(db, "case_requested", "failure")[-1].details["reason"] == rules.NO_SUCH_PERSON
+    assert db.query(m.ComplianceCase).count() == 0
+
+
+def test_a_username_two_accounts_share_case_aside_names_neither(db, people):
+    _user(db, "Carl")
+    assert cr._named_by_username(db, ["carl"]) is None
+    assert cr._named_by_username(db, ["olga", " "]) == [people.olga.id]
