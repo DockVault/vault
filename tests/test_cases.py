@@ -1112,3 +1112,32 @@ def test_the_case_page_route_hides_them_from_a_concerned_administrator(db, peopl
     db.commit()
     page = cr.get_case(case.id, SimpleNamespace(headers={}), current_user=otto_admin, db=db)
     assert "reject_reason" not in page and "Insufficient" not in str(page)
+
+
+# --------------------------------------------------------------------------- closing while a release is undone
+
+def test_a_close_that_asked_no_code_is_refused_when_a_hold_stands_again_under_the_lock(db, people, no_codes,
+                                                                                      monkeypatch):
+    """Whether a close asks for the hold's code is decided before the case's lock: a release undone in between
+    would otherwise be released again without the code. Under the lock the close is refused (409, recorded) and the
+    restored hold stands; asked again, it asks for the code."""
+    case = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    holds.release(db, case, by=people.carl, reason="Not needed.")
+    db.commit()
+    assert not holds.standing(db, case.id)
+    real = cr._take_case_step
+
+    def undone_meanwhile(case_id, current_user, db_, **kw):
+        holds.undo_release(db_, db_.get(m.ComplianceCase, case_id), by=people.bob)
+        db_.commit()
+        return real(case_id, current_user, db_, **kw)
+    monkeypatch.setattr(cr, "_take_case_step", undone_meanwhile)
+    _, err = _call(cr.close_case, case.id, cr.Reason(reason="Concluded."), request=None, current_user=people.carl,
+                   db=db)
+    assert err.status_code == 409 and err.detail["reason"] == cases.HOLD_STANDS_AGAIN and no_codes == []
+    assert _rows(db, "case_closed", "failure")[-1].details["reason"] == cases.HOLD_STANDS_AGAIN
+    db.expire_all()
+    assert case.status == "active" and holds.standing(db, case.id)
+    monkeypatch.setattr(cr, "_take_case_step", real)
+    out = cr.close_case(case.id, cr.Reason(reason="Concluded."), request=None, current_user=people.carl, db=db)
+    assert out["status"] == "closed" and no_codes == ["STEP_UP_HOLD_DECIDE"]

@@ -815,10 +815,17 @@ def close_case(case_id: uuid.UUID, body: Reason, request: Request,
         raise HTTPException(status_code=422, detail={"reason": cases.NO_REASON, "text": cases.text(cases.NO_REASON)})
     kw = dict(action="case_closed", refusal=cases.close_refusal)
     case = _check_case(case_id, current_user, db, **kw)
-    if legal_holds.standing(db, case.id):
+    code_asked = bool(legal_holds.standing(db, case.id))
+    if code_asked:
         STEP_UP_HOLD_DECIDE(db, current_user, request)
-    return _take_case_step(case_id, current_user, db,
-                           step=lambda c: cases.close(db, c, by=current_user, reason=reason), **kw)
+
+    def step(c):
+        # Under the case's lock: a release undone since the code was (not) asked for would otherwise be released
+        # again here without it.
+        if not code_asked and legal_holds.standing(db, c.id):
+            raise cases.CaseRefused(cases.HOLD_STANDS_AGAIN)
+        cases.close(db, c, by=current_user, reason=reason)
+    return _take_case_step(case_id, current_user, db, step=step, **kw)
 
 
 @router.post("/compliance/cases/{case_id}/objection")

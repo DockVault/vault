@@ -60,6 +60,7 @@ NO_REASON = "no_reason"
 NOT_INDEPENDENT_HOST = "independent_admin"
 NO_OBJECTION = "no_objection"
 SFTP_VERSION = "sftp_version"
+HOLD_STANDS_AGAIN = "hold_stands_again"
 
 TEXTS = {
     rules.NOT_NOW: "the case is not in a state that allows this",
@@ -99,6 +100,8 @@ TEXTS = {
                            "host operator has no account the independence rule could check"),
     NO_OBJECTION: "write the objection",
     SFTP_VERSION: "an SFTP server of another version may be running: a hold cannot be placed now",
+    HOLD_STANDS_AGAIN: ("a legal hold of the case stands again (its release was undone): closing the case releases "
+                        "it, which asks for your code; try again"),
 }
 
 
