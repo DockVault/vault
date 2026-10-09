@@ -148,7 +148,7 @@ _IDENTIFIER_KEYS = (
     "user_ids", "vault_id", "vault_ids", "members", "opened_by_temp_credential_id", "record_id", "alert_id",
     # accounts, and who acted (real usernames, which administrators see on the Users page)
     "username", "target_username", "target_user", "created_username", "deleted_username", "updated_username",
-    "temp_username", "requested_by", "approved_by", "invited_by", "by", "made_by", "cleared_by",
+    "temp_username", "requested_by", "approved_by", "invited_by", "by", "made_by", "cleared_by", "auditor",
     "created_role", "new_role", "old_role", "role", "target_role", "already_member",
     # who set an account's password, and who added an SSH key (a username, or the host operator's name)
     "password_set_by", "added_by",
@@ -186,6 +186,9 @@ _IDENTIFIER_KEYS = (
     "export_id", "file_count", "manifest_sha256", "missing", "unreadable", "mismatched",
     # names shown on the Activity page because of a case: how many events, and a digest of their ids (never a name)
     "events", "events_digest",
+    # a recorded name revealed outside a case: the event, and the reason's category from a fixed list (its text is
+    # sealed in compliance_reveals, never here)
+    "event_id", "reason_category",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

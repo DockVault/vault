@@ -59,8 +59,10 @@ HOLD_RELEASED = "hold_released"
 HOLD_RESTORED = "hold_restored"
 HOLD_LAPSED = "hold_lapsed"
 EXPORT = "export"
+# Outside a case: an auditor revealed names the activity log recorded in full (app/core/name_reveal.py).
+REVEAL = "reveal"
 KINDS = (ACTIVATION, EXTENSION, SCOPE_REMOVED, ACCESS_ENDED, CLOSED, HOLD_PLACED, HOLD_CONFIRMED, HOLD_RELEASED,
-         HOLD_RESTORED, HOLD_LAPSED, EXPORT)
+         HOLD_RESTORED, HOLD_LAPSED, EXPORT, REVEAL)
 
 # An outbox row's status, and what the case shows of its rows.
 PENDING, SENT, RETRYING, FAILED, NO_ADDRESS = "pending", "sent", "retrying", "failed", "no_email_address"
@@ -85,6 +87,10 @@ PURPOSE_WORDS = {
 }
 BASIS_WORDS = {"legal_obligation": "legal obligation", "public_task": "public task",
                "legitimate_interests": "legitimate interests"}
+REASON_WORDS = {"security_incident": "a security incident", "internal_investigation": "an internal investigation",
+                "regulator_request": "a regulator's or an authority's request",
+                "data_subject_request": "a data-subject request", "litigation_hold": "litigation",
+                "other": "another reason"}
 
 
 def utcnow() -> datetime:
@@ -157,6 +163,7 @@ class Facts:
     exports: int = 0
     files: int = 0
     contact: Optional[str] = None
+    reason: Optional[str] = None
 
 
 def _plural(n: int, one: str, many: Optional[str] = None) -> str:
@@ -241,6 +248,11 @@ def notice_text(f: Facts) -> tuple:
         return ("Files exported from your vaults",
                 [f"{case}: {_who(f.by)} (auditor) exported copies of {_plural(f.files, 'file')} from your vaults.",
                  contact])
+    if f.kind == REVEAL:
+        return ("Names in your vault's activity were revealed",
+                [f"{_who(f.auditor)} (auditor) revealed names the activity log recorded about a vault you own, for "
+                 f"{REASON_WORDS.get(f.reason, 'a stated reason')}. Each reveal is recorded with its reason; further "
+                 "reveals by them in that vault today are recorded without another notice.", contact])
     return ("Compliance access to your vaults", [f"{case} changed."])
 
 
@@ -255,8 +267,11 @@ def contact(db) -> Optional[str]:
 
 def facts(db, case, kind: str, details: Optional[Mapping] = None) -> Facts:
     """The facts of a notice of ``kind`` about ``case``: read from the case's codes, dates and usernames, and the
-    counts in ``details`` (an outbox row's)."""
+    counts in ``details`` (an outbox row's). A notice outside a case (a reveal) reads ``details`` alone."""
     d = dict(details or {})
+    if case is None:
+        return Facts(kind=kind, number=None, auditor=d.get("auditor"), by=d.get("by"),
+                     vaults=int(d.get("vaults") or 0), reason=d.get("reason"), contact=contact(db))
 
     def when(key):
         value = d.get(key)
@@ -343,6 +358,44 @@ def tell_owners(db, case, kind: str, counts_by_owner: Mapping, *, now: Optional[
         refresh_case_status(db, case)
         after_commit.later(db, _WAKE, 1)
     return told
+
+
+def tell_owner_of_reveal(db, owner_id, *, auditor, vault_id, reason_category: str,
+                         now: Optional[datetime] = None) -> bool:
+    """Tell ``owner_id`` that ``auditor`` revealed names the log recorded about their vault ``vault_id``, once per
+    auditor, vault and day (UTC), in the caller's transaction (the reveal's): the notification, the outbox row and
+    the ``owner_notice_written`` row. A later reveal that day folds into it. Returns whether the owner was told now.
+    The caller holds the auditor's row locked, so two reveals at once cannot both tell."""
+    from app.core.models import ComplianceNoticeOutbox, User
+    from app.core.security import seal_case_field
+    now = now or utcnow()
+    owner = db.get(User, uuid.UUID(str(owner_id)))
+    if owner is None:
+        return False
+    key = f"reveal:{auditor.id}:{vault_id}:{now:%Y-%m-%d}"
+    if db.query(ComplianceNoticeOutbox.id).filter(
+            ComplianceNoticeOutbox.dedup_key == f"{key}:{owner.id}").first() is not None:
+        return False
+    row_details = {"auditor": auditor.username, "reason": reason_category, "vaults": 1}
+    title, body = app_text(facts(db, None, REVEAL, row_details), has_note=False)
+    notify_in_transaction(db, [owner.id], title=title, body=body, dedup=key)
+    address, previous = destinations(db, owner)
+    row_id = uuid.uuid4()
+    row = ComplianceNoticeOutbox(
+        id=row_id, case_id=None, user_id=owner.id, kind=REVEAL, dedup_key=f"{key}:{owner.id}",
+        details=_jsonable(row_details), status=PENDING if address or previous else NO_ADDRESS, attempts=0,
+        next_attempt_at=now if address or previous else None, created_at=now, sent_to=[])
+    row.address_enc = seal_case_field(row_id, address, "notice_address") if address else None
+    row.previous_address_enc = (seal_case_field(row_id, previous, "notice_previous_address")
+                                if previous else None)
+    db.add(row)
+    _audit(db, "owner_notice_written", None, actor_name=SYSTEM, user_id=owner.id,
+           details={"kind": REVEAL, "vaults": 1, "vault_id": str(vault_id),
+                    "email_status": row.status if row.status == NO_ADDRESS else CASE_QUEUED,
+                    "copy_to_previous": previous is not None})
+    db.flush()
+    after_commit.later(db, _WAKE, 1)
+    return True
 
 
 def _jsonable(details: Mapping) -> dict:
@@ -443,9 +496,10 @@ def email_context(db, row, case) -> dict:
     case number for the subject."""
     f = facts(db, case, row.kind, row.details)
     title, lines = notice_text(f)
-    note = owner_note(case) if row.kind == ACTIVATION else None
+    note = owner_note(case) if row.kind == ACTIVATION and case is not None else None
     change = " ".join([title + "."] + lines + ([f"Note from the auditor: “{note}”"] if note else []))
-    return {"change": change, "code": case.number or "", "when": _when(row.created_at), "by": f.contact or ""}
+    return {"change": change, "code": (case.number if case is not None else None) or "", "when": _when(row.created_at),
+            "by": f.contact or ""}
 
 
 class SendFailed(Exception):
@@ -495,14 +549,12 @@ def _attempt(db, row, now: datetime, send: Callable) -> str:
     row.attempts = (row.attempts or 0) + 1
     if failure is None:
         row.status, row.sent_at, row.next_attempt_at, row.last_error_class = SENT, now, None, None
-        if case is not None:
-            _audit(db, "owner_notice_email_sent", case, actor_name=SYSTEM, user_id=row.user_id,
-                   details={"kind": row.kind, "attempts": row.attempts, "copy_to_previous": PREVIOUS in done})
+        _audit(db, "owner_notice_email_sent", case, actor_name=SYSTEM, user_id=row.user_id,
+               details={"kind": row.kind, "attempts": row.attempts, "copy_to_previous": PREVIOUS in done})
     elif row.attempts > len(RETRY_MINUTES):
         row.status, row.next_attempt_at, row.last_error_class = FAILED, None, failure[:64]
-        if case is not None:
-            _audit(db, "owner_notice_email_failed", case, actor_name=SYSTEM, user_id=row.user_id, status="failure",
-                   details={"kind": row.kind, "attempts": row.attempts, "send_error": failure[:64]})
+        _audit(db, "owner_notice_email_failed", case, actor_name=SYSTEM, user_id=row.user_id, status="failure",
+               details={"kind": row.kind, "attempts": row.attempts, "send_error": failure[:64]})
         db.add(SecurityAlert(
             event_type="owner_notice_email_failed", severity="warning",
             message=("The email telling a vault's owner about compliance access to their vaults could not be sent "
