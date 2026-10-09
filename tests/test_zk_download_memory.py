@@ -49,8 +49,16 @@ def test_a_zero_knowledge_download_does_not_cost_the_file(admin):
     flight; reading either side of it measures the residue instead, which is small whatever the
     server did. The first version of this test did that and passed against a build that held the
     whole file.
+
+    The file is large enough that the server's fixed overhead is a small share of it, and the
+    download is measured twice, the smaller rise counting. A streamed download still raises memory
+    by a fixed amount whatever the file: 13-29 MB for 16-96 MB files on a busy Windows host, where a
+    48 MB file and its 16 MB limit sat inside that band and failed at random. A held blob costs at
+    least the whole file on every run, so neither the size nor the second run lets it through: at
+    128 MB the limit (a third, 42.7 MB) leaves about 14 MB above the highest overhead seen and stays
+    85 MB below the file.
     """
-    size = 48 * MB
+    size = 128 * MB
     body = bytes((i * 17 + 11) % 256 for i in range(65536)) * (size // 65536)
 
     with _zk_enabled(admin):
@@ -61,17 +69,21 @@ def test_a_zero_knowledge_download_does_not_cost_the_file(admin):
                 admin, vault["id"], unique("blob") + ".bin", body, DEK,
                 mime="application/octet-stream", chunk_size=MB)
 
-            with CgroupSampler() as sampler:
-                got = admin.get(f"/vaults/{vault['id']}/files/{file_id}/download")
-            rise = sampler.rise
-
-            assert got.status_code == 200, got.text
-            assert got.content == body, (
-                "the ciphertext did not round trip, so this measured nothing")
+            rises = []
+            for _ in range(2):
+                with CgroupSampler() as sampler:
+                    got = admin.get(f"/vaults/{vault['id']}/files/{file_id}/download")
+                rises.append(sampler.rise)
+                assert got.status_code == 200, got.text
+                assert got.content == body, (
+                    "the ciphertext did not round trip, so this measured nothing")
+                del got
+            rise = min(rises)
 
             assert rise < size // 3, (
                 f"a {size // MB} MB zero-knowledge download raised allocated memory by "
-                f"{rise / MB:.1f} MB; the blob is being held rather than streamed")
+                f"{rise / MB:.1f} MB at the least (runs: {', '.join(f'{r / MB:.1f}' for r in rises)} MB); "
+                f"the blob is being held rather than streamed")
         finally:
             admin.delete_vault(vault["id"])
 
