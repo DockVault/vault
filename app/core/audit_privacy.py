@@ -176,6 +176,8 @@ _IDENTIFIER_KEYS = (
     # server's operator approved it, how an objection came (from an owner or an administrator), whether its access
     # ended, and a hold placed and confirmed by an approval
     "purpose", "days", "ends_at", "hold", "by_operator", "by_owner", "access_ended", "by_approval",
+    # reading under a case: whether a password vault was opened without its password, and a view in the preview
+    "password_override", "preview",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
