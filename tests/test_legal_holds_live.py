@@ -13,8 +13,9 @@ gate in app/services/vault_service.py, app/core/legal_hold_marker.py).
   * the server's operator confirms a hold on the host (python -m app.core.host_compliance, as dockvault.py runs
     it) only while no administrator could, and a refusal is recorded;
   * the person who started a case releases its hold alone only while they stand as they did: not once demoted,
-    nor once their auditor right is revoked, nor after someone else changed their sign-in details, even once that
-    change's own record is gone; an auditor lists only the cases they started;
+    nor once their auditor right is revoked (an administrator who placed it as an auditor too), nor after someone
+    else changed their sign-in details, even once that change's own record is gone; an auditor lists only the cases
+    they started;
   * the purge leaves a vault whose row a placing or an undo holds for its next pass;
   * a hold is refused while an SFTP server of another version may be running;
   * a refused step is recorded under its case.
@@ -475,6 +476,39 @@ def test_an_auditor_whose_right_was_revoked_no_longer_releases_the_hold_alone(ad
             psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
         forget_grants(uma["id"])
         admin.delete_user(uma["id"])
+
+
+def test_an_administrator_who_placed_a_hold_as_an_auditor_needs_the_right_once_it_is_revoked(admin, admins, vaults):
+    """An administrator who also holds an auditor right places a hold as the auditor: once the right is revoked they
+    no longer release it alone, though they are still an administrator able to act."""
+    from _account_change_helpers import second_admin
+    from _sf_helpers import enroll_totp
+    made, cases = vaults
+    with second_admin(admin, independent=True) as (carol, carol_c):
+        _s, carol_codes = enroll_totp(carol, carol_c)
+        try:
+            grant_right(admins, carol["id"])
+            client = signed_in_with_code(carol, carol_codes)
+            r = client.post("/compliance/holds", json={"vault_ids": [made[0]["id"]], **TEXT},
+                            headers=compliance_receipt(client, "compliance.hold.place", carol["_password"],
+                                                       carol_codes))
+            assert r.status_code == 201, r.text
+            case_id = r.json()["id"]
+            cases.append(case_id)
+            assert psql(f"SELECT grant_id IS NOT NULL FROM compliance_cases WHERE id = '{case_id}'") == "t"
+            r = admin.delete(f"/users/{carol['id']}/auditor")
+            assert r.status_code == 200, r.text
+            _client, r = _release_as(carol, carol_codes, case_id, "still an administrator")
+            assert r.status_code == 403 and r.json()["detail"]["reason"] == "no_grant", r.text
+            assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' "
+                        "AND released_at IS NULL") == "1"
+            r = _decide(admins["bob"], case_id, "release", {"reason": "an independent administrator releases it"})
+            assert r.status_code == 200, r.text
+        finally:
+            for cid in list(cases):
+                psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
+            del cases[:]
+            forget_grants(carol["id"])
 
 
 def test_a_change_to_the_placers_sign_in_details_by_someone_else_outlives_its_record(admin, admins, vaults):

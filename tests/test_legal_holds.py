@@ -705,6 +705,22 @@ def test_a_starter_whose_auditor_right_is_in_force_ends_the_hold_alone_as_its_au
     assert holds.review_refusal(db, case, people.ada, at) is None
 
 
+def test_a_case_started_as_an_auditor_counts_only_the_auditor_right(db, people, monkeypatch):
+    """An administrator who started a case as an auditor (the case records the grant) ends its hold alone only while
+    that right is in force: being an administrator able to act, with their own password and nobody else's change,
+    does not stand in for a right revoked or suspended since."""
+    state = {"live": True, "why": None}
+    _live_auditor(monkeypatch, people.ada, state)
+    case = _place(db, people.ada, [people.v1])
+    assert case.grant_id is not None
+    at = NOW + timedelta(hours=1)
+    assert holds.release_refusal(db, case, people.ada, at) is None
+    for why in (auditor_rights.NO_GRANT, auditor_rights.SUSPENDED, auditor_rights.EXPIRED):
+        state.update(live=False, why=why)
+        for refusal in (holds.release_refusal, holds.review_refusal, cr._release_refusal, cr._review_refusal):
+            assert refusal(db, case, people.ada, at) == why
+
+
 # --------------------------------------------------------------------------- a change kept on the case
 
 @pytest.fixture

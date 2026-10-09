@@ -229,19 +229,22 @@ def is_case_auditor(case, person) -> bool:
 def starter_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[str]:
     """Why ``person``, who started ``case`` (its auditor, or the administrator who placed a hold-only case), may
     not review or release its holds on their own now, or None. They may while they still stand as they did: an
-    auditor whose right is in force (auditor_rights.auditor_live), or an administrator able to act
-    (credential_changes.can_approve) whose password is their own and whose sign-in details nobody else has changed
-    since the case started. A change by someone else is kept on the case (after_starter_change), so it counts for
-    as long as the case is kept, not only while the change's own record lives. A starter who lost that standing, or
-    whoever took over their account, does not end a hold alone: an independent administrator does
-    (decider_refusal)."""
+    auditor whose right is in force (auditor_rights.auditor_live), or, for a case an administrator started, an
+    administrator able to act (credential_changes.can_approve) whose password is their own and whose sign-in
+    details nobody else has changed since the case started. A case started as an auditor (it records the grant)
+    counts only the auditor right: being an administrator as well does not stand in for a right that is no longer
+    in force. A change by someone else is kept on the case (after_starter_change), so it counts for as long as the
+    case is kept, not only while the change's own record lives. A starter who lost that standing, or whoever took
+    over their account, does not end a hold alone: an independent administrator does (decider_refusal)."""
     from app.core import auditor_rights, credential_changes as cc, password_origin
     now = now or utcnow()
     standing_now = auditor_rights.auditor_live(db, person, now)
     if standing_now.live:
         return None
+    if case.grant_id is not None:
+        return standing_now.reason
     if not cc.can_approve(person):
-        return standing_now.reason if case.grant_id is not None else "not_able"
+        return "not_able"
     if password_origin.is_set_by_other(person):
         return ind.PASSWORD_NOT_OWN
     if case.starter_changed_at is not None:
