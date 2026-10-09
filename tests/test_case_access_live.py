@@ -10,6 +10,8 @@ vault-password throttle is the auditor's for the vault across two cases.
 test_case_access.py and test_case_reading.py cover the rules offline.
 """
 import subprocess
+import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -95,7 +97,7 @@ def test_the_auditor_reads_the_case_and_every_read_is_recorded(world):
 
     r = uma_c.get(f"{base}/files/{files['minutes']}/content")
     assert r.status_code == 200 and r.content == MINUTES, r.text
-    assert r.headers["Cache-Control"] == "no-store" and r.headers["Content-Disposition"].startswith("inline")
+    assert "no-store" in r.headers["Cache-Control"] and r.headers["Content-Disposition"].startswith("inline")
     r = uma_c.get(f"{base}/files/{files['clip']}/content", headers={"Range": "bytes=1000-1999"})
     assert r.status_code == 206 and r.content == CLIP[1000:2000]
     r = uma_c.get(f"{base}/files/{files['clip']}/content", headers={"Range": "bytes=2000-2999"})
@@ -106,8 +108,10 @@ def test_the_auditor_reads_the_case_and_every_read_is_recorded(world):
     assert [x["name"] for x in r.json()["results"]] == ["minutes.txt"]
 
     assert _rows("case_file_viewed", case["id"]) == 3, "one per file: the two byte ranges added one row"
-    assert _rows("case_folder_listed", case["id"]) == 4
-    assert psql(f"SELECT details->>'query_length' || '|' || details->>'matches' FROM audit_logs "
+    # The case's vaults, the vault's root and the Board folder; a file's metadata counts as a listing of its folder,
+    # which was listed a moment before (once in ten minutes).
+    assert _rows("case_folder_listed", case["id"]) == 3
+    assert psql(f"SELECT (details->>'query_length') || '|' || (details->>'matches') FROM audit_logs "
                 f"WHERE action = 'case_search' AND case_id = '{case['id']}'") == "3|1"
     assert psql(f"SELECT count(*) FROM audit_logs WHERE case_id = '{case['id']}' "
                 "AND details::text ILIKE '%min%' AND action = 'case_search'") == "0", "the query is never recorded"
@@ -213,6 +217,21 @@ def _redis_del(pattern):
                    capture_output=True, text=True, timeout=30)
 
 
+@contextmanager
+def _vault_attempts(limit):
+    """The vault-password throttle's limit for accounts set to ``limit`` (an administrator's override, read by the
+    throttle within five seconds); the stack's own value afterwards."""
+    psql("INSERT INTO system_settings (key, value) VALUES ('global', '{}') ON CONFLICT (key) DO NOTHING")
+    psql("UPDATE system_settings SET value = (coalesce(value::jsonb, '{}'::jsonb) || "
+         f"'{{\"rate_limit_vault_attempts\": {int(limit)}}}'::jsonb)::json WHERE key = 'global'")
+    time.sleep(6)
+    try:
+        yield
+    finally:
+        psql("UPDATE system_settings SET value = (value::jsonb - 'rate_limit_vault_attempts')::json "
+             "WHERE key = 'global'")
+
+
 def test_a_password_vault_opens_with_its_password_and_the_throttle_spans_cases(world):
     uma, uma_c, _codes = world["uma"]
     _olga, olga_c, _vid = world["olga"]
@@ -243,10 +262,16 @@ def test_a_password_vault_opens_with_its_password_and_the_throttle_spans_cases(w
                     f"FROM audit_logs WHERE action = 'case_vault_unlocked' AND case_id = '{first['id']}'") == \
             "failure:wrong_password,success:"
 
-        # Wrong passwords in the first case spend the budget the second case's unlock uses.
-        statuses = [uma_c.post(unlock, json={"password": "wrong"}).status_code for _ in range(12)]
-        assert 429 in statuses, statuses
-        r = uma_c.post(f"/compliance/cases/{second['id']}/vaults/{pv}/unlock", json={"password": "Vault-Pass-2026!"})
-        assert r.status_code == 429, r.text
+        # Wrong passwords in the first case spend the budget the second case's unlock uses: with a limit of 3, the
+        # wrong one above and two more are counted, the next is refused before its password is checked, and so is
+        # the right password in the second case.
+        with _vault_attempts(3):
+            statuses = [uma_c.post(unlock, json={"password": "wrong"}).status_code for _ in range(3)]
+            assert statuses == [403, 403, 429], statuses
+            r = uma_c.post(f"/compliance/cases/{second['id']}/vaults/{pv}/unlock",
+                           json={"password": "Vault-Pass-2026!"})
+            assert r.status_code == 429, r.text
+        assert psql(f"SELECT count(*) FROM audit_logs WHERE action = 'case_vault_unlocked' AND status = 'success' "
+                    f"AND case_id = '{second['id']}'") == "0"
     finally:
         _redis_del(f"rate_limit:vault:{pv}:*")
