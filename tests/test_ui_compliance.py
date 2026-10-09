@@ -495,3 +495,54 @@ def test_a_password_vault_opens_in_the_workspace_with_its_password(browser: Brow
         _close(page)
         forget_cases([case["id"]], [pv])
         olga_c.delete_vault(pv, vault_password="Vault-Pass-2026!")
+
+
+def test_a_legal_hold_is_placed_confirmed_and_released_in_the_browser(browser: Browser, world):
+    ada, _ada_c, ada_codes = world["admins"]["ada"]
+    bob, _bob_c, bob_codes = world["admins"]["bob"]
+    olga, olga_c = world["olga"], world["olga_c"]
+    held = olga_c.create_vault()["id"]
+    pages = []
+    try:
+        a = _page(browser, "v1")
+        pages.append(a)
+        _login(a, ada, ada_codes)
+        _compliance(a)
+        _tab(a, "holds")
+        a.locator(".cmp-place-hold").click()
+        sheet = a.locator("#cmp-hold-sheet.active")
+        sheet.locator("textarea").nth(0).fill("Preserve the records named in the claim served last week, case 2026-17.")
+        sheet.locator("textarea").nth(1).fill("Files deleted from your vault are kept for a legal matter.")
+        sheet.locator(".cmp-pick-row input").fill(olga["_username"])
+        sheet.locator(".cmp-pick-row button").click()
+        sheet.locator(f'.cmp-vault-picker input[data-vault-id="{held}"]').check()
+        sheet.locator(".cmp-hold-go").click()
+        _step_up(a, ada, ada_codes)
+        card = a.locator(".cmp-hold").filter(has=a.locator(".cmp-h", has_text="Legal hold")).first
+        expect(card).to_be_visible(timeout=15000)
+        case_id = psql("SELECT case_id FROM legal_hold_vaults WHERE vault_id = '" + held + "' AND released_at IS NULL")
+        assert case_id, "no hold was placed"
+
+        b = _page(browser, "v1")
+        pages.append(b)
+        _login(b, bob, bob_codes)
+        _compliance(b)
+        _tab(b, "holds")
+        card = b.locator(f'.cmp-hold[data-case-id="{case_id}"]')
+        card.locator(".cmp-hold-confirm").click()
+        _step_up(b, bob, bob_codes)
+        card = b.locator(f'.cmp-hold[data-case-id="{case_id}"]')
+        expect(card).to_contain_text("Confirmed", timeout=15000)
+        card.locator(".cmp-hold-release").click()
+        _prompt(b, "The claim was settled.")
+        _step_up(b, bob, bob_codes)
+        expect(b.locator(f'.cmp-hold[data-case-id="{case_id}"]')).to_contain_text("Released", timeout=15000)
+        assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' AND released_at IS NULL") == "0"
+        for p in pages:
+            assert _errors(p) == [], _errors(p)
+    finally:
+        for p in pages:
+            _close(p)
+        cid = psql(f"SELECT coalesce(string_agg(case_id::text, ','), '') FROM legal_hold_vaults WHERE vault_id = '{held}'")
+        forget_cases([c for c in cid.split(",") if c], [held])
+        olga_c.delete_vault(held)
