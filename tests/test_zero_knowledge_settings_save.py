@@ -211,9 +211,10 @@ REFUSES_STANDARD = ("This deployment's plan requires zero-knowledge vaults.",
 def test_what_the_settings_page_is_told_is_what_people_can_make(db, monkeypatch):
     """For every mix of the plan's zero-knowledge settings, the allowed types and the two saved switches, GET
     /settings reports as in effect what someone in no department can make, and a lock reason that is true of
-    it. A plan that forces zero-knowledge while the operator allows only standard vaults is the case this was
-    wrong for: people make standard vaults there, but the page said the plan requires zero-knowledge. A cap
-    with room is used: a cap that is reached is a quota, refused with its own message."""
+    it; and /zk-enabled, which the page also reads, says the plan requires zero-knowledge exactly where that
+    is the reason. A plan that forces zero-knowledge while the operator allows only standard vaults is the
+    case this was wrong for: people make standard vaults there, but the page said the plan requires
+    zero-knowledge. A cap with room is used: a cap that is reached is a quota, refused with its own message."""
     person = _person(db)
     for plan_zk, plan_force, cap, allowed, force, enabled in itertools.product(
             (True, False), (True, False), (-1, 0, 2), ("", "standard", "zero_knowledge", "standard,zero_knowledge"),
@@ -238,6 +239,8 @@ def test_what_the_settings_page_is_told_is_what_people_can_make(db, monkeypatch)
             assert made == {"standard": False, "zero_knowledge": True}, (mix, reason, made)
         else:
             assert reason is None, (mix, reason)
+        plan_requires = reason == "This deployment's plan requires zero-knowledge vaults."
+        assert _zk_enabled_route(db, person)["plan_force_zero_knowledge"] is plan_requires, (mix, reason)
 
 
 def test_the_settings_page_leaves_a_locked_switch_out_of_a_save():

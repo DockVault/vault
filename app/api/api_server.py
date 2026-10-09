@@ -7229,8 +7229,10 @@ async def get_zk_enabled(
         # Whether the PLAN itself mandates zero-knowledge (Enterprise tier) — distinct from
         # the local admin 'force_zero_knowledge' toggle. Lets the Settings page show that the
         # requirement is imposed by the plan (a floor the local toggle can't drop below),
-        # instead of an unchecked box that looks contradictory when ZK is already forced.
-        "plan_force_zero_knowledge": zk_rules.plan_forces(),
+        # instead of an unchecked box that looks contradictory when ZK is already forced. Not where the
+        # allowed types leave zero-knowledge out: people make standard vaults there, so the plan's force
+        # does not hold and the page must not say it does.
+        "plan_force_zero_knowledge": zk_allowed and zk_rules.plan_forces(),
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
