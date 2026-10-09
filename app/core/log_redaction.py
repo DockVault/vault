@@ -10,6 +10,11 @@ Some tokens travel in the request URL rather than a header, and each one opens s
   ``/public-links/{token}/download/...``) and an upload link (``/u/{token}``,
   ``/receivers/{token}/upload-session...``).
 
+A query string's VALUES never reach a line at all: an access line prints each query parameter's name only
+(``GET /activity/events?user&ip&q``), because a value can be what someone typed (an Activity search for a
+person's name, an address, free text) as well as a secret. A name that does not look like one, and a part
+with no ``=`` (which could be a value), print as ``<name>`` and ``<value>``.
+
 Whoever reads a line holding one of these can open or use what it points at. The web log-pull serves
 request lines to a ``web``-scoped token holder (a less-privileged consumer), and ``docker logs`` shows
 the same lines, so every one is masked before it reaches any log sink, and again when a log is read
@@ -78,16 +83,45 @@ def redact_log_path(path: str) -> str:
     return path
 
 
+# A query parameter's name as an access line prints it. Anything else in a name's place prints as <name>.
+_QUERY_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,64}$")
+
+
+def query_names(query: str) -> str:
+    """A query string as an access line prints it: each parameter's name, in order, never its value. A
+    name that does not look like one prints as ``<name>``; a part with no ``=`` prints as ``<value>``,
+    since it may be a value sent on its own."""
+    out = []
+    for part in query.split("&"):
+        if not part:
+            continue
+        name, eq, _value = part.partition("=")
+        out.append(("<name>" if not _QUERY_NAME_RE.match(name) else name) if eq else "<value>")
+    return "&".join(out)
+
+
 def redact_access_path(full_path: str) -> str:
-    """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
-    mask every secret-carrying route in the PATH and every secret-named QUERY value (the landing
-    page's ?invite=/?reset= token, a legacy ?vault_password=, and the like)."""
+    """A full request target (path + optional query) as an access line prints it: every secret-carrying
+    route in the PATH masked, and the QUERY reduced to its parameter names (query_names), so neither a
+    token (the landing page's ?invite=/?reset=, a legacy ?vault_password=) nor anything typed into a
+    search reaches the line."""
     path, sep, query = full_path.partition("?")
     path = redact_log_path(path)
     if not sep:
         return path
-    query = SECRET_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
-    return path + "?" + query
+    return path + "?" + query_names(query)
+
+
+def access_target(path: str, query: str = "") -> str:
+    """The request target the in-app access line prints for ``path`` and its raw ``query``: as
+    redact_access_path prints it, the same as uvicorn's line."""
+    return redact_access_path(path + ("?" + query if query else ""))
+
+
+# A request line inside a log line read back ("GET /x?a=1 HTTP/1.1"): its target is reduced as
+# redact_access_path reduces it, so a line written before query values were dropped serves none.
+_REQUEST_TARGET_RE = re.compile(
+    r"((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT) )([^\s\"']+)( HTTP/)")
 
 
 def redact_secret_urls_in_text(text: str) -> str:
@@ -96,16 +130,17 @@ def redact_secret_urls_in_text(text: str) -> str:
     still never serves a usable token."""
     if not text:
         return text
+    text = _REQUEST_TARGET_RE.sub(lambda m: m.group(1) + redact_access_path(m.group(2)) + m.group(3), text)
     for rx, repl in _TEXT_SECRET_SUBS:
         text = rx.sub(repl, text)
     return SECRET_QUERY_RE.sub(r"\1<redacted>", text)
 
 
 class AccessLogRedactFilter(logging.Filter):
-    """Scrub URL-borne secrets out of uvicorn's access log. The request target is rewritten through
-    redact_access_path on EVERY line: a hand-kept list of trigger substrings here once let the note,
-    file and upload link tokens through, because it named only the invite, share and reset routes.
-    The regexes are cheap next to the request itself. Never raises, never drops a line."""
+    """Scrub URL-borne secrets and every query value out of uvicorn's access log. The request target is
+    rewritten through redact_access_path on EVERY line: a hand-kept list of trigger substrings here once
+    let the note, file and upload link tokens through, because it named only the invite, share and reset
+    routes. The regexes are cheap next to the request itself. Never raises, never drops a line."""
     def filter(self, record):  # noqa: A003
         try:
             args = record.args

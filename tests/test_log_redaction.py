@@ -37,11 +37,12 @@ def test_redact_log_path(path, expected):
 
 @pytest.mark.parametrize("full, expected", [
     (f"/reset/{TOKEN}", "/reset/<redacted>"),
-    (f"/?reset={TOKEN}", "/?reset=<redacted>"),
-    (f"/?invite={TOKEN}", "/?invite=<redacted>"),
-    (f"/accept?invite={TOKEN}&x=1", "/accept?invite=<redacted>&x=1"),
-    (f"/reset/{TOKEN}?next=%2Fdash", "/reset/<redacted>?next=%2Fdash"),
-    ("/dashboard?tab=vaults", "/dashboard?tab=vaults"),   # no secret -> unchanged
+    (f"/?reset={TOKEN}", "/?reset"),
+    (f"/?invite={TOKEN}", "/?invite"),
+    (f"/accept?invite={TOKEN}&x=1", "/accept?invite&x"),
+    (f"/reset/{TOKEN}?next=%2Fdash", "/reset/<redacted>?next"),
+    ("/dashboard?tab=vaults", "/dashboard?tab"),          # no secret: still the names only
+    ("/dashboard", "/dashboard"),                         # no query -> unchanged
 ])
 def test_redact_access_path(full, expected):
     out = redact_access_path(full)
@@ -62,9 +63,9 @@ def _access_record(target: str) -> logging.LogRecord:
 
 @pytest.mark.parametrize("target, expected", [
     (f"/reset/{TOKEN}", "/reset/<redacted>"),          # THE regression this guards: reset in the path
-    (f"/?reset={TOKEN}", "/?reset=<redacted>"),         # ...and in the landing-page query
+    (f"/?reset={TOKEN}", "/?reset"),                    # ...and in the landing-page query
     (f"/invites/{TOKEN}", "/invites/<redacted>"),
-    (f"/?invite={TOKEN}", "/?invite=<redacted>"),
+    (f"/?invite={TOKEN}", "/?invite"),
     (f"/shares/{TOKEN}/claim", "/shares/<redacted>/claim"),
 ])
 def test_filter_redacts_secret_targets(target, expected):
@@ -134,12 +135,12 @@ def test_routes_with_ids_stay_readable(target):
 
 @pytest.mark.parametrize("target, expected", [
     # The legacy query form an API client may still use to prove a vault password on delete.
-    (f"/vaults/7d1e/delete?vault_password={TOKEN}", "/vaults/7d1e/delete?vault_password=<redacted>"),
-    (f"/vaults/7d1e/delete?Vault_Password={TOKEN}&x=1", "/vaults/7d1e/delete?Vault_Password=<redacted>&x=1"),
-    (f"/x?passcode={TOKEN}", "/x?passcode=<redacted>"),
-    (f"/x?a=1&client_secret={TOKEN}", "/x?a=1&client_secret=<redacted>"),
-    (f"/x?token={TOKEN}", "/x?token=<redacted>"),
-    ("/files?key_version=3&tab=vaults", "/files?key_version=3&tab=vaults"),   # not secret-named
+    (f"/vaults/7d1e/delete?vault_password={TOKEN}", "/vaults/7d1e/delete?vault_password"),
+    (f"/vaults/7d1e/delete?Vault_Password={TOKEN}&x=1", "/vaults/7d1e/delete?Vault_Password&x"),
+    (f"/x?passcode={TOKEN}", "/x?passcode"),
+    (f"/x?a=1&client_secret={TOKEN}", "/x?a&client_secret"),
+    (f"/x?token={TOKEN}", "/x?token"),
+    ("/files?key_version=3&tab=vaults", "/files?key_version&tab"),   # not secret-named: names only too
 ])
 def test_secret_named_query_values_are_masked(target, expected):
     assert redact_access_path(target) == expected

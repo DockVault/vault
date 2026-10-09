@@ -384,8 +384,7 @@ SESSION_TIMEOUT_MAX_MINUTES = 30 * 24 * 60  # 30 days
 # small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
 # access-log filter below. Add new secret-bearing routes in app/core/log_redaction.py.
 from app.core.log_redaction import (  # noqa: E402
-    redact_log_path as _redact_log_path,
-    redact_access_path as _redact_access_path,
+    access_target as _access_target,
     AccessLogRedactFilter as _AccessLogRedactFilter,
 )
 
@@ -524,13 +523,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         # Web log-pull access line. Only when the in-app sink is active (split/direct shape — under
         # run_combined it stays inactive and the launcher captures stdout instead, so no double-write).
-        # Method + path + status + client IP + duration ONLY — never bodies, headers, or query strings
-        # (the pull path also redacts on read, but we avoid logging secrets at the source).
+        # Method + path + the query's parameter NAMES + status + client IP + duration ONLY — never
+        # bodies, headers, or a query value (the pull path also redacts on read, but we avoid logging
+        # secrets, or what someone typed into a search, at the source).
         try:
             from app.services import log_sink
             if log_sink.is_active():
                 _dur_ms = int((_t.monotonic() - _req_started) * 1000)
-                log_sink.emit("web", f"{request.method} {_redact_log_path(request.url.path)} -> "
+                log_sink.emit("web", f"{request.method} {_access_target(request.url.path, request.url.query)} -> "
                                      f"{response.status_code} {get_client_ip(request)} {_dur_ms}ms")
         except Exception:  # noqa: BLE001 — logging must never affect the response
             pass
