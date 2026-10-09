@@ -97,6 +97,15 @@ async def require_interactive_account(current_user: User = Depends(get_current_u
     return current_user
 
 
+def require_live_auditor_or_admin(current_user: User = Depends(require_interactive_account),
+                                  db: Session = Depends(get_db)) -> User:
+    """An administrator in their own session, or an account whose auditor right is in force: who may place a legal
+    hold, and so look up an owner's vaults for one."""
+    if _is_admin(current_user):
+        return current_user
+    return require_live_auditor(current_user=current_user, db=db)
+
+
 def require_live_auditor(current_user: User = Depends(require_interactive_account),
                          db: Session = Depends(get_db)) -> User:
     """An account whose auditor right is in force now, computed from the grant and the account as they stand
@@ -944,9 +953,10 @@ def narrow_case(case_id: uuid.UUID, body: Narrowing, current_user: User = Depend
 
 @router.get("/compliance/vault-picker")
 def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
-                 current_user: User = Depends(require_live_auditor), db: Session = Depends(get_db)):
-    """One owner's vaults for a case (by account id or username): type, size, file count, creation date and id; a
-    name only where the auditor can already read the vault. Each query is recorded."""
+                 current_user: User = Depends(require_live_auditor_or_admin), db: Session = Depends(get_db)):
+    """One owner's vaults for a case or a legal hold (by account id or username): type, size, file count, creation
+    date and id; a name only where the caller can already read the vault. A live auditor, or an administrator (who
+    places holds). Each query is recorded."""
     from app.core import cases
     from app.core.authorization import PermissionService
     from app.core.models import Vault

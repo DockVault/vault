@@ -1162,12 +1162,27 @@ def test_turning_down_and_extending_ask_for_the_approval_code_before_the_step(db
         assert case.status == "pending" and _rows(db, "case_rejected") == []
 
 
-def test_the_vault_picker_and_asking_for_a_case_are_for_a_live_auditor_only():
-    """Both depend on require_live_auditor, which refuses a right that is not in force whatever its stored state
-    (test_auditor_liveness.py)."""
-    for path, method in (("/compliance/vault-picker", "GET"), ("/compliance/cases", "POST")):
-        (route,) = [r for r in cr.router.routes if getattr(r, "path", None) == path and method in r.methods]
-        assert cr.require_live_auditor in {d.call for d in route.dependant.dependencies}, path
+def _dependencies(path, method):
+    (route,) = [r for r in cr.router.routes if getattr(r, "path", None) == path and method in r.methods]
+    return {d.call for d in route.dependant.dependencies}
+
+
+def test_asking_for_a_case_is_for_a_live_auditor_only_and_the_vault_picker_for_an_administrator_too():
+    """Asking depends on require_live_auditor, which refuses a right that is not in force whatever its stored state
+    (test_auditor_liveness.py); the vault picker on require_live_auditor_or_admin: an administrator places legal
+    holds, and finds the vaults with it."""
+    assert cr.require_live_auditor in _dependencies("/compliance/cases", "POST")
+    assert cr.require_live_auditor_or_admin in _dependencies("/compliance/vault-picker", "GET")
+
+
+def test_the_vault_picker_lets_an_administrator_in_and_refuses_anyone_else_not_a_live_auditor(db, people):
+    assert cr.require_live_auditor_or_admin(current_user=people.bob, db=db) is people.bob
+    assert cr.require_live_auditor_or_admin(current_user=people.uma, db=db) is people.uma
+    _, err = _call(cr.require_live_auditor_or_admin, current_user=people.olga, db=db)
+    assert err.status_code == 403 and err.detail["reason"] == rights.NO_GRANT
+    out = cr.vault_picker(owner="olga", current_user=people.bob, db=db)
+    assert {v["id"] for v in out["vaults"]} == {str(people.v1.id), str(people.v2.id)}
+    assert _rows(db, "case_picker_viewed")[-1].user_id == people.bob.id
 
 
 # --------------------------------------------------------------------------- an administrator the case concerns
