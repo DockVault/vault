@@ -249,6 +249,32 @@ def test_a_lost_cancel_of_a_request_the_resealed_raise_supersedes_is_not_sealed_
     assert failures(env.verify()) == []
 
 
+def test_a_lost_value_dot_env_gave_is_not_sealed_again_by_the_host(env, monkeypatch):
+    """The lost policy seal is an .env change (AUDIT_PROTECTED_MIN_DAYS raised to 400, keeping more): its entry
+    has no setting, so the host does not seal it again (a policy seal of cause restore sets only what an
+    administrator set); the server's next pass seals .env's value again itself."""
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    monkeypatch.setenv("AUDIT_PROTECTED_MIN_DAYS", "400")
+    env.settings.audit_protected_min_days = 400
+    env.clock.advance(minutes=10)
+    env.seal()
+    seq, detail = env.st.view.newest_policy()
+    assert detail["cause"] == "env" and detail["state"]["audit_admin_min_days"]["value"] == 400
+    assert detail["state"]["audit_admin_min_days"]["setting"] is None
+    _cut_from(env, seq)
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    seen, done = _accept(env)
+    assert any(f"Lost: the newest policy seal ({seq})" in ln for ln in seen["lines"]), seen["lines"]
+    assert done["resealed"] == [] and env.seals()[-1].kind == "restore"
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    seq, detail = env.st.view.newest_policy()
+    assert detail["cause"] == "env" and detail["state"]["audit_admin_min_days"]["value"] == 400
+    assert failures(env.verify()) == []
+
+
 def test_a_lost_head_record_is_accepted_after_the_key_history_is_confirmed(env):
     _sealed_day(env)
     os.unlink(env.st.head_store().path)
@@ -567,6 +593,22 @@ def test_accept_restore_raises_the_generation(env):
     seen = restore.accept_restore(env.engine, _host(env), read=True)
     restore.accept_restore(env.engine, _host(env), expect=seen["state"])
     assert env.st.head_store().load()["generation"] == 2
+
+
+def test_accept_restore_refuses_a_restore_mark_it_cannot_read(env):
+    """A restore mark that cannot be read still holds every deletion: accept-restore refuses it in both phases
+    and leaves it and the chain as they are; the host removes it by hand once the restore is checked."""
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    path = env.st.head_store().path
+    with open(hr.mark_path(path), "w", encoding="utf-8") as fh:
+        fh.write('{"at": "2026-')
+    before = len(env.seals())
+    for kw in ({"read": True}, {"expect": "dvstate1:0"}):
+        with pytest.raises(restore.Refused, match="the restore mark cannot be read"):
+            restore.accept_restore(env.engine, _host(env), **kw)
+    assert os.path.exists(hr.mark_path(path)) and len(env.seals()) == before
+    assert env.st.restore_mark() == {"unreadable": "JSONDecodeError"}
 
 
 def test_a_key_history_only_the_replaced_record_held_is_kept_and_the_left_key_named(env):

@@ -148,6 +148,50 @@ def test_the_step_up_is_fixed_and_the_page_builds_the_list_without_inner_html():
     assert 'id="integrity-warnings-card"' in html and "/static/js/settings-integrity.js?v=" in html
 
 
+def test_a_seal_from_the_database_another_writer_appended_is_not_offered_to_administrators(env, admin,
+                                                                                           monkeypatch):
+    """Two waiting changes the database no longer shows waiting: the server's own pass ends the first with a
+    cancel seal from the database's values, which an administrator may acknowledge; the second's cancel, appended
+    by another writer after the head record, is the host operator's: not offered, and its acknowledgment
+    refused."""
+    from app.core import retention
+    from app.core import setting_changes as sc
+    from app.core.models import ManagedSettingChange
+    from test_audit_chain_trust import _change
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    first = _change(env, admin, "audit_max_days", 30)
+    second = _change(env, admin, "audit_max_mb", 100)
+    assert first.status == second.status == "pending"
+    requests = {(s.detail or {}).get("request"): s.seq for s in env.seals() if s.kind == "request"}
+
+    def cancelled_in_the_database(change_id):
+        with env.session() as db:
+            db.get(ManagedSettingChange, change_id).status = sc.CANCELLED
+            db.commit()
+
+    cancelled_in_the_database(first.change.id)
+    retention.run_pass(env.session, now=env.clock() + timedelta(minutes=30))
+    own = [s.seq for s in env.seals() if s.kind == "cancel" and s.detail["cancels"] == requests[str(first.change.id)]]
+    assert len(own) == 1 and own[0] in ai.database_seqs(env.st.view)
+    cancelled_in_the_database(second.change.id)
+    foreign = _forge(env, "cancel", {"cancels": requests[str(second.change.id)], "request": str(second.change.id),
+                                     "audit_row": None, "by": "database", "user_id": None})
+    env.clock.advance(minutes=30)
+    env.seal()
+    view, record = env.st.view, env.st.head_store().load()
+    assert foreign in ai.database_seqs(view) and foreign in ai.unacknowledged_foreign(view, record)
+    assert routes.admin_warnings(view, record)["veto"] == own
+    shown = routes.get_warnings(current_user=admin, db=env.session())["warnings"]
+    assert [(w["seq"], w["kind"]) for w in shown] == [(own[0], "veto-from-database")]
+    monkeypatch.setattr(routes, "_step_up", lambda db, user, request: None)
+    with pytest.raises(HTTPException) as refused:
+        routes.acknowledge_warnings(_Body([foreign]), request=None, current_user=admin, db=env.session())
+    assert refused.value.status_code == 409 and "host operator" in refused.value.detail
+    assert routes.acknowledge_warnings(_Body(own), request=None, current_user=admin, db=env.session()) == \
+        {"acknowledged": own}
+
+
 def test_a_late_seal_another_writer_appended_is_not_offered_to_administrators(env):
     """Another writer's seals after the head record are the host operator's to acknowledge."""
     seq, _added = _late(env)
