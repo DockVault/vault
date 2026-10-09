@@ -871,9 +871,10 @@ def _open(case, column: str, field: str) -> Optional[str]:
 
 def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool = False, light: bool = False) -> dict:
     """``case`` as ``viewer`` (its auditor or an administrator) may see it. The justification only for the auditor
-    and an administrator who could approve it; the people named only for those the case does not concern. Never a
-    vault, file or folder name. ``light`` (a list of cases): only what the list shows, without the texts, what each
-    step would allow and the vaults' figures, which the case's own page reads."""
+    and an administrator who could approve it; the people named, the reasons it was turned down or closed and the
+    owners' objections only for those the case does not concern. Never a vault, file or folder name. ``light`` (a
+    list of cases): only what the list shows, without the texts, what each step would allow and the vaults'
+    figures, which the case's own page reads."""
     from app.core import auditor_rights as rights
     from app.core import legal_holds
     from app.core.models import ComplianceCasePerson, User
@@ -934,10 +935,12 @@ def case_view(db, case, viewer, *, now: Optional[datetime] = None, detail: bool 
         out["justification"] = _open(case, "justification_enc", "justification")
     if own or admin:
         out["owner_note"] = _open(case, "owner_note_enc", "owner_note")
+    # The people named, and free text that may name whom the case is about: never to an administrator the case
+    # concerns, who sees it only as an owner does.
+    if own or (admin and not concerned):
         out["reject_reason"] = _open(case, "reject_reason_enc", "reject_reason")
         out["close_reason"] = _open(case, "close_reason_enc", "close_reason")
         out["objections"] = objections(case)
-    if own or (admin and not concerned):
         out["people"] = [{"user_id": str(p.user_id), "username": names.get(p.user_id), "why": p.why}
                          for p in sorted(people, key=lambda p: (p.why, str(p.user_id)))]
     if admin and detail:

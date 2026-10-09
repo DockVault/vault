@@ -1073,3 +1073,42 @@ def test_the_vault_picker_and_asking_for_a_case_are_for_a_live_auditor_only():
     for path, method in (("/compliance/vault-picker", "GET"), ("/compliance/cases", "POST")):
         (route,) = [r for r in cr.router.routes if getattr(r, "path", None) == path and method in r.methods]
         assert cr.require_live_auditor in {d.call for d in route.dependant.dependencies}, path
+
+
+# --------------------------------------------------------------------------- an administrator the case concerns
+
+def test_an_administrator_the_case_concerns_reads_no_reason_and_no_objection(db, people):
+    """They see the case only as an owner does: not why it was turned down or closed, nor the owners' objections,
+    free text that may name whom it is about."""
+    otto_admin = people.otto
+    otto_admin.role = m.RoleEnum.ADMIN
+    db.commit()
+    turned = _ask(db, people.uma, _vaults(people.v1, people.v3))
+    cases.reject(db, turned, by=people.bob, reason="Insufficient grounds against otto.")
+    closed = _approve(db, _ask(db, people.uma, _vaults(people.v2, people.v3)), people.bob)
+    cases.record_objection(db, closed, by=people.olga, text_="otto is the one to ask.")
+    cases.close(db, closed, by=people.carl, reason="Concluded: otto cleared.")
+    db.commit()
+    hidden = ("reject_reason", "close_reason", "objections", "people")
+    for case in (turned, closed):
+        mine = cases.case_view(db, case, otto_admin, detail=True)
+        assert not set(hidden) & set(mine), case.status
+        assert "otto" not in str({k: v for k, v in mine.items() if k not in ("vaults",)})
+        assert mine["owner_note"] == TEXT["owner_note"]
+        theirs = cases.case_view(db, case, people.carl, detail=True)
+        assert set(hidden) <= set(theirs)
+    assert cases.case_view(db, turned, people.carl)["reject_reason"] == "Insufficient grounds against otto."
+    assert cases.case_view(db, closed, people.carl)["close_reason"] == "Concluded: otto cleared."
+    assert [e["text"] for e in cases.case_view(db, closed, people.carl)["objections"]] == ["otto is the one to ask."]
+    assert cases.case_view(db, closed, people.uma)["close_reason"] == "Concluded: otto cleared."
+
+
+def test_the_case_page_route_hides_them_from_a_concerned_administrator(db, people):
+    otto_admin = people.otto
+    otto_admin.role = m.RoleEnum.ADMIN
+    db.commit()
+    case = _ask(db, people.uma, _vaults(people.v3))
+    cases.reject(db, case, by=people.bob, reason="Insufficient grounds against otto.")
+    db.commit()
+    page = cr.get_case(case.id, SimpleNamespace(headers={}), current_user=otto_admin, db=db)
+    assert "reject_reason" not in page and "Insufficient" not in str(page)
