@@ -17,16 +17,21 @@ The algorithm, in order:
 4. justification, from the chain alone: every policy seal has a cause that holds against the one before it
    and sets only what its cause may set (only .env sets the delay), every request names a setting the
    panel manages and waits at least the delay in force, every cancel names a pending request, every late
-   seal follows its hour's root seal within 6 hours, every rewrite keeps the stable root;
+   seal follows its hour's root seal within 6 hours, every rewrite keeps the stable root, every archive seal
+   lists whole-hour parts of its day that do not overlap, says complete exactly when they cover the day, adds
+   parts only after the day's earlier ones, and changes them only right after a change of that day;
 5-7. per hour: the rows (or an erase's earlier commitments) rebuilt into both roots and compared with the
-   hour's newest root seal, naming missing and added rows by id;
+   hour's newest root seal, naming missing and added rows by id; an archived hour's rows come from the block
+   of its day that holds it, read only once its length and digest are the ones the day's latest archive seal
+   binds (block-altered, block-missing, block-unsealed), and a row of audit_logs in an archived hour is
+   row-in-archived-day;
 8. outside the chain: rows naming an account that is not theirs, account rows unlinked from an account that
    still exists, rows before the chain's first hour or dated ahead, undated rows, and hooks on the tables.
 
 With ``--anchor dvchain1:...`` and no key, the links up to the anchor authenticate every seal up to it; a later
-late, prune, rewrite or erase seal that changes an hour the anchor covered is reported as not authenticated (a
-warning), whoever it says wrote it, and an anchor whose seal a restore lost is reported against that restore
-seal.
+late, prune, rewrite or erase seal that changes an hour the anchor covered, or archive seal that rebinds a day
+holding such an hour, is reported as not authenticated (a warning), whoever it says wrote it, and an anchor whose
+seal a restore lost is reported against that restore seal.
 
 Information, for good: what each prune, rewrite, erase, acknowledgment and restore did, the hours a restore
 sealed again and the ones it found changed, a restore that accepted history under a key the chain had left,
@@ -36,7 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
 from sqlalchemy import func, text
@@ -373,6 +378,9 @@ def other_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
         for row in d.get("rows") or []:
             if row and row[0] in view.erased_rows:
                 return "a row erased twice"
+    elif seal.kind == "archive":
+        from app.core import audit_archive
+        return audit_archive.archive_problem(view, seal)
     elif seal.kind == "key":
         pass
     return None
@@ -552,8 +560,10 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
         if anchor_covers is not None and seal.seq not in verified:
             for hour in changed_hours(seal):
                 if hour < anchor_covers:
+                    what = (f"day {hour.date().isoformat()}'s blocks" if seal.kind == "archive"
+                            else f"hour {fmt.hour_text(hour)}")
                     report.add(WARNING, "changed-after-anchor",
-                               f"hour {fmt.hour_text(hour)} changed after the anchor by seal {seal.seq} ({seal.kind}, "
+                               f"{what} changed after the anchor by seal {seal.seq} ({seal.kind}, "
                                "not authenticated)", seal.seq, fmt.hour_text(hour))
         if information:
             _event(view, seal, report)
@@ -616,8 +626,9 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
 
 def changed_hours(seal) -> List[datetime]:
     """The hours a late, prune, rewrite or erase seal changes: each re-roots an hour sealed before it, or records
-    a change to its rows. A late seal counts whoever it says wrote it (the host, or the sealer with an
-    acknowledgment): without the key neither its writer nor the acknowledgment is authenticated."""
+    a change to its rows; and, for an archive seal, which rebinds its day's blocks, the day's first hour. A late
+    seal counts whoever it says wrote it (the host, or the sealer with an acknowledgment): without the key
+    neither its writer nor the acknowledgment is authenticated."""
     d = seal.detail or {}
     if seal.kind == "late":
         try:
@@ -637,6 +648,13 @@ def changed_hours(seal) -> List[datetime]:
             return [fmt.parse_time_text(d["hour"])]
         except (TypeError, ValueError):
             return []
+    if seal.kind == "archive":
+        # It rebinds its day's blocks: reported once, by the day's first hour.
+        try:
+            day = date.fromisoformat(d["day"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        return [datetime(day.year, day.month, day.day)]
     return []
 
 
@@ -665,6 +683,10 @@ def _event(view, seal, report: Report) -> None:
         report.add(INFO, "erased", f"seal {seal.seq} on {when}: {len(d.get('rows') or [])} rows of hour "
                                    f"{d.get('hour')} erased for request {d.get('request_seq')}"
                                    + (" (its last)" if d.get("final") else ""), seal.seq)
+    elif seal.kind == "archive" and d.get("cause") == "unarchive":
+        # Archiving and its rewrites are routine; putting a day back as rows is the host's.
+        report.add(INFO, "unarchived", f"seal {seal.seq} on {when}: {d.get('day')} restored as rows by the host",
+                   seal.seq)
     elif seal.kind == "ack":
         parts = []
         if d.get("acknowledges"):
@@ -896,9 +918,16 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
 
 
 def _rows(db, view, report: Report, from_hour, to_hour) -> None:
+    from app.core import audit_archive
     ai = _ai()
+    # The blocks: the set and each one's length against the archive seals (no payload read), rows put back into
+    # archived hours, then each part in the range read once, whole.
+    audit_archive.check_block_set(db, view, report)
+    audit_archive.check_parts(db, view, report, audit_archive.archived_parts_in(view, from_hour, to_hour))
     for hour in list(view.single_hours()):
         if (from_hour and hour < from_hour) or (to_hour and hour >= to_hour):
+            continue
+        if view.archived_part(hour) is not None:
             continue
         report.hours_checked += 1
         check_hour(db, view, view.entry_for(hour), hour, report)
@@ -910,7 +939,7 @@ def _rows(db, view, report: Report, from_hour, to_hour) -> None:
             continue
         times = [r[0] for r in db.query(A.timestamp).filter(A.timestamp >= start, A.timestamp < end).all()]
         for hour in sorted({ai.hour_floor(t) for t in times}):
-            if view.has_own(hour):
+            if view.has_own(hour) or view.archived_part(hour) is not None:
                 continue
             report.add(FAILURE, "rows-added", f"rows in {fmt.hour_text(hour)}, an hour sealed empty",
                        run_seq, fmt.hour_text(hour))
@@ -1010,18 +1039,8 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
                         from_hour=ai.hour_floor(now) - timedelta(days=7), now=now,
                         key_shared=st.current_key().source == "encryption", information=False)
         rolling_from = (record.get("check") or {}).get("rolling_from")
-        older = [h for h in st.view.single_hours() if h < ai.hour_floor(now) - timedelta(days=7)]
-        if older:
-            per_day = max(1, len(older) // ROLLING_DAYS + 1)
-            start = 0
-            if rolling_from:
-                start = bisect_hours(older, fmt.parse_time_text(rolling_from))
-            chunk = older[start:start + per_day] or older[:per_day]
-            for hour in chunk:
-                check_hour(db, st.view, st.view.entry_for(hour), hour, report)
-            next_from = chunk[-1] + ai.HOUR if chunk else None
-        else:
-            next_from = None
+        next_from = _rolling(db, st.view, report, ai.hour_floor(now) - timedelta(days=7),
+                             fmt.parse_time_text(rolling_from) if rolling_from else None)
     finally:
         db.close()
     failures = {f.kind: f.message for f in report.findings if f.severity == FAILURE}
@@ -1048,6 +1067,37 @@ def bisect_hours(hours, at) -> int:
     import bisect
     i = bisect.bisect_left(hours, at)
     return i if i < len(hours) else 0
+
+
+def _rolling(db, view, report: Report, before: datetime, rolling_from: Optional[datetime]) -> Optional[datetime]:
+    """The rolling check: about a thirtieth of the sealed hours older than ``before`` and of the archived parts,
+    in order from ``rolling_from`` (a part weighs as many hours as it holds, and is read once, whole), so that
+    every hour and every block is checked at least every 30 days. Returns where the next check starts."""
+    from app.core import audit_archive
+    ai = _ai()
+    items = [(h, 1, None) for h in view.single_hours() if h < before and view.archived_part(h) is None]
+    items += [(part.first_hour, len(part.hours()), (day, part)) for day, part in view.archived_parts()
+              if part.first_hour < before]
+    if not items:
+        return None
+    items.sort(key=lambda it: it[0])
+    per_day = max(1, sum(w for _t, w, _p in items) // ROLLING_DAYS + 1)
+    start = bisect_hours([t for t, _w, _p in items], rolling_from) if rolling_from else 0
+    taken, weight = [], 0
+    for item in items[start:]:
+        if weight >= per_day:
+            break
+        taken.append(item)
+        weight += item[1]
+    if not taken:
+        taken = items[:1]
+    for when, _w, part in taken:
+        if part is None:
+            check_hour(db, view, view.entry_for(when), when, report)
+        else:
+            audit_archive.check_parts(db, view, report, [part])
+    last_when, _w, last_part = taken[-1]
+    return (last_part[1].last_hour if last_part is not None else last_when) + ai.HOUR
 
 
 # --------------------------------------------------------------------------- the host command

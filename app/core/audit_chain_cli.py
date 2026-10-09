@@ -10,6 +10,8 @@
     accept-database-head [--old-key-file F] [--confirm NAME ...] [--no-reseal] (--read | --expect)
     accept-restore [--no-reseal] (--read | --expect)
     acknowledge-removed-before T --retention-days N (--read | --expect)
+    unarchive [--from DAY] [--to DAY] (--read | --expect)
+    compact
 
 Every command but verify and head answers with one JSON line on standard output (dockvault.py reads it):
 ``{"ok": true, ...}`` or ``{"ok": false, "error": ...}``; what the app prints while it starts goes to standard
@@ -158,6 +160,32 @@ def _removed_before(args) -> int:
     return _answer(run)
 
 
+def _unarchive(args) -> int:
+    def run():
+        from app.core import audit_archive
+        engine, st = _server()
+        try:
+            first = audit_archive._parse_day(args.from_day)
+            last = audit_archive._parse_day(args.to_day)
+        except ValueError:
+            from app.core import audit_chain_host as host
+            raise host.Refused("--from and --to take a day (YYYY-MM-DD)")
+        try:
+            return audit_archive.unarchive(engine, st, first, last, expect=args.expect, read=args.read)
+        except audit_archive.NotVerified as nv:
+            from app.core import audit_chain_host as host
+            raise host.Refused(f"{nv.kind}: {nv}")
+    return _answer(run)
+
+
+def _compact(args) -> int:
+    def run():
+        from app.core import audit_archive
+        engine, _st = _server()
+        return audit_archive.compact(engine)
+    return _answer(run)
+
+
 def _verify(args) -> int:
     from app.core import audit_chain_format as fmt
     from app.core import audit_chain_verify as v
@@ -280,10 +308,15 @@ def main(argv=None) -> int:
     rb.add_argument("--retention-days", type=int, required=True,
                     help="the AUDIT_LOG_RETENTION_DAYS the older release ran with")
     _phase(rb)
+    ua = sub.add_parser("unarchive", help="restore archived days as rows")
+    ua.add_argument("--from", dest="from_day", help="the first day (YYYY-MM-DD); the oldest by default")
+    ua.add_argument("--to", dest="to_day", help="the last day (YYYY-MM-DD); the newest by default")
+    _phase(ua)
+    sub.add_parser("compact", help="VACUUM FULL of the audit tables (blocks audit writes while it runs)")
     args = p.parse_args(argv)
     handlers = {"acknowledge": _acknowledge, "rekey": _rekey, "after-record": _after_record,
                 "accept-database-head": _accept_database_head, "accept-restore": _accept_restore,
-                "acknowledge-removed-before": _removed_before}
+                "acknowledge-removed-before": _removed_before, "unarchive": _unarchive, "compact": _compact}
     if args.action in handlers:
         return handlers[args.action](args)
     if args.action not in ("verify", "head"):

@@ -204,6 +204,10 @@ def describe_seal(view, record: Optional[dict], seq: int, now: datetime) -> List
                                  "it inside")
     elif kind in ("prune", "rewrite", "erase"):
         lines.append("  changes rows; the pruner leaves the hours it re-roots alone until it is acknowledged")
+    elif kind == "archive":
+        day = next((d for d, e in view.archives.items() if e.seq == seq), None)
+        lines.append(f"  binds the archive blocks of {day.isoformat() if day else 'a day'}"
+                     + (" (no longer that day's latest archive seal)" if day is None else ""))
     elif kind == "ack":
         named = [s for s, by in view.acked.items() if seq in by]
         lines.append(f"  acknowledges {named or 'nothing'}: acknowledging this seal acknowledges only it; list "
@@ -326,6 +330,9 @@ def late_rows_plan(db, view, record: Optional[dict], hour: datetime) -> dict:
     import secrets
     if view.entry_for(hour) is None:
         raise Refused(f"{fmt.hour_text(hour)} is not a sealed hour")
+    if view.archived_part(hour) is not None:
+        raise Refused(f"{fmt.hour_text(hour)} is archived: its rows are in the archive, and a row of audit_logs in "
+                      "it is row-in-archived-day, which nothing seals over")
     root = ai.hour_root(db, view, hour)
     own = view.has_own(hour)
     wr = ai.working_row(db, hour) if own else None

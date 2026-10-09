@@ -19,8 +19,8 @@ from app.core import audit_integrity as ai  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import setting_changes as sc  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange,  # noqa: E402
-                             SystemSetting, User)
+from app.core.models import (AuditArchiveBlock, AuditLog, AuditSeal, ManagedSetting,  # noqa: E402
+                             ManagedSettingChange, SystemSetting, User)
 
 KEY_TEXT = "c" * 64
 ENC_KEY = "Y2hhbmdlbWVjaGFuZ2VtZWNoYW5nZW1lY2hhbmdlbWU="
@@ -38,7 +38,8 @@ def settings(tmp: Path, **kw):
                 plan_log_max_days=-1, plan_log_max_mb=-1, security_alert_retention_days=90,
                 security_record_days=30, security_record_min_days=7, security_record_max_days=365,
                 jwt_access_token_expire_minutes=60, audit_seal_lag_minutes=60, encryption_key=ENC_KEY,
-                audit_chain_key=KEY_TEXT, audit_chain_head_file=str(tmp / "keys" / "audit-chain-head.json"))
+                audit_chain_key=KEY_TEXT, audit_chain_head_file=str(tmp / "keys" / "audit-chain-head.json"),
+                audit_hot_days=90, audit_archive_start_after_days=14)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -71,7 +72,8 @@ class Env:
         monkeypatch.setattr(sc, "announce", lambda *a, **k: None)
         self.engine = sa.create_engine(f"sqlite:///{tmp / 'audit.db'}")
         copies = sa.MetaData()
-        for model in (User, AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, SystemSetting):
+        for model in (User, AuditLog, AuditSeal, AuditArchiveBlock, ManagedSetting, ManagedSettingChange,
+                      SystemSetting):
             columns = []
             for column in model.__table__.columns:
                 default = column.server_default

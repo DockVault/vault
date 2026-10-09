@@ -52,7 +52,8 @@ from app.core import audit_chain_format as fmt
 from app.core import audit_chain_keys as keys
 from app.core import settings_registry as registry
 from app.core.audit_head_record import HeadStore, LINK_EVERY
-from app.core.audit_chain_view import HourEntry, RootEntry, View  # noqa: F401 -- the view's types, as before
+from app.core.audit_chain_view import (ArchiveEntry, ArchivePart, HourEntry, RootEntry,  # noqa: F401
+                                      View, archive_parts)
 
 # The lock that keeps writers of seals apart, in every process (distinct from every other lock class).
 CHAIN_LOCK = (0x6163, 1)
@@ -77,9 +78,9 @@ registry.register(registry.SettingSpec(
 # The kinds of seal, and which set an hour's roots.
 KINDS = ("genesis", "policy", "request", "cancel", "hour", "late", "prune", "rewrite", "erase", "archive", "key",
          "ack", "restore")
-# Kinds of seal another writer may not append after the head record in this release: nothing here writes them
-# yet, and the checks of their fields come with their writers.
-UNCHECKED_KINDS = ("archive",)
+# Kinds of seal another writer may not append after the head record in this release, because nothing here
+# checks their fields (none now: every kind's checks are in audit verify's step 4).
+UNCHECKED_KINDS: tuple = ()
 ROOT_KINDS = ("hour", "late", "prune", "rewrite")
 BODY_ROOT_KINDS = ("genesis", "hour", "late")
 
@@ -305,6 +306,9 @@ class ChainState:
         self.pending_after: List[dict] = []
         # The first start's backlog is not sealed yet: the pruner's passes then follow each other closely.
         self.backlog = False
+        # Archived days the audit job found nothing to delete in, by (day, archive seq, reason): (the UTC date of
+        # that look, the time before which it looked). It looks again the next day, or once that time moves on.
+        self.archive_checked: Dict[tuple, Any] = {}
 
     def cfg(self):
         return self.settings or _settings()

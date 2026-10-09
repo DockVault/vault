@@ -81,11 +81,14 @@ def change_dict(change) -> Optional[dict]:
 @router.get("/settings/managed")
 def get_managed_settings(current_user: User = Depends(require_interactive_admin),
                          db: Session = Depends(get_db)):
-    """Every managed setting, from this process's copy, and the changes waiting (read from the table)."""
+    """Every managed setting, from this process's copy, the changes waiting (read from the table), and when
+    the audit archive starts and what it holds."""
     limit_statements(db)
+    from app.core import audit_archive
     return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
-            "pending": [change_dict(c) for c in setting_changes.pending_for(db)]}
+            "pending": [change_dict(c) for c in setting_changes.pending_for(db)],
+            "archive": audit_archive.summary()}
 
 
 def spec_or_404(key: str) -> registry.SettingSpec:

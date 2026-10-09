@@ -272,6 +272,9 @@ RETENTION_ENV_KEYS = (
     # The audit log's integrity chain: when an hour is sealed, and where the head record lives.
     ("audit_seal_lag_minutes", "AUDIT_SEAL_LAG_MINUTES", "60"),
     ("audit_chain_head_file", "AUDIT_CHAIN_HEAD_FILE", "/app/keys/audit-chain-head.json"),
+    # The audit log's archive: the days kept as rows, and how long after this release first ran it begins.
+    ("audit_hot_days", "AUDIT_HOT_DAYS", "90"),
+    ("audit_archive_start_after_days", "AUDIT_ARCHIVE_START_AFTER_DAYS", "14"),
 )
 
 # What the audit log may record of personal data at most: setup offers three presets for the AUDIT_MAX_* limits

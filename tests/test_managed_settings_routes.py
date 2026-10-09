@@ -28,8 +28,8 @@ from app.api import api_server as api  # noqa: E402
 from app.api import managed_settings_router as routes  # noqa: E402
 from app.core import setting_changes as sc  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, RoleEnum,  # noqa: E402
-                             SystemSetting, User)
+from app.core.models import (AuditArchiveBlock, AuditLog, AuditSeal, ManagedSetting,  # noqa: E402
+                             ManagedSettingChange, RoleEnum, SystemSetting, User)
 from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -62,7 +62,8 @@ def env(monkeypatch):
 def db(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'managed.db'}")
-        for model in (User, ManagedSetting, ManagedSettingChange, AuditLog, AuditSeal, SystemSetting):
+        for model in (User, ManagedSetting, ManagedSettingChange, AuditLog, AuditSeal, AuditArchiveBlock,
+                      SystemSetting):
             model.__table__.create(engine)
         factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         monkeypatch.setattr(reg, "_default_session_factory", factory)

@@ -2,11 +2,14 @@
 (app/core/audit_integrity.py).
 
     GET  /activity/integrity                    the chain's head (the line to keep somewhere else), how far the
-                                                hours are sealed, the last check's time and outcome, and every
-                                                failure and warning not yet acknowledged
+                                                hours are sealed, the last check's time and outcome, every
+                                                failure and warning not yet acknowledged, and the archive:
+                                                when it starts, the row window, and the days held in
+                                                compressed blocks
     GET  /settings/audit-integrity/warnings     the warnings an administrator may acknowledge: each late seal with
                                                 the rows it added (time, action, account, resource), and each seal
-                                                the pruner wrote from the database's values
+                                                the pruner wrote from the database's values; and the archive, as
+                                                for the Activity page
     POST /settings/audit-integrity/acknowledge  acknowledge some of them, with the step-up the "password always"
                                                 policy asks for, in an ``ack`` seal by that administrator
 
@@ -29,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.api.user_management_api import require_interactive_admin
 from app.core import audit_chain_format as fmt
-from app.core import audit_integrity
+from app.core import audit_archive, audit_integrity
 from app.core import fixed_step_up
 from app.core.database import get_db
 from app.core.models import User
@@ -60,7 +63,8 @@ def get_integrity(current_user: User = Depends(require_interactive_admin)):
             "key_id": status.get("key_id"), "key_shared": bool(status.get("key_shared")),
             "outcome": status.get("outcome"), "checked_at": (status.get("check") or {}).get("daily_at"),
             "failures": _entries(status.get("failures")), "warnings": _entries(status.get("warnings")),
-            "stopped": status.get("stopped"), "claim": CLAIM}
+            "stopped": status.get("stopped"), "claim": CLAIM,
+            "archive": audit_archive.summary()}
 
 
 def admin_warnings(view, record) -> dict:
@@ -125,7 +129,7 @@ def get_warnings(current_user: User = Depends(require_interactive_admin), db: Se
             what = "kept longer, as the database holds: " + ", ".join(changed)
         out.append({"seq": seq, "kind": "veto-from-database", "sealed_at": fmt.time_text(seal.sealed_at),
                     "what": what})
-    return {"warnings": out}
+    return {"warnings": out, "archive": audit_archive.summary()}
 
 
 class AcknowledgeBody(BaseModel):

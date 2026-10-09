@@ -202,10 +202,12 @@ class SizePlan:
 def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, delay: timedelta, *,
                     server: bool = True) -> SizePlan:
     """How the size cap applies now, from the audit chain's verified view: each sealed hour counts its lagged
-    bytes over a window of one delay of time while sealing ran (app/core/audit_chain_size.py), the total is
-    the chain's, and the rows decide only which part of an hour's figure the cap may never delete. It keeps
-    the newest hours, protected rows first, that fit under the cap; the unprotected rows of older hours go,
-    and never a row younger than the window's start."""
+    bytes over a window of one delay of time while sealing ran, and each archived part the smaller of its bound
+    length and its hours' lagged bytes (app/core/audit_chain_size.py); the total is the chain's, and the rows
+    (an archived part's aggregates, app/core/audit_archive.py) decide only which part of a figure the cap may
+    never delete. It keeps the newest hours and parts, protected rows first, that fit under the cap; the
+    unprotected rows of older ones go, and never a row younger than the window's start."""
+    from app.core import audit_archive
     from app.core import audit_chain_format as fmt
     from app.core import audit_chain_size as chain_size
     from app.core.audit_chain_view import from_us
@@ -214,31 +216,36 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
         return plan
     start_us = chain_size.window_start(view, record, now, delay, server=server)
     held = chain_size.held_back(view, record, start_us) if server else set()
-    by_hour = chain_size.hour_bytes(view, start_us, held)
+    by_hour, parts = chain_size.counted(view, start_us, held)
     cap = numbers.max_mb * MB
-    plan.counted_bytes = sum(by_hour.values())
+    plan.counted_bytes = sum(by_hour.values()) + sum(c for _d, _p, c, _h in parts)
     plan.counted_before = from_us(start_us)
     plan.size = {"cap": cap, "delay": delay.days, "from": fmt.time_text(plan.counted_before),
                  "counted": plan.counted_bytes, "held_back": sorted(held)}
-    if not by_hour:
+    if not plan.counted_bytes:
         return plan
-    dialect = db.get_bind().dialect.name
-    hour = _hour(model, dialect)
-    rows = (db.query(hour.label("hour"), func.sum(_row_bytes(model, dialect)))
-            .filter(_size_protected(model, now, numbers)).group_by(hour).all())
-    protected_rows = {_as_time(h): int(size or 0) for h, size in rows}
-    unprotected = {}
-    for h, counted in by_hour.items():
-        protected = min(protected_rows.get(h, 0), counted)
-        plan.protected_bytes += protected
-        if counted - protected:
-            unprotected[h] = counted - protected
+    # (hour, counted, protected): an archived part's spread over its hours (app/core/audit_archive.py part_units).
+    units = []
+    if by_hour:
+        dialect = db.get_bind().dialect.name
+        hour = _hour(model, dialect)
+        rows = (db.query(hour.label("hour"), func.sum(_row_bytes(model, dialect)))
+                .filter(_size_protected(model, now, numbers)).group_by(hour).all())
+        protected_rows = {_as_time(h): int(size or 0) for h, size in rows}
+        units += [(h, counted, min(protected_rows.get(h, 0), counted)) for h, counted in by_hour.items()]
+    if any(c for _d, _p, c, _h in parts):
+        figures = audit_archive.part_figures(db, view)
+        for d, part, c, lagged in parts:
+            units += audit_archive.part_units(part, c, lagged, figures.get((d, part.part)), now, numbers.min_days)
+    plan.protected_bytes = sum(p for _w, _c, p in units)
     left = plan.protected_bytes
-    for h in sorted(unprotected, reverse=True):
-        if left + unprotected[h] > cap:
-            plan.cutoff = h + timedelta(hours=1)
+    for when, counted, protected in sorted(units, key=lambda u: u[0], reverse=True):
+        if counted == protected:
+            continue
+        if left + counted - protected > cap:
+            plan.cutoff = when + timedelta(hours=1)
             break
-        left += unprotected[h]
+        left += counted - protected
     plan.met = plan.protected_bytes <= cap
     return plan
 
@@ -305,7 +312,12 @@ def prune(p, numbers: Optional[Numbers] = None):
     numbers = numbers or chain_values
     aged = by_age(AuditLog, p.now, numbers)
     if aged:
-        done = audit_chain_prune.prune(p, retention.deletable(AuditLog, p.now, *aged), reason="retention")
+        # Archived rows go through their blocks (app/core/audit_archive.py), selected by the same conditions over
+        # a table shaped like audit_logs; only days that start before the maximum's cutoff are read.
+        done = audit_chain_prune.prune(
+            p, retention.deletable(AuditLog, p.now, *aged), reason="retention",
+            archived=lambda m: retention.deletable(m, p.now, *by_age(m, p.now, numbers)),
+            before=p.now - timedelta(days=numbers.max_days))
         result.add(done.deleted, done.oldest, done.newest)
     # The size cap counts the chain's figures, which still hold what the maximum is about to delete: it runs
     # once the maximum's work is done (time left in the pass).
@@ -315,7 +327,10 @@ def prune(p, numbers: Optional[Numbers] = None):
             sized = by_size(AuditLog, p.now, numbers, sp)
             if not sized:
                 return None
-            return retention.deletable(AuditLog, p.now, *sized), sp.size
+            return audit_chain_prune.Selection(
+                retention.deletable(AuditLog, p.now, *sized), sp.size,
+                archived=lambda m: retention.deletable(m, p.now, *by_size(m, p.now, numbers, sp)),
+                before=min(sp.cutoff, sp.counted_before))
 
         done = audit_chain_prune.prune(p, None, reason="size-cap", plan=plan)
         result.add(done.deleted, done.oldest, done.newest)
@@ -341,14 +356,20 @@ def preview(db, now: datetime, numbers: Numbers) -> dict:
             *retention.deletable(AuditLog, now, *conditions)).one()
         return {"rows": int(rows), "bytes": int(total), "newest": newest.isoformat() + "Z" if newest else None}
 
-    from app.core import audit_integrity
+    from app.core import audit_archive, audit_integrity
     st = audit_integrity.state()
     aged = by_age(AuditLog, now, numbers)
     plan = chain_size_plan(db, AuditLog, st.view, st.known_record(), now, numbers, _delay())
     sized = by_size(AuditLog, now, numbers, plan)
     if sized and aged:
         sized = sized + [not_(and_(*retention.deletable(AuditLog, now, *aged)))]
-    return {"by_age": measure(aged), "by_size": measure(sized), "cap_met": plan.met,
+    # Archived rows, estimated from their blocks' aggregates (whole hours).
+    archived = audit_archive.preview(
+        db, st.view, age_cut=now - timedelta(days=numbers.max_days) if numbers.max_days else None,
+        admin_cut=now - timedelta(days=numbers.admin_min_days) if numbers.admin_min_days > 0 else None,
+        size_cut=min(plan.cutoff, plan.counted_before) if plan.cutoff is not None else None,
+        young_cut=now - timedelta(days=numbers.min_days) if numbers.min_days > 0 else None)
+    return {"by_age": measure(aged), "by_size": measure(sized), "archived": archived, "cap_met": plan.met,
             "counted_bytes": plan.counted_bytes, "protected_bytes": plan.protected_bytes}
 
 

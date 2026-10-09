@@ -30,8 +30,8 @@ from app.core import audit_retention as ar  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import setting_changes as sc  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange,  # noqa: E402
-                             RoleEnum, SystemSetting, User)
+from app.core.models import (AuditArchiveBlock, AuditLog, AuditSeal, ManagedSetting,  # noqa: E402
+                             ManagedSettingChange, RoleEnum, SystemSetting, User)
 from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -69,7 +69,8 @@ def factory(monkeypatch):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'audit.db'}")
         copies = sa.MetaData()
-        for model in (User, AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, SystemSetting):
+        for model in (User, AuditLog, AuditSeal, AuditArchiveBlock, ManagedSetting, ManagedSettingChange,
+                      SystemSetting):
             columns = []
             for column in model.__table__.columns:
                 default = column.server_default

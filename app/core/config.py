@@ -495,6 +495,13 @@ class Settings(BaseSettings):
     audit_chain_key: str = Field(default="")
     audit_seal_lag_minutes: int = Field(default=60)
     audit_chain_head_file: str = Field(default="/app/keys/audit-chain-head.json")
+    # The audit log's archive (app/core/audit_archive.py): UTC days older than AUDIT_HOT_DAYS (31-3650) are
+    # compressed into daily blocks, each checked against the seals before its rows are removed; nothing is
+    # deleted, and `dockvault.py audit unarchive` restores them. The panel can change the window within those
+    # bounds. Archiving starts AUDIT_ARCHIVE_START_AFTER_DAYS (0-90) after this release first ran here (the
+    # chain's genesis), so going back to an earlier release meanwhile needs no unarchive.
+    audit_hot_days: int = Field(default=90)
+    audit_archive_start_after_days: int = Field(default=14)
     
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
     # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old

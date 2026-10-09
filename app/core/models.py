@@ -8,7 +8,7 @@ from enum import Enum as PyEnum
 import uuid
 
 from sqlalchemy import (
-    Column, String, Integer, SmallInteger, Boolean, DateTime, ForeignKey,
+    Column, String, Integer, SmallInteger, Boolean, Date, DateTime, ForeignKey,
     Text, BigInteger, LargeBinary, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
@@ -1405,6 +1405,35 @@ class AuditSeal(Base):
         Index('uq_audit_seals_hour', 'period_start', unique=True,
               postgresql_where=text("kind = 'hour'"), sqlite_where=text("kind = 'hour'")),
     )
+
+
+class AuditArchiveBlock(Base):
+    """One part of a UTC day of audit rows, compressed (app/core/audit_archive.py; the format is
+    app/core/audit_archive_format.py).
+
+    A day older than ``audit_hot_days`` leaves ``audit_logs`` for blocks once every hour of it is sealed: each
+    part holds whole hours and every column of each row, and is verified against the hours' seals before the
+    rows are deleted, in the same transaction. The ``archive`` seal of that transaction binds each part's hours,
+    row count, length and digest, so nothing here is trusted on its own: ``aggregates`` (rows and bytes by
+    action, status and channel, and by hour) are checked against the payload whenever it is read. ``payload``
+    is stored without Postgres's own compression (STORAGE EXTERNAL, set by a background step), so its length is
+    read without reading it. A NEW table, which create_all builds; a release before it ignores it, and the data
+    marker (data_requirements) keeps releases from 0.33.1 on from starting while a block exists.
+    """
+    __tablename__ = 'audit_archive_blocks'
+
+    day = Column(Date, primary_key=True)
+    part = Column(Integer, primary_key=True, autoincrement=False)
+    first_hour = Column(DateTime, nullable=False)
+    last_hour = Column(DateTime, nullable=False)
+    row_count = Column(BigInteger, nullable=False)
+    codec = Column(String(16), nullable=False)
+    format = Column(SmallInteger, nullable=False)
+    payload = Column(LargeBinary, nullable=False)
+    raw_bytes = Column(BigInteger, nullable=False)
+    aggregates = Column(JSON, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    rewritten_at = Column(DateTime, nullable=True)
 
 
 class SftpProcess(Base):

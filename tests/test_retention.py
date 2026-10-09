@@ -32,7 +32,8 @@ set_bare_api_env()
 from app.api import api_server as api  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (ActiveSession, AuditLog, AuditSeal, CredentialChange, ManagedSetting,  # noqa: E402
+from app.core.models import (ActiveSession, AuditArchiveBlock, AuditLog, AuditSeal,  # noqa: E402
+                             CredentialChange, ManagedSetting,
                              ManagedSettingChange, PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert,
                              SystemSetting, User, ZkKeyProofChallenge)
 from _audit_chain_env import Chain  # noqa: E402
@@ -66,8 +67,8 @@ def factory(monkeypatch):
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'retention.db'}")
         copies = sa.MetaData()
         for model in (User, ActiveSession, PendingLogin, CredentialChange, RateLimitRecord, SecurityAlert,
-                      AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, SystemSetting,
-                      ZkKeyProofChallenge):
+                      AuditLog, AuditSeal, AuditArchiveBlock, ManagedSetting, ManagedSettingChange,
+                      SystemSetting, ZkKeyProofChallenge):
             # Each column as it is, without the foreign keys (the tables they name are not copied), and with
             # SQLite's spelling of "now" where Postgres's is the default.
             columns = []
@@ -233,7 +234,8 @@ def test_the_jobs_and_which_the_hold_switch_stops():
         ("audit_seals", False), ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
         ("credential_changes", False),
         ("rate_limit_records", False), ("security_alerts", True), ("security_records", True),
-        ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True)]
+        ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True),
+        ("audit_archive", False)]
 
 
 def test_finished_sessions_and_sign_ins_go_after_their_window(env, factory):

@@ -158,10 +158,12 @@ def test_a_seal_of_an_unknown_kind_is_refused(env):
     assert "unknown kind" in _stopped_by(env, "after-record-invalid")
 
 
-def test_an_archive_seal_is_refused_until_this_release_checks_them(env):
+def test_an_archive_seal_appended_after_the_record_meets_step_four(env):
+    """Its fields are checked as audit verify checks them (tests/test_audit_archive.py has each rule)."""
     env.run_until_sealed()
-    _forge(env, "archive", {"day": "2026-10-19", "parts": [], "complete": True})
-    assert "neither writes nor checks" in _stopped_by(env, "after-record-invalid")
+    _forge(env, "archive", {"day": "2026-10-19", "cause": "archive", "after_seq": None, "parts": [],
+                            "complete": True})
+    assert "an archive seal whose period is not its day" in _stopped_by(env, "after-record-invalid")
 
 
 def test_an_hour_seal_that_does_not_start_where_the_last_ended_is_refused(env):

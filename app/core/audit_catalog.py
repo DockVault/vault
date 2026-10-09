@@ -274,6 +274,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("audit_chain_restored", "administration", "Audit log restore accepted", "warning"),
     AuditAction("audit_removal_acknowledged", "administration", "Audit rows removed by an older release sealed over",
                 "warning"),
+    # The host's `audit unarchive` (app/core/audit_archive.py): an archived day put back as rows.
+    AuditAction("audit_archive_restored", "administration", "Archived audit day restored as rows", "notice"),
     # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
     AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),

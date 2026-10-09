@@ -76,7 +76,7 @@ SOURCE_LOCKED = "locked"
 # The modules that register specs, imported the first time the registry is read.
 SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes", "app.core.retention",
                                  "app.core.audit_retention", "app.core.security_records",
-                                 "app.core.audit_privacy", "app.core.audit_integrity")
+                                 "app.core.audit_privacy", "app.core.audit_integrity", "app.core.audit_archive")
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
 ENV_ONLY_KEYS: frozenset[str] = frozenset({"audit_chain_key", "audit_chain_head_file"})

@@ -150,7 +150,8 @@ def register_keep(table: str, rule: Callable) -> Callable:
 def keep_clauses(model, now: datetime) -> list:
     """The conditions of the rows of ``model``'s table the row-keep rules keep, as of ``now``."""
     clauses = []
-    for rule in KEEP_RULES.get(model.__tablename__, []):
+    # A model mapped to another table holding the same rows (the archive's) names the table whose rules apply.
+    for rule in KEEP_RULES.get(getattr(model, "__keep_rules_of__", model.__tablename__), []):
         clause = rule(model, now)
         if clause is not None:
             clauses.append(clause)
@@ -392,6 +393,13 @@ def prune_audit_logs(p: Pass) -> JobResult:
     return audit_retention.prune(p)
 
 
+def archive_audit_rows(p: Pass) -> JobResult:
+    """Audit days older than the row window, moved whole into compressed daily blocks once checked against
+    their seals (app/core/audit_archive.py). Deletes nothing, so the hold does not stop it."""
+    from app.core import audit_archive
+    return audit_archive.archive_job(p)
+
+
 JOBS: list[Job] = [
     Job("audit_seals", "Sealing of audit rows", seal_audit_rows),
     Job("setting_changes", "Waiting settings changes that are due", apply_waiting_changes),
@@ -404,6 +412,7 @@ JOBS: list[Job] = [
     Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),
     Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
+    Job("audit_archive", "Audit days moved into compressed daily blocks", archive_audit_rows),
 ]
 
 

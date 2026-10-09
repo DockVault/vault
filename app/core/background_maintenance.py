@@ -98,6 +98,14 @@ STEPS: list[Step] = [
               "'autovacuum_analyze_scale_factor=0.02']::text[], false) FROM pg_class c "
               "JOIN pg_namespace n ON n.oid = c.relnamespace "
               "WHERE c.relname = 'audit_logs' AND n.nspname = current_schema()"),
+    # The audit archive's blocks are compressed already: stored without Postgres's own compression, each is kept
+    # as it is, and its length is read from its pointer without reading it (the daily check of the blocks'
+    # lengths reads no payload). On an empty table, as when it is first created, this is instant.
+    statement("audit_archive_blocks_storage",
+              "ALTER TABLE audit_archive_blocks ALTER COLUMN payload SET STORAGE EXTERNAL",
+              "SELECT coalesce(bool_and(a.attstorage = 'e'), false) FROM pg_attribute a "
+              "JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+              "WHERE c.relname = 'audit_archive_blocks' AND n.nspname = current_schema() AND a.attname = 'payload'"),
     # The recording levels keep a shortened address, and the fingerprint of a name typed at a failed sign-in,
     # in audit_logs.recorded (app/core/audit_privacy.py); the Events filters and the most active addresses
     # look them up by value. Only rows recorded in another form than the value have the column set.

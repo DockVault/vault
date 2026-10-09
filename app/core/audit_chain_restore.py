@@ -295,6 +295,17 @@ def lost_hours(db, view, record: dict, now: datetime) -> dict:
     return out
 
 
+def archive_mismatch(db, view) -> List[str]:
+    """The archive blocks whose day and part no archive seal of ``view`` names, with the length it binds, and the
+    parts it names that have no such block: "<day> part <n>" each."""
+    from app.core import audit_archive
+    stored = audit_archive.stored_blocks(db)
+    named = {(d, p.part): p.length for d, p in view.archived_parts()}
+    out = [f"{d.isoformat()} part {n}" for (d, n), length in sorted(stored.items()) if named.get((d, n)) != length]
+    out += [f"{d.isoformat()} part {n} (missing)" for (d, n) in sorted(named) if (d, n) not in stored]
+    return out
+
+
 def lost_retention(view, record: dict) -> dict:
     """What the head record's checkpoints say the accepted chain lacks: {policy, cancels, erases}."""
     cp = record.get("checkpoints") or {}
@@ -504,6 +515,11 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
             lines.append(f"Hours {hours['lost'][0]} to {hours['lost'][1]} will be sealed again from their rows as they "
                          f"stand; compared from {hours['compared_from'] or 'nothing'}:")
             lines += hours["lines"] or ["  every lost hour compared gives what the head record kept"]
+        blocks = archive_mismatch(w.db, view)
+        if blocks:
+            lines.append(f"{len(blocks)} archive blocks are not the ones the accepted chain's archive seals name "
+                         f"(lost with their seals, or added): audit verify will report them, and their days' rows are "
+                         f"in no block a seal binds: " + ", ".join(blocks[:10]))
         if lost["policy"]:
             lines.append(f"Lost: the newest policy seal ({lost['policy']['seq']}) and the state it set.")
         for r, c in lost["cancels"]:
@@ -525,7 +541,8 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
                  if view.position else None, "record": list(_order(record)) if record else None,
                  "file": bool(has_file), "part": part, "under": under, "deleted": deleted,
                  "hours": [hours["lost"], hours["changed"], hours["days_changed"], digest(hours["figures"])],
-                 "lost": lost, "reseal": [sorted(settings.items()), cancels, superseded], "needed": needed}
+                 "lost": lost, "reseal": [sorted(settings.items()), cancels, superseded], "needed": needed,
+                 "blocks": blocks}
         if read:
             return {"state": token(state), "lines": lines, "confirm": needed}
         check_expected(state, expect)

@@ -19,6 +19,11 @@ first), unless the host has acknowledged its seal and both the time the server f
 sealed_at lie at or before the window's start. So it never raises what the hour counts before the host has
 seen it and a delay of sealing has passed.
 
+An archived part (app/core/audit_archive.py) counts the smaller of its bound length, the one its day's archive
+seal records, and the lagged bytes of the hours it holds: archiving shrinks what the cap counts, never adds to it,
+and a length another writer inflated changes nothing. Its hours then count only through it. A day archived over
+several passes counts its parts for the hours they hold, and lagged hot bytes for its other hours.
+
 Each size-cap prune records the cap and the delay it used, the window's start (``from``), the seals it held
 back (``held_back``) and the total it counted (``counted``), so that ``audit verify`` recomputes the total from
 the chain alone.
@@ -105,9 +110,9 @@ def lagged(entries: List[tuple], start_us: int) -> int:
     return least
 
 
-def hour_bytes(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
+def _lagged_hours(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
     """{hour: lagged bytes} of every hour with a unit of its own that counts more than nothing (runs of empty
-    hours count nothing)."""
+    hours count nothing), archived or not."""
     out = {}
     for start, end, last in view.units():
         if end - start != _ai().HOUR:
@@ -119,8 +124,34 @@ def hour_bytes(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
     return out
 
 
+def counted(view, start_us: int, held: Set[int]) -> Tuple[Dict[datetime, int], List[tuple]]:
+    """What the size cap counts: ({hour: lagged bytes} of every hour not archived that counts more than nothing,
+    [(day, part, counted, {hour: lagged bytes}) of every archived part]). A part counts the smaller of its bound
+    length (its archive seal's) and the lagged bytes of the hours it holds, so it never counts more than its hours
+    did as rows, and a length another writer's seal inflated changes nothing."""
+    lagged_hours = _lagged_hours(view, start_us, held)
+    parts = []
+    archived = set()
+    for day, part in view.archived_parts():
+        hours = {}
+        for h in part.hours():
+            archived.add(h)
+            if h in lagged_hours:
+                hours[h] = lagged_hours[h]
+        parts.append((day, part, min(int(part.length), sum(hours.values())), hours))
+    hot = {h: n for h, n in lagged_hours.items() if h not in archived}
+    return hot, parts
+
+
+def hour_bytes(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
+    """{hour: lagged bytes} of every hour not archived that counts more than nothing."""
+    return counted(view, start_us, held)[0]
+
+
 def total(view, start_us: int, held: Set[int]) -> int:
-    return sum(hour_bytes(view, start_us, held).values())
+    """What the size cap counts: every hot hour's lagged bytes, and every archived part's count."""
+    hot, parts = counted(view, start_us, held)
+    return sum(hot.values()) + sum(c for _d, _p, c, _h in parts)
 
 
 # --------------------------------------------------------------------------- the check of a size-cap prune

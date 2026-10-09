@@ -14,11 +14,18 @@ transaction, under the chain lock:
 Only sealed hours are pruned: rows in hours not yet sealed (the first start's backlog, the current hour) wait. An
 hour whose root seal, or an erase seal after it, is a seal another writer appended after the head record is left
 as it is until the host acknowledges that seal: its rows may have been edited and sealed over.
+
+Archived rows are deleted first, a day per transaction, through the block-rewrite primitive
+(app/core/audit_archive.py): the ``prune`` seal and an ``archive`` seal of cause ``rewrite`` commit with the new
+blocks. The caller says how to select them, as conditions over any model shaped like audit_logs (``archived``),
+and before what time no row is selected (``before``): days that start later are not read. A day where nothing
+was selected is read again the next day (the size cap's: once ``before`` has moved on).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from sqlalchemy import and_, func
 
@@ -42,6 +49,16 @@ def _hours_matching(db, conditions, before: datetime, limit: int) -> List[dateti
 
 class HourNotVerified(Exception):
     pass
+
+
+@dataclass
+class Selection:
+    """What one size-cap transaction deletes: the conditions over audit_logs, the size its seal records, and for
+    archived rows the same conditions over another model (``archived``) and the time before which they lie."""
+    conditions: list
+    size: Optional[dict] = None
+    archived: Optional[Callable] = None
+    before: Optional[datetime] = None
 
 
 def _verify_hour(w, hour: datetime):
@@ -78,12 +95,14 @@ def _materialise(w, hour: datetime, salt: Optional[bytes], wr) -> None:
         wr.legacy_salt = None
 
 
-def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None):
+def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None,
+          archived: Optional[Callable] = None, before: Optional[datetime] = None):
     """Delete the audit rows meeting ``conditions`` in sealed hours, oldest first, one day of hours per
     ``prune`` seal and transaction, while the pass has time. ``plan(writer)``, when given, decides each
-    transaction's (conditions, size) under the chain lock from the view as it stands, or None to stop: the
-    size cap's, whose total each seal records as of its own place. Nothing is deleted while a restore is not
-    finished or its grace runs. Returns a retention.JobResult."""
+    transaction's Selection under the chain lock from the view as it stands, or None to stop: the size cap's,
+    whose total each seal records as of its own place. ``archived`` and ``before`` (or the plan's): the archived
+    rows the same conditions select, deleted first (see the module's docstring). Nothing is deleted while a
+    restore is not finished or its grace runs. Returns a retention.JobResult."""
     from app.core import retention
     from app.core.models import AuditLog as A
     ai = _ai()
@@ -91,6 +110,12 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None)
     result = retention.JobResult()
     engine = ai._engine_of(p.session_factory)
     failures: Dict[str, str] = {}
+    # A view that held no archived day when it was last brought up to date skips this; a block another process
+    # archived meanwhile is read at the next pass.
+    if (archived is not None or plan is not None) and st.view.archives:
+        done = _prune_archived(p, st, engine, failures, reason=reason, size=size, plan=plan, archived=archived,
+                               before=before)
+        result.add(done.deleted, done.oldest, done.newest)
     skipped: set = set()
     while p.time_left():
         with ai.ChainWriter(engine, st) as w:
@@ -104,7 +129,7 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None)
                 planned = plan(w)
                 if planned is None:
                     break
-                conditions, size = planned
+                conditions, size = planned.conditions, planned.size
             hours = [h for h in _hours_matching(w.db, conditions, view.newest_hour_end, 200) if h not in skipped]
             if not hours:
                 break
@@ -116,6 +141,12 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None)
                     break
                 if view.entry_for(hour) is None:
                     skipped.add(hour)
+                    continue
+                if view.archived_part(hour) is not None:
+                    # No legitimate path writes a row into an archived hour: it is never deleted as genuine.
+                    skipped.add(hour)
+                    failures["row-in-archived-day"] = f"rows of audit_logs are in {fmt.hour_text(hour)}, which is " \
+                                                      "archived; they were not pruned"
                     continue
                 if ai.hour_held(view, w.record, hour) is not None:
                     skipped.add(hour)
@@ -158,4 +189,69 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None)
         result.add(batch.deleted, batch.oldest, batch.newest)
     if failures:
         ai.report_failures(st, p.session_factory, failures)
+    return result
+
+
+def _prune_archived(p, st, engine, failures: Dict[str, str], *, reason: str, size: Optional[dict], plan,
+                    archived: Optional[Callable], before: Optional[datetime]):
+    """The archived rows the caller's conditions select, oldest day first, one day per transaction (see the
+    module's docstring)."""
+    from app.core import audit_archive as arc
+    from app.core import retention
+    ai = _ai()
+    result = retention.JobResult()
+    today = p.now.date()
+    looked = st.archive_checked
+    while p.time_left():
+        batch = None
+        with ai.ChainWriter(engine, st) as w:
+            view = w.st.view
+            newest = view.newest_policy()
+            if newest is None or w.st.holds_deletion():
+                break
+            make, until, seal_size = archived, before, size
+            if plan is not None:
+                planned = plan(w)
+                if planned is None:
+                    break
+                make, until, seal_size = planned.archived, planned.before, planned.size
+            if make is None or until is None:
+                break
+
+            def due(d, e) -> bool:
+                seen = looked.get((d, e.seq, reason))
+                if seen is None or seen[0] != today:
+                    return True
+                return reason != "retention" and seen[1] < until
+            days = [d for d in sorted(view.archives) if view.archives[d].parts and arc.day_start(d) < until
+                    and due(d, view.archives[d])]
+            if not days:
+                break
+            day = days[0]
+            looked[(day, view.archives[day].seq, reason)] = (today, until)
+            try:
+                rw = arc.prune_day(w, day, make, p.now)
+            except arc.NotVerified as nv:
+                failures[nv.kind] = f"{nv}; nothing in {day.isoformat()} was deleted"
+                rw = None
+            except arc.NotArchivable as why:
+                arc._say(f"The pruner leaves {day.isoformat()} as it is for now: {why}")
+                rw = None
+            if rw is None:
+                w.db.rollback()
+                continue
+            batch = retention.JobResult()
+            batch.add(rw.changed, rw.oldest, rw.newest)
+            detail = {"reason": reason, "policy_seq": newest[0], "request_seq": None, "hours": rw.entries}
+            if seal_size is not None:
+                detail["size"] = seal_size
+            p.record(w.db, batch, "audit_logs")
+            change = w.append("prune", detail=detail)
+            arc.seal_rewrite(w, day, change.seq, rw, p.now)
+        if batch is not None:
+            result.add(batch.deleted, batch.oldest, batch.newest)
+    # Forget the looks at days no seal names any more.
+    current = {(d, e.seq) for d, e in st.view.archives.items()}
+    for key in [k for k in looked if (k[0], k[1]) not in current]:
+        del looked[key]
     return result

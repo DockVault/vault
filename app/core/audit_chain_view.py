@@ -13,15 +13,16 @@ never acted on. A one-off check that walks the whole chain (the verifier) may ke
 (``keep_roots``), 96 bytes an entry, so it reads no seal twice.
 
 The retention state (the policy seals, the requests, cancels and acknowledgments) is kept as it is: those
-seals are few.
+seals are few. So is the archive: for every day with blocks, its latest ``archive`` seal's number, cause,
+whether it is complete, and each part's hours, rows, bound length and digest (about 350 bytes a day).
 """
 from __future__ import annotations
 
 import bisect
 from array import array
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Dict, Iterator, List, Optional
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from app.core import audit_chain_format as fmt
 
@@ -94,6 +95,87 @@ class HourEntry:
         return self.end - self.start > HOUR
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivePart:
+    """One part of an archived day as its ``archive`` seal binds it: its number, the first and last hour it holds
+    (whole hours of the day, both included; hours with no rows may be among them), its rows, the length of its
+    payload as stored and the SHA-256 of that payload (64 hex digits)."""
+    part: int
+    first_hour: datetime
+    last_hour: datetime
+    rows: int
+    length: int
+    sha256: str
+
+    def holds(self, hour: datetime) -> bool:
+        return self.first_hour <= hour <= self.last_hour
+
+    def hours(self) -> List[datetime]:
+        out, h = [], self.first_hour
+        while h <= self.last_hour:
+            out.append(h)
+            h += HOUR
+        return out
+
+    def as_list(self) -> list:
+        return [self.part, fmt.hour_text(self.first_hour), fmt.hour_text(self.last_hour), self.rows, self.length,
+                self.sha256]
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveEntry:
+    """A day's latest ``archive`` seal: its number, cause, whether its parts cover the day, and the parts."""
+    seq: int
+    cause: str
+    complete: bool
+    parts: Tuple[ArchivePart, ...] = ()
+
+    def part_for(self, hour: datetime) -> Optional[ArchivePart]:
+        for p in self.parts:
+            if p.holds(hour):
+                return p
+        return None
+
+
+_HEX = frozenset("0123456789abcdef")
+
+
+def archive_day(detail: dict) -> date:
+    """The day an ``archive`` seal's detail names. Raises ValueError."""
+    value = detail.get("day")
+    if not isinstance(value, str) or len(value) != 10:
+        raise ValueError("an archive seal with no day")
+    return date.fromisoformat(value)
+
+
+def archive_parts(detail: dict) -> Tuple[ArchivePart, ...]:
+    """The parts an ``archive`` seal's detail lists, in its order. Raises ValueError on one that is not well
+    formed: [part, first hour, last hour, rows, length, digest], whole numbers not below 0 (a part numbered
+    from 1), hours as the chain writes them, the digest 64 lowercase hex digits."""
+    raw = detail.get("parts")
+    if not isinstance(raw, list):
+        raise ValueError("an archive seal whose parts are not a list")
+    out = []
+    for p in raw:
+        if not isinstance(p, list) or len(p) != 6:
+            raise ValueError("a part is not [part, first hour, last hour, rows, length, digest]")
+        number, first, last, rows, length, digest = p
+        for n in (number, rows, length):
+            if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+                raise ValueError("a part's number, rows or length is not a whole number")
+        if number < 1:
+            raise ValueError("a part numbered below 1")
+        if not isinstance(digest, str) or len(digest) != 64 or not set(digest) <= _HEX:
+            raise ValueError("a part's digest is not 64 hex digits")
+        if not isinstance(first, str) or not isinstance(last, str):
+            raise ValueError("a part's hours are not times")
+        first_hour, last_hour = fmt.parse_time_text(first), fmt.parse_time_text(last)
+        if fmt.hour_text(first_hour) != first or fmt.hour_text(last_hour) != last:
+            raise ValueError("a part's range is not whole hours")
+        out.append(ArchivePart(number, first_hour, last_hour, rows, length, digest))
+    return tuple(out)
+
+
 class View:
     """The seals this process has accepted, with every link recomputed, and the fields the pruner acts on."""
 
@@ -138,7 +220,25 @@ class View:
         self.late_seqs: List[int] = []
         self.erase_through: Dict[int, Any] = {}        # erase request seq -> its run's scope
         self.erased_rows: set = set()
+        self.archives: Dict[date, ArchiveEntry] = {}   # day -> its latest archive seal
+        # The newest prune, rewrite or erase seal and the days it changed: an archive seal of cause rewrite
+        # follows one in its transaction.
+        self.last_change: Optional[Tuple[int, frozenset]] = None
         self.record_seq = 0
+
+    # -- the archive
+
+    def archived_part(self, hour: datetime) -> Optional[ArchivePart]:
+        """The part of its day's latest archive seal that holds ``hour``, or None: the hour is then not archived,
+        and its rows are in audit_logs."""
+        entry = self.archives.get(hour.date())
+        return entry.part_for(hour) if entry is not None else None
+
+    def archived_parts(self) -> Iterator[Tuple[date, ArchivePart]]:
+        """(day, part) of every archived part, oldest first."""
+        for day in sorted(self.archives):
+            for p in sorted(self.archives[day].parts, key=lambda p: p.first_hour):
+                yield day, p
 
     # -- per seal
 
@@ -383,10 +483,13 @@ class View:
             if d.get("by") != "host":
                 self.late_seqs.append(seal.seq)
         elif kind in ("prune", "rewrite"):
+            days = set()
             for h in d.get("hours") or []:
                 hour = fmt.parse_time_text(h[0])
+                days.add(hour.date())
                 self._add_root(hour, seal.seq, at_us, int(h[2]), int(h[3]), kind,
                                (bytes.fromhex(h[4]), bytes.fromhex(h[5]), bytes.fromhex(h[6])))
+            self.last_change = (seal.seq, frozenset(days))
             if d.get("request_seq") is not None and d.get("final"):
                 self.finals[int(d["request_seq"])] = seal.seq
         elif kind == "erase":
@@ -395,12 +498,25 @@ class View:
             for row in d.get("rows") or []:
                 if row:
                     self.erased_rows.add(row[0])
+            days = set()
             if d.get("hour"):
                 hour = fmt.parse_time_text(d["hour"])
+                days.add(hour.date())
                 self._split_out(hour)
                 self._erases.setdefault(to_hours(hour), []).append(seal.seq)
+            self.last_change = (seal.seq, frozenset(days))
             if d.get("final") and d.get("request_seq") is not None:
                 self.finals[int(d["request_seq"])] = seal.seq
+        elif kind == "archive":
+            # A seal the checks refuse (no day, a part not well formed) changes nothing the view holds; audit
+            # verify reports it (app/core/audit_archive.py, archive_problem).
+            try:
+                day = archive_day(d)
+                parts = archive_parts(d)
+            except (TypeError, ValueError):
+                day = None
+            if day is not None:
+                self.archives[day] = ArchiveEntry(seal.seq, str(d.get("cause")), bool(d.get("complete")), parts)
         elif kind == "policy":
             self.policies.append((seal.seq, d))
             if d.get("cause") == "applies" and d.get("request_seq") is not None:

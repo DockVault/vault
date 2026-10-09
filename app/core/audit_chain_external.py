@@ -7,6 +7,9 @@ that is exactly a time cutoff over the sealed rows, checked against every sealed
 - the cutoff hour is the hour of the earliest sealed row kept; every sealed hour before it lost all its rows,
   in the cutoff hour the missing rows are exactly the first ones of its (timestamp, id) list, and no hour after
   it lost a row, nor holds a row its seal does not, nor changed (every hour checks out against its seal);
+- every archive block matches its archive seal and verifies intact: a release without the chain deletes from
+  audit_logs only, so a genuine rollback prune leaves the blocks whole, and the prefix rule above is over the
+  hours not archived;
 - the cutoff the operator names falls in the cutoff hour;
 - the cutoff is as old as the retention that made it: a database writer who deletes every row before a recent
   time makes exactly the shape of a retention prune, so the operator states the AUDIT_LOG_RETENTION_DAYS the
@@ -66,7 +69,12 @@ def removal_plan(db, view, record: Optional[dict], before: datetime, retention_d
     ai = _ai()
     if retention_days is None or retention_days < 1:
         raise Refused("--retention-days: the AUDIT_LOG_RETENTION_DAYS the older release ran with (1 or more)")
-    hours = [h for h in view.single_hours() if view.entry_for(h).root.count]
+    from app.core import audit_archive
+    blocks = audit_archive.block_problems(db, view)
+    if blocks:
+        raise Refused("an archive block does not verify, which no release without the chain changes: "
+                      + "; ".join(blocks[:5]) + " (run audit verify)")
+    hours = [h for h in view.single_hours() if view.entry_for(h).root.count and view.archived_part(h) is None]
     states: Dict[datetime, dict] = {}
     lines = ["Sealed hours with rows: sealed count, count now"]
     for h in hours:
