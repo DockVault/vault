@@ -462,7 +462,12 @@ def test_an_auditor_whose_right_was_revoked_no_longer_releases_the_hold_alone(ad
         assert r.status_code == 201, r.text
         cases.append(r.json()["id"])
         assert [c["id"] for c in client.get("/compliance/holds").json()["cases"]] == [case_id]
-        assert r.json()["id"] in [c["id"] for c in admin.get("/compliance/holds").json()["cases"]]
+        # Another administrator lists it; the session's administrator owns the held vault, so the case concerns
+        # them and they see it only as an owner does, on their own page.
+        _bob, bob_c, _ = admins["bob"]
+        assert r.json()["id"] in [c["id"] for c in bob_c.get("/compliance/holds").json()["cases"]]
+        assert r.json()["id"] not in [c["id"] for c in admin.get("/compliance/holds").json()["cases"]]
+        assert r.json()["id"] in [c["id"] for c in admin.get("/me/compliance-access").json()["cases"]]
         r = admin.delete(f"/users/{uma['id']}/auditor")
         assert r.status_code == 200, r.text
         client, r = _release_as(uma, uma_codes, case_id, "my right was revoked")
