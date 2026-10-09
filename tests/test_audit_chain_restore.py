@@ -199,11 +199,13 @@ def test_a_lost_cancel_and_a_lost_hold_are_sealed_again(env):
         assert db.get(AuditLog, old) is not None
 
 
-def test_a_lost_cancel_of_a_request_the_resealed_raise_supersedes_is_not_sealed_again(env):
+@pytest.mark.parametrize("database_older", [True, False])
+def test_a_lost_cancel_of_a_request_the_resealed_raise_supersedes_is_not_sealed_again(env, database_older):
     """A reduction asked for and cancelled, then a raise of the same setting, both cut from the tail: the restore
     seals the raise again, and that supersedes the request, so no cancel of it is written (a cancel of a request
-    that is not pending would fail verification for good). The request's change row, which the restored database
-    shows waiting, ends as superseded, as a newer change of the setting ends it on the panel."""
+    that is not pending would fail verification for good). When the database is the older copy, the request's
+    change row shows waiting and ends as superseded, as a newer change of the setting ends it on the panel; when
+    only the seals were cut, the row stays cancelled and is not named."""
     from app.core import setting_changes as sc
     env.row(T0 - timedelta(days=60))
     env.run_until_sealed()
@@ -217,26 +219,30 @@ def test_a_lost_cancel_of_a_request_the_resealed_raise_supersedes_is_not_sealed_
         ps.cancel(w, outcome.change.id, admin)
     assert _change(env, admin, "audit_min_days", 60).status == "applied"
     _cut_from(env, before_cut + 1)
-    with env.session() as db:              # the database as it stood before the cancel and the raise
-        change = db.get(ManagedSettingChange, outcome.change.id)
-        change.status, change.decided_by, change.decided_by_name = sc.PENDING, None, None
-        change.decided_at, change.reason = None, None
-        db.get(ManagedSetting, "audit_min_days").value = 30
-        db.commit()
+    if database_older:
+        with env.session() as db:          # the database as it stood before the cancel and the raise
+            change = db.get(ManagedSettingChange, outcome.change.id)
+            change.status, change.decided_by, change.decided_by_name = sc.PENDING, None, None
+            change.decided_at, change.reason = None, None
+            db.get(ManagedSetting, "audit_min_days").value = 30
+            db.commit()
     env.clock.advance(hours=1)
     assert env.seal().stopped == "head-record-mismatch"
     seen, done = _accept(env)
     assert any("Lost: the cancel" in ln for ln in seen["lines"])
     assert not any("Cancels sealed again" in ln for ln in seen["lines"])
-    assert any(f"supersede (their rows end as superseded): request {req} (audit_min_days)" in ln
-               for ln in seen["lines"]), seen["lines"]
+    named = any(f"supersede (their rows end as superseded): request {req} (audit_min_days)" in ln
+                for ln in seen["lines"])
+    assert named is database_older, seen["lines"]
     assert done["resealed"] == ["audit_min_days"] and done["cancels"] == []
-    assert done["superseded"] == [str(outcome.change.id)]
+    assert done["superseded"] == ([str(outcome.change.id)] if database_older else [])
     assert [s.kind for s in env.seals()[-2:]] == ["restore", "policy"]
-    assert req not in env.st.view.pending_requests()
     with env.session() as db:
         change = db.get(ManagedSettingChange, outcome.change.id)
-        assert (change.status, change.reason) == (sc.SUPERSEDED, "a value sealed again after a restore")
+        if database_older:
+            assert (change.status, change.reason) == (sc.SUPERSEDED, "a value sealed again after a restore")
+        else:
+            assert change.status == sc.CANCELLED and change.reason != "a value sealed again after a restore"
         assert sc.pending_for(db, "audit_min_days") == []
     # Asked again for a request no longer pending (as after a change between the restore and its cancels), the
     # cancels' own step writes nothing.
@@ -245,6 +251,7 @@ def test_a_lost_cancel_of_a_request_the_resealed_raise_supersedes_is_not_sealed_
     assert len(env.seals()) == before
     env.clock.advance(hours=1)
     assert env.seal().stopped is None
+    assert req in env.st.view.requests and req not in env.st.view.pending_requests()
     assert ps.numbers(env.st)["audit_min_days"] == 60
     assert failures(env.verify()) == []
 
@@ -414,7 +421,8 @@ def test_a_raise_a_whole_backup_restore_undid_is_sealed_again_and_stored(env):
 def test_a_waiting_change_the_raise_a_whole_backup_restore_undid_superseded_ends_with_it(env):
     """A reduction waiting when the backup was taken, then a raise of the same setting (which ended it): the
     restored database shows it waiting again. accept-restore seals the raise again, which supersedes it, and its
-    change row ends as superseded in the same transaction instead of being shown as due for good."""
+    change row ends as superseded in the same transaction instead of being shown as due for good. A reduction of
+    another setting, waiting all along, is left waiting."""
     from app.core import setting_changes as sc
     env.row(T0 - timedelta(days=60))
     env.run_until_sealed()
@@ -423,6 +431,9 @@ def test_a_waiting_change_the_raise_a_whole_backup_restore_undid_superseded_ends
     waiting = _change(env, admin, "audit_min_days", 10)
     assert waiting.status == "pending"
     req = [s for s in env.seals() if s.kind == "request"][-1].seq
+    other = _change(env, admin, "audit_max_days", 400)
+    assert other.status == "pending"
+    other_req = [s for s in env.seals() if s.kind == "request"][-1].seq
     snap = _snapshot(env)
     assert _change(env, admin, "audit_min_days", 60).status == "applied"
     env.clock.advance(hours=1)
@@ -436,10 +447,11 @@ def test_a_waiting_change_the_raise_a_whole_backup_restore_undid_superseded_ends
     assert done["resealed"] == ["audit_min_days"] and done["superseded"] == [str(waiting.change.id)]
     with env.session() as db:
         assert db.get(ManagedSettingChange, waiting.change.id).status == sc.SUPERSEDED
+        assert db.get(ManagedSettingChange, other.change.id).status == sc.PENDING
         assert db.get(ManagedSetting, "audit_min_days").value == 60
-    assert req not in env.st.view.pending_requests()
     env.clock.advance(hours=1)
     env.seal()
+    assert req not in env.st.view.pending_requests() and other_req in env.st.view.pending_requests()
     assert failures(env.verify()) == []
 
 
