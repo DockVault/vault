@@ -489,7 +489,9 @@ def test_the_daily_check_puts_the_marker_back(env):
 
 def test_an_hour_an_erase_follows_is_left_as_rows(env):
     _sealed_day(env)
-    env.st.view._erases[to_hours(at(4))] = [999]   # an erase after hour 4's seal, as the view would hold it
+    # An erase seal after hour 4's seal, as the view would hold it (seal 2, which reads back cleanly and erases
+    # no row, stands in for one: no writer of erase seals yet).
+    env.st.view._erases[to_hours(at(4))] = [2]
     _archive(env)
     assert _hot(env) == 6 and _blocks(env) == []
 
@@ -636,7 +638,7 @@ def _part(first, last, rows=1, length=10, number=1):
     return [number, fmt.hour_text(first), fmt.hour_text(last), rows, length, "ab" * 32]
 
 
-def _forge_archive(env, parts, *, cause="archive", complete=None, after=None, period=None, day=DAY):
+def _forge_archive(env, parts, *, cause="archive", complete=None, after=None, period=None, day=DAY, totals=None):
     view = env.st.view
     if complete is None:
         try:
@@ -647,9 +649,10 @@ def _forge_archive(env, parts, *, cause="archive", complete=None, after=None, pe
             complete = False
     detail = {"day": day.isoformat(), "cause": cause, "after_seq": after, "complete": complete, "parts": parts}
     start = period or datetime.combine(day, time())
+    rows, length = totals or (sum(p[3] for p in parts), sum(p[4] for p in parts))
     with ai.ChainWriter(env.engine, env.st) as w:
         return w.append("archive", detail=detail, period_start=start, period_end=start + timedelta(days=1),
-                        row_count=sum(p[3] for p in parts), row_bytes=sum(p[4] for p in parts)).seq
+                        row_count=rows, row_bytes=length).seq
 
 
 def _unjustified(env):
@@ -672,6 +675,8 @@ def _unjustified(env):
     ([[1, fmt.hour_text(at(3)), fmt.hour_text(at(23)), 1, 10, "AB" * 32]], {}, "bad part"),
     ([[1, fmt.time_text(at(3, 30)), fmt.hour_text(at(23)), 1, 10, "ab" * 32]], {}, "bad part"),
     ([], {}, "with a change or no part"),
+    ([_part(at(3), at(23))], {"totals": (2, 10)}, "totals are not its parts'"),
+    ([_part(at(3), at(23))], {"totals": (1, 11)}, "totals are not its parts'"),
 ])
 def test_an_archive_seal_breaking_a_rule_is_unjustified(env, parts, kw, why):
     _sealed_day(env)
@@ -1172,3 +1177,110 @@ def test_a_payload_inflated_in_the_database_changes_nothing_the_size_cap_counts(
         db.commit()
     assert _counted(env) == before
     assert "block-altered" in failures(env.verify())
+
+
+def test_a_part_is_pruned_and_put_back_a_chunk_at_a_time(env, monkeypatch):
+    """The rows of a part go through the temporary table and back into audit_logs a chunk at a time, never held
+    whole."""
+    monkeypatch.setattr(arc, "PROBE_CHUNK", 2)
+    protected = ar.protected_actions()[0]
+    _day_rows(env, {3: 3, 4: 2})
+    kept = [env.row(at(6, i), action=protected) for i in range(3)]
+    env.run_until_sealed()
+    _archive(env)
+    ar.prune(_pass(env), _numbers(admin_min=365))
+    assert [r["id"] for r in af.open_block(_blocks(env)[0].payload).rows()] == kept
+    _unarchive(env)
+    assert sorted(r["id"] for r in _rows(env, at(0), at(23))) == sorted(kept)
+    assert failures(env.verify()) == []
+
+
+def test_a_reader_stopped_early_runs_its_checks_when_finished(env):
+    _sealed_day(env)
+    _archive(env)
+    agg = dict(_blocks(env)[0].aggregates)
+    agg["hours"] = []
+    with env.session() as db:
+        db.query(AuditArchiveBlock).update({AuditArchiveBlock.aggregates: agg}, synchronize_session=False)
+        db.commit()
+    (part,) = env.st.view.archives[DAY].parts
+    with env.session() as db:
+        reader = arc.PartReader(db, env.st.view, DAY, part)
+        next(iter(reader.rows()))
+        assert not reader.checked
+        with pytest.raises(arc.NotVerified, match="aggregates"):
+            reader.finish()
+
+
+def test_a_row_written_into_the_parts_hours_while_it_is_archived_is_never_deleted_unarchived(env, monkeypatch):
+    """A row that lands in the part's hours between the block's check and the delete (a statement of another
+    transaction, here in this one) makes the deleted count differ: the transaction rolls back."""
+    _sealed_day(env)
+    real = arc._check_stored
+
+    def check_then_write(db, view, day, part, bw, expected=None):
+        real(db, view, day, part, bw, expected)
+        db.add(AuditLog(id=uuid.uuid4(), action="file_uploaded", status="success", timestamp=at(5, 30),
+                        username="mallory", seal_nonce=uuid.uuid4().bytes))
+        db.flush()
+    monkeypatch.setattr(arc, "_check_stored", check_then_write)
+    _archive(env)
+    assert _blocks(env) == [] and _hot(env) == 6 and _archive_seals(env) == []
+
+
+def test_the_part_planner_takes_no_day_not_sealed_whole(env, monkeypatch):
+    _day_rows(env, {3: 1, 4: 1, 5: 1, 6: 1})
+    monkeypatch.setattr(ai, "ROW_BUDGET", 2)
+    env.seal()
+    with ai.ChainWriter(env.engine, env.st) as w:
+        with pytest.raises(arc.NotArchivable, match="not sealed whole"):
+            arc.archive_next_part(w, DAY, env.clock())
+
+
+def _store_payload(env, payload):
+    with env.session() as db:
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.part == 1).update(
+            {AuditArchiveBlock.payload: payload}, synchronize_session=False)
+        db.commit()
+
+
+def test_a_block_is_refused_when_it_is_not_the_part_its_seal_names(env):
+    """Each of these needs a seal that binds the block (only the key's holder writes one): the block is still
+    read against what the seal says of it."""
+    _sealed_day(env)
+    _archive(env)
+    (part,) = env.st.view.archives[DAY].parts
+    view = env.st.view
+    with env.session() as db:
+        more = ArchivePart(part.part, part.first_hour, part.last_hour, part.rows + 1, part.length, part.sha256)
+        with pytest.raises(arc.NotVerified, match="holds 6 rows; its seal 7"):
+            arc.PartReader(db, view, DAY, more).finish()
+        shorter = ArchivePart(part.part, part.first_hour, at(3), part.rows, part.length, part.sha256)
+        with pytest.raises(arc.NotVerified, match="outside the part"):
+            arc.PartReader(db, view, DAY, shorter).finish()
+    rows = list(af.open_block(_blocks(env)[0].payload).rows())
+    other = af.BlockWriter(DAY, 2)
+    for row in rows:
+        other.add(row)
+    payload = other.finish()
+    _store_payload(env, payload)
+    with env.session() as db:
+        named = ArchivePart(1, part.first_hour, part.last_hour, part.rows, len(payload), af.digest(payload))
+        with pytest.raises(arc.NotVerified, match="says it is another part"):
+            arc.PartReader(db, view, DAY, named).finish()
+
+
+def test_a_block_keeping_a_salt_of_an_hour_it_does_not_hold_is_refused(env):
+    _sealed_day(env)
+    _archive(env)
+    (part,) = env.st.view.archives[DAY].parts
+    rows = list(af.open_block(_blocks(env)[0].payload).rows())
+    other = af.BlockWriter(DAY, 1, {at(1): os.urandom(32)})
+    for row in rows:
+        other.add(row)
+    payload = other.finish()
+    _store_payload(env, payload)
+    with env.session() as db:
+        named = ArchivePart(1, part.first_hour, part.last_hour, part.rows, len(payload), af.digest(payload))
+        with pytest.raises(arc.NotVerified, match="salt of an hour it does not hold"):
+            arc.PartReader(db, env.st.view, DAY, named).finish()

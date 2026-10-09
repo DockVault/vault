@@ -16,10 +16,10 @@ The pruner's ``audit_archive`` job, after the audit job, each pass:
    PART_ROWS rows each (an hour with more rows gets a part of its own); at most DAYS_PER_PASS days and
    ROW_BUDGET rows a pass;
 3. archives one part per transaction, under the chain lock: it writes the block while reading the part's rows
-   once, in order, and checks each hour's count, both roots and ids digest against the hour's root seal as the
-   verified view names it (read again, its link checked); inserts the block, reads it back from the table and
-   checks it there: its length and digest, every column of every row (the format's identity digest), each hour
-   again, and the aggregates. Only then does it delete the rows, which must be exactly the ones it wrote, clear
+   once, in order, inserts it, reads it back from the table and checks it there: its length and digest, every
+   column of every row against the rows it read (the format's identity digest), each hour's count, both roots
+   and ids digest against the hour's root seal as the verified view names it (read again, its link checked), and
+   the aggregates. Only then does it delete the rows, which must be exactly the ones it wrote, clear
    the hours' working data (the block keeps their salt), keep the data marker (data_requirements) that stops a
    release that cannot read blocks from starting, and write the ``archive`` seal of the day, listing every part
    the day has so far. Anything that does not check out rolls the whole transaction back: the rows stay, and a
@@ -49,7 +49,6 @@ way, and it blocks audit writes while it runs.
 """
 from __future__ import annotations
 
-import itertools
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -257,19 +256,6 @@ def held_hour(view, record: Optional[dict], hour: datetime) -> Optional[int]:
     return _ai().hour_held(view, record, hour)
 
 
-def figures_by_hour(rows: Iterable[dict], salts: Dict[datetime, bytes],
-                    c_prev: Optional[Dict[datetime, Dict]] = None) -> Dict[datetime, object]:
-    """Each hour's figures (app/core/audit_integrity.py hour_figures) over ``rows``, in (timestamp, id) order."""
-    ai = _ai()
-    out: Dict[datetime, object] = {}
-    for hour, group in itertools.groupby(rows, key=lambda r: ai.hour_floor(r["timestamp"])):
-        if hour in out:
-            raise NotVerified("rows-altered", f"the rows of {fmt.hour_text(hour)} are out of order",
-                              fmt.hour_text(hour))
-        out[hour] = ai.hour_figures(group, salts.get(hour), (c_prev or {}).get(hour) or None)
-    return out
-
-
 EMPTY = (0, fmt.EMPTY_ROOT, fmt.EMPTY_ROOT, fmt.ids_digest([]))
 
 
@@ -356,37 +342,80 @@ def open_part(db, day: date, part, payload: Optional[bytes] = None) -> af.Block:
         raise NotVerified("block-altered", f"the block of {_label(day, part)} cannot be read: {exc}") from None
 
 
-def read_part_rows(db, view, day: date, part, *, keep: bool = True,
-                   expected: Optional[Dict[datetime, tuple]] = None) -> Tuple[List[dict], af.Block, dict]:
-    """The rows of ``part`` (all of them when ``keep``), checked: the block against its seal, each hour of the
-    part against its seal (or ``expected``), and the block's aggregates against its rows. Raises NotVerified."""
-    block = open_part(db, day, part)
-    if block.header.get("day") != day.isoformat() or block.header.get("part") != part.part:
-        raise NotVerified("block-altered", f"the block of {_label(day, part)} says it is another part")
-    kept: List[dict] = []
-    hours = hours_between(part.first_hour, part.last_hour)
-    c_prev = {h: _c_prev(db, view, h) for h in hours} if expected is None else {}
+class PartReader:
+    """The rows of a part, read from its block one at a time and checked: the block against its archive seal before
+    anything is read (length, digest, the part it says it is, the hours of its salts), each hour's figures built
+    as its rows go by, and, once the last row has been read, the row count, each hour against its root seal (or
+    ``expected``), and the block's aggregates. Nothing holds the rows, so a part of any size is read in fixed
+    memory (only each hour's ids grow with it). A caller that stops early calls finish(), which reads the rest and
+    runs the checks; a check that fails raises NotVerified, and the caller's transaction then rolls back whatever
+    it did with the rows."""
 
-    def rows():
-        for row in block.rows():
-            if keep:
-                kept.append(row)
-            yield row
-    try:
-        figs = figures_by_hour(rows(), block.salts, c_prev)
-    except af.BlockError as exc:
-        raise NotVerified("block-altered", f"the block of {_label(day, part)} cannot be read: {exc}") from None
-    if block.count != part.rows:
-        raise NotVerified("block-altered", f"the block of {_label(day, part)} holds {block.count} rows; its seal "
-                                           f"{part.rows}")
-    if any(h not in set(hours) for h in block.salts):
-        raise NotVerified("block-altered", f"the block of {_label(day, part)} keeps a salt of an hour it does not "
-                                           "hold")
-    check_hours(db, view, hours, figs, expected)
-    stored = _stored_aggregates(db, day, part.part)
-    if stored != block.aggregates:
-        raise NotVerified("block-altered", f"the aggregates of {_label(day, part)} are not its rows'")
-    return kept, block, figs
+    def __init__(self, db, view, day: date, part, *, expected: Optional[Dict[datetime, tuple]] = None):
+        self.db, self.view, self.day, self.part, self.expected = db, view, day, part, expected
+        self.block = open_part(db, day, part)
+        if self.block.header.get("day") != day.isoformat() or self.block.header.get("part") != part.part:
+            raise NotVerified("block-altered", f"the block of {_label(day, part)} says it is another part")
+        self.hours = hours_between(part.first_hour, part.last_hour)
+        try:
+            self.salts = self.block.salts
+        except (TypeError, ValueError, AttributeError):
+            raise NotVerified("block-altered", f"the block of {_label(day, part)} has salts it cannot read") from None
+        if any(h not in set(self.hours) for h in self.salts):
+            raise NotVerified("block-altered", f"the block of {_label(day, part)} keeps a salt of an hour it does "
+                                               "not hold")
+        self.c_prev = {h: _c_prev(db, view, h) for h in self.hours} if expected is None else {}
+        self.figs: Dict[datetime, object] = {}
+        self.checked = False
+        self._iter = None
+
+    def rows(self) -> Iterator[dict]:
+        if self._iter is None:
+            self._iter = self._rows()
+        return self._iter
+
+    def _rows(self) -> Iterator[dict]:
+        ai = _ai()
+        current, builder = None, None
+        try:
+            for row in self.block.rows():
+                if not isinstance(row.get("timestamp"), datetime):
+                    raise NotVerified("block-altered", f"a row of {_label(self.day, self.part)} has no time")
+                hour = ai.hour_floor(row["timestamp"])
+                if hour != current:
+                    if builder is not None:
+                        self.figs[current] = builder.result()
+                    if hour in self.figs:
+                        raise NotVerified("rows-altered", f"the rows of {fmt.hour_text(hour)} are out of order",
+                                          fmt.hour_text(hour))
+                    current = hour
+                    builder = ai.FiguresBuilder(self.salts.get(hour), self.c_prev.get(hour) or None)
+                builder.add(row)
+                yield row
+        except af.BlockError as exc:
+            raise NotVerified("block-altered", f"the block of {_label(self.day, self.part)} cannot be read: "
+                                               f"{exc}") from None
+        if builder is not None:
+            self.figs[current] = builder.result()
+        self._check()
+
+    def _check(self) -> None:
+        label = _label(self.day, self.part)
+        if self.block.count != self.part.rows:
+            raise NotVerified("block-altered", f"the block of {label} holds {self.block.count} rows; its seal "
+                                               f"{self.part.rows}")
+        check_hours(self.db, self.view, self.hours, self.figs, self.expected)
+        if _stored_aggregates(self.db, self.day, self.part.part) != self.block.aggregates:
+            raise NotVerified("block-altered", f"the aggregates of {label} are not its rows'")
+        self.checked = True
+
+    def finish(self) -> "PartReader":
+        """Read whatever is left and run the checks (NotVerified). Returns itself."""
+        for _row in self.rows():
+            pass
+        if not self.checked:
+            raise NotVerified("block-altered", f"the block of {_label(self.day, self.part)} was not read to its end")
+        return self
 
 
 def sync_marker(db, now: datetime, present: Optional[bool] = None) -> bool:
@@ -433,7 +462,7 @@ def _check_stored(db, view, day: date, part, bw: af.BlockWriter,
     lengths = stored_blocks(db, day)
     if lengths.get((day, part.part)) != part.length:
         raise NotVerified("block-altered", f"the block of {_label(day, part)} was not stored whole")
-    _rows, block, _figs = read_part_rows(db, view, day, part, keep=False, expected=expected)
+    block = PartReader(db, view, day, part, expected=expected).finish().block
     if block.identity.digest() != bw.identity.digest():
         raise NotVerified("block-altered", f"the block of {_label(day, part)} does not give back the rows written "
                                            "into it")
@@ -518,13 +547,8 @@ def archive_next_part(w, day: date, now: datetime):
                 salts[h] = bytes(wr.legacy_salt)
     number = max((p.part for p in prev), default=0) + 1
     bw = af.BlockWriter(day, number, salts)
-
-    def through_writer():
-        for row in iter_full_rows(db, first, last + HOUR):
-            bw.add(row)
-            yield row
-    figs = figures_by_hour(through_writer(), salts)
-    check_hours(db, view, hours, figs)
+    for row in iter_full_rows(db, first, last + HOUR):
+        bw.add(row)
     payload = bw.finish()
     part = ArchivePart(number, first, last, bw.rows, len(payload), af.digest(payload))
     _insert_block(db, day, number, first, last, bw, payload, now)
@@ -629,14 +653,16 @@ def _check_day_blocks(db, entry, day: date) -> None:
             raise NotVerified("block-unsealed", f"a block of {day.isoformat()} (part {key[1]}) is in no archive seal")
 
 
-def rewrite_day(w, day: date, change: Callable[[List[dict]], Tuple[List[dict], set]],
+def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform: Callable[[dict], Optional[dict]],
                 now: datetime) -> Optional[Rewritten]:
-    """Apply ``change`` to the rows of every part of ``day``, in ``w``'s transaction. ``change(rows)`` returns
-    (the rows to keep, rewritten where it rewrites them; the ids it changed or removed). Every block is checked
-    first; a changed part is written again, its changed hours' nonces materialised and their salts dropped,
-    and checked as stored. Returns what changed, or None when nothing did. The caller then writes its change's
-    seal with ``entries`` and calls seal_rewrite(). Raises NotVerified, or NotArchivable when an hour it would
-    change waits for the host (another writer's seal not acknowledged)."""
+    """Change rows of ``day``'s parts in ``w``'s transaction, a part at a time and holding none of its rows.
+    ``pick(rows)`` reads a part's rows (all of them) and returns {id: timestamp} of those the change touches;
+    ``transform(row)`` returns such a row as it is to be kept (rewritten where it rewrites it), or None to remove
+    it. Every block is checked first (each part read once to pick, and checked to its end); a part with rows
+    picked is read again and written anew, the nonces of its changed hours' rows materialised and those hours'
+    salts dropped, and checked as stored. Returns what changed, or None when nothing did. The caller then writes
+    its change's seal with ``entries`` and calls seal_rewrite(). Raises NotVerified, or NotArchivable when an hour
+    it would change waits (another writer's seal the host has not acknowledged, or an erase after its seal)."""
     from app.core.models import AuditArchiveBlock as B
     ai = _ai()
     db, view = w.db, w.st.view
@@ -647,44 +673,50 @@ def rewrite_day(w, day: date, change: Callable[[List[dict]], Tuple[List[dict], s
     out = Rewritten()
     new_parts = []
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
-        rows, block, _figs = read_part_rows(db, view, day, part)
-        kept, changed_ids = change(rows)
-        if not changed_ids:
+        reader = PartReader(db, view, day, part)
+        touched = pick(reader.rows())
+        reader.finish()
+        if not touched:
             new_parts.append(part)
             continue
-        salts = block.salts
-        changed_hours = sorted({ai.hour_floor(r["timestamp"]) for r in rows if r["id"] in changed_ids})
+        changed_hours = sorted({ai.hour_floor(t) for t in touched.values()})
         for h in changed_hours:
             held = held_hour(view, w.record, h)
             if held is not None:
                 raise NotArchivable(f"{fmt.hour_text(h)}'s seal {held} was appended by another writer and waits "
                                     "for the host")
-            if view.own_entry(h) is not None and view.own_entry(h).erases:
+            own = view.own_entry(h)
+            if own is not None and own.erases:
                 raise NotArchivable(f"{fmt.hour_text(h)} has an erase after its seal")
-        for row in kept:
+        salts = reader.salts
+        new_salts = {h: salt for h, salt in salts.items() if h not in changed_hours}
+        builders = {h: ai.FiguresBuilder() for h in changed_hours}
+        bw = af.BlockWriter(day, part.part, new_salts)
+        again = PartReader(db, view, day, part)
+        for row in again.rows():
             h = ai.hour_floor(row["timestamp"])
-            if h in changed_hours and row.get("seal_nonce") is None and h in salts:
-                row["seal_nonce"] = fmt.legacy_nonce(salts[h], row["id"])
-        new_salts = {h: s for h, s in salts.items() if h not in changed_hours}
-        new_figs = figures_by_hour(iter(kept), new_salts)
+            if row["id"] in touched:
+                row = transform(dict(row))
+                if row is None:
+                    continue
+            if h in builders:
+                # The hour changes: each row's derived nonce is written into it, and the salt goes.
+                if row.get("seal_nonce") is None and h in salts:
+                    row["seal_nonce"] = fmt.legacy_nonce(salts[h], row["id"])
+                builders[h].add(row)
+            bw.add(row)
+        again.finish()
         expected = {}
         for h in changed_hours:
             root = _root(db, view, h)
-            f = new_figs.get(h)
-            figures = (f.count, f.bytes, f.root_s, f.root_c, f.ids_digest) if f is not None else \
-                (0, 0, fmt.EMPTY_ROOT, fmt.EMPTY_ROOT, fmt.ids_digest([]))
-            expected[h] = (figures[0], figures[2], figures[3], figures[4])
-            out.entries.append([fmt.hour_text(h), root.seq, figures[0], figures[1], figures[2].hex(),
-                                figures[3].hex(), figures[4].hex()])
-        removed = [r for r in rows if r["id"] in changed_ids]
-        times = [row["timestamp"] for row in removed if row.get("timestamp") is not None]
-        out.changed += len(changed_ids)
-        if times:
-            out.oldest = min([t for t in (out.oldest,) if t is not None] + times)
-            out.newest = max([t for t in (out.newest,) if t is not None] + times)
-        bw = af.BlockWriter(day, part.part, new_salts)
-        for r in kept:
-            bw.add(r)
+            f = builders[h].result()
+            expected[h] = (f.count, f.root_s, f.root_c, f.ids_digest)
+            out.entries.append([fmt.hour_text(h), root.seq, f.count, f.bytes, f.root_s.hex(), f.root_c.hex(),
+                                f.ids_digest.hex()])
+        times = list(touched.values())
+        out.changed += len(touched)
+        out.oldest = min([t for t in (out.oldest,) if t is not None] + times)
+        out.newest = max([t for t in (out.newest,) if t is not None] + times)
         payload = bw.finish()
         new = ArchivePart(part.part, part.first_hour, part.last_hour, bw.rows, len(payload), af.digest(payload))
         db.query(B).filter(B.day == day, B.part == part.part).update(
@@ -760,18 +792,26 @@ def _probe_values(row: dict) -> dict:
     return out
 
 
-def matching(db, rows: List[dict], conditions_for: Callable) -> set:
-    """The ids of ``rows`` that ``conditions_for(model)`` selects."""
+def matching(db, rows: Iterable[dict], conditions_for: Callable) -> Dict:
+    """{id: timestamp} of the ``rows`` that ``conditions_for(model)`` selects: the rows go, PROBE_CHUNK at a time,
+    into the temporary table, and the conditions run there; nothing is held but a chunk."""
     model = probe_model()
     table = model.__table__
     db.execute(table.delete())
-    if not rows:
-        return set()
-    for start in range(0, len(rows), 2000):
-        db.execute(sa.insert(table), [_probe_values(r) for r in rows[start:start + 2000]])
-    found = {fmt.as_uuid(r[0]) for r in db.query(model.id).filter(*conditions_for(model)).all()}
+    chunk: List[dict] = []
+    for row in rows:
+        chunk.append(_probe_values(row))
+        if len(chunk) >= PROBE_CHUNK:
+            db.execute(sa.insert(table), chunk)
+            chunk = []
+    if chunk:
+        db.execute(sa.insert(table), chunk)
+    found = {fmt.as_uuid(i): t for i, t in db.query(model.id, model.timestamp).filter(*conditions_for(model)).all()}
     db.execute(table.delete())
     return found
+
+
+PROBE_CHUNK = 2000
 
 
 def prune_day(w, day: date, conditions_for: Callable, now: datetime) -> Optional[Rewritten]:
@@ -779,10 +819,7 @@ def prune_day(w, day: date, conditions_for: Callable, now: datetime) -> Optional
     transaction. Raises NotVerified, NotArchivable."""
     probe_create(w.db)
     try:
-        def change(rows):
-            gone = matching(w.db, rows, conditions_for)
-            return [r for r in rows if r["id"] not in gone], gone
-        return rewrite_day(w, day, change, now)
+        return rewrite_day(w, day, lambda rows: matching(w.db, rows, conditions_for), lambda row: None, now)
     finally:
         probe_drop(w.db)
 
@@ -829,10 +866,22 @@ def _insert_rows(db, rows: List[dict]) -> None:
     db.execute(stmt, [{"v_" + name: row.get(name) for name in af.NAMES} for row in rows])
 
 
+def _restore_rows(db, rows: List[dict]) -> None:
+    """Insert a chunk of archived rows back; a row whose account was deleted since it was archived has its link
+    cleared, as the foreign key would have done (the link is outside the chain)."""
+    from app.core.models import User
+    users = {fmt.as_uuid(row["user_id"]) for row in rows if row.get("user_id") is not None}
+    present = {fmt.as_uuid(u) for (u,) in db.query(User.id).filter(User.id.in_(list(users))).all()} if users else set()
+    for row in rows:
+        if row.get("user_id") is not None and fmt.as_uuid(row["user_id"]) not in present:
+            row["user_id"] = None
+    _insert_rows(db, rows)
+
+
 def restore_day(w, day: date, now: datetime) -> int:
     """Put ``day``'s archived rows back into audit_logs, in ``w``'s transaction (see the module's docstring).
     Returns the rows restored. Raises NotVerified."""
-    from app.core.models import AuditArchiveBlock as B, AuditLog as A, User
+    from app.core.models import AuditArchiveBlock as B, AuditLog as A
     ai = _ai()
     db, view = w.db, w.st.view
     entry = view.archives.get(day)
@@ -846,21 +895,19 @@ def restore_day(w, day: date, now: datetime) -> int:
                                                         A.timestamp < part.last_hour + HOUR).scalar():
             raise NotVerified("row-in-archived-day", f"audit_logs has rows in {_label(day, part)}, which is "
                                                      "archived")
-        rows, block, _figs = read_part_rows(db, view, day, part)
-        users = {fmt.as_uuid(row["user_id"]) for row in rows if row.get("user_id") is not None}
-        present = {fmt.as_uuid(u) for (u,) in db.query(User.id).filter(User.id.in_(list(users))).all()} \
-            if users else set()
-        for row in rows:
-            # An account deleted since its rows were archived: the foreign key would have cleared the link
-            # (the link is outside the chain).
-            if row.get("user_id") is not None and fmt.as_uuid(row["user_id"]) not in present:
-                row["user_id"] = None
-        for chunk in range(0, len(rows), 2000):
-            _insert_rows(db, rows[chunk:chunk + 2000])
-        salts = block.salts
+        reader = PartReader(db, view, day, part)
         by_hour: Dict[datetime, bytearray] = {}
-        for r in rows:
-            by_hour.setdefault(ai.hour_floor(r["timestamp"]), bytearray()).extend(r["id"].bytes)
+        chunk: List[dict] = []
+        for row in reader.rows():
+            by_hour.setdefault(ai.hour_floor(row["timestamp"]), bytearray()).extend(row["id"].bytes)
+            chunk.append(row)
+            if len(chunk) >= PROBE_CHUNK:
+                _restore_rows(db, chunk)
+                chunk = []
+        if chunk:
+            _restore_rows(db, chunk)
+        reader.finish()
+        salts = reader.salts
         for h in hours:
             ids = bytes(by_hour.get(h, b""))
             root = _root(db, view, h)
@@ -875,7 +922,7 @@ def restore_day(w, day: date, now: datetime) -> int:
                 continue
             wr.row_ids = ids
             wr.legacy_salt = salts.get(h)
-        restored += len(rows)
+        restored += reader.block.count
     db.query(B).filter(B.day == day).delete(synchronize_session=False)
     db.flush()
     sync_marker(db, now)
@@ -1006,7 +1053,7 @@ def check_parts(db, view, report, parts: List[tuple]) -> None:
     from app.core.audit_chain_verify import FAILURE
     for day, part in parts:
         try:
-            _rows, block, _figs = read_part_rows(db, view, day, part, keep=False)
+            block = PartReader(db, view, day, part).finish().block
         except NotVerified as nv:
             if nv.kind != "block-missing":       # check_block_set names a missing block
                 report.add(FAILURE, nv.kind, str(nv), view.archives[day].seq, nv.hour)

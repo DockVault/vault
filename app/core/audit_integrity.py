@@ -1166,24 +1166,27 @@ def row_nonce(row: dict, salt: Optional[bytes]) -> Optional[bytes]:
     return None
 
 
-def hour_figures(rows, salt: Optional[bytes] = None, c_prev: Optional[Dict] = None,
-                 exclude: Optional[set] = None) -> HourFigures:
-    """The figures of an hour over ``rows``: count, bytes, both roots and the ids. A row with no nonce takes
-    one from ``salt``; with neither it is listed in ``missing_nonce`` (and committed under a NULL nonce). A
-    row ``c_prev`` names uses that commitment (an erase newer than the hour's root seal)."""
-    out = HourFigures()
-    ts, tc = fmt.TreeBuilder(), fmt.TreeBuilder()
-    ids = bytearray()
-    for row in rows:
-        if exclude and row["id"] in exclude:
-            continue
+class FiguresBuilder:
+    """An hour's figures built a row at a time (hour_figures over an iterable), so a caller that streams rows on
+    to somewhere else holds none of them: only the ids and the two trees' stacks grow with the hour."""
+
+    def __init__(self, salt: Optional[bytes] = None, c_prev: Optional[Dict] = None, exclude: Optional[set] = None):
+        self.salt, self.c_prev, self.exclude = salt, c_prev, exclude
+        self.out = HourFigures()
+        self._ts, self._tc = fmt.TreeBuilder(), fmt.TreeBuilder()
+        self._ids = bytearray()
+
+    def add(self, row: dict) -> None:
+        if self.exclude and row["id"] in self.exclude:
+            return
+        out = self.out
         out.count += 1
         out.bytes += row.get("_bytes", 0)
         rid = row["id"]
-        if c_prev and rid in c_prev:
-            c = c_prev[rid]
+        if self.c_prev and rid in self.c_prev:
+            c = self.c_prev[rid]
         else:
-            nonce = row_nonce(row, salt)
+            nonce = row_nonce(row, self.salt)
             if row.get("seal_nonce") is None:
                 out.nonceless += 1
                 if nonce is None:
@@ -1193,13 +1196,27 @@ def hour_figures(rows, salt: Optional[bytes] = None, c_prev: Optional[Dict] = No
             if not fmt.json_text_writable(row.get(col)):
                 out.unwritable.append(rid)
                 break
-        ts.push(fmt.leaf_s(row))
-        tc.push(fmt.leaf_c(rid, c))
-        ids += rid.bytes
-    out.root_s, out.root_c = ts.root(), tc.root()
-    out.ids = bytes(ids)
-    out.ids_digest = fmt.ids_digest_of_blob(out.ids)
-    return out
+        self._ts.push(fmt.leaf_s(row))
+        self._tc.push(fmt.leaf_c(rid, c))
+        self._ids += rid.bytes
+
+    def result(self) -> HourFigures:
+        out = self.out
+        out.root_s, out.root_c = self._ts.root(), self._tc.root()
+        out.ids = bytes(self._ids)
+        out.ids_digest = fmt.ids_digest_of_blob(out.ids)
+        return out
+
+
+def hour_figures(rows, salt: Optional[bytes] = None, c_prev: Optional[Dict] = None,
+                 exclude: Optional[set] = None) -> HourFigures:
+    """The figures of an hour over ``rows``: count, bytes, both roots and the ids. A row with no nonce takes
+    one from ``salt``; with neither it is listed in ``missing_nonce`` (and committed under a NULL nonce). A
+    row ``c_prev`` names uses that commitment (an erase newer than the hour's root seal)."""
+    builder = FiguresBuilder(salt, c_prev, exclude)
+    for row in rows:
+        builder.add(row)
+    return builder.result()
 
 
 def read_authenticated(db, view: View, seq: int) -> Seal:
