@@ -3,8 +3,9 @@ app/core/audit_head_record.py), offline:
 
 - the retention checkpoints: the newest policy seal with the entries where the honoured state differs from it,
   each cancel with the link of the request it cancels;
-- the hour summaries of the last 30 days, with the salt of an hour whose rows have no nonce, and, while sealing
-  is stopped, the hours that close, computed from their rows and marked unsealed;
+- the hour summaries of the last 30 days, with the salt of an hour whose rows have no nonce while the hour is
+  unchanged (an erase seal takes it out, as a prune's summary holds none), and, while sealing is stopped, the
+  hours that close, computed from their rows and marked unsealed;
 - a digest per day older than the summaries (over every hour's figures, and without the personal values'
   root), computed again when a later seal re-roots one of its hours;
 - the link of every 64th seal, by generation.
@@ -74,6 +75,23 @@ def test_an_hour_of_rows_without_a_nonce_keeps_its_salt_in_its_summary(env):
         assert summary["salt"] == bytes(wr.legacy_salt).hex() and summary["unsealed"] is False
         fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), bytes.fromhex(summary["salt"]))
     assert fig.root_c.hex() == summary["root_c"] and fig.count == summary["count"] == 1
+
+
+def test_an_erase_seal_takes_its_hours_salt_out_of_the_summary(env):
+    """The record write after an erase seal (which sets no roots) drops that hour's salt from its summary, as
+    the erase deletes it from the database; another hour keeps its own."""
+    env.row(T0 - timedelta(hours=5), nonce=False)
+    env.row(T0 - timedelta(hours=4), nonce=False)
+    env.run_until_sealed()
+    record = _record(env)
+    erased, kept = (fmt.hour_text(ai.hour_floor(T0 - timedelta(hours=h))) for h in (5, 4))
+    assert record["hours"][erased]["salt"] and record["hours"][kept]["salt"]
+    salt = record["hours"][kept]["salt"]
+    seal = ai.Seal(env.st.view.position + 1, "erase", None, None, fmt.FORMAT, 0, 0, None, None, None,
+                   {"hour": erased, "rows": [], "request_seq": 3, "final": True}, "k1", env.clock())
+    ai._summarise(record, env.st.view, seal)
+    assert record["hours"][erased]["salt"] is None and record["hours"][kept]["salt"] == salt
+    assert record["hours"][erased]["count"] == 1          # the rest of the summary stands
 
 
 def test_while_sealing_is_stopped_the_hours_that_close_are_summarised_unsealed(env):

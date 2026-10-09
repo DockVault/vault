@@ -15,7 +15,8 @@ that is exactly a time cutoff over the sealed rows, checked against every sealed
 
 Anything else is refused, with the counts per hour printed. The write phase reads the rows again under the
 chain lock and refuses unless they are what the read phase printed; it then writes one ``prune`` seal per UTC
-day (reason external, by the host) re-rooting the hours over the rows kept.
+day (reason external, by the host) re-rooting the hours over the rows kept. As every change to an hour, it
+writes each kept row's derived nonce into the row and deletes the hour's salt in the same transaction.
 """
 from __future__ import annotations
 
@@ -128,6 +129,7 @@ def removal_plan(db, view, record: Optional[dict], before: datetime, retention_d
 def acknowledge_removed_before(engine, st, before: datetime, *, retention_days: int, expect: Optional[str] = None,
                                read: bool = False) -> dict:
     """See the module's docstring. Raises Refused."""
+    from app.core import audit_chain_prune as prune_rows
     ai = _ai()
     sealed: List[int] = []
     with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
@@ -150,6 +152,9 @@ def acknowledge_removed_before(engine, st, before: datetime, *, retention_days: 
                     raise Refused(f"{fmt.hour_text(h)} changed while its removal was being sealed; seals written "
                                   f"so far: {sealed or 'none'}")
                 fig = s["fig"]
+                # A change to the hour: each kept row's derived nonce is written into it and the hour's salt
+                # deleted, in this transaction (the figures, taken with the salt, stay the same).
+                prune_rows._materialise(w, h, s["salt"], s["wr"])
                 if s["wr"] is not None:
                     s["wr"].row_ids = fig.ids
                 entries.append([fmt.hour_text(h), s["root"].seq, fig.count, fig.bytes, fig.root_s.hex(),

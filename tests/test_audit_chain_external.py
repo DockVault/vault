@@ -89,6 +89,36 @@ def test_a_rollback_prune_is_sealed_over_once_its_shape_and_age_check_out(env):
     assert env.seal().stopped is None
 
 
+def test_the_hours_a_removal_re_roots_keep_their_nonces_and_lose_their_salt(env):
+    """Rows written without a nonce (before the upgrade) in the hours an older release cut by time: the prune
+    seal that seals over the removal writes each kept row's derived nonce into the row and deletes the hour's
+    salt in the same transaction, as every change to such an hour does; an hour it does not change keeps its
+    salt, and every row still verifies."""
+    hour = ai.hour_floor(T0 - timedelta(days=33, hours=3))
+    earlier = hour - timedelta(hours=6)
+    for m in (5, 35):
+        env.row(earlier + timedelta(minutes=m), nonce=False)
+    env.row(hour + timedelta(minutes=10), nonce=False)
+    kept = env.row(hour + timedelta(minutes=50), nonce=False)
+    later = ai.hour_floor(T0 - timedelta(days=30))
+    env.row(later + timedelta(minutes=20), nonce=False)
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=1))
+    env.clock.advance(days=2)                            # the older release ran
+    with env.session() as db:
+        salts = {h: bytes(ai.working_row(db, h).legacy_salt) for h in (earlier, hour, later)}
+        db.query(AuditLog).filter(AuditLog.timestamp < hour + timedelta(minutes=30)).delete()
+        db.commit()
+    env.seal()
+    _seen, done = _removal(env, hour + timedelta(minutes=50), 34)
+    assert done["sealed"] and done["hours"] == 2
+    with env.session() as db:
+        assert ai.working_row(db, earlier).legacy_salt is None and ai.working_row(db, hour).legacy_salt is None
+        assert bytes(ai.working_row(db, later).legacy_salt) == salts[later]
+        assert bytes(db.get(AuditLog, kept).seal_nonce) == fmt.legacy_nonce(salts[hour], kept)
+    assert failures(env.verify()) == []
+
+
 def test_a_cutoff_more_recent_than_the_stated_retention_allows_is_refused(env):
     _ids, cutoff = _rolled_back(env)
     before = _first_kept_time(env, cutoff)

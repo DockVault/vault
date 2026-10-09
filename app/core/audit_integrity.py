@@ -969,8 +969,16 @@ def day_digests(db, view: View, record: dict, now: datetime, seals: List[Seal]) 
 
 
 def _summarise(record: dict, view: View, seal: Seal) -> None:
-    """Hour summaries for a seal that sets roots."""
+    """Hour summaries for a seal that sets roots. A summary keeps its hour's salt (rows without a nonce of their
+    own) only while the hour is unchanged, as the database does: a prune or rewrite replaces it with none, and
+    an erase, which sets no roots, drops it; kept beside the erase's earlier commitments, it would let erased
+    low-entropy values be tested."""
     hours = record.setdefault("hours", {})
+    if seal.kind == "erase":
+        entry = hours.get(str((seal.detail or {}).get("hour")))
+        if entry is not None:
+            entry["salt"] = None
+        return
     entries = []
     if seal.kind in ("hour", "late"):
         start = seal.period_start
