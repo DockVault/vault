@@ -139,8 +139,8 @@
         nb.show({
             id: ACCESS_BANNER,
             text: unseen.length === 1
-                ? 'There is news about access to your vaults (an investigation or a legal hold).'
-                : 'There are ' + unseen.length + ' notices about access to your vaults (investigations or legal holds).',
+                ? 'There is news about access to your vaults (an investigation, a legal hold, or a recorded name revealed).'
+                : 'There are ' + unseen.length + ' notices about access to your vaults (investigations, legal holds, or recorded names revealed).',
             linkText: 'Access to my vaults', onOpen: () => openMyAccess(),
             onRead: () => call('/me/compliance-access/seen', { method: 'POST', body: JSON.stringify({ through: newest }) }),
         });
