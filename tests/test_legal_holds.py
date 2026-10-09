@@ -1108,6 +1108,58 @@ def test_a_refused_step_is_recorded_and_asks_for_no_code(db, people, steps):
     assert steps == [("compliance.hold.place", "ada")]
 
 
+@pytest.mark.parametrize("why", [holds.CONFIRM_TOO_LATE, holds.NOTHING_TO_CONFIRM, holds.NOTHING_TO_RELEASE,
+                                 holds.NOTHING_TO_REVIEW, holds.NOTHING_TO_UNDO, holds.UNDO_TOO_LATE])
+def test_a_step_with_nothing_left_to_act_on_answers_409_is_recorded_and_asks_for_no_code(db, people, steps,
+                                                                                       monkeypatch, why):
+    """A step the case's state leaves nothing to do for (nothing waiting, or its time passed) conflicts with the
+    case, 409, whoever asks: it is not a refusal of the person (403). It is recorded with its reason, asks for no
+    code and changes nothing."""
+    view = cr.place_hold(_body([people.v1]), _request(), people.ada, db)
+    case_id = uuid.UUID(view["id"])
+
+    def at(when):
+        monkeypatch.setattr(holds, "utcnow", lambda: when)
+
+    def confirm():
+        return cr.confirm_hold(case_id, _request(), people.bob, db)
+
+    def release():
+        return cr.release_hold(case_id, cr.Reason(reason="done"), _request(), people.ada, db)
+
+    def review():
+        return cr.review_hold(case_id, people.ada, db)
+
+    def undo():
+        return cr.undo_hold_release(case_id, _request(), people.bob, db)
+
+    step, action = {holds.CONFIRM_TOO_LATE: (confirm, "hold_confirmed"),
+                    holds.NOTHING_TO_CONFIRM: (confirm, "hold_confirmed"),
+                    holds.NOTHING_TO_RELEASE: (release, "hold_released"),
+                    holds.NOTHING_TO_REVIEW: (review, "hold_reviewed"),
+                    holds.NOTHING_TO_UNDO: (undo, "hold_release_undone"),
+                    holds.UNDO_TOO_LATE: (undo, "hold_release_undone")}[why]
+    if why == holds.CONFIRM_TOO_LATE:
+        at(NOW + timedelta(days=int(cs.current(cs.HOLD_CONFIRM_DAYS))))
+    elif why == holds.NOTHING_TO_CONFIRM:
+        confirm()
+    elif why in (holds.NOTHING_TO_RELEASE, holds.NOTHING_TO_REVIEW, holds.UNDO_TOO_LATE):
+        release()
+        if why == holds.UNDO_TOO_LATE:
+            at(NOW + timedelta(days=int(cs.current(cs.HOLD_PURGE_DELAY_DAYS))))
+    asked = list(steps)
+    before = [(h.vault_id, h.confirmed_at, h.released_at, h.last_reviewed_at) for h in db.query(m.LegalHoldVault)]
+    with pytest.raises(HTTPException) as refused:
+        step()
+    assert refused.value.status_code == 409 and refused.value.detail["reason"] == why
+    failed = [r for r in _rows(db, action) if r.status == "failure"]
+    assert len(failed) == 1 and failed[0].case_id == case_id and failed[0].details["reason"] == why
+    assert steps == asked, "no code is asked for a step with nothing to act on"
+    db.expire_all()
+    assert [(h.vault_id, h.confirmed_at, h.released_at, h.last_reviewed_at)
+            for h in db.query(m.LegalHoldVault)] == before
+
+
 def test_a_release_needs_a_reason_that_is_more_than_spaces(db, people, steps):
     view = cr.place_hold(_body([people.v1]), _request(), people.ada, db)
     case_id = uuid.UUID(view["id"])

@@ -16,6 +16,7 @@ gate in app/services/vault_service.py, app/core/legal_hold_marker.py).
     nor once their auditor right is revoked (an administrator who placed it as an auditor too), nor after someone
     else changed their sign-in details, even once that change's own record is gone; an auditor lists only the cases
     they started;
+  * a confirmation after the confirm deadline answers 409 and confirms nothing;
   * the purge leaves a vault whose row a placing or an undo holds for its next pass;
   * a hold is refused while an SFTP server of another version may be running;
   * a refused step is recorded under its case.
@@ -542,6 +543,21 @@ def test_a_change_to_the_placers_sign_in_details_by_someone_else_outlives_its_re
     assert r.status_code == 403 and r.json()["detail"]["reason"] == "starter_changed", r.text
     assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' AND released_at IS NULL") == "1"
     assert psql(f"SELECT status FROM compliance_cases WHERE id = '{case_id}'") == "hold_only"
+
+
+def test_a_confirmation_after_the_confirm_deadline_answers_409(admin, admins, vaults):
+    made, cases = vaults
+    r = _place(admins["ada"], [made[1]["id"]])
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    psql("UPDATE legal_hold_vaults SET confirm_by_deadline = (now() AT TIME ZONE 'utc') - interval '1 minute' "
+         f"WHERE case_id = '{case_id}'")
+    r = _decide(admins["bob"], case_id, "confirm")
+    assert r.status_code == 409 and r.json()["detail"]["reason"] == "confirm_too_late", r.text
+    assert psql(f"SELECT coalesce(confirmed_by_username, '') FROM legal_hold_vaults WHERE case_id = '{case_id}'") == ""
+    assert psql(f"SELECT status || '|' || (details::jsonb ->> 'reason') FROM audit_logs WHERE action = "
+                f"'hold_confirmed' AND case_id = '{case_id}'") == "failure|confirm_too_late"
 
 
 _PURGE_LEAVES_A_LOCKED_VAULT = """
