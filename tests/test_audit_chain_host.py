@@ -14,7 +14,7 @@ from datetime import timedelta
 
 import pytest
 
-from _audit_chain_env import Env, T0, failures
+from _audit_chain_env import Env, T0, failures, host_rows
 from app.core import audit_chain_format as fmt
 from app.core import audit_chain_host as host
 from app.core import audit_integrity as ai
@@ -69,6 +69,7 @@ def test_a_value_no_release_writes_is_a_failure_until_the_host_acknowledges_the_
     seen, done = _both(host.acknowledge, env.engine, env.st, seqs=[], failures=False, rows=[str(odd)])
     assert done["rows"] == [str(odd)] and any(str(odd) in ln for ln in seen["lines"])
     assert env.seals()[-1].detail["rows"] == [str(odd)]
+    assert host_rows(env, host.ACKNOWLEDGED_ACTION) == [{"acknowledges": [], "failures": [], "rows": [str(odd)]}]
     report = env.verify()
     assert failures(report) == [] and "value-not-writable" in report.kinds("information")
 
@@ -119,6 +120,7 @@ def test_the_host_seals_rows_added_after_the_window_once_it_has_read_them(env):
     late = env.seals()[-1]
     assert late.kind == "late" and late.detail["by"] == "host" and late.detail["added"] == [str(added)]
     assert done["sealed"] == late.seq
+    assert host_rows(env, host.ACKNOWLEDGED_ACTION) == [{"late_rows": fmt.hour_text(hour), "added": 1}]
     report = env.verify()
     assert failures(report) == [] and "late" not in report.kinds("warning")
     assert "late" not in ai.status(env.st)["warnings"]

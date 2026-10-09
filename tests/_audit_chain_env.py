@@ -160,6 +160,16 @@ def failures(report):
     return report.kinds(FAILURE)
 
 
+def host_rows(env, action: str):
+    """The details of every audit row of ``action``, as the recording choke point kept them: a key it does not
+    classify is dropped and noted in ``recorded``, which must therefore hold no "dropped"."""
+    with env.session() as db:
+        rows = db.query(AuditLog).filter(AuditLog.action == action).all()
+        for row in rows:
+            assert "dropped" not in (row.recorded or {}), (action, row.recorded)
+        return [row.details for row in rows]
+
+
 CHAIN_SETTINGS = dict(encryption_key=ENC_KEY, audit_chain_key=KEY_TEXT, audit_seal_lag_minutes=60,
                       security_record_days=30, security_record_min_days=7, security_record_max_days=365,
                       audit_min_retention_days=0, audit_protected_min_days=365, audit_log_max_mb=0,

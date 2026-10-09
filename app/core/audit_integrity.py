@@ -284,7 +284,7 @@ class ChainState:
         # writer appended (accept-restore acknowledges those of the first start after a restore).
         self.process_started_at = clock()
         # "server" for the web process, "host" for a host command's process (where it accepted a seal).
-        self.role = "server"
+        self.process_kind = "server"
         # Seals another writer appended after the head record, accepted into the view and not yet listed in
         # the record: a writer whose own work failed (or whose record write did not happen) leaves them here,
         # and the next record write lists them.
@@ -706,7 +706,7 @@ class ChainWriter:
                 delay = None
             entry = {"generation": view.generation, "seq": seal.seq, "kind": seal.kind, "link": link.hex(),
                      "accepted_at": fmt.time_text(st.clock()),
-                     "where": "host" if st.role == "host" else ("start" if not st.started else "running"),
+                     "where": "host" if st.process_kind == "host" else ("start" if not st.started else "running"),
                      "process_started_at": fmt.time_text(st.process_started_at), "delay_days": delay,
                      "acknowledged": False, "discarded": False}
             st.pending_after.append(entry)

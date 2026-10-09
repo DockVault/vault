@@ -127,7 +127,8 @@ def rekey(engine, st, *, old_key: Optional[bytes] = None, accept_unverified: boo
             check_expected(state, expect)
         if returning and not confirm_return:
             raise Refused("a return to a key the chain had left needs --confirm-return")
-        host_audit_row(w.db, KEY_ACTION, {"from": in_force, "to": current.key_id, "proof": proof is not None})
+        host_audit_row(w.db, KEY_ACTION, {"from_key": in_force, "to_key": current.key_id,
+                                          "proof": proof is not None})
         seal = w.append("key", detail={"old_key_id": in_force, "new_key_id": current.key_id,
                                        "old_key_proof": proof.hex() if proof is not None else None,
                                        "accepted_unverified": bool(accept_unverified), "by": "host"}, key=current)

@@ -8,7 +8,7 @@ from datetime import timedelta
 
 import pytest
 
-from _audit_chain_env import Env, T0, failures
+from _audit_chain_env import Env, T0, failures, host_rows
 from app.core import audit_chain_external as external
 from app.core import audit_chain_format as fmt
 from app.core import audit_chain_host as host
@@ -28,7 +28,7 @@ def env(monkeypatch, tmp_path):
 
 def _host(env):
     st = ai.ChainState(settings=env.settings, clock=env.clock)
-    st.role = "host"
+    st.process_kind = "host"
     return st
 
 
@@ -72,6 +72,10 @@ def test_a_rollback_prune_is_sealed_over_once_its_shape_and_age_check_out(env):
     prunes = [s for s in env.seals() if s.kind == "prune"]
     assert prunes and all(p.detail["reason"] == "external" and p.detail["by"] == "host" for p in prunes)
     assert prunes[-1].detail["cutoff"]["retention_days"] == 34
+    # One audit row a day, each saying what its prune seal sealed over.
+    assert sorted(host_rows(env, external.ACTION), key=lambda r: r["day"]) == [
+        {"day": p.detail["hours"][0][0][:10], "hours": len(p.detail["hours"]), "cutoff": p.detail["cutoff"]["hour"],
+         "retention_days": 34} for p in prunes]
     report = env.verify()
     assert failures(report) == []
     env.clock.advance(hours=1)

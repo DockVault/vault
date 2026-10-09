@@ -15,7 +15,7 @@ from datetime import timedelta
 
 import pytest
 
-from _audit_chain_env import Env, KEY_TEXT, T0, failures
+from _audit_chain_env import Env, KEY_TEXT, T0, failures, host_rows
 from app.core import audit_chain_format as fmt
 from app.core import audit_chain_host as host
 from app.core import audit_chain_recovery as recovery
@@ -37,7 +37,7 @@ def env(monkeypatch, tmp_path):
 def _host(env):
     """The host tool's process: a chain state of its own, on the same database and head record."""
     st = ai.ChainState(settings=env.settings, clock=env.clock)
-    st.role = "host"
+    st.process_kind = "host"
     return st
 
 
@@ -66,6 +66,9 @@ def test_rekey_with_the_old_key_moves_the_chain_with_its_proof(env):
     key_seal = env.seals()[-1]
     assert key_seal.kind == "key" and key_seal.detail["old_key_proof"] and key_seal.detail["by"] == "host"
     assert done["to"] == env.st.current_key().key_id
+    # Its audit row keeps what it did: the key ids it moved between (never read as an email address).
+    assert host_rows(env, recovery.KEY_ACTION) == [{"from_key": key_seal.detail["old_key_id"], "to_key": done["to"],
+                                                    "proof": True}]
     env.clock.advance(hours=1)
     assert env.seal().stopped is None
     report = env.verify()
@@ -188,6 +191,7 @@ def test_a_seal_refused_on_its_face_is_discarded_with_its_rows_saved(env):
         assert json.load(fh)[0]["seq"] == seq
     ack = env.seals()[-1]
     assert ack.seq == seq and ack.kind == "ack" and ack.detail["discarded"][0][0] == seq
+    assert host_rows(env, recovery.DISCARDED_ACTION) == [{"seals": [seq], "saved": done["saved"]}]
     record = env.st.head_store().load()
     assert record["discards"] == 1
     # The server's process, which read the chain before, rebuilds its view from the higher discard count.
@@ -278,6 +282,7 @@ def test_after_record_accepts_another_writers_listed_seals_for_good(env):
     env.seal()
     assert seq in ai.unacknowledged_foreign(env.st.view, env.st.head_store().load())
     _two(env, recovery.after_record)
+    assert host_rows(env, recovery.ACCEPTED_ACTION) == [{"seals": [seq], "failures": []}]
     env.clock.advance(minutes=30)
     env.seal()
     assert seq not in ai.unacknowledged_foreign(env.st.view, env.st.head_store().load())

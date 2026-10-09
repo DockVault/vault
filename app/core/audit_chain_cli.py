@@ -36,7 +36,7 @@ def _server():
     from app.core.database import _require_engine
     ai = _ai()
     st = ai.ChainState()
-    st.role = "host"
+    st.process_kind = "host"
     return _require_engine(), st
 
 
@@ -102,7 +102,7 @@ def _acknowledge(args) -> int:
             seqs = [int(s) for s in (args.seqs or "").split(",") if s.strip()]
         except ValueError:
             raise host.Refused("--seqs takes seal numbers")
-        rows = [r.strip() for r in (args.rows or "").split(",") if r.strip()]
+        rows = [row.strip() for row in (args.rows or "").split(",") if row.strip()]
         return host.acknowledge(engine, st, seqs=seqs, failures=args.failures, rows=rows, expect=args.expect,
                                 read=args.read)
     return _answer(run)
@@ -237,14 +237,14 @@ def main(argv=None) -> int:
     a.add_argument("--rows", default="", help="rows holding a value no release writes, by id, comma-separated")
     a.add_argument("--late-rows", help="seal the rows added to this sealed hour (YYYY-MM-DDTHH:00:00Z)")
     _phase(a)
-    r = sub.add_parser("rekey", help="move the chain to the current key, or accept its history without the old one")
-    k = r.add_mutually_exclusive_group()
+    rk = sub.add_parser("rekey", help="move the chain to the current key, or accept its history without the old one")
+    k = rk.add_mutually_exclusive_group()
     k.add_argument("--old-key-file", help="a file holding the AUDIT_CHAIN_KEY the chain is under")
     k.add_argument("--old-key-stdin", action="store_true", help="read that key from standard input")
-    r.add_argument("--accept-unverified-history", action="store_true",
+    rk.add_argument("--accept-unverified-history", action="store_true",
                    help="write the key seal without the old key's proof (the old key is lost)")
-    r.add_argument("--confirm-return", action="store_true", help="return to a key the chain had left")
-    g = r.add_mutually_exclusive_group(required=True)
+    rk.add_argument("--confirm-return", action="store_true", help="return to a key the chain had left")
+    g = rk.add_mutually_exclusive_group(required=True)
     g.add_argument("--read", action="store_true")
     g.add_argument("--expect")
     g.add_argument("--now", action="store_true",

@@ -18,7 +18,7 @@ from datetime import timedelta
 
 import pytest
 
-from _audit_chain_env import Env, KEY_TEXT, T0, failures
+from _audit_chain_env import Env, KEY_TEXT, T0, failures, host_rows
 from app.core import audit_chain_format as fmt
 from app.core import audit_chain_host as host
 from app.core import audit_chain_policy_seals as ps
@@ -40,7 +40,7 @@ def env(monkeypatch, tmp_path):
 
 def _host(env):
     st = ai.ChainState(settings=env.settings, clock=env.clock)
-    st.role = "host"
+    st.process_kind = "host"
     return st
 
 
@@ -78,6 +78,8 @@ def test_a_cut_tail_is_accepted_and_the_server_takes_the_new_generation(env):
     assert seal.detail["lost_through_seq"] == newest and seal.detail["grace_until"]
     assert fmt.parse_time_text(seal.detail["grace_until"]) - seal.sealed_at == timedelta(days=done["grace_days"])
     assert done["generation"] == 2
+    assert host_rows(env, restore.RESTORED_ACTION) == [{"cause": "database", "lost_through_seq": newest,
+                                                        "deleted_through_seq": None}]
     env.clock.advance(hours=1)
     assert env.seal().stopped is None                    # the same process, no restart
     assert env.st.view.generation == 2
@@ -293,6 +295,8 @@ def test_a_whole_backup_restored_holds_deletion_until_accepted_and_names_what_it
     assert any("Undone by the restore: the cancel" in ln for ln in seen["lines"])
     done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
     assert done["cancels"] == [req]
+    assert host_rows(env, restore.RESTORED_ACTION) == [{"cause": "backup", "bundle": "dockvault-test-1",
+                                                        "acknowledges": done["acknowledged"]}]
     assert hr.read_mark(env.st.head_store().path) is None
     seal = [s for s in env.seals() if s.kind == "restore"][0]
     assert seal.detail["cause"] == "backup" and seal.detail["grace_until"]

@@ -168,6 +168,11 @@ _IDENTIFIER_KEYS = (
     # the audit log's integrity chain: the kinds of what a check found and what it says (seal numbers, hours,
     # row ids and counts, never a row's values), and the seals an acknowledgment names
     "kinds", "messages", "seq", "hour", "acknowledges", "failures",
+    # the host's commands on the chain: the seals they accept or discard and where discarded rows were saved,
+    # the key ids a key change moves between, what a restore lost and the bundle it came from, and the day,
+    # hours and cutoff hour of rows an older release removed
+    "seals", "saved", "from_key", "to_key", "cause", "lost_through_seq", "deleted_through_seq", "bundle",
+    "late_rows", "day", "hours", "cutoff",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
