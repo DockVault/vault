@@ -959,3 +959,59 @@ def test_the_creator_kept_with_the_grant_still_refuses_after_the_creator_is_dele
     db.commit()
     assert cases.decision_refusal(db, case, creators.bea) == ind.MADE_BY_CREATOR
     assert cases.decision_refusal(db, case, creators.zed) == ind.MADE_CREATOR
+
+
+# --------------------------------------------------------------------------- the approval's hold and deletions
+
+def test_the_approval_locks_the_vaults_its_hold_covers_before_it_reads_their_owners(db, people, monkeypatch):
+    """A deletion holds its vault's row (FOR NO KEY UPDATE) until it commits: the approval locks the rows of the
+    vaults its hold will cover, as placing a hold does, so it waits for that deletion and its hold covers every
+    deletion that commits after it. test_cases_live.py shows the wait on PostgreSQL."""
+    calls = []
+    real_lock, real_owners = holds._lock_vaults, cases._refresh_owners
+
+    def lock(db_, ids, **kw):
+        calls.append(("lock", sorted(str(i) for i in ids), kw))
+        return real_lock(db_, ids, **kw)
+
+    def owners(db_, case):
+        calls.append(("owners",))
+        return real_owners(db_, case)
+    monkeypatch.setattr(holds, "_lock_vaults", lock)
+    monkeypatch.setattr(cases, "_refresh_owners", owners)
+    case = _ask(db, people.uma, _vaults(people.v1, people.v3))
+    _approve(db, case, people.bob)
+    assert calls == [("lock", sorted([str(people.v1.id), str(people.v3.id)]), {"missing_ok": True}), ("owners",)]
+    calls.clear()
+    _approve(db, _ask(db, people.uma, _vaults(people.v2), hold=False), people.bob)
+    assert calls == [("owners",)], "an approval with no hold locks nothing"
+
+
+def test_a_vault_deleted_while_the_approval_waited_for_it_covers_nothing(db, people, monkeypatch):
+    v1, v2 = people.v1.id, people.v2.id
+    case = _ask(db, people.uma, _vaults(people.v1, people.v2))
+    real = holds._lock_vaults
+
+    def deleted_meanwhile(db_, ids, **kw):
+        # The deletion the lock waited for committed first: the vault is gone when the lock is taken.
+        db_.query(m.Vault).filter(m.Vault.id == v2).delete(synchronize_session=False)
+        return real(db_, ids, **kw)
+    monkeypatch.setattr(holds, "_lock_vaults", deleted_meanwhile)
+    _approve(db, case, people.bob)
+    assert case.status == "active"
+    assert {r.vault_id: r.folder_ids for r in cases.vault_rows(db, case)} == {v1: None, v2: []}
+    assert [h.vault_id for h in db.query(m.LegalHoldVault)] == [v1]
+
+
+def test_locking_a_vault_that_is_gone_refuses_or_leaves_it_out():
+    gone = uuid.uuid4()
+    from _kept_db import kept_database
+    with kept_database() as (make, _engine):
+        session = make()
+        try:
+            assert holds._lock_vaults(session, [gone], missing_ok=True) == []
+            with pytest.raises(holds.HoldRefused) as refused:
+                holds._lock_vaults(session, [gone])
+            assert refused.value.reason == holds.NO_SUCH_VAULT and refused.value.code == 404
+        finally:
+            session.close()

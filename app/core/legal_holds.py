@@ -418,16 +418,19 @@ def may_place(db, person) -> Optional[str]:
     return None if auditor_rights.auditor_live(db, person).live else NOT_ALLOWED
 
 
-def _lock_vaults(db, vault_ids: List[uuid.UUID]) -> list:
+def _lock_vaults(db, vault_ids: List[uuid.UUID], *, missing_ok: bool = False) -> list:
     """Each vault's (id, owner, type), its row locked FOR UPDATE, in id order: the lock waits for a deletion
     holding the row (every deleting path takes it FOR NO KEY UPDATE), so a hold covers every deletion that
-    commits after it."""
+    commits after it. A vault that is not there (gone, or deleted by the transaction the lock waited for) refuses
+    the step, or with ``missing_ok`` is left out."""
     from app.core.models import Vault
     rows = []
     for vid in sorted(vault_ids, key=str):
         row = (db.query(Vault.id, Vault.owner_id, Vault.type).filter(Vault.id == vid)
                .with_for_update().first())
         if row is None:
+            if missing_ok:
+                continue
             raise HoldRefused(NO_SUCH_VAULT, code=404)
         rows.append(row)
     return rows

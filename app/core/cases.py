@@ -464,6 +464,12 @@ def approve(db, case, *, approver=None, now: Optional[datetime] = None):
     live, _standing = auditor_standing(db, case, now)
     if not live:
         raise CaseRefused(rules.AUDITOR_NOT_LIVE)
+    if case.hold_requested:
+        # The holds must cover every deletion that commits after them: wait for a deletion that holds a vault's
+        # row (every deleting path takes it FOR NO KEY UPDATE), each row in id order as placing a hold does. The
+        # owners are read below, after the wait; a vault deleted meanwhile is gone there and covers nothing.
+        legal_holds._lock_vaults(db, [row.vault_id for row in vault_rows(db, case, covering_only=True)],
+                                 missing_ok=True)
     _refresh_owners(db, case)
     if approver is not None:
         why = approver_refusal(db, case, approver, now)   # again, now that the owners are read afresh

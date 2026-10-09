@@ -3,16 +3,18 @@ full flow, with an auditor right granted by two administrators, a case asked for
 the approving transaction (the same transaction id on the case, its hold, the owner's notification, the outbox row
 and the audit rows) and by email (an SMTP server kept inside the web container), extended, and closed with a
 summary; a fault in the owner's notice that fails the approval; the end of access by the pruner; the host's
-approval refused while an administrator could approve; every refusal recorded; an administrator made by whoever
-created the auditor's account refused as approver.
+approval refused while an administrator could approve; every refusal recorded; an approval whose hold waits for a
+deletion in progress, after which the next deletion is kept; an administrator made by whoever created the
+auditor's account refused as approver.
 
 test_cases.py covers the rules offline.
 """
 import subprocess
+import time
 
 import pytest
 
-from _account_change_helpers import API, in_api_container, notifications, psql, signed_in
+from _account_change_helpers import API, DB, in_api_container, notifications, psql, signed_in
 from _auditor_helpers import (compliance_receipt, forget_grants, grant_right, new_auditor_account, run_pass,
                               two_admins)
 from _owner_notice_helpers import mail_to, outbox, owner_with_vault, sender_held, sending_to_sink, wait_for
@@ -231,6 +233,48 @@ def test_refusals_are_recorded(world, admin):
     # Withdrawn by its auditor while it waits.
     r = uma_c.post(f"/compliance/cases/{case['id']}/withdraw")
     assert r.status_code == 200 and r.json()["status"] == "withdrawn"
+
+
+def _upload(client, vid, name, content):
+    r = client.post(f"/vaults/{vid}/files", files=[("files", (name, content, "text/plain"))])
+    r.raise_for_status()
+    return r.json()["files"][0]["id"]
+
+
+def test_an_approval_whose_hold_meets_a_deletion_in_progress_waits_and_the_next_deletion_is_kept(world):
+    olga, olga_c, vid = world["olga"]
+    during = _upload(olga_c, vid, "during.txt", b"deleted while the approval waits")
+    after = _upload(olga_c, vid, "after.txt", b"deleted after the approval")
+    case = _ask(world)
+    assert case["hold"] is True
+    bob, bob_c, bob_codes = _as(world, "bob")
+    headers = compliance_receipt(bob_c, "compliance.case.approve", bob["_password"], bob_codes)
+    headers["If-Match"] = '"1"'
+    # A deletion's transaction holds the vault's row (FOR NO KEY UPDATE, as every deleting path takes it), deletes a
+    # file and commits three seconds later.
+    holder = subprocess.Popen(["docker", "exec", DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-Atc",
+                               f"BEGIN; SELECT id FROM vaults WHERE id = '{vid}' FOR NO KEY UPDATE; "
+                               f"DELETE FROM files WHERE id = '{during}'; SELECT pg_sleep(3); COMMIT;"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and psql(
+                "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(3)%' AND state = 'active' "
+                "AND pid <> pg_backend_pid()") == "0":
+            time.sleep(0.1)
+        started = time.monotonic()
+        r = bob_c.post(f"/compliance/cases/{case['id']}/approve", headers=headers)
+        waited = time.monotonic() - started
+    finally:
+        holder.wait(timeout=30)
+    assert r.status_code == 200 and r.json()["status"] == "active", r.text
+    assert waited >= 1.5, f"the approval did not wait for the deletion's lock ({waited:.2f}s)"
+    # That deletion committed before the hold did; every one after it is kept.
+    assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case['id']}' "
+                "AND released_at IS NULL") == "1"
+    assert psql(f"SELECT count(*) FROM files WHERE id = '{during}'") == "0"
+    assert olga_c.post(f"/vaults/{vid}/files/{after}/delete").status_code == 200
+    assert psql(f"SELECT kept_reason FROM held_files WHERE id = '{after}'") == "deleted"
 
 
 def test_an_administrator_made_by_whoever_created_the_auditors_account_may_not_approve(admin):
