@@ -261,11 +261,24 @@ def _size_cap_prune(env, **changed):
                                                               root.ids_digest.hex()]]})
 
 
+def _shorter_delay(env, _counted):
+    """A delay of one day against the policy seal's seven, with its window and counted figure computed honestly
+    over that one day (and still over the cap): only the delay is wrong."""
+    st = env.st
+    start = size.window_start(st.view, st.known_record(), env.clock(), timedelta(days=1))
+    held = size.held_back(st.view, st.known_record(), start)
+    counted = size.total(st.view, start, held)
+    assert counted > 1024 * KB
+    return {"delay": 1, "from": fmt.time_text(size.times.dt(start)), "counted": counted, "held_back": sorted(held)}
+
+
 @pytest.mark.parametrize("change,why", [
-    (lambda c: {"counted": c + 1}, "counted"),
-    (lambda c: {"from": fmt.time_text(T0 + timedelta(days=7, hours=20))}, "window is shorter"),
-    (lambda c: {"held_back": [3]}, "held-back seals"),
-    (lambda c: {"cap": c + 10 * 1024 * KB}, "under its cap"),
+    (lambda env, c: {"counted": c + 1}, "counted"),
+    (lambda env, c: {"from": fmt.time_text(T0 + timedelta(days=7, hours=20))}, "window is shorter"),
+    (lambda env, c: {"held_back": [3]}, "held-back seals"),
+    (lambda env, c: {"cap": c + 10 * 1024 * KB}, "under its cap"),
+    (lambda env, c: {"cap": 512 * KB}, "cap or delay keeps less than its policy"),
+    (_shorter_delay, "cap or delay keeps less than its policy"),
 ])
 def test_verify_rejects_a_size_cap_prune_the_chain_does_not_give(env, change, why):
     for h in range(6):
@@ -274,7 +287,7 @@ def test_verify_rejects_a_size_cap_prune_the_chain_does_not_give(env, change, wh
     _seal_to(env, T0 + timedelta(days=8))
     counted = _counted(env)
     assert counted > 1024 * KB
-    _size_cap_prune(env, **change(counted))
+    _size_cap_prune(env, **change(env, counted))
     on = _why(env.verify())
     off = _why(_off(env))
     assert any(why in m for m in on), on
