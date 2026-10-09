@@ -238,15 +238,16 @@ files except to serve them, and cannot read zero-knowledge ones.
 
 - **Container output** (`docker logs`): the web access log (client address and port, method, path
   with any link, invitation or reset token in it redacted, the query's parameter names but never their
-  values, status) and the application's own lines
+  values, status; a WebSocket handshake's line the same way) and the application's own lines
   (startup, counts from the cleanups, warnings). Those lines name accounts by id and carry no file
   names or passwords. A database error's text leaves out the statement's values (**new in 0.33.0**),
   and an unexpected error, or a failed audit, notification or security-event write, is logged by its
   class and where it was raised. The database driver's own text can still name a value that broke a
   uniqueness rule (a username, an address), and some older error lines print it. **Changed in 0.34.0:**
   a query's values were printed, so a search sent in the query (an Activity search for a name, an
-  address or free text) reached this log; now only the names are, and a line read back through log
-  access from before the change serves only the names too. How long Docker
+  address or free text) reached this log; now only the names are, a WebSocket handshake's line
+  included, and a line read back through log access from before the change serves only the names too.
+  How long Docker
   keeps this is set by the host's Docker logging
   configuration; the shipped compose files set no limit, so set `max-size` and `max-file` for the
   logging driver if you need one.

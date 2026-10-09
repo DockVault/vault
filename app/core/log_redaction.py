@@ -122,6 +122,13 @@ def access_target(path: str, query: str = "") -> str:
 # redact_access_path reduces it, so a line written before query values were dropped serves none.
 _REQUEST_TARGET_RE = re.compile(
     r"((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT) )([^\s\"']+)( HTTP/)")
+# The same for a WebSocket handshake line ('"WebSocket /ws/monitor?a=1" [accepted]').
+_WEBSOCKET_TARGET_RE = re.compile(r"(\"WebSocket )([^\s\"']+)(\")")
+
+# How uvicorn writes a WebSocket handshake: to uvicorn.error, not uvicorn.access, as
+# '%s - "WebSocket %s" [accepted]' (or 403, or '%d' for a response the application sent), the path with
+# its query second.
+_WEBSOCKET_LINE = '"WebSocket %s"'
 
 
 def redact_secret_urls_in_text(text: str) -> str:
@@ -131,6 +138,7 @@ def redact_secret_urls_in_text(text: str) -> str:
     if not text:
         return text
     text = _REQUEST_TARGET_RE.sub(lambda m: m.group(1) + redact_access_path(m.group(2)) + m.group(3), text)
+    text = _WEBSOCKET_TARGET_RE.sub(lambda m: m.group(1) + redact_access_path(m.group(2)) + m.group(3), text)
     for rx, repl in _TEXT_SECRET_SUBS:
         text = rx.sub(repl, text)
     return SECRET_QUERY_RE.sub(r"\1<redacted>", text)
@@ -149,6 +157,25 @@ class AccessLogRedactFilter(logging.Filter):
                 if redacted != args[2]:
                     lst = list(args)
                     lst[2] = redacted
+                    record.args = tuple(lst)
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
+        return True
+
+
+class WebSocketLogRedactFilter(logging.Filter):
+    """The same for a WebSocket handshake, which uvicorn writes to its error log (uvicorn.error), not the
+    access log: the path and its query are the record's second argument, reduced as an access line's
+    target is. Other records on that log are left as they are. Never raises, never drops a line."""
+    def filter(self, record):  # noqa: A003
+        try:
+            args = record.args
+            if (isinstance(args, tuple) and len(args) >= 2 and isinstance(args[1], str)
+                    and _WEBSOCKET_LINE in str(record.msg)):
+                redacted = redact_access_path(args[1])
+                if redacted != args[1]:
+                    lst = list(args)
+                    lst[1] = redacted
                     record.args = tuple(lst)
         except Exception:  # noqa: BLE001 — logging must never raise
             pass

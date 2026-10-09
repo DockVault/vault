@@ -387,6 +387,7 @@ SESSION_TIMEOUT_MAX_MINUTES = 30 * 24 * 60  # 30 days
 from app.core.log_redaction import (  # noqa: E402
     access_target as _access_target,
     AccessLogRedactFilter as _AccessLogRedactFilter,
+    WebSocketLogRedactFilter as _WebSocketLogRedactFilter,
 )
 
 
@@ -399,11 +400,15 @@ def _public_base_url(request) -> str:
 
 
 def _install_access_log_redaction() -> None:
-    """Attach the access-log redaction filter once (idempotent), covering both run modes:
-    `python -m app.api.api_server` and an ASGI server importing `app`."""
+    """Attach the access-log redaction filters once (idempotent), covering both run modes:
+    `python -m app.api.api_server` and an ASGI server importing `app`. uvicorn writes a WebSocket
+    handshake, with its path and query, to its error log rather than the access log."""
     lg = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, _AccessLogRedactFilter) for f in lg.filters):
         lg.addFilter(_AccessLogRedactFilter())
+    lg = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _WebSocketLogRedactFilter) for f in lg.filters):
+        lg.addFilter(_WebSocketLogRedactFilter())
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
