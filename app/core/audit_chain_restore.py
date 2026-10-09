@@ -91,13 +91,15 @@ def database_chain(db, held: Dict[str, keys.ChainKey], generation: int):
         elif not ai._mac_ok(k.key, link, seal.mac):
             problems.append(f"seal {seal.seq}'s MAC does not verify (mac-invalid)")
         elif seal.kind == "key":
-            uncovered = []
+            uncovered = []          # only a key seal whose own MAC verified covers the seals before it
         view.accept(seal, link)
         newest = seal
     if uncovered:
         problems.append(f"{len(uncovered)} seals (from {uncovered[0]}) are under a key this command does not hold, "
                         "and no later key seal covers them: give it with --old-key-file")
     if newest is not None:
+        # Defence in depth: the checks above already refuse a newest seal under a key not held (uncovered, as no
+        # key seal follows it) or whose MAC fails; this states the rule the command rests on in one place.
         k = held.get(view.key_in_force())
         if k is None or not ai._mac_ok(k.key, view.link_at(view.position), newest.mac):
             problems.append(f"the newest seal ({view.position}) does not verify under the key in force there "
