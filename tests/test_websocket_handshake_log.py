@@ -104,3 +104,17 @@ def test_a_handshake_line_read_back_serves_names_only():
     from app.services import log_pull
     served = log_pull.redact_log_text(old, [])
     assert VALUE not in served and TOKEN not in served, served
+
+
+@pytest.mark.parametrize("path", ["/ws/monitor", "/ws/no-such-socket", "/ws/vaults/42/events", "/socket"])
+@pytest.mark.parametrize("fmt, extra", FORMATS)
+def test_a_handshake_line_to_any_path_read_back_serves_names_only(path, fmt, extra):
+    """A line written before the change may record a handshake to any path, in any of the three forms: one
+    to a path no socket serves is logged as refused (403), and a client chooses the path and its query."""
+    old = "[web] INFO: " + fmt % ("172.18.0.1:40112", f"{path}?x={VALUE}&token={TOKEN}", *extra)
+    out = redact_secret_urls_in_text(old)
+    assert VALUE not in out and TOKEN not in out, out
+    assert f'"WebSocket {path}?x&token"' in out, out
+    from app.services import log_pull
+    served = log_pull.redact_log_text(old, [])
+    assert VALUE not in served and TOKEN not in served, served
