@@ -111,8 +111,6 @@ def opened(db, case, vault_ids, *, unlocked: set) -> list:
     out = []
     for row in rows:
         vid = str((row.details or {}).get("vault_id") or "")
-        if vid not in wanted:
-            continue
         if vid not in facts:
             facts[vid] = _vault_facts(db, rules.as_id(vid))
         name, hidden = _file_name(db, row.resource_id, facts[vid], unlocked=vid in unlocked)
