@@ -119,11 +119,14 @@ def access_target(path: str, query: str = "") -> str:
 
 
 # A request line inside a log line read back ("GET /x?a=1 HTTP/1.1"): its target is reduced as
-# redact_access_path reduces it, so a line written before query values were dropped serves none.
+# redact_access_path reduces it, so a line written before query values were dropped serves none. The
+# target runs to " HTTP/": a quote does not end it, since a client can send one raw in a query and the
+# line holds the query as it came (a target never holds a space).
 _REQUEST_TARGET_RE = re.compile(
-    r"((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT) )([^\s\"']+)( HTTP/)")
-# The same for a WebSocket handshake line ('"WebSocket /ws/monitor?a=1" [accepted]').
-_WEBSOCKET_TARGET_RE = re.compile(r"(\"WebSocket )([^\s\"']+)(\")")
+    r"((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT) )(\S+)( HTTP/)")
+# The same for a WebSocket handshake line ('"WebSocket /ws/monitor?a=1" [accepted]'): the target runs to
+# the last quote before the space that follows it, so a raw quote inside it does not end it either.
+_WEBSOCKET_TARGET_RE = re.compile(r"(\"WebSocket )(\S+)(\")")
 
 # How uvicorn writes a WebSocket handshake: to uvicorn.error, not uvicorn.access, as
 # '%s - "WebSocket %s" [accepted]' (or 403, or '%d' for a response the application sent), the path with

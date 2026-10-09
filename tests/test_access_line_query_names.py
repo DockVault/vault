@@ -68,6 +68,25 @@ def test_a_line_read_back_from_before_the_change_serves_names_only(method):
     _assert_no_value(log_pull.redact_log_text(old, []))
 
 
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_a_line_read_back_with_a_raw_quote_in_its_target_serves_names_only(method, quote):
+    """A browser sends a quote in a query encoded, but a client can send it raw, and a line written before the
+    change holds the query as it came. Such a line is reduced as any other: the quote does not end the
+    target, so the values after it are not served."""
+    target = (f"/activity/events?q=it{quote}s+quarterly+report+draft&user=alice.martin%40example.com"
+              f"&ip=203.0.113.9&tag={quote}secretval{quote}")
+    old = f'[web] INFO: 172.18.0.1:40112 - "{method} {target} HTTP/1.1" 200 OK'
+    out = redact_secret_urls_in_text(old)
+    _assert_no_value(out)
+    assert "secretval" not in out, out
+    assert f'"{method} /activity/events?q&user&ip&tag HTTP/1.1" 200 OK' in out, out
+    from app.services import log_pull
+    served = log_pull.redact_log_text(old, [])
+    _assert_no_value(served)
+    assert "secretval" not in served, served
+
+
 @pytest.mark.parametrize("query, expected", [
     ("a=1&b=2", "a&b"),
     ("a=1&&b=", "a&b"),                                   # an empty part is skipped, an empty value is a name

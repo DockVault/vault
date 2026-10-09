@@ -118,3 +118,18 @@ def test_a_handshake_line_to_any_path_read_back_serves_names_only(path, fmt, ext
     from app.services import log_pull
     served = log_pull.redact_log_text(old, [])
     assert VALUE not in served and TOKEN not in served, served
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("fmt, extra", FORMATS)
+def test_a_handshake_line_with_a_raw_quote_in_its_target_read_back_serves_names_only(quote, fmt, extra):
+    """A client can send a quote raw in the query, and a line written before the change holds it as it came.
+    The quote does not end the target: the values after it are not served."""
+    target = f"/ws/monitor?x=a{quote}{VALUE}&y={quote}{VALUE}-2{quote}&z=after"
+    old = "[web] INFO: " + fmt % ("172.18.0.1:40112", target, *extra)
+    out = redact_secret_urls_in_text(old)
+    assert VALUE not in out and "after" not in out, out
+    assert '"WebSocket /ws/monitor?x&y&z"' in out, out
+    from app.services import log_pull
+    served = log_pull.redact_log_text(old, [])
+    assert VALUE not in served and "after" not in served, served
