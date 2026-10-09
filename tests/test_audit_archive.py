@@ -1139,3 +1139,36 @@ def test_a_removal_by_an_older_release_is_acknowledged_with_blocks_present_only_
     seen = external.acknowledge_removed_before(env.engine, env.st, cutoff, retention_days=40, read=True)
     external.acknowledge_removed_before(env.engine, env.st, cutoff, retention_days=40, expect=seen["state"])
     assert failures(env.verify()) == [] and len(_blocks(env)) == 1
+
+
+def test_a_removal_over_a_legacy_day_put_back_as_rows_is_acknowledged(env):
+    """Unarchive restores a nonce-less day's row ids and salt: the prefix rule of the acknowledgment works over
+    it as over any hour."""
+    from app.core import audit_chain_external as external
+    _day_rows(env, {3: 2, 4: 3, 6: 1}, nonce=False)
+    env.run_until_sealed()
+    _archive(env)
+    _unarchive(env)
+    env.clock.advance(days=2)              # an older release ran for two days: no seal meanwhile
+    cutoff = at(4, 1)
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.timestamp < cutoff).delete(synchronize_session=False)
+        db.commit()
+    env.seal()
+    assert "rows-missing" in failures(env.verify())
+    seen = external.acknowledge_removed_before(env.engine, env.st, cutoff, retention_days=90, read=True)
+    external.acknowledge_removed_before(env.engine, env.st, cutoff, retention_days=90, expect=seen["state"])
+    assert failures(env.verify()) == [] and _hot(env) == 3
+
+
+def test_a_payload_inflated_in_the_database_changes_nothing_the_size_cap_counts(env):
+    _sealed_day(env)
+    _archive(env)
+    _seal_days(env, 8)
+    before = _counted(env)
+    with env.session() as db:
+        db.query(AuditArchiveBlock).update({AuditArchiveBlock.payload: _blocks(env)[0].payload + b"x" * 100000},
+                                           synchronize_session=False)
+        db.commit()
+    assert _counted(env) == before
+    assert "block-altered" in failures(env.verify())
