@@ -11,6 +11,7 @@ type alone is allowed). A save that sends a locked switch at its saved value cha
 change it is refused with that reason; and the page leaves locked switches out. The round trips below run
 the server's own GET and PUT on a throwaway SQLite database.
 """
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -204,8 +205,11 @@ def test_the_settings_page_leaves_a_locked_switch_out_of_a_save():
     js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     start = js.index("const zkLock = settings.zero_knowledge_switches_locked")
     shown = js[start:js.index("const dssEl", start)]
-    assert "settings.zero_knowledge_in_effect === true" in shown and "zkEl.disabled = !!zkLock" in shown
-    assert "settings.force_zero_knowledge_in_effect === true" in shown and "fzkEl.disabled = !!zkLock" in shown
+    # Each switch on its own (the force's element is fzkEl, whose name ends in the other's).
+    assert re.search(r"(?<!f)zkEl\.checked = zkLock \? settings\.zero_knowledge_in_effect === true", shown)
+    assert re.search(r"(?<!f)zkEl\.disabled = !!zkLock;", shown)
+    assert re.search(r"fzkEl\.checked = zkLock \? settings\.force_zero_knowledge_in_effect === true", shown)
+    assert re.search(r"fzkEl\.disabled = !!zkLock;", shown)
     assert "zk-switches-locked-note" in shown
     save = js[js.index("A zero-knowledge switch the page locked"):js.index("// Branding: send the brand overrides.")]
     assert "['setting-zero-knowledge-enabled', 'zero_knowledge_enabled']" in save
