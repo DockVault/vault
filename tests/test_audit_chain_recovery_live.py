@@ -19,7 +19,13 @@ chain verifies clean:
 - rows an older release removed by age while sealing was stopped: ``acknowledge-removed-before`` seals over
   them;
 - rows added to an hour sealed more than 6 hours before: ``acknowledge --late-rows`` seals them; a row holding a
-  value no release writes: ``acknowledge --rows``.
+  value no release writes: ``acknowledge --rows``;
+- a head kept before a removal: with the key it matches and every seal is authenticated; without the key
+  (``verify --no-key``) the removal's prune is "not authenticated"; a later head closes it. A head a database
+  restore lost is reported against the restore seal, as information with the key and a warning without it;
+- a lost head record: accepted once its key history is confirmed by name, and reported for good; a database
+  cut back to before a key change: its chain ends under a key the chain left, accepted by name, and the move
+  back needs ``rekey --confirm-return``; reported for good.
 
 test_audit_chain_recovery.py, test_audit_chain_restore.py, test_audit_chain_external.py and
 test_audit_chain_host.py cover the rules offline.
@@ -415,3 +421,146 @@ out["report"] = report()
     after = _script(throwaway, 'out["stopped"] = passes()\nout["report"] = report()\n')
     _clean(after["report"])
     assert "value-not-writable" in after["report"]["information"]
+
+
+# --------------------------------------------------------------------------- anchors and what verify reports
+
+def _verify(name, *args, key=KEY):
+    """audit verify in the web container on the throwaway database: (exit code, findings by kind)."""
+    code, answer, err = _cli(name, "verify", "--json", *args, key=key)
+    assert answer and answer["ok"], (answer, err[-3000:])
+    found = {}
+    for f in answer["findings"]:
+        found.setdefault(f["kind"], []).append(f)
+    return code, found, answer
+
+
+def test_an_anchor_kept_before_a_removal_is_checked_with_and_without_the_key(throwaway):
+    first = _script(throwaway, r"""
+rows = [add_row(at(days=20, hours=-h)) for h in range(6)]
+out["stopped"] = passes(at(days=19))
+""")
+    assert first["stopped"] is None, first
+    _code, _found, sealed = _verify(throwaway)
+    anchor = sealed["head"]
+    removed = _script(throwaway, r"""
+with engine.begin() as c:
+    ts = [r[0] for r in c.execute(text("SELECT timestamp FROM audit_logs WHERE action = 'file_uploaded' "
+                                       "ORDER BY timestamp"))]
+    t = ts[3]
+    c.execute(text("DELETE FROM audit_logs WHERE timestamp < :t"), {"t": t})
+out["before"] = fmt.time_text(t)
+out["back"] = passes()
+""")
+    assert removed["back"] is None, removed
+    _two(throwaway, "acknowledge-removed-before", removed["before"], "--retention-days", "7")
+    _script(throwaway, 'out["stopped"] = passes()\n')
+    # With the key: every seal authenticated, the anchor matches, the prune and the stop reported for good.
+    code, found, answer = _verify(throwaway, "--anchor", anchor)
+    assert code == 0 and "anchor-mismatch" not in found and "changed-after-anchor" not in found, found
+    assert found.get("pruned") and "external prune of" in found["pruned"][0]["message"], found
+    assert found.get("gap"), found
+    # Without the key, as an auditor holding only the anchor: the prune is not authenticated.
+    code, found, _answer = _verify(throwaway, "--anchor", anchor, "--no-key")
+    changed = found.get("changed-after-anchor") or []
+    assert code == 1 and changed and all(f["severity"] == "warning" for f in changed), found
+    assert {f["seq"] for f in changed} == {f["seq"] for f in found["pruned"]}, found
+    assert "anchor-mismatch" not in found
+    # A head kept after the removal closes it.
+    code, found, _answer = _verify(throwaway, "--anchor", answer["head"], "--no-key")
+    assert "changed-after-anchor" not in found and "anchor-mismatch" not in found, found
+
+
+def test_an_anchor_a_database_restore_lost_is_reported_against_its_restore_seal(throwaway):
+    old = throwaway + "_old"
+    try:
+        _script(throwaway, r"""
+for h in range(10, 1, -1):
+    add_row(at(hours=h))
+out["stopped"] = passes(at(hours=6))
+""")
+        psql(f"CREATE DATABASE {old} TEMPLATE {throwaway}")
+        _script(throwaway, 'out["stopped"] = passes()\n')
+        _code, _found, newer = _verify(throwaway)
+        anchor = newer["head"]
+        psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{throwaway}'")
+        psql(f"DROP DATABASE {throwaway}")
+        psql(f"CREATE DATABASE {throwaway} TEMPLATE {old}")
+        _two(throwaway, "accept-database-head")
+        _script(throwaway, 'out["stopped"] = passes()\n')
+        code, found, _answer = _verify(throwaway, "--anchor", anchor)
+        assert "anchor-mismatch" not in found, found
+        lost = found.get("anchor-lost") or []
+        assert [f["severity"] for f in lost] == ["information"], found
+        restored = found.get("restored") or []
+        assert [f["seq"] for f in restored] == [lost[0]["seq"]], found
+        assert found.get("resealed-after-restore"), found
+        code, found, _answer = _verify(throwaway, "--anchor", anchor, "--no-key")
+        assert [f["severity"] for f in found.get("anchor-lost") or []] == ["warning"], found
+        assert "anchor-mismatch" not in found
+    finally:
+        psql(f"DROP DATABASE IF EXISTS {old}")
+
+
+def test_a_lost_head_record_is_accepted_after_its_key_history_is_confirmed_and_reported_for_good(throwaway):
+    head = f"/tmp/{throwaway}-head.json"
+    first = _script(throwaway, r"""
+add_row(at(hours=5)); add_row(at(hours=4))
+out["stopped"] = passes()
+""")
+    assert first["stopped"] is None, first
+    assert _in_api("rm", "-f", head).returncode == 0
+    stopped = _script(throwaway, 'out["stopped"] = passes()\n')
+    assert stopped["stopped"] == "head-record-missing", stopped
+    code, seen, _err = _cli(throwaway, "accept-database-head", "--read")
+    assert code == 0 and seen["ok"] and seen["confirm"] and seen["confirm"][0].startswith("key-history-"), seen
+    code, refused, _err = _cli(throwaway, "accept-database-head", "--expect", seen["state"])
+    assert code == 2 and "confirm by name" in refused["error"], refused
+    code, done, err = _cli(throwaway, "accept-database-head", "--expect", seen["state"],
+                           *[x for c in seen["confirm"] for x in ("--confirm", c)])
+    assert code == 0 and done["ok"], (done, err[-3000:])
+    after = _script(throwaway, 'out["stopped"] = passes()\nout["report"] = report()\n')
+    assert after["stopped"] is None, after
+    _clean(after["report"])
+    _code, found, _answer = _verify(throwaway)
+    assert any("the head record missing" in f["message"] for f in found.get("restored") or []), found
+
+
+def test_a_database_cut_back_under_a_key_the_chain_left_needs_rekey_with_a_confirmation(throwaway):
+    under_a = throwaway + "_a"
+    try:
+        _script(throwaway, r"""
+for h in range(9, 4, -1):
+    add_row(at(hours=h))
+out["stopped"] = passes(at(hours=4))
+""", key=A)
+        psql(f"CREATE DATABASE {under_a} TEMPLATE {throwaway}")
+        assert _script(throwaway, 'out["stopped"] = passes()\n', key=B)["stopped"] == "key-change-waiting"
+        _two(throwaway, "rekey", "--old-key-stdin", key=B, stdin=A + "\n")
+        moved = _script(throwaway, 'out["stopped"] = passes()\n', key=B)
+        assert moved["stopped"] is None, moved
+        # The database put back to a copy from before the move: its chain ends under A, which the chain left.
+        psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{throwaway}'")
+        psql(f"DROP DATABASE {throwaway}")
+        psql(f"CREATE DATABASE {throwaway} TEMPLATE {under_a}")
+        assert _script(throwaway, 'out["stopped"] = passes()\n', key=B)["stopped"] == "head-record-mismatch"
+        code, seen, err = _cli(throwaway, "accept-database-head", "--old-key-stdin", "--read", key=B, stdin=A + "\n")
+        assert code == 0 and seen["ok"], (seen, err[-3000:])
+        assert any(c.startswith("left-key-") for c in seen["confirm"]), seen
+        assert any("A KEY THE RECORDED CHAIN LEFT" in ln for ln in seen["lines"]), seen
+        code, done, err = _cli(throwaway, "accept-database-head", "--old-key-stdin", "--expect", seen["state"],
+                               *[x for c in seen["confirm"] for x in ("--confirm", c)], key=B, stdin=A + "\n")
+        assert code == 0 and done["ok"], (done, err[-3000:])
+        assert _script(throwaway, 'out["stopped"] = passes()\n', key=B)["stopped"] == "key-not-current"
+        code, refused, _err = _cli(throwaway, "rekey", "--old-key-stdin", "--read", key=B, stdin=A + "\n")
+        if code == 0:
+            code, refused, _err = _cli(throwaway, "rekey", "--old-key-stdin", "--expect", refused["state"], key=B,
+                                       stdin=A + "\n")
+        assert code == 2 and "--confirm-return" in refused["error"], refused
+        _two(throwaway, "rekey", "--old-key-stdin", "--confirm-return", key=B, stdin=A + "\n")
+        after = _script(throwaway, 'out["stopped"] = passes()\nout["report"] = report()\n', key=B)
+        assert after["stopped"] is None, after
+        _clean(after["report"])
+        assert "restored-under-left-key" in after["report"]["information"], after
+    finally:
+        psql(f"DROP DATABASE IF EXISTS {under_a}")
