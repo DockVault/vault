@@ -423,6 +423,31 @@ def test_the_grace_takes_the_longest_delay_the_chain_and_the_head_records_give(e
     assert restore.grace_days(env.st.view, None, record) == 9
 
 
+def test_the_grace_takes_envs_delay_when_it_is_longer_than_the_chains_and_the_head_records(env, monkeypatch):
+    """RETENTION_REDUCTION_DELAY_DAYS raised to 12 in .env while sealing was stopped, longer than the accepted
+    chain's 7 and the head record's 7 (and the 9 a record's honoured state gives): the grace is .env's 12, for
+    accept-database-head's restore seal and for accept-restore's two records alike."""
+    _sealed_day(env)
+    newest = env.seals()[-1].seq
+    _cut_from(env, newest - 2)
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    record = env.st.head_store().load()
+    assert restore.grace_days(env.st.view, record) == 7
+    monkeypatch.setenv("RETENTION_REDUCTION_DELAY_DAYS", "12")
+    env.settings.retention_reduction_delay_days = 12
+    honoured = {"checkpoints": {"policy": {"state": {"reduction_delay_days": {"value": 1}},
+                                           "honoured": {"reduction_delay_days": {"value": 9}}}}}
+    assert restore.grace_days(env.st.view, record, honoured) == 12
+    seen, done = _accept(env)
+    assert done["grace_days"] == 12 and any("Nothing is deleted for 12 days" in ln for ln in seen["lines"])
+    seal = [s for s in env.seals() if s.kind == "restore"][-1]
+    assert fmt.parse_time_text(seal.detail["grace_until"]) - seal.sealed_at == timedelta(days=12)
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
+
+
 def test_a_lost_cancel_is_not_offered_for_another_request_at_its_seq(env):
     """The database's seal at the cancelled request's seq is another request (its link is not the one the record
     kept): the cancel is not offered for it."""
