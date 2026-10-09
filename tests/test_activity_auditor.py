@@ -128,8 +128,8 @@ def test_an_auditors_reading_is_recorded_once_in_ten_minutes(db, people):
 
 def test_a_reading_whose_record_cannot_be_written_is_refused(db, people, monkeypatch):
     def broken(*a, **k):
-        raise ca.Refused(ca.RECORD_FAILED)
-    monkeypatch.setattr(ca, "record", broken)
+        raise RuntimeError("the database refuses the row")
+    monkeypatch.setattr(AuditLogger, "build_row", broken)
     _, err = _call(av.require_activity_viewer, current_user=people.uma, db=db)
     assert err.status_code == 503
 

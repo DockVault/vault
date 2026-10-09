@@ -47,16 +47,19 @@ def reads_by_right(db, user, now: Optional[datetime] = None) -> bool:
 def note_events_viewed(db, user, now: Optional[datetime] = None) -> bool:
     """Record that the auditor ``user`` read the log, unless that was recorded in the last ten minutes. Returns
     whether a row was written. Raises HTTPException(503) when it cannot be written."""
-    from app.core import case_access
     from app.core.models import AuditLog
+    from app.services.audit_logger import AuditLogger
     now = now or utcnow()
     recent = db.query(AuditLog.id).filter(AuditLog.user_id == user.id, AuditLog.action == VIEWED,
                                           AuditLog.status == "success", AuditLog.timestamp >= now - QUIET).first()
     if recent is not None:
         return False
     try:
-        case_access.record(db, None, user, VIEWED, resource_type="audit_log", resource_id=None, details={})
-    except case_access.Refused:
+        db.add(AuditLogger(db).build_row(action=VIEWED, status="success", user=user, resource_type="audit_log",
+                                         details={}))
+        db.commit()
+    except Exception:  # noqa: BLE001 -- no read of the log by the right without its record
+        db.rollback()
         raise HTTPException(status_code=503, detail=(
             "Reading the activity log could not be recorded, so it was not shown. Try again shortly."))
     return True
