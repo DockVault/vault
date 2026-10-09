@@ -215,6 +215,7 @@ def test_every_compliance_action_is_in_its_own_category():
     for name in ("auditor_grant_proposed", "auditor_granted", "auditor_grant_refused", "auditor_suspended",
                  "case_requested", "case_approved", "case_file_viewed", "case_access_refused", "hold_placed",
                  "held_file_purged", "hold_blocked_delete", "audit_name_revealed", "owner_notice_written",
-                 "owner_notice_email_failed", "case_names_viewed", "auditor_events_viewed"):
+                 "owner_notice_email_failed", "case_names_viewed", "auditor_events_viewed", "case_access_ended",
+                 "owner_notice_seen", "owner_access_unlocked"):
         assert name in names, name
-    assert len(names) == 44
+    assert len(names) == 47
