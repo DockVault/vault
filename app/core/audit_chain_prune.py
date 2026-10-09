@@ -11,7 +11,9 @@ transaction, under the chain lock:
 3. deletes the rows and writes the ``prune`` seal with each changed hour's new count, bytes, roots and ids,
    naming the ``policy`` seal in force, together with the ``retention_pruned`` audit row.
 
-Only sealed hours are pruned: rows in hours not yet sealed (the first start's backlog, the current hour) wait.
+Only sealed hours are pruned: rows in hours not yet sealed (the first start's backlog, the current hour) wait. An
+hour whose root seal, or an erase seal after it, is a seal another writer appended after the head record is left
+as it is until the host acknowledges that seal: its rows may have been edited and sealed over.
 """
 from __future__ import annotations
 
@@ -113,6 +115,9 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None)
                 if hour.date() != day or batch.deleted >= p.batch_rows:
                     break
                 if view.entry_for(hour) is None:
+                    skipped.add(hour)
+                    continue
+                if ai.hour_held(view, w.record, hour) is not None:
                     skipped.add(hour)
                     continue
                 try:

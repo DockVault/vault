@@ -264,6 +264,20 @@ def database_seqs(view: View) -> List[int]:
     return sorted(out)
 
 
+def hour_held(view: View, record: Optional[dict], hour: datetime) -> Optional[int]:
+    """The seal that keeps the pruner from changing ``hour``: its root seal, or an erase seal after it, when that is
+    a seal another writer appended after the head record and the host has not acknowledged (the hour's rows may
+    have been edited and sealed over). None when there is none."""
+    entry = view.entry_for(hour)
+    if entry is None:
+        return None
+    waiting = unacknowledged_foreign(view, record)
+    for seq in [entry.root.seq] + list(entry.erases):
+        if seq in waiting:
+            return seq
+    return None
+
+
 # --------------------------------------------------------------------------- the process's state
 
 class ChainState:
