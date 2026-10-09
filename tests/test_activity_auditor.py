@@ -401,7 +401,8 @@ def test_the_routes_select_the_case_and_record_before_sending(monkeypatch):
     import inspect
     events = inspect.getsource(api.activity_events)
     assert "_activity_case(db, current_user, case, request)" in events and "**_case_filters(selection)" in events
-    assert events.index("_case_names(db, selection, current_user, events, rows)") < events.index('out["events"] = events')
+    names_at = events.index("_case_names(db, selection, current_user, events, rows)")
+    assert names_at < events.index('out["events"] = events')
     one = inspect.getsource(api.activity_event)
     assert "_case_names(db, selection, current_user, [event], [row])" in one
     assert "**_case_filters(selection)" in one
@@ -417,3 +418,80 @@ def test_the_summary_tells_only_an_administrator_what_is_happening_now():
     source = inspect.getsource(api.activity_summary)
     assert 'out["now"] = summary.now_panel(db, now, _activity_transfers()) if current_user.role == RoleEnum.ADMIN ' \
            'else None' in source
+
+
+# --------------------------------------------------------------------------- the edges
+
+def test_an_administrators_temporary_credential_reads_no_log(db, people, denials):
+    people.bob._is_temp_session = True
+    try:
+        _, err = _call(av.require_activity_viewer, current_user=people.bob, db=db)
+    finally:
+        people.bob._is_temp_session = False
+    assert err.status_code == 403 and [u for u, _ in denials] == ["bob"]
+
+
+def test_a_suspended_auditor_hears_no_signal(db, people, monkeypatch):
+    from app.core import database
+    monkeypatch.setattr(database, "SessionLocal", lambda: _same(db))
+    rights.suspend(db, rights.open_grant(db, people.uma.id), "password_changed")
+    db.commit()
+    assert rights.open_grant(db, people.uma.id) is not None
+    assert not api._ws_sees_activity(str(people.uma.id), False)
+
+
+def test_a_vault_the_case_may_no_longer_open_shows_no_name(db, people, storage, settings):
+    """A password vault approved under with_password, then the deployment refuses such vaults: the stricter rule
+    applies, and the vault shows nothing because of the case, not even its name."""
+    pv = _vault(db, people.olga, password="argon2-hash")
+    f = _file(db, storage, pv, name="salaries.csv")
+    case = _case(db, people, _vaults(pv), password_override=False)
+    settings[cs.PASSWORD_VAULTS] = cs.REFUSE
+    row = _event(db, "file_download", by=people.olga, resource_type="file", resource_id=f.id, vault=pv)
+    views, shown, _sel = _shown(db, people, case, [row])
+    assert views[0]["names"] == {"vault": an.NOT_SHOWN, "item": an.NOT_SHOWN} and shown == [set()]
+
+
+def test_an_item_of_another_vault_is_never_named_through_the_case(db, people, storage):
+    """An event that says it is in the case's vault but is about a file of another vault: the file is not named."""
+    elsewhere = _file(db, storage, people.v2, name="secret.txt")
+    case = _case(db, people, _vaults(people.v1))
+    row = _event(db, "file_download", by=people.olga, resource_type="file", resource_id=elsewhere.id,
+                 vault=people.v1)
+    views, _shown_, _sel = _shown(db, people, case, [row])
+    assert views[0]["names"]["vault"] == people.v1.name and views[0]["names"]["item"] != "secret.txt"
+
+
+def test_recorded_names_of_a_vault_outside_the_case_stay_shut(db, people, storage, monkeypatch):
+    f = _file(db, storage, people.v2, name="other.txt")
+    case = _case(db, people, _vaults(people.v1))
+    row = _event(db, "file_download", by=people.otto, resource_type="file", resource_id=f.id, vault=people.v2)
+    row.recorded = {"names": {"vault": str(people.v2.id), "values": {
+        "vault_name": {"fp": "fp2", "sealed": "sealed-vault"}, "file_name": {"fp": "fp1", "sealed": "sealed-file"}}}}
+    db.commit()
+    from app.core import audit_privacy
+    monkeypatch.setattr(audit_privacy, "open_name", lambda vault, row_id, key, sealed: f"opened:{sealed}")
+    views, shown, _sel = _shown(db, people, case, [row])
+    assert "opened:" not in str(views[0]) and shown == [set()]
+
+
+def test_the_events_route_selects_the_case_through_its_search_form(db, people, storage):
+    """The Events list for the case (through its search form, which passes every filter): only the case's events,
+    with the file's name shown because of the case and the page recorded once however often it is fetched."""
+    from types import SimpleNamespace as NS
+    f = _file(db, storage, people.v1, name="minutes.txt")
+    g = _file(db, storage, people.v2, name="other.txt")
+    case = _case(db, people, _vaults(people.v1))
+    mine = _event(db, "file_download", by=people.olga, resource_type="file", resource_id=f.id, vault=people.v1)
+    other = _event(db, "file_download", by=people.otto, resource_type="file", resource_id=g.id, vault=people.v2)
+    request = NS(headers={})
+    for _ in range(3):
+        out = asr.search_events(asr.EventsSearch(case=str(case.id), limit=100), request, current_user=people.uma,
+                                db=db)
+    ids = {e["id"] for e in out["events"]}
+    assert str(mine.id) in ids and str(other.id) not in ids
+    (shown,) = [e for e in out["events"] if e["id"] == str(mine.id)]
+    assert shown["names"]["item"] == "minutes.txt" and "item" in shown["shown_by_case"]
+    assert len(_rows(db, ac.VIEWED)) == 1
+    plain = asr.search_events(asr.EventsSearch(limit=100), request, current_user=people.uma, db=db)
+    assert str(other.id) in {e["id"] for e in plain["events"]}, "without the case, every event"
