@@ -7,7 +7,8 @@ in the 14 days before the request or since, an administrator of less than 14 day
 else set), it refuses whoever created the auditor's account and an administrator in that creator's lineage either
 way (one the creator made, one who made the creator: read now and as the grant's proposal kept it), whoever
 changed the auditor's sign-in details while the auditor's grant stood (the grant's own list), a person the case
-concerns, and whoever proposed the auditor's grant. A case whose grant is no longer recorded refuses everyone: the grant's list could not be read.
+concerns, whoever proposed the auditor's grant and an administrator in the proposer's lineage either way (read now
+and as the grant kept it when it was proposed). A case whose grant is no longer recorded refuses everyone: the grant's list could not be read.
 
 independent_approvers() is who could approve now: administrators who can act, with an authenticator set up (the
 approval asks for its code), refused by nothing. When there is none, the server's operator approves on the host
@@ -53,7 +54,7 @@ def approver_refusal(db, case, approver, now: Optional[datetime] = None) -> Opti
         return NO_GRANT
     from app.core.auditor_rights import creator_of
     auditor = db.get(User, case.auditor_id)
-    records = admin_grants.of(db, [approver.id, case.auditor_id])
+    records = admin_grants.of(db, [approver.id, case.auditor_id, grant.proposed_by])
     requested_at = case.requested_at or now
     creator, creator_grant = creator_of(db, auditor)
     kept = grant.proposal_snapshot or {}
@@ -66,7 +67,8 @@ def approver_refusal(db, case, approver, now: Optional[datetime] = None) -> Opti
         subject_created_by=creator, creator_grant=creator_grant, kept_creator=kept.get("creator"),
         kept_creator_lineage=kept.get("creator_lineage") or [],
         credential_changers=grant.credential_changers or [], concerned=concerned(db, case),
-        proposer_id=grant.proposed_by)
+        proposer_id=grant.proposed_by, proposer_grant=records.get(grant.proposed_by),
+        kept_proposer=kept.get("requester"), kept_proposer_lineage=kept.get("lineage") or [])
 
 
 def independent_approvers(db, case, now: Optional[datetime] = None) -> list:

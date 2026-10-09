@@ -29,7 +29,13 @@ refuses besides (compliance_refusal_reason):
   * anyone who changed the auditor's sign-in details while the grant stood (CHANGED_SUBJECT), read from the
     grant's own list, which outlives the records of credential changes (pruned 14 days after they apply);
   * a person the case concerns (CONCERNED): an owner of a vault in it, a custodian, someone named;
-  * whoever proposed the auditor's grant (PROPOSED).
+  * whoever proposed the auditor's grant (PROPOSED), and an administrator in the proposer's lineage, either way:
+    one the proposer made, directly or through administrators the proposer made (MADE_BY_PROPOSER), and one who
+    made the proposer an administrator (MADE_PROPOSER). For a grant the proposer is the one who asked, whose
+    lineage the rule above reads; for a case it is read from the proposer's record now and from what the grant
+    kept when it was proposed (the proposer's id and lineage), as the creator's is: an auditor with no recorded
+    creator (self-signup, or a creator deleted before the proposal) would otherwise let the proposer's stand-in
+    approve the case.
 Two paths would otherwise let one person read a vault: a stand-in administrator (A makes B an administrator,
 then B approves A's grant and A's case) and a stand-in account (A creates U, someone grants U the right, and A
 approves U's case). Combined, they are one path too: A creates U and makes B an administrator, and B approves U's
@@ -65,6 +71,8 @@ MADE_CREATOR = "made_creator"            # they made whoever created the auditor
 CHANGED_SUBJECT = "changed_subject"      # they changed the auditor's sign-in details while the grant stood
 CONCERNED = "concerned"                  # the case concerns them
 PROPOSED = "proposed"                    # they proposed the auditor's grant
+MADE_BY_PROPOSER = "made_by_proposer"    # whoever proposed the auditor's grant made them an administrator
+MADE_PROPOSER = "made_proposer"          # they made whoever proposed the auditor's grant an administrator
 
 
 def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant, changed: Set,
@@ -123,7 +131,8 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
                               approver_password_set_by_other: bool = False, subject_created_by=None,
                               creator_grant=None, kept_creator=None, kept_creator_lineage: Iterable = (),
                               credential_changers: Iterable = (), concerned: Iterable = (),
-                              proposer_id=None) -> Optional[str]:
+                              proposer_id=None, proposer_grant=None, kept_proposer=None,
+                              kept_proposer_lineage: Iterable = ()) -> Optional[str]:
     """Why ``approver_id`` may not approve a compliance step about the auditor ``subject_id`` that
     ``requester_id`` asked for at ``requested_at`` (the auditor, for a case; the proposer, for a grant), or None.
     refusal_reason() first, with the auditor as the account it is about, then the refusals compliance adds (the
@@ -131,7 +140,9 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
     who created the auditor's account, ``creator_grant`` the creator's admin_grants record (None: none),
     ``kept_creator`` and ``kept_creator_lineage`` the creator and their lineage as kept earlier (an auditor
     grant's, when it was proposed), ``credential_changers`` the grant's list, ``concerned`` the persons the case
-    concerns, ``proposer_id`` who proposed the grant."""
+    concerns, ``proposer_id`` who proposed the grant, ``proposer_grant`` the proposer's admin_grants record (None:
+    none), ``kept_proposer`` and ``kept_proposer_lineage`` the proposer and their lineage as the grant kept them
+    when it was proposed."""
     from app.core import admin_grants
     # Every id in one text form before the rule compares them: the same person's id read from a column (a UUID)
     # and from a record or a request (text, in any case, with or without hyphens) must compare equal, and
@@ -163,6 +174,14 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
         return CHANGED_SUBJECT
     if who in {_as_text(person) for person in concerned or () if person is not None}:
         return CONCERNED
-    if proposer_id is not None and _as_text(proposer_id) == who:
+    # Whoever proposed the grant, through an administrator either way: one they made, directly or through
+    # administrators they made, and one who made them an administrator.
+    proposers = {_as_text(person) for person in (proposer_id, kept_proposer) if person is not None}
+    if who in proposers:
         return PROPOSED
+    if any(admin_grants.made_by(approver_grant, proposer) for proposer in proposers):
+        return MADE_BY_PROPOSER
+    kept_proposers = {_as_text(person) for person in kept_proposer_lineage or () if person is not None}
+    if admin_grants.made_by(proposer_grant, who) or who in kept_proposers:
+        return MADE_PROPOSER
     return None

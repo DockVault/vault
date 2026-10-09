@@ -43,6 +43,7 @@ from typing import Iterable, Optional
 from app.core import after_commit
 from app.core import case_rules as rules
 from app.core import compliance_settings as cs
+from app.core import independence as ind
 from app.core import owner_notices
 from app.core.case_context import acting_for
 
@@ -102,6 +103,12 @@ TEXTS = {
     SFTP_VERSION: "an SFTP server of another version may be running: a hold cannot be placed now",
     HOLD_STANDS_AGAIN: ("a legal hold of the case stands again (its release was undone): closing the case releases "
                         "it, which asks for your code; try again"),
+    # The independence rule's reasons about the auditor's account, said of a case with access.
+    ind.CREATED_SUBJECT: "you created the auditor's account, so you knew its first password",
+    ind.MADE_BY_CREATOR: "whoever created the auditor's account made you an administrator",
+    ind.MADE_CREATOR: "you made whoever created the auditor's account an administrator",
+    ind.MADE_BY_PROPOSER: "whoever proposed the auditor's right made you an administrator",
+    ind.MADE_PROPOSER: "you made whoever proposed the auditor's right an administrator",
 }
 
 

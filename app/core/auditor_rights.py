@@ -99,6 +99,8 @@ TEXTS = {
     ind.CHANGED_SUBJECT: "you changed the account's sign-in details while it held the right",
     ind.CONCERNED: "the case concerns you",
     ind.PROPOSED: "you proposed the account's auditor right",
+    ind.MADE_BY_PROPOSER: "whoever proposed the account's auditor right made you an administrator",
+    ind.MADE_PROPOSER: "you made whoever proposed the account's auditor right an administrator",
 }
 
 

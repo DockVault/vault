@@ -963,6 +963,86 @@ def test_the_creator_kept_with_the_grant_still_refuses_after_the_creator_is_dele
     assert cases.decision_refusal(db, case, creators.zed) == ind.MADE_CREATOR
 
 
+# --------------------------------------------------------------------------- the grant's proposer's lineage
+
+@pytest.fixture
+def proposers(db, people):
+    """uma's account has no recorded creator (self-signup, or a creator deleted before the proposal); ada proposed
+    her right. zed made ada an administrator, and ada made bea one."""
+    zed = _user(db, "zed", m.RoleEnum.ADMIN)
+    admin_grants.record(db, people.ada.id, granted_by_id=zed.id, granted_by_name="zed", now=rights.utcnow() - OLD)
+    bea = _user(db, "bea", m.RoleEnum.ADMIN)
+    admin_grants.record(db, bea.id, granted_by_id=people.ada.id, granted_by_name="ada", now=rights.utcnow() - OLD)
+    db.commit()
+    assert people.uma.created_by is None and people.grant.proposed_by == people.ada.id
+    return SimpleNamespace(zed=zed, bea=bea)
+
+
+@pytest.mark.parametrize("who,reason", [("bea", ind.MADE_BY_PROPOSER), ("zed", ind.MADE_PROPOSER)])
+def test_an_administrator_in_the_lineage_of_the_grants_proposer_decides_no_step_of_the_case(db, people, proposers,
+                                                                                           no_codes, who, reason):
+    approver = getattr(proposers, who)
+    case = _ask(db, people.uma, _vaults(people.v1))
+    assert cases.decision_refusal(db, case, approver) == reason
+    assert sorted(a.username for a in cases.independent_approvers(db, case)) == ["bob", "carl"]
+    _, err = _call(cr.approve_case, case.id, request=None, if_match='"1"', current_user=approver, db=db)
+    assert err.status_code == 403 and err.detail["reason"] == reason and no_codes == []
+    assert _rows(db, "case_approved", "failure")[-1].details["reason"] == reason
+    assert err.detail["text"] == cases.text(reason) != reason
+    _, err = _call(cr.reject_case, case.id, cr.Reason(reason="No grounds."), request=None, current_user=approver,
+                   db=db)
+    assert err.status_code == 403 and err.detail["reason"] == reason and no_codes == []
+    assert case.status == "pending"
+    _approve(db, case, people.bob)
+    for refusal in (cases.extend_refusal, cases.narrow_refusal, cases.close_refusal, holds.release_refusal):
+        assert refusal(db, case, approver) == reason, refusal.__name__
+        assert refusal(db, case, people.carl) is None, refusal.__name__
+    holds.release(db, case, by=people.carl, reason="Not needed.")
+    db.commit()
+    assert holds.undo_refusal(db, case, approver) == reason
+    held = holds.place_hold_only(db, people.uma, [people.v2.id], **TEXT)
+    db.commit()
+    assert held.grant_id == people.grant.id
+    assert holds.confirm_refusal(db, held, approver) == reason
+    assert holds.confirm_refusal(db, held, people.carl) is None
+
+
+def test_the_proposer_kept_with_the_grant_still_refuses_after_the_proposer_is_demoted_or_deleted(db, people,
+                                                                                                proposers):
+    """The case reads the proposer and their lineage as the grant kept them when it was proposed: demoting the
+    proposer deletes their lineage, and deleting them clears the grant's proposed_by."""
+    rights.revoke(db, people.grant, actor=people.carl, reason="Renewed.")
+    db.commit()
+    grant = rights.propose(db, people.uma, proposer=people.ada, now=rights.utcnow() - timedelta(hours=2))
+    db.commit()
+    assert grant.proposal_snapshot["requester"] == str(people.ada.id)
+    assert grant.proposal_snapshot["lineage"] == [str(proposers.zed.id)]
+    rights.approve(db, grant, approver=people.bob, now=rights.utcnow() - timedelta(hours=1))
+    db.commit()
+    case = _ask(db, people.uma, _vaults(people.v1))
+    assert case.grant_id == grant.id
+    admin_grants.forget(db, people.ada.id)
+    db.commit()
+    assert cases.decision_refusal(db, case, proposers.zed) == ind.MADE_PROPOSER, "kept lineage, proposer demoted"
+    grant.proposed_by = None
+    db.commit()
+    assert cases.decision_refusal(db, case, proposers.bea) == ind.MADE_BY_PROPOSER, "kept proposer, since deleted"
+    assert cases.decision_refusal(db, case, proposers.zed) == ind.MADE_PROPOSER
+    assert cases.decision_refusal(db, case, people.carl) is None
+
+
+def test_the_grant_itself_refuses_the_proposers_lineage_as_the_one_who_asked(db, people, proposers):
+    """Approving the right refuses the proposer's lineage already, as the one who asked: the case adds the same for
+    every later step."""
+    rights.revoke(db, people.grant, actor=people.carl, reason="Renewed.")
+    db.commit()
+    grant = rights.propose(db, people.uma, proposer=people.ada)
+    db.commit()
+    assert rights.approver_refusal(db, grant, proposers.bea) == ind.MADE_BY_REQUESTER
+    assert rights.approver_refusal(db, grant, proposers.zed) == ind.MADE_REQUESTER
+    assert rights.approver_refusal(db, grant, people.bob) is None
+
+
 # --------------------------------------------------------------------------- the approval's hold and deletions
 
 def test_the_approval_locks_the_vaults_its_hold_covers_before_it_reads_their_owners(db, people, monkeypatch):

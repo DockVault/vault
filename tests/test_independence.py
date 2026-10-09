@@ -54,7 +54,7 @@ def test_the_reasons_are_distinct():
     reasons = [ind.ASKED, ind.OWN_ACCOUNT, ind.REQUESTER_GONE, ind.MADE_BY_REQUESTER, ind.MADE_REQUESTER,
                ind.CHANGED_ACCOUNT, ind.BECAME_ADMIN_AFTER, ind.NEW_ADMIN, ind.PASSWORD_NOT_OWN, ind.MADE_BY_SUBJECT,
                ind.MADE_SUBJECT, ind.CREATED_SUBJECT, ind.MADE_BY_CREATOR, ind.MADE_CREATOR, ind.CHANGED_SUBJECT,
-               ind.CONCERNED, ind.PROPOSED]
+               ind.CONCERNED, ind.PROPOSED, ind.MADE_BY_PROPOSER, ind.MADE_PROPOSER]
     assert len(set(reasons)) == len(reasons)
 
 
@@ -65,13 +65,15 @@ AUDITOR, PROPOSER, APPROVER, MAKER, OTHER, CREATOR = (uuid.uuid4() for _ in rang
 
 def _decide(approver=APPROVER, *, requester=AUDITOR, subject=AUDITOR, approver_grant=None, requester_grant=None,
             subject_grant=None, changed=(), password_by_other=False, created_by=None, creator_grant=None,
-            kept_creator=None, kept_creator_lineage=(), changers=(), concerned=(), proposer=PROPOSER):
+            kept_creator=None, kept_creator_lineage=(), changers=(), concerned=(), proposer=PROPOSER,
+            proposer_grant=None, kept_proposer=None, kept_proposer_lineage=()):
     return ind.compliance_refusal_reason(
         approver, requester_id=requester, subject_id=subject, approver_grant=approver_grant,
         requester_grant=requester_grant, subject_grant=subject_grant, changed=set(changed), requested_at=AT,
         approver_password_set_by_other=password_by_other, subject_created_by=created_by,
         creator_grant=creator_grant, kept_creator=kept_creator, kept_creator_lineage=kept_creator_lineage,
-        credential_changers=changers, concerned=concerned, proposer_id=proposer)
+        credential_changers=changers, concerned=concerned, proposer_id=proposer, proposer_grant=proposer_grant,
+        kept_proposer=kept_proposer, kept_proposer_lineage=kept_proposer_lineage)
 
 
 # (name, the decision's arguments, the reason or None)
@@ -143,6 +145,29 @@ CASES = [
     ("the grant's proposer approves the case", {"proposer": APPROVER}, ind.PROPOSED),
     ("the grant's proposer, by text", {"proposer": str(APPROVER)}, ind.PROPOSED),
     ("no proposer known", {"proposer": None}, None),
+    # The proposer's lineage, either way, for a case (an auditor with no recorded creator: self-signup, or a creator
+    # deleted before the proposal): read now, and as the grant kept it when it was proposed.
+    ("the proposer made the approver", {"approver_grant": _grant([PROPOSER])}, ind.MADE_BY_PROPOSER),
+    ("the proposer made the approver, two steps down", {"approver_grant": _grant([MAKER, PROPOSER])},
+     ind.MADE_BY_PROPOSER),
+    ("the proposer made the approver, by text", {"proposer": str(PROPOSER).upper(),
+                                                 "approver_grant": _grant([PROPOSER])}, ind.MADE_BY_PROPOSER),
+    ("the approver made the proposer", {"proposer_grant": _grant([APPROVER])}, ind.MADE_PROPOSER),
+    ("the approver made the proposer, two steps up", {"proposer_grant": _grant([APPROVER, MAKER])},
+     ind.MADE_PROPOSER),
+    ("the proposer kept, since deleted: made the approver", {"proposer": None, "kept_proposer": PROPOSER,
+                                                             "approver_grant": _grant([PROPOSER])},
+     ind.MADE_BY_PROPOSER),
+    ("the proposer kept, the approver themselves", {"proposer": None, "kept_proposer": str(APPROVER)},
+     ind.PROPOSED),
+    ("the proposer's lineage kept, since demoted", {"kept_proposer_lineage": [str(APPROVER).upper(), None]},
+     ind.MADE_PROPOSER),
+    ("siblings: one administrator made the proposer and the approver",
+     {"proposer_grant": _grant([OTHER]), "approver_grant": _grant([OTHER]), "kept_proposer_lineage": [str(OTHER)]},
+     None),
+    ("the approver made someone who did not propose", {"approver_grant": _grant([OTHER])}, None),
+    ("a person concerned before the proposer's lineage", {"concerned": [APPROVER],
+                                                          "approver_grant": _grant([PROPOSER])}, ind.CONCERNED),
     # The rule's own refusals come first.
     ("the auditor approves their own case", {"approver": AUDITOR}, ind.ASKED),
     ("the auditor approves their own grant", {"approver": AUDITOR, "requester": PROPOSER}, ind.OWN_ACCOUNT),
