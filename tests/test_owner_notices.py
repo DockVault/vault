@@ -510,3 +510,14 @@ def test_the_note_is_in_the_email_of_an_activation_never_in_the_notification(mad
     assert "The auditor's note to you is on Access to my vaults." in body and TEXT["owner_note"] not in body
     row.kind = on.HOLD_PLACED
     assert TEXT["owner_note"] not in on.email_context(db, row, case)["change"]
+
+
+def test_a_sender_skips_a_row_another_sender_holds_instead_of_waiting_for_it(db, monkeypatch):
+    """The sender's advisory lock keeps a second sender out; each row is still read FOR UPDATE SKIP LOCKED, so one
+    that got in anyway moves on to the next row. (PostgreSQL's clause; SQLite has no row locks.)"""
+    from sqlalchemy.dialects import postgresql
+    sql = " ".join(str(on.due_query(db, NOW).statement.compile(dialect=postgresql.dialect())).split())
+    assert sql.endswith("FOR UPDATE SKIP LOCKED"), sql
+    picked = SimpleNamespace(first=lambda: "the next row")
+    monkeypatch.setattr(on, "due_query", lambda db_, now: picked)
+    assert on.due(db, NOW) == "the next row"

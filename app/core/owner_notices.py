@@ -520,12 +520,19 @@ def _attempt(db, row, now: datetime, send: Callable) -> str:
     return row.status
 
 
-def due(db, now: datetime):
-    """The next row due to be sent, locked for this transaction (rows another sender holds are skipped)."""
+def due_query(db, now: datetime):
+    """The rows due to be sent, oldest first, each locked for the transaction that reads it; a row another sender
+    holds is skipped (SKIP LOCKED), not waited for. The sender's advisory lock already keeps a second sender out;
+    one that got in anyway moves on to the next row instead of waiting for the first."""
     from app.core.models import ComplianceNoticeOutbox as O
     return (db.query(O).filter(O.status.in_((PENDING, RETRYING)),
                                or_(O.next_attempt_at.is_(None), O.next_attempt_at <= now))
-            .order_by(O.created_at, O.id).with_for_update(skip_locked=True).first())
+            .order_by(O.created_at, O.id).with_for_update(skip_locked=True))
+
+
+def due(db, now: datetime):
+    """The next row due to be sent, locked for this transaction (rows another sender holds are skipped)."""
+    return due_query(db, now).first()
 
 
 def send_due(session_factory: Optional[Callable] = None, *, engine=None, now: Optional[Callable] = None,
