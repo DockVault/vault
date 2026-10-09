@@ -341,7 +341,9 @@ def test_the_fetch_checks_the_case_and_every_file_again_and_changes_nothing_when
 # --------------------------------------------------------------------------- names in the archive
 
 HOSTILE = ["../escape.txt", "/etc/passwd", "C:\\Windows\\win.ini", "con.txt", "a\x00b\x1fc\u202e.txt", "x" * 1000,
-           "dup.txt", "dup.txt", "DUP.TXT", "...", "trailing. ", "nul"]
+           "dup.txt", "dup.txt", "DUP.TXT", "...", "trailing. ", "nul",
+           # Equal ignoring case only once folded: the second sorts after the first.
+           "SS.txt", "ß.txt"]
 
 
 def test_hostile_names_become_safe_unique_entries_and_the_manifest_keeps_them(db, people, storage, codes):
@@ -533,3 +535,118 @@ def test_only_the_export_reads_a_stored_file_without_its_checksum_check():
 def test_the_export_is_the_only_new_reader_of_stored_files_for_a_case():
     source = Path(ce.__file__).read_text(encoding="utf-8")
     assert source.count("_open_stored_file(") == 1 and "ca._vault_service(db)._open_stored_file" in source
+
+
+# --------------------------------------------------------------------------- what "every file" leaves out, and what
+# the fetch checks again
+
+def test_every_file_leaves_out_what_the_case_may_not_export_instead_of_refusing_it(db, people, storage, codes):
+    """A zero-knowledge vault, a locked password vault, a file outside the time range and a kept file due for its
+    purge are left out of "every file"; the rest is exported."""
+    zk = _vault(db, people.olga, kind="zero_knowledge")
+    _file(db, storage, zk, name="sealed.bin")
+    pv = _vault(db, people.olga, password="argon2-hash")
+    _file(db, storage, pv, name="salaries.csv")
+    keep = _file(db, storage, people.v1, name="recent.txt")
+    old = _file(db, storage, people.v1, name="old.txt")
+    old.created_at = old.updated_at = ca.utcnow() - timedelta(days=400)
+    due = _kept(db, _file(db, storage, people.v1, name="purged.txt"))
+    due.purge_after = ca.utcnow() - timedelta(minutes=1)
+    db.commit()
+    case = _case(db, people, _vaults(people.v1, zk, pv), can_export=True,
+                 files_from=ca.utcnow() - timedelta(days=30))
+    out = _prepare(db, people, case, every=True)
+    assert db.get(m.ComplianceExport, uuid.UUID(out["export_id"])).file_ids == [str(keep.id)]
+
+
+def test_an_export_is_fetched_only_by_the_account_that_prepared_it(db, people, storage, codes):
+    f = _file(db, storage, people.v1)
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    out = _prepare(db, people, case, [f])
+    export = db.get(m.ComplianceExport, uuid.UUID(out["export_id"]))
+    export.created_by = people.mallory.id
+    db.commit()
+    _, err = _call(_fetch, db, people, case, out["export_id"])
+    assert err.status_code == 404 and err.detail["reason"] == ce.NO_SUCH_EXPORT
+    assert export.fetched_at is None
+
+
+def test_a_fetched_export_is_refused_as_fetched_before_its_files_are_checked_again(db, people, storage, codes):
+    f = _file(db, storage, people.v1)
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    out = _prepare(db, people, case, [f])
+    _body(_fetch(db, people, case, out["export_id"]))
+    people.v1.password_hash = "argon2-hash"
+    db.commit()
+    _, err = _call(_fetch, db, people, case, out["export_id"])
+    assert err.status_code == 410 and err.detail["reason"] == ce.FETCHED
+
+
+def test_two_fetches_at_once_give_the_archive_once(db, people, storage, codes, monkeypatch):
+    """The fetch marks the export fetched only where it is not yet: another fetch that read it unfetched a moment
+    before and committed first leaves this one nothing."""
+    from sqlalchemy.orm import sessionmaker
+    f = _file(db, storage, people.v1)
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    out = _prepare(db, people, case, [f])
+    real = ca.unlocked_vaults
+    other = sessionmaker(bind=db.get_bind())()
+
+    def meanwhile(*a, **k):
+        other.query(m.ComplianceExport).filter(m.ComplianceExport.id == uuid.UUID(out["export_id"])).update(
+            {"fetched_at": ca.utcnow()})
+        other.commit()
+        return real(*a, **k)
+    monkeypatch.setattr(ca, "unlocked_vaults", meanwhile)
+    with pytest.raises(ca.Refused) as refused:
+        ce.claim(db, case.id, out["export_id"], people.uma, session_hash=SESSION)
+    other.close()
+    assert refused.value.reason == ce.FETCHED
+    assert db.query(m.ComplianceNoticeOutbox).filter(m.ComplianceNoticeOutbox.kind == "export").count() == 0
+
+
+def test_a_password_vault_must_be_unlocked_again_to_fetch_its_export(db, people, storage, codes):
+    pv = _vault(db, people.olga, password="argon2-hash")
+    f = _file(db, storage, pv, name="salaries.csv")
+    case = _case(db, people, _vaults(pv), can_export=True)
+    unlock = f"{pv.id}={_receipt(case, pv, people.uma)}"
+    out = _prepare(db, people, case, [f], unlock=unlock)
+    _, err = _call(_fetch, db, people, case, out["export_id"])
+    assert err.status_code == 403 and err.detail["reason"] == ca.LOCKED
+    assert db.get(m.ComplianceExport, uuid.UUID(out["export_id"])).fetched_at is None
+    assert _rows(db, "case_export_completed") == []
+    _body(_fetch(db, people, case, out["export_id"], unlock=unlock))
+    assert len(_rows(db, "case_export_completed")) == 1
+
+
+def test_an_export_stops_when_exports_are_turned_off(db, people, storage, codes, settings):
+    a = _file(db, storage, people.v1, name="a.txt", content=b"first")
+    b = _file(db, storage, people.v1, name="b.txt", content=b"second")
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    parts, _export_id = _stream(db, people, case, [a, b])
+    next(parts)
+    settings[cs.EXPORT] = cs.DISABLED
+    with pytest.raises(ce.Stopped):
+        while True:
+            next(parts)
+    parts.close()
+    (row,) = _rows(db, "case_export_aborted", "failure")
+    assert row.details["reason"] == ce.EXPORT_OFF and row.details["file_count"] == 1
+
+
+def test_the_response_closes_its_stream_when_the_client_goes_away(db, people, storage, codes):
+    """The route's body ends the export when its reader stops (a client gone): the abort is recorded at once, not
+    when the response is collected."""
+    a = _file(db, storage, people.v1, name="a.txt", content=b"a" * 5000)
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    out = _prepare(db, people, case, [a])
+    resp = _fetch(db, people, case, out["export_id"])
+
+    async def one_then_leave():
+        body = resp.body_iterator
+        piece = await body.__anext__()
+        await body.aclose()
+        return piece
+    assert run_coroutine(one_then_leave())
+    (row,) = _rows(db, "case_export_aborted", "failure")
+    assert row.details["export_id"] == out["export_id"] and resp is not None
