@@ -28,9 +28,14 @@ VALUES = (NAME, "alice.martin%40example.com", "alice.martin", ADDRESS, TEXT, "qu
 NAMES = "/activity/events?user&user_match&ip&q&category&category"
 
 
-def _uvicorn_line(target):
+# Every method a request line can carry: a search can be sent with any of them, and a line read back may
+# hold any of them.
+METHODS = ("GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")
+
+
+def _uvicorn_line(target, method="GET"):
     rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %s',
-                            ("198.51.100.20:5123", "GET", target, "1.1", 200), None)
+                            ("198.51.100.20:5123", method, target, "1.1", 200), None)
     assert AccessLogRedactFilter().filter(rec) is True
     return rec.getMessage()
 
@@ -40,10 +45,11 @@ def _assert_no_value(text):
         assert value not in text, f"{value!r} reached the line: {text}"
 
 
-def test_an_activity_search_reaches_the_uvicorn_line_as_names_only():
-    line = _uvicorn_line(SEARCH)
+@pytest.mark.parametrize("method", METHODS)
+def test_an_activity_search_reaches_the_uvicorn_line_as_names_only(method):
+    line = _uvicorn_line(SEARCH, method)
     _assert_no_value(line)
-    assert f'"GET {NAMES} HTTP/1.1"' in line
+    assert f'"{method} {NAMES} HTTP/1.1"' in line
 
 
 def test_an_activity_search_reaches_the_in_app_line_as_names_only():
@@ -52,11 +58,12 @@ def test_an_activity_search_reaches_the_in_app_line_as_names_only():
     assert access_target(path, "") == path and access_target("/vaults", None) == "/vaults"
 
 
-def test_a_line_read_back_from_before_the_change_serves_names_only():
-    old = f'[web] INFO: 172.18.0.1:40112 - "GET {SEARCH} HTTP/1.1" 200 OK'
+@pytest.mark.parametrize("method", METHODS)
+def test_a_line_read_back_from_before_the_change_serves_names_only(method):
+    old = f'[web] INFO: 172.18.0.1:40112 - "{method} {SEARCH} HTTP/1.1" 200 OK'
     out = redact_secret_urls_in_text(old)
     _assert_no_value(out)
-    assert f'"GET {NAMES} HTTP/1.1" 200 OK' in out
+    assert f'"{method} {NAMES} HTTP/1.1" 200 OK' in out
     from app.services import log_pull
     _assert_no_value(log_pull.redact_log_text(old, []))
 
