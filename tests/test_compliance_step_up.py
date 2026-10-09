@@ -334,6 +334,9 @@ def test_the_web_app_shows_them_below_the_matrix_without_a_switch():
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     assert "window.renderFixedStepUps = renderFixedStepUps;" in script
-    assert "innerHTML" not in script and "'input'" not in script
+    # The list is read-only: its renderer makes no control (the page's other screens do, elsewhere in the file).
+    fixed = script[script.index("function renderFixedStepUps(fixed) {"):script.index("window.renderFixedStepUps = ")]
+    assert "innerHTML" not in script
+    assert not [c for c in ("'input'", "'select'", "'button'", "'textarea'") if c in fixed]
     assert app.count("window.renderFixedStepUps((data && data.fixed) || [])") == 1
     assert index.count('<script src="/static/js/compliance.js?v=') == 1
