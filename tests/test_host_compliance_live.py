@@ -106,8 +106,13 @@ def test_a_case_needs_its_reference_and_no_independent_administrator(admin, prop
     answer = tool("approve", "--case", case_id, "--confirm-case", "00000000")
     assert answer["ok"] is False and "does not match" in answer["error"]
     answer = tool("approve", "--case", case_id, "--confirm-case", reference)
-    assert answer["ok"] is False and "not available" in answer["error"]
+    # The reference typed again and no administrator able to approve: the host's approval itself runs, and refuses
+    # this case, whose auditor's right was only proposed. Each refusal is recorded as the host's.
+    assert answer["ok"] is False and "right is not in force" in answer["error"], answer
     assert psql(f"SELECT status, number IS NULL FROM compliance_cases WHERE id='{case_id}'") == "pending|t"
+    assert psql("SELECT string_agg(coalesce(username, '') || '/' || status || '/' || (details::jsonb ->> 'reason'), "
+                f"',' ORDER BY timestamp) FROM audit_logs WHERE action = 'case_approved' AND case_id = '{case_id}' "
+                "AND details::jsonb ->> 'reason' = 'auditor_not_live'") == f"{HOST}/failure/auditor_not_live"
 
 
 def test_downgrade_blockers_from_both_tools():
