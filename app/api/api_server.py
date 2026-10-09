@@ -42,6 +42,7 @@ bootstrap_entrypoint("API")
 from app.core.database import get_db, init_db, check_db_connection, redis_probe_ping
 from app.core import vault_attempt_throttle
 from app.core.sign_in_lockout import source_of
+from app.core import zero_knowledge_rules as zk_rules
 from app.core import redis_guard
 from app.core.rate_limiter import redis_circuit_open, retry_after_seconds
 from app.core.auth_offload import (
@@ -4106,11 +4107,18 @@ async def get_settings(
     data = dict(row.value) if row and row.value else {}
     for k in _SETTINGS_SENSITIVE:
         data.pop(k, None)
-    # Report the EFFECTIVE zero-knowledge state (plan ceiling + auto-enable), not the raw
-    # stored flag: the admin toggle must reflect reality, or a settings save (which sends the
-    # whole object) would persist the unchecked default and silently disable the auto-enabled
-    # feature. An explicit admin off is preserved (_zk_enabled returns it verbatim).
-    data["zero_knowledge_enabled"] = _zk_enabled(db)
+    # The two zero-knowledge switches AS SAVED (a never-saved zero-knowledge switch counts as on, so a save
+    # that sends the object back cannot turn the auto-enabled feature off), what is in effect beside them,
+    # and why they are locked when they cannot change anything now (app/core/zero_knowledge_rules.py). The
+    # saved value, not the effective one: reported while the plan lacked zero-knowledge, the effective "off"
+    # came back on the next save and stayed when the plan got zero-knowledge back.
+    _stored_switches = {k: data.get(k) for k in zk_rules.SWITCHES}
+    _allowed = _allowed_vault_types()
+    data["zero_knowledge_enabled"] = zk_rules.switch_on(_stored_switches)
+    data["force_zero_knowledge"] = zk_rules.force_on(_stored_switches)
+    data["zero_knowledge_in_effect"] = _zk_enabled(db)
+    data["force_zero_knowledge_in_effect"] = zk_rules.force_in_effect(_stored_switches, _allowed)
+    data["zero_knowledge_switches_locked"] = zk_rules.switch_lock(_allowed)
     # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default
     # ('deployment') even when never explicitly saved.
     data["directory_search_scope"] = _directory_search_scope(db)
@@ -4350,6 +4358,10 @@ async def update_settings(
     from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     existing = dict(row.value) if row and row.value else {}
+    try:
+        payload = zk_rules.settle_switches(payload, existing, _allowed_vault_types())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     merged = {**existing, **(payload or {})}
     if row is None:
         db.add(SystemSetting(key=_SETTINGS_KEY, value=merged))
@@ -7213,7 +7225,7 @@ async def get_zk_enabled(
         # the local admin 'force_zero_knowledge' toggle. Lets the Settings page show that the
         # requirement is imposed by the plan (a floor the local toggle can't drop below),
         # instead of an unchecked box that looks contradictory when ZK is already forced.
-        "plan_force_zero_knowledge": bool(settings.plan_force_zero_knowledge and settings.plan_zero_knowledge),
+        "plan_force_zero_knowledge": zk_rules.plan_forces(),
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
@@ -16275,11 +16287,9 @@ def _allowed_vault_types() -> set:
     comma-separated PLAN_* env). Entries are normalised and intersected with the
     recognised VAULT_TYPES; an EMPTY or all-unrecognised value means NO restriction —
     every recognised type is allowed (the permissive default). Never returns an empty
-    set, so a mis-set env can't brick all vault creation."""
-    raw = settings.plan_allowed_vault_types or ""
-    wanted = {t.strip().lower() for t in raw.split(",") if t.strip()}
-    allowed = wanted & VAULT_TYPES
-    return allowed or set(VAULT_TYPES)
+    set, or only zero-knowledge on a plan that does not offer it, so a mis-set env can't
+    brick all vault creation (app/core/zero_knowledge_rules.py)."""
+    return zk_rules.allowed_types(settings.plan_allowed_vault_types, VAULT_TYPES)
 
 
 def _is_zk_vault(vault) -> bool:
@@ -16325,18 +16335,19 @@ def _zk_enabled(db) -> bool:
     When the plan GRANTS zero-knowledge, ZK is AUTO-ENABLED unless a local admin has
     explicitly turned it off. The local 'zero_knowledge_enabled' setting now acts only as an
     admin override: absent => on (the entitled tenant gets ZK without an undiscoverable
-    manual click), explicitly False => off, explicitly True => on. get_settings() reports
-    this EFFECTIVE value so a settings save can't silently clobber the auto-enable."""
-    if not settings.plan_zero_knowledge:
+    manual click), explicitly False => off, explicitly True => on. A plan whose cap on
+    zero-knowledge vaults is 0 offers none, and where the operator allows only
+    zero-knowledge vaults an administrator's off switch would leave nothing to make, so
+    it does not apply (app/core/zero_knowledge_rules.py)."""
+    if not zk_rules.plan_offers():
         return False
-    if settings.plan_force_zero_knowledge:
+    if zk_rules.plan_forces():
         return True
     try:
         from app.core.models import SystemSetting
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
-        override = val.get("zero_knowledge_enabled")
-        return True if override is None else bool(override)
+        return zk_rules.enabled(val, _allowed_vault_types())
     except Exception:  # noqa: BLE001
         # Plan grants ZK; fail toward the entitlement (the confidentiality-safe direction),
         # matching the plan-force short-circuit above rather than silently disabling it.
@@ -16355,17 +16366,17 @@ def _user_must_use_zk(db, user) -> bool:
     plan-imposed floor: permissive (False) for non-forced plans, forced (True) for
     plan-forced ones — and _zk_enabled short-circuits ZK on for plan-forced deployments,
     so the user is never boxed into 'must use ZK but ZK is off'."""
-    plan_force = settings.plan_force_zero_knowledge and settings.plan_zero_knowledge
+    plan_force = zk_rules.plan_forces()
     try:
         from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
         # The administrators' force holds only where the plan lets zero-knowledge vaults be made at all
-        # (_zk_enabled). Saved before the plan dropped zero-knowledge, it would otherwise refuse a standard
-        # vault while the zero-knowledge one is refused as not enabled: no vault could be made.
-        setting_force = bool(settings.plan_zero_knowledge and val.get("force_zero_knowledge")
-                             and val.get("zero_knowledge_enabled"))
+        # (a plan that includes them, with a cap that is not 0) and their zero-knowledge switch is on (never
+        # saved counts as on). Saved before the plan dropped zero-knowledge, it would otherwise refuse a
+        # standard vault while the zero-knowledge one is refused as not enabled: no vault could be made.
+        setting_force = zk_rules.admin_force_holds(val)
         if not (plan_force or setting_force):
             return False
         allowed = {str(g) for g in (val.get("standard_vault_allowed_groups") or [])}
