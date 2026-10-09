@@ -650,3 +650,58 @@ def test_the_response_closes_its_stream_when_the_client_goes_away(db, people, st
     assert run_coroutine(one_then_leave())
     (row,) = _rows(db, "case_export_aborted", "failure")
     assert row.details["export_id"] == out["export_id"] and resp is not None
+
+
+def _scope():
+    return {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+            "method": "GET", "path": "/", "headers": []}
+
+
+@pytest.mark.parametrize("how", ["disconnect_heard", "send_fails", "task_cancelled"])
+def test_a_client_gone_mid_stream_records_the_abort_before_the_response_is_collected(db, people, storage, codes,
+                                                                                    how):
+    """However the server learns the client is gone (it hears the disconnect, sending fails, or it cancels the
+    request's task), the response closes its body, so the export's abort is recorded at once."""
+    import asyncio
+    a = _file(db, storage, people.v1, name="a.txt", content=b"a" * 5000)
+    b = _file(db, storage, people.v1, name="b.txt", content=b"b" * 5000)
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    out = _prepare(db, people, case, [a, b])
+    resp = _fetch(db, people, case, out["export_id"])
+
+    async def serve():
+        gone = asyncio.Event()
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                if how == "send_fails":
+                    raise OSError("the client went away")
+                gone.set()
+                await asyncio.sleep(3600)          # the client stops reading; the server hears it leave
+
+        async def receive():
+            if how == "task_cancelled":
+                await asyncio.sleep(3600)          # this server never says; it cancels the task instead
+            await gone.wait()
+            return {"type": "http.disconnect"}
+        try:
+            if how == "task_cancelled":
+                # Cancelled as an anyio host cancels a request: every await inside stays cancelled.
+                import anyio
+                async with anyio.create_task_group() as group:
+                    async def cancel_when_gone():
+                        await gone.wait()
+                        group.cancel_scope.cancel()
+                    group.start_soon(cancel_when_gone)
+                    await resp(_scope(), receive, send)
+            else:
+                await resp(_scope(), receive, send)
+        except Exception:  # noqa: BLE001 -- however the response ended
+            pass
+        # Read as the response ends, before the loop closes (closing it would close the body too).
+        db.expire_all()
+        return len(_rows(db, "case_export_aborted", "failure"))
+    assert run_coroutine(serve()) == 1, "recorded when the response ended, not when it was collected"
+    (row,) = _rows(db, "case_export_aborted", "failure")
+    assert row.details["export_id"] == out["export_id"] and row.case_id == case.id and resp is not None
+    assert _rows(db, "case_export_completed") == []

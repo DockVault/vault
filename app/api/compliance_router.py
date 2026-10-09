@@ -47,7 +47,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import anyio
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -1370,8 +1372,6 @@ def fetch_case_export(case_id: uuid.UUID, export_id: uuid.UUID, request: Request
     """The export's archive, streamed as it is built (ZIP64): once, by the auditor who prepared it, with their own
     session (no link to leak). Each owner is told before the first byte; the end, or a stop before it, is
     recorded."""
-    import anyio
-    from fastapi.responses import StreamingResponse
     from starlette.concurrency import iterate_in_threadpool
     from app.api.api_server import _current_session_hash
     from app.core import case_access
@@ -1392,12 +1392,29 @@ def fetch_case_export(case_id: uuid.UUID, export_id: uuid.UUID, request: Request
                 if piece:
                     yield piece
         finally:
-            # A stream stopped by the client, or never started, ends here too: recorded, off the event loop.
+            # A stream stopped by the client, or never started, ends here too: recorded, off the event loop (the
+            # response closes this body under a shield: see _ClosingStreamingResponse).
             await anyio.to_thread.run_sync(parts.close)
 
-    return StreamingResponse(body(), media_type="application/zip",
-                             headers={"Content-Disposition": f'attachment; filename="{name}"',
-                                      "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    return _ClosingStreamingResponse(body(), media_type="application/zip",
+                                     headers={"Content-Disposition": f'attachment; filename="{name}"',
+                                              "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """A streamed response that closes its body when it ends, whatever ended it: a client gone leaves the body
+    suspended mid-stream (the server stops reading it, sending fails, or the request's task is cancelled), and only
+    closing it runs its ``finally`` (for an export: the record of its abort) now rather than when it is collected.
+    The close is shielded from a cancellation in progress, which would otherwise stop it at its first await."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            closer = getattr(self.body_iterator, "aclose", None)
+            if closer is not None:
+                with anyio.CancelScope(shield=True):
+                    await closer()
 
 
 # --------------------------------------------------------------------------- revealing a recorded name, outside a case
