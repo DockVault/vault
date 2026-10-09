@@ -24,8 +24,9 @@ The algorithm, in order:
    still exists, rows before the chain's first hour or dated ahead, undated rows, and hooks on the tables.
 
 With ``--anchor dvchain1:...`` and no key, the links up to the anchor authenticate every seal up to it; a later
-prune, rewrite or erase that changes an hour the anchor covered is reported as not authenticated (a warning),
-and an anchor whose seal a restore lost is reported against that restore seal.
+late, prune, rewrite or erase seal that changes an hour the anchor covered is reported as not authenticated (a
+warning), whoever it says wrote it, and an anchor whose seal a restore lost is reported against that restore
+seal.
 
 Information, for good: what each prune, rewrite, erase, acknowledgment and restore did, the hours a restore
 sealed again and the ones it found changed, a restore that accepted history under a key the chain had left,
@@ -612,8 +613,15 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
 
 
 def changed_hours(seal) -> List[datetime]:
-    """The hours a prune, rewrite or erase seal changes."""
+    """The hours a late, prune, rewrite or erase seal changes: each re-roots an hour sealed before it, or records
+    a change to its rows. A late seal counts whoever it says wrote it (the host, or the sealer with an
+    acknowledgment): without the key neither its writer nor the acknowledgment is authenticated."""
     d = seal.detail or {}
+    if seal.kind == "late":
+        try:
+            return [fmt.parse_time_text(d["hour"])]
+        except (KeyError, TypeError, ValueError):
+            return []
     if seal.kind in ("prune", "rewrite"):
         out = []
         for h in d.get("hours") or []:

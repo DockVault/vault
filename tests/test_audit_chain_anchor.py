@@ -3,6 +3,9 @@
 - without the key, a matching anchor authenticates every seal up to it, and a later prune that changes an hour
   the anchor covered is a warning, "not authenticated"; a prune of hours sealed after the anchor is not; with
   the key, or against a later anchor, nothing is reported;
+- a late seal after the anchor that adds a row to an hour the anchor covered is the same warning, whoever it
+  says wrote it: the host, or the sealer with an administrator's acknowledgment (without the key neither is
+  authenticated); a late seal of an hour sealed after the anchor is not reported;
 - after a restore, an anchor whose seal the restore lost is reported against the restore seal (information
   when this check verified that seal, a warning off the server without the key); an anchor on a seal the
   restore kept, or at the lost head with another link, is still anchor-mismatch; a chain rewritten from some
@@ -16,6 +19,7 @@ import pytest
 
 from _audit_chain_env import Env, T0, failures
 from app.core import audit_chain_format as fmt
+from app.core import audit_integrity as ai
 from app.core import audit_chain_restore as restore
 from app.core.models import AuditLog
 from test_audit_chain_guards import _forge, _off
@@ -80,6 +84,74 @@ def test_a_prune_of_hours_sealed_after_the_anchor_is_not_reported(capped):
     _anchor, prunes = _pruned_after_the_anchor(capped)
     early = fmt.head(2, capped.st.view.link_at(2))           # genesis and its policy seal: no hour yet
     report = _off(capped, anchor=early)
+    assert "anchor-mismatch" not in failures(report)
+    assert _found(report, "changed-after-anchor") == []
+
+
+def _host_late_after_the_anchor(env):
+    """An hour sealed and the head then (the anchor); a day later a row dated into that hour and a late seal by
+    the host over it, appended by someone holding the key with no head record write."""
+    when = T0 - timedelta(hours=5, minutes=30)
+    env.row(when)
+    env.run_until_sealed()
+    anchor = env.verify().head
+    env.clock.advance(hours=30)
+    env.run_until_sealed()
+    hour = ai.hour_floor(when)
+    added = env.row(hour + timedelta(minutes=40), action="admin_login", username="mallory")
+    entry = env.st.view.entry_for(hour)
+    with env.session() as db:
+        fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), None)
+        wr = ai.working_row(db, hour)
+        wr.row_ids = fig.ids
+        db.commit()
+    seq = _forge(env, "late", {"hour": fmt.hour_text(hour), "prev_seq": entry.root.seq, "added": [str(added)],
+                               "by": "host"},
+                 period_start=hour, period_end=hour + ai.HOUR, row_count=fig.count, row_bytes=fig.bytes,
+                 root_s=fig.root_s, root_c=fig.root_c, ids_digest=fig.ids_digest)
+    return anchor, hour, seq
+
+
+def _sealer_late_after_the_anchor(env):
+    """An hour sealed and the head then (the anchor); within 6 hours a row added to that hour, the sealer's late
+    seal over it, and an administrator's acknowledgment of that seal."""
+    when = T0 - timedelta(hours=3, minutes=10)
+    env.row(when)
+    env.run_until_sealed()
+    anchor = env.verify().head
+    hour = ai.hour_floor(when)
+    env.row(hour + timedelta(minutes=40), username="mallory")
+    env.clock.advance(hours=1)
+    env.seal()
+    (late,) = [s for s in env.seals() if s.kind == "late"]
+    assert late.detail["by"] == "sealer" and late.detail["hour"] == fmt.hour_text(hour)
+    _forge(env, "ack", {"acknowledges": [late.seq], "failures": [], "rows": [], "discarded": [], "by": "admin",
+                        "user_id": None, "request": None})
+    env.clock.advance(minutes=30)
+    env.seal()
+    return anchor, hour, late.seq
+
+
+@pytest.mark.parametrize("late_after_the_anchor", [_host_late_after_the_anchor, _sealer_late_after_the_anchor])
+def test_without_the_key_a_late_seal_of_an_hour_the_anchor_covered_is_not_authenticated(env, late_after_the_anchor):
+    anchor, hour, seq = late_after_the_anchor(env)
+    report = _off(env, anchor=anchor, check_rows=True)
+    assert "anchor-mismatch" not in failures(report) and failures(report) == []
+    assert "late" not in report.kinds("warning")          # acknowledged, as far as the chain alone can tell
+    changed = _found(report, "changed-after-anchor")
+    assert [(f.seq, f.hour) for f in changed] == [(seq, fmt.hour_text(hour))]
+    assert changed[0].severity == "warning" and "(late, not authenticated)" in changed[0].message
+    assert report.exit_code == 1
+    # With the key nothing is unauthenticated (the server then judges the seal on the head record), and a head
+    # kept after the late seal closes it.
+    assert _found(env.verify(anchor=anchor), "changed-after-anchor") == []
+    assert _found(_off(env, anchor=env.verify().head), "changed-after-anchor") == []
+
+
+def test_a_late_seal_of_an_hour_sealed_after_the_anchor_is_not_reported(env):
+    _anchor, _hour, _seq = _sealer_late_after_the_anchor(env)
+    early = fmt.head(2, env.st.view.link_at(2))           # genesis and its policy seal: no hour yet
+    report = _off(env, anchor=early)
     assert "anchor-mismatch" not in failures(report)
     assert _found(report, "changed-after-anchor") == []
 

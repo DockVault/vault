@@ -21,8 +21,10 @@ chain verifies clean:
 - rows added to an hour sealed more than 6 hours before: ``acknowledge --late-rows`` seals them; a row holding a
   value no release writes: ``acknowledge --rows``;
 - a head kept before a removal: with the key it matches and every seal is authenticated; without the key
-  (``verify --no-key``) the removal's prune is "not authenticated"; a later head closes it. A head a database
-  restore lost is reported against the restore seal, as information with the key and a warning without it;
+  (``verify --no-key``) the removal's prune is "not authenticated"; a later head closes it. The same for a head
+  kept before rows were added to an hour it covered and sealed by ``acknowledge --late-rows``: the host's late
+  seal is "not authenticated" without the key. A head a database restore lost is reported against the restore
+  seal, as information with the key and a warning without it;
 - a lost head record: accepted once its key history is confirmed by name, and reported for good; a database
   cut back to before a key change: its chain ends under a key the chain left, accepted by name, and the move
   back needs ``rekey --confirm-return``; reported for good.
@@ -467,6 +469,40 @@ out["back"] = passes()
     assert {f["seq"] for f in changed} == {f["seq"] for f in found["pruned"]}, found
     assert "anchor-mismatch" not in found
     # A head kept after the removal closes it.
+    code, found, _answer = _verify(throwaway, "--anchor", answer["head"], "--no-key")
+    assert "changed-after-anchor" not in found and "anchor-mismatch" not in found, found
+
+
+def test_an_anchor_kept_before_rows_were_added_to_its_hour_is_checked_with_and_without_the_key(throwaway):
+    first = _script(throwaway, r"""
+add_row(at(hours=12))
+out["stopped"] = passes(at(hours=9))
+out["hour"] = fmt.hour_text(ai.hour_floor(at(hours=12)))
+""")
+    assert first["stopped"] is None, first
+    _code, _found, sealed = _verify(throwaway)
+    anchor = sealed["head"]
+    added = _script(throwaway, r"""
+out["added"] = add_row(ai.hour_floor(at(hours=12)) + timedelta(minutes=50))
+out["back"] = passes()
+""")
+    _seen, done = _two(throwaway, "acknowledge", "--late-rows", first["hour"])
+    assert done["added"] == 1, (added, done)
+    after = _script(throwaway, r"""
+out["stopped"] = passes()
+out["late"] = [s for s, k in seals() if k == "late"]
+""")
+    assert after["stopped"] is None and len(after["late"]) == 1, after
+    # With the key: the anchor matches and the host's late seal is authenticated.
+    code, found, answer = _verify(throwaway, "--anchor", anchor)
+    assert "anchor-mismatch" not in found and "changed-after-anchor" not in found, found
+    # Without the key, as an auditor holding only the anchor: the late seal is not authenticated.
+    code, found, _answer = _verify(throwaway, "--anchor", anchor, "--no-key")
+    changed = found.get("changed-after-anchor") or []
+    late = [(f["seq"], f["hour"], f["severity"]) for f in changed]
+    assert code == 1 and late == [(after["late"][0], first["hour"], "warning")], found
+    assert "not authenticated" in changed[0]["message"] and "anchor-mismatch" not in found, found
+    # A head kept after the late seal closes it.
     code, found, _answer = _verify(throwaway, "--anchor", answer["head"], "--no-key")
     assert "changed-after-anchor" not in found and "anchor-mismatch" not in found, found
 
