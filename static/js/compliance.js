@@ -324,6 +324,16 @@
 
     window.renderVaultReview = renderVaultReview;
 
+    // ---- a vault's owner: a notice that someone else gave a person access to one of their vaults ------------
+    // Its target is the vault ("#vault/<id>") when it is about one vault: the bell opens it, where the owner sees
+    // who has access. A notice about several vaults has no target (it says how many).
+    function openNotifTarget(target) {
+        const m = /^#vault\/([0-9a-fA-F-]{36})$/.exec(String(target || ''));
+        if (m && typeof openVault === 'function') openVault(m[1]);
+    }
+
+    window.openNotifTarget = openNotifTarget;
+
     function watchSignIn() {
         const screen = document.getElementById('dashboard-screen');
         if (!screen) return;

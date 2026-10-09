@@ -172,6 +172,10 @@ _IDENTIFIER_KEYS = (
     # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes
     # to the address before an administrator's change, and why a send failed (a category, never a server's answer)
     "email_status", "copy_to_previous", "send_error",
+    # an owner's notice that someone else gave a person access to their vault (app/core/access_notices.py): the
+    # people given access (usernames, their accounts' dates and makers, whether a password was set by someone else)
+    # and how many more; never a vault's name
+    "people", "more_people",
     # a case's steps: what it is for (a code), its days of access and their end, whether it holds, whether the
     # server's operator approved it, how an objection came (from an owner or an administrator), whether its access
     # ended, and a hold placed and confirmed by an approval

@@ -16320,6 +16320,22 @@ async def add_group_members(
                 status_code=403,
                 detail="You cannot add yourself to this department: it has access to vaults or "
                        "shared items you cannot otherwise open. Ask another administrator.")
+    # The owners are told, in this transaction, of the vaults and shared items joining gives the new members
+    # (app/core/access_notices.py).
+    from app.core import access_notices
+    reach = access_notices.Reach(db, current_user)
+    joining = [uid for uid in dict.fromkeys(payload.user_ids) if uid not in existing]
+    if joining:
+        from app.core.models import vault_group_access
+        for vid, _perm in db.query(vault_group_access.c.vault_id, vault_group_access.c.permission).filter(
+                vault_group_access.c.group_id == group_id).all():
+            reach.watch(db.query(Vault).filter(Vault.id == vid).first(), joining,
+                        via=access_notices.JOINED, department=group.name)
+        for share in db.query(Share).filter(Share.claim_audience == "departments", Share.status == "active",
+                                            Share.expires_at > datetime.utcnow(),
+                                            Share.audience_department_ids.contains([str(group_id)])).all():
+            reach.watch_share(share, db.query(Vault).filter(Vault.id == share.vault_id).first(), joining,
+                              department=group.name)
     added = []
     for uid in payload.user_ids:
         if uid in existing:
@@ -16332,6 +16348,7 @@ async def add_group_members(
         ))
         existing.add(uid)
         added.append(uid)
+    reach.tell()
     db.commit()
     # Group membership IS access: a member inherits every vault the group can reach, so adding
     # someone here can widen their reach without any vault being touched. The row names WHO was
@@ -18371,6 +18388,12 @@ async def grant_vault_permission(
             vault_members.c.vault_id == vault_id,
             vault_members.c.user_id == permission.user_id).first() is not None
 
+        # The owner is told, in this transaction, when someone else gives this person access they did not hold
+        # (app/core/access_notices.py).
+        from app.core import access_notices
+        reach = access_notices.Reach(db, current_user)
+        reach.watch(vault, [user.id], via=access_notices.GRANT)
+
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
         read_perm = permission.level in ['read', 'write', 'delete', 'manage']
@@ -18399,6 +18422,7 @@ async def grant_vault_permission(
                 'manage_permission': manage_perm,
             },
         ))
+        reach.tell()
         db.commit()
 
         # Someone can now open this vault who could not a moment ago. That is the single most
@@ -18498,6 +18522,12 @@ async def revoke_vault_permission(
             # being left active; and a rotation that starts after this sees them already removed.
             db.query(Vault).populate_existing().filter(Vault.id == vault_id).with_for_update().first()
 
+        # The owner is told, in this transaction, when removing this row lets the person's departments give
+        # them more than it did (app/core/access_notices.py).
+        from app.core import access_notices
+        reach = access_notices.Reach(db, current_user)
+        reach.watch(vault, [user_id], via=access_notices.ROW_REMOVED)
+
         # Delete permission entry
         from app.core.models import vault_members
         from sqlalchemy import delete as sql_delete
@@ -18541,6 +18571,7 @@ async def revoke_vault_permission(
                 mk.revoked_at = now
                 mk.revoked_by = current_user.id
 
+        reach.tell()
         db.commit()
 
         # Recorded AFTER the rowcount check, so the log says a revoke happened only when one did.
@@ -18632,7 +18663,8 @@ async def grant_vault_group_access(
     # locks it: a concurrent request that adds the caller to this department waits for this one and
     # then sees this grant, and the reverse, so the two cannot pass the self-access check below
     # together.
-    if not db.query(Group).filter(Group.id == payload.group_id).with_for_update().first():
+    group = db.query(Group).filter(Group.id == payload.group_id).with_for_update().first()
+    if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     # A receiver vault is share-frozen to READ (like the per-user permissions route): a department
     # granted write could alter or delete the arrived files and upload bypassing the receiver's policy.
@@ -18657,6 +18689,12 @@ async def grant_vault_group_access(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You belong to this department, so granting it access would give you access to "
                    "another person's vault; ask its owner or another administrator.")
+    # The owner is told, in this transaction, of the members this gives access they did not hold
+    # (app/core/access_notices.py).
+    from app.core import access_notices
+    reach = access_notices.Reach(db, current_user)
+    reach.watch(vault, [r[0] for r in db.execute(select(user_groups.c.user_id).where(
+        user_groups.c.group_id == payload.group_id)).fetchall()], via=access_notices.DEPARTMENT, department=group.name)
     existing = db.execute(
         select(vault_group_access).where(
             vault_group_access.c.vault_id == vault_id,
@@ -18677,6 +18715,7 @@ async def grant_vault_group_access(
                 added_at=datetime.now(timezone.utc), added_by=current_user.id,
             )
         )
+    reach.tell()
     db.commit()
     # `perm` is what was written. Logging the request's own string here recorded whatever the caller
     # typed, which is not what the vault ended up granting.

@@ -246,7 +246,7 @@ def test_seed_creates_all_defaults_and_binds_unbound_actions():
     n = ea.seed_default_templates(sess)
     assert n == len(_seeded_keys())                             # one default row per action but a locked one
     locked = [k for k in ea.DEFAULT_TEMPLATES if k not in _seeded_keys()]
-    assert locked == ["compliance_access_notice"]
+    assert locked == ["compliance_access_notice", "vault_access_notice"]
     for key in locked:
         assert key not in sess.templates and sess.actions[key].template_id is None
     for key in _seeded_keys():

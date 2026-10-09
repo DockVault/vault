@@ -220,6 +220,20 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "vault_access_notice": {
+        "name": "Access given to your vault",
+        "subject": "Someone was given access to your vault",
+        "body_html": (
+            "<h2>Someone was given access to your vault</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>This was done by someone other than you, who could not open that vault before. Open "
+            "{{vault.name}} to see who has access to your vaults.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "retention_change": {
         "name": "How long records are kept",
         "subject": "A change to how long {{vault.name}} keeps its records",
@@ -274,6 +288,11 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "
      "are exported -- says what, when and by whom, never a vault, file or folder name. Its wording is fixed: "
      "it cannot be changed or turned off.", LOCKED),
+    ("vault_access_notice", "Access given to your vault",
+     "Sent to a vault's owner when someone who could not open the vault gives a person access to it (a grant to "
+     "the person or to a department, adding them to a department, or removing their own access row) -- names the "
+     "person, when and by whom their account was created and whether its password was set by someone else; never "
+     "a vault's name. Its wording is fixed: it cannot be changed or turned off.", LOCKED),
     ("retention_change", "How long records are kept",
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",

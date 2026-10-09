@@ -7164,6 +7164,9 @@ async function onNotifClick(n) {
         if (item) item.click();
     } else if (_NOTIF_TARGET_OPEN[n.target]) {
         _NOTIF_TARGET_OPEN[n.target]();
+    } else if (n.target && typeof window.openNotifTarget === 'function') {
+        // A target that carries an id, such as one vault (static/js/compliance.js).
+        window.openNotifTarget(n.target);
     }
 }
 

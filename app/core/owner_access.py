@@ -27,6 +27,9 @@ from typing import Mapping, Optional
 
 from app.core import case_rules as rules
 
+# A notice of access someone else gave (app/core/access_notices.py) is the bell's, not this banner's: the banner is
+# about compliance access (investigations, holds, revealed names).
+_ACCESS_GRANTED = "access_granted"
 # The most files opened the page lists per case, newest first.
 OPENED_SHOWN = 200
 NAME_HIDDEN_PASSWORD = "password"
@@ -172,7 +175,8 @@ def unseen(db, user) -> list:
     """The notices to the owner not yet read: one per step and owner (their outbox rows), newest first."""
     from app.core.models import ComplianceCase, ComplianceNoticeOutbox as O
     rows = (db.query(O, ComplianceCase.number).outerjoin(ComplianceCase, ComplianceCase.id == O.case_id)
-            .filter(O.user_id == user.id, O.seen_at.is_(None)).order_by(O.created_at.desc()).limit(100).all())
+            .filter(O.user_id == user.id, O.seen_at.is_(None), O.kind != _ACCESS_GRANTED)
+            .order_by(O.created_at.desc()).limit(100).all())
     return [{"case_id": str(r.case_id) if r.case_id else None, "number": number, "kind": r.kind,
              "at": _iso(r.created_at)} for r, number in rows]
 
@@ -191,7 +195,8 @@ def mark_seen(db, user, *, through: Optional[datetime] = None, now: Optional[dat
     from app.core.models import ComplianceNoticeOutbox as O
     from app.services.audit_logger import AuditLogger
     now = now or utcnow()
-    q = db.query(O).filter(O.user_id == user.id, O.seen_at.is_(None), O.created_at <= (through or now))
+    q = db.query(O).filter(O.user_id == user.id, O.seen_at.is_(None), O.kind != _ACCESS_GRANTED,
+                           O.created_at <= (through or now))
     rows = q.all()
     for row in rows:
         row.seen_at = now

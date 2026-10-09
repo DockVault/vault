@@ -61,6 +61,9 @@ HOLD_LAPSED = "hold_lapsed"
 EXPORT = "export"
 # Outside a case: an auditor revealed names the activity log recorded in full (app/core/name_reveal.py).
 REVEAL = "reveal"
+# Outside a case: someone else gave a person access to one of the owner's vaults (app/core/access_notices.py). Not
+# a case's notice: its own words, its own email action, and not counted on the compliance banner.
+ACCESS_GRANTED = "access_granted"
 KINDS = (ACTIVATION, EXTENSION, SCOPE_REMOVED, ACCESS_ENDED, CLOSED, HOLD_PLACED, HOLD_CONFIRMED, HOLD_RELEASED,
          HOLD_RESTORED, HOLD_LAPSED, EXPORT, REVEAL)
 
@@ -493,7 +496,12 @@ def owner_note(case) -> Optional[str]:
 
 def email_context(db, row, case) -> dict:
     """What the email says, for the email action: the notice, the auditor's note (with an activation), and the
-    case number for the subject."""
+    case number for the subject. A notice of access someone else gave has its own words (app/core/access_notices.py),
+    as of when it was written."""
+    if row.kind == ACCESS_GRANTED:
+        from app.core import access_notices
+        title, lines = access_notices.notice_text(dict(row.details or {}), now=row.created_at, contact=contact(db))
+        return {"change": " ".join([title + "."] + lines), "code": "", "when": _when(row.created_at), "by": ""}
     f = facts(db, case, row.kind, row.details)
     title, lines = notice_text(f)
     note = owner_note(case) if row.kind == ACTIVATION and case is not None else None
@@ -508,12 +516,21 @@ class SendFailed(Exception):
         self.category = category
 
 
+def email_action(kind: str) -> str:
+    """The email action a notice of ``kind`` is sent through: its own for access someone else gave, else the
+    compliance notice's. Both are locked: their wording is fixed and they cannot be turned off."""
+    if kind == ACCESS_GRANTED:
+        from app.core import access_notices
+        return access_notices.EMAIL_ACTION
+    return EMAIL_ACTION
+
+
 def send_email(db, row, case, address: str, username: Optional[str]) -> None:
     """Hand the notice to SMTP through the email action. Raises SendFailed."""
     from app.core import email_send
     from app.core.email_actions import send_action_email
     try:
-        ok = send_action_email(db, EMAIL_ACTION, recipient={"email": address, "username": username or ""},
+        ok = send_action_email(db, email_action(row.kind), recipient={"email": address, "username": username or ""},
                                action_context=email_context(db, row, case), raise_errors=True)
     except email_send.EmailSendError as exc:
         raise SendFailed(exc.category)
