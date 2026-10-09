@@ -148,7 +148,9 @@ def test_default_bodies_declare_no_unknown_tokens():
 
 def test_default_template_payloads_match_the_catalog():
     payloads = ea.default_template_payloads()
-    assert [p["key"] for p in payloads] == [a["key"] for a in ea.ACTION_CATALOG]  # catalog order
+    # catalog order; a locked action, whose wording is fixed and which has no seeded row, is not offered
+    assert [p["key"] for p in payloads] == [a["key"] for a in ea.ACTION_CATALOG if a["category"] != ea.LOCKED]
+    assert [p["key"] for p in payloads] == _seeded_keys()
     for p in payloads:
         spec = ea.DEFAULT_TEMPLATES[p["key"]]
         assert p["name"] == spec["name"]

@@ -466,10 +466,13 @@ def seed_default_templates(db: Session) -> int:
 def default_template_payloads() -> list[dict]:
     """The built-in default templates, sanitized, for the editor's "Load From → defaults" section.
     Returns one entry per action key in catalog order: ``{key, name, subject, body_html}`` where
-    ``body_html`` is the sanitized default (byte-identical to the seeded row's stored body)."""
+    ``body_html`` is the sanitized default (byte-identical to the seeded row's stored body). A locked
+    action has none: its wording is fixed, no template row is seeded for it, and none can be bound to it."""
     from app.core import email_sanitize
     out: list[dict] = []
-    for key, _n, _d, _c in _ACTION_META:
+    for key, _n, _d, category in _ACTION_META:
+        if category == LOCKED:
+            continue
         spec = DEFAULT_TEMPLATES[key]
         out.append({
             "key": key,
