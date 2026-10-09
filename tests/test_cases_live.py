@@ -3,7 +3,8 @@ full flow, with an auditor right granted by two administrators, a case asked for
 the approving transaction (the same transaction id on the case, its hold, the owner's notification, the outbox row
 and the audit rows) and by email (an SMTP server kept inside the web container), extended, and closed with a
 summary; a fault in the owner's notice that fails the approval; the end of access by the pruner; the host's
-approval refused while an administrator could approve; every refusal recorded.
+approval refused while an administrator could approve; every refusal recorded; an administrator made by whoever
+created the auditor's account refused as approver.
 
 test_cases.py covers the rules offline.
 """
@@ -11,10 +12,11 @@ import subprocess
 
 import pytest
 
-from _account_change_helpers import API, in_api_container, notifications, psql
+from _account_change_helpers import API, in_api_container, notifications, psql, signed_in
 from _auditor_helpers import (compliance_receipt, forget_grants, grant_right, new_auditor_account, run_pass,
                               two_admins)
 from _owner_notice_helpers import mail_to, outbox, owner_with_vault, sender_held, sending_to_sink, wait_for
+from _sf_helpers import enroll_totp
 
 pytestmark = pytest.mark.integration
 
@@ -229,3 +231,43 @@ def test_refusals_are_recorded(world, admin):
     # Withdrawn by its auditor while it waits.
     r = uma_c.post(f"/compliance/cases/{case['id']}/withdraw")
     assert r.status_code == 200 and r.json()["status"] == "withdrawn"
+
+
+def test_an_administrator_made_by_whoever_created_the_auditors_account_may_not_approve(admin):
+    """ada creates uma's account and makes bea an administrator; bob approves uma's right, which ada proposed; uma
+    asks for a case on olga's vault. bea may not approve it (a stand-in administrator and a stand-in account
+    combined): refused (403) before any code, and recorded."""
+    with two_admins(admin) as admins:
+        ada, ada_c, _ada_codes = admins["ada"]
+        uma, uma_c, codes = new_auditor_account(ada_c)
+        bea = ada_c.create_user(role="admin")
+        made = []
+        try:
+            assert psql(f"SELECT created_by FROM users WHERE id = '{uma['id']}'") == ada["id"]
+            # bea of long standing, with a password of her own, still made by ada.
+            psql("UPDATE admin_grants SET granted_at = (now() AT TIME ZONE 'utc') - interval '15 days' "
+                 f"WHERE user_id = '{bea['id']}'")
+            psql(f"UPDATE users SET password_set_by = NULL, password_set_by_other_at = NULL WHERE id = '{bea['id']}'")
+            assert ada["id"] in psql(f"SELECT lineage::text FROM admin_grants WHERE user_id = '{bea['id']}'")
+            bea_c = signed_in(bea)
+            _s, bea_codes = enroll_totp(bea, bea_c)
+            grant_right(admins, uma["id"])
+            _olga, _olga_c, vid = owner_with_vault(admin)
+            r = uma_c.post("/compliance/cases", json={"scope": [{"kind": "vault", "target_id": vid}], **TEXT},
+                           headers=compliance_receipt(uma_c, "compliance.case.request", uma["_password"], codes))
+            assert r.status_code == 201, r.text
+            case = r.json()
+            made.append(case["id"])
+            view = admins["bob"][1].get(f"/compliance/cases/{case['id']}").json()
+            assert bea["_username"] not in view["independent_approvers"]
+            headers = compliance_receipt(bea_c, "compliance.case.approve", bea["_password"], bea_codes)
+            headers["If-Match"] = '"1"'
+            r = bea_c.post(f"/compliance/cases/{case['id']}/approve", headers=headers)
+            assert r.status_code == 403 and r.json()["detail"]["reason"] == "made_by_creator", r.text
+            assert _failures("case_approved", case["id"]) == "made_by_creator"
+            assert psql(f"SELECT status FROM compliance_cases WHERE id = '{case['id']}'") == "pending"
+        finally:
+            for cid in made:
+                psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
+            forget_grants(uma["id"])
+            admin.delete_user(bea["id"])

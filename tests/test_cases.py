@@ -893,3 +893,69 @@ def test_an_owner_not_told_yet_finds_no_case(db, people):
     assert cases.owns_a_vault_in(db, case, people.olga)
     out = cr.record_case_objection(case.id, cr.ObjectionIn(text="I object."), current_user=people.olga, db=db)
     assert out["objections"] == 1
+
+
+# --------------------------------------------------------------------------- the auditor's creator's lineage
+
+@pytest.fixture
+def creators(db, people):
+    """A stand-in administrator and a stand-in account combined: zed made ada an administrator, ada created uma's
+    account and made bea an administrator. (ada proposed uma's right and bob approved it.)"""
+    zed = _user(db, "zed", m.RoleEnum.ADMIN)
+    admin_grants.record(db, people.ada.id, granted_by_id=zed.id, granted_by_name="zed", now=rights.utcnow() - OLD)
+    bea = _user(db, "bea", m.RoleEnum.ADMIN)
+    admin_grants.record(db, bea.id, granted_by_id=people.ada.id, granted_by_name="ada", now=rights.utcnow() - OLD)
+    people.uma.created_by = people.ada.id
+    db.commit()
+    return SimpleNamespace(zed=zed, bea=bea)
+
+
+@pytest.mark.parametrize("who,reason", [("bea", ind.MADE_BY_CREATOR), ("zed", ind.MADE_CREATOR)])
+def test_an_administrator_in_the_lineage_of_the_auditors_creator_decides_no_step_of_the_case(db, people, creators,
+                                                                                            no_codes, who, reason):
+    approver = getattr(creators, who)
+    case = _ask(db, people.uma, _vaults(people.v1))
+    assert cases.decision_refusal(db, case, approver) == reason
+    assert sorted(a.username for a in cases.independent_approvers(db, case)) == ["bob", "carl"]
+    # Through the routes: refused before any code, and recorded.
+    _, err = _call(cr.approve_case, case.id, request=None, if_match='"1"', current_user=approver, db=db)
+    assert err.status_code == 403 and err.detail["reason"] == reason and no_codes == []
+    assert _rows(db, "case_approved", "failure")[-1].details["reason"] == reason
+    assert err.detail["text"] == cases.text(reason) != reason
+    _, err = _call(cr.reject_case, case.id, cr.Reason(reason="No grounds."), request=None, current_user=approver,
+                   db=db)
+    assert err.status_code == 403 and err.detail["reason"] == reason and no_codes == []
+    # Every other step the rule decides: extending, narrowing, closing, releasing and undoing a release, confirming.
+    _approve(db, case, people.bob)
+    for refusal in (cases.extend_refusal, cases.narrow_refusal, cases.close_refusal, holds.release_refusal):
+        assert refusal(db, case, approver) == reason, refusal.__name__
+        assert refusal(db, case, people.carl) is None, refusal.__name__
+    holds.release(db, case, by=people.carl, reason="Not needed.")
+    db.commit()
+    assert holds.undo_refusal(db, case, approver) == reason
+    assert holds.undo_refusal(db, case, people.carl) is None
+    held = holds.place_hold_only(db, people.uma, [people.v2.id], **TEXT)
+    db.commit()
+    assert holds.confirm_refusal(db, held, approver) == reason
+    assert holds.confirm_refusal(db, held, people.carl) is None
+
+
+def test_the_creator_kept_with_the_grant_still_refuses_after_the_creator_is_deleted_or_demoted(db, people,
+                                                                                               creators):
+    """The case reads the creator and their lineage as the auditor's grant kept them when it was proposed: deleting
+    the creator clears the account's created_by, and demoting them deletes their lineage."""
+    rights.revoke(db, people.grant, actor=people.carl, reason="Renewed.")
+    db.commit()
+    grant = rights.propose(db, people.uma, proposer=people.carl, now=rights.utcnow() - timedelta(hours=2))
+    db.commit()
+    assert grant.proposal_snapshot["creator"] == str(people.ada.id)
+    assert grant.proposal_snapshot["creator_lineage"] == [str(creators.zed.id)]
+    rights.approve(db, grant, approver=people.bob, now=rights.utcnow() - timedelta(hours=1))
+    db.commit()
+    case = _ask(db, people.uma, _vaults(people.v1))
+    assert case.grant_id == grant.id
+    people.uma.created_by = None
+    admin_grants.forget(db, people.ada.id)
+    db.commit()
+    assert cases.decision_refusal(db, case, creators.bea) == ind.MADE_BY_CREATOR
+    assert cases.decision_refusal(db, case, creators.zed) == ind.MADE_CREATOR

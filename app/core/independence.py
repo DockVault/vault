@@ -21,13 +21,19 @@ refuses besides (compliance_refusal_reason):
     grant someone else proposed): an administrator the auditor made, or who made the auditor one
     (MADE_BY_SUBJECT, MADE_SUBJECT);
   * whoever created the auditor's account (CREATED_SUBJECT): they knew its first password;
+  * an administrator in the lineage of whoever created the auditor's account, either way: one the creator made,
+    directly or through administrators the creator made (MADE_BY_CREATOR), and one who made the creator an
+    administrator (MADE_CREATOR). The creator's lineage is read from their record now and, for an auditor grant,
+    from what was kept when it was proposed (demoting the creator deletes their record, and deleting the account
+    clears users.created_by);
   * anyone who changed the auditor's sign-in details while the grant stood (CHANGED_SUBJECT), read from the
     grant's own list, which outlives the records of credential changes (pruned 14 days after they apply);
   * a person the case concerns (CONCERNED): an owner of a vault in it, a custodian, someone named;
   * whoever proposed the auditor's grant (PROPOSED).
 Two paths would otherwise let one person read a vault: a stand-in administrator (A makes B an administrator,
 then B approves A's grant and A's case) and a stand-in account (A creates U, someone grants U the right, and A
-approves U's case).
+approves U's case). Combined, they are one path too: A creates U and makes B an administrator, and B approves U's
+case; or Z makes A an administrator, A creates U, and Z approves U's case.
 """
 from __future__ import annotations
 
@@ -54,6 +60,8 @@ PASSWORD_NOT_OWN = "password"    # their current password was set by someone els
 MADE_BY_SUBJECT = "made_by_subject"      # the auditor made them an administrator
 MADE_SUBJECT = "made_subject"            # they made the auditor an administrator
 CREATED_SUBJECT = "created_subject"      # they created the auditor's account
+MADE_BY_CREATOR = "made_by_creator"      # whoever created the auditor's account made them an administrator
+MADE_CREATOR = "made_creator"            # they made whoever created the auditor's account an administrator
 CHANGED_SUBJECT = "changed_subject"      # they changed the auditor's sign-in details while the grant stood
 CONCERNED = "concerned"                  # the case concerns them
 PROPOSED = "proposed"                    # they proposed the auditor's grant
@@ -113,14 +121,17 @@ def changer_ids(entries: Iterable) -> Set[str]:
 def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver_grant, requester_grant,
                               subject_grant, changed: Set, requested_at: datetime,
                               approver_password_set_by_other: bool = False, subject_created_by=None,
+                              creator_grant=None, kept_creator=None, kept_creator_lineage: Iterable = (),
                               credential_changers: Iterable = (), concerned: Iterable = (),
                               proposer_id=None) -> Optional[str]:
     """Why ``approver_id`` may not approve a compliance step about the auditor ``subject_id`` that
     ``requester_id`` asked for at ``requested_at`` (the auditor, for a case; the proposer, for a grant), or None.
     refusal_reason() first, with the auditor as the account it is about, then the refusals compliance adds (the
     module docstring). ``subject_grant`` is the auditor's admin_grants record (None: none), ``subject_created_by``
-    who created the auditor's account, ``credential_changers`` the grant's list, ``concerned`` the persons the
-    case concerns, ``proposer_id`` who proposed the grant."""
+    who created the auditor's account, ``creator_grant`` the creator's admin_grants record (None: none),
+    ``kept_creator`` and ``kept_creator_lineage`` the creator and their lineage as kept earlier (an auditor
+    grant's, when it was proposed), ``credential_changers`` the grant's list, ``concerned`` the persons the case
+    concerns, ``proposer_id`` who proposed the grant."""
     from app.core import admin_grants
     # Every id in one text form before the rule compares them: the same person's id read from a column (a UUID)
     # and from a record or a request (text, in any case, with or without hyphens) must compare equal, and
@@ -138,8 +149,16 @@ def compliance_refusal_reason(approver_id, *, requester_id, subject_id, approver
     if admin_grants.made_by(subject_grant, approver_id):
         return MADE_SUBJECT
     who = approver_id
-    if subject_created_by is not None and _as_text(subject_created_by) == who:
+    creators = {_as_text(person) for person in (subject_created_by, kept_creator) if person is not None}
+    if who in creators:
         return CREATED_SUBJECT
+    # Whoever created the auditor's account, through an administrator either way: one they made, directly or
+    # through administrators they made, and one who made them an administrator.
+    if any(admin_grants.made_by(approver_grant, creator) for creator in creators):
+        return MADE_BY_CREATOR
+    kept_lineage = {_as_text(person) for person in kept_creator_lineage or () if person is not None}
+    if admin_grants.made_by(creator_grant, who) or who in kept_lineage:
+        return MADE_CREATOR
     if who in changer_ids(credential_changers):
         return CHANGED_SUBJECT
     if who in {_as_text(person) for person in concerned or () if person is not None}:

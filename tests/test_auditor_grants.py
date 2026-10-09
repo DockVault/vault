@@ -292,6 +292,58 @@ def test_the_changes_are_read_as_they_stand_too_not_only_from_the_snapshot(db, p
     assert rights.approver_refusal(db, grant, bob) == ind.CHANGED_ACCOUNT
 
 
+@pytest.fixture
+def creators(db, people):
+    """The account's creator's lineage, either way: zed made ada an administrator, ada created uma's account and
+    made bea an administrator; carl, independent of them all, proposes uma's right."""
+    zed = _user(db, "zed", RoleEnum.ADMIN)
+    admin_grants.record(db, people.ada.id, granted_by_id=zed.id, granted_by_name="zed", now=rights.utcnow() - OLD)
+    bea = _user(db, "bea", RoleEnum.ADMIN, by=people.ada)
+    carl = _user(db, "carl", RoleEnum.ADMIN)
+    people.uma.created_by = people.ada.id
+    db.commit()
+    return SimpleNamespace(zed=zed, bea=bea, carl=carl)
+
+
+@pytest.mark.parametrize("who,expected", [("bea", ind.MADE_BY_CREATOR), ("zed", ind.MADE_CREATOR), ("bob", None)])
+def test_an_administrator_in_the_lineage_of_the_accounts_creator_may_not_approve(db, people, settings, creators,
+                                                                                  who, expected):
+    """A stand-in administrator and a stand-in account combined: the creator made the approver an administrator,
+    or the approver made the creator one. Neither proposed the grant."""
+    grant = _proposed(db, people.uma, creators.carl)
+    approver = {"bea": creators.bea, "zed": creators.zed, "bob": people.bob}[who]
+    assert rights.approver_refusal(db, grant, approver) == expected
+    assert (approver in rights.independent_approvers(db, grant)) is (expected is None)
+    if expected is not None:
+        assert rights.text(expected) != expected, "said in plain words"
+
+
+def test_the_creator_kept_at_the_proposal_still_refuses_after_the_creator_is_deleted_or_demoted(db, people, settings,
+                                                                                                creators):
+    grant = _proposed(db, people.uma, creators.carl)
+    assert grant.proposal_snapshot["creator"] == str(people.ada.id)
+    assert grant.proposal_snapshot["creator_lineage"] == [str(creators.zed.id)]
+    # Deleting ada clears the account's creator; demoting her deletes her lineage.
+    people.uma.created_by = None
+    admin_grants.forget(db, people.ada.id)
+    db.commit()
+    assert rights.approver_refusal(db, grant, creators.bea) == ind.MADE_BY_CREATOR
+    assert rights.approver_refusal(db, grant, creators.zed) == ind.MADE_CREATOR
+    # Without what the proposal kept, the records alone no longer refuse them.
+    grant.proposal_snapshot = {**grant.proposal_snapshot, "creator": None, "creator_lineage": []}
+    db.commit()
+    assert rights.approver_refusal(db, grant, creators.bea) is None
+    assert rights.approver_refusal(db, grant, creators.zed) is None
+
+
+def test_the_creators_lineage_is_read_as_it_stands_too_not_only_from_the_snapshot(db, people, settings, creators):
+    grant = _proposed(db, people.uma, creators.carl)
+    grant.proposal_snapshot = None
+    db.commit()
+    assert rights.approver_refusal(db, grant, creators.bea) == ind.MADE_BY_CREATOR
+    assert rights.approver_refusal(db, grant, creators.zed) == ind.MADE_CREATOR
+
+
 def test_an_approver_without_an_authenticator_is_not_counted_independent(db, people, settings):
     grant = _proposed(db, people.uma, people.ada)
     db.query(SecondFactorEnrollment).filter(SecondFactorEnrollment.user_id == people.bob.id).delete()

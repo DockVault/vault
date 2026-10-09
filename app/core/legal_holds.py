@@ -125,6 +125,8 @@ TEXTS = {
     ind.MADE_BY_SUBJECT: "the person who started the case made you an administrator",
     ind.MADE_SUBJECT: "you made the person who started the case an administrator",
     ind.CREATED_SUBJECT: "you created the account of the person who started the case",
+    ind.MADE_BY_CREATOR: "whoever created the account of the person who started the case made you an administrator",
+    ind.MADE_CREATOR: "you made whoever created the account of the person who started the case an administrator",
     ind.CHANGED_SUBJECT: "you changed the auditor's sign-in details while their right stood",
     ind.CONCERNED: "the case concerns you",
     ind.PROPOSED: "you proposed the auditor's right",
@@ -209,16 +211,18 @@ def decider_refusal(db, case, person, now: Optional[datetime] = None) -> Optiona
         return case_eligibility.approver_refusal(db, case, person, now)
     if not cc.can_approve(person):
         return "not_able"
+    from app.core.auditor_rights import creator_of
     starter = db.get(User, case.auditor_id)
     records = admin_grants.of(db, [person.id, case.auditor_id])
     requested_at = case.requested_at or now
+    creator, creator_grant = creator_of(db, starter)
     return ind.compliance_refusal_reason(
         person.id, requester_id=case.auditor_id, subject_id=case.auditor_id,
         approver_grant=records.get(person.id), requester_grant=records.get(case.auditor_id),
         subject_grant=records.get(case.auditor_id),
         changed=cc.changers(db, case.auditor_id, min(requested_at, now) - cc.WINDOW), requested_at=requested_at,
         approver_password_set_by_other=password_origin.is_set_by_other(person),
-        subject_created_by=starter.created_by if starter is not None else None,
+        subject_created_by=creator, creator_grant=creator_grant,
         credential_changers=[], concerned=concerned(db, case), proposer_id=None)
 
 

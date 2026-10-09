@@ -324,7 +324,9 @@ def test_an_independent_administrator_confirms_and_the_placer_cannot(db, people,
 
 @pytest.mark.parametrize("who, reason", [("owner_admin", ind.CONCERNED), ("new_admin", ind.NEW_ADMIN),
                                          ("made_by_placer", ind.MADE_BY_REQUESTER),
-                                         ("created_placer", ind.CREATED_SUBJECT)])
+                                         ("created_placer", ind.CREATED_SUBJECT),
+                                         ("made_by_placers_creator", ind.MADE_BY_CREATOR),
+                                         ("made_placers_creator", ind.MADE_CREATOR)])
 def test_who_is_not_independent_of_the_placer_cannot_confirm(db, people, who, reason):
     if who == "owner_admin":
         person = _user(db, "oscar", m.RoleEnum.ADMIN)
@@ -336,6 +338,18 @@ def test_who_is_not_independent_of_the_placer_cannot_confirm(db, people, who, re
     elif who == "made_by_placer":
         person = _user(db, "mia", m.RoleEnum.ADMIN, by=people.ada)
         case = _place(db, people.ada, [people.v1])
+    elif who == "made_by_placers_creator":
+        # cleo created pia's account and made mia an administrator; pia places, mia may not confirm.
+        cleo = _user(db, "cleo", m.RoleEnum.ADMIN)
+        person = _user(db, "mia", m.RoleEnum.ADMIN, by=cleo)
+        placer = _user(db, "pia", m.RoleEnum.ADMIN, created_by=cleo.id)
+        case = _place(db, placer, [people.v1])
+    elif who == "made_placers_creator":
+        # zed made cleo an administrator, cleo created pia's account; pia places, zed may not confirm.
+        person = _user(db, "zed", m.RoleEnum.ADMIN)
+        cleo = _user(db, "cleo", m.RoleEnum.ADMIN, by=person)
+        placer = _user(db, "pia", m.RoleEnum.ADMIN, created_by=cleo.id)
+        case = _place(db, placer, [people.v1])
     else:
         person = _user(db, "carl", m.RoleEnum.ADMIN)
         placer = _user(db, "pia", m.RoleEnum.ADMIN, created_by=person.id)

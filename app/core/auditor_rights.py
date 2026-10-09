@@ -94,6 +94,8 @@ TEXTS = {
     ind.MADE_BY_SUBJECT: "the account made you an administrator",
     ind.MADE_SUBJECT: "you made the account an administrator",
     ind.CREATED_SUBJECT: "you created the account, so you knew its first password",
+    ind.MADE_BY_CREATOR: "whoever created the account made you an administrator",
+    ind.MADE_CREATOR: "you made whoever created the account an administrator",
     ind.CHANGED_SUBJECT: "you changed the account's sign-in details while it held the right",
     ind.CONCERNED: "the case concerns you",
     ind.PROPOSED: "you proposed the account's auditor right",
@@ -219,8 +221,28 @@ def preconditions(db, user, now: Optional[datetime] = None) -> List[str]:
 # --------------------------------------------------------------------------- who may approve
 
 def proposal_snapshot(db, *, proposer_id, subject_id, at: datetime) -> dict:
-    """What the independence rule reads about a proposal, as it stands when it is made (the module docstring)."""
-    return cc.snapshot(db, requester_id=proposer_id, target_id=subject_id, requested_at=at)
+    """What the independence rule reads about a proposal, as it stands when it is made (the module docstring): the
+    proposer's lineage and the account's recent changers (credential_changes.snapshot), and who created the
+    account with that creator's lineage. Deleting the creator clears users.created_by, and demoting them deletes
+    their lineage; the rule reads both the records then and these."""
+    from app.core import admin_grants
+    from app.core.models import User
+    kept = cc.snapshot(db, requester_id=proposer_id, target_id=subject_id, requested_at=at)
+    subject = db.get(User, subject_id) if subject_id is not None else None
+    creator = subject.created_by if subject is not None else None
+    record = admin_grants.of(db, [creator]).get(creator) if creator is not None else None
+    kept["creator"] = str(creator) if creator is not None else None
+    kept["creator_lineage"] = [str(x) for x in ((record.lineage or []) if record is not None else [])]
+    return kept
+
+
+def creator_of(db, user):
+    """(who created ``user``'s account, that creator's admin_grants record): the independence rule refuses the
+    creator and an administrator in the creator's lineage either way. (None, None) for an account the server's
+    operator created, or whose creator was deleted."""
+    from app.core import admin_grants
+    creator = user.created_by if user is not None else None
+    return creator, (admin_grants.of(db, [creator]).get(creator) if creator is not None else None)
 
 
 def approver_refusal(db, grant, approver, now: Optional[datetime] = None) -> Optional[str]:
@@ -238,17 +260,19 @@ def approver_refusal(db, grant, approver, now: Optional[datetime] = None) -> Opt
     records = admin_grants.of(db, [approver.id, grant.proposed_by, grant.user_id])
     requested_at = grant.proposed_at or now
     changed = cc.changers(db, grant.user_id, min(requested_at, now) - cc.WINDOW) if grant.user_id else set()
+    creator, creator_grant = creator_of(db, subject)
+    kept = grant.proposal_snapshot or {}
     reason = ind.compliance_refusal_reason(
         approver.id, requester_id=grant.proposed_by, subject_id=grant.user_id,
         approver_grant=records.get(approver.id), requester_grant=records.get(grant.proposed_by),
         subject_grant=records.get(grant.user_id), changed=changed, requested_at=requested_at,
         approver_password_set_by_other=password_origin.is_set_by_other(approver),
-        subject_created_by=subject.created_by if subject is not None else None,
+        subject_created_by=creator, creator_grant=creator_grant, kept_creator=kept.get("creator"),
+        kept_creator_lineage=kept.get("creator_lineage") or [],
         credential_changers=grant.credential_changers or [], proposer_id=grant.proposed_by)
     if reason is not None:
         return reason
     # What was kept when it was proposed: demoting or deleting the proposer since deletes their lineage.
-    kept = grant.proposal_snapshot or {}
     who = ind._as_text(approver.id)
     if who in {ind._as_text(x) for x in (kept.get("lineage") or [])}:
         return ind.MADE_REQUESTER
