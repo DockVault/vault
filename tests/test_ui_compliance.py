@@ -462,3 +462,36 @@ def test_the_badge_and_the_nav_for_each_kind_of_account(browser: Browser, world)
     finally:
         _close(page)
         world["uma_c"].post(f"/compliance/cases/{waiting}/withdraw")
+
+
+def test_a_password_vault_opens_in_the_workspace_with_its_password(browser: Browser, world):
+    olga_c = world["olga_c"]
+    pv = olga_c.create_vault(password="Vault-Pass-2026!")["id"]
+    r = olga_c.post(f"/vaults/{pv}/files", files=[("files", ("secret-plan.txt", b"the plan", "text/plain"))],
+                    headers={"X-Vault-Password": "Vault-Pass-2026!"})
+    assert r.status_code in (200, 201), r.text
+    case = approved_case(world["admins"], (world["uma"], world["uma_c"], world["codes"]), [pv])
+    page = _page(browser, "v2")
+    try:
+        _login(page, world["uma"], world["codes"])
+        _compliance(page)
+        page.locator(f'.cmp-case-row[data-case-id="{case["id"]}"]').click()
+        page.locator(".cmp-open-ws").click()
+        row = page.locator(".cmp-file-row")
+        expect(row).to_have_count(1, timeout=15000)
+        expect(row).to_contain_text("Name hidden until the vault is unlocked")
+        form = page.locator(f'.cmp-tree-vault[data-vault-id="{pv}"] .cmp-unlock')
+        form.locator("input").fill("not the password")
+        form.locator("button").click()
+        expect(form.locator("small")).not_to_have_text("For 15 minutes, in this case.", timeout=15000)
+        form.locator("input").fill("Vault-Pass-2026!")
+        form.locator("button").click()
+        expect(page.locator(".cmp-file-row")).to_contain_text("secret-plan.txt", timeout=15000)
+        expect(page.locator(f'.cmp-tree-vault[data-vault-id="{pv}"] .cmp-unlock')).to_have_count(0)
+        page.locator(".cmp-file-row").click()
+        expect(page.locator(".cmp-viewer-text")).to_have_text("the plan", timeout=15000)
+        assert _errors(page) == [], _errors(page)
+    finally:
+        _close(page)
+        forget_cases([case["id"]], [pv])
+        olga_c.delete_vault(pv, vault_password="Vault-Pass-2026!")
