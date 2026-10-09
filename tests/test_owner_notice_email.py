@@ -2,7 +2,6 @@
 ``compliance_access_notice``), offline: always on, always its built-in subject and body whatever template a row
 binds it to, never bindable in Email Studio, and, as sent through the outbox, free of every vault, file and folder
 name, the justification and the people named."""
-import asyncio
 import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -10,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from _async_run import run_coroutine
 from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
@@ -175,7 +175,8 @@ def test_the_bulk_trigger_treats_it_as_always_on(db, monkeypatch):
 def _studio_update(db, payload):
     from app.api import email_studio_router as studio
     admin = SimpleNamespace(id=uuid.uuid4(), username="ada")
-    return asyncio.run(studio.update_action(KEY, studio.ActionUpdateIn(**payload), request=None, admin=admin, db=db))
+    return run_coroutine(studio.update_action(KEY, studio.ActionUpdateIn(**payload), request=None, admin=admin,
+                                              db=db))
 
 
 @pytest.mark.parametrize("payload", [{"template_id": None}, {"enabled": False}, {}])
@@ -201,8 +202,8 @@ def test_email_studio_still_binds_the_other_actions(db, monkeypatch):
     t = _custom_template(db)
     monkeypatch.setattr(studio, "_audit", lambda *a, **k: None)
     admin = SimpleNamespace(id=uuid.uuid4(), username="ada")
-    out = asyncio.run(studio.update_action("share_created", studio.ActionUpdateIn(template_id=t.id), request=None,
-                                           admin=admin, db=db))
+    out = run_coroutine(studio.update_action("share_created", studio.ActionUpdateIn(template_id=t.id), request=None,
+                                             admin=admin, db=db))
     assert out["template_id"] == str(t.id)
 
 
