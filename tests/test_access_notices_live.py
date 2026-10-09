@@ -14,7 +14,7 @@ test_access_notices.py covers the rules offline.
 import pytest
 
 from _account_change_helpers import notifications, psql, signed_in
-from _owner_notice_helpers import mail_to, owner_with_vault, sending_to_sink, wait_for
+from _owner_notice_helpers import mail_to, owner_with_vault, sender_held, sending_to_sink, wait_for
 from conftest import ADMIN_USER, unique
 
 pytestmark = pytest.mark.integration
@@ -72,12 +72,15 @@ def test_an_administrators_grant_tells_the_owner_in_its_own_transaction_and_by_e
     owner, owner_c, vid = _owner(admin, made)
     x = _person(admin, made)
     with sending_to_sink(admin):
-        r = admin.post(f"/vaults/{vid}/permissions", json={"user_id": x["id"], "level": "write"})
-        assert r.status_code == 200, r.text
-        member_xmin = psql(f"SELECT xmin::text FROM vault_members WHERE vault_id = '{vid}' AND user_id = '{x['id']}'")
-        assert _notice_xmins(owner["id"]) == [member_xmin]
-        [(status, row_xmin)] = _outbox_rows(owner["id"])
-        assert row_xmin == member_xmin and status in ("pending", "sent")
+        # The sender is held while the rows are read: its send would write the outbox row anew.
+        with sender_held():
+            r = admin.post(f"/vaults/{vid}/permissions", json={"user_id": x["id"], "level": "write"})
+            assert r.status_code == 200, r.text
+            member_xmin = psql(f"SELECT xmin::text FROM vault_members WHERE vault_id = '{vid}' "
+                               f"AND user_id = '{x['id']}'")
+            assert _notice_xmins(owner["id"]) == [member_xmin]
+            [(status, row_xmin)] = _outbox_rows(owner["id"])
+            assert row_xmin == member_xmin and status == "pending"
         [n] = _access_notices(owner_c)
         assert n["target"] == f"#vault/{vid}" and n["title"] == SUBJECT
         assert f"{ADMIN_USER} gave {x['_username']} read and write access to one of your vaults." in n["body"]
@@ -100,16 +103,19 @@ def test_the_department_paths_each_tell_the_owner_in_the_changes_transaction(adm
     assert admin.post(f"/groups/{gid}/members", json={"user_ids": [x["id"]]}).status_code == 200
     assert _access_notices(owner_c) == []
 
-    # The department is given the vault: x gains it.
-    assert admin.post(f"/vaults/{vid}/group-access", json={"group_id": gid, "permission": "read"}).status_code == 200
-    xmin = psql(f"SELECT xmin::text FROM vault_group_access WHERE vault_id = '{vid}' AND group_id = '{gid}'")
-    assert _notice_xmins(owner["id"])[-1] == xmin and _outbox_rows(owner["id"])[-1][1] == xmin
+    # The department is given the vault: x gains it. (The sender is held while the outbox row is read.)
+    with sender_held():
+        assert admin.post(f"/vaults/{vid}/group-access",
+                          json={"group_id": gid, "permission": "read"}).status_code == 200
+        xmin = psql(f"SELECT xmin::text FROM vault_group_access WHERE vault_id = '{vid}' AND group_id = '{gid}'")
+        assert _notice_xmins(owner["id"])[-1] == xmin and _outbox_rows(owner["id"])[-1][1] == xmin
     assert f"which {x['_username']} belongs to, read access to one of your vaults" in _access_notices(owner_c)[0]["body"]
 
     # y joins it.
-    assert admin.post(f"/groups/{gid}/members", json={"user_ids": [y["id"]]}).status_code == 200
-    xmin = psql(f"SELECT xmin::text FROM user_groups WHERE group_id = '{gid}' AND user_id = '{y['id']}'")
-    assert _notice_xmins(owner["id"])[-1] == xmin
+    with sender_held():
+        assert admin.post(f"/groups/{gid}/members", json={"user_ids": [y["id"]]}).status_code == 200
+        xmin = psql(f"SELECT xmin::text FROM user_groups WHERE group_id = '{gid}' AND user_id = '{y['id']}'")
+        assert _notice_xmins(owner["id"])[-1] == xmin and _outbox_rows(owner["id"])[-1][1] == xmin
     assert f"added {y['_username']} to the department" in _access_notices(owner_c)[0]["body"]
 
     # x is held to read by a member row while the department may write; removing the row widens x.
