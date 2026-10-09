@@ -11,6 +11,7 @@ guesses cannot pass the limit. A device's sync bucket keeps counting successes, 
 test_login_throttle.py drives the same on a running stack, with the cache and without it.
 """
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
 
+from app.core import name_keys  # noqa: E402
 from app.core import rate_limiter as R  # noqa: E402
 from app.core.models import AuditLog, RateLimitRecord, RoleEnum, SignInLockout, User  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
@@ -65,10 +67,32 @@ class _Redis:
 
 
 @pytest.fixture(autouse=True)
-def _breaker_closed():
+def _breaker_closed(monkeypatch):
+    """Each test starts and ends with the limiter's breaker closed, and leaves no probe of its own running.
+
+    Opening the breaker starts its background probe, which pings the cache a cooldown later. In this test
+    process, whose runtime was never initialised, that ping initialised it and reinstalled the settings from
+    the environment, so the secret the sign-in name keys are made with changed in the middle of a later
+    test, and one name's attempts were counted in two buckets. Here a probe waits on an event the teardown
+    sets, pings nothing, and is joined; and the name keys are made with a fixed secret, so a reinstall from
+    anywhere else cannot change them either."""
+    stop = threading.Event()
+
+    def _no_cache():
+        raise ConnectionError("no cache in this test process")
+
+    monkeypatch.setattr(R, "_cb_probe_sleep", lambda seconds: stop.wait(seconds))
+    monkeypatch.setattr(R, "_cb_ping", _no_cache)
+    monkeypatch.setattr(name_keys, "_key", lambda: b"a fixed test secret|sign-in-name-key")
+    earlier = list(R._cb_probe_threads)
     R._cb_record_success()
     yield
     R._cb_record_success()
+    stop.set()
+    started = [t for t in list(R._cb_probe_threads) if t not in earlier]
+    for thread in started:
+        thread.join(5)
+    assert not [t for t in started if t.is_alive()], "a breaker probe outlived the test"
 
 
 @pytest.fixture
