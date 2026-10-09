@@ -1015,3 +1015,61 @@ def test_locking_a_vault_that_is_gone_refuses_or_leaves_it_out():
             assert refused.value.reason == holds.NO_SUCH_VAULT and refused.value.code == 404
         finally:
             session.close()
+
+
+def test_the_approval_writes_the_rollback_marker_with_its_hold(db, people):
+    """The marker that keeps an older release from starting is written by the approval's own transaction, not left
+    to the pruner's next pass."""
+    from sqlalchemy import text as sql
+    marker = "SELECT count(*) FROM data_requirements WHERE key = 'legal-holds'"
+    assert db.execute(sql(marker)).scalar() == 0
+    _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    assert db.execute(sql(marker)).scalar() == 1
+
+
+# --------------------------------------------------------------------------- what each step records and asks
+
+def test_turning_down_and_closing_each_write_their_success_row_under_the_case(db, people):
+    turned = _ask(db, people.uma, _vaults(people.v1))
+    cases.reject(db, turned, by=people.bob, reason="Not enough grounds.")
+    db.commit()
+    (row,) = _rows(db, "case_rejected", "success")
+    assert (row.case_id, row.user_id, row.resource_id) == (turned.id, people.bob.id, str(turned.id))
+    closed = _approve(db, _ask(db, people.uma, _vaults(people.v2), hold=False), people.bob)
+    cases.close(db, closed, by=people.carl, reason="Concluded.")
+    db.commit()
+    (row,) = _rows(db, "case_closed", "success")
+    assert (row.case_id, row.user_id, row.resource_id) == (closed.id, people.carl.id, str(closed.id))
+
+
+@pytest.mark.parametrize("step", ["reject", "extend"])
+def test_turning_down_and_extending_ask_for_the_approval_code_before_the_step(db, people, monkeypatch, step):
+    asked = []
+
+    def no_code(db_, user, request):
+        asked.append(user.username)
+        raise HTTPException(status_code=403, detail="the code was not given")
+    monkeypatch.setattr(cr, "STEP_UP_CASE_APPROVE", no_code)
+    case = _ask(db, people.uma, _vaults(people.v1))
+    if step == "extend":
+        _approve(db, case, people.bob)
+        ends = case.access_ends_at
+        _, err = _call(cr.extend_case, case.id, cr.Extension(days=1), request=None, if_match=f'"{case.version}"',
+                       current_user=people.carl, db=db)
+    else:
+        _, err = _call(cr.reject_case, case.id, cr.Reason(reason="Not enough grounds."), request=None,
+                       current_user=people.carl, db=db)
+    assert err.status_code == 403 and err.detail == "the code was not given" and asked == ["carl"]
+    db.expire_all()
+    if step == "extend":
+        assert case.status == "active" and case.access_ends_at == ends and _rows(db, "case_extended") == []
+    else:
+        assert case.status == "pending" and _rows(db, "case_rejected") == []
+
+
+def test_the_vault_picker_and_asking_for_a_case_are_for_a_live_auditor_only():
+    """Both depend on require_live_auditor, which refuses a right that is not in force whatever its stored state
+    (test_auditor_liveness.py)."""
+    for path, method in (("/compliance/vault-picker", "GET"), ("/compliance/cases", "POST")):
+        (route,) = [r for r in cr.router.routes if getattr(r, "path", None) == path and method in r.methods]
+        assert cr.require_live_auditor in {d.call for d in route.dependant.dependencies}, path

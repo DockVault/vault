@@ -380,3 +380,14 @@ def test_the_owners_files_opened_are_found_among_many_of_other_owners(db, people
     db.commit()
     (seen,) = oa.page(db, people.olga)["cases"]
     assert [o["name"] for o in seen["opened"]] == ["mine.txt"], "the owner's one, older than a thousand others"
+
+
+def test_one_owners_banner_never_lists_another_owners_notices(db, people):
+    case = _case(db, people, [people.v1, people.v2])
+    for owner in (people.olga, people.otto):
+        assert [(u["number"], u["kind"]) for u in oa.unseen(db, owner)] == [(case.number, "activation")]
+    assert oa.mark_seen(db, people.olga) == 1
+    db.commit()
+    assert oa.unseen(db, people.olga) == []
+    assert len(oa.unseen(db, people.otto)) == 1, "olga's reading leaves otto's notice unread"
+    assert oa.unseen(db, people.mallory) == [] and oa.unseen(db, people.uma) == []
