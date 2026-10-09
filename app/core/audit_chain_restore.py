@@ -341,6 +341,40 @@ def reseal_settings(view, lost: dict) -> Dict[str, dict]:
     return out
 
 
+def unsuperseded_cancels(view, lost: dict, settings: Dict[str, object]) -> List[int]:
+    """The lost cancels to seal again: those of requests the values sealed again do not supersede (a policy
+    seal of cause restore setting a setting supersedes every request for it before it, and a cancel of a request
+    that is not pending would fail verification for good)."""
+    return [r for r, _c in lost["cancels"] if (view.requests.get(r) or {}).get("setting") not in settings]
+
+
+def superseded_changes(db, view, settings: Dict[str, object]) -> List[list]:
+    """The waiting changes the values sealed again supersede: [request seq, setting, change id] for each request
+    the accepted chain holds pending for one of those settings whose change row the database shows waiting. The
+    chain will never apply them, so their rows end as superseded in the transaction of the policy seal, as a
+    newer change of the setting ends them on the panel; left waiting they would be shown as due for good."""
+    from app.core import setting_changes
+    from app.core.models import ManagedSettingChange as Change
+    out = []
+    for seq, d in sorted(view.pending_requests().items()):
+        if d.get("what") != "setting" or d.get("setting") not in settings or not d.get("request"):
+            continue
+        try:
+            change = db.get(Change, fmt.as_uuid(d.get("request")))
+        except (TypeError, ValueError):
+            change = None
+        if change is not None and change.status == setting_changes.PENDING:
+            out.append([seq, d.get("setting"), str(change.id)])
+    return out
+
+
+def _superseded_lines(superseded: List[list]) -> List[str]:
+    if not superseded:
+        return []
+    return ["Waiting changes the values sealed again supersede (their rows end as superseded): "
+            + ", ".join(f"request {seq} ({name})" for seq, name, _c in superseded)]
+
+
 def retention_lines(view) -> List[str]:
     newest = view.newest_policy()
     if newest is None:
@@ -432,7 +466,8 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
                                                                      "lines": [], "figures": []}
         lost = lost_retention(view, record) if record else {"policy": None, "cancels": [], "erases": []}
         settings = reseal_settings(view, lost) if reseal else {}
-        cancels = [r for r, _c in lost["cancels"]] if reseal else []
+        cancels = unsuperseded_cancels(view, lost, settings) if reseal else []
+        superseded = superseded_changes(w.db, view, settings)
         if under:
             lines.append(f"THE DATABASE'S CHAIN ENDS UNDER {under['key_id']}, A KEY THE RECORDED CHAIN LEFT AT SEAL "
                          f"{under['left_at_seq']}: anyone holding it could have written everything after the point "
@@ -478,6 +513,7 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
                          + ", ".join(f"{k} = {v!r}" for k, v in sorted(settings.items())))
         if cancels:
             lines.append("Cancels sealed again: requests " + ", ".join(map(str, cancels)))
+        lines += _superseded_lines(superseded)
         grace = grace_days(view, record)
         lines.append(f"Nothing is deleted for {grace} days of running time after the restore seal. Cancels, holds and "
                      "requests made after the database's newest seal are lost and must be made again.")
@@ -487,7 +523,7 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
                  if view.position else None, "record": list(_order(record)) if record else None,
                  "file": bool(has_file), "part": part, "under": under, "deleted": deleted,
                  "hours": [hours["lost"], hours["changed"], hours["days_changed"], digest(hours["figures"])],
-                 "lost": lost, "reseal": [sorted(settings.items()), cancels], "needed": needed}
+                 "lost": lost, "reseal": [sorted(settings.items()), cancels, superseded], "needed": needed}
         if read:
             return {"state": token(state), "lines": lines, "confirm": needed}
         check_expected(state, expect)
@@ -516,7 +552,7 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
             seal = w.append("restore", detail=lambda seq, at: {**restored, "grace_until": fmt.time_text(
                 at + timedelta(days=grace))}, key=k)
             if settings:
-                _append_restore_policy(w, settings, key=k)
+                _append_restore_policy(w, settings, superseded, key=k)
         summaries = _summaries_from(w.db, view, now) if view.position else {}
         carried = _carried_after_record(record, view) if record else []
         w.after_record_change = _new_generation(view, summaries, carried, now)
@@ -526,14 +562,16 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
     if cancels:
         _reseal_cancels(engine, st, cancels)
     return {"restored": seal.seq, "generation": w.st.view.generation, "grace_days": grace,
-            "resealed": sorted(settings), "cancels": cancels}
+            "resealed": sorted(settings), "cancels": cancels, "superseded": [c for _s, _n, c in superseded]}
 
 
-def _append_restore_policy(w, settings: Dict[str, object], key) -> None:
+def _append_restore_policy(w, settings: Dict[str, object], superseded: List[list], key) -> None:
     """A policy seal of cause restore by the host, right after the restore seal, setting the lost values that
     keep more; and each value stored in managed_settings in the same transaction, as after any change: the
     restored database's own value, older and deleting sooner, would otherwise be one the chain does not allow
-    (unjustified-input)."""
+    (unjustified-input). The waiting changes it supersedes (``superseded_changes``) end as superseded."""
+    from app.core import setting_changes
+    from app.core.models import ManagedSettingChange as Change
     from app.core import audit_chain_policy_seals as ps
     from app.core import settings_registry as registry
     from app.core.credential_changes import HOST_OPERATOR
@@ -552,6 +590,11 @@ def _append_restore_policy(w, settings: Dict[str, object], key) -> None:
             registry.store(w.db, name, setting, by_name=HOST_OPERATOR, now=w.st.clock())
         except registry.SettingRefused:
             continue      # one .env now locks or keeps from the panel: the chain's entry holds it alone
+    for _seq, _name, change_id in superseded:
+        change = w.db.get(Change, fmt.as_uuid(change_id))
+        if change is not None and change.status == setting_changes.PENDING:
+            setting_changes._end(change, setting_changes.SUPERSEDED, by_id=None, by_name=HOST_OPERATOR,
+                                 now=w.st.clock(), reason="a value sealed again after a restore")
 
 
 def _reseal_cancels(engine, st, requests: List[int]) -> None:
@@ -676,7 +719,8 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
         lost = lost_retention(view, replaced) if replaced and replaced.get("link") else \
             {"policy": None, "cancels": [], "erases": []}
         settings = reseal_settings(view, lost) if reseal else {}
-        cancels = [r for r, _c in lost["cancels"]] if reseal else []
+        cancels = unsuperseded_cancels(view, lost, settings) if reseal else []
+        superseded = superseded_changes(w.db, view, settings)
         if under:
             lines.append(f"THE RESTORED CHAIN IS UNDER {under['key_id']}, WHICH THE REPLACED RECORD HAD LEFT: the "
                          "bundle's .env brought it back, so anyone holding it can write seals again. Set a new "
@@ -692,6 +736,7 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
                          + ", ".join(f"{k} = {v!r}" for k, v in sorted(settings.items())))
         if cancels:
             lines.append("Cancels sealed again: requests " + ", ".join(map(str, cancels)))
+        lines += _superseded_lines(superseded)
         grace = grace_days(view, record, replaced)
         lines.append(f"Nothing is deleted for {grace} days of running time after the restore seal.")
         lines.append("The restored chain's retention state:")
@@ -703,7 +748,7 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
                          f"from {fmt.time_text(due)}")
         state = {"chain": host.chain_state(view, record), "command": "accept-restore", "mark": mark.get("at"),
                  "window": window, "kept": kept, "under": under, "lost": lost,
-                 "reseal": [sorted(settings.items()), cancels]}
+                 "reseal": [sorted(settings.items()), cancels, superseded]}
         if read:
             return {"state": token(state), "lines": lines}
         check_expected(state, expect)
@@ -726,7 +771,7 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
         seal = w.append("restore", detail=lambda seq, at: {**detail, "grace_until": fmt.time_text(
             at + timedelta(days=grace))}, key=key)
         if settings:
-            _append_restore_policy(w, settings, key=key)
+            _append_restore_policy(w, settings, superseded, key=key)
         # The new generation: the restored chain's seals of the backup's window are the host's now (the restore
         # seal acknowledges them); another writer's seals the restored record listed keep that status.
         view.generation = new_generation
@@ -753,4 +798,4 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
     if cancels:
         _reseal_cancels(engine, st, cancels)
     return {"restored": seal.seq, "acknowledged": window, "grace_days": grace, "resealed": sorted(settings),
-            "cancels": cancels}
+            "cancels": cancels, "superseded": [c for _s, _n, c in superseded]}
