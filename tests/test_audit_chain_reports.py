@@ -107,3 +107,17 @@ def test_the_daily_check_leaves_out_what_each_seal_did(env):
     env.seal()
     report = v.daily_check(env.session, env.st, force=True)
     assert report is not None and "gap" not in report.kinds() and "gap" in env.verify().kinds()
+
+
+def test_a_restore_that_found_nothing_changed_still_says_which_hours_it_sealed_again(env):
+    _sealed_day(env)
+    hour = ai.hour_floor(T0 - timedelta(hours=10))
+    _cut_from(env, env.st.view.entry_for(hour).root.seq)
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "head-record-mismatch"
+    _accept(env)
+    seal = [s for s in env.seals() if s.kind == "restore"][-1]
+    assert seal.detail["hours"]["lost"] and seal.detail["hours"]["changed"] == []
+    resealed = _found(env.verify(), "resealed-after-restore")
+    assert [f.seq for f in resealed] == [seal.seq]
+    assert f"hours {seal.detail['hours']['lost'][0]} to" in resealed[0].message and "changed:" not in resealed[0].message
