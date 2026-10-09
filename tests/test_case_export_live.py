@@ -111,9 +111,10 @@ def test_an_export_needs_the_session_and_one_stopped_early_is_recorded(world):
     with uma_c.session.get(url, stream=True, timeout=30) as r:
         assert r.status_code == 200
         next(r.iter_content(4096))
+    # Recorded as the response ends, within seconds; not whenever the stopped response happens to be collected.
     aborted = wait_for(lambda: psql(f"SELECT count(*) FROM audit_logs WHERE action = 'case_export_aborted' "
-                                    f"AND case_id = '{case['id']}'") != "0" or None, timeout=60)
-    assert aborted, "a fetch stopped before its end is recorded"
+                                    f"AND case_id = '{case['id']}'") != "0" or None, timeout=10, every=0.5)
+    assert aborted, "a fetch stopped before its end is recorded at once"
     assert psql(f"SELECT count(*) FROM audit_logs WHERE action = 'case_export_completed' "
                 f"AND case_id = '{case['id']}'") == "0"
     assert uma_c.get(url.replace(BASE_URL, "")).status_code == 410, "a new export is needed"
