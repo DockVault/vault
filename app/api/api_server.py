@@ -4116,7 +4116,7 @@ async def get_settings(
     _allowed = _allowed_vault_types()
     data["zero_knowledge_enabled"] = zk_rules.switch_on(_stored_switches)
     data["force_zero_knowledge"] = zk_rules.force_on(_stored_switches)
-    data["zero_knowledge_in_effect"] = _zk_enabled(db)
+    data["zero_knowledge_in_effect"] = zk_rules.in_effect(_stored_switches, _allowed)
     data["force_zero_knowledge_in_effect"] = zk_rules.force_in_effect(_stored_switches, _allowed)
     data["zero_knowledge_switches_locked"] = zk_rules.switch_lock(_allowed)
     # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default

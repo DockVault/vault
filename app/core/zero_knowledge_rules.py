@@ -19,6 +19,8 @@ The rules, so that no mix of them leaves a person with no vault type to make:
   leave only zero-knowledge (an administrator's off switch would leave nothing to make), or the
   administrators' switch is on.
 - The administrators' force holds where the plan offers zero-knowledge and their zero-knowledge switch is on.
+- The allowed types are the outer gate: where they leave out zero-knowledge, no zero-knowledge vault is made
+  and nobody must make one, whatever the plan's force or the administrators' switches say.
 - The two switches change something only where the plan offers zero-knowledge without forcing it and both
   types are allowed. Elsewhere they are locked: GET /settings says why, the settings page shows them
   disabled and does not send them, and a save that tries to change one is refused with that reason. Their
@@ -83,23 +85,33 @@ def admin_force_holds(stored: Mapping) -> bool:
     return plan_offers() and force_on(stored) and switch_on(stored)
 
 
+def in_effect(stored: Mapping, allowed: Set[str]) -> bool:
+    """Whether zero-knowledge vaults may be made (the cap aside), the allowed types included."""
+    return ZK in allowed and enabled(stored, allowed)
+
+
 def force_in_effect(stored: Mapping, allowed: Set[str]) -> bool:
-    """Whether a person in no department must make zero-knowledge vaults."""
-    return plan_forces() or allowed == {ZK} or (ZK in allowed and admin_force_holds(stored))
+    """Whether a person in no department must make zero-knowledge vaults. Never where the allowed types leave
+    out zero-knowledge: people make standard vaults there, whatever the plan's force says."""
+    if ZK not in allowed:
+        return False
+    return plan_forces() or allowed == {ZK} or admin_force_holds(stored)
 
 
 def switch_lock(allowed: Set[str]) -> Optional[str]:
-    """Why the two switches cannot change anything now, in words for the settings page; None when they can."""
+    """Why the two switches cannot change anything now, in words for the settings page; None when they can.
+    The allowed types come before the plan's force: where they leave out zero-knowledge, saying the plan
+    requires it would describe a rule that does not hold."""
     if not settings.plan_zero_knowledge:
         return "This deployment's plan does not include zero-knowledge vaults."
     if not plan_offers():
         return "This deployment's plan allows no zero-knowledge vaults."
+    if ZK not in allowed:
+        return "This deployment does not allow zero-knowledge vaults."
     if plan_forces():
         return "This deployment's plan requires zero-knowledge vaults."
     if allowed == {ZK}:
         return "This deployment allows only zero-knowledge vaults, so they cannot be turned off."
-    if ZK not in allowed:
-        return "This deployment does not allow zero-knowledge vaults."
     return None
 
 

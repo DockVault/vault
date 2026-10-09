@@ -70,6 +70,19 @@ def test_when_zero_knowledge_vaults_may_be_made(plan, plan_args, stored, allowed
     assert R.enabled(stored, allowed) is expected
 
 
+@pytest.mark.parametrize("plan_args, stored, allowed, expected", [
+    ({}, {}, BOTH, True),
+    ({}, {}, ZK_ONLY, True),
+    ({}, {"zero_knowledge_enabled": False}, BOTH, False),
+    ({}, {}, STANDARD_ONLY, False),                                     # the allowed types come first
+    ({"force": True}, {}, STANDARD_ONLY, False),
+    ({"cap": 0}, {}, BOTH, False),
+])
+def test_when_zero_knowledge_is_in_effect_with_the_allowed_types(plan, plan_args, stored, allowed, expected):
+    plan(**plan_args)
+    assert R.in_effect(stored, allowed) is expected
+
+
 @pytest.mark.parametrize("plan_args, stored, holds", [
     ({}, {"force_zero_knowledge": True}, True),                                # the switch never saved: on
     ({}, {"force_zero_knowledge": True, "zero_knowledge_enabled": True}, True),
@@ -90,6 +103,7 @@ def test_when_the_administrators_force_holds(plan, plan_args, stored, holds):
     ({}, {}, ZK_ONLY, True),
     ({"force": True}, {}, BOTH, True),
     ({"force": True, "cap": 0}, {"force_zero_knowledge": True}, BOTH, False),
+    ({"force": True}, {"force_zero_knowledge": True}, STANDARD_ONLY, False),  # the allowed types come first
 ])
 def test_what_the_force_is_in_effect_for_someone_in_no_department(plan, plan_args, stored, allowed, expected):
     plan(**plan_args)
@@ -104,6 +118,8 @@ def test_what_the_force_is_in_effect_for_someone_in_no_department(plan, plan_arg
     ({"force": True}, BOTH, "This deployment's plan requires zero-knowledge vaults."),
     ({}, ZK_ONLY, "This deployment allows only zero-knowledge vaults, so they cannot be turned off."),
     ({}, STANDARD_ONLY, "This deployment does not allow zero-knowledge vaults."),
+    ({"force": True}, STANDARD_ONLY, "This deployment does not allow zero-knowledge vaults."),
+    ({"force": True}, ZK_ONLY, "This deployment's plan requires zero-knowledge vaults."),
 ])
 def test_why_the_switches_are_locked(plan, plan_args, allowed, reason):
     plan(**plan_args)

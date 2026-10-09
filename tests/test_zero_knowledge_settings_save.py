@@ -11,6 +11,7 @@ type alone is allowed). A save that sends a locked switch at its saved value cha
 change it is refused with that reason; and the page leaves locked switches out. The round trips below run
 the server's own GET and PUT on a throwaway SQLite database.
 """
+import itertools
 import re
 import tempfile
 import uuid
@@ -199,6 +200,46 @@ def test_switches_that_can_change_something_are_saved_as_sent(db):
         assert got["zero_knowledge_in_effect"] is enabled
 
 
+# Each lock reason, and what it says about the vaults someone in no department can make.
+REFUSES_ZERO_KNOWLEDGE = ("This deployment's plan does not include zero-knowledge vaults.",
+                          "This deployment's plan allows no zero-knowledge vaults.",
+                          "This deployment does not allow zero-knowledge vaults.")
+REFUSES_STANDARD = ("This deployment's plan requires zero-knowledge vaults.",
+                    "This deployment allows only zero-knowledge vaults, so they cannot be turned off.")
+
+
+def test_what_the_settings_page_is_told_is_what_people_can_make(db, monkeypatch):
+    """For every mix of the plan's zero-knowledge settings, the allowed types and the two saved switches, GET
+    /settings reports as in effect what someone in no department can make, and a lock reason that is true of
+    it. A plan that forces zero-knowledge while the operator allows only standard vaults is the case this was
+    wrong for: people make standard vaults there, but the page said the plan requires zero-knowledge. A cap
+    with room is used: a cap that is reached is a quota, refused with its own message."""
+    person = _person(db)
+    for plan_zk, plan_force, cap, allowed, force, enabled in itertools.product(
+            (True, False), (True, False), (-1, 0, 2), ("", "standard", "zero_knowledge", "standard,zero_knowledge"),
+            (None, True, False), (None, True, False)):
+        mix = dict(plan_zk=plan_zk, plan_force=plan_force, cap=cap, allowed=allowed, force=force, enabled=enabled)
+        for name, value in (("plan_zero_knowledge", plan_zk), ("plan_force_zero_knowledge", plan_force),
+                            ("plan_max_zk_vaults", cap), ("plan_allowed_vault_types", allowed)):
+            monkeypatch.setattr(settings, name, value)
+        saved = {k: v for k, v in (("force_zero_knowledge", force), ("zero_knowledge_enabled", enabled))
+                 if v is not None}
+        db.execute(sa.delete(SystemSetting.__table__))
+        db.execute(sa.insert(SystemSetting.__table__).values(key="global", value=saved))
+        db.commit()
+        got = _get(db)
+        made = {kind: _create(db, person, kind) == kind for kind in ("standard", "zero_knowledge")}
+        assert got["zero_knowledge_in_effect"] is made["zero_knowledge"], (mix, got, made)
+        assert got["force_zero_knowledge_in_effect"] is (not made["standard"]), (mix, got, made)
+        reason = got["zero_knowledge_switches_locked"]
+        if reason in REFUSES_ZERO_KNOWLEDGE:
+            assert not made["zero_knowledge"], (mix, reason, made)
+        elif reason in REFUSES_STANDARD:
+            assert made == {"standard": False, "zero_knowledge": True}, (mix, reason, made)
+        else:
+            assert reason is None, (mix, reason)
+
+
 def test_the_settings_page_leaves_a_locked_switch_out_of_a_save():
     """The page shows a locked switch as in effect, disabled, with the server's reason, and its save leaves a
     disabled switch out (so the saved value is kept)."""
@@ -241,3 +282,4 @@ def test_the_vault_form_is_told_a_cap_of_none_is_no_zero_knowledge(db, monkeypat
     assert (got["zero_knowledge_enabled"], got["must_use_zk"], got["plan_force_zero_knowledge"]) == \
         (False, False, False)
     assert got["max_zk_vaults"] == 0
+
