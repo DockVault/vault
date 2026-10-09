@@ -112,6 +112,7 @@ def test_the_full_flow(world, admin):
                 "AND type = 'compliance_access') || '|' || "
                 "(SELECT string_agg(DISTINCT xmin::text, ',') FROM compliance_notice_outbox WHERE case_id = '{c}') "
                 "|| '|' || (SELECT string_agg(DISTINCT xmin::text, ',') FROM audit_logs WHERE case_id = '{c}' "
+                "AND status = 'success' "
                 "AND action IN ('case_approved', 'owner_notice_written', 'hold_placed', 'hold_confirmed'))"
                 .format(c=case["id"], u=olga["id"])).split("|")
             assert len(xids) == 5 and len(set(xids)) == 1 and xids[0], xids
