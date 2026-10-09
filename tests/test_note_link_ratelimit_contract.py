@@ -28,24 +28,27 @@ def test_redeem_keeps_the_per_pair_bucket():
     # Keyed on the token's HASH: the rate-limit key lives in Redis, and a raw link token there is a
     # usable secret sitting in cleartext next to the hashed lockout key.
     body = _redeem_body()
-    assert 'identifier=f"{client_ip}:{_notelink_token_hash(token)}"' in body, (
+    assert 'identifier=f"{source_of(client_ip)}:{_notelink_token_hash(token)}"' in body, (
         "the per-(IP, token) bucket must remain to bound hammering a single link")
     assert 'identifier=f"{client_ip}:{token}"' not in body, (
+        "the per-(IP, token) bucket must not put the raw link token in its Redis key")
+    assert 'identifier=f"{source_of(client_ip)}:{token}"' not in body, (
         "the per-(IP, token) bucket must not put the raw link token in its Redis key")
 
 
 def test_every_public_link_throttle_keys_on_the_token_hash():
     # The same rule for the other two public link kinds, whose redeem/open routes use a per-(IP, token)
     # bucket of their own.
-    assert 'identifier=f"{client_ip}:{token}"' not in _SRC, (
-        "a per-(IP, token) throttle key still embeds the raw token")
-    assert 'identifier=f"{client_ip}:{_publiclink_token_hash(token)}"' in _SRC
-    assert 'identifier=f"{client_ip}:{_receiver_token_hash(token)}"' in _SRC
+    for subject in ("client_ip", "source_of(client_ip)"):
+        assert 'identifier=f"{%s}:{token}"' % subject not in _SRC, (
+            "a per-(IP, token) throttle key still embeds the raw token")
+    assert 'identifier=f"{source_of(client_ip)}:{_publiclink_token_hash(token)}"' in _SRC
+    assert 'identifier=f"{source_of(client_ip)}:{_receiver_token_hash(token)}"' in _SRC
 
 
 def test_redeem_adds_the_per_ip_bucket_for_enumeration():
     body = _redeem_body()
-    assert "identifier=client_ip," in body, (
+    assert "identifier=source_of(client_ip)," in body, (
         "the per-IP bucket is missing -> guessing many different tokens from one IP is unthrottled")
     assert 'prefix="notelink_redeem_ip"' in body, (
         "the per-IP bucket must use its own distinct rate-limit prefix")

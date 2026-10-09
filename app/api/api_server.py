@@ -41,6 +41,7 @@ bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, redis_probe_ping
 from app.core import vault_attempt_throttle
+from app.core.sign_in_lockout import source_of
 from app.core import redis_guard
 from app.core.rate_limiter import redis_circuit_open, retry_after_seconds
 from app.core.auth_offload import (
@@ -5093,7 +5094,7 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
     client_ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=client_ip, limit=settings.rate_limit_api_auth,
+            identifier=source_of(client_ip), limit=settings.rate_limit_api_auth,
             window=settings.rate_limit_api_auth_window, prefix="invite_lookup", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -5138,7 +5139,7 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
 
     # (a) Rate limit — per IP AND per token prefix, both fail-closed (this is an unauthenticated
     # account-creation surface; it must throttle even during a Redis outage).
-    for ident, pfx, lim in ((client_ip, "invite_accept_ip", settings.rate_limit_api_auth),
+    for ident, pfx, lim in ((source_of(client_ip), "invite_accept_ip", settings.rate_limit_api_auth),
                             (prefix, "invite_accept_prefix", 5)):
         try:
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
@@ -5617,7 +5618,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
     ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            identifier=source_of(ip), limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
             prefix="forgot_password_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please try again shortly.")
@@ -6749,7 +6750,7 @@ async def get_reset(token: str, request: Request, db: Session = Depends(get_db))
     ip = get_client_ip(request)
     try:
         allowed, _, _ = _rl.check_rate_limit(
-            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            identifier=source_of(ip), limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
             prefix="reset_lookup_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -6785,7 +6786,7 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     # Whole-space brute force is already infeasible against the 256-bit token and bounded by the per-IP cap.
     try:
         for ident, pfx, lim, win in (
-                (ip, "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
+                (source_of(ip), "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
                 (prefix or "none", "reset_do_prefix", 5, 60)):
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=win, prefix=pfx, fail_open=False)
             if not allowed:
@@ -6870,7 +6871,7 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
     # budgets don't collide with login (rate_limit:login_user:* / rate_limit:login_ip:*) or invites
     # (invite_accept_*). The username key is the raw submitted value (lowered), so even a
     # never-existing name is throttled.
-    for ident, pfx, lim in ((client_ip, "signup_ip", settings.rate_limit_api_auth),
+    for ident, pfx, lim in ((source_of(client_ip), "signup_ip", settings.rate_limit_api_auth),
                             (uname.strip().lower(), "signup_identifier", 5)):
         try:
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
@@ -7668,7 +7669,7 @@ async def second_factor_login_verify(
     from app.core.rate_limiter import rate_limiter as _rl
     user, pending = principal
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{user.id}",
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{user.id}",
                                              limit=10, window=300, prefix="sf_login_verify", fail_open=False)
     if not allowed:
         import time as _t
@@ -7807,7 +7808,7 @@ async def second_factor_step_up(
     if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{current_user.id}",
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{current_user.id}",
                                              limit=10, window=300, prefix="sf_step_up", fail_open=False)
     if not allowed:
         import time as _t
@@ -12679,10 +12680,10 @@ async def redeem_note_link(
     #     is the per-IP throttle GET /invites/{token} and /reset/{token} already apply.
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{_notelink_token_hash(token)}", limit=_NOTELINK_REDEEM_LIMIT,
+            identifier=f"{source_of(client_ip)}:{_notelink_token_hash(token)}", limit=_NOTELINK_REDEEM_LIMIT,
             window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_NOTELINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_NOTELINK_REDEEM_IP_LIMIT,
             window=_NOTELINK_REDEEM_IP_WINDOW, prefix="notelink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -13511,10 +13512,10 @@ async def redeem_public_link(
     # alone throttles enumerating many different tokens from one address.
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{_publiclink_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
+            identifier=f"{source_of(client_ip)}:{_publiclink_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
             window=_PUBLINK_REDEEM_WINDOW, prefix="publiclink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
             window=_PUBLINK_REDEEM_IP_WINDOW, prefix="publiclink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -13670,7 +13671,7 @@ async def download_public_link(
     # bucket — a real folder download of many files stays well under it.
     try:
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
             window=_PUBLINK_REDEEM_IP_WINDOW, prefix="publiclink_download_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -14563,10 +14564,10 @@ async def open_receiver_upload_session(
 
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{_receiver_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
+            identifier=f"{source_of(client_ip)}:{_receiver_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
             window=_PUBLINK_REDEEM_WINDOW, prefix="receiver_open", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
             window=_PUBLINK_REDEEM_IP_WINDOW, prefix="receiver_open_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")

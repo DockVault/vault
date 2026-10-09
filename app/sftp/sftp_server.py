@@ -107,6 +107,10 @@ class _ConnectionAdmission:
     first nine -- while the flood the cap was for had never needed the authenticated slots at all.
     Any cap <= 0 disables that limit.
 
+    A source address is counted under its throttle subject (sign_in_lockout.source_of: an IPv6 address
+    grouped to its /64, an IPv4 address written as IPv6 as the IPv4 one), as every other per-address
+    budget is, so one client cannot spread its connections across the addresses of its /64.
+
     :meth:`admit` reserves a pre-auth slot (False when a ceiling is reached); :meth:`authenticated`
     moves a connection to the authenticated bucket once its credentials have been accepted (False
     when THAT ceiling is reached: the caller closes the connection, and the slot is still the
@@ -133,6 +137,8 @@ class _ConnectionAdmission:
             table[ip] = remaining
 
     def admit(self, ip: str) -> bool:
+        from app.core.sign_in_lockout import source_of
+        ip = source_of(ip)
         if self._sem is not None and not self._sem.acquire(blocking=False):
             return False
         if self._max_per_ip and self._max_per_ip > 0:
@@ -148,6 +154,8 @@ class _ConnectionAdmission:
         """The connection has authenticated: it leaves the pre-auth count (freeing that slot for
         the next handshake from this address) and joins the authenticated count -- unless THAT cap
         is reached, in which case it stays where it was and the caller must close it."""
+        from app.core.sign_in_lockout import source_of
+        ip = source_of(ip)
         with self._lock:
             if self._max_authenticated_per_ip and self._max_authenticated_per_ip > 0 \
                     and self._authenticated.get(ip, 0) >= self._max_authenticated_per_ip:
@@ -158,6 +166,8 @@ class _ConnectionAdmission:
         return True
 
     def release(self, ip: str, authenticated: bool = False) -> None:
+        from app.core.sign_in_lockout import source_of
+        ip = source_of(ip)
         with self._lock:
             if authenticated:
                 self._bump(self._authenticated, ip, -1)
@@ -2157,8 +2167,15 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
 # the bound survives an outage without locking out a healthy client — the account lockout +
 # is_active/is_locked checks stay the primary controls; this is a DoS/enumeration bound, not a
 # credential control.
+def _sftp_key_subject(ip: str, username: str) -> str:
+    """The key-offer budget's subject: the address's throttle subject (an IPv6 address grouped to its
+    /64) and the name. The durable fallback's row carries it as is; the cache key adds a prefix."""
+    from app.core.sign_in_lockout import source_of
+    return f"{source_of(ip)}:{username}"
+
+
 def _sftp_key_id(ip: str, username: str) -> str:
-    return f"sftp_pk:{ip}:{username}"
+    return f"sftp_pk:{_sftp_key_subject(ip, username)}"
 
 
 def _sftp_key_throttled(ip: str, username: str) -> bool:
@@ -2180,7 +2197,7 @@ def _sftp_key_throttled(ip: str, username: str) -> bool:
         return not allowed
     except RateLimiterUnavailable:
         # Redis down / breaker open -> the same durable DB throttle the password path uses.
-        allowed, _ = AuthService._db_throttle_hit(f"{ip}:{username}", "sftp_pk", limit, window)
+        allowed, _ = AuthService._db_throttle_hit(_sftp_key_subject(ip, username), "sftp_pk", limit, window)
         return not allowed
     except Exception:
         # Any other unexpected error: fail CLOSED (treat as throttled) rather than lift the bound.
@@ -2242,7 +2259,7 @@ def _sftp_key_clear(ip: str, username: str) -> None:
         from app.core.models import RateLimitRecord
         with get_db_context() as db:
             db.query(RateLimitRecord).filter(
-                RateLimitRecord.identifier == f"{ip}:{username}",
+                RateLimitRecord.identifier == _sftp_key_subject(ip, username),
                 RateLimitRecord.action == "sftp_pk",
             ).delete(synchronize_session=False)
     except Exception:
