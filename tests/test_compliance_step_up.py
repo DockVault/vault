@@ -147,7 +147,7 @@ def test_the_router_guards_each_and_the_boot_contract_holds():
 # pin is the other half: each check is called in the body of a route. The steps whose routes are not written
 # yet are listed here; writing one fails this test until its step leaves the list, and the list is empty when
 # compliance access is complete.
-ROUTES_TO_COME = {"compliance.case.export"}
+ROUTES_TO_COME = set()
 ROUTE_METHODS = {"get", "post", "put", "patch", "delete"}
 
 

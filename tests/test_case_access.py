@@ -473,7 +473,7 @@ def test_only_the_compliance_routes_import_the_resolver():
         if any(i.endswith("case_access") for i in _imports(path)):
             users.append(str(path.relative_to(ROOT)).replace("\\", "/"))
     assert set(users) <= {"app/api/compliance_router.py", "app/services/activity_names.py",
-                          "app/core/case_export.py", "app/core/case_names.py"}, users
+                          "app/core/case_export.py", "app/services/activity_case.py"}, users
 
 
 def test_no_permission_and_no_endpoint_group_names_a_compliance_capability():
