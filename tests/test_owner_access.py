@@ -299,6 +299,16 @@ def test_no_banner_before_the_approval_for_a_vault_narrowed_out_or_without_a_hol
     assert oa.member_review(db, other.id) is None
 
 
+def test_a_case_closed_before_its_access_ended_shows_members_no_banner(db, people):
+    """Closing a case ends its access at once, though the access period it was given runs on: the banner goes."""
+    case = _case(db, people, [people.v1], hold=False)
+    assert oa.member_review(db, people.v1.id) is not None
+    cases.close(db, case, by=people.uma, reason="Concluded early.")
+    db.commit()
+    assert case.status == "closed" and case.access_ends_at > cases.utcnow()
+    assert oa.member_review(db, people.v1.id) is None
+
+
 def test_a_hold_only_case_shows_members_no_banner(db, people):
     holds.place_hold_only(db, people.ada, [people.v1.id], purpose="litigation_hold", legal_basis="legal_obligation",
                           justification=TEXT["justification"], owner_note="Kept.")

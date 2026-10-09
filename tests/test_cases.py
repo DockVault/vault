@@ -819,6 +819,22 @@ def test_an_extension_once_access_ended_is_refused_before_any_code_and_the_case_
     assert case.access_ends_at == ended
 
 
+def test_a_new_grant_does_not_bring_back_a_case_asked_under_the_grant_revoked(db, people):
+    """A case stands on the grant it was asked under: once that right is revoked, a new right granted later gives
+    the auditor nothing in the old case, which stays suspended; a new case is asked under the new grant."""
+    case = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    rights.revoke(db, people.grant, actor=people.ada, reason="Left the team.")
+    db.commit()
+    assert cases.effective_status(db, case) == rules.SUSPENDED
+    again = rights.propose(db, people.uma, proposer=people.ada, now=rights.utcnow() - timedelta(minutes=2))
+    rights.approve(db, again, approver=people.bob, now=rights.utcnow() - timedelta(minutes=1))
+    db.commit()
+    assert rights.auditor_live(db, people.uma).live
+    assert cases.auditor_standing(db, case)[0] is False
+    assert cases.effective_status(db, case) == rules.SUSPENDED
+    assert _refused(cases.extend, db, case, by=people.carl, days=1).reason == rules.AUDITOR_NOT_LIVE
+
+
 def test_the_vault_picker_names_only_what_the_auditor_can_already_read(db, people, monkeypatch):
     from app.core.authorization import PermissionService
     zk = _vault(db, people.olga, kind="zero_knowledge")
