@@ -154,6 +154,13 @@ ROUTE_RULES: Sequence[Tuple[Tuple[str, ...], str, BodyRule, str]] = (
     (_POST, "/vaults/{vault_id}/zk/seal-names",
      BodyRule("seal_names", 4 * MiB, needs_session=True),
      "up to 1,000 encrypted names sent by the browser in one request (about 1.5 KB each at most)"),
+    # Reading a compliance case: a short query and a vault password, never more than the anonymous class.
+    (_POST, "/compliance/cases/{case_id}/search",
+     BodyRule("case_query", PUBLIC_LIMIT, needs_session=True),
+     "a file name to look for in a case, at most 255 characters"),
+    (_POST, "/compliance/cases/{case_id}/vaults/{vault_id}/unlock",
+     BodyRule("case_query", PUBLIC_LIMIT, needs_session=True),
+     "a vault password, to unlock that vault in a case"),
 ) + tuple((m, t, PUBLIC, "a public route: a handful of short fields") for m, t in _PUBLIC_ROUTES)
 
 

@@ -178,6 +178,9 @@ _IDENTIFIER_KEYS = (
     "purpose", "days", "ends_at", "hold", "by_operator", "by_owner", "access_ended", "by_approval",
     # reading under a case: whether a password vault was opened without its password, and a view in the preview
     "password_override", "preview",
+    # a listing or a search under a case: the folder listed, and of a search the query's length (never its text),
+    # how many names it read, whether it stopped early, and how many matched
+    "folder_id", "query_length", "scanned", "truncated", "matches",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

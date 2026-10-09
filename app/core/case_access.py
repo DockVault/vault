@@ -26,7 +26,10 @@ Opening a file checks, in this order, and stops at the first refusal:
    one: the ids its keys bind are the original ones).
 
 Nothing here changes the vault: no ``last_accessed``, no ``vault_views`` row, no share or download counter, no
-transfer entry under the file's name.
+transfer entry under the file's name. Listing a folder (``case_folder_listed``) and searching (``case_search``) are
+recorded too, a listing once per folder in ten minutes. Names appear only where the case may read them: never in a
+zero-knowledge vault (its structure, sizes and dates only), in a vault with a password only once it is unlocked (or
+under the override).
 
 Every refusal raises Refused; the routes record it (``case_access_refused``, record_refused) and answer with its
 status: 404 where the answer would tell whether something exists that the caller may not see (another auditor's
@@ -37,7 +40,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, Optional, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from app.core import case_rules as rules
 from app.core import compliance_settings as cs
@@ -407,11 +410,13 @@ def _row(db, case, user, action: str, *, resource_type: str, resource_id, detail
             details={**({"case_number": case.number} if case is not None else {}), **details}))
 
 
-def record(db, case, user, action: str, *, resource_type: str, resource_id, details: dict) -> None:
+def record(db, case, user, action: str, *, resource_type: str, resource_id, details: dict,
+           status: str = "success") -> None:
     """Write and commit a read's row under the case. Raises Refused(RECORD_FAILED) when it cannot be written: the
     read is then refused."""
     try:
-        _row(db, case, user, action, resource_type=resource_type, resource_id=resource_id, details=details)
+        _row(db, case, user, action, resource_type=resource_type, resource_id=resource_id, details=details,
+             status=status)
         db.commit()
     except Exception:  # noqa: BLE001 -- no read without its record
         db.rollback()
@@ -483,3 +488,275 @@ def open_file(db, case_id, file_id, user, *, unlocked_given: Optional[Mapping[st
     return case, found, download
 
 
+# --------------------------------------------------------------------------- what a case lists
+
+def _usernames(db, ids) -> Dict[str, str]:
+    from app.core.models import User
+    wanted = {i for i in ids if i is not None}
+    if not wanted:
+        return {}
+    return {str(i): n for i, n in db.query(User.id, User.username).filter(User.id.in_(wanted)).all()}
+
+
+def file_entry(item, *, kept: bool, status: str, names: bool, users: Mapping[str, str]) -> dict:
+    """What a listing shows of a file: never its stored checksum; its name and type only where names show."""
+    by = getattr(item, "uploaded_by", None)
+    changed = getattr(item, "modified_by", None) or by
+    return {"kind": "file", "id": str(item.id), "vault_id": str(item.vault_id),
+            "folder_id": str(item.folder_id) if item.folder_id else None,
+            "name": (item.original_name or item.name) if names else None,
+            "mime_type": item.mime_type if names else None, "size": int(item.size_bytes or 0),
+            "uploaded_at": _iso(item.created_at), "uploaded_by": users.get(str(by)) if by else None,
+            "uploaded_by_id": str(by) if by else None, "changed_at": _iso(item.updated_at),
+            "changed_by": users.get(str(changed)) if changed else None, "status": status,
+            "kept_at": _iso(getattr(item, "kept_at", None)) if kept else None,
+            "has_password": bool(getattr(item, "password_hash", None))}
+
+
+def folder_entry(item, *, kept: bool, names: bool, in_scope: bool) -> dict:
+    return {"kind": "folder", "id": str(item.id), "vault_id": str(item.vault_id),
+            "parent_id": str(item.parent_folder_id) if item.parent_folder_id else None,
+            "name": item.name if names else None, "created_at": _iso(item.created_at),
+            "status": KEPT_DELETED if kept else LIVE, "kept_at": _iso(getattr(item, "kept_at", None)) if kept else None,
+            # A folder shown only because a folder of the case is inside it: its own files are not in the case.
+            "in_scope": in_scope}
+
+
+def vault_entry(db, case, row, vault, unlocked: Iterable) -> dict:
+    """A vault of the case as its auditor sees it: type, label (a zero-knowledge vault's label is what its members
+    see while it is locked), counts, and how it opens."""
+    if vault is None:
+        return {"vault_id": str(row.vault_id), "exists": False, "type": row.vault_type_at_approval}
+    zk = is_zero_knowledge(vault, row)
+    try:
+        opening = vault_opening(case, vault, row, unlocked)
+        refused = None
+    except Refused as exc:
+        opening, refused = Opening(names=False), exc.reason
+    # A vault's own name shows as it does to a reader of the vault (a zero-knowledge vault's is the label its members
+    # see while it is locked); its files' and folders' names follow the opening.
+    return {"vault_id": str(vault.id), "exists": True, "type": vault.type or "standard",
+            "name": vault.name if refused is None else None, "zero_knowledge": zk,
+            "has_password": bool(vault.password_hash), "locked": opening.locked, "refused": refused,
+            "password_override": opening.override,
+            "covers": "whole" if row.folder_ids is None else "folders",
+            "file_count": int(vault.file_count or 0), "bytes": int(vault.total_size_bytes or 0)}
+
+
+def tree(db, case, user, vault_id, folder_id=None, *, unlocked: Iterable = (), now: Optional[datetime] = None,
+         offset: int = 0, limit: int = LIST_MAX) -> dict:
+    """One folder of a vault of the case (the root without ``folder_id``): its folders and, where the case covers
+    them, its files, live and kept, with their status. A folder above the case's folders lists only the way to
+    them. Records ``case_folder_listed`` once per folder in ten minutes, before answering. Raises Refused."""
+    from app.core.models import File, Folder, HeldFile, HeldFolder, Vault
+    now = now or utcnow()
+    vid = rules.as_id(vault_id)
+    row = covering_rows(db, case).get(vid) if vid is not None else None
+    if row is None:
+        raise Refused(NO_SUCH_VAULT)
+    vault = db.get(Vault, vid)
+    if vault is None:
+        raise Refused(NO_SUCH_VAULT)
+    opening = vault_opening(case, vault, row, unlocked)
+    scope = scope_of(row)
+    folders = Folders(db, vid, now=now)
+    leading = folders.leading(scope)
+    fid = str(rules.as_id(folder_id)) if folder_id is not None and rules.as_id(folder_id) is not None else None
+    if folder_id is not None and fid is None:
+        raise Refused(NO_SUCH_FOLDER)
+    if fid is not None and fid not in folders.parent:
+        raise Refused(NO_SUCH_FOLDER)
+    here = folders.chain(fid) if fid is not None else []
+    covered = scope is None or (fid is not None and rules.in_scope(scope, fid, here[1:]))
+    if fid is not None and not covered and fid not in leading:
+        raise Refused(OUT_OF_SCOPE)
+    kept_ok = _kept_readable(db)
+    parent = rules.as_id(fid) if fid is not None else None
+
+    entries: List[dict] = []
+    child_q = db.query(Folder).filter(Folder.vault_id == vid, Folder.parent_folder_id == parent if parent is not None
+                                      else Folder.parent_folder_id.is_(None))
+    children = [(f, False) for f in child_q.order_by(Folder.created_at, Folder.id).all()]
+    if kept_ok:
+        live_ids = {str(f.id) for f, _ in children}
+        kq = db.query(HeldFolder).filter(HeldFolder.vault_id == vid, _not_due(HeldFolder, now),
+                                         HeldFolder.parent_folder_id == parent if parent is not None
+                                         else HeldFolder.parent_folder_id.is_(None))
+        children += [(f, True) for f in kq.order_by(HeldFolder.created_at, HeldFolder.id).all()
+                     if str(f.id) not in live_ids]
+    for f, kept in children:
+        inside = covered or str(f.id) in (scope or ())
+        if inside or str(f.id) in leading:
+            entries.append(folder_entry(f, kept=kept, names=opening.names, in_scope=inside))
+
+    files: List[Tuple[object, bool]] = []
+    if covered:
+        fq = db.query(File).filter(File.vault_id == vid, File.folder_id == parent if parent is not None
+                                   else File.folder_id.is_(None))
+        files = [(f, False) for f in fq.order_by(File.created_at, File.id).all()]
+        if kept_ok:
+            kq = db.query(HeldFile).filter(HeldFile.vault_id == vid, _not_due(HeldFile, now),
+                                           HeldFile.folder_id == parent if parent is not None
+                                           else HeldFile.folder_id.is_(None))
+            live = {str(f.id) for f, _ in files}
+            files += [(f, True) for f in kq.order_by(HeldFile.created_at, HeldFile.id).all() if str(f.id) not in live]
+        files = [(f, kept) for f, kept in files if in_range(case, f)]
+    users = _usernames(db, [getattr(f, a, None) for f, _ in files for a in ("uploaded_by", "modified_by")])
+    entries += [file_entry(f, kept=kept, status=status_of(f, kept, now), names=opening.names, users=users)
+                for f, kept in files]
+    total = len(entries)
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or LIST_MAX), LIST_MAX))
+    page = entries[offset:offset + limit]
+    details = {"vault_id": str(vid), "folder_id": fid, "count": total}
+    if opening.override:
+        details["password_override"] = True
+    record_once(db, case, user, "case_folder_listed", resource_type="folder" if fid else "vault",
+                resource_id=fid or str(vid), details=details, now=now)
+    path_names = folders_names(db, vid, here, opening.names)
+    return {"vault": vault_entry(db, case, row, vault, unlocked), "folder_id": fid,
+            "path": [{"id": f, "name": path_names.get(f)} for f in reversed(here)],
+            "entries": page, "total": total, "offset": offset, "more": offset + len(page) < total}
+
+
+def folders_names(db, vault_id, ids, names: bool) -> Dict[str, Optional[str]]:
+    """{folder id: its name, or None where names do not show}, live or kept."""
+    from app.core.models import Folder, HeldFolder
+    out: Dict[str, Optional[str]] = {str(i): None for i in ids}
+    if not names or not ids:
+        return out
+    wanted = [rules.as_id(i) for i in ids if rules.as_id(i) is not None]
+    for f in db.query(Folder).filter(Folder.vault_id == vault_id, Folder.id.in_(wanted)).all():
+        out[str(f.id)] = f.name
+    if _kept_readable(db):
+        for f in db.query(HeldFolder).filter(HeldFolder.vault_id == vault_id, HeldFolder.id.in_(wanted)).all():
+            out.setdefault(str(f.id), None)
+            if out[str(f.id)] is None:
+                out[str(f.id)] = f.name
+    return out
+
+
+def file_info(db, case, user, file_id, *, unlocked: Iterable = (), now: Optional[datetime] = None) -> dict:
+    """One file's metadata in the case (as a listing shows it, with its folder path). Its name is read as a listing
+    reads it, so its folder's listing is recorded (once in ten minutes). Raises Refused."""
+    now = now or utcnow()
+    found = file_for(db, case, file_id, now=now)
+    opening = vault_opening(case, found.vault, found.row, unlocked)
+    users = _usernames(db, [getattr(found.item, "uploaded_by", None), getattr(found.item, "modified_by", None)])
+    entry = file_entry(found.item, kept=found.kept, status=found.status, names=opening.names, users=users)
+    path = list(reversed(chain(db, found.vault.id, found.item.folder_id, now=now)))
+    names = folders_names(db, found.vault.id, path, opening.names)
+    entry["path"] = [{"id": f, "name": names.get(f)} for f in path]
+    entry["zero_knowledge"] = is_zero_knowledge(found.vault, found.row)
+    entry["locked"] = opening.locked
+    details = {"vault_id": str(found.vault.id), "folder_id": str(found.item.folder_id) if found.item.folder_id
+               else None, "count": 1}
+    if opening.override:
+        details["password_override"] = True
+    fid = str(found.item.folder_id) if found.item.folder_id else None
+    record_once(db, case, user, "case_folder_listed", resource_type="folder" if fid else "vault",
+                resource_id=fid or str(found.vault.id), details=details, now=now)
+    return entry
+
+
+# --------------------------------------------------------------------------- search
+
+EXACT, PREFIX = "exact", "prefix"
+
+
+def _matches(name: Optional[str], query: str, mode: str) -> bool:
+    if not name:
+        return False
+    a, b = name.casefold(), query.casefold()
+    return a == b if mode == EXACT else a.startswith(b)
+
+
+def search(db, case, user, query: str, *, mode: str = PREFIX, vault_id=None, unlocked: Iterable = (),
+           now: Optional[datetime] = None) -> dict:
+    """File names in the case that are ``query`` (``exact``) or start with it (``prefix``), ignoring case: in the
+    vaults whose names the case may read (never zero-knowledge; a password vault once unlocked, or under the
+    override), live and kept, inside the case's folders and time range. At most SEARCH_MAX names are read per
+    query, newest first; ``truncated`` says when more were left. Records ``case_search`` with the query's length
+    and the number of matches, never the text. Raises Refused."""
+    from app.core.models import File, HeldFile, Vault
+    now = now or utcnow()
+    query = (query or "").strip()
+    if not query or len(query) > QUERY_MAX:
+        raise Refused("bad_query", status=422, record=False)
+    if mode not in (EXACT, PREFIX):
+        raise Refused("bad_query", status=422, record=False)
+    rows = covering_rows(db, case)
+    if vault_id is not None:
+        vid = rules.as_id(vault_id)
+        if vid is None or vid not in rows:
+            raise Refused(NO_SUCH_VAULT)
+        rows = {vid: rows[vid]}
+    candidates: List[Tuple[datetime, str, uuid.UUID, bool]] = []
+    openings: Dict[uuid.UUID, Opening] = {}
+    folder_maps: Dict[uuid.UUID, Folders] = {}
+    kept_ok = _kept_readable(db)
+    for vid, row in rows.items():
+        vault = db.get(Vault, vid)
+        if vault is None:
+            continue
+        try:
+            opening = vault_opening(case, vault, row, unlocked)
+        except Refused:
+            continue
+        if not opening.names:
+            continue
+        openings[vid] = opening
+        scope = scope_of(row)
+        folders = folder_maps.setdefault(vid, Folders(db, vid, now=now))
+        sources = [(File, False)] + ([(HeldFile, True)] if kept_ok else [])
+        for model, kept in sources:
+            q = db.query(model.id, model.folder_id, model.created_at, model.updated_at).filter(model.vault_id == vid)
+            if kept:
+                q = q.filter(_not_due(model, now))
+            for fid, folder, created, updated in q.all():
+                if not times_in_range(case, created, updated):
+                    continue
+                if scope is not None and not rules.in_scope(scope, fid, folders.chain(folder)):
+                    continue
+                candidates.append((updated or created or datetime.min, str(fid), vid, kept))
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    seen: Set[str] = set()
+    unique = []
+    for c in candidates:
+        if c[1] not in seen:
+            seen.add(c[1])
+            unique.append(c)
+    truncated = len(unique) > SEARCH_MAX
+    unique = unique[:SEARCH_MAX]
+    live_ids = [uuid.UUID(c[1]) for c in unique if not c[3]]
+    kept_ids = [uuid.UUID(c[1]) for c in unique if c[3]]
+    items: List[Tuple[object, bool]] = []
+    for model, ids, kept in ((File, live_ids, False), (HeldFile, kept_ids, True)):
+        for start in range(0, len(ids), 500):
+            items += [(f, kept) for f in db.query(model).filter(model.id.in_(ids[start:start + 500])).all()]
+    found = [(f, kept) for f, kept in items if _matches(f.original_name or f.name, query, mode)]
+    users = _usernames(db, [getattr(f, a, None) for f, _ in found for a in ("uploaded_by", "modified_by")])
+    results = [file_entry(f, kept=kept, status=status_of(f, kept, now), names=True, users=users)
+               for f, kept in found]
+    results.sort(key=lambda e: (e["changed_at"] or e["uploaded_at"] or "", e["id"]), reverse=True)
+    details = {"query_length": len(query), "matches": len(results), "scanned": len(unique), "truncated": truncated,
+               "mode": mode, "vault_ids": sorted(str(v) for v in openings)}
+    if any(o.override for o in openings.values()):
+        details["password_override"] = True
+    record(db, case, user, "case_search", resource_type="case", resource_id=case.id, details=details)
+    return {"results": results, "scanned": len(unique), "truncated": truncated,
+            "vaults_searched": sorted(str(v) for v in openings),
+            "vaults_not_searched": sorted(str(v) for v in rows if v not in openings)}
+
+
+
+def vaults(db, case, user, *, unlocked: Iterable = (), now: Optional[datetime] = None) -> dict:
+    """The vaults of the case as its auditor reads them (their names, as a reader of each vault sees them; how each
+    opens). Recorded as a listing of the case, once in ten minutes."""
+    from app.core.models import Vault
+    now = now or utcnow()
+    rows = covering_rows(db, case)
+    out = [vault_entry(db, case, row, db.get(Vault, vid), unlocked) for vid, row in rows.items()]
+    record_once(db, case, user, "case_folder_listed", resource_type="case", resource_id=case.id,
+                details={"count": len(out), "vault_ids": sorted(str(v) for v in rows)}, now=now)
+    return {"vaults": out}

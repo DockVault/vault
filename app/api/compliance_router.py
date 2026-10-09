@@ -33,7 +33,12 @@ down, withdrawing, extending, closing, narrowing, recording an objection, and th
 the holds'.
 
 A vault's owner (app/core/owner_access.py): Access to my vaults, the banner's "I've read it", and unlocking a
-password-protected vault's names on that page. Their routes are at the end of this module.
+password-protected vault's names on that page. Their routes follow the cases'.
+
+Reading a case (app/core/case_access.py, the only code that opens a file for a case): its vaults and folders, a
+file's metadata, content and rendered preview, unlocking a password-protected vault with its password, and
+searching file names. Their routes are at the end of this module; each asks for no endpoint group and no
+permission, and records what it reads and every refusal.
 """
 from __future__ import annotations
 
@@ -568,7 +573,7 @@ def undo_hold_release(case_id: uuid.UUID, request: Request, current_user: User =
 
 
 # --------------------------------------------------------------------------- cases
-# (app/core/cases.py has the steps, app/core/case_rules.py the rules; the content routes come with the case resolver)
+# (app/core/cases.py has the steps, app/core/case_rules.py the rules; reading a case is at the end of this module)
 #
 #     GET   /compliance/cases                         the caller's cases (an auditor's own; every case for an admin)
 #     POST  /compliance/cases                         ask for one: a live auditor, with the step-up
@@ -985,3 +990,299 @@ def unlock_my_vault_names(vault_id: uuid.UUID, body: OwnerUnlock, request: Reque
         raise HTTPException(status_code=503, detail="The names were not unlocked: the audit record could not be "
                                                     "written.")
     return {"vault_id": str(vault.id), "receipt": receipt, "expires_at": expires.isoformat() + "Z"}
+
+
+# --------------------------------------------------------------------------- reading a case
+# (app/core/case_access.py checks every read, records it, and is the only code that opens a file for a case)
+#
+#     GET  /compliance/cases/{id}/tree?vault_id=&folder_id=     without vault_id: the case's vaults; else one folder
+#     GET  /compliance/cases/{id}/files/{file_id}               one file's metadata
+#     GET  /compliance/cases/{id}/files/{file_id}/content       its bytes: Range, Cache-Control: no-store
+#     GET  /compliance/cases/{id}/files/{file_id}/preview-render  Markdown, HTML or code, rendered and sanitised
+#     POST /compliance/cases/{id}/vaults/{vault_id}/unlock      {password}: a 15-minute receipt for that vault
+#     POST /compliance/cases/{id}/search                        {q, mode?, vault_id?}: file names
+#
+# The receipts of unlocked vaults come back in X-Case-Unlock ("<vault id>=<receipt>", comma-separated). Every
+# refusal is recorded (case_access_refused) and answered with its reason: 404 where the answer would say whether
+# something exists that the caller may not see, 403 otherwise, 429 past the view rate.
+
+# Types a browser would run if one were ever opened as a page: their bytes are sent as text.
+_ACTIVE_TYPES = ("text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+                 "text/javascript", "application/javascript", "application/ecmascript", "text/ecmascript")
+_CONTENT_CSP = "default-src 'none'; sandbox"
+
+
+class CaseUnlock(BaseModel):
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+class CaseSearch(BaseModel):
+    q: str = Field(..., min_length=1, max_length=255)
+    mode: str = Field(default="prefix", max_length=8)
+    vault_id: Optional[uuid.UUID] = None
+
+
+def _read_refused(db, case_id, current_user, refused, *, resource_type=None, resource_id=None):
+    """Record a refused read (unless only malformed) and raise its answer."""
+    from app.core import case_access
+    if refused.record:
+        case_access.record_refused(db, case_id, current_user, refused, resource_type=resource_type,
+                                   resource_id=resource_id)
+    raise HTTPException(status_code=refused.status, detail={"reason": refused.reason, "text": refused.text})
+
+
+def _reader(case_id, current_user, db, request, x_case_unlock):
+    """(case, the vaults its receipts unlock) for a read, after check 1."""
+    from app.api.api_server import _current_session_hash
+    from app.core import case_access
+    case = case_access.case_for(db, case_id, current_user)
+    unlocked = case_access.unlocked_vaults(db, case, current_user, _current_session_hash(request),
+                                           case_access.parse_unlock_header(x_case_unlock))
+    return case, unlocked
+
+
+@router.get("/compliance/cases/{case_id}/tree")
+def case_tree(case_id: uuid.UUID, request: Request, vault_id: Optional[uuid.UUID] = None,
+              folder_id: Optional[uuid.UUID] = None, offset: int = Query(0, ge=0, le=10_000_000),
+              limit: int = Query(500, ge=1, le=2000), x_case_unlock: Optional[str] = Header(default=None),
+              current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """The case's vaults, or one folder of one of them (its root without folder_id): folders and files, live and
+    kept, with their status; names only where the case may read them. Recorded once per folder in ten minutes."""
+    from app.core import case_access
+    limit_statements(db)
+    try:
+        case, unlocked = _reader(case_id, current_user, db, request, x_case_unlock)
+        if vault_id is None:
+            return case_access.vaults(db, case, current_user, unlocked=unlocked)
+        return case_access.tree(db, case, current_user, vault_id, folder_id, unlocked=unlocked, offset=offset,
+                                limit=limit)
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="folder" if folder_id else "vault",
+                      resource_id=folder_id or vault_id)
+
+
+@router.get("/compliance/cases/{case_id}/files/{file_id}")
+def case_file_info(case_id: uuid.UUID, file_id: uuid.UUID, request: Request,
+                   x_case_unlock: Optional[str] = Header(default=None),
+                   current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """One file of the case: as a listing shows it, with its folder path. Never its stored checksum."""
+    from app.core import case_access
+    limit_statements(db)
+    try:
+        case, unlocked = _reader(case_id, current_user, db, request, x_case_unlock)
+        return case_access.file_info(db, case, current_user, file_id, unlocked=unlocked)
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="file", resource_id=file_id)
+
+
+def _content_type(mime: Optional[str]) -> str:
+    from app.api.api_server import _safe_media_type
+    safe = _safe_media_type(mime)
+    if safe.split(";")[0].strip().lower() in _ACTIVE_TYPES:
+        return "text/plain; charset=utf-8"
+    return safe
+
+
+def _inline(name: Optional[str]) -> str:
+    from app.api.api_server import _content_disposition
+    value = _content_disposition(name or "file")
+    return "inline" + value[len("attachment"):] if value.startswith("attachment") else value
+
+
+def _open(db, case_id, file_id, current_user, request, x_case_unlock, *, preview=False):
+    """Checks 1 to 4 and the stored file opened (case_access.open_file), every refusal recorded and answered."""
+    from app.api.api_server import _current_session_hash
+    from app.core import case_access
+    from app.services.vault_service import FileNotFoundError as StoredFileMissing, FileServiceError
+    try:
+        return case_access.open_file(db, case_id, file_id, current_user,
+                                     unlocked_given=case_access.parse_unlock_header(x_case_unlock),
+                                     session_hash=_current_session_hash(request), preview=preview)
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="file", resource_id=file_id)
+    except StoredFileMissing:
+        raise HTTPException(status_code=404, detail={"reason": "content_missing",
+                                                     "text": "The stored content of this file is missing."})
+    except FileServiceError:
+        raise HTTPException(status_code=500, detail={"reason": "content_unreadable",
+                                                     "text": "The stored content of this file could not be read."})
+
+
+_INTEGRITY = {"reason": "integrity", "text": "This file does not match the checksum stored for it."}
+
+
+@router.get("/compliance/cases/{case_id}/files/{file_id}/content")
+def case_file_content(case_id: uuid.UUID, file_id: uuid.UUID, request: Request,
+                      x_case_unlock: Optional[str] = Header(default=None),
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """A file's bytes, to be shown (never a download of its own: copies leave only through an export). A byte
+    range adds no record; the first view of the file in ten minutes is recorded before the first byte."""
+    from fastapi.responses import StreamingResponse
+    from app.api.api_server import _RANGE_WINDOW
+    from app.services.download_stream import UNSATISFIABLE, ChecksumMismatch, parse_byte_range
+    limit_statements(db)
+    _case, found, download = _open(db, case_id, file_id, current_user, request, x_case_unlock)
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+               "Content-Security-Policy": _CONTENT_CSP,
+               "Content-Disposition": _inline(found.item.original_name or found.item.name)}
+    media = _content_type(download.mime_type)
+    try:
+        if download.total_length == 0:
+            download.verify_now()
+        etag = f'"{download.content_mac}"' if download.content_mac else None
+        wanted = None
+        if download.read_range is not None:
+            headers["Accept-Ranges"] = "bytes"
+            if etag:
+                headers["ETag"] = etag
+            if_range = request.headers.get("if-range")
+            if if_range is None or (etag is not None and if_range.strip() == etag):
+                wanted = parse_byte_range(request.headers.get("range"), download.total_length)
+        if wanted is UNSATISFIABLE:
+            raise HTTPException(status_code=416, detail="Requested range not satisfiable",
+                                headers={"Content-Range": f"bytes */{download.total_length}"})
+        if wanted is not None and wanted.start == 0 and wanted.last == download.total_length - 1:
+            wanted = None
+    except ChecksumMismatch:
+        download.close()
+        raise HTTPException(status_code=500, detail=_INTEGRITY)
+    except BaseException:
+        download.close()
+        raise
+
+    if wanted is not None:
+        span = wanted
+
+        def ranged():
+            try:
+                at = span.start
+                while at <= span.last:
+                    piece = download.read_range(at, min(_RANGE_WINDOW, span.last - at + 1))
+                    if not piece:
+                        break
+                    yield piece
+                    at += len(piece)
+            finally:
+                download.close()
+        return StreamingResponse(ranged(), status_code=206, media_type=media,
+                                 headers={**headers, "Content-Length": str(span.length),
+                                          "Content-Range": span.content_range()})
+
+    def whole():
+        try:
+            for piece in download.chunks():
+                yield piece
+        finally:
+            download.close()
+    return StreamingResponse(whole(), media_type=media,
+                             headers={**headers, "Content-Length": str(download.total_length)})
+
+
+# A rendered preview is for readable text: the same ceiling as the vault's own preview.
+PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+
+
+@router.get("/compliance/cases/{case_id}/files/{file_id}/preview-render")
+def case_file_preview(case_id: uuid.UUID, file_id: uuid.UUID, request: Request, kind: Optional[str] = None,
+                      x_case_unlock: Optional[str] = Header(default=None),
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Markdown, HTML or source of a file of the case, rendered and sanitised for the sandboxed preview
+    (app/core/preview_render.py, as the vault's own preview). Recorded as a view."""
+    from fastapi.responses import JSONResponse
+    from app.core import case_access
+    from app.core.preview_render import render_preview_document
+    from app.services.download_stream import ChecksumMismatch
+    limit_statements(db)
+    try:
+        case = case_access.case_for(db, case_id, current_user)
+        found = case_access.file_for(db, case, file_id)
+        if int(found.item.size_bytes or 0) > PREVIEW_MAX_BYTES:
+            raise case_access.Refused(case_access.TOO_LARGE, record=False)
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="file", resource_id=file_id)
+    _case, found, download = _open(db, case_id, file_id, current_user, request, x_case_unlock, preview=True)
+    try:
+        with download:
+            content = b"".join(download.chunks())
+    except ChecksumMismatch:
+        raise HTTPException(status_code=500, detail=_INTEGRITY)
+    if kind not in ("markdown", "html", "code", "text", None):
+        kind = None
+    document, resolved = render_preview_document(content.decode("utf-8", errors="replace"),
+                                                 found.item.original_name or found.item.name or "file.txt", kind)
+    resp = JSONResponse({"html": document, "kind": resolved})
+    resp.headers["Content-Security-Policy"] = _CONTENT_CSP
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@router.post("/compliance/cases/{case_id}/vaults/{vault_id}/unlock")
+def unlock_case_vault(case_id: uuid.UUID, vault_id: uuid.UUID, body: CaseUnlock, request: Request,
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """A receipt that opens one password-protected vault of the case for 15 minutes, for this session, case and
+    auditor (app/core/vault_unlock_receipts.py). The password is checked once, on the vault-password throttle every
+    check of that vault's password by this account counts in (so a new case does not reset it), and never recorded.
+    Only where the case opens password vaults with their password."""
+    from app.api.api_server import _current_session_hash
+    from app.core import case_access
+    from app.core import compliance_settings as cs
+    from app.core import vault_unlock_receipts as receipts
+    from app.core.models import Vault
+    limit_statements(db)
+    try:
+        case = case_access.case_for(db, case_id, current_user)
+        row = case_access.covering_rows(db, case).get(vault_id)
+        vault = db.get(Vault, vault_id) if row is not None else None
+        if vault is None:
+            raise case_access.Refused(case_access.NO_SUCH_VAULT)
+        if case_access.is_zero_knowledge(vault, row):
+            raise case_access.Refused(case_access.ZERO_KNOWLEDGE)
+        if not vault.password_hash:
+            raise case_access.Refused("no_password", status=400, record=False)
+        rule = case_access.policy(case)
+        if rule == cs.REFUSE:
+            raise case_access.Refused(case_access.PASSWORD_REFUSED)
+        if rule == cs.OVERRIDE:
+            raise case_access.Refused("opens_without_password", status=400, record=False)
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="vault", resource_id=vault_id)
+    session_hash = _current_session_hash(request)
+    if not session_hash:
+        raise HTTPException(status_code=403, detail="A receipt is given only to a signed-in session.")
+    try:
+        receipts.check_password(current_user, vault, body.password)
+    except receipts.UnlockRefused as refused:
+        try:
+            case_access.record(db, case, current_user, "case_vault_unlocked", resource_type="vault",
+                               resource_id=vault.id, status="failure", details={"vault_id": str(vault.id), "reason": (
+                                   "wrong_password" if refused.status == 403 else "throttled")})
+        except case_access.Refused:
+            pass
+        raise HTTPException(status_code=refused.status, detail=refused.detail)
+    receipt, expires = receipts.issue(purpose=receipts.PURPOSE_CASE, session_hash=session_hash, case_id=case.id,
+                                      vault_id=vault.id, user_id=current_user.id,
+                                      credential=receipts.credential_digest(vault.password_hash))
+    try:
+        case_access.record(db, case, current_user, "case_vault_unlocked", resource_type="vault", resource_id=vault.id,
+                           details={"vault_id": str(vault.id), "expires_at": expires.isoformat() + "Z"})
+    except case_access.Refused:
+        raise HTTPException(status_code=503, detail="The vault was not unlocked: the record could not be written.")
+    return {"vault_id": str(vault.id), "receipt": receipt, "expires_at": expires.isoformat() + "Z"}
+
+
+@router.post("/compliance/cases/{case_id}/search")
+def search_case(case_id: uuid.UUID, body: CaseSearch, request: Request,
+                x_case_unlock: Optional[str] = Header(default=None),
+                current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """File names of the case that are the query, or start with it (``mode`` exact or prefix), ignoring case, at most
+    2,000 names read per query. The query travels in the body and is never recorded: the record keeps its length
+    and the number of matches."""
+    from app.core import case_access
+    limit_statements(db)
+    try:
+        case, unlocked = _reader(case_id, current_user, db, request, x_case_unlock)
+        return case_access.search(db, case, current_user, body.q, mode=body.mode, vault_id=body.vault_id,
+                                  unlocked=unlocked)
+    except case_access.Refused as refused:
+        _read_refused(db, case_id, current_user, refused, resource_type="case", resource_id=case_id)
