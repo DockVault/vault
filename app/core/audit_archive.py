@@ -34,9 +34,12 @@ all the day's hours the chain covers says ``complete``.
 
 Changing archived rows (the audit job's deletions now; the erase and the address rewrite later) goes through
 rewrite_day(), the block-rewrite primitive: every block of the day is checked against the day's ``archive``
-seal (length, digest) and its hours against their seals before anything changes; the changed parts are
-written again and checked the same way; the change's own seal (a ``prune``) and then an ``archive`` seal of
-cause ``rewrite`` naming it commit in the same transaction. A day whose rows are all gone loses its blocks.
+seal (length, digest) and its hours against their seals, and a part the change touches is written again and
+checked the same way, all in one transaction, so a check that fails anywhere leaves every block as it was; the
+change's own seal (a ``prune``) and then an ``archive`` seal of cause ``rewrite`` naming it commit with them. A
+day whose rows are all gone loses its blocks. No part's rows are held: a part is read as a stream, checked as it
+goes (PartReader), once to pick the rows the change touches and once to write it anew, and unarchive puts rows
+back a chunk at a time.
 
 The size cap counts each archived part as the smaller of its bound length (the ``archive`` seal's) and the lagged
 bytes of the hours it holds (app/core/audit_chain_size.py).
