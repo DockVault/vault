@@ -1315,6 +1315,21 @@ def test_a_hold_only_case_shows_an_administrator_it_concerns_nothing(db, people,
     assert told.holds and all(n["concerned"] == [str(otto_admin.id)] for n in told.holds)
 
 
+def test_whom_a_step_concerns_is_read_with_what_the_step_added_but_not_yet_wrote(db, people, monkeypatch):
+    """The session does not write on its own before a query: the administrators' notices read the people a step has
+    just added (a named person, an owner read again) before leaving them out."""
+    case = _ask(db, people.uma, _vaults(people.v1))
+    db.add(m.ComplianceCasePerson(case_id=case.id, user_id=people.carl.id, why="named"))
+    assert str(people.carl.id) not in {str(a) for a in cases._admins(db, case)}
+    db.rollback()
+    queued = []
+    monkeypatch.setattr(holds, "queue", lambda db_, notice: queued.append(notice))
+    db.add(m.ComplianceCasePerson(case_id=case.id, user_id=people.bob.id, why="named"))
+    holds._tell(db, case, "t", "b")
+    assert str(people.bob.id) in queued[0]["concerned"]
+    db.rollback()
+
+
 def test_the_administrators_notice_of_a_hold_leaves_out_those_it_concerns(db, people, otto_admin, monkeypatch):
     """legal_holds.deliver tells every active administrator and the auditor, but for the ones a notice says the case
     concerns."""
