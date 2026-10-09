@@ -492,7 +492,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "connect-src 'self' ws: wss:",  # API calls and WebSocket
                 "frame-ancestors 'none'",  # Prevent clickjacking (no iframes)
                 "base-uri 'self'",  # Prevent base tag injection
-                "form-action 'self'",  # Forms only submit to same origin
+                # No form is ever sent by the browser itself: every form on the served pages is sent by
+                # script, its submit handler stopping the browser's own submission. So a form that escapes
+                # its handler (scripts off, a script that never loaded, injected markup) sends nothing.
+                "form-action 'none'",
             ]
             
             # Add HTTPS upgrade directive if the external scheme is HTTPS

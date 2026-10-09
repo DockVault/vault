@@ -4,13 +4,14 @@ app.js binds every form's submit handler and loads at the end of <body>; until i
 sign-in screen is on screen and usable. These tests hold app.js back (a route that is not answered
 while the form is sent), send the sign-in, sign-up and password-reset forms, and check that no
 request carries the typed values, in its address or its body, and that the page does not move.
-Then app.js is let through and signing in works as usual. With scripts off the sign-in goes out
-as a POST to the page: nothing typed lands in an address, and the server refuses it without
-sending any of it back.
+Then app.js is let through and signing in works as usual. With scripts off the browser sends
+nothing at all: the page's Content-Security-Policy says form-action 'none'. Without that header
+(the control) the sign-in would go out as a POST to the page, nothing typed in an address, and the
+server would refuse it without sending any of it back.
 
 What keeps the values in: a capture-phase submit listener that static/js/auth-boot.js installs from
-<head>, and method="post" on every form (tests/test_forms_never_sent_by_the_browser.py pins both
-without a browser).
+<head>, method="post" on every form (tests/test_forms_never_sent_by_the_browser.py pins both
+without a browser), and form-action 'none' (tests/test_csp_form_action.py).
 """
 import pytest
 from playwright.sync_api import Page, expect
@@ -117,17 +118,58 @@ def test_password_reset_request_before_app_js_sends_nothing(page: Page, held):
     held.check_nothing_left("forgot-form")
 
 
-def test_with_scripts_off_the_sign_in_goes_out_as_a_post_and_nothing_comes_back(browser, base_url):
+def _scripts_off_sign_in(browser, base_url, *, without_form_action_rule=False):
+    """Open the sign-in screen with scripts off, type, press the button. Returns (page, requests, moves,
+    the policy the page was served with). With ``without_form_action_rule`` the page is served with its
+    form-action directive taken out of the Content-Security-Policy (the control)."""
     home = base_url.rstrip("/") + "/"
     context = browser.new_context(java_script_enabled=False, base_url=base_url)
+    page = context.new_page()
+    sent, moves, policy = [], [], []
+    page.on("request", lambda r: sent.append((r.method, r.url, r.post_data or "")))
+    page.on("framenavigated", lambda f: f == page.main_frame and moves.append(f.url))
+
+    def serve(route):
+        if route.request.method != "GET":
+            return route.continue_()
+        response = route.fetch()
+        headers = dict(response.headers)
+        csp = headers.get("content-security-policy", "")
+        if without_form_action_rule:
+            csp = "; ".join(d for d in csp.split("; ") if not d.startswith("form-action"))
+            headers["content-security-policy"] = csp
+        policy.append(csp)
+        route.fulfill(response=response, headers=headers)
+
+    page.route(home, serve)
+    page.goto(home)
+    expect(page.locator("#login-form")).to_be_visible()
+    page.fill("#username", USER)
+    page.fill("#password", SECRET)
+    return context, page, home, sent, moves, policy
+
+
+def test_with_scripts_off_the_browser_sends_the_sign_in_nowhere(browser, base_url):
+    context, page, home, sent, moves, policy = _scripts_off_sign_in(browser, base_url)
     try:
-        page = context.new_page()
-        sent = []
-        page.on("request", lambda r: sent.append((r.method, r.url, r.post_data or "")))
-        page.goto(home)
-        expect(page.locator("#login-form")).to_be_visible()
-        page.fill("#username", USER)
-        page.fill("#password", SECRET)
+        assert "form-action 'none'" in policy[0].split("; "), policy
+        page.click("#login-form button[type=submit]")
+        page.wait_for_timeout(1500)  # time for a submission the browser might start
+        assert [(m, u) for m, u, _ in sent if m != "GET"] == []
+        assert [(m, u) for m, u, body in sent if any(t in u or t in body for t in TYPED)] == []
+        assert page.url == home and moves == [home], moves
+    finally:
+        context.close()
+
+
+def test_without_the_form_action_rule_the_scripts_off_sign_in_would_go_out(browser, base_url):
+    """The control: the same click with the directive taken out sends the form, so the test above is
+    not passing because the click sent nothing anyway. It goes out as a POST to the page (nothing typed
+    in an address), and the server refuses it without sending any of it back."""
+    context, page, home, sent, moves, policy = _scripts_off_sign_in(browser, base_url,
+                                                                    without_form_action_rule=True)
+    try:
+        assert "form-action" not in policy[0], policy
         with page.expect_navigation() as nav:
             page.click("#login-form button[type=submit]")
         posts = [(u, body) for m, u, body in sent if m == "POST"]
