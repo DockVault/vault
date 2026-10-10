@@ -109,6 +109,16 @@ def test_the_card_counts_what_the_pruner_counts_with_another_writers_inflated_ho
         plan = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), now, ar.current(), ar._delay())
     assert shown["counted_bytes"] == plan.counted_bytes == before and inflated in plan.size["held_back"]
     assert shown["warn"] is False
+    # A delay later the window has passed the seal: held back, it still counts no more than the hour's 0.1 MB.
+    _run_to(env, now + timedelta(days=8))
+    assert inflated in ai.unacknowledged_foreign(env.st.view, env.st.known_record())
+    later = env.clock()
+    shown = rs.cap_counted(later, env.st)
+    with env.session() as db:
+        plan = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), later, ar.current(),
+                                  ar._delay())
+    assert shown["counted_bytes"] == plan.counted_bytes < ar.MB and inflated in plan.size["held_back"]
+    assert shown["now_bytes"] < ar.MB and shown["warn"] is False
 
 
 def test_the_warning_is_on_the_bytes_now_and_says_when_the_cap_would_start_deleting(env, monkeypatch, tmp_path):
