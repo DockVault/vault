@@ -152,7 +152,7 @@ def test_the_routes_are_plain_functions_mounted_on_the_app():
     found = _managed_routes()
     assert {("GET", "/settings/managed"), ("PUT", "/settings/managed/{key}"),
             ("POST", "/settings/managed/changes/{change_id}/cancel"),
-            ("GET", "/settings/managed/audit/preview")} <= set(found)
+            ("GET", "/settings/managed/audit/preview"), ("GET", "/settings/managed/storage")} <= set(found)
     for route in found.values():
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
 
@@ -160,7 +160,7 @@ def test_the_routes_are_plain_functions_mounted_on_the_app():
 def test_only_an_interactive_administrator_reaches_them():
     from app.api import user_management_api as um
     found = _managed_routes()
-    assert len(found) == 4
+    assert len(found) == 5
     for route in found.values():
         deps = {d.call for d in route.dependant.dependencies}
         assert um.require_interactive_admin in deps, route.path

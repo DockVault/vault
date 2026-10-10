@@ -175,14 +175,20 @@ def test_name_fingerprints_are_given_only_for_a_vault_the_viewer_can_read(db, mo
 def test_the_events_the_event_and_the_export_go_through_the_gate():
     import inspect
     from app.api import api_server
+    # The Events list reads its rows (from the table, or from it and the archive) in one helper, which gives the
+    # names through the gate.
     events = inspect.getsource(api_server.activity_events)
-    assert events.count("recorded_names_for(db, current_user, rows, unlocked)") == 1
+    assert events.count("_activity_events_page(") == 1
+    page = inspect.getsource(api_server._activity_events_page)
+    assert page.count("recorded_names_for(db, current_user, rows, unlocked)") == 1
     one = inspect.getsource(api_server.activity_event)
     assert one.count("recorded_names_for(db, current_user, [row], unlocked)[0]") == 1
-    export = inspect.getsource(api_server)
-    export = export[export.index("    def fetch(after):"):]
-    export = export[:export.index("return views, nxt")]
-    assert "recorded_names_for(s, viewer, got, unlocked)" in export
+    # The export's batches, from the table or from an archive search, all go through views_of.
+    export = inspect.getsource(api_server.activity_export)
+    views = export[export.index("    def views_of(s, got):"):export.index("    def from_search(after):")]
+    assert views.count("recorded_names_for(s, viewer, got, unlocked)") == 1
+    fetch = export[export.index("    def from_search(after):"):export.index("    def lines():")]
+    assert fetch.count("views_of(") == 2 and "recorded_names_for" not in fetch
     # The row view never carries what was recorded wholesale: only what the gate lets through is added.
     from app.services.activity_events import row_view
     assert "recorded_names" not in inspect.getsource(row_view)

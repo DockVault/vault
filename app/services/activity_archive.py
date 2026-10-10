@@ -193,7 +193,7 @@ def _insert(db, table, rows: List[dict]) -> None:
     from app.core import audit_archive_format as af
     from app.core import audit_chain_format as fmt
     from app.core.models import User
-    users = {fmt.as_uuid(r["user_id"]) for r in rows if r.get("user_id") is not None}
+    users = {fmt.as_uuid(row["user_id"]) for row in rows if row.get("user_id") is not None}
     present = {fmt.as_uuid(u) for (u,) in db.query(User.id).filter(User.id.in_(list(users))).all()} if users else set()
     pg = _is_pg(db)
     values = {}
