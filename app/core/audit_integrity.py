@@ -1175,7 +1175,8 @@ class HourFigures:
     missing_nonce: List = field(default_factory=list)
     unwritable: List = field(default_factory=list)
     # The stored bytes of the rows of the actions the size cap never deletes (administration and security): the
-    # chain binds it beside ``bytes`` (``protected_bytes``), and the cap's protected share never exceeds it.
+    # chain binds it beside ``bytes`` (``protected_bytes``). The cap keeps an hour whole once it reaches the hour's
+    # bytes, and its protected share of any other hour never exceeds it (audit_chain_size.kept_whole).
     protected: int = 0
 
 
