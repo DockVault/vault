@@ -11,6 +11,10 @@ process of their own, in their two phases:
   table shaped like audit_logs), keeping the protected ones; the size cap counts an archived part by its bound
   length once a delay of sealing has passed, and verify recomputes a size-cap prune's total;
 - a block changed, removed or added in the database, and a row put back into an archived hour, are found;
+- what a database writer cannot make the size cap do: raise the share it may never delete, or make an hour the
+  chain keeps whole one it cuts at;
+- verify and the daily check read one state, and the head record that goes with it, while the archive, an
+  unarchive, or a host command's process between its commit and its record write, commits;
 - ``audit compact`` runs VACUUM FULL over both audit tables; ``df`` in the database container gives the free space
   dockvault.py checks before an unarchive.
 
@@ -476,3 +480,130 @@ out["blocks_after"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
     assert done["unarchived_during"]["failure"] == [] and done["hot"] == 2 and done["left"] == 1, done
     assert done["daily"] == [] and done["recorded"] == [] and done["daily_rows"] >= 2, done
     assert done["after"]["failure"] == [] and done["blocks_after"] == 0, done
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_row_deleted_from_an_hour_the_chain_keeps_whole_never_moves_the_size_caps_cutoff_newer_on_postgres(
+        throwaway, deleted):
+    """The protected rows alone exceed the cap. An older hour holds an unprotected row, which the cap takes; a newer
+    hour held one protected row when sealed and has since had a late unprotected row sealed into it, which counts
+    only once a delay of sealing has passed; a newer hour still holds one protected row. Deleted in the database,
+    that row would make its hour look partly unprotected and move the cutoff to it: the chain alone says which hours
+    the cap keeps whole, so the plan is the honest one and the late row stays."""
+    done = _script(throwaway, f"DELETED = {deleted}\n" + SIZE_CAP + r'''
+os.environ["AUDIT_LOG_MAX_MB"] = "1"
+from app.core.config import settings as _settings
+_settings.audit_log_max_mb = 1
+from app.core import audit_chain_host as host
+older_day = DAY - timedelta(days=5)
+older = add_row(at(1, day=older_day), details=blob())
+add_row(at(9), action=protected, details=blob())
+newest = add_row(at(15), action=protected, details=blob())
+clock[0] = real_now - timedelta(days=10)
+out["stopped"] = passes()
+run_days(9)
+late = add_row(at(9, 30), details=blob())
+seen = host.seal_late_rows(engine, st, at(9), read=True)
+host.seal_late_rows(engine, st, at(9), expect=seen["state"])
+run_days(1)
+out["honest"] = plan(1000)
+if DELETED:
+    q("DELETE FROM audit_logs WHERE id = :i", i=newest)
+out["planned"] = plan(1000)
+ar.prune(retention.Pass(SessionLocal, now=clock[0]), ar.Numbers(0, 0, 0, 1000))
+out["left"] = sorted(r[0] for r in q("SELECT id::text FROM audit_logs WHERE id IN (:a, :b)", a=older, b=late))
+out["older"], out["late"], out["cut"] = older, late, str(at(2, day=older_day))
+out["report"] = report()
+''')
+    assert done["stopped"] is None and done["honest"][0] == done["cut"], done
+    assert done["planned"] == done["honest"], done
+    assert done["left"] == [done["late"]], done
+    assert ("rows-missing" in done["report"]["failure"]) is deleted, done["report"]
+
+
+SLOW_HOST = r'''
+import subprocess
+import time
+
+
+def host_command(*args, slow=0):
+    """The host's command in a process of its own, as dockvault.py runs it, that waits ``slow`` seconds between its
+    commit and its head record write (a slow disk, a busy host)."""
+    code = ("import sys, time\n"
+            "from app.core import audit_head_record as hr\n"
+            "real = hr.HeadStore.write\n"
+            "def write(self, change, now):\n"
+            f"    time.sleep({slow})\n"
+            "    return real(self, change, now)\n"
+            "hr.HeadStore.write = write\n"
+            "from app.core.audit_chain_verify import main\n"
+            "sys.exit(main())\n")
+    return subprocess.Popen([sys.executable, "-c", code, *args], env=dict(os.environ), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+
+def answer(proc):
+    stdout, stderr = proc.communicate(timeout=600)
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    return proc.returncode, (json.loads(lines[-1]) if lines and lines[-1].startswith("{") else None), stderr[-1500:]
+
+
+def unarchive_slowly(day, slow):
+    """The host's unarchive of ``day``: the read, then the write, which commits and waits ``slow`` seconds before it
+    writes the head record. Returns its process once its seal is committed."""
+    d = day.isoformat()
+    code, seen, err = answer(host_command("unarchive", "--from", d, "--to", d, "--read"))
+    assert code == 0 and seen and seen.get("ok"), (code, seen, err)
+    before = q("SELECT max(seq) FROM audit_seals")[0][0]
+    proc = host_command("unarchive", "--from", d, "--to", d, "--expect", seen["state"], slow=slow)
+    deadline = time.time() + 120
+    while q("SELECT max(seq) FROM audit_seals")[0][0] == before and time.time() < deadline:
+        time.sleep(0.1)
+    assert proc.poll() is None, answer(proc)
+    return proc
+'''
+
+
+def test_the_daily_check_and_audit_verify_read_the_head_record_that_goes_with_their_snapshot_on_postgres(throwaway):
+    """A host command runs in a process of its own and writes the head record file after its commit. The daily
+    check, with this process's older copy of the record, and ``audit verify`` in a process of its own, each run while
+    such a command has committed and not yet written its record: each takes its snapshot and reads the record under
+    the chain lock, so it waits for the command and reports nothing; the daily check records nothing."""
+    done = _script(throwaway, SLOW_HOST + r'''
+other = DAY - timedelta(days=1)
+for h in (3, 4):
+    add_row(at(h))
+    add_row(at(h, day=other))
+clock[0] = real_now - timedelta(days=9)
+out["stopped"] = passes()
+run_days(9)
+clock[0] = datetime.now(timezone.utc).replace(tzinfo=None)
+archive()
+passes()
+out["blocks"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+out["clean_before"] = report()["failure"]
+proc = unarchive_slowly(other, 6)
+started = time.time()
+daily = v.daily_check(SessionLocal, st, now=clock[0], force=True)
+out["daily_waited"] = time.time() - started
+out["daily"] = sorted(f.kind for f in daily.findings if f.severity == v.FAILURE)
+out["daily_after_record"] = "after-record" in daily.kinds(v.WARNING)
+out["recorded"] = sorted(ai.open_failures(st.head_store().load()))
+out["first_unarchive"] = answer(proc)[:2]
+proc = unarchive_slowly(DAY, 6)
+started = time.time()
+code, verified, err = answer(host_command("verify", "--json"))
+out["verify_waited"] = time.time() - started
+out["verify"] = [code, sorted({f["kind"] for f in (verified or {}).get("findings", [])
+                               if f["severity"] in ("failure", "warning")}), err[-500:]]
+out["second_unarchive"] = answer(proc)[:2]
+out["blocks_after"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+out["after"] = report()
+''')
+    assert done["stopped"] is None and done["blocks"] == 2 and done["clean_before"] == [], done
+    assert done["first_unarchive"][0] == 0 and done["second_unarchive"][0] == 0, done
+    assert done["daily"] == [] and not done["daily_after_record"] and done["recorded"] == [], done
+    assert done["daily_waited"] >= 3, done
+    assert done["verify"][0] == 0 and done["verify"][1] == [], done
+    assert done["verify_waited"] >= 3, done
+    assert done["blocks_after"] == 0 and done["after"]["failure"] == [], done
