@@ -85,8 +85,9 @@ def redact_log_path(path: str) -> str:
     return path
 
 
-# A query parameter's name as an access line prints it. Anything else in a name's place prints as <name>.
-_QUERY_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,64}$")
+# A query parameter's name as an access line prints it, matched in full (fullmatch: a "$" would also let a
+# name end in a line break). Anything else in a name's place prints as <name>.
+_QUERY_NAME_RE = re.compile(r"[A-Za-z0-9_.\-\[\]]{1,64}")
 
 
 def query_names(query: str) -> str:
@@ -98,7 +99,7 @@ def query_names(query: str) -> str:
         if not part:
             continue
         name, eq, _value = part.partition("=")
-        out.append(("<name>" if not _QUERY_NAME_RE.match(name) else name) if eq else "<value>")
+        out.append(("<name>" if not _QUERY_NAME_RE.fullmatch(name) else name) if eq else "<value>")
     return "&".join(out)
 
 

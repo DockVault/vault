@@ -181,6 +181,8 @@ def test_reading_a_line_back_twice_serves_what_reading_it_once_serves(version):
     ("al ice=1", "<name>"),                               # not a name
     ("%40alice=1", "<name>"),                             # an encoded name is never printed
     ("a" * 65 + "=1", "<name>"),
+    ("a\n=1&x=2", "<name>&x"),                             # a line break never reaches a line in a name
+    ("a\r\n=1", "<name>"),
     ("filter[status]=open&page.size=5&key_version=3&tab-x=1", "filter[status]&page.size&key_version&tab-x"),
     ("", ""),
 ])
