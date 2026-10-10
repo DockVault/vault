@@ -246,7 +246,9 @@ files except to serve them, and cannot read zero-knowledge ones.
   uniqueness rule (a username, an address), and some older error lines print it. **Changed in 0.34.0:**
   a query's values were printed, so a search sent in the query (an Activity search for a name, an
   address or free text) reached this log; now only the names are, a WebSocket handshake's line
-  included, and a line read back through log access from before the change serves only the names too.
+  included, and a line read back through log access from before the change serves only the names too,
+  except an older line whose query held nothing but bare, name-like parts, which is served as it was
+  written.
   How long Docker
   keeps this is set by the host's Docker logging
   configuration; the shipped compose files set no limit, so set `max-size` and `max-file` for the

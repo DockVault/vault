@@ -149,6 +149,8 @@ def test_a_target_with_names_only_is_read_back_unchanged(target, version):
     ("/activity/events?q&<alice.martin>", "/activity/events?<value>&<value>"),       # only the two markers pass
     ("/activity/events?q&<values>", "/activity/events?<value>&<value>"),
     ("/invites/SEKRETtoken_ABCDEF0123?q", "/invites/<redacted>?q"),                  # the path is still masked
+    ("/activity/events?q=secret?x", "/activity/events?q"),                           # the query starts at the first "?"
+    ("/activity/events?alice@example.com", "/activity/events?<value>"),              # "@" is never in a name
 ])
 def test_a_target_not_written_with_names_only_is_still_reduced(old, expected):
     assert log_redaction.read_back_target(old) == expected
@@ -182,6 +184,7 @@ def test_reading_a_line_back_twice_serves_what_reading_it_once_serves(version):
     ("x=1&secret-search-text", "x&<value>"),
     ("al ice=1", "<name>"),                               # not a name
     ("%40alice=1", "<name>"),                             # an encoded name is never printed
+    ("a@b=1", "<name>"),                                  # nor one holding a raw "@"
     ("a" * 65 + "=1", "<name>"),
     ("a\n=1&x=2", "<name>&x"),                             # a line break never reaches a line in a name
     ("a\r\n=1", "<name>"),
