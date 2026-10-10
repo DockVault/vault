@@ -7,8 +7,9 @@ off, a script that never loaded, injected markup) then sends nothing, to this or
 Pinned here: the header the middleware sets on an HTML response, over http and over https (TLS in the server
 or at a trusted proxy), carries exactly one form-action directive, and it is 'none'; and every form on every
 served page, and every form a script makes (an invitation's or a reset's password, a vault's password in the
-Activity page or a compliance case, a search in a case), has a submit handler that calls preventDefault, so
-nothing the pages do relies on the browser sending a form.
+Activity page or a compliance case, a search in a case), has a submit handler whose first statement calls its
+event's preventDefault (nothing before it that could return, wait or throw), so nothing the pages do relies on
+the browser sending a form.
 tests/test_csp_form_action_live.py and tests/test_ui_forms_before_the_app_loads.py check it in a browser.
 """
 import pathlib
@@ -100,31 +101,49 @@ def test_the_pages_and_their_forms_are_all_seen():
         assert not re.search(r"<form\b", js.read_text(encoding="utf-8"), re.I), js.name
 
 
+def _stops_the_browser_first(body, param):
+    """Whether a submit handler's first statement is its event's preventDefault() (``param``: the event's name in
+    the handler). Anything before it could leave the handler with the browser's own submission still to come: a
+    return, an await, a call that throws; and a call on some paths only, or in a callback, may never run."""
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", "", body, flags=re.S)
+    first = re.match(r"\s*" + re.escape(param) + r"\s*\.\s*preventDefault\s*\(\s*\)\s*;", code) if param else None
+    return first is not None
+
+
 def _handler_prevents_default(js, form_id):
-    """Whether the scripts bind a submit handler to ``form_id`` that calls preventDefault: the handler is
+    """Whether the scripts bind a submit handler to ``form_id`` that calls preventDefault first: the handler is
     found from the form's id (directly, or through the variable the element is held in), and is either an
-    inline function or a named one, whose opening lines must call preventDefault."""
+    inline function or a named one, whose first statement must be its event's preventDefault(). Never another
+    form's handler: one bound directly is bound on the lookup itself, and a variable's binding counts only before
+    the name is declared again."""
+    submit = r"\s*\??\.addEventListener\(\s*['\"]submit['\"]\s*,\s*"
     for m in re.finditer(r"(?:document\.)?(?:getElementById|\$)\(\s*['\"]" + re.escape(form_id) + r"['\"]\s*\)", js):
         window = js[m.start():m.start() + 2500]
         held = re.search(r"(?:const|let|var)\s+(\w+)\s*=\s*$", js[max(0, m.start() - 60):m.start()])
-        binders = [r"^(?:document\.)?(?:getElementById|\$)\([^)]*\)\s*\??\.addEventListener\(\s*['\"]submit['\"]\s*,\s*"]
+        bindings = [re.match(r"(?:document\.)?(?:getElementById|\$)\([^)]*\)" + submit, window)]
         if held:
-            binders.append(r"\b" + re.escape(held.group(1)) + r"\s*\??\.addEventListener\(\s*['\"]submit['\"]\s*,\s*")
-        for binder in binders:
-            b = re.search(binder, window, re.M)
+            name = re.escape(held.group(1))
+            again = re.search(r"\b(?:const|let|var)\s+" + name + r"\b", window)
+            bindings.append(re.search(r"\b" + name + submit, window[:again.start()] if again else window))
+        for b in bindings:
             if not b:
                 continue
             rest = window[b.end():]
             named = re.match(r"(\w+)\s*\)", rest)
             if named:
-                fn = re.search(r"function\s+" + re.escape(named.group(1)) + r"\s*\([^)]*\)\s*\{", js)
-                body = _block(js, fn.end()) if fn else ""
+                fn = re.search(r"function\s+" + re.escape(named.group(1)) + r"\s*\(\s*(\w*)[^)]*\)\s*\{", js)
+                body, param = (_block(js, fn.end()), fn.group(1)) if fn else ("", "")
             else:
-                inline = re.match(r"(?:async\s+)?(?:function\s*)?\(?\s*\w*\s*\)?\s*(?:=>)?\s*\{", rest)
-                body = _block(rest, inline.end()) if inline else ""
-            if "preventDefault()" in body[:300]:
+                inline = re.match(_INLINE, rest)
+                body, param = (_block(rest, inline.end()), inline.group(1)) if inline else ("", "")
+            if _stops_the_browser_first(body, param):
                 return True
     return False
+
+
+# An inline handler's opening, up to its body's brace: ``(e) => {``, ``async (e) => {``, ``function (e) {``, with the
+# event's name captured.
+_INLINE = r"(?:async\s+)?(?:function\s*)?\(?\s*(\w*)\s*\)?\s*(?:=>)?\s*\{"
 
 
 def _block(text, start):
@@ -160,6 +179,74 @@ def test_the_handler_check_flags_a_form_without_one():
                                                         "f-form")] == [True, True, False, False, False, False]
 
 
+# Handler bodies, and whether each stops the browser's own submission before anything else: (event name, body).
+FIRST_STATEMENT = [
+    (("e", " e.preventDefault(); go(); "), True),
+    (("ev", "\n    // nothing is sent by the browser\n    ev.preventDefault();\n    send();\n"), True),
+    (("e", "\n    /* first */ e . preventDefault ( ) ;\n"), True),
+    # A return before it: the browser sends the form on that path.
+    (("e", "\n    if (!input.value) return;\n    e.preventDefault();\n"), False),
+    (("e", "\n    const q = box.value.trim();\n    if (!q) { return; }\n    e.preventDefault();\n"), False),
+    # An await before it: the handler has returned to the browser by then.
+    (("e", "\n    await ready();\n    e.preventDefault();\n"), False),
+    # A statement before it, which could throw.
+    (("e", "\n    const data = read(form);\n    e.preventDefault();\n"), False),
+    # On some paths only, or in a callback that may never run.
+    (("e", "\n    if (busy) e.preventDefault();\n"), False),
+    (("e", "\n    busy && e.preventDefault();\n"), False),
+    (("e", "\n    setTimeout(() => e.preventDefault());\n"), False),
+    # Another object's, the global event's, or none at all.
+    (("e", "\n    other.preventDefault();\n"), False),
+    (("", "\n    event.preventDefault();\n"), False),
+    (("e", "\n    e.preventDefault\n"), False),
+    (("e", ""), False),
+]
+
+
+@pytest.mark.parametrize("handler,stops", FIRST_STATEMENT)
+def test_a_handler_stops_the_browser_only_with_its_first_statement(handler, stops):
+    body, param = handler[1], handler[0]
+    assert _stops_the_browser_first(body, param) is stops
+
+
+def test_both_checks_need_preventdefault_before_anything_else():
+    """A handler that returns, awaits or does anything else first is flagged, by id and when a script makes the form,
+    inline or named, however short the handler; and a form is never credited with another form's handler, bound
+    on a later line or through a variable of the same name declared again."""
+    js = ("document.getElementById('a-form').addEventListener('submit', (e) => {\n"
+          "    if (!x) return;\n    e.preventDefault();\n});\n"
+          "document.getElementById('b-form').addEventListener('submit', async (e) => {\n"
+          "    await ready();\n    e.preventDefault();\n});\n"
+          "const c = document.getElementById('c-form');\nc.addEventListener('submit', sendC);\n"
+          "function sendC(e) {\n    if (!ok) return;\n    e.preventDefault();\n}\n"
+          "document.getElementById('d-form').addEventListener('submit', function (ev) {\n"
+          "    ev.preventDefault();\n});\n"
+          "const form = document.getElementById('e-form');\n"
+          "function later() {\n    const form = document.getElementById('f-form');\n"
+          "    form.addEventListener('submit', (e) => {\n        e.preventDefault();\n    });\n}\n"
+          "document.getElementById('g-form').hidden = false;\n"
+          "document.getElementById('h-form').addEventListener('submit', (e) => {\n    e.preventDefault();\n});\n")
+    assert [_handler_prevents_default(js, f) for f in ("a-form", "b-form", "c-form", "d-form", "e-form", "f-form",
+                                                        "g-form", "h-form")] == [
+        False, False, False, True, False, True, False, True]
+    made = ("function mk(tag) {\n    return document.createElement(tag);\n}\n"
+            "function one() {\n    const a = mk('form');\n"
+            "    a.addEventListener('submit', async (e) => {\n        const q = a.value;\n        if (!q) return;\n"
+            "        e.preventDefault();\n        await go(q);\n    });\n}\n"
+            "function two() {\n    const b = mk('form');\n    b.addEventListener('submit', sendB);\n}\n"
+            "function sendB(e) {\n    await ready();\n    e.preventDefault();\n}\n"
+            "function three() {\n    const c = mk('form');\n"
+            "    c.addEventListener('submit', async (e) => {\n        e.preventDefault();\n"
+            "        if (!c.value) return;\n"
+            "        await go();\n    });\n}\n"
+            "function four() {\n    const d = mk('form');\n    {\n        const d = mk('form');\n"
+            "        d.addEventListener('submit', (e) => {\n            e.preventDefault();\n        });\n    }\n}\n")
+    forms = _made_forms(made)
+    assert [held for _, held in forms] == ["a", "b", "c", "d", "d"]
+    assert [_made_form_prevents_default(made, start, held) for start, held in forms] == [
+        False, False, True, False, True]
+
+
 # --------------------------------------------------------------------------------------------------
 # Forms a script makes element by element: no id in a page's markup, so the checks above never see them.
 # --------------------------------------------------------------------------------------------------
@@ -187,22 +274,24 @@ def _made_forms(js):
 
 def _made_form_prevents_default(js, start, held):
     """Whether the form made at ``start`` and held in ``held`` is given, in the block that makes it, a submit
-    handler whose opening lines call preventDefault."""
+    handler whose first statement is its event's preventDefault()."""
     if held is None:
         return False
     block = _block(js, start)
+    again = re.search(r"\b(?:const|let|var)\s+" + re.escape(held) + r"\b", block)
+    block = block[:again.start()] if again else block      # past it, the name holds another form
     for b in re.finditer(r"\b" + re.escape(held) + r"\s*\??\.addEventListener\(\s*['\"]submit['\"]\s*,\s*", block):
         rest = block[b.end():]
-        inline = re.match(r"(?:async\s+)?(?:function\s*)?\(?\s*\w*\s*\)?\s*(?:=>)?\s*\{", rest)
+        inline = re.match(_INLINE, rest)
         named = re.match(r"(\w+)\s*\)", rest)
         if inline:
-            body = _block(rest, inline.end())
+            body, param = _block(rest, inline.end()), inline.group(1)
         elif named:
-            fn = re.search(r"function\s+" + re.escape(named.group(1)) + r"\s*\([^)]*\)\s*\{", js)
-            body = _block(js, fn.end()) if fn else ""
+            fn = re.search(r"function\s+" + re.escape(named.group(1)) + r"\s*\(\s*(\w*)[^)]*\)\s*\{", js)
+            body, param = (_block(js, fn.end()), fn.group(1)) if fn else ("", "")
         else:
-            body = ""
-        if "preventDefault()" in body[:300]:
+            body, param = "", ""
+        if _stops_the_browser_first(body, param):
             return True
     return False
 
