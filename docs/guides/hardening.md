@@ -105,7 +105,7 @@ hold also tells the owner). The purpose "Regulator or authority request" does no
 - **The vault picker shows any administrator, and any auditor whose right is in force, an account's vaults**: for
   each, its type, whether it has a password, its number of files, its size and when it was made (an administrator
   needs this to place a legal hold). It never shows a vault's name to someone who could not read the vault anyway,
-  and each look is recorded (`case_picker_viewed`, naming the account looked at).
+  and each look is recorded (`case_picker_viewed`, with the id of the account looked at).
 - **An administrator a case concerns cannot see it on the Compliance page, but can learn of it from the Activity
   page**, which every administrator reads whole. The rows of compliance access are there with no vault or file
   name: a case asked for or approved, a hold placed (with the vault's id), and an auditor's look at the vault
