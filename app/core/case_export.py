@@ -81,7 +81,7 @@ _RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f
 _UNSAFE = set('<>:"|?*\\/')
 
 # A file's status in the manifest, besides case_access's (live, expired, deleted_kept, expired_kept).
-MISSING = "missing"            # gone from the vault, and not kept, before it could be read
+MISSING = "missing"            # gone from the vault before it could be read (not kept, or kept and now due)
 UNREADABLE = "unreadable"      # its stored content could not be opened
 LEFT_CASE = "left_case"        # no longer one the case may export when its turn came (see ExportStream._may_read)
 
@@ -534,8 +534,8 @@ class ExportStream:
 
     def _may_read(self, entry: Entry) -> bool:
         """Before each file: the case still gives its auditor access, and export (else the export stops: Stopped);
-        and the file is still one the case may export, as the fetch checked it (else it is left out, listed
-        LEFT_CASE). A file gone from the vault is left to _open_stored, which lists it as missing."""
+        and the file is still one the case may export, as the fetch checked it, now: else it is left out, listed
+        LEFT_CASE, or MISSING when it is gone from the vault (also a kept file now due for its purge)."""
         from app.core.models import User
         db = self._db_factory()
         try:
@@ -554,9 +554,7 @@ class ExportStream:
                 found = ca.file_for(db, case, entry.file_id, now=now)
                 ca.content_opening(case, found, {entry.vault_id} if entry.unlocked else ())
             except ca.Refused as refused:
-                if refused.reason == ca.NO_SUCH_FILE:
-                    return True
-                entry.status = LEFT_CASE
+                entry.status = MISSING if refused.reason == ca.NO_SUCH_FILE else LEFT_CASE
                 return False
             return True
         finally:

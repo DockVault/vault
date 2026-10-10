@@ -482,6 +482,30 @@ def test_a_file_gone_since_the_fetch_is_listed_missing_and_one_kept_since_is_exp
     assert row.details["missing"] == 1 and row.details["unreadable"] == 1 and row.details["file_count"] == 1
 
 
+def test_a_file_gone_or_now_due_for_its_purge_once_the_stream_began_is_listed_missing(db, people, storage, codes):
+    """After the archive has begun: a file deleted from the vault, and a kept file whose purge has come due, are
+    listed missing when their turn comes, and nothing of either is read."""
+    a = _file(db, storage, people.v1, name="a.txt", content=b"alpha-first")
+    b = _file(db, storage, people.v1, name="b.txt", content=b"bravo-deleted")
+    c = _file(db, storage, people.v1, name="c.txt", content=b"charlie-due")
+    case = _case(db, people, _vaults(people.v1), can_export=True)
+    kept = _kept(db, c)
+    parts, _export_id = _stream(db, people, case, [a, b, c])
+    got = b""
+    while len(storage.opened) < 1:
+        got += next(parts)
+    db.delete(db.get(m.File, b.id))
+    kept.purge_after = ca.utcnow() - timedelta(minutes=1)
+    db.commit()
+    got += b"".join(parts)
+    parts.close()
+    status = {r["file_id"]: (r["status"], r["entry"]) for r in _manifest(_archive(got))["files"]}
+    assert status[str(b.id)] == (ce.MISSING, None) and status[str(c.id)] == (ce.MISSING, None)
+    assert storage.opened == [str(a.id)] and b"bravo-deleted" not in got and b"charlie-due" not in got
+    (row,) = _rows(db, "case_export_completed")
+    assert row.details["missing"] == 2 and row.details["left_case"] == 0 and row.details["file_count"] == 1
+
+
 def test_a_stored_file_that_does_not_match_its_checksum_is_exported_and_flagged(db, people, storage, codes):
     f = _file(db, storage, people.v1, content=b"what was stored")
     f.checksum_sha256 = hashlib.sha256(b"something else").hexdigest()
