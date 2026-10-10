@@ -1343,6 +1343,8 @@
             S.lastRead = new Date();
             S.listLoaded = true;
             S.listError = null;
+            // What the list says of archived days (static/js/activity-archive.js).
+            document.dispatchEvent(new CustomEvent('activity:list', { detail: data }));
             clearHeld();
             renderListError();
             renderList();
@@ -1351,6 +1353,7 @@
             if (seq !== S.listSeq || S.blocked) return;
             S.listError = err.message || 'unknown error';
             S.listLoaded = true;
+            document.dispatchEvent(new CustomEvent('activity:list', { detail: null }));
             renderListError();
             renderList();
         } finally {
@@ -2222,6 +2225,7 @@
 
     function applyBand(data, snap) {
         S.band = data;
+        document.dispatchEvent(new CustomEvent('activity:band', { detail: data }));
         if (snap != null) S.bandFrom = { kind: data.range, from: data.from, snap };
         if (!S.now && data.now) S.now = data.now;
         renderBand();

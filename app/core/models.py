@@ -1415,9 +1415,9 @@ class AuditArchiveBlock(Base):
     part holds whole hours and every column of each row, and is verified against the hours' seals before the
     rows are deleted, in the same transaction. The ``archive`` seal of that transaction binds each part's hours,
     row count, length and digest, so nothing here is trusted on its own: ``aggregates`` (rows and bytes by
-    action, status and channel, and by hour) are checked against the payload whenever it is read. ``payload``
-    is stored without Postgres's own compression (STORAGE EXTERNAL, set by a background step), so its length is
-    read without reading it. A NEW table, which create_all builds; a release before it ignores it, and the data
+    action, status and channel, by hour, and rows by all four) are checked against the payload whenever it is read.
+    ``payload`` is stored without Postgres's own compression (STORAGE EXTERNAL, set by a background step), so its
+    length is read without reading it. A NEW table, which create_all builds; a release before it ignores it, and the data
     marker (data_requirements) keeps releases from 0.33.1 on from starting while a block exists.
     """
     __tablename__ = 'audit_archive_blocks'

@@ -2391,12 +2391,16 @@ async def health_check():
 
 @app.get("/audit/events")
 async def recent_audit_events(
+    response: Response,
     limit: int = 10,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Recent audit-log entries for the dashboard activity feed (admin only)."""
+    """Recent audit-log entries for the dashboard activity feed (admin only). Rows only: the archived days'
+    span is in the activity_archive.ARCHIVE_HEADERS when there are any."""
     from app.core.models import AuditLog
+    from app.services import activity_archive
+    response.headers.update(activity_archive.headers_for())
     limit = max(1, min(limit, 50))
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
@@ -2476,6 +2480,7 @@ def _audit_row_to_dict(r):
 
 @app.get("/audit/log")
 async def search_audit_log(
+    response: Response,
     user_id: Optional[str] = None,
     action: Optional[str] = Query(None, max_length=128),
     from_date: Optional[str] = None,
@@ -2484,8 +2489,13 @@ async def search_audit_log(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """Filtered audit-log search for the admin Audit page (admin only)."""
+    """Filtered audit-log search for the admin Audit page (admin only). Rows only: when the range reaches
+    archived days, their span is in the activity_archive.ARCHIVE_HEADERS (the Activity page searches them)."""
+    from app.core import audit_range
     from app.core.models import AuditLog
+    from app.services import activity_archive
+    response.headers.update(activity_archive.headers_for(audit_range.lower_bound(from_date),
+                                                         audit_range.upper_bound(to_date)))
     limit = max(1, min(limit, 2000))
     rows = (
         _build_audit_query(db, user_id, action, from_date, to_date)
@@ -2566,20 +2576,49 @@ def activity_events(
     `count_only` returns {"count": n} for any of them instead of rows. Every row carries its `cursor`;
     `head_cursor` is the newest row's in the response.
 
+    A range with a start that reaches a day the archive keeps as compressed blocks is read from rows and
+    archive together, the same filters running over both (app/services/activity_archive.py): at most
+    activity_archive.MAX_DAYS archived days at a time (400 beyond it). `archive` in the response says
+    where the archive is, whether this read searched it, and the days it could not read; it is there only
+    when the range reaches the archive.
+
     A plain def, so FastAPI runs it in its thread pool: a count and a page over a large audit table
     must not hold the event loop. It never writes an audit row: the page re-reads it as events arrive,
     and a row written here would signal another read."""
     from app.core import audit_range
-    from app.core.models import AuditLog
+    from app.services import activity_archive as archive
     from app.services import activity_events as ev
     limit = max(1, min(limit, ev.MAX_PAGE))
     wanted_ids = ev.split_ids(ids)
-    base = ev.build_events_query(
-        db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
-        actions=action, username=user, user_exact=(user_match == "exact"), no_account=no_account,
-        ip=ip, text=q, temp_credential_id=temp_credential_id, temp_credential=temp_credential,
-        vault_id=vault_id, ids=wanted_ids,
-        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+    start, end = audit_range.lower_bound(from_date), audit_range.upper_bound(to_date)
+    # Reading the rows after a point reaches the archive only when that point is in it.
+    reach = start
+    anchor = ev.read_anchor(after) if after and not wanted_ids else None
+    if anchor and anchor[0] == "cursor":
+        since = anchor[1][0] - timedelta(seconds=overlap)
+        reach = since if start is None or since > start else start
+    try:
+        with archive.source(db, reach, end) as src:
+            out = _activity_events_page(
+                src.db, src.entity, request, current_user, db, wanted_ids, after, overlap, cursor, page,
+                count_only, limit, dict(categories=category, channels=channel, statuses=status, actions=action,
+                                        username=user, user_exact=(user_match == "exact"), no_account=no_account,
+                                        ip=ip, text=q, temp_credential_id=temp_credential_id,
+                                        temp_credential=temp_credential, vault_id=vault_id, ids=wanted_ids,
+                                        start=start, end=end))
+            if src.note is not None:
+                out["archive"] = src.note
+            return out
+    except archive.TooBroad as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _activity_events_page(rdb, AuditLog, request, current_user, db, wanted_ids, after, overlap, cursor, page,
+                          count_only, limit, filters):
+    """activity_events' read, over ``rdb`` and ``AuditLog`` (the request's session and model, or an archive
+    search's: app/services/activity_archive.py). Names are looked up through the request's session ``db``."""
+    from app.services import activity_events as ev
+    base = ev.build_events_query(rdb.query(AuditLog), AuditLog, **filters)
     newest_first = (AuditLog.timestamp.desc(), AuditLog.id.desc())
     out = {"events": [], "next_cursor": None, "total": None}
 
@@ -2590,7 +2629,7 @@ def activity_events(
     elif after:
         anchor = ev.read_anchor(after)
         if anchor and anchor[0] == "id":
-            row = db.query(AuditLog.timestamp, AuditLog.id).filter(AuditLog.id == anchor[1]).first()
+            row = rdb.query(AuditLog.timestamp, AuditLog.id).filter(AuditLog.id == anchor[1]).first()
             anchor = (row[0], row[1]) if row else None
         elif anchor:
             anchor = anchor[1]
@@ -2940,14 +2979,30 @@ def activity_summary(
                     "That range cannot be charted. Choose a start before its end, at most 48 years before it."))
     zone_name = getattr(zone, "key", None)
     key = (range_, since, until, zone_name, tz_offset, win.start if win else None, summary.signature(filters))
+    from app.services import activity_archive as archive
+
+    def band(s):
+        if win is not None:
+            return summary.summarize(s, AuditLog, win, filters, since=since, until=until, now=now)
+        end = min(until, now) if until else now
+        first = summary.oldest(s, AuditLog, filters, until)           # all time is charted from it
+        # or from the oldest archived part the events block counts, when that is older
+        archived = archive.oldest_archived(summary.block_filters(filters)["events"], until)
+        if archived is not None and (first is None or archived < first):
+            first = archived
+        return summary.summarize(s, AuditLog, summary.all_time(first, end, tz_offset, zone), filters,
+                                 until=until, from_=first if first is not None and first < end else None, now=now)
 
     def compute():
-        if win is not None:
-            return summary.summarize(db, AuditLog, win, filters, since=since, until=until)
-        end = min(until, now) if until else now
-        first = summary.oldest(db, AuditLog, filters, until)          # all time is charted from it
-        return summary.summarize(db, AuditLog, summary.all_time(first, end, tz_offset, zone), filters,
-                                 until=until, from_=first if first is not None and first < end else None)
+        # Over archived hours the band reads rows and the parts' aggregates in one state of the database.
+        if not archive.reaches_archive(since, min(until, now) if until else now):
+            return band(db)
+        s = archive.snapshot_session(db.get_bind())
+        try:
+            return band(s)
+        finally:
+            s.rollback()
+            s.close()
 
     band, age = summary.cached(key, range_, compute)
     out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1),
@@ -3015,20 +3070,43 @@ def activity_export(
     Streamed a batch at a time, each batch in its own short database session, so a large export neither
     holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
     started, stops at activity_events.EXPORT_CAP rows (the last line says so), and is itself recorded
-    before a row is sent: when that record cannot be written the export is refused with 503."""
+    before a row is sent: when that record cannot be written the export is refused with 503.
+
+    A range with a start that reaches archived days is exported from rows and archive together, as the
+    Events list reads them (app/services/activity_archive.py): then every batch is read in the one
+    transaction that holds the archived rows, open while the export streams. Its last lines name any
+    archived day it could not read, or, for a range with no start, the archived days it left out."""
+    import contextlib
+    from starlette.background import BackgroundTask
     from app.core import audit_range
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
+    from app.services import activity_archive as archive
     from app.services import activity_events as ev
     from app.services.activity_names import recorded_names_for, show_unlocked, temp_credential_names, unlocked_vaults
     unlocked = unlocked_vaults(db, current_user, request)
+    viewer_id = current_user.id          # read now: the audit row below commits, and the stream runs after
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
         statuses=status, actions=action, username=user, user_exact=(user_match == "exact"),
         no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
         temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date))
-    total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
+    # The archive search, when the range needs one, stays open until the export has streamed.
+    held = contextlib.ExitStack()
+    try:
+        src = held.enter_context(archive.source(db, filters["start"], filters["end"]))
+    except archive.TooBroad as exc:
+        held.close()
+        raise HTTPException(status_code=400, detail=str(exc))
+    searched = bool(src.note and src.note["searched"])
+    if not searched:
+        held.close()
+    try:
+        total = ev.build_events_query(src.db.query(src.entity), src.entity, **filters).order_by(None).count()
+    except BaseException:
+        held.close()
+        raise
     # Recorded before a row is sent, and required: an export of up to EXPORT_CAP rows of personal data
     # that left no trace would be a gap in the log's own account of who read it. So when the row cannot
     # be written (the database refusing inserts, say) the export is refused, not sent unrecorded.
@@ -3045,8 +3123,11 @@ def activity_export(
                                               ("temp_credential_id", temp_credential_id),
                                               ("temp_credential", temp_credential), ("vault_id", vault_id),
                                               ("from_date", from_date), ("to_date", to_date)) if v},
+                # The archived days it read, when it read any: the archive is personal data too.
+                **({"archived_days": src.note["searched_days"]} if searched else {}),
             })
     except Exception as e:                                   # noqa: BLE001 - refused below, whatever it was
+        held.close()
         print(f"⚠ export refused: its audit row could not be written ({type(e).__name__})")
         try:
             db.rollback()
@@ -3055,29 +3136,44 @@ def activity_export(
         raise HTTPException(status_code=503, detail=(
             "The export could not be recorded in the audit log, so it was not made. Try again shortly."))
 
+    def views_of(s, got):
+        views = [ev.row_view(r) for r in got]
+        temp_credential_names(s, views)
+        viewer = s.get(User, viewer_id)
+        for view, recorded in zip(views, recorded_names_for(s, viewer, got, unlocked) if viewer
+                                  else [None] * len(views)):
+            view["recorded_names"] = recorded
+        return views
+
     def fetch(after):
+        if searched:                      # every batch from the search's one transaction
+            got = ev.export_page(src.db.query(src.entity), src.entity, filters, after).all()
+            nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
+            return views_of(src.db, got), nxt
         s = SessionLocal()
         try:
             got = ev.export_page(s.query(AuditLog), AuditLog, filters, after).all()
             nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
-            views = [ev.row_view(r) for r in got]
-            temp_credential_names(s, views)
-            viewer = s.get(User, current_user.id)
-            for view, recorded in zip(views, recorded_names_for(s, viewer, got, unlocked) if viewer
-                                      else [None] * len(views)):
-                view["recorded_names"] = recorded
-            return views, nxt
+            return views_of(s, got), nxt
         finally:
             s.close()
 
+    def lines():
+        try:
+            yield from ev.export_lines(fetch, format, total, archive=src.note)
+        finally:
+            held.close()
+
     name = f"activity-{started:%Y%m%d-%H%M%S}.{format}"
     return StreamingResponse(
-        ev.export_lines(fetch, format, total),
+        lines(),
         media_type="text/csv; charset=utf-8" if format == "csv" else "application/x-ndjson",
         headers={"Content-Disposition": f"attachment; filename={name}",
                  "X-Export-Total": str(total),
                  "X-Export-Rows": str(min(total, ev.EXPORT_CAP)),
                  "Cache-Control": "no-store"},
+        # A stream never started (the client gone first) still ends the search.
+        background=BackgroundTask(held.close),
     )
 
 

@@ -173,6 +173,8 @@ _IDENTIFIER_KEYS = (
     # hours and cutoff hour of rows an older release removed
     "seals", "saved", "from_key", "to_key", "cause", "lost_through_seq", "deleted_through_seq", "bundle",
     "late_rows", "day", "hours", "cutoff",
+    # how many archived days an export read
+    "archived_days",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",

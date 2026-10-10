@@ -27,9 +27,10 @@ came back unchanged.
 
 ``aggregates`` (kept in the block's row, beside the payload, and checked against the rows whenever the payload
 is read): ``{"by": [[action, status, channel, rows, line bytes, stored bytes], ...], "hours": [[hour, rows,
-stored bytes], ...]}``, sorted. The line bytes are the NDJSON lines' (with the dictionary); the stored bytes the
-sizes Postgres stored the rows in. The summaries over archived days read them, and the size cap, which takes
-from them no more of an archived part as never to be deleted than the chain binds for its hours.
+stored bytes], ...], "by_hour": [[hour, action, status, channel, rows], ...]}``, sorted. The line bytes are the
+NDJSON lines' (with the dictionary); the stored bytes the sizes Postgres stored the rows in. The Activity page's
+summary band counts archived hours from ``by_hour`` (app/services/activity_archive.py), and the size cap takes from
+``by`` and ``hours`` no more of an archived part as never to be deleted than the chain binds for its hours.
 """
 from __future__ import annotations
 
@@ -128,11 +129,13 @@ def _sort_key(key: tuple) -> tuple:
 
 
 class _Aggregates:
-    """Rows, line bytes and stored bytes by (action, status, channel), and rows and stored bytes by hour."""
+    """Rows, line bytes and stored bytes by (action, status, channel), rows and stored bytes by hour, and rows by
+    (hour, action, status, channel)."""
 
     def __init__(self):
         self.by: Dict[tuple, list] = {}
         self.hours: Dict[datetime, list] = {}
+        self.by_hour: Dict[tuple, int] = {}
 
     def add(self, row: dict, line_bytes: int) -> None:
         stored = int(row.get("_bytes") or 0)
@@ -146,10 +149,14 @@ class _Aggregates:
             h = self.hours.setdefault(hour, [0, 0])
             h[0] += 1
             h[1] += stored
+            key = (hour, row.get("action"), row.get("status"), row.get("channel"))
+            self.by_hour[key] = self.by_hour.get(key, 0) + 1
 
     def stored_form(self) -> dict:
         return {"by": [list(k) + list(v) for k, v in sorted(self.by.items(), key=lambda kv: _sort_key(kv[0]))],
-                "hours": [[fmt.hour_text(h)] + list(v) for h, v in sorted(self.hours.items())]}
+                "hours": [[fmt.hour_text(h)] + list(v) for h, v in sorted(self.hours.items())],
+                "by_hour": [[fmt.hour_text(k[0]), k[1], k[2], k[3], n] for k, n in
+                            sorted(self.by_hour.items(), key=lambda kv: (kv[0][0], _sort_key(kv[0][1:])))]}
 
 
 class BlockWriter:

@@ -211,6 +211,47 @@ def build_events_query(q, AuditLog, *, categories: Sequence[str] = (), channels:
     return q
 
 
+# The Events filters an archived part's aggregates can answer: they count rows by hour, action, status and
+# channel (app/core/audit_archive_format.py), so the category, event, status and channel filters, and a time
+# range in whole hours. Any other filter (a person, an address, text, a vault, a credential, rows by id) needs
+# the rows themselves.
+AGGREGATE_FILTERS = frozenset({"categories", "actions", "statuses", "channels", "start", "end"})
+
+
+def is_empty_filter(value) -> bool:
+    return value is None or value is False or value == "" or value == [] or value == ()
+
+
+def aggregate_countable(filters: dict) -> bool:
+    """Whether build_events_query's keyword arguments ``filters`` can be counted from aggregates alone."""
+    return all(key in AGGREGATE_FILTERS for key, value in filters.items() if not is_empty_filter(value))
+
+
+def aggregate_match(categories: Sequence[str] = (), channels: Sequence[str] = (), statuses: Sequence[str] = (),
+                    actions: Sequence[str] = (), **_time):
+    """A predicate ``(action, status, channel) -> bool`` that matches the rows build_events_query's category,
+    channel, status and event filters match, the same values ignored, unknown or empty in the same way (a NULL
+    action, status or channel matches what SQL matches it with). The time range is the caller's."""
+    tests = []
+    if categories:
+        known = [c for c in categories if audit_catalog.category_label(c)]
+        names = frozenset(audit_catalog.stored_names(known)) if known else frozenset()
+        legacy = LEGACY_CATEGORY in categories
+        every = frozenset(n for a in audit_catalog.ACTIONS for n in (a.name,) + a.aliases)
+        tests.append(lambda a, s, c: a is not None and (a in names or (legacy and a not in every)))
+    if channels:
+        picked = frozenset(c for c in channels if c in CHANNEL_CHOICES and c != "unknown")
+        unknown = "unknown" in channels
+        tests.append(lambda a, s, c: (c is not None and c in picked) or (unknown and c is None))
+    if statuses:
+        wanted = frozenset(statuses_for(statuses))
+        tests.append(lambda a, s, c: s is not None and s in wanted)
+    if actions:
+        wanted_actions = frozenset(stored_action_names(actions))
+        tests.append(lambda a, s, c: a is not None and a in wanted_actions)
+    return lambda action, status, channel: all(t(action, status, channel) for t in tests)
+
+
 def is_fingerprint(text) -> bool:
     from app.core.audit_fingerprints import is_fingerprint as check
     return check((text or "").strip())
@@ -563,12 +604,30 @@ def _cell(value):
 _HEAD_NOW = object()
 
 
-def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP, head=_HEAD_NOW):
+def archive_lines(note: Optional[dict]) -> List[str]:
+    """What an export says of the archive (app/services/activity_archive.py's note for its range): the archived
+    days it could not read, or, when its range had no start, that the archived days are not in it."""
+    if not note:
+        return []
+    if not note.get("searched"):
+        return [f"Days up to {note['newest_day']} are archived and not in this export. Export a range that starts "
+                f"on or before that day to include them (at most {note['max_days']} archived days at a time)."]
+    out = []
+    for gone in note.get("unreadable") or []:
+        out.append(f"The archived day {gone['day']} could not be read ({gone['reason']}), so its events are not in "
+                   "this export.")
+    return out
+
+
+def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP, head=_HEAD_NOW,
+                 archive: Optional[dict] = None):
     """The export, a line at a time. `fetch_batch(after)` returns (row_views, next_cursor) for the rows
     after the cursor (None: from the newest). Stops at `cap` rows; when more matched, a line says how many
-    were left out. The last line carries the audit chain's head as it stood when the export started
-    (app/core/audit_integrity.py): an anchor for checking the log later; the export itself is not
-    verifiable, since it carries no nonces. No head yet, no line."""
+    were left out. `archive` (the archive search's note for the range) adds a line for each archived day
+    the export could not read, or one saying the archived days are not in it. The last line carries the
+    audit chain's head as it stood when the export started (app/core/audit_integrity.py): an anchor for
+    checking the log later; the export itself is not verifiable, since it carries no nonces. No head yet,
+    no line."""
     import csv
     import io
     import json
@@ -601,6 +660,11 @@ def export_lines(fetch_batch, fmt: str, total: int, cap: int = EXPORT_CAP, head=
             yield csv_line(["# " + note])
         else:
             yield json.dumps({"truncated": True, "exported": sent, "total": total, "message": note}) + "\n"
+    for note in archive_lines(archive):
+        if fmt == "csv":
+            yield csv_line(["# " + note])
+        else:
+            yield json.dumps({"archive": True, "message": note}) + "\n"
     if head:
         if fmt == "csv":
             yield csv_line([f"# Audit chain head when this export started: {head}"])

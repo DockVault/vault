@@ -99,6 +99,8 @@
 .act-integrity[data-state="warning"] { border-color: var(--warning, #d68910); }
 .act-integrity-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .act-integrity-code { overflow-wrap: anywhere; word-break: break-all; font-size: .8rem; min-width: 0; }
+/* What the list and the band say of archived days (static/js/activity-archive.js). */
+.act-archive-note { margin: 6px 0 10px; overflow-wrap: anywhere; }
 .act-integrity-failure { color: var(--danger, #c0392b); }
 .act-integrity-warning { color: var(--warning, #d68910); }
 #activity-section.is-blocked .act-band, #activity-section.is-blocked .act-toolbar,

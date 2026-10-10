@@ -192,8 +192,12 @@ async def get_recent_events(
         for event in events
     ]
     
-    # Use conditional response with ETag to reduce traffic
-    return handle_conditional_response(request, events_data)
+    # Use conditional response with ETag to reduce traffic. Rows only: the archived days' span, when there are
+    # any, is in the archive headers (app/services/activity_archive.py).
+    from app.services import activity_archive
+    response = handle_conditional_response(request, events_data)
+    response.headers.update(activity_archive.headers_for())
+    return response
 
 
 @router.get("/active-connections")

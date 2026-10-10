@@ -293,12 +293,17 @@ def oldest(db, AuditLog, filters: dict, until: Optional[datetime] = None) -> Opt
 
 
 def summarize(db, AuditLog, win: Window, filters: dict, since: Optional[datetime] = None,
-              until: Optional[datetime] = None, from_: Optional[datetime] = None) -> dict:
+              until: Optional[datetime] = None, from_: Optional[datetime] = None,
+              now: Optional[datetime] = None) -> dict:
     """The band over the window for the Events filters `filters` (build_events_query's keyword arguments,
     with `start` and `end` the time picked on the chart). Rows count from `since` (None: from the oldest
     the log holds) up to `until` (exclusive; None: up to now, and anything written since). Each block
     counts under every filter but its own (OWN_FILTERS); blocks under the same filters share one query.
-    `from_` is the start the band states when it is not `since` (all time: the oldest row)."""
+    `from_` is the start the band states when it is not `since` (all time: the oldest row).
+
+    Archived hours count from the archived parts' aggregates where they answer a block's filters
+    (app/services/activity_archive.py), and the band then says so in `archive`: the blocks counted from
+    the archive, those counting rows only, and where the archive is."""
     from sqlalchemy import and_, func, literal_column, or_, text
     from app.services.activity_events import build_events_query, stored_action_names
     per_block = block_filters(filters)
@@ -346,9 +351,19 @@ def summarize(db, AuditLog, win: Window, filters: dict, since: Optional[datetime
         return (rows(block).filter(col.isnot(None), *conds).with_entities(col, count, failures)
                 .group_by(col).order_by(count.desc(), col).limit(TOP).all())
 
-    return shape(win, grouped, top("people", AuditLog.username, AuditLog.user_id.isnot(None)),
+    from app.services import activity_archive
+    archived, note = activity_archive.band_archive(
+        db, win, per_block, since, until, now or datetime.now(timezone.utc).replace(tzinfo=None))
+    grouped = grouped + archived.get("events", [])
+    for block in ("categories", "sign_ins"):
+        if block in apart and block in archived:
+            apart[block] = list(apart[block]) + archived[block]
+    band = shape(win, grouped, top("people", AuditLog.username, AuditLog.user_id.isnot(None)),
                  top("addresses", func.coalesce(AuditLog.ip_address, AuditLog.recorded["ip"].as_string())),
                  apart, from_ or since)
+    if note is not None:
+        band["archive"] = note
+    return band
 
 
 def cached(key: tuple, range_key: str, compute):

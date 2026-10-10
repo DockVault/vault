@@ -1515,6 +1515,8 @@
                         <div class="act-panel act-active" id="act-p-active"></div>
                         <button type="button" class="act-more-charts" id="act-more-charts" aria-expanded="false" aria-controls="act-band"><span class="act-more-text">More charts</span><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
                     </section>
+                    <!-- What the band counts of archived days (static/js/activity-archive.js). -->
+                    <p class="text-sm act-archive-note" id="act-archive-band" role="status" hidden></p>
 
                     <div class="act-toolbar toolbar" id="act-toolbar">
                         <div class="toolbar-search act-search">
@@ -1542,6 +1544,8 @@
                         <div class="act-list" id="act-list" aria-busy="false">
                             <div class="act-progress" aria-hidden="true"></div>
                             <div class="alert alert-error act-list-alert" id="act-list-alert" role="alert" hidden></div>
+                            <!-- Whether the list reads archived days (static/js/activity-archive.js). -->
+                            <p class="text-sm act-archive-note" id="act-archive-list" role="status" hidden></p>
                             <table class="data-table activity-table" id="act-table" aria-label="Events">
                                 <thead>
                                     <tr>
@@ -4067,6 +4071,7 @@
     <script src="/static/js/app.js?v=20261003b"></script>
     <script src="/static/js/activity.js?v=20260929a"></script>
     <script src="/static/js/audit-integrity.js?v=20261005a"></script>
+    <script src="/static/js/activity-archive.js?v=20261010a"></script>
     <script src="/static/js/settings-records.js?v=20261003a"></script>
     <script src="/static/js/settings-integrity.js?v=20261007a"></script>
     <script src="/static/js/notice-banner.js?v=20261002a"></script>

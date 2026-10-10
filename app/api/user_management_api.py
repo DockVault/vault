@@ -1137,12 +1137,15 @@ async def get_user_activity(
     if check_if_none_match(request, response_hash):
         return Response(status_code=304)  # Not Modified
     
-    # Convert to JSON-serializable format and return with ETag
+    # Convert to JSON-serializable format and return with ETag. Rows only: when the days asked for reach archived
+    # days, their span is in the archive headers (app/services/activity_archive.py).
+    from app.services import activity_archive
     content = json.dumps([item.model_dump(mode='json') for item in result], default=str)
     return Response(
         content=content,
         media_type="application/json",
-        headers={"ETag": f'"{response_hash}"'}
+        headers={"ETag": f'"{response_hash}"',
+                 **activity_archive.headers_for(date_threshold.replace(tzinfo=None), None)}
     )
 
 
