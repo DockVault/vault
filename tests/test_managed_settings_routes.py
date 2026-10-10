@@ -431,6 +431,9 @@ def test_the_changes_waiting_and_their_cancel_come_from_the_chain_not_the_table(
     out = routes.cancel_managed_setting_change(change_id, current_user=bob, db=db)
     assert (out["status"], out["change"]["decided_by"], out["change"]["new"]) == ("cancelled", "bob", 10)
     assert quiet["announced"][-1] == (sc.CANCELLED_BY_ADMIN, "keep_days", 30, 10, "bob")
+    (audit,) = db.query(AuditLog).filter(AuditLog.action == sc.CANCELLED_ACTION).all()
+    assert (audit.username, audit.details["old"], audit.details["new"], audit.details["setting"]) == (
+        "bob", 30, 10, 10)
     newest = db.query(AuditSeal).order_by(AuditSeal.seq.desc()).first()
     assert (newest.kind, newest.detail["request"], newest.detail["by"]) == ("cancel", sealed["id"], "admin")
     assert _waiting(db, alice) == []
@@ -443,7 +446,7 @@ def test_the_changes_waiting_and_their_cancel_come_from_the_chain_not_the_table(
     assert db.get(ManagedSettingChange, planted).status == sc.PENDING
 
 
-def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_waiting(env, db, quiet):
+def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_waiting(env, db, quiet, chain):
     """The chain's tail cut: sealing stops, the view keeps what it authenticated. A cancel of the waiting change
     is saved on its row (sealed from the database once sealing runs again); a row planted with no request seal is
     no change (404); a waiting change whose row the database marks ended already does not apply (409, saying so)."""
@@ -453,6 +456,9 @@ def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_wait
     second = uuid.UUID(_put(db, alice, "keep_days", 20)["change"]["id"])     # supersedes the first
     db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
     db.commit()
+    assert chain.seal_all().stopped == "head-record-mismatch"
+    assert routes.get_managed_settings(current_user=alice, db=db)["pending_chain"] == {
+        "read": True, "stopped": "head-record-mismatch"}
     seals = db.query(AuditSeal).count()
     with refused(404):
         routes.cancel_managed_setting_change(_planted(db, alice), current_user=alice, db=db)
