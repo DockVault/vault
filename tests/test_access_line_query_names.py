@@ -146,6 +146,8 @@ def test_a_target_with_names_only_is_read_back_unchanged(target, version):
     ("/activity/events?q&&user", "/activity/events?<value>&<value>"),                # an empty part: never written
     ("/activity/events?q&" + "a" * 65, "/activity/events?<value>&<value>"),          # too long for a name
     ("/activity/events?q&user\n", "/activity/events?<value>&<value>"),               # a name never ends a line
+    ("/activity/events?q&<alice.martin>", "/activity/events?<value>&<value>"),       # only the two markers pass
+    ("/activity/events?q&<values>", "/activity/events?<value>&<value>"),
     ("/invites/SEKRETtoken_ABCDEF0123?q", "/invites/<redacted>?q"),                  # the path is still masked
 ])
 def test_a_target_not_written_with_names_only_is_still_reduced(old, expected):
