@@ -302,7 +302,34 @@
         const list = (page && page.cases) || [];
         if (!list.length) out.push(el('p', 'my-access-empty', 'No investigation or legal hold concerns your vaults.'));
         list.forEach((c) => out.push(caseCard(c)));
+        out.push(revealsCard((page && page.reveals) || [], Boolean(page && page.reveals_more)));
         body.replaceChildren(...out);
+    }
+
+    // Names an auditor revealed from the activity log's events on the owner's vaults, outside any case: when, by
+    // whom, why (the category); never the reason's text or the names themselves.
+    function revealsCard(reveals, more) {
+        const card = el('div', 'card my-access-reveals');
+        card.style.padding = '12px';
+        card.style.margin = '12px 0';
+        card.appendChild(el('strong', null, 'Recorded names revealed'));
+        card.appendChild(el('p', 'text-tertiary text-sm',
+            'An auditor can reveal a name the activity log recorded in full about one of your vaults, outside a case, '
+            + 'giving a reason. Each time is listed here, newest first.'));
+        if (!reveals.length) {
+            card.appendChild(el('div', 'text-sm my-access-reveals-empty', 'None so far.'));
+            return card;
+        }
+        reveals.forEach((r) => {
+            const line = el('div', 'my-access-reveal text-sm');
+            line.dataset.vaultId = r.vault_id;
+            line.appendChild(el('span', 'my-access-when', when(r.at)));
+            line.appendChild(el('span', null, ' ' + vaultName(r.vault_id) + ': by ' + (r.auditor || '')
+                + ', reason: ' + (REVEAL_REASONS[r.reason_category] || r.reason_category || '')));
+            card.appendChild(line);
+        });
+        if (more) card.appendChild(el('div', 'text-tertiary text-sm', 'Older ones are kept in the record, not listed here.'));
+        return card;
     }
 
     async function openMyAccess() {

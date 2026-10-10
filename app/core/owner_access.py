@@ -4,8 +4,9 @@
 (an investigation once approved, a hold-only case once placed): its number, status, purpose and legal basis, its
 auditor and its approver, the auditor's note to the owner, its dates, and for each of the owner's vaults in it
 what it covers, whether a hold stands and how many files the hold kept; the exports of the case; and the files
-opened in the owner's vaults under it, as they happen. Never the justification, the people named, or anything of
-another owner's vaults. File names are read when the page is shown, and only where the owner could read them in
+opened in the owner's vaults under it, as they happen; and the names an auditor revealed outside a case from the
+activity log's events on the owner's vaults (when, by whom, the reason's category; never the reason's text or the
+names). Never the justification, the people named, or anything of another owner's vaults. File names are read when the page is shown, and only where the owner could read them in
 the vault itself: a Standard vault's at once, a password-protected vault's once its password is given on the page
 (a receipt good for 15 minutes, app/core/vault_unlock_receipts.py, on the vault-password throttle every check of
 that vault's password by the owner counts in), a zero-knowledge vault's never (the server does not have them).
@@ -32,6 +33,8 @@ from app.core import case_rules as rules
 _ACCESS_GRANTED = "access_granted"
 # The most files opened the page lists per case, newest first.
 OPENED_SHOWN = 200
+# The most revealed names the page lists, newest first.
+REVEALS_SHOWN = 200
 NAME_HIDDEN_PASSWORD = "password"
 NAME_HIDDEN_ZERO_KNOWLEDGE = "zero_knowledge"
 NAME_HIDDEN_GONE = "gone"
@@ -181,11 +184,24 @@ def unseen(db, user) -> list:
              "at": _iso(r.created_at)} for r, number in rows]
 
 
+def reveals(db, user) -> dict:
+    """The names revealed outside a case from events on vaults the user owns now, newest first: when, by which
+    auditor, the reason's category and the vault. Never the reason's text (sealed for the record) or the names."""
+    from app.core.models import ComplianceReveal as R, Vault
+    rows = (db.query(R.created_at, R.auditor_username, R.reason_category, R.vault_id)
+            .join(Vault, Vault.id == R.vault_id).filter(Vault.owner_id == user.id)
+            .order_by(R.created_at.desc(), R.id.desc()).limit(REVEALS_SHOWN + 1).all())
+    return {"reveals": [{"at": _iso(at), "auditor": _who(by), "reason_category": category, "vault_id": str(vid)}
+                        for at, by, category, vid in rows[:REVEALS_SHOWN]],
+            "reveals_more": len(rows) > REVEALS_SHOWN}
+
+
 def page(db, user, *, unlocked: Optional[set] = None, now: Optional[datetime] = None) -> dict:
     now = now or utcnow()
     unlocked = unlocked or set()
     return {"cases": [case_for_owner(db, c, rows, unlocked=unlocked, now=now, owner_id=user.id)
                       for c, rows in owner_rows(db, user)],
+            **reveals(db, user),
             "unseen": unseen(db, user)}
 
 

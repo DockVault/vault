@@ -44,7 +44,8 @@ def test_an_owner_sees_only_their_own_vaults_in_a_case(world):
     assert CASE_TEXT["justification"] not in page.text and v2 not in page.text and otto["_username"] not in page.text
     assert [v["vault_id"] for v in otto_c.get("/me/compliance-access").json()["cases"][0]["vaults"]] == [v2]
     mia_c = signed_in(world["mia"])
-    assert mia_c.get("/me/compliance-access").json() == {"cases": [], "unseen": []}, "a member owns nothing here"
+    assert mia_c.get("/me/compliance-access").json() == {"cases": [], "reveals": [], "reveals_more": False,
+                                                         "unseen": []}, "a member owns nothing here"
 
 
 def test_the_notices_stay_unread_until_the_owner_says_so(world):

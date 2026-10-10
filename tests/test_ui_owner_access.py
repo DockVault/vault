@@ -4,7 +4,8 @@ notice banner in static/js/notice-banner.js).
 A vault's owner sees, after sign-in, the same banner component the recording notice uses while a notice about
 access to their vaults is unread; its link opens the page with the case; "I've read it" takes it away for good.
 A member who opens the vault sees a neutral banner that names no case number, purpose, auditor or person
-concerned. On a phone (390 px) the page fits the screen without scrolling sideways.
+concerned. On a phone (390 px) the page fits the screen without scrolling sideways. A name revealed from the
+owner's vault outside a case is listed with who revealed it, when and why (the category), never the reason's text.
 """
 import pytest
 from playwright.sync_api import Page, expect
@@ -116,3 +117,25 @@ def test_the_page_fits_a_phone(page: Page, world):
     assert sizes["doc"] <= sizes["view"], sizes
     assert sizes["content"] <= sizes["contentBox"] + 1, sizes
     assert sizes["card"] <= sizes["view"], sizes
+
+
+def test_the_page_lists_a_name_revealed_from_the_owners_vault(page: Page, world):
+    """A reveal outside a case on the owner's vault (written as the reveal writes its row) is listed on the page
+    with when, who and the reason's category, never the reason's text."""
+    from _account_change_helpers import psql
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    reveal = psql("INSERT INTO compliance_reveals (id, event_id, auditor_username, vault_id, reason_category, "
+                  "reason_text_enc, created_at) VALUES (gen_random_uuid(), gen_random_uuid(), "
+                  f"'{world['auditor']}', '{world['vid']}', 'regulator_request', 'not-a-sealed-reason', "
+                  "now() AT TIME ZONE 'utc') RETURNING id").splitlines()[0]
+    try:
+        _login(page, world["olga"])
+        page.evaluate("() => window.openMyAccess()")
+        line = page.locator(f'#my-access-modal .my-access-reveal[data-vault-id="{world["vid"]}"]')
+        expect(line).to_have_count(1, timeout=15000)
+        expect(line).to_contain_text("by " + world["auditor"] + ", reason: Regulator or authority request")
+        expect(page.locator("#my-access-modal")).not_to_contain_text("not-a-sealed-reason")
+        assert errors == []
+    finally:
+        psql(f"DELETE FROM compliance_reveals WHERE id = '{reveal}'")

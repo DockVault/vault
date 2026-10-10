@@ -2,8 +2,8 @@
 /me/compliance-access in app/api/compliance_router.py, the vault-detail route's compliance_review), offline on a
 real (SQLite) database: only cases on the owner's own vaults, and of those only the owner's vaults; never the
 justification or the people named; the notices until they are read; a file's name only as the owner could read
-it; the members' neutral banner; VaultService.get_vault untouched. test_ui_owner_access.py shows the page and the
-banners in a browser."""
+it; the names revealed from the owner's vaults outside a case; the members' neutral banner; VaultService.get_vault
+untouched. test_ui_owner_access.py shows the page and the banners in a browser."""
 import inspect
 import uuid
 from datetime import timedelta
@@ -143,7 +143,7 @@ def test_the_page_never_names_the_justification_the_people_named_or_another_owne
 
 def test_a_case_waiting_for_approval_is_not_on_the_page(db, people):
     case = _case(db, people, [people.v1], approve=False)
-    assert oa.page(db, people.olga) == {"cases": [], "unseen": []}
+    assert oa.page(db, people.olga) == {"cases": [], "reveals": [], "reveals_more": False, "unseen": []}
     cases.approve(db, case, approver=people.bob)
     db.commit()
     assert [c["id"] for c in oa.page(db, people.olga)["cases"]] == [str(case.id)]
@@ -405,3 +405,40 @@ def test_a_vault_no_longer_the_owners_shows_them_no_file_name(db, people):
     (seen,) = oa.page(db, people.olga)["cases"]
     assert [(o["name"], o["name_hidden"]) for o in seen["opened"]] == [(None, oa.NAME_HIDDEN_NOT_OWNER)]
     assert oa.page(db, people.otto)["cases"] == [], "the new owner was never told of this case"
+
+
+# --------------------------------------------------------------------------- names revealed outside a case
+
+def _revealed(db, vault, *, by="uma", category="security_incident", at=None, text="sealed-reason-text"):
+    db.add(m.ComplianceReveal(event_id=uuid.uuid4(), auditor_username=by, vault_id=vault.id, reason_category=category,
+                              reason_text_enc=text, created_at=at or rights.utcnow()))
+    db.commit()
+
+
+def test_the_page_lists_the_names_revealed_from_the_owners_vaults_newest_first(db, people):
+    now = rights.utcnow()
+    _revealed(db, people.v1, at=now - timedelta(hours=2), category="internal_investigation")
+    _revealed(db, people.v1, at=now - timedelta(minutes=5), by="operator@host")
+    _revealed(db, people.v2, at=now - timedelta(minutes=1))
+    page = oa.page(db, people.olga)
+    assert [(r["vault_id"], r["auditor"], r["reason_category"]) for r in page["reveals"]] == [
+        (str(people.v1.id), "the server's operator", "security_incident"),
+        (str(people.v1.id), "uma", "internal_investigation")]
+    assert page["reveals_more"] is False
+    assert "sealed-reason-text" not in str(page), "never the reason's text"
+    assert [r["vault_id"] for r in oa.page(db, people.otto)["reveals"]] == [str(people.v2.id)]
+    assert oa.page(db, people.uma)["reveals"] == [], "the auditor owns nothing: nothing listed"
+    # Once a vault is someone else's, its reveals are on the new owner's page, not the former one's.
+    people.v1.owner_id = people.otto.id
+    db.commit()
+    assert oa.page(db, people.olga)["reveals"] == []
+    assert len(oa.page(db, people.otto)["reveals"]) == 3
+
+
+def test_the_page_lists_at_most_its_cap_of_reveals_and_says_more_were_left(db, people, monkeypatch):
+    monkeypatch.setattr(oa, "REVEALS_SHOWN", 2)
+    now = rights.utcnow()
+    for minutes in (1, 2, 3):
+        _revealed(db, people.v1, at=now - timedelta(minutes=minutes), by=f"auditor{minutes}")
+    page = oa.page(db, people.olga)
+    assert [r["auditor"] for r in page["reveals"]] == ["auditor1", "auditor2"] and page["reveals_more"] is True

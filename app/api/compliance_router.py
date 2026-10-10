@@ -1027,8 +1027,9 @@ def _owner_receipts(header: Optional[str]) -> dict:
 def my_compliance_access(request: Request, x_owner_unlock: Optional[str] = Header(default=None),
                          current_user: User = Depends(require_interactive_account), db: Session = Depends(get_db)):
     """Access to my vaults: every case that told the caller about one of their vaults, what it covers of them, the
-    files it opened there (names read now, as the caller could read them in the vault), its exports, and the notices
-    not yet read. Never the justification, the people named, or another owner's vaults."""
+    files it opened there (names read now, as the caller could read them in the vault), its exports; the names
+    revealed outside a case from events on the caller's vaults (who, when, the reason's category); and the notices
+    not yet read. Never the justification, the people named, a reveal's reason text, or another owner's vaults."""
     from app.api.api_server import _current_session_hash
     from app.core import owner_access
     limit_statements(db)

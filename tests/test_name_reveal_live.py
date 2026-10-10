@@ -67,6 +67,11 @@ def test_an_auditor_reveals_a_recorded_name_and_the_owner_is_told_once(world, le
     notes = psql(f"SELECT string_agg(body, ' ') FROM notifications WHERE user_id = '{olga['id']}' "
                  "AND type = 'compliance_access'")
     assert uma["username"] in notes and first not in notes and second not in notes
+    # Both reveals are on the owner's page, newest first, with who and why, never the reason's text or the names.
+    page = olga_c.get("/me/compliance-access").json()
+    mine = [r for r in page["reveals"] if r["vault_id"] == vid]
+    assert [(r["auditor"], r["reason_category"]) for r in mine] == [(uma["username"], "security_incident")] * 2
+    assert "SEC-2041" not in str(page) and first not in str(page) and second not in str(page)
 
 
 def test_a_vault_with_a_password_is_refused_and_only_an_auditor_reveals(world, levels_restored, admin):
