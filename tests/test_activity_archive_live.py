@@ -283,6 +283,17 @@ web = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), chan
 out["web_ok"] = [e["id"] for e in web["events"]] == expected_web
 one = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), ids=[expected[-1]]))
 out["ids_ok"] = [e["id"] for e in one["events"]] == [expected[-1]]
+# The rows after a point: from an archived row, the search starts at that point (one archived day here); from a
+# row still kept, it reads rows only and says nothing of the archive.
+everything = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), limit=200))["events"]
+anchor = next(i for i, e in enumerate(everything) if e["timestamp"].startswith(ARCHIVED[3].isoformat()))
+newer = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), after=everything[anchor]["cursor"],
+                                          limit=200))
+out["after_ok"] = [e["id"] for e in newer["events"]] == list(reversed(expected[:anchor]))
+out["after_note"] = newer.get("archive")
+hot_row = next(e for e in everything if e["timestamp"].startswith(HOT[0].isoformat()))
+out["after_hot_note"] = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), after=hot_row["cursor"],
+                                                         limit=5)).get("archive", "absent")
 rows_only = call(api.activity_events, **dict(EVENTS, limit=5))
 out["rows_only_note"] = rows_only.get("archive")
 hot = call(api.activity_events, **dict(EVENTS, from_date=at(HOT[0], 0).isoformat(), limit=5))
@@ -347,6 +358,8 @@ out["feed_headers"] = [r.headers.get(h) for h in archive.ARCHIVE_HEADERS]
     assert note["searched"] is True and note["searched_days"] == 3 and note["unreadable"] == [], note
     assert got["total"] == got["expected"] == 3 * 18 + 2 * 18
     assert got["paged_ok"] and got["all_ok"] and got["web_ok"] and got["ids_ok"], got
+    assert got["after_ok"] and got["after_note"]["searched_days"] == 1, got["after_note"]
+    assert got["after_hot_note"] == "absent"
     assert got["rows_only_note"]["searched"] is False and got["rows_only_note"]["newest_day"] == got["days"][-1]
     assert got["hot_note"] == "absent"
     assert got["refused"][0] == 400 and "at most 1 at a time" in got["refused"][1], got["refused"]
