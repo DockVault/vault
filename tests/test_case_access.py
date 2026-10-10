@@ -68,6 +68,24 @@ def test_the_record_is_committed_before_the_file_is_opened(db, people, storage, 
     monkeypatch.setattr(ca, "_vault_service", lambda db_: Service())
     _read(db, case, f, people.uma)
     assert order == ["commit", "open"]
+    # A view that needs no row (within ten minutes) still ends its transaction before the file is opened: the lock
+    # it took on the auditor's account row is never held while the file is sent.
+    _read(db, case, f, people.uma)
+    assert order == ["commit", "open", "commit", "open"] and len(_rows(db, "case_file_viewed")) == 1
+
+
+def test_the_auditors_row_is_locked_before_the_ten_minute_check(db, people, storage, monkeypatch):
+    """The lock that makes views at once count one after the other is taken before the check reads the record."""
+    f = _file(db, storage, people.v1)
+    case = _case(db, people, _vaults(people.v1))
+    order = []
+    source = inspect.getsource(ca._lock_auditor)
+    assert "with_for_update()" in source and "User.id == user.id" in source
+    monkeypatch.setattr(ca, "_lock_auditor", lambda db_, user: order.append(("lock", user.id)))
+    real_recent = ca._recent
+    monkeypatch.setattr(ca, "_recent", lambda *a, **k: (order.append("check"), real_recent(*a, **k))[1])
+    _read(db, case, f, people.uma)
+    assert order == [("lock", people.uma.id), "check"]
 
 
 def test_a_view_whose_record_cannot_be_written_is_refused_and_opens_nothing(db, people, storage, monkeypatch):
