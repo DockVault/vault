@@ -832,9 +832,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             except Exception:
                 pass  # fall through to IP
 
-        # 3. Fall back to IP — trusted-proxy aware (a direct client can't spoof X-Forwarded-For).
+        # 3. Fall back to IP — trusted-proxy aware (a direct client can't spoof X-Forwarded-For), kept
+        # under the address's throttle subject (an IPv6 address grouped to its /64).
         from app.core.net_utils import client_ip
-        return f"ip:{client_ip(request)}"
+        from app.core.sign_in_lockout import source_of
+        return f"ip:{source_of(client_ip(request))}"
     
     def _should_rate_limit(self, path: str) -> bool:
         """Check if path should be rate limited."""
@@ -933,10 +935,11 @@ def rate_limit(
             
             # Get identifier based on 'per' parameter (trusted-proxy-aware client IP).
             from app.core.net_utils import client_ip as _client_ip
+            from app.core.sign_in_lockout import source_of
             if per == "user" and hasattr(request.state, "user_id") and request.state.user_id:
                 identifier = f"user:{request.state.user_id}"
             else:
-                identifier = f"ip:{_client_ip(request)}"
+                identifier = f"ip:{source_of(_client_ip(request))}"
             
             # Initialize rate limiter
             rate_limiter = RateLimiter(redis_client)

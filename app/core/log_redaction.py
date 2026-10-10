@@ -10,6 +10,13 @@ Some tokens travel in the request URL rather than a header, and each one opens s
   ``/public-links/{token}/download/...``) and an upload link (``/u/{token}``,
   ``/receivers/{token}/upload-session...``).
 
+A query string's VALUES never reach a line at all: an access line prints each query parameter's name only
+(``GET /activity/events?user&ip&q``), because a value can be what someone typed (an Activity search for a
+person's name, an address, free text) as well as a secret. A name that does not look like one, and a part
+with no ``=`` (which could be a value), print as ``<name>`` and ``<value>``. A line read back through log
+access whose query already holds names only is served as it was written (read_back_target); any other
+query is reduced on the way out, so a line written before values were dropped serves none.
+
 Whoever reads a line holding one of these can open or use what it points at. The web log-pull serves
 request lines to a ``web``-scoped token holder (a less-privileged consumer), and ``docker logs`` shows
 the same lines, so every one is masked before it reaches any log sink, and again when a log is read
@@ -78,16 +85,74 @@ def redact_log_path(path: str) -> str:
     return path
 
 
+# A query parameter's name as an access line prints it, matched in full (fullmatch: a "$" would also let a
+# name end in a line break). Anything else in a name's place prints as <name>.
+_QUERY_NAME_RE = re.compile(r"[A-Za-z0-9_.\-\[\]]{1,64}")
+
+
+def query_names(query: str) -> str:
+    """A query string as an access line prints it: each parameter's name, in order, never its value. A
+    name that does not look like one prints as ``<name>``; a part with no ``=`` prints as ``<value>``,
+    since it may be a value sent on its own."""
+    out = []
+    for part in query.split("&"):
+        if not part:
+            continue
+        name, eq, _value = part.partition("=")
+        out.append(("<name>" if not _QUERY_NAME_RE.fullmatch(name) else name) if eq else "<value>")
+    return "&".join(out)
+
+
 def redact_access_path(full_path: str) -> str:
-    """Redact secrets from a full request target (path + optional query) for the uvicorn access log:
-    mask every secret-carrying route in the PATH and every secret-named QUERY value (the landing
-    page's ?invite=/?reset= token, a legacy ?vault_password=, and the like)."""
+    """A full request target (path + optional query) as an access line prints it: every secret-carrying
+    route in the PATH masked, and the QUERY reduced to its parameter names (query_names), so neither a
+    token (the landing page's ?invite=/?reset=, a legacy ?vault_password=) nor anything typed into a
+    search reaches the line."""
     path, sep, query = full_path.partition("?")
     path = redact_log_path(path)
     if not sep:
         return path
-    query = SECRET_QUERY_RE.sub(r"\1<redacted>", "?" + query)[1:]
-    return path + "?" + query
+    return path + "?" + query_names(query)
+
+
+def access_target(path: str, query: str = "") -> str:
+    """The request target the in-app access line prints for ``path`` and its raw ``query``: as
+    redact_access_path prints it, the same as uvicorn's line."""
+    return redact_access_path(path + ("?" + query if query else ""))
+
+
+def _names_only(query: str) -> bool:
+    """True when ``query`` is one query_names prints: every part a name, ``<name>`` or ``<value>`` (so none
+    holds an ``=``, and none is empty). False for an empty query."""
+    return all(part in ("<name>", "<value>") or _QUERY_NAME_RE.fullmatch(part) for part in query.split("&"))
+
+
+def read_back_target(target: str) -> str:
+    """A request target found in a log line read back, as log access serves it. A target whose query already
+    holds names only, as every line written since query values were dropped holds it, is served as written,
+    with only its path masked: reduced again, each name would print as ``<value>``. Any other target is
+    reduced as redact_access_path reduces it, so a line written before the change serves no value. The one
+    older line served as it was written is one whose query held nothing but bare, name-like parts."""
+    path, sep, query = target.partition("?")
+    if _names_only(query):                    # never for an empty query, so never for a target with no "?"
+        return redact_log_path(path) + sep + query
+    return redact_access_path(target)
+
+
+# A request line inside a log line read back ("GET /x?a=1 HTTP/1.1"): its target is reduced as
+# read_back_target reduces it, so a line written before query values were dropped serves none. The
+# target runs to " HTTP/": a quote does not end it, since a client can send one raw in a query and the
+# line holds the query as it came (a target never holds a space).
+_REQUEST_TARGET_RE = re.compile(
+    r"((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT) )(\S+)( HTTP/)")
+# The same for a WebSocket handshake line ('"WebSocket /ws/monitor?a=1" [accepted]'): the target runs to
+# the last quote before the space that follows it, so a raw quote inside it does not end it either.
+_WEBSOCKET_TARGET_RE = re.compile(r"(\"WebSocket )(\S+)(\")")
+
+# How uvicorn writes a WebSocket handshake: to uvicorn.error, not uvicorn.access, as
+# '%s - "WebSocket %s" [accepted]' (or 403, or '%d' for a response the application sent), the path with
+# its query second.
+_WEBSOCKET_LINE = '"WebSocket %s"'
 
 
 def redact_secret_urls_in_text(text: str) -> str:
@@ -96,16 +161,18 @@ def redact_secret_urls_in_text(text: str) -> str:
     still never serves a usable token."""
     if not text:
         return text
+    text = _REQUEST_TARGET_RE.sub(lambda m: m.group(1) + read_back_target(m.group(2)) + m.group(3), text)
+    text = _WEBSOCKET_TARGET_RE.sub(lambda m: m.group(1) + read_back_target(m.group(2)) + m.group(3), text)
     for rx, repl in _TEXT_SECRET_SUBS:
         text = rx.sub(repl, text)
     return SECRET_QUERY_RE.sub(r"\1<redacted>", text)
 
 
 class AccessLogRedactFilter(logging.Filter):
-    """Scrub URL-borne secrets out of uvicorn's access log. The request target is rewritten through
-    redact_access_path on EVERY line: a hand-kept list of trigger substrings here once let the note,
-    file and upload link tokens through, because it named only the invite, share and reset routes.
-    The regexes are cheap next to the request itself. Never raises, never drops a line."""
+    """Scrub URL-borne secrets and every query value out of uvicorn's access log. The request target is
+    rewritten through redact_access_path on EVERY line: a hand-kept list of trigger substrings here once
+    let the note, file and upload link tokens through, because it named only the invite, share and reset
+    routes. The regexes are cheap next to the request itself. Never raises, never drops a line."""
     def filter(self, record):  # noqa: A003
         try:
             args = record.args
@@ -114,6 +181,25 @@ class AccessLogRedactFilter(logging.Filter):
                 if redacted != args[2]:
                     lst = list(args)
                     lst[2] = redacted
+                    record.args = tuple(lst)
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
+        return True
+
+
+class WebSocketLogRedactFilter(logging.Filter):
+    """The same for a WebSocket handshake, which uvicorn writes to its error log (uvicorn.error), not the
+    access log: the path and its query are the record's second argument, reduced as an access line's
+    target is. Other records on that log are left as they are. Never raises, never drops a line."""
+    def filter(self, record):  # noqa: A003
+        try:
+            args = record.args
+            if (isinstance(args, tuple) and len(args) >= 2 and isinstance(args[1], str)
+                    and _WEBSOCKET_LINE in str(record.msg)):
+                redacted = redact_access_path(args[1])
+                if redacted != args[1]:
+                    lst = list(args)
+                    lst[1] = redacted
                     record.args = tuple(lst)
         except Exception:  # noqa: BLE001 — logging must never raise
             pass

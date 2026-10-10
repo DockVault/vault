@@ -41,6 +41,8 @@ bootstrap_entrypoint("API")
 
 from app.core.database import get_db, init_db, check_db_connection, redis_probe_ping
 from app.core import vault_attempt_throttle
+from app.core.sign_in_lockout import source_of
+from app.core import zero_knowledge_rules as zk_rules
 from app.core import redis_guard
 from app.core.rate_limiter import redis_circuit_open, retry_after_seconds
 from app.core.auth_offload import (
@@ -383,9 +385,9 @@ SESSION_TIMEOUT_MAX_MINUTES = 30 * 24 * 60  # 30 days
 # small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
 # access-log filter below. Add new secret-bearing routes in app/core/log_redaction.py.
 from app.core.log_redaction import (  # noqa: E402
-    redact_log_path as _redact_log_path,
-    redact_access_path as _redact_access_path,
+    access_target as _access_target,
     AccessLogRedactFilter as _AccessLogRedactFilter,
+    WebSocketLogRedactFilter as _WebSocketLogRedactFilter,
 )
 
 
@@ -398,11 +400,15 @@ def _public_base_url(request) -> str:
 
 
 def _install_access_log_redaction() -> None:
-    """Attach the access-log redaction filter once (idempotent), covering both run modes:
-    `python -m app.api.api_server` and an ASGI server importing `app`."""
+    """Attach the access-log redaction filters once (idempotent), covering both run modes:
+    `python -m app.api.api_server` and an ASGI server importing `app`. uvicorn writes a WebSocket
+    handshake, with its path and query, to its error log rather than the access log."""
     lg = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, _AccessLogRedactFilter) for f in lg.filters):
         lg.addFilter(_AccessLogRedactFilter())
+    lg = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _WebSocketLogRedactFilter) for f in lg.filters):
+        lg.addFilter(_WebSocketLogRedactFilter())
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -492,7 +498,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "connect-src 'self' ws: wss:",  # API calls and WebSocket
                 "frame-ancestors 'none'",  # Prevent clickjacking (no iframes)
                 "base-uri 'self'",  # Prevent base tag injection
-                "form-action 'self'",  # Forms only submit to same origin
+                # No form is ever sent by the browser itself: every form on the served pages is sent by
+                # script, its submit handler stopping the browser's own submission. So a form that escapes
+                # its handler (scripts off, a script that never loaded, injected markup) sends nothing.
+                "form-action 'none'",
             ]
             
             # Add HTTPS upgrade directive if the external scheme is HTTPS
@@ -523,13 +532,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         # Web log-pull access line. Only when the in-app sink is active (split/direct shape — under
         # run_combined it stays inactive and the launcher captures stdout instead, so no double-write).
-        # Method + path + status + client IP + duration ONLY — never bodies, headers, or query strings
-        # (the pull path also redacts on read, but we avoid logging secrets at the source).
+        # Method + path + the query's parameter NAMES + status + client IP + duration ONLY — never
+        # bodies, headers, or a query value (the pull path also redacts on read, but we avoid logging
+        # secrets, or what someone typed into a search, at the source).
         try:
             from app.services import log_sink
             if log_sink.is_active():
                 _dur_ms = int((_t.monotonic() - _req_started) * 1000)
-                log_sink.emit("web", f"{request.method} {_redact_log_path(request.url.path)} -> "
+                log_sink.emit("web", f"{request.method} {_access_target(request.url.path, request.url.query)} -> "
                                      f"{response.status_code} {get_client_ip(request)} {_dur_ms}ms")
         except Exception:  # noqa: BLE001 — logging must never affect the response
             pass
@@ -4153,11 +4163,18 @@ async def get_settings(
     data = dict(row.value) if row and row.value else {}
     for k in _SETTINGS_SENSITIVE:
         data.pop(k, None)
-    # Report the EFFECTIVE zero-knowledge state (plan ceiling + auto-enable), not the raw
-    # stored flag: the admin toggle must reflect reality, or a settings save (which sends the
-    # whole object) would persist the unchecked default and silently disable the auto-enabled
-    # feature. An explicit admin off is preserved (_zk_enabled returns it verbatim).
-    data["zero_knowledge_enabled"] = _zk_enabled(db)
+    # The two zero-knowledge switches AS SAVED (a never-saved zero-knowledge switch counts as on, so a save
+    # that sends the object back cannot turn the auto-enabled feature off), what is in effect beside them,
+    # and why they are locked when they cannot change anything now (app/core/zero_knowledge_rules.py). The
+    # saved value, not the effective one: reported while the plan lacked zero-knowledge, the effective "off"
+    # came back on the next save and stayed when the plan got zero-knowledge back.
+    _stored_switches = {k: data.get(k) for k in zk_rules.SWITCHES}
+    _allowed = _allowed_vault_types()
+    data["zero_knowledge_enabled"] = zk_rules.switch_on(_stored_switches)
+    data["force_zero_knowledge"] = zk_rules.force_on(_stored_switches)
+    data["zero_knowledge_in_effect"] = zk_rules.in_effect(_stored_switches, _allowed)
+    data["force_zero_knowledge_in_effect"] = zk_rules.force_in_effect(_stored_switches, _allowed)
+    data["zero_knowledge_switches_locked"] = zk_rules.switch_lock(_allowed)
     # Always report the EFFECTIVE directory-search policy so the admin toggle reflects the default
     # ('deployment') even when never explicitly saved.
     data["directory_search_scope"] = _directory_search_scope(db)
@@ -4397,6 +4414,10 @@ async def update_settings(
     from app.core.models import SystemSetting
     row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
     existing = dict(row.value) if row and row.value else {}
+    try:
+        payload = zk_rules.settle_switches(payload, existing, _allowed_vault_types())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     merged = {**existing, **(payload or {})}
     if row is None:
         db.add(SystemSetting(key=_SETTINGS_KEY, value=merged))
@@ -5144,7 +5165,7 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
     client_ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=client_ip, limit=settings.rate_limit_api_auth,
+            identifier=source_of(client_ip), limit=settings.rate_limit_api_auth,
             window=settings.rate_limit_api_auth_window, prefix="invite_lookup", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -5189,7 +5210,7 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
 
     # (a) Rate limit — per IP AND per token prefix, both fail-closed (this is an unauthenticated
     # account-creation surface; it must throttle even during a Redis outage).
-    for ident, pfx, lim in ((client_ip, "invite_accept_ip", settings.rate_limit_api_auth),
+    for ident, pfx, lim in ((source_of(client_ip), "invite_accept_ip", settings.rate_limit_api_auth),
                             (prefix, "invite_accept_prefix", 5)):
         try:
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
@@ -5668,7 +5689,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
     ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            identifier=source_of(ip), limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
             prefix="forgot_password_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please try again shortly.")
@@ -6833,7 +6854,7 @@ async def get_reset(token: str, request: Request, db: Session = Depends(get_db))
     ip = get_client_ip(request)
     try:
         allowed, _, _ = _rl.check_rate_limit(
-            identifier=ip, limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
+            identifier=source_of(ip), limit=settings.rate_limit_api_auth, window=settings.rate_limit_api_auth_window,
             prefix="reset_lookup_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -6869,7 +6890,7 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     # Whole-space brute force is already infeasible against the 256-bit token and bounded by the per-IP cap.
     try:
         for ident, pfx, lim, win in (
-                (ip, "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
+                (source_of(ip), "reset_do_ip", settings.rate_limit_api_auth, settings.rate_limit_api_auth_window),
                 (prefix or "none", "reset_do_prefix", 5, 60)):
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=win, prefix=pfx, fail_open=False)
             if not allowed:
@@ -6956,7 +6977,7 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
     # budgets don't collide with login (rate_limit:login_user:* / rate_limit:login_ip:*) or invites
     # (invite_accept_*). The username key is the raw submitted value (lowered), so even a
     # never-existing name is throttled.
-    for ident, pfx, lim in ((client_ip, "signup_ip", settings.rate_limit_api_auth),
+    for ident, pfx, lim in ((source_of(client_ip), "signup_ip", settings.rate_limit_api_auth),
                             (uname.strip().lower(), "signup_identifier", 5)):
         try:
             allowed, _, reset = _rl.check_rate_limit(identifier=ident, limit=lim, window=60,
@@ -7294,8 +7315,10 @@ async def get_zk_enabled(
         # Whether the PLAN itself mandates zero-knowledge (Enterprise tier) — distinct from
         # the local admin 'force_zero_knowledge' toggle. Lets the Settings page show that the
         # requirement is imposed by the plan (a floor the local toggle can't drop below),
-        # instead of an unchecked box that looks contradictory when ZK is already forced.
-        "plan_force_zero_knowledge": bool(settings.plan_force_zero_knowledge and settings.plan_zero_knowledge),
+        # instead of an unchecked box that looks contradictory when ZK is already forced. Not where the
+        # allowed types leave zero-knowledge out: people make standard vaults there, so the plan's force
+        # does not hold and the page must not say it does.
+        "plan_force_zero_knowledge": zk_allowed and zk_rules.plan_forces(),
         "max_zk_vaults": settings.plan_max_zk_vaults,
         "zk_vault_count": _zk_vault_count(db),
         "allowed_vault_types": sorted(allowed),
@@ -7754,7 +7777,7 @@ async def second_factor_login_verify(
     from app.core.rate_limiter import rate_limiter as _rl
     user, pending = principal
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{user.id}",
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{user.id}",
                                              limit=10, window=300, prefix="sf_login_verify", fail_open=False)
     if not allowed:
         import time as _t
@@ -7893,7 +7916,7 @@ async def second_factor_step_up(
     if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{client_ip}:{current_user.id}",
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{current_user.id}",
                                              limit=10, window=300, prefix="sf_step_up", fail_open=False)
     if not allowed:
         import time as _t
@@ -12780,10 +12803,10 @@ async def redeem_note_link(
     #     is the per-IP throttle GET /invites/{token} and /reset/{token} already apply.
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{_notelink_token_hash(token)}", limit=_NOTELINK_REDEEM_LIMIT,
+            identifier=f"{source_of(client_ip)}:{_notelink_token_hash(token)}", limit=_NOTELINK_REDEEM_LIMIT,
             window=_NOTELINK_REDEEM_WINDOW, prefix="notelink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_NOTELINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_NOTELINK_REDEEM_IP_LIMIT,
             window=_NOTELINK_REDEEM_IP_WINDOW, prefix="notelink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -13612,10 +13635,10 @@ async def redeem_public_link(
     # alone throttles enumerating many different tokens from one address.
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{_publiclink_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
+            identifier=f"{source_of(client_ip)}:{_publiclink_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
             window=_PUBLINK_REDEEM_WINDOW, prefix="publiclink_redeem", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
             window=_PUBLINK_REDEEM_IP_WINDOW, prefix="publiclink_redeem_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -13771,7 +13794,7 @@ async def download_public_link(
     # bucket — a real folder download of many files stays well under it.
     try:
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
             window=_PUBLINK_REDEEM_IP_WINDOW, prefix="publiclink_download_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -14664,10 +14687,10 @@ async def open_receiver_upload_session(
 
     try:
         allowed, _, reset = _rl.check_rate_limit(
-            identifier=f"{client_ip}:{_receiver_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
+            identifier=f"{source_of(client_ip)}:{_receiver_token_hash(token)}", limit=_PUBLINK_REDEEM_LIMIT,
             window=_PUBLINK_REDEEM_WINDOW, prefix="receiver_open", fail_open=False)
         allowed_ip, _, reset_ip = _rl.check_rate_limit(
-            identifier=client_ip, limit=_PUBLINK_REDEEM_IP_LIMIT,
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
             window=_PUBLINK_REDEEM_IP_WINDOW, prefix="receiver_open_ip", fail_open=False)
     except RateLimiterUnavailable:
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
@@ -16389,11 +16412,9 @@ def _allowed_vault_types() -> set:
     comma-separated PLAN_* env). Entries are normalised and intersected with the
     recognised VAULT_TYPES; an EMPTY or all-unrecognised value means NO restriction —
     every recognised type is allowed (the permissive default). Never returns an empty
-    set, so a mis-set env can't brick all vault creation."""
-    raw = settings.plan_allowed_vault_types or ""
-    wanted = {t.strip().lower() for t in raw.split(",") if t.strip()}
-    allowed = wanted & VAULT_TYPES
-    return allowed or set(VAULT_TYPES)
+    set, or only zero-knowledge on a plan that does not offer it, so a mis-set env can't
+    brick all vault creation (app/core/zero_knowledge_rules.py)."""
+    return zk_rules.allowed_types(settings.plan_allowed_vault_types, VAULT_TYPES)
 
 
 def _is_zk_vault(vault) -> bool:
@@ -16439,18 +16460,19 @@ def _zk_enabled(db) -> bool:
     When the plan GRANTS zero-knowledge, ZK is AUTO-ENABLED unless a local admin has
     explicitly turned it off. The local 'zero_knowledge_enabled' setting now acts only as an
     admin override: absent => on (the entitled tenant gets ZK without an undiscoverable
-    manual click), explicitly False => off, explicitly True => on. get_settings() reports
-    this EFFECTIVE value so a settings save can't silently clobber the auto-enable."""
-    if not settings.plan_zero_knowledge:
+    manual click), explicitly False => off, explicitly True => on. A plan whose cap on
+    zero-knowledge vaults is 0 offers none, and where the operator allows only
+    zero-knowledge vaults an administrator's off switch would leave nothing to make, so
+    it does not apply (app/core/zero_knowledge_rules.py)."""
+    if not zk_rules.plan_offers():
         return False
-    if settings.plan_force_zero_knowledge:
+    if zk_rules.plan_forces():
         return True
     try:
         from app.core.models import SystemSetting
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
-        override = val.get("zero_knowledge_enabled")
-        return True if override is None else bool(override)
+        return zk_rules.enabled(val, _allowed_vault_types())
     except Exception:  # noqa: BLE001
         # Plan grants ZK; fail toward the entitlement (the confidentiality-safe direction),
         # matching the plan-force short-circuit above rather than silently disabling it.
@@ -16469,17 +16491,17 @@ def _user_must_use_zk(db, user) -> bool:
     plan-imposed floor: permissive (False) for non-forced plans, forced (True) for
     plan-forced ones — and _zk_enabled short-circuits ZK on for plan-forced deployments,
     so the user is never boxed into 'must use ZK but ZK is off'."""
-    plan_force = settings.plan_force_zero_knowledge and settings.plan_zero_knowledge
+    plan_force = zk_rules.plan_forces()
     try:
         from app.core.models import SystemSetting, user_groups
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
         val = (row.value or {}) if (row and row.value) else {}
         # The administrators' force holds only where the plan lets zero-knowledge vaults be made at all
-        # (_zk_enabled). Saved before the plan dropped zero-knowledge, it would otherwise refuse a standard
-        # vault while the zero-knowledge one is refused as not enabled: no vault could be made.
-        setting_force = bool(settings.plan_zero_knowledge and val.get("force_zero_knowledge")
-                             and val.get("zero_knowledge_enabled"))
+        # (a plan that includes them, with a cap that is not 0) and their zero-knowledge switch is on (never
+        # saved counts as on). Saved before the plan dropped zero-knowledge, it would otherwise refuse a
+        # standard vault while the zero-knowledge one is refused as not enabled: no vault could be made.
+        setting_force = zk_rules.admin_force_holds(val)
         if not (plan_force or setting_force):
             return False
         allowed = {str(g) for g in (val.get("standard_vault_allowed_groups") or [])}

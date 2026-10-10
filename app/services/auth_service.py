@@ -204,11 +204,13 @@ def account_locked(user) -> bool:
 
 
 def login_user_key(identifier, ip_address, *, prefixed=True) -> str:
-    """The sign-in throttle's per-name bucket: one per name AND source address. ``prefixed`` gives
-    the cache key; without it, the durable fallback's identifier (its column is bounded). The name is
-    kept as its keyed stand-in, never as typed (app/core/name_keys.py)."""
+    """The sign-in throttle's per-name bucket: one per name AND source address (the address's
+    throttle subject: an IPv6 address grouped to its /64). ``prefixed`` gives the cache key; without
+    it, the durable fallback's identifier (its column is bounded). The name is kept as its keyed
+    stand-in, never as typed (app/core/name_keys.py)."""
     from app.core.name_keys import name_key
-    bucket = f"{name_key(identifier)}|{ip_address}"
+    from app.core.sign_in_lockout import source_of
+    bucket = f"{name_key(identifier)}|{source_of(ip_address)}"
     return f"login_user:{bucket}" if prefixed else bucket[:255]
 
 
@@ -2093,8 +2095,9 @@ class AuthService:
 
         charges.append(("cache", user_bucket, user_entry))
 
-        # Per-IP limit (2x threshold).
-        ip_bucket, ip_entry = f"login_ip:{ip_address}", str(uuid.uuid4())
+        # Per-IP limit (2x threshold), kept under the address's throttle subject.
+        from app.core.sign_in_lockout import source_of
+        ip_bucket, ip_entry = f"login_ip:{source_of(ip_address)}", str(uuid.uuid4())
         allowed_ip, remaining_ip, reset_ip = rate_limiter.check_rate_limit(
             ip_bucket, ip_limit, window,
             prefix="rate_limit", fail_open=False, entry_id=ip_entry,
@@ -2123,8 +2126,9 @@ class AuthService:
                 retry_after=retry_user, limit=user_limit, remaining=0,
             )
 
+        from app.core.sign_in_lockout import source_of
         allowed_ip, retry_ip, ip_charge = self._db_throttle_charge(
-            ip_address, "login_ip", ip_limit, window
+            source_of(ip_address), "login_ip", ip_limit, window
         )
         if not allowed_ip:
             raise RateLimitExceededError(

@@ -3569,15 +3569,22 @@ async function showCreateVault() {
             const allowed = Array.isArray(f && f.allowed_vault_types) ? f.allowed_vault_types : [];
             const standardBlocked = allowed.length > 0 && !allowed.includes('standard');
             const forceZk = must || (on && standardBlocked);
+            // A plan cap of 0 zero-knowledge vaults, or an allowlist without them, is not
+            // something an administrator can switch on in Settings (the switches are locked
+            // there), so the note names the plan or the deployment instead.
+            const planAllowsNone = !!f && f.max_zk_vaults === 0;
+            const zkBlocked = allowed.length > 0 && !allowed.includes('zero_knowledge');
 
             if (!on && !must) {
-                // Zero-knowledge not offered — standard only. Say WHY (plan vs admin
+                // Zero-knowledge not offered — standard only. Say WHY (plan, deployment or admin
                 // toggle) instead of silently omitting the option (textContent, no HTML).
                 grp.style.display = 'none';
                 if (note) {
-                    note.textContent = planHasZk
-                        ? 'Zero-knowledge vaults are turned off for this workspace. An administrator can enable them in Settings.'
-                        : 'Zero-knowledge vaults are not available on your current plan.';
+                    note.textContent = (!planHasZk || planAllowsNone)
+                        ? 'Zero-knowledge vaults are not available on your current plan.'
+                        : zkBlocked
+                            ? 'Zero-knowledge vaults are not allowed on this deployment.'
+                            : 'Zero-knowledge vaults are turned off for this workspace. An administrator can enable them in Settings.';
                     note.style.display = '';
                 }
             } else if (forceZk) {
@@ -8594,10 +8601,25 @@ async function loadSettings() {
         // central settings save.
 
         // SFTP & Encryption
+        // The two zero-knowledge switches come AS SAVED. Where they cannot change anything now (the plan
+        // lacks zero-knowledge or requires it, or only one vault type is allowed) the server says why: they
+        // show what is in effect, locked, and a save leaves them out, so their saved values are kept.
+        const zkLock = settings.zero_knowledge_switches_locked || '';
         const zkEl = document.getElementById('setting-zero-knowledge-enabled');
-        if (zkEl) zkEl.checked = settings.zero_knowledge_enabled === true;
         const fzkEl = document.getElementById('setting-force-zero-knowledge');
-        if (fzkEl) fzkEl.checked = settings.force_zero_knowledge === true;
+        if (zkEl) {
+            zkEl.checked = zkLock ? settings.zero_knowledge_in_effect === true : settings.zero_knowledge_enabled === true;
+            zkEl.disabled = !!zkLock;
+        }
+        if (fzkEl) {
+            fzkEl.checked = zkLock ? settings.force_zero_knowledge_in_effect === true : settings.force_zero_knowledge === true;
+            fzkEl.disabled = !!zkLock;
+        }
+        const zkLockNote = document.getElementById('zk-switches-locked-note');
+        if (zkLockNote) {
+            zkLockNote.textContent = zkLock ? zkLock + ' These two settings are kept as saved and apply again when that changes.' : '';
+            zkLockNote.style.display = zkLock ? '' : 'none';
+        }
         const dssEl = document.getElementById('setting-directory-search-scope');
         if (dssEl) dssEl.value = (settings.directory_search_scope === 'same_department') ? 'same_department' : 'deployment';
         const fnrEl = document.getElementById('setting-force-no-remember-vault-password');
@@ -8637,12 +8659,14 @@ async function loadSettings() {
             if (planForced) {
                 if (zkAllowEl) { zkAllowEl.checked = true; zkAllowEl.disabled = true; }
                 if (fzkEl) { fzkEl.checked = true; fzkEl.disabled = true; }
-            } else {
+            } else if (!zkLock) {
                 if (zkAllowEl) zkAllowEl.disabled = false;
                 if (fzkEl) fzkEl.disabled = false;
             }
             if (note) note.style.display = planForced ? '' : 'none';
-        } catch (_) { /* plan state unavailable — leave the toggles editable */ }
+            // One note at a time: the plan's own note says it when the plan requires zero-knowledge.
+            if (planForced && zkLockNote) zkLockNote.style.display = 'none';
+        } catch (_) { /* plan state unavailable — the switches stay as GET /settings set them */ }
         sftpRequireTempCredGroups = (settings.sftp_require_temp_cred_groups || []).map(String);
         standardVaultAllowedGroups = (settings.standard_vault_allowed_groups || []).map(String);
         await loadSftpPolicyGroups();
@@ -8749,6 +8773,13 @@ async function saveAllSettings() {
             max_temp_creds_per_user: parseInt(document.getElementById('setting-max-temp-creds-per-user').value) || 0,
             temp_cred_allow_zk_vaults: document.getElementById('setting-temp-cred-allow-zk-vaults').checked
         };
+        // A zero-knowledge switch the page locked (it could not be changed here) is not sent, so its saved
+        // value is kept rather than overwritten with what was shown.
+        for (const [elId, key] of [['setting-zero-knowledge-enabled', 'zero_knowledge_enabled'],
+                                   ['setting-force-zero-knowledge', 'force_zero_knowledge']]) {
+            const el = document.getElementById(elId);
+            if (!el || el.disabled) delete settings[key];
+        }
 
         // Branding: send the brand overrides. An empty value clears that
         // override server-side (reverts to the env default). app_name/app_description
