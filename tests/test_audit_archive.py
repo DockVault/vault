@@ -2125,7 +2125,8 @@ def test_hot_hours_younger_than_the_minimum_are_protected_whole_whatever_the_cha
 
 def test_a_hot_hour_only_partly_younger_than_the_minimum_is_not_kept_whole(env, monkeypatch):
     """The minimum for every row ends inside an hour: that hour is not kept whole, so none of its count is protected
-    by the minimum and its rows from before the minimum may go; its younger rows stay."""
+    by the minimum and its rows from before the minimum may go; its younger rows stay. Half an hour earlier the
+    minimum ends at the hour's start, and the hour is kept whole."""
     _capped(env, monkeypatch)
     final = env.clock() + timedelta(days=8, minutes=30)
     hour = ai.hour_floor(final - timedelta(days=12))
@@ -2138,8 +2139,13 @@ def test_a_hot_hour_only_partly_younger_than_the_minimum_is_not_kept_whole(env, 
     assert env.clock() == final
     numbers = _numbers(max_days=0, max_mb=1000, min_days=12)
     with env.session() as db:
+        at_start = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(),
+                                      env.clock() - timedelta(minutes=30), numbers, timedelta(days=7))
         plan = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(), numbers,
                                   timedelta(days=7))
+    hot, _parts = _counted(env)
+    assert at_start.protected_bytes == hot[hour] > 0
+    assert at_start.cutoff == ai.hour_floor(T0 - timedelta(days=25)) + timedelta(hours=1)
     assert plan.protected_bytes == 0 and plan.cutoff == hour + timedelta(hours=1)
     ar.prune(_pass(env), numbers)
     with env.session() as db:
