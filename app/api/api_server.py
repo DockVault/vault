@@ -2572,7 +2572,8 @@ def activity_events(
       nearest first), at most `limit`, with `more` true when more remain. `overlap` seconds also takes
       rows from just before that point, for a poll that catches rows committed late;
     - specific rows: `ids` (repeated, or comma-separated), those of the rows that match the filters,
-      newest first. This is how the live signal's rows are fetched.
+      newest first. This is how the live signal's rows are fetched. They are looked up in the rows first:
+      the archive is searched only when one of them is no row at all.
     `count_only` returns {"count": n} for any of them instead of rows. Every row carries its `cursor`;
     `head_cursor` is the newest row's in the response.
 
@@ -2591,8 +2592,11 @@ def activity_events(
     limit = max(1, min(limit, ev.MAX_PAGE))
     wanted_ids = ev.split_ids(ids)
     start, end = audit_range.lower_bound(from_date), audit_range.upper_bound(to_date)
-    # Reading the rows after a point reaches the archive only when that point is in it.
+    # Reading the rows after a point reaches the archive only when that point is in it; reading rows by id only when
+    # one of them is no row of audit_logs (the live list's new rows always are).
     reach = start
+    if wanted_ids and archive.ids_are_rows(db, wanted_ids):
+        reach = None
     anchor = ev.read_anchor(after) if after and not wanted_ids else None
     if anchor and anchor[0] == "cursor":
         since = anchor[1][0] - timedelta(seconds=overlap)

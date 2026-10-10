@@ -426,6 +426,51 @@ def test_the_searchs_table_goes_with_it(env):
         assert s.db.query(func.count()).select_from(sa.table(archive.SEARCH_TABLE)).scalar() == 4 * 18
 
 
+def test_rows_asked_for_by_id_are_looked_up_in_the_rows_before_the_archive(env):
+    """The live list reads its new rows by id with the list's own range: every one is a row, so the read stays in
+    audit_logs whatever the range (whether it matches the filters or not), and only an id that is no row at all
+    takes it to the archive."""
+    ids = _corpus(env, None)
+    _archive_all(env)
+    new = _put(env, at(HOT[1], 23), username="eve")
+    with env.session() as db:
+        archived = [i for i in ids if db.get(AuditLog, i) is None]
+        hot = [i for i in ids if db.get(AuditLog, i) is not None]
+        assert archived and hot
+        assert archive.ids_are_rows(db, [str(new)]) is True
+        assert archive.ids_are_rows(db, [f"{new},{hot[0]}", str(hot[1])]) is True
+        assert archive.ids_are_rows(db, [str(new), str(archived[0])]) is False
+        assert archive.ids_are_rows(db, [str(archived[0])]) is False
+        assert archive.ids_are_rows(db, [str(uuid.uuid4())]) is False          # no row at all
+        assert archive.ids_are_rows(db, []) is True
+        assert archive.ids_are_rows(db, ["not-an-id"]) is True                  # nothing that reads as an id
+
+
+class _Recorded:
+    """A stand-in session that records the statements a search's transaction opens with, as on Postgres."""
+
+    def __init__(self):
+        self.sql = []
+
+    def get_bind(self):
+        return type("Bind", (), {"dialect": type("Dialect", (), {"name": "postgresql"})()})()
+
+    def execute(self, statement, *a, **k):
+        self.sql.append(str(statement))
+
+
+def test_a_searchs_transaction_bounds_its_statements_and_its_idle_time(monkeypatch):
+    """On Postgres every statement of a search is bounded, and so is the time its transaction waits between them
+    (an export's reader that stops reading), each set for that transaction only."""
+    from app.core import audit_chain_verify as v
+    monkeypatch.setattr(v, "one_state", lambda db: db.sql.append("one state"))
+    db = _Recorded()
+    archive._begin(db)
+    assert db.sql == ["one state", f"SET LOCAL statement_timeout = {archive.STATEMENT_TIMEOUT_MS}",
+                      f"SET LOCAL idle_in_transaction_session_timeout = {archive.IDLE_TIMEOUT_MS}"]
+    assert archive.STATEMENT_TIMEOUT_MS == 60_000 and archive.IDLE_TIMEOUT_MS == 120_000
+
+
 def test_a_search_reads_only_the_archived_rows_of_its_range(env):
     _corpus(env, None)
     _archive_all(env)

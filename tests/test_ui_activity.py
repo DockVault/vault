@@ -82,6 +82,35 @@ def test_events_filter_by_user_and_open_a_row(page: Page, anon, activity_admin):
     expect(pane).to_be_hidden()
 
 
+def test_an_open_events_recheck_reads_only_its_own_instant(page: Page, anon, activity_admin, admin):
+    """When the list is read again with an event open, the page asks whether that event still matches with the
+    list's filters and the range narrowed to the event's own instant (to the millisecond after it): over archived
+    days the server then reads only the part that holds it, not every archived day of the range."""
+    from datetime import datetime, timedelta, timezone
+    from urllib.parse import parse_qs, urlparse
+    name = unique("ghost")
+    anon.post("/auth/login", json={"username": name, "password": "not-it-1"})
+    _login(page, activity_admin)
+    _open_activity(page)
+    _filter_by_person(page, name)
+    rows = page.locator("#activity-rows tr.act-row")
+    expect(rows).to_have_count(1, timeout=10000)
+    page.keyboard.press("Escape")
+    rows.first.click()
+    expect(page.locator("#act-detail")).to_be_visible()
+    ts = admin.get("/activity/events", params={"user": name, "user_match": "exact"}).json()["events"][0]["timestamp"]
+    with page.expect_request(lambda r: "/activity/events?" in r.url and "ids=" in r.url) as recheck:
+        page.click("#act-range [data-range='7d']")
+    asked = parse_qs(urlparse(recheck.value.url).query)
+    moment = datetime.fromisoformat(ts).astimezone(timezone.utc)
+    end = moment.replace(microsecond=moment.microsecond // 1000 * 1000) + timedelta(milliseconds=1)
+    assert asked["from_date"] == [ts], asked
+    assert asked["to_date"] == [end.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"], asked
+    assert asked["user"] == [name]
+    expect(page.locator("#act-detail")).to_be_visible()
+    expect(page.locator("#act-detail")).to_contain_text(name)
+
+
 def test_on_a_phone_the_filters_are_a_sheet_and_results_are_rows(page: Page, anon, activity_admin):
     name = unique("ghost")
     anon.post("/auth/login", json={"username": name, "password": "not-it-1"})

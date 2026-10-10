@@ -14,7 +14,9 @@ the numbers (TooBroad), and narrowed by its dates.
 
 A range with no start reads rows only, and says where the archive is (``archive`` in the response): the page then
 offers a range to search it. The live list's reads of newer rows start where they continue from, so they reach
-the archive only when that point is in it.
+the archive only when that point is in it; its reads of specific rows (``ids``: the new rows the live signal names,
+an open event's re-check) look the ids up in audit_logs first and reach the archive only for an id that is no row
+at all (ids_are_rows), and the page narrows an open event's re-check to the event's own instant.
 
 The view and the transaction's snapshot are taken in that order: the snapshot first, then the view. A part the
 view names that the snapshot holds no block of was archived after the snapshot (its rows are then still rows in
@@ -53,6 +55,10 @@ MAX_BYTES = 16 * 1024 * 1024
 SEARCH_TABLE = "audit_archive_search"
 # How long any statement of a search may run.
 STATEMENT_TIMEOUT_MS = 60_000
+# How long a search's transaction may wait between its statements. An export's search waits while the client reads
+# what it sent: a client that stops reading for this long loses its export, and the search's connection and
+# snapshot are freed (Postgres ends the session) rather than held for as long as the client stays connected.
+IDLE_TIMEOUT_MS = 120_000
 # Rows inserted into the search's table at a time.
 INSERT_CHUNK = 2000
 # The headers the readers of rows only say where the archive is in: its oldest and newest archived UTC days.
@@ -298,6 +304,7 @@ def _begin(db) -> None:
     v.one_state(db)
     if _is_pg(db):
         db.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
+        db.execute(text(f"SET LOCAL idle_in_transaction_session_timeout = {int(IDLE_TIMEOUT_MS)}"))
 
 
 def _drop(db, table) -> None:
@@ -341,6 +348,8 @@ def search(engine, p: Plan, st=None) -> Iterator[Search]:
         try:
             db.rollback()
             _drop(db, table)
+        except Exception:  # noqa: BLE001 -- a session Postgres ended (an export's reader that stopped reading)
+            db.invalidate()
         finally:
             db.close()
 
@@ -528,6 +537,20 @@ def snapshot_session(engine):
     return db
 
 
+def ids_are_rows(db, ids: Sequence[str]) -> bool:
+    """Whether every row asked for by id (activity_events.parse_ids: those that read as ids) is a row of audit_logs,
+    whatever the filters say of it. A read of specific rows then stays in audit_logs and reads no block, whatever
+    its range: the live list reads its new rows this way, and they are always rows. Only an id that is no row at all
+    (archived since, or never one) takes the read to the archive."""
+    from app.core.models import AuditLog
+    from app.services import activity_events as ev
+    wanted = ev.parse_ids(ids)
+    if not wanted:
+        return True
+    found = db.query(func.count()).select_from(AuditLog).filter(AuditLog.id.in_(wanted)).scalar() or 0
+    return found >= len(wanted)
+
+
 def reaches_archive(start: Optional[datetime], end: Optional[datetime], st=None) -> bool:
     try:
         return bool(parts_between(archives(st), start, end))
@@ -536,5 +559,6 @@ def reaches_archive(start: Optional[datetime], end: Optional[datetime], st=None)
 
 
 __all__ = ["ARCHIVE_HEADERS", "MAX_BYTES", "MAX_DAYS", "MAX_ROWS", "Plan", "Search", "Source", "TooBroad",
-           "archives", "band_archive", "check_budget", "headers_for", "oldest_archived", "parts_between", "plan",
+           "archives", "band_archive", "check_budget", "headers_for", "ids_are_rows", "oldest_archived",
+           "parts_between", "plan",
            "reaches_archive", "search", "snapshot_session", "source", "span"]

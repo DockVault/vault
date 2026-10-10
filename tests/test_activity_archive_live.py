@@ -372,3 +372,135 @@ out["feed_headers"] = [r.headers.get(h) for h in archive.ARCHIVE_HEADERS]
     assert got["feed_headers"] == [got["days"][0], got["days"][-1]]
     assert got["band_note"]["counted"] == ["events", "categories", "sign_ins"]
     assert got["band_total"] == got["rows_from_first"] >= 6 * 6 * 3, got
+
+
+def test_rows_read_by_id_stay_in_the_rows_and_a_stalled_export_frees_its_search_on_postgres(throwaway):
+    """The live list reads its new rows by id with the list's own range, which reaches the archive here: the read
+    stays in the rows and searches no block (also when the row does not match the filters, and for a count); an id
+    that is no row is searched for, and an open event's re-check narrowed to its own instant reads one archived day.
+    A search's statements and its idle time are bounded for its own transaction. An export whose reader stops
+    reading loses its search once the idle time has run: Postgres ends the session, the export stops with an
+    error, nothing waits idle in a transaction any more, and the next export runs."""
+    got = _script(throwaway, r'''
+import time
+from app.api import api_server as api
+corpus()
+out["stopped"] = passes()
+admin_id = str(add_user("boss", RoleEnum.ADMIN))
+start = at(ARCHIVED[0], 0)
+db = SessionLocal()
+archived_id = ids_of(db, AuditLog, {"start": at(ARCHIVED[1], 0), "end": at(ARCHIVED[2], 0)})[0]
+db.close()
+out["days"] = archive_all()
+new = str(uuid.uuid4())
+q("INSERT INTO audit_logs (id, action, status, channel, timestamp, username, seal_nonce) VALUES (:i, 'file_uploaded', "
+  "'success', 'web', :t, 'eve', :n)", i=new, t=clock[0] - timedelta(seconds=5), n=os.urandom(16))
+
+
+def call(fn, **kw):
+    db = SessionLocal()
+    try:
+        admin = db.get(User, uuid.UUID(admin_id))
+        got = fn(current_user=admin, db=db, **kw)
+        return asyncio.run(got) if asyncio.iscoroutine(got) else got
+    finally:
+        db.close()
+
+
+EVENTS = dict(category=[], channel=[], status=[], action=[], user=None, user_match="contains", no_account=False,
+              ip=None, q=None, temp_credential_id=None, temp_credential=None, vault_id=None, from_date=None,
+              to_date=None, cursor=None, page=None, after=None, overlap=0, ids=[], count_only=False, limit=50,
+              request=None)
+searched = []
+real_search = archive.search
+
+
+def counted(engine_, p, st_=None):
+    searched.append(len(p.days))
+    return real_search(engine_, p, st_)
+
+
+archive.search = counted
+r = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), ids=[new]))
+out["new"] = [[e["id"] for e in r["events"]] == [new], (r.get("archive") or {}).get("searched"), list(searched)]
+r = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), ids=[new], count_only=True))
+out["new_count"] = [r["count"], list(searched)]
+r = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), ids=[new], channel=["sftp"]))
+out["new_filtered_out"] = [len(r["events"]), list(searched)]
+r = call(api.activity_events, **dict(EVENTS, from_date=start.isoformat(), ids=[archived_id]))
+out["archived"] = [[e["id"] for e in r["events"]] == [archived_id], r["archive"]["searched"], list(searched)]
+ts = r["events"][0]["timestamp"]
+moment = datetime.fromisoformat(ts).replace(tzinfo=None)
+del searched[:]
+r = call(api.activity_events, **dict(EVENTS, from_date=ts, to_date=(moment + timedelta(milliseconds=1)).isoformat(),
+                                     ids=[archived_id]))
+out["recheck"] = [[e["id"] for e in r["events"]] == [archived_id], list(searched)]
+archive.search = real_search
+
+p = archive.plan(start, None, st)
+with archive.search(engine, p, st) as s:
+    out["inside"] = [s.db.execute(text("SHOW statement_timeout")).scalar(),
+                     s.db.execute(text("SHOW idle_in_transaction_session_timeout")).scalar()]
+with engine.connect() as c:
+    out["outside"] = [c.execute(text("SHOW statement_timeout")).scalar(),
+                      c.execute(text("SHOW idle_in_transaction_session_timeout")).scalar()]
+
+EXPORT = dict(category=[], channel=[], status=[], action=[], user=None, user_match="contains", no_account=False,
+              ip=None, q=None, temp_credential_id=None, temp_credential=None, vault_id=None, to_date=None,
+              request=None)
+
+
+def idle_in_transaction():
+    return q("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+             "AND state = 'idle in transaction'")[0][0]
+
+
+async def stalled(resp, pause):
+    it = resp.body_iterator
+    got = [await it.__anext__()]
+    out["idle_while_stalled"] = idle_in_transaction()
+    time.sleep(pause)
+    error = None
+    try:
+        async for chunk in it:
+            got.append(chunk)
+    except Exception as exc:  # noqa: BLE001
+        error = type(exc).__name__
+    if resp.background is not None:
+        await resp.background()
+    return len(got), error
+
+
+archive.IDLE_TIMEOUT_MS = 1500
+ev.EXPORT_BATCH = 10
+resp = call(api.activity_export, **dict(EXPORT, format="ndjson", from_date=start.isoformat()))
+out["stalled"] = list(asyncio.run(stalled(resp, 4)))
+out["idle_after"] = idle_in_transaction()
+
+
+async def body(resp):
+    chunks = []
+    async for c in resp.body_iterator:
+        chunks.append(c if isinstance(c, str) else c.decode())
+    if resp.background is not None:
+        await resp.background()
+    return "".join(chunks)
+
+
+resp = call(api.activity_export, **dict(EXPORT, format="ndjson", from_date=start.isoformat()))
+text_ = asyncio.run(body(resp))
+out["next_export"] = [sum(1 for line in text_.splitlines() if '"id"' in line), int(resp.headers["X-Export-Total"])]
+''')
+    assert got["stopped"] is None, got
+    assert len(got["days"]) == 4
+    assert got["new"] == [True, False, []], got["new"]
+    assert got["new_count"] == [1, []], got["new_count"]
+    assert got["new_filtered_out"] == [0, []], got["new_filtered_out"]
+    assert got["archived"] == [True, True, [4]], got["archived"]
+    assert got["recheck"] == [True, [1]], got["recheck"]
+    assert got["inside"] == ["1min", "2min"], got
+    assert got["outside"][0] == "0" and got["outside"][1] != "2min", got           # for the search's transaction only
+    assert got["idle_while_stalled"] >= 1, got
+    assert got["stalled"][1] is not None, got["stalled"]
+    assert got["idle_after"] == 0, got
+    assert got["next_export"][0] == got["next_export"][1] > 72, got
