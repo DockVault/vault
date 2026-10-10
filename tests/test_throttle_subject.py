@@ -498,3 +498,18 @@ def test_every_public_route_budget_keys_one_subject_per_client(monkeypatch):
             assert a[prefix] != other[prefix], f"{fn.__name__} {prefix}: another /64 has its own"
             assert "2001:db8:1:2::/64" in a[prefix] and SAME_A not in a[prefix]
             assert m[prefix] == p[prefix] and "198.51.100.7" in p[prefix], (fn.__name__, prefix, m, p)
+
+
+def test_every_compliance_step_up_counts_one_subject_per_client(monkeypatch):
+    """The steps of compliance access are earned at the same step-up route as any other action, on the same
+    budget: two addresses in one /64 share it and another /64 has its own, for each of the steps."""
+    from app.api import api_server as A
+    from app.core import second_factor_actions as acts
+    user = SimpleNamespace(id="u-1", _is_temp_session=False)
+    assert len(acts.COMPLIANCE_STEP_UPS) >= 8
+    for action in acts.COMPLIANCE_STEP_UPS:
+        kwargs = {"body": A.SecondFactorStepUpRequest(action=action), "current_user": user}
+        a, b, other = (_route_keys(monkeypatch, A.second_factor_step_up, kwargs, x) for x in (SAME_A, SAME_B, OTHER))
+        assert a["sf_step_up"] == b["sf_step_up"], (action, a, b)
+        assert a["sf_step_up"] != other["sf_step_up"], (action, a, other)
+        assert "2001:db8:1:2::/64" in a["sf_step_up"] and SAME_A not in a["sf_step_up"], (action, a)
