@@ -427,6 +427,40 @@ def test_an_export_stops_when_the_cases_access_ends(db, people, storage, codes):
     assert b"second" not in got
 
 
+def test_a_file_no_longer_in_the_case_when_its_turn_comes_is_left_out_and_listed(db, people, storage, codes):
+    """Each file is checked again as the fetch checked it: one moved out of the case's folder, one in a vault the
+    case was narrowed away from, and one in a vault given a password the fetch did not open are left out of the
+    archive and listed as having left the case; the file still in the case is exported."""
+    from app.core import cases
+    board = _folder(db, people.v1)
+    side = _folder(db, people.v1, None, "Side")
+    other = _vault(db, people.olga)
+    stays = _file(db, storage, people.v1, name="a.txt", content=b"alpha-stays", folder=board)
+    moved = _file(db, storage, people.v1, name="b.txt", content=b"bravo-moved", folder=board)
+    narrowed = _file(db, storage, people.v2, name="c.txt", content=b"charlie-narrowed")
+    locked = _file(db, storage, other, name="d.txt", content=b"delta-locked")
+    case = _case(db, people, [{"kind": "folder", "target_id": board.id}, *_vaults(people.v2, other)],
+                 can_export=True)
+    parts, _export_id = _stream(db, people, case, [stays, moved, narrowed, locked])
+    moved.folder_id = side.id
+    other.password_hash = "argon2-hash"
+    db.commit()
+    cases.narrow(db, case, by=people.uma, scope=[{"kind": "folder", "target_id": board.id},
+                                                  *_vaults(other)])
+    db.commit()
+    data = b"".join(parts)
+    parts.close()
+    archive = _archive(data)
+    status = {r["file_id"]: (r["status"], r["entry"]) for r in _manifest(archive)["files"]}
+    assert status[str(stays.id)][0] == ca.LIVE and archive.read(status[str(stays.id)][1]) == b"alpha-stays"
+    for f in (moved, narrowed, locked):
+        assert status[str(f.id)] == (ce.LEFT_CASE, None), f.name
+    assert all(x not in data for x in (b"bravo-moved", b"charlie-narrowed", b"delta-locked"))
+    assert storage.opened == [str(stays.id)], "nothing of the files that left the case was read"
+    (row,) = _rows(db, "case_export_completed")
+    assert row.details["left_case"] == 3 and row.details["file_count"] == 1 and row.details["missing"] == 0
+
+
 def test_a_file_gone_since_the_fetch_is_listed_missing_and_one_kept_since_is_exported(db, people, storage, codes):
     a = _file(db, storage, people.v1, name="a.txt", content=b"alpha")
     b = _file(db, storage, people.v1, name="b.txt", content=b"bravo")

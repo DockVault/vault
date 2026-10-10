@@ -25,7 +25,9 @@ is told ("N files exported from your vaults"), in the app and through the email 
     SHA256SUMS                              for ``sha256sum -c``
 
 The stream reads with sessions of its own (the request's may be gone while it runs) and checks the case again
-before each file: an export stops when the case's access does. Files are decrypted piece by piece and written
+before each file: an export stops when the case's access does. Each file is checked again too, as the fetch checked
+it: one moved out of the case's folders or time range, in a vault narrowed out of the case or made zero-knowledge,
+or in a vault that has a password the fetch did not open, is left out and listed as having left the case. Files are decrypted piece by piece and written
 straight into the archive, so memory stays bounded whatever their size. The stored checksum is used only to compare
 and is never written out. When the stream ends, ``case_export_completed`` records the manifest's SHA-256, the
 number of files and the bytes; a stream that stops early (the client went away, the case's access ended, a file
@@ -81,6 +83,7 @@ _UNSAFE = set('<>:"|?*\\/')
 # A file's status in the manifest, besides case_access's (live, expired, deleted_kept, expired_kept).
 MISSING = "missing"            # gone from the vault, and not kept, before it could be read
 UNREADABLE = "unreadable"      # its stored content could not be opened
+LEFT_CASE = "left_case"        # no longer one the case may export when its turn came (see ExportStream._may_read)
 
 OK, MISMATCH = "ok", "mismatch"
 
@@ -205,6 +208,8 @@ class Entry:
     sha256: Optional[str] = None
     integrity: Optional[str] = None
     when: Optional[datetime] = None
+    # Its vault's password was given (a receipt) when the export was fetched: the stream reads it as opened then.
+    unlocked: bool = False
 
 
 def claim(db, case_id, export_id, user, *, unlocked_given=None, session_hash=None, now: Optional[datetime] = None):
@@ -238,7 +243,7 @@ def claim(db, case_id, export_id, user, *, unlocked_given=None, session_hash=Non
             continue
         ca.content_opening(case, found, unlocked)
         entries.append(Entry(file_id=str(found.item.id), vault_id=str(found.vault.id), kept=found.kept,
-                             status=found.status))
+                             status=found.status, unlocked=str(found.vault.id) in unlocked))
         if found.vault.owner_id is not None:
             counts = owners.setdefault(str(found.vault.owner_id), {"files": 0, "vaults": set()})
             counts["files"] += 1
@@ -425,8 +430,10 @@ What it holds
                                      SHA-256 of the bytes in this archive, and whether that matches the checksum
                                      the deployment stored for the file (ok, or mismatch: the bytes differ from
                                      what was stored, or no checksum was stored). A file listed as "missing" had
-                                     left the vault before it could be exported, and one listed as "unreadable"
-                                     could not be opened; neither is in files/. In the CSV, a value a spreadsheet
+                                     left the vault before it could be exported, one listed as "unreadable"
+                                     could not be opened, and one listed as "left_case" was no longer in the
+                                     case when its turn came (moved out of its folders, for example); none of
+                                     them is in files/. In the CSV, a value a spreadsheet
                                      would read as a formula starts with an apostrophe.
   case.json                          the case: its number, purpose, legal basis, scope, auditor, approver and dates.
   SHA256SUMS                         the SHA-256 of every file above.
@@ -525,21 +532,33 @@ class ExportStream:
 
     # -- the steps
 
-    def _check_case(self) -> None:
-        """The case still gives its auditor access, and export: an export stops when they end."""
+    def _may_read(self, entry: Entry) -> bool:
+        """Before each file: the case still gives its auditor access, and export (else the export stops: Stopped);
+        and the file is still one the case may export, as the fetch checked it (else it is left out, listed
+        LEFT_CASE). A file gone from the vault is left to _open_stored, which lists it as missing."""
         from app.core.models import User
         db = self._db_factory()
         try:
             user = db.get(User, self.user_id)
             if user is None:
                 raise Stopped(ca.NOT_AUDITOR)
+            now = ca.utcnow()
             try:
-                case = ca.case_for(db, self.case_id, user, now=ca.utcnow())
+                case = ca.case_for(db, self.case_id, user, now=now)
             except ca.Refused as refused:
                 raise Stopped(refused.reason)
             why = refusal(case)
             if why is not None:
                 raise Stopped(why)
+            try:
+                found = ca.file_for(db, case, entry.file_id, now=now)
+                ca.content_opening(case, found, {entry.vault_id} if entry.unlocked else ())
+            except ca.Refused as refused:
+                if refused.reason == ca.NO_SUCH_FILE:
+                    return True
+                entry.status = LEFT_CASE
+                return False
+            return True
         finally:
             db.close()
 
@@ -561,7 +580,8 @@ class ExportStream:
             for entry in self.entries:
                 if entry.status == MISSING:
                     continue
-                self._check_case()
+                if not self._may_read(entry):
+                    continue
                 try:
                     download = _open_stored(self._db_factory, entry, self.now)
                 except Exception:  # noqa: BLE001 -- nothing of it is in the archive: the manifest says so
@@ -618,6 +638,7 @@ class ExportStream:
             "export_id": str(self.export_id), "manifest_sha256": manifest_sha256, "file_count": self.files_done,
             "bytes": self.bytes_done, "missing": sum(1 for e in self.entries if e.status == MISSING),
             "unreadable": sum(1 for e in self.entries if e.status == UNREADABLE),
+            "left_case": sum(1 for e in self.entries if e.status == LEFT_CASE),
             "mismatched": sum(1 for e in self.entries if e.integrity == MISMATCH)},
             manifest_sha256=manifest_sha256)
 

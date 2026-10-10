@@ -185,9 +185,10 @@ _IDENTIFIER_KEYS = (
     # a listing or a search under a case: the folder listed, and of a search the query's length (never its text),
     # how many names it read, whether it stopped early, and how many matched
     "folder_id", "query_length", "scanned", "truncated", "matches",
-    # an export from a case: its id, how many files were exported, missing, unreadable or did not match their
-    # stored checksum, and the SHA-256 of its manifest (a digest of the export's own list, never of a file)
-    "export_id", "file_count", "manifest_sha256", "missing", "unreadable", "mismatched",
+    # an export from a case: its id, how many files were exported, missing, unreadable, no longer in the case when
+    # their turn came or did not match their stored checksum, and the SHA-256 of its manifest (a digest of the
+    # export's own list, never of a file)
+    "export_id", "file_count", "manifest_sha256", "missing", "unreadable", "left_case", "mismatched",
     # names shown on the Activity page because of a case: how many events, and a digest of their ids (never a name)
     "events", "events_digest",
     # a recorded name revealed outside a case: the event, and the reason's category from a fixed list (its text is
