@@ -145,6 +145,120 @@ def test_a_log_file_count_docker_refuses_is_named(count, ok):
     assert (problems == []) is ok, problems
 
 
+@pytest.mark.parametrize("values, named", [
+    ({"DOCKER_LOG_MAX_SIZE": " 10m"}, 'DOCKER_LOG_MAX_SIZE=" 10m" is not a size'),
+    ({"DOCKER_LOG_MAX_SIZE": "10m "}, 'DOCKER_LOG_MAX_SIZE="10m " is not a size'),
+    ({"DOCKER_LOG_MAX_SIZE": "10m\n"}, 'DOCKER_LOG_MAX_SIZE="10m\\n" is not a size'),
+    ({"DOCKER_LOG_MAX_FILE": " 5"}, 'DOCKER_LOG_MAX_FILE=" 5" is not a whole number'),
+    ({"DOCKER_LOG_MAX_FILE": "5\n"}, 'DOCKER_LOG_MAX_FILE="5\\n" is not a whole number'),
+    ({"DOCKER_LOG_MAX_SIZE": None}, "DOCKER_LOG_MAX_SIZE has a quote that is never closed"),
+    ({"DOCKER_LOG_MAX_FILE": None}, "DOCKER_LOG_MAX_FILE has a quote that is never closed"),
+])
+def test_a_space_around_a_value_or_a_quote_never_closed_is_named(values, named):
+    """Docker starts no container whose log size or file count has a space before or after it, and compose keeps
+    the spaces of a quoted value: such a value is named, and so is a quote never closed (compose refuses .env)."""
+    (problem,) = dv.container_log_problems(values)
+    assert problem.startswith(named), problem
+
+
+# .env lines, the process environment, and what docker compose gives the compose files (checked against docker
+# compose 2.40 by test_compose_reads_env_as_compose_env_values_says): (size, file count), None for a quote never
+# closed, absent when .env does not set it.
+ABSENT = "absent"
+COMPOSE_READS = [
+    ("DOCKER_LOG_MAX_SIZE=10m # comment", {}, ("10m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=10m#x", {}, ("10m#x", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=10m\t# tab comment", {}, ("10m\t# tab comment", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="10m" # comment', {}, ("10m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE='10m' # comment", {}, ("10m", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE=" 10m"', {}, (" 10m", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="10m "', {}, ("10m ", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=' 10m'", {}, (" 10m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE= 10m", {}, ("10m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=10m   ", {}, ("10m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=\t10m\t", {}, ("10m", ABSENT)),
+    ("  DOCKER_LOG_MAX_SIZE = 10m", {}, ("10m", ABSENT)),
+    ("export DOCKER_LOG_MAX_SIZE=7m", {}, ("7m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=10m\nDOCKER_LOG_MAX_SIZE=20m", {}, ("20m", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="1\\"0m"', {}, ('1"0m', ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="10\\nm"', {}, ("10\nm", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE='10\\nm'", {}, ("10\\nm", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="a\\qb"', {}, ("a\\qb", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE=10m "x"', {}, ('10m "x"', ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="10m', {}, (None, ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=${OTHER:-30m}", {}, ("30m", ABSENT)),
+    ("OTHER=\nDOCKER_LOG_MAX_SIZE=${OTHER-8m}", {}, ("", ABSENT)),
+    ("OTHER=\nDOCKER_LOG_MAX_SIZE=${OTHER:-8m}", {}, ("8m", ABSENT)),
+    ("OTHER=40m\nDOCKER_LOG_MAX_SIZE=${OTHER}", {}, ("40m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=$OTHER", {}, ("", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=${DOCKER_LOG_MAX_FILE}m\nDOCKER_LOG_MAX_FILE=3", {}, ("m", "3")),
+    ("DOCKER_LOG_MAX_FILE=3\nDOCKER_LOG_MAX_SIZE=${DOCKER_LOG_MAX_FILE}m", {}, ("3m", "3")),
+    ("DOCKER_LOG_MAX_SIZE='$OTHER'", {}, ("$OTHER", ABSENT)),
+    ('DOCKER_LOG_MAX_SIZE="\\$x"', {}, ("$x", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=44m", {"DOCKER_LOG_MAX_SIZE": "33m"}, ("33m", ABSENT)),
+    ("DOCKER_LOG_MAX_SIZE=${LOGSIZE}", {"LOGSIZE": "55m"}, ("55m", ABSENT)),
+    ('DOCKER_LOG_MAX_FILE=" 5"', {}, (ABSENT, " 5")),
+    ("DOCKER_LOG_MAX_FILE=5 # five", {}, (ABSENT, "5")),
+    ("# DOCKER_LOG_MAX_SIZE=50m", {}, (ABSENT, ABSENT)),
+]
+_NAMES = ("DOCKER_LOG_MAX_SIZE", "DOCKER_LOG_MAX_FILE")
+
+
+@pytest.mark.parametrize("text, environ, expected", COMPOSE_READS)
+def test_the_values_are_read_as_docker_compose_reads_them(text, environ, expected):
+    values = dv.compose_env_values(text + "\n", _NAMES, environ)
+    assert tuple(values.get(name, ABSENT) for name in _NAMES) == expected
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize("text, environ, expected", COMPOSE_READS)
+def test_compose_reads_env_as_compose_env_values_says(tmp_path, text, environ, expected):
+    """The table above, against the docker compose installed here: what it renders into a compose file's logging
+    options (an empty or missing value takes the default, as the shipped files' ${...:-default} does)."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    (tmp_path / "docker-compose.yml").write_text(
+        'services:\n  a:\n    image: busybox\n    logging:\n      driver: json-file\n      options:\n'
+        '        max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"\n        max-file: "${DOCKER_LOG_MAX_FILE:-5}"\n',
+        encoding="utf-8")
+    (tmp_path / ".env").write_text(text + "\n", encoding="utf-8")
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith(("DOCKER_LOG_", "COMPOSE_"))}
+    for name in ("OTHER", "LOGSIZE"):
+        run_env.pop(name, None)
+    run_env.update(environ)
+    r = subprocess.run(["docker", "compose", "--env-file", str(tmp_path / ".env"), "-f",
+                        str(tmp_path / "docker-compose.yml"), "config", "--format", "json"],
+                       cwd=str(tmp_path), env=run_env, capture_output=True, text=True, timeout=90)
+    if None in expected:
+        assert r.returncode != 0 and "unterminated" in r.stderr, r.stderr
+        return
+    assert r.returncode == 0, r.stderr[:800]
+    options = json.loads(r.stdout)["services"]["a"]["logging"]["options"]
+    rendered = (options["max-size"].replace("$$", "$"), options["max-file"].replace("$$", "$"))
+    values = dv.compose_env_values(text + "\n", _NAMES, environ)
+    assert rendered == (values.get("DOCKER_LOG_MAX_SIZE") or "10m", values.get("DOCKER_LOG_MAX_FILE") or "5")
+
+
+def test_the_check_before_a_recreate_reads_env_as_compose_does(tmp_path, monkeypatch, capsys):
+    """A quoted space compose keeps is refused before anything is recreated; a value with a comment compose drops
+    is not; and the process environment, which compose prefers, is the one checked."""
+    for name in _NAMES:
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+    for text, ok in (('DOCKER_LOG_MAX_SIZE=" 10m"\n', False), ('DOCKER_LOG_MAX_FILE=" 5"\n', False),
+                     ("DOCKER_LOG_MAX_SIZE=10m # rotate at ten megabytes\n", True),
+                     ("DOCKER_LOG_MAX_FILE=5 # five files\n", True), ('DOCKER_LOG_MAX_SIZE="10m\n', False)):
+        tool = _tool(tmp_path, "COMPOSE_PROFILES=combined\n" + text)
+        monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a) or _Proc(0, ""))
+        assert tool._recreate_stack(build=True) is ok, text
+    assert "is not a size Docker reads" in capsys.readouterr().out
+    tool = _tool(tmp_path, "COMPOSE_PROFILES=combined\nDOCKER_LOG_MAX_SIZE=20m\n")
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a) or _Proc(0, ""))
+    monkeypatch.setenv("DOCKER_LOG_MAX_SIZE", "0m")
+    assert tool._recreate_stack(build=True) is False
+    assert "DOCKER_LOG_MAX_SIZE=0m is not a size" in capsys.readouterr().out
+
+
 def _cfg(**extra):
     cfg = {"server_name": "localhost", "encryption_key": "k", "jwt_secret_key": "j", "vault_db_password": "p",
            "redis_password": "r", "admin_username": "admin", "admin_email": "a@example.com",

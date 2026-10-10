@@ -289,19 +289,101 @@ _LOG_SIZE = re.compile(r"^(\d+(?:\.\d+)?) ?([kmgtp])?i?b?$", re.IGNORECASE)
 _LOG_SIZE_UNITS = {None: 1, "k": 10 ** 3, "m": 10 ** 6, "g": 10 ** 9, "t": 10 ** 12, "p": 10 ** 15}
 
 
+# ${NAME}, ${NAME:-default}, ${NAME-default}, $NAME, and $$ (a dollar sign), as docker compose replaces them in .env.
+_ENV_REFERENCE = re.compile(r"\$\$|\$\{(\w+)(?:(:?)-([^}]*))?\}|\$(\w+)")
+_DOUBLE_QUOTE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "$": "$$"}
+
+
+def _env_replace(value, lookup):
+    def one(m):
+        if m.group(0) == "$$":
+            return "$"
+        name = m.group(1) or m.group(4)
+        found = lookup(name)
+        if m.group(1) and m.group(3) is not None and (found is None or (m.group(2) and found == "")):
+            return m.group(3)
+        return found or ""
+    return _ENV_REFERENCE.sub(one, value)
+
+
+def _env_line_value(rest, lookup):
+    """The value of one .env line after its "=", as docker compose reads it, or None for a quote never closed."""
+    rest = rest.strip(" \t")
+    if rest[:1] == "'":
+        end = rest.find("'", 1)
+        return None if end < 0 else rest[1:end]
+    if rest[:1] == '"':
+        out, i = [], 1
+        while i < len(rest):
+            c = rest[i]
+            if c == "\\" and i + 1 < len(rest):
+                out.append(_DOUBLE_QUOTE_ESCAPES.get(rest[i + 1], c + rest[i + 1]))
+                i += 2
+                continue
+            if c == '"':
+                return _env_replace("".join(out), lookup)
+            out.append(c)
+            i += 1
+        return None
+    comment = rest.find(" #")
+    if comment >= 0:
+        rest = rest[:comment]
+    return _env_replace(rest.strip(" \t"), lookup)
+
+
+def compose_env_values(text, names, environ=None):
+    """The values of ``names`` as docker compose gives them to the compose files, from .env's ``text`` and the
+    process environment ``environ`` (os.environ when None), which compose prefers to .env. .env is read by compose's
+    rules (docker compose 2.40): blank lines and lines starting with # are skipped, "export " is allowed, and the
+    last line of a name wins; a value in single quotes is taken as it stands; one in double quotes with its escapes
+    and its ${...} replaced, anything after the closing quote ignored; an unquoted one is cut at " #" (a space, then
+    #), trimmed, and its ${...} replaced, from the process environment or the lines above it. parse_env differs on
+    purpose: it keeps what the setup scripts wrote. A value whose quote is never closed is None: compose refuses
+    the file."""
+    environ = os.environ if environ is None else environ
+    read = {}
+
+    def lookup(name):
+        return environ[name] if name in environ else read.get(name)
+
+    for raw in (text or "").splitlines():
+        line = raw.strip(" \t\r")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export ") or line.startswith("export\t"):
+            line = line[7:].lstrip(" \t")
+        key, sep, rest = line.partition("=")
+        key = key.strip(" \t")
+        if not sep or not key:
+            continue
+        read[key] = _env_line_value(rest, lookup)
+    return {name: (environ[name] if name in environ else read[name]) for name in names
+            if name in environ or name in read}
+
+
+def _shown(value):
+    return value if value == value.strip() and value.isprintable() else json.dumps(value)
+
+
 def container_log_problems(env):
-    """What in ``env`` (a parsed .env) Docker would refuse as the rotation of container output: [] when nothing.
-    Docker creates no container whose log size is not a positive size or whose file count is below 1, so a stack
-    recreated with one would not come back; empty values take the compose files' defaults."""
+    """What in ``env`` (DOCKER_LOG_MAX_SIZE and DOCKER_LOG_MAX_FILE as docker compose gives them to the compose
+    files: compose_env_values) Docker would refuse as the rotation of container output: [] when nothing. Docker
+    starts no container whose log size is not a positive size, or whose file count is below 1, and a space before
+    or after either is not one, so a stack recreated with one would not come back. An empty value takes the
+    compose files' default; a quote never closed is named, since compose refuses the file."""
     problems = []
-    size = (env.get("DOCKER_LOG_MAX_SIZE") or "").strip()
+    for name in ("DOCKER_LOG_MAX_SIZE", "DOCKER_LOG_MAX_FILE"):
+        if name in env and env[name] is None:
+            problems.append("%s has a quote that is never closed, so docker compose cannot read .env" % name)
+    size = env.get("DOCKER_LOG_MAX_SIZE") or ""
     if size:
-        m = _LOG_SIZE.match(size)
+        m = _LOG_SIZE.fullmatch(size)
         if not m or int(float(m.group(1)) * _LOG_SIZE_UNITS[(m.group(2) or "").lower() or None]) < 1:
-            problems.append("DOCKER_LOG_MAX_SIZE=%s is not a size Docker reads (for example 10m, 50m, 1g)" % size)
-    count = (env.get("DOCKER_LOG_MAX_FILE") or "").strip()
-    if count and not (re.match(r"^\+?\d+$", count) and int(count) >= 1):
-        problems.append("DOCKER_LOG_MAX_FILE=%s is not a whole number of files, 1 or more" % count)
+            problems.append("DOCKER_LOG_MAX_SIZE=%s is not a size Docker reads (for example 10m, 50m, 1g)"
+                            % _shown(size))
+    count = env.get("DOCKER_LOG_MAX_FILE") or ""
+    if count and not (re.fullmatch(r"\+?\d+", count) and int(count) >= 1):
+        problems.append("DOCKER_LOG_MAX_FILE=%s is not a whole number of files, 1 or more" % _shown(count))
     return problems
 
 
@@ -4191,11 +4273,22 @@ class DockVault:
     def _container_logs_readable(self):
         """False, having said why, when .env sets a container-log rotation Docker would refuse: the stack is
         then left as it is, rather than recreated into containers that cannot be created."""
-        problems = container_log_problems(self._load_env())
+        problems = container_log_problems(self._container_log_values())
         for problem in problems:
             print(self.pal.paint("  %s; fix it in .env (or remove the line for the default). Nothing was "
                                  "recreated." % problem, "red"))
         return not problems
+
+    def _container_log_values(self):
+        """DOCKER_LOG_MAX_SIZE and DOCKER_LOG_MAX_FILE as docker compose will give them to the compose files: read
+        from .env by compose's rules, the process environment first (compose_env_values)."""
+        text = ""
+        try:
+            with open(self._env_path(), encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            pass
+        return compose_env_values(text, ("DOCKER_LOG_MAX_SIZE", "DOCKER_LOG_MAX_FILE"))
 
     def _note_host_log_driver(self):
         """Say where container output goes when the operator may not expect it (container_log_note)."""
