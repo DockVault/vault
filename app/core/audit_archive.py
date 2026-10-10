@@ -451,11 +451,17 @@ def _write_archive_seal(w, day: date, cause: str, parts, *, after_seq: Optional[
 
 def _insert_block(db, day: date, number: int, first: datetime, last: datetime, bw: af.BlockWriter,
                   payload: bytes, now: datetime) -> None:
+    from sqlalchemy.exc import IntegrityError
     from app.core.models import AuditArchiveBlock as B
     db.add(B(day=day, part=number, first_hour=first, last_hour=last, row_count=bw.rows, codec=af.CODEC,
              format=af.FORMAT, payload=payload, raw_bytes=bw.raw_bytes, aggregates=bw.aggregates,
              created_at=now))
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # A block of that number written since the day's blocks were checked: the caller rolls back.
+        raise NotVerified("block-unsealed", f"a block of {day.isoformat()} (part {number}) is in no archive "
+                                            "seal") from None
 
 
 def _check_stored(db, view, day: date, part, bw: af.BlockWriter,
@@ -518,6 +524,9 @@ def archive_next_part(w, day: date, now: datetime):
     if entry is not None and entry.complete:
         raise NotArchivable(f"{day.isoformat()} is archived whole, and has rows in audit_logs")
     prev = sorted(entry.parts, key=lambda p: p.first_hour) if entry is not None else []
+    # A block the day's archive seal does not name (or one it names gone, or of another length) is a finding: the
+    # day is left as it is, and the pass goes on with the next day.
+    _check_day_blocks(db, entry, day)
     covered = day_hours(view, day)
     if not covered:
         return None
@@ -649,11 +658,21 @@ class Rewritten:
 
 
 def _check_day_blocks(db, entry, day: date) -> None:
-    """Every block of ``day`` must be a part of its archive seal. Raises NotVerified (block-unsealed)."""
-    numbers = {p.part for p in entry.parts}
-    for key in stored_blocks(db, day):
-        if key[1] not in numbers:
+    """Every block of ``day`` must be a part of its archive seal (``entry``, None when the day has none), and every
+    part's block there at the length the seal binds; no payload is read. Raises NotVerified (block-unsealed,
+    block-missing, block-altered)."""
+    parts = {p.part: p for p in entry.parts} if entry is not None else {}
+    stored = stored_blocks(db, day)
+    for key in sorted(stored):
+        if key[1] not in parts:
             raise NotVerified("block-unsealed", f"a block of {day.isoformat()} (part {key[1]}) is in no archive seal")
+    for number, part in sorted(parts.items()):
+        length = stored.get((day, number))
+        if length is None:
+            raise NotVerified("block-missing", f"the block of {_label(day, part)} is gone")
+        if length != part.length:
+            raise NotVerified("block-altered", f"the block of {_label(day, part)} is not the one its archive seal "
+                                               "names")
 
 
 def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform: Callable[[dict], Optional[dict]],

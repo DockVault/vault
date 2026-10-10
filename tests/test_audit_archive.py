@@ -1482,3 +1482,82 @@ def test_the_chain_binds_each_hours_protected_bytes_and_an_archived_parts_share_
     entry = next(h for h in prune.detail["hours"] if h[0] == fmt.hour_text(at(3)))
     assert entry[7] == admin_bytes == entry[3]
     assert _ids_in_blocks(env, DAY) == [admin] and failures(env.verify()) == []
+
+
+# --------------------------------------------------------------------------- a block the day's seal does not name
+
+def _plant(env, day, number, like):
+    """A block row a database writer adds for ``day`` with part ``number``, a copy of ``like``."""
+    with env.session() as db:
+        db.add(AuditArchiveBlock(day=day, part=number, first_hour=like.first_hour, last_hour=like.last_hour,
+                                 row_count=like.row_count, codec="zstd", format=1, payload=like.payload,
+                                 raw_bytes=like.raw_bytes, aggregates=like.aggregates, created_at=T0))
+        db.commit()
+
+
+def _half_archived(env, monkeypatch):
+    """A day whose first part is archived and whose second waits, and a later day not archived yet."""
+    monkeypatch.setattr(arc, "PART_ROWS", 3)
+    later = DAY + timedelta(days=1)
+    _day_rows(env, {2: 3, 9: 3})
+    _day_rows(env, {5: 1}, day=later)
+    env.run_until_sealed()
+    monkeypatch.setattr(ai, "ROW_BUDGET", 3)
+    _archive(env)
+    (block,) = _blocks(env)
+    assert block.day == DAY and _hot(env) == 3
+    monkeypatch.setattr(ai, "ROW_BUDGET", 100000)
+    return later, block
+
+
+def test_a_block_planted_with_the_days_next_part_number_leaves_that_day_and_archives_the_next(env, monkeypatch):
+    """A database writer adds a block numbered as the day's next part. The job leaves that day as it is
+    (block-unsealed, reported) and still archives the next day, pass after pass, never stopping at the first."""
+    later, block = _half_archived(env, monkeypatch)
+    _plant(env, DAY, 2, block)
+    _archive(env)
+    _archive(env)
+    assert later in {b.day for b in _blocks(env)} and _hot(env) == 3
+    assert "block-unsealed" in ai.open_failures(env.st.head_store().load())
+
+
+def test_a_block_planted_for_a_day_not_archived_yet_leaves_that_day_and_archives_the_next(env, monkeypatch):
+    monkeypatch.setattr(arc, "DAYS_PER_PASS", 1)
+    second, third = DAY + timedelta(days=1), DAY + timedelta(days=2)
+    for day in (DAY, second, third):
+        _day_rows(env, {5: 1}, day=day)
+    env.run_until_sealed()
+    _archive(env)
+    (block,) = _blocks(env)
+    assert block.day == DAY
+    _plant(env, second, 1, block)
+    _archive(env)
+    assert {b.day for b in _blocks(env)} == {DAY, second, third} and _hot(env, second) == 1 and _hot(env, third) == 0
+    assert "block-unsealed" in ai.open_failures(env.st.head_store().load())
+
+
+def test_a_block_conflict_after_the_check_is_a_finding_not_a_crash(env, monkeypatch):
+    """Should a block of the next part number appear between the day's check and the insert, the insert's conflict
+    is reported as a block no seal names, and the pass goes on."""
+    later, block = _half_archived(env, monkeypatch)
+    _plant(env, DAY, 2, block)
+    monkeypatch.setattr(arc, "_check_day_blocks", lambda db, entry, day: None)
+    _archive(env)
+    assert later in {b.day for b in _blocks(env)} and _hot(env) == 3
+    assert "block-unsealed" in ai.open_failures(env.st.head_store().load())
+
+
+def test_a_part_whose_block_is_gone_or_of_another_length_stops_its_days_next_part_only(env, monkeypatch):
+    later, block = _half_archived(env, monkeypatch)
+    with env.session() as db:
+        db.query(AuditArchiveBlock).update({AuditArchiveBlock.payload: bytes(block.payload) + b"\0"},
+                                           synchronize_session=False)
+        db.commit()
+    _archive(env)
+    assert later in {b.day for b in _blocks(env)} and _hot(env) == 3
+    assert "block-altered" in ai.open_failures(env.st.head_store().load())
+    with env.session() as db:
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == DAY).delete()
+        db.commit()
+    _archive(env)
+    assert _hot(env) == 3 and "block-missing" in ai.open_failures(env.st.head_store().load())
