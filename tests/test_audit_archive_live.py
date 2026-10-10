@@ -328,6 +328,7 @@ if EDITED:
         agg["by"] = [[protected] + list(r[1:]) for r in agg["by"]]
         c.execute(text("UPDATE audit_archive_blocks SET aggregates = CAST(:a AS json) WHERE day = :d"),
                   {"a": json.dumps(agg), "d": older_day})
+    arc._figures.clear()                     # read again, as a process does after a restart
 out["planned"] = plan(cap)
 ar.prune(retention.Pass(SessionLocal, now=clock[0]), ar.Numbers(0, 0, 0, cap))
 left = {}
