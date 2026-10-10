@@ -19,11 +19,13 @@ chain's: each hour's bytes as the seals that set its roots bound them, lagged ov
 (RETENTION_REDUCTION_DELAY_DAYS) of time while sealing ran (app/core/audit_chain_size.py), so an hour counts
 its rows only once a delay of sealing has passed since the seal that took them in, and rows younger than the
 window are never deleted by it: whoever can make the app write rows, or write them into the table, cannot make
-it delete older ones before the delay. How much of an hour it may never delete comes from its rows, but never
-more than the chain binds as the hour's protected bytes, so rows written into an old hour can only lower it.
-When the protected rows alone exceed the cap, the administrators are told, once a day, and nothing protected
-goes. The size of a row is what Postgres stores for it (pg_column_size of the row), measured by the sealer when
-it seals the row's hour.
+it delete older ones before the delay. Which hours it keeps whole the chain alone decides: an hour whose
+lagged protected bytes reach its lagged bytes, or all of whose rows are younger than the minimum for every row.
+How much of any other hour it may never delete comes from its rows, but never more than the chain binds as the
+hour's protected bytes, so rows written into or deleted from an hour can only lower that share, and never make
+an hour the chain keeps whole one the cap may cut at. When the protected rows alone exceed the cap, the
+administrators are told, once a day, and nothing protected goes. The size of a row is what Postgres stores
+for it (pg_column_size of the row), measured by the sealer when it seals the row's hour.
 
 Each is a managed setting whose lowering deletes sooner, so it waits (app/core/setting_changes.py). The
 startup contract refuses a deployment whose .env contradicts itself: a protected minimum longer than the
@@ -205,11 +207,13 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
                     server: bool = True) -> SizePlan:
     """How the size cap applies now, from the audit chain's verified view: each sealed hour counts its lagged
     bytes over a window of one delay of time while sealing ran, and each archived part the smaller of its bound
-    length and its hours' lagged bytes (app/core/audit_chain_size.py); the total is the chain's, and the rows
-    (an archived part's aggregates, app/core/audit_archive.py) decide only which part of a figure the cap may
-    never delete, never more than the protected bytes the chain binds for its hours (rows only lower a share).
-    It keeps the newest hours and parts, protected rows first, that fit under the cap; the
-    unprotected rows of older ones go, and never a row younger than the window's start."""
+    length and its hours' lagged bytes (app/core/audit_chain_size.py); the total is the chain's. The chain alone
+    also says which hours the cap keeps whole (audit_chain_size.kept_whole): their whole count is their share
+    the cap may never delete, whatever their rows say. For every other hour the rows (an archived part's
+    aggregates, app/core/audit_archive.py) decide that share, never above the protected bytes the chain binds
+    for the hour, so the rows can only lower it. It keeps the newest hours and parts, protected rows first, that
+    fit under the cap (size_cutoff); the unprotected rows of older ones go, and never a row younger than the
+    window's start."""
     from app.core import audit_archive
     from app.core import audit_chain_format as fmt
     from app.core import audit_chain_size as chain_size
@@ -227,10 +231,7 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
                  "counted": plan.counted_bytes, "held_back": sorted(held)}
     if not plan.counted_bytes:
         return plan
-    # (hour, counted, protected): an archived part's spread over its hours (app/core/audit_archive.py part_units).
-    # A share comes from the rows, but never above what the chain binds as that hour's protected bytes (or the
-    # whole hour, when every row of it is younger than the minimum for every row), so rows added in the database
-    # can only lower it.
+    # (hour, counted, protected, whole): an archived part's spread over its hours (audit_archive.part_units).
     bound = chain_size.protected_hours(view, start_us, held)
     young = now - timedelta(days=numbers.min_days) if numbers.min_days > 0 else None
     units = []
@@ -241,24 +242,39 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
                 .filter(_size_protected(model, now, numbers)).group_by(hour).all())
         protected_rows = {_as_time(h): int(size or 0) for h, size in rows}
         for h, counted in by_hour.items():
-            most = counted if young is not None and h >= young else bound.get(h, 0)
-            units.append((h, counted, min(protected_rows.get(h, 0), counted, most)))
+            if chain_size.kept_whole(h, counted, bound, young):
+                units.append((h, counted, counted, True))
+            else:
+                units.append((h, counted, min(protected_rows.get(h, 0), bound.get(h, 0)), False))
     if any(c for _d, _p, c, _h in parts):
         figures = audit_archive.part_figures(db, view)
         for d, part, c, lagged in parts:
             units += audit_archive.part_units(part, c, lagged, bound, figures.get((d, part.part)), now,
                                               numbers.min_days)
-    plan.protected_bytes = sum(p for _w, _c, p in units)
-    left = plan.protected_bytes
-    for when, counted, protected in sorted(units, key=lambda u: u[0], reverse=True):
-        if counted == protected:
-            continue
-        if left + counted - protected > cap:
-            plan.cutoff = when + timedelta(hours=1)
-            break
-        left += counted - protected
+    plan.protected_bytes = sum(p for _w, _c, p, _k in units)
+    plan.cutoff = size_cutoff(units, cap)
     plan.met = plan.protected_bytes <= cap
     return plan
+
+
+def size_cutoff(units: list, cap: int) -> Optional[datetime]:
+    """Where the size cap cuts, over ``units`` [(hour, counted, protected, whole)]: what it keeps starts as every
+    unit's protected share and, from the newest unit on, takes in the rest of each unit's count while it fits;
+    the cutoff is the end of the first unit whose rest does not fit, and the cap deletes the unprotected rows
+    older than it. None when everything fits. A unit the chain keeps whole, or one that counts nothing, is never
+    where it cuts: cutting there frees nothing the cap counts, and deletes the unprotected rows of every hour
+    older than it, rows the cap does not count yet among them. Since the rows decide neither which units are
+    whole nor what they count, and only lower the other units' shares, what the walk keeps at each unit it
+    checks is at most what it keeps with the rows as the chain describes them: a database writer can move the
+    cutoff older, never newer."""
+    left = sum(p for _w, _c, p, _k in units)
+    for when, counted, protected, whole in sorted(units, key=lambda u: u[0], reverse=True):
+        if whole or not counted:
+            continue
+        if left + counted - protected > cap:
+            return when + timedelta(hours=1)
+        left += counted - protected
+    return None
 
 
 def by_size(model, now: datetime, numbers: Numbers, plan: SizePlan) -> Optional[list]:

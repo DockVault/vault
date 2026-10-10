@@ -20,10 +20,13 @@ sealed_at lie at or before the window's start. So it never raises what the hour 
 seen it and a delay of sealing has passed.
 
 Each entry also binds the bytes of its hour's administration and security rows, which the size cap never deletes
-(``protected_bytes``). The share of an hour or a part the cap may never delete is taken from the rows (an archived
-part's aggregates), but never above those bytes counted the same way (protected_hours): a database writer who adds
-a protected row to an old hour, or edits an archived part's aggregates, can lower a share, which keeps more, but
-cannot raise one and so make the cap delete newer rows sooner.
+(``protected_bytes``). The chain alone says which hours the cap keeps whole (kept_whole): those whose protected
+bytes, counted the same way (protected_hours), reach their bytes, and those wholly younger than the minimum for
+every row. The share of any other hour, or of a part's other hours, the cap may never delete is taken from the
+rows (an archived part's aggregates), but never above those protected bytes. A database writer who adds, deletes
+or relabels rows, or edits an archived part's aggregates, can lower such a share, but cannot raise one, nor make
+an hour the chain keeps whole look partly unprotected; either would move the cap's cutoff newer and delete rows
+it keeps honestly. Lowering a share only ever moves the cutoff older (audit_retention.size_cutoff).
 
 An archived part (app/core/audit_archive.py) counts the smaller of its bound length, the one its day's archive
 seal records, and the lagged bytes of the hours it holds: archiving shrinks what the cap counts, never adds to it,
@@ -152,9 +155,10 @@ def counted(view, start_us: int, held: Set[int]) -> Tuple[Dict[datetime, int], L
 def protected_hours(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
     """{hour: lagged protected bytes} of every hour with a unit of its own whose rows the size cap never deletes
     count more than nothing, archived or not: the protected bytes its root entries record, counted as the hour's
-    bytes are (a held-back entry no more than the entry before it, the least over the window). The cap's protected
-    share of an hour never exceeds it, so rows added in the database, or an archived part's aggregates edited
-    there, can only lower a share (which keeps more), never raise it."""
+    bytes are (a held-back entry no more than the entry before it, the least over the window), so never more than
+    the hour's lagged bytes. An hour it reaches those for the cap keeps whole (kept_whole); the cap's protected
+    share of any other hour never exceeds it, so rows added in the database, or an archived part's aggregates
+    edited there, can only lower that share, never raise it."""
     out = {}
     for start, end, last in view.units():
         if end - start != _ai().HOUR:
@@ -163,6 +167,16 @@ def protected_hours(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
         if n:
             out[start] = n
     return out
+
+
+def kept_whole(hour: datetime, lagged_bytes: int, bound: Dict[datetime, int], young: Optional[datetime]) -> bool:
+    """Whether the size cap keeps ``hour`` whole, as the chain alone says: every row of it younger than the minimum
+    for every row (``young``: now less that minimum, None without one; an hour that starts at or after it), or its
+    lagged protected bytes (``bound``, protected_hours) reaching its lagged bytes (``lagged_bytes``). Never what its
+    rows or an archived part's aggregates say: those can be changed in the database, and an hour they made look
+    partly unprotected would become one the cap cuts at, newer than any it cuts at honestly
+    (audit_retention.size_cutoff)."""
+    return (young is not None and hour >= young) or bound.get(hour, 0) >= lagged_bytes
 
 
 def hour_bytes(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:

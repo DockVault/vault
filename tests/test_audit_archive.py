@@ -993,6 +993,7 @@ def test_part_units_spread_a_parts_count_and_protected_share_over_its_hours():
     units = arc.part_units(part, 900, lagged, {at(3): 400}, figures, T0, 0)
     assert [u[0] for u in units] == [at(3), at(4), at(6)]
     assert [u[1] for u in units] == [300, 300, 300] and [u[2] for u in units] == [300, 0, 0]
+    assert [u[3] for u in units] == [True, False, False]
     # Half an hour's bytes bound as protected: half its spread.
     assert [u[2] for u in arc.part_units(part, 900, lagged, {at(4): 200}, figures, T0, 0)] == [0, 150, 0]
     # A bound above the hour's bytes counts the whole hour, never more.
@@ -1001,12 +1002,24 @@ def test_part_units_spread_a_parts_count_and_protected_share_over_its_hours():
     more = arc.PartFigures(rows=(3, 3, 0, 3), stored=(300, 300, 0, 300), protected_rows=9, protected_stored=900)
     assert [u[2] for u in arc.part_units(part, 900, lagged, {at(3): 400}, more, T0, 0)] == [300, 0, 0]
     less = arc.PartFigures(rows=(3, 3, 0, 3), stored=(300, 300, 0, 300), protected_rows=1, protected_stored=100)
-    both = {at(3): 400, at(6): 400}
-    assert [u[2] for u in arc.part_units(part, 900, lagged, both, less, T0, 0)] == [0, 0, 100]
-    assert [u[2] for u in arc.part_units(part, 900, lagged, both, None, T0, 0)] == [0, 0, 0]
+    halves = {at(3): 200, at(6): 200}
+    assert [u[2] for u in arc.part_units(part, 900, lagged, halves, less, T0, 0)] == [0, 0, 100]
+    assert [u[2] for u in arc.part_units(part, 900, lagged, halves, None, T0, 0)] == [0, 0, 0]
+    # Never the share of an hour the chain keeps whole, whatever the aggregates say: they lower only the others'.
+    wholes = {at(3): 400, at(6): 400}
+    for said in (less, None):
+        units = arc.part_units(part, 900, lagged, wholes, said, T0, 0)
+        assert [u[2] for u in units] == [300, 0, 300] and [u[3] for u in units] == [True, False, True]
+    assert [u[2] for u in arc.part_units(part, 900, lagged, {at(3): 400, at(6): 200}, less, T0, 0)] == [300, 0, 0]
     # Every hour younger than the minimum for every row: the whole part, whatever the chain binds.
     young = arc.part_units(part, 900, lagged, {}, figures, at(6) + timedelta(days=5), 30)
-    assert sum(u[2] for u in young) == 900
+    assert sum(u[2] for u in young) == 900 and all(u[3] for u in young)
+    # An hour only partly younger than the minimum is not kept whole: its rows from before the minimum may go.
+    for since, kept, whole in ((at(3, 30), [0, 300, 300], [False, True, True]),
+                               (at(4), [0, 300, 300], [False, True, True]),
+                               (at(4, 1), [0, 0, 300], [False, False, True])):
+        units = arc.part_units(part, 900, lagged, {}, figures, since + timedelta(days=30), 30)
+        assert [u[2] for u in units] == kept and [u[3] for u in units] == whole, since
     assert all(0 <= u[2] <= u[1] for u in units)
     assert arc.part_units(part, 0, {at(3): 1}, {}, figures, T0, 0) == []
 
@@ -1452,6 +1465,280 @@ def test_a_protected_row_added_to_an_old_hour_never_makes_the_size_cap_delete_a_
     assert ("rows-added" in failures(env.verify())) is added
 
 
+def test_the_size_cutoff_is_never_at_a_unit_the_chain_keeps_whole_nor_at_one_that_counts_nothing():
+    """The walk from the newest unit: a whole unit or one that counts nothing is never where the cap cuts, even
+    when the protected shares alone exceed the cap; the cutoff is the end of the newest other unit that does not
+    fit."""
+    units = [(at(1), 100, 0, False), (at(2), 50, 50, True), (at(3), 0, 0, False), (at(4), 80, 20, False),
+             (at(5), 70, 70, True)]
+    assert ar.size_cutoff(units, 1000) is None
+    assert ar.size_cutoff(units, 250) == at(2)            # the newer unit's rest fits, the older's does not
+    assert ar.size_cutoff(units, 150) == at(5)            # the newest unit not kept whole
+    assert ar.size_cutoff(list(reversed(units)), 150) == at(5)
+    assert ar.size_cutoff(units, 100) == at(5)            # the protected shares (140) alone exceed the cap
+    # Above the cap with only whole units and one that counts nothing newer than the cut one.
+    assert ar.size_cutoff([(at(1), 100, 0, False), (at(3), 0, 0, False), (at(5), 70, 70, True)], 50) == at(2)
+    assert ar.size_cutoff([(at(5), 70, 70, True)], 10) is None
+    assert ar.size_cutoff([], 10) is None
+
+
+def test_lowering_the_shares_of_units_not_kept_whole_never_moves_the_size_cutoff_newer():
+    """What the rows decide, a share of a unit the chain does not keep whole, lowered in any way: at every cap the
+    cutoff stays or moves older (or goes), never newer."""
+    import random
+    rnd = random.Random(20261010)
+    for _ in range(300):
+        units = []
+        for i in range(rnd.randint(1, 8)):
+            counted = rnd.choice([0, rnd.randint(1, 500)])
+            whole = rnd.random() < 0.3
+            units.append((at(i), counted, counted if whole else rnd.randint(0, max(0, counted - 1)), whole))
+        lowered = [(h, c, p if w else rnd.randint(0, p), w) for h, c, p, w in units]
+        for cap in range(0, sum(u[1] for u in units) + 2, 7):
+            honest, low = ar.size_cutoff(units, cap), ar.size_cutoff(lowered, cap)
+            assert low is None or (honest is not None and low <= honest), (units, lowered, cap)
+
+
+def _say_no_row_is_protected(env, day):
+    """What a database writer without the key can do: edit the aggregates of ``day``'s block to say none of its rows
+    is of an action the size cap never deletes."""
+    with env.session() as db:
+        blk = db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == day).one()
+        aggregates = dict(blk.aggregates)
+        aggregates["by"] = [["file_uploaded"] + list(row[1:]) for row in aggregates["by"]]
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == day).update(
+            {AuditArchiveBlock.aggregates: aggregates}, synchronize_session=False)
+        db.commit()
+    arc._figures.clear()                    # read again, as a process does after a restart
+
+
+def _late_row(env, hour, **kw):
+    """A row written into a sealed hour, and the host's late seal of it (two phases)."""
+    row = env.row(hour + timedelta(minutes=30), **kw)
+    seen = host.seal_late_rows(env.engine, env.st, hour, read=True)
+    host.seal_late_rows(env.engine, env.st, hour, expect=seen["state"])
+    return row
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+@pytest.mark.parametrize("whole_by", ["protected rows", "the minimum"])
+def test_a_row_deleted_from_an_hour_the_chain_keeps_whole_never_moves_the_size_caps_cutoff_newer(env, monkeypatch,
+                                                                                               whole_by, deleted):
+    """The protected rows alone exceed the cap. An older hour holds an unprotected row, which the cap takes; a
+    newer hour held one protected row when it was sealed and has since had a late unprotected row sealed into it,
+    which counts only once a delay of sealing has passed; a newer hour still the chain keeps whole, by its one
+    protected row or by the minimum for every row. A database writer deletes that newest hour's row: its rows then
+    say it is partly unprotected, but the chain alone says which hours the cap keeps whole, so the cutoff stays at
+    the older hour and the late row stays."""
+    _capped(env, monkeypatch)
+    protected = ar.protected_actions()[0]
+    d1, d2 = (T0 - timedelta(days=25)).date(), (T0 - timedelta(days=20)).date()
+    min_days = 12 if whole_by == "the minimum" else 0
+    older = env.row(at(1, day=d1), details=_blob(15000))
+    env.row(at(9, day=d2), action=protected, details=_blob(15000))
+    if min_days:
+        newest = env.row(T0 - timedelta(days=1), details=_blob(15000))
+    else:
+        newest = env.row(at(15, day=d2), action=protected, details=_blob(15000))
+    env.run_until_sealed()
+    _seal_days(env, 8)
+    late = _late_row(env, at(9, day=d2), details=_blob(15000))
+    _seal_days(env, 1)
+    numbers = _numbers(max_days=0, max_mb=1000, min_days=min_days)
+
+    def plan():
+        with env.session() as db:
+            return ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(), numbers,
+                                      timedelta(days=7))
+
+    honest = plan()
+    assert honest.cutoff == at(2, day=d1) and not honest.met
+    if deleted:
+        with env.session() as db:
+            db.query(AuditLog).filter(AuditLog.id == newest).delete(synchronize_session=False)
+            db.commit()
+    planned = plan()
+    assert (planned.cutoff, planned.protected_bytes) == (honest.cutoff, honest.protected_bytes)
+    ar.prune(_pass(env), numbers)
+    with env.session() as db:
+        left = {r[0] for r in db.query(AuditLog.id).filter(AuditLog.id.in_([older, late])).all()}
+    assert left == {late}
+    assert ("rows-missing" in failures(env.verify())) is deleted
+
+
+@pytest.mark.parametrize("edited", [False, True])
+def test_aggregates_edited_to_say_no_row_is_protected_never_make_the_cap_cut_at_a_part_the_chain_keeps_whole(
+        env, monkeypatch, edited):
+    """The protected rows alone exceed the cap. The older archived day holds one unprotected row, which the cap
+    takes; the newer holds only protected rows, so the chain keeps its hours whole. Edited to say none of the newer
+    day's rows is protected, its aggregates would lower those hours' shares and move the cutoff past them: they
+    lower only the shares of hours the chain does not keep whole, so the plan is the honest one."""
+    _capped(env, monkeypatch)
+    protected = ar.protected_actions()[0]
+    newer = DAY + timedelta(days=1)
+    older = env.row(at(1), details=_blob(15000))
+    kept = [env.row(at(h, day=newer), action=protected, details=_blob(15000)) for h in (9, 15)]
+    env.run_until_sealed()
+    _archive(env)
+    assert len(_blocks(env)) == 2
+    _seal_days(env, 8)
+    cap = _numbers(max_days=0, max_mb=1000)
+
+    def plan():
+        with env.session() as db:
+            return ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(), cap,
+                                      timedelta(days=7))
+
+    honest = plan()
+    assert honest.cutoff == at(2) and not honest.met
+    if edited:
+        _say_no_row_is_protected(env, newer)
+    planned = plan()
+    assert (planned.cutoff, planned.protected_bytes) == (honest.cutoff, honest.protected_bytes)
+    ar.prune(_pass(env), cap)
+    assert older not in _ids_in_blocks(env, DAY) and sorted(_ids_in_blocks(env, newer)) == sorted(kept)
+    assert ("block-altered" in failures(env.verify())) is edited
+
+
+def test_a_late_row_in_an_archived_hour_the_chain_keeps_whole_waits_for_its_delay_as_in_a_hot_hour(env,
+                                                                                                    monkeypatch):
+    """An hour of one protected row, and a late unprotected row the host sealed into it before its day was
+    archived: until a delay of sealing has passed after the late seal, the chain still keeps that hour whole. The
+    part's aggregates count the late row, and so say less of the part is protected than the chain binds of the
+    hour; they never lower a whole hour's share, so the cap, cutting at the older hour's unprotected row, leaves
+    the late row, as it leaves one in a hot hour."""
+    _capped(env, monkeypatch)
+    protected = ar.protected_actions()[0]
+    older = env.row(at(1), details=_blob(15000))
+    admin = env.row(at(9), action=protected, details=_blob(15000))
+    env.run_until_sealed()
+    _seal_days(env, 8)
+    late = _late_row(env, at(9), details=_blob(15000))
+    _archive(env)
+    assert len(_blocks(env)) == 1 and _hot(env) == 0
+    _seal_days(env, 1)
+    ar.prune(_pass(env), _numbers(max_days=0, max_mb=1000))
+    assert _ids_in_blocks(env, DAY) == [admin, late] and older not in _ids_in_blocks(env, DAY)
+    assert failures(env.verify()) == []
+
+
+def _mixed(env):
+    """Three archived days and older and newer hot hours, each hour with protected and other rows of varied
+    sizes."""
+    protected = ar.protected_actions()[0]
+    sizes = [3000, 9000, 1500, 12000, 6000, 800, 4000]
+    i = 0
+    for d in range(3):
+        day = DAY + timedelta(days=d)
+        for h in (2, 5, 9, 14, 20):
+            for k in range(3):
+                env.row(at(h, k, day=day), action=protected if (h + k + d) % 3 == 0 else "file_uploaded",
+                        details=_blob(sizes[i % len(sizes)]))
+                i += 1
+    for days_ago in (25, 20, 1):
+        day = (T0 - timedelta(days=days_ago)).date()
+        for h in (1, 7, 15):
+            for k in range(2):
+                env.row(at(h, k, day=day), action=protected if (h + k + days_ago) % 4 == 0 else "file_uploaded",
+                        details=_blob(sizes[i % len(sizes)]))
+                i += 1
+    env.run_until_sealed()
+    _archive(env)
+    assert len({b.day for b in _blocks(env)}) == 3
+    _seal_days(env, 8)
+
+
+def _edit_every_block(env, change):
+    with env.session() as db:
+        for blk in db.query(AuditArchiveBlock).all():
+            db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == blk.day,
+                                               AuditArchiveBlock.part == blk.part).update(
+                {AuditArchiveBlock.aggregates: change(dict(blk.aggregates))}, synchronize_session=False)
+        db.commit()
+    arc._figures.clear()
+
+
+def _all_protected(agg):
+    agg["by"] = [[ar.protected_actions()[0]] + list(r[1:]) for r in agg["by"]]
+    return agg
+
+
+def _none_protected(agg):
+    agg["by"] = [["file_uploaded"] + list(r[1:]) for r in agg["by"]]
+    return agg
+
+
+def _inflated(agg):
+    agg["by"] = [[ar.protected_actions()[0], r[1], r[2], r[3] * 50, r[4] * 50, r[5] * 50] for r in agg["by"]]
+    agg["hours"] = [[h[0], h[1] * 50, h[2] * 50] for h in agg["hours"]]
+    return agg
+
+
+def _rows_edit(env, update=None, delete=None):
+    with env.session() as db:
+        if update is not None:
+            db.query(AuditLog).filter(update[0]).update(update[1], synchronize_session=False)
+        if delete is not None:
+            db.query(AuditLog).filter(delete).delete(synchronize_session=False)
+        db.commit()
+
+
+def _protected_rows_inserted(env):
+    for days_ago in (25, 20):
+        day = (T0 - timedelta(days=days_ago)).date()
+        for h in (1, 7, 15):
+            env.row(at(h, 40, day=day), action=ar.protected_actions()[0], details=_blob(30000))
+
+
+TAMPERS = {
+    "aggregates all protected": lambda env: _edit_every_block(env, _all_protected),
+    "aggregates none protected": lambda env: _edit_every_block(env, _none_protected),
+    "aggregates inflated": lambda env: _edit_every_block(env, _inflated),
+    "aggregates unreadable": lambda env: _edit_every_block(env, lambda agg: {"by": "x", "hours": 7}),
+    "protected rows inserted": _protected_rows_inserted,
+    "rows relabelled protected": lambda env: _rows_edit(env, update=(
+        AuditLog.action != ar.protected_actions()[0], {AuditLog.action: ar.protected_actions()[0]})),
+    "protected rows relabelled": lambda env: _rows_edit(env, update=(
+        AuditLog.action == ar.protected_actions()[0], {AuditLog.action: "file_uploaded"})),
+    "protected rows deleted": lambda env: _rows_edit(env, delete=AuditLog.action == ar.protected_actions()[0]),
+    "young rows deleted": lambda env: _rows_edit(env, delete=AuditLog.timestamp >= T0 - timedelta(days=2)),
+    "everything": lambda env: (_edit_every_block(env, _inflated), _protected_rows_inserted(env),
+                               _rows_edit(env, update=(AuditLog.action != ar.protected_actions()[0],
+                                                       {AuditLog.action: ar.protected_actions()[0]}))),
+}
+
+
+@pytest.mark.parametrize("min_days", [0, 10])
+@pytest.mark.parametrize("tamper", sorted(TAMPERS))
+def test_no_database_edit_raises_the_size_caps_protected_share_or_moves_its_cutoff_newer(env, monkeypatch, tamper,
+                                                                                          min_days):
+    """Rows and aggregates edited in the database every way a writer without the key can: at every cap from none
+    to all of what the cap counts, what the plan counts is the chain's, its protected share is never higher and its
+    cutoff never newer than the honest plan's."""
+    _capped(env, monkeypatch)
+    _mixed(env)
+
+    def plan(cap):
+        with env.session() as db:
+            return ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(),
+                                      _numbers(max_days=0, max_mb=cap, min_days=min_days), timedelta(days=7))
+
+    total = plan(10 ** 15).counted_bytes
+    caps = sorted({max(1, total * k // 24) for k in range(0, 25)})
+    honest = {cap: plan(cap) for cap in caps}
+    assert any(p.cutoff is not None for p in honest.values()) and any(not p.met for p in honest.values())
+    TAMPERS[tamper](env)
+    worse = []
+    for cap in caps:
+        h, t = honest[cap], plan(cap)
+        assert t.counted_bytes == h.counted_bytes
+        if t.protected_bytes > h.protected_bytes:
+            worse.append((cap, "protected", h.protected_bytes, t.protected_bytes))
+        if t.cutoff is not None and (h.cutoff is None or t.cutoff > h.cutoff):
+            worse.append((cap, "cutoff", h.cutoff, t.cutoff))
+    assert worse == []
+
+
 def test_the_chain_binds_each_hours_protected_bytes_and_an_archived_parts_share_comes_from_them(env):
     protected = ar.protected_actions()[0]
     admin = env.row(at(3), action=protected, details=_blob(4000))
@@ -1761,6 +2048,31 @@ def test_hot_hours_younger_than_the_minimum_are_protected_whole_whatever_the_cha
                                   _numbers(max_days=0, max_mb=hot[hour] - 1, min_days=0), timedelta(days=7))
     assert young.protected_bytes == young.counted_bytes >= hot[hour] and not young.met
     assert aged.protected_bytes < hot[hour]
+
+
+def test_a_hot_hour_only_partly_younger_than_the_minimum_is_not_kept_whole(env, monkeypatch):
+    """The minimum for every row ends inside an hour: that hour is not kept whole, so none of its count is protected
+    by the minimum and its rows from before the minimum may go; its younger rows stay."""
+    _capped(env, monkeypatch)
+    final = env.clock() + timedelta(days=8, minutes=30)
+    hour = ai.hour_floor(final - timedelta(days=12))
+    older = env.row(T0 - timedelta(days=25), details=_blob(15000))
+    before = env.row(hour + timedelta(minutes=10), details=_blob(15000))
+    after = env.row(hour + timedelta(minutes=40), details=_blob(15000))
+    env.run_until_sealed()
+    _seal_days(env, 8)
+    env.clock.advance(minutes=30)
+    assert env.clock() == final
+    numbers = _numbers(max_days=0, max_mb=1000, min_days=12)
+    with env.session() as db:
+        plan = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(), numbers,
+                                  timedelta(days=7))
+    assert plan.protected_bytes == 0 and plan.cutoff == hour + timedelta(hours=1)
+    ar.prune(_pass(env), numbers)
+    with env.session() as db:
+        left = {r[0] for r in db.query(AuditLog.id).filter(AuditLog.id.in_([older, before, after])).all()}
+    assert left == {after}
+    assert failures(env.verify()) == []
 
 
 # --------------------------------------------------------------------------- a later release's block format

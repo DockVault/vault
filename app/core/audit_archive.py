@@ -1205,8 +1205,8 @@ def part_figures(db, view) -> Dict[tuple, PartFigures]:
     """{(day, part): PartFigures} of every archived part, from the aggregates its block keeps beside the payload
     (checked against its rows whenever the payload is read: archiving, a change, the rolling check), read once per
     payload (keyed by its digest). They decide what the preview says, and can only lower the share of a part's count
-    the size cap may never delete (which the chain bounds, part_units), never what the cap counts; a part whose
-    aggregates cannot be read has none."""
+    the size cap may never delete in the hours the chain does not keep whole (part_units), never what the cap
+    counts nor which hours it keeps whole; a part whose aggregates cannot be read has none."""
     from app.core.audit_retention import protected_actions
     from app.core.models import AuditArchiveBlock as B
     parts = {(d, p.part): p for d, p in view.archived_parts()}
@@ -1248,9 +1248,9 @@ def protected_share(part, counted: int, figures: Optional[PartFigures], now: dat
     """What a part's aggregates say of its count the size cap may never delete, never more than the count: its
     administration and security rows, or its rows younger than the minimum for every row (whole hours), whichever is
     larger, as a share of its stored bytes; 0 when it has no aggregates that can be read. The aggregates are not
-    checked when the cap plans, so this only lowers what the chain binds (part_units), never raises it. Rows another
-    module's row-keep rule keeps are not known here: they count as deletable, so the cap keeps more, never less (the
-    deletion itself never takes them)."""
+    checked when the cap plans, so this only lowers what the chain binds of the hours it does not keep whole
+    (part_units), never raises it. Rows another module's row-keep rule keeps are not known here: they count as
+    deletable, so the cap keeps more, never less (the deletion itself never takes them)."""
     if figures is None or counted <= 0:
         return 0
     total = sum(figures.stored)
@@ -1265,32 +1265,35 @@ def protected_share(part, counted: int, figures: Optional[PartFigures], now: dat
 
 def part_units(part, counted: int, lagged: Dict[datetime, int], bound: Dict[datetime, int],
                figures: Optional[PartFigures], now: datetime, min_days: int) -> List[tuple]:
-    """(hour, counted, protected) of each hour of a part, for the size cap's walk from the newest: the part's count
-    spread over its hours by their lagged bytes, each hour's protected share the same part of its spread as the
-    chain binds of its lagged bytes (``bound``: the hour's lagged protected bytes, audit_chain_size.protected_hours;
-    the whole hour when every row of it is younger than the minimum for every row). The part's aggregates
-    (protected_share), which are not checked when the cap plans, only lower the shares, from the oldest hour on: an
-    understated share keeps more, an overstated one would delete newer rows sooner. The shares add up to the part's
-    count exactly, and each protected share is never more than its hour's."""
+    """(hour, counted, protected, whole) of each hour of a part, for the size cap's walk from the newest
+    (audit_retention.size_cutoff): the part's count spread over its hours by their lagged bytes. An hour the chain
+    keeps whole (audit_chain_size.kept_whole: its lagged protected bytes in ``bound`` reach its lagged bytes, or
+    every row of it is younger than the minimum for every row) takes its whole spread as its protected share; any
+    other hour the same part of its spread as the chain binds of its lagged bytes. The part's aggregates
+    (protected_share), which are not checked when the cap plans, only lower the shares of the hours not kept whole,
+    from the oldest hour on, never a whole hour's: a share they lower keeps more, and a whole hour they made look
+    partly unprotected would become one the cap cuts at, newer than any it cuts at honestly. The spreads add up to
+    the part's count exactly, and each protected share is never more than its hour's spread."""
+    from app.core import audit_chain_size as chain_size
     total = sum(lagged.values())
     if counted <= 0 or total <= 0:
         return []
     hours = sorted(lagged)
     shares = [counted * lagged[h] // total for h in hours]
     shares[-1] += counted - sum(shares)
-    since = now - timedelta(days=min_days) if min_days > 0 else None
-    kept = []
-    for h, share in zip(hours, shares):
-        most = lagged[h] if since is not None and h >= since else min(lagged[h], bound.get(h, 0))
-        kept.append(share * most // lagged[h])
+    young = now - timedelta(days=min_days) if min_days > 0 else None
+    whole = [chain_size.kept_whole(h, lagged[h], bound, young) for h in hours]
+    kept = [share if w else share * bound.get(h, 0) // lagged[h] for h, share, w in zip(hours, shares, whole)]
     over = sum(kept) - protected_share(part, counted, figures, now, min_days)
     for i in range(len(hours)):
         if over <= 0:
             break
+        if whole[i]:
+            continue
         cut = min(over, kept[i])
         kept[i] -= cut
         over -= cut
-    return list(zip(hours, shares, kept))
+    return list(zip(hours, shares, kept, whole))
 
 
 def preview(db, view, *, age_cut: Optional[datetime], admin_cut: Optional[datetime], size_cut: Optional[datetime],
