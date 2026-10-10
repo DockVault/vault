@@ -88,6 +88,23 @@ def test_the_auditors_row_is_locked_before_the_ten_minute_check(db, people, stor
     assert order == [("lock", people.uma.id), "check"]
 
 
+def test_a_file_deleted_between_the_record_and_the_opening_is_no_such_file(db, people, storage, monkeypatch):
+    """The record commits, then the owner deletes the file before it is opened: the view answers as a file that is
+    not there (it is listed again as kept, when a hold keeps it), never an error; its record stays."""
+    f = _file(db, storage, people.v1)
+    case = _case(db, people, _vaults(people.v1))
+    real_record = ca.record
+
+    def record_then_delete(db_, *a, **k):
+        real_record(db_, *a, **k)
+        db_.execute(m.File.__table__.delete().where(m.File.__table__.c.id == f.id))
+        db_.commit()
+
+    monkeypatch.setattr(ca, "record", record_then_delete)
+    assert _refusal(ca.open_file, db, case.id, f.id, people.uma).reason == ca.NO_SUCH_FILE
+    assert storage.opened == [] and len(_rows(db, "case_file_viewed")) == 1
+
+
 def test_a_view_whose_record_cannot_be_written_is_refused_and_opens_nothing(db, people, storage, monkeypatch):
     from app.services.audit_logger import AuditLogger
     f = _file(db, storage, people.v1)

@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
+from sqlalchemy.orm.exc import ObjectDeletedError
+
 from app.core import case_rules as rules
 from app.core import compliance_settings as cs
 from app.core.case_context import acting_for
@@ -496,7 +498,11 @@ def open_file(db, case_id, file_id, user, *, unlocked_given: Optional[Mapping[st
                details=view_details(found, opening, **({"preview": True} if preview else {})))
     else:
         db.commit()                                                           # the lock, released
-    download = _vault_service(db)._open_stored_file(found.item, found.vault, found.item.id, whole=False)   # 5
+    try:
+        download = _vault_service(db)._open_stored_file(found.item, found.vault, found.item.id, whole=False)   # 5
+    except ObjectDeletedError:
+        # Deleted (or kept by a hold, which moves its row) between the commit and the opening: no such file now.
+        raise Refused(NO_SUCH_FILE)
     return case, found, download
 
 
