@@ -6,9 +6,10 @@ Their socket hears the live signal (an id and a category, nothing more) until th
 selected, the events are the case's own and those on its vaults, a file's name shows because of the case, and N
 fetches of the same page write one ``case_names_viewed`` row. In a vault with a vault password the auditor is no
 member of, the case's event says the password hides the file's name and offers it, and the password given in the
-case shows it; with a case on one folder for a time range, only where the case names the item. Anyone else, and an
-administrator the case concerns, is answered that there is no such case. test_activity_auditor.py covers the rules
-offline.
+case shows it; with a case on one folder for a time range, only where the case names the item. An administrator who
+holds the right and unlocked a vault's names on the Activity page keeps what that shows with their case selected.
+Anyone else, and an administrator the case concerns, is answered that there is no such case.
+test_activity_auditor.py covers the rules offline.
 """
 import json
 import time
@@ -16,9 +17,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from _account_change_helpers import psql
+from _account_change_helpers import own_password, psql, signed_in
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault, wait_for
+from _sf_helpers import enroll_totp
 from conftest import ApiClient, unique
 
 websocket = pytest.importorskip("websocket")  # websocket-client
@@ -274,3 +276,50 @@ def test_a_case_on_one_folder_offers_the_password_only_where_it_would_name_the_i
         if case is not None:
             forget_cases([case["id"]], [pv])
         olga_c.delete_vault(pv, vault_password=password)
+
+
+def test_an_administrators_own_unlock_is_kept_with_their_case_selected(world):
+    """An administrator may hold the auditor right. dan, one who does, is a member of olga's vault with a vault
+    password and unlocked its names on the Activity page. With dan's case on that vault selected, the file's event
+    reads what dan's own unlock shows without the case, and nothing is offered. The control: without that unlock, the
+    case says the password hides the name and offers it."""
+    admin = world["admin"]
+    _olga, olga_c, _vid = world["olga"]
+    dan = own_password(admin.create_user(role="admin"))
+    dan_c = signed_in(dan)
+    _secret, codes = enroll_totp(dan, dan_c)
+    grant_right(world["admins"], dan["id"])
+    password = "Vault-Pass-2026!"
+    pv = olga_c.create_vault(name=unique("shared"), password=password)["id"]
+    sent = {"X-Vault-Password": password}
+    case = None
+    try:
+        up = olga_c.post(f"/vaults/{pv}/files", files=[("files", (f"{unique('memo')}.txt", b"memo", "text/plain"))],
+                         headers=sent)
+        assert up.status_code in (200, 201), up.text
+        fid = up.json()["files"][0]["id"]
+        r = olga_c.post(f"/vaults/{pv}/permissions", json={"user_id": dan["id"], "level": "read"}, headers=sent)
+        assert r.status_code in (200, 201), r.text
+        case = approved_case(world["admins"], (dan, dan_c, codes), [pv])
+
+        def about_the_file(params, headers=None):
+            r = dan_c.get("/activity/events", params={"vault_id": pv, "limit": 100, **params}, headers=headers or {})
+            assert r.status_code == 200, r.text[:300]
+            found = {(e["names"]["item"], e.get("unlock_in_case")) for e in r.json()["events"]
+                     if e.get("resource_id") == fid}
+            assert found, "the upload's event is listed"
+            return found
+
+        assert about_the_file({"case": case["id"]}) == {(HIDDEN, True)}, "the control: hidden, and offered"
+        r = dan_c.post(f"/activity/vaults/{pv}/unlock", json={"password": password})
+        assert r.status_code == 200, r.text
+        own = {"X-Activity-Unlock": f"{pv}:{r.json()['receipt']}"}
+        alone = about_the_file({}, own)
+        assert len(alone) == 1 and not {name for name, _mark in alone} & {HIDDEN, NOT_SHOWN}, alone
+        assert about_the_file({"case": case["id"]}, own) == alone, "the case keeps what dan's own unlock shows"
+    finally:
+        if case is not None:
+            forget_cases([case["id"]], [pv])
+        forget_grants(dan["id"])
+        olga_c.delete_vault(pv, vault_password=password)
+        admin.delete_user(dan["id"])
