@@ -484,13 +484,19 @@ def _record_after(record, generation) -> Dict[int, dict]:
             if e.get("generation") == generation and not e.get("discarded")}
 
 
+# In a session's info, the transaction whose snapshot one_state_and_record took: the check then reads by it.
+SNAPSHOT_TAKEN = "audit_chain_one_state"
+
+
 def one_state(db) -> None:
     """Make every read of ``db``'s transaction from here on see the database as it was at the first: the seals,
     the blocks and the rows of one state, whatever another process commits meanwhile (a host's ``audit unarchive``,
     the server's archive job or pruner). Without it a check walks the seals, then reads blocks and rows a change
     committed after the walk, and reports failures that are not there. REPEATABLE READ on Postgres; on SQLite (the
     offline tests) a read transaction begun now, which needs WAL for a writer to commit meanwhile. ``db`` must not
-    have read yet."""
+    have read yet, unless one_state_and_record took its snapshot."""
+    if db.info.get(SNAPSHOT_TAKEN) is not None and db.info[SNAPSHOT_TAKEN] is db.get_transaction():
+        return
     if db.in_transaction():
         raise RuntimeError("a check reads one state of the database: it needs a session that has not read yet")
     dialect = db.get_bind().dialect.name
@@ -498,6 +504,25 @@ def one_state(db) -> None:
         db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     elif dialect == "sqlite":
         db.execute(text("BEGIN"))
+
+
+def one_state_and_record(db, st, *, wait: float = 30.0) -> Optional[dict]:
+    """Take ``db``'s one state (one_state) and read the head record from its file, both under the chain lock
+    (audit_integrity.chain_lock), and return the record (None when there is none, or none this release can read).
+    Every writer commits and then writes the record under that lock, the host's commands in processes of their
+    own among them, so the record lists exactly the seals of the snapshot: read at different moments, a seal
+    committed between them shows as one the record does not know (``host-seal-unrecorded``, ``after-record``) or
+    the record names one the snapshot lacks. The lock is held only while the snapshot is taken and the record
+    read. Raises ChainBusy when the lock is not free within ``wait`` seconds."""
+    ai = _ai()
+    with ai.chain_lock(db.get_bind(), st, wait=wait):
+        one_state(db)
+        db.execute(text("SELECT max(seq) FROM audit_seals"))     # the snapshot starts with the first read
+        db.info[SNAPSHOT_TAKEN] = db.get_transaction()
+        try:
+            return st.head_store().load()
+        except ValueError:
+            return None
 
 
 def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, current_key_id: Optional[str] = None,
@@ -508,8 +533,8 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
     this verifier holds, by id. Rows are rebuilt for the hours in [from_hour, to_hour) (all when None).
     ``information`` False leaves out what each seal did (the daily check keeps only failures and warnings, and
     a long chain holds a prune seal for nearly every hour). Every read is of one state of the database (one_state):
-    ``db`` must be a session that has not read yet, and a caller that reads more for the same check uses it and
-    ``report.view``."""
+    ``db`` must be a session that has not read yet, or one whose snapshot one_state_and_record took with the
+    ``record`` it returned, and a caller that reads more for the same check uses it and ``report.view``."""
     ai = _ai()
     one_state(db)
     now = now or ai.utcnow()
@@ -1078,12 +1103,20 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
     ai = _ai()
     st = st or ai.state()
     now = now or st.clock()
-    record = st.head_store().memory or {}
-    last = (record.get("check") or {}).get("daily_at")
+    last = ((st.head_store().memory or {}).get("check") or {}).get("daily_at")
     if not force and last and now - fmt.parse_time_text(last) < ai.DAILY:
         return None
     db = session_factory()
     try:
+        # The record that goes with the snapshot, read from the file under the chain lock: this process's copy can
+        # be older than a host command's seals the snapshot holds. A lock kept longer than the wait leaves the check
+        # for the next pass.
+        try:
+            record = one_state_and_record(db, st)
+        except ai.ChainBusy:
+            return None
+        if record is None:
+            record = st.head_store().memory or {}
         keys_held = {k: v.key for k, v in st.keys_held().items()}
         report = verify(db, record=record, held=keys_held, current_key_id=st.current_key().key_id,
                         from_hour=ai.hour_floor(now) - timedelta(days=7), now=now,

@@ -39,6 +39,7 @@ if __name__ == "__main__":
     from app.core.audit_chain_verify import main as _main
     raise SystemExit(_main())
 
+import contextlib
 import secrets
 import threading
 import time
@@ -859,6 +860,23 @@ class ChainWriter:
 
         st.head_store().write(change, now)
         st.pending_after = [e for e in st.pending_after if e not in accepted]
+
+
+@contextlib.contextmanager
+def chain_lock(engine, st: Optional[ChainState] = None, *, wait: float = 30.0):
+    """The chain lock alone, for a reader: the process's own writers' mutex and, on Postgres, the advisory lock on
+    a connection of its own. Every writer, the server's and a host command's in a process of its own, holds it from
+    its head record check through its commit and its record's write, so a reader that takes its snapshot and reads
+    the head record under it sees each writer's seals in both or in neither. Raises ChainBusy when the lock is not
+    free within ``wait`` seconds."""
+    lock = ChainWriter(engine, st, wait=wait, writer="reader")
+    lock._take_mutex()
+    try:
+        lock.conn = engine.connect()
+        lock._take_advisory()
+        yield
+    finally:
+        lock._release()
 
 
 def _salt_of(db, seal: Seal) -> Optional[bytes]:

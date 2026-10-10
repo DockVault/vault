@@ -196,12 +196,14 @@ def _verify(args) -> int:
             from app.core.database import SessionLocal
             ai = _ai()
             st = ai.ChainState()
-            try:
-                record = st.head_store().load()
-            except ValueError:
-                record = None
             db = SessionLocal()
             try:
+                record = None
+                if args.action == "head" or not getattr(args, "no_key", False):
+                    # The head record that goes with the check's snapshot: both taken under the chain lock, which
+                    # the server holds from each commit through its record write, so a seal it commits meanwhile
+                    # is in both or in neither.
+                    record = v.one_state_and_record(db, st)
                 if args.action == "head":
                     report = v.verify(db, record=record, check_rows=False)
                 elif getattr(args, "no_key", False):

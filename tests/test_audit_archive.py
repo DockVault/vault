@@ -1924,6 +1924,39 @@ def test_the_daily_check_records_no_failure_when_an_unarchive_commits_during_it(
     assert ai.open_failures(env.st.head_store().load()) == {}
 
 
+def test_the_daily_check_reads_the_head_record_a_host_command_wrote_in_a_process_of_its_own(env):
+    """A host command runs in a process of its own: it commits its seal and writes the head record file, and the
+    server's copy of the record is the older one. The daily check takes its snapshot and reads the record from the
+    file together, so the host's seal is in both: nothing is reported, and nothing recorded."""
+    _wal(env)
+    _sealed_day(env)
+    _archive(env)
+    _seal_days(env, 8)
+    assert failures(env.verify()) == []
+    host_process = ai.ChainState(settings=env.settings, clock=env.clock)
+    seen = arc.unarchive(env.engine, host_process, None, None, read=True)
+    arc.unarchive(env.engine, host_process, None, None, expect=seen["state"])
+    report = v.daily_check(env.session, env.st, now=env.clock(), force=True)
+    assert failures(report) == [] and "after-record" not in report.kinds(v.WARNING)
+    assert ai.open_failures(env.st.head_store().load()) == {}
+
+
+def test_the_daily_check_waits_for_the_chain_lock_and_runs_at_a_later_pass_when_it_is_busy(env):
+    """The snapshot and the record are taken under the chain lock; a lock another writer keeps longer than the wait
+    leaves the check for the next pass, recording nothing."""
+    _sealed_day(env)
+    before = env.st.head_store().load()
+
+    def busy(*_a, **_k):
+        raise ai.ChainBusy("busy, retry")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ai, "chain_lock", busy)
+        assert v.daily_check(env.session, env.st, now=env.clock(), force=True) is None
+    assert env.st.head_store().load() == before
+    assert v.daily_check(env.session, env.st, now=env.clock(), force=True) is not None
+
+
 def test_a_check_needs_a_session_that_has_not_read_yet(env):
     env.run_until_sealed()
     with env.session() as db:
