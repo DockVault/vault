@@ -104,6 +104,7 @@ def test_the_bytes_now_take_growth_in_at_once_and_the_cap_deletes_from_its_first
     over = size.first_over(st.view, st.known_record(), now, delay, ar.MB)
     assert over is not None and abs(over - (_sealed_at(env, at) + delay)) < timedelta(seconds=1)
     assert size.first_over(st.view, st.known_record(), now, delay, grown) is None
+    assert size.first_over(st.view, st.known_record(), now, delay, counted - 1) == now      # over it already
     with env.session() as db:
         today = ar.preview(db, now, ar.current())["by_size"]["rows"]
         as_counted = ar.preview(db, now, ar.current(), bytes_now=True)["by_size"]["rows"]

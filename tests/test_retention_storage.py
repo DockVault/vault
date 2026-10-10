@@ -143,6 +143,42 @@ def test_the_warning_is_on_the_bytes_now_and_says_when_the_cap_would_start_delet
     assert abs(over - (_sealed_at(env, at) + timedelta(days=7))) < timedelta(seconds=1)
 
 
+def test_when_the_cap_would_start_deleting_counts_the_archived_days_too(env, monkeypatch):
+    """Archived days count their parts' figures, which do not change; a large row in the current hour then
+    takes the count over a limit from its hour's seal plus the delay, and over the bytes now never, on what is
+    sealed now. The figure is the earliest: the pruner's own count is at most the limit just before it and over
+    it just after."""
+    from app.core import audit_chain_size as size
+    from test_audit_chain_size import KB, _big, _sealed_at
+    from test_audit_chain_trust import _run_to
+    import os
+    for h in range(4):              # what does not compress: an archived part counts its block's length
+        env.row(datetime.combine(OLD, time(h, 0)), details={"blob": os.urandom(75 * KB).hex()})
+    env.run_until_sealed()
+    for _ in range(3):
+        arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    assert env.st.view.archives, "nothing was archived"
+    _run_to(env, T0 + timedelta(days=8))
+    at = env.clock() - timedelta(minutes=10)
+    _big(env, at, 300)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    parts = sum(c for _d, _p, c, _h in size.counted(st.view, size.window_start(st.view, st.known_record(), now,
+                                                                                delay), set())[1])
+    grown = size.now_count(st.view, st.known_record(), now)
+    counted = size.cap_count(st.view, st.known_record(), now, delay)[4]
+    assert parts >= 200 * KB and counted < grown and grown - counted >= 300 * KB
+    limit = grown - 100 * KB                 # passed only once the large row counts, and only with the archive
+    over = size.first_over(st.view, st.known_record(), now, delay, limit)
+    assert over is not None and abs(over - (_sealed_at(env, at) + delay)) < timedelta(seconds=1)
+    assert size.first_over(st.view, st.known_record(), now, delay, grown) is None
+    assert size.first_over(st.view, st.known_record(), now, delay, counted - 1) == now
+    _run_to(env, over - timedelta(hours=1))
+    assert size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] <= limit
+    _run_to(env, over + timedelta(hours=1))
+    assert size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] > limit
+
+
 def test_a_cap_before_the_chain_has_a_view_counts_nothing_yet(env, monkeypatch):
     monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 365, 5))
     env.fresh_process()
