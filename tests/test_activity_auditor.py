@@ -624,6 +624,32 @@ def test_no_one_else_is_offered_the_password_in_a_case(db, people, storage, sett
     assert not any(_offered(views)) and views[0]["names"]["item"] == an.NOT_SHOWN
 
 
+def test_the_offer_follows_the_cases_range_by_upload_or_by_change(db, people, storage):
+    """A case on a vault with a vault password, for files uploaded or changed between 30 and 10 days ago. Its auditor
+    is offered the password for a file uploaded in the range and changed after it, and for one uploaded before it and
+    changed in it, both named once it is given; never for one uploaded before the range and changed after it."""
+    pv = _vault(db, people.olga, password="argon2-hash")
+    now = ca.utcnow()
+
+    def made(name, uploaded, changed):
+        f = _file(db, storage, pv, name=name)
+        f.created_at, f.updated_at = now - timedelta(days=uploaded), now - timedelta(days=changed)
+        return f
+    files = [made("uploaded-in.txt", 20, 2), made("changed-in.txt", 40, 15), made("neither.txt", 40, 2)]
+    db.commit()
+    assert [(f.created_at, f.updated_at) for f in files] == [
+        (now - timedelta(days=u), now - timedelta(days=c)) for u, c in ((20, 2), (40, 15), (40, 2))]
+    case = _case(db, people, _vaults(pv), files_from=now - timedelta(days=30), files_to=now - timedelta(days=10))
+    rows = [_event(db, "file_download", by=people.olga, resource_type="file", resource_id=f.id, vault=pv)
+            for f in files]
+    views, _s, _sel = _shown(db, people, case, rows)
+    assert _offered(views) == [True, True, False]
+    assert [v["names"]["item"] for v in views] == [an.PASSWORD_HIDDEN, an.PASSWORD_HIDDEN, an.NOT_SHOWN]
+    views, _s, _sel = _shown(db, people, case, rows, unlock=f"{pv.id}={_receipt(case, pv, people.uma)}")
+    assert [v["names"]["item"] for v in views] == ["uploaded-in.txt", "changed-in.txt", an.NOT_SHOWN]
+    assert not any(_offered(views))
+
+
 def test_telling_a_name_is_hidden_decrypts_no_name(db, people, storage):
     """Whether the case would name an item of a locked vault is read from its columns: no file or folder (live or
     kept) is loaded, so no name is decrypted before the vault is unlocked in the case."""
