@@ -13,7 +13,9 @@ Some tokens travel in the request URL rather than a header, and each one opens s
 A query string's VALUES never reach a line at all: an access line prints each query parameter's name only
 (``GET /activity/events?user&ip&q``), because a value can be what someone typed (an Activity search for a
 person's name, an address, free text) as well as a secret. A name that does not look like one, and a part
-with no ``=`` (which could be a value), print as ``<name>`` and ``<value>``.
+with no ``=`` (which could be a value), print as ``<name>`` and ``<value>``. A line read back through log
+access whose query already holds names only is served as it was written (read_back_target); any other
+query is reduced on the way out, so a line written before values were dropped serves none.
 
 Whoever reads a line holding one of these can open or use what it points at. The web log-pull serves
 request lines to a ``web``-scoped token holder (a less-privileged consumer), and ``docker logs`` shows
@@ -118,8 +120,26 @@ def access_target(path: str, query: str = "") -> str:
     return redact_access_path(path + ("?" + query if query else ""))
 
 
+def _names_only(query: str) -> bool:
+    """True when ``query`` is one query_names prints: every part a name, ``<name>`` or ``<value>`` (so none
+    holds an ``=``, and none is empty). False for an empty query."""
+    return all(part in ("<name>", "<value>") or _QUERY_NAME_RE.fullmatch(part) for part in query.split("&"))
+
+
+def read_back_target(target: str) -> str:
+    """A request target found in a log line read back, as log access serves it. A target whose query already
+    holds names only, as every line written since query values were dropped holds it, is served as written,
+    with only its path masked: reduced again, each name would print as ``<value>``. Any other target is
+    reduced as redact_access_path reduces it, so a line written before the change serves no value. The one
+    older line served as it was written is one whose query held nothing but bare, name-like parts."""
+    path, sep, query = target.partition("?")
+    if _names_only(query):                    # never for an empty query, so never for a target with no "?"
+        return redact_log_path(path) + sep + query
+    return redact_access_path(target)
+
+
 # A request line inside a log line read back ("GET /x?a=1 HTTP/1.1"): its target is reduced as
-# redact_access_path reduces it, so a line written before query values were dropped serves none. The
+# read_back_target reduces it, so a line written before query values were dropped serves none. The
 # target runs to " HTTP/": a quote does not end it, since a client can send one raw in a query and the
 # line holds the query as it came (a target never holds a space).
 _REQUEST_TARGET_RE = re.compile(
@@ -140,8 +160,8 @@ def redact_secret_urls_in_text(text: str) -> str:
     still never serves a usable token."""
     if not text:
         return text
-    text = _REQUEST_TARGET_RE.sub(lambda m: m.group(1) + redact_access_path(m.group(2)) + m.group(3), text)
-    text = _WEBSOCKET_TARGET_RE.sub(lambda m: m.group(1) + redact_access_path(m.group(2)) + m.group(3), text)
+    text = _REQUEST_TARGET_RE.sub(lambda m: m.group(1) + read_back_target(m.group(2)) + m.group(3), text)
+    text = _WEBSOCKET_TARGET_RE.sub(lambda m: m.group(1) + read_back_target(m.group(2)) + m.group(3), text)
     for rx, repl in _TEXT_SECRET_SUBS:
         text = rx.sub(repl, text)
     return SECRET_QUERY_RE.sub(r"\1<redacted>", text)

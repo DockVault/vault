@@ -120,6 +120,35 @@ def test_a_handshake_line_to_any_path_read_back_serves_names_only(path, fmt, ext
     assert VALUE not in served and TOKEN not in served, served
 
 
+@pytest.mark.parametrize("path", ["/ws/monitor", "/ws/no-such-socket", "/ws/vaults/42/events", "/socket"])
+@pytest.mark.parametrize("fmt, extra", FORMATS)
+def test_a_handshake_line_written_with_names_only_is_read_back_as_it_was_written(path, fmt, extra):
+    """A handshake line written since values were dropped holds names only (with <name> and <value> where a
+    name does not look like one or a part has no "="), and log access serves it as it was written. Reduced a
+    second time, each name would print as <value>."""
+    rec = _record(fmt, f"{path}?x={VALUE}&token={TOKEN}&al%20ice=1&{VALUE}", extra)
+    assert WebSocketLogRedactFilter().filter(rec) is True
+    written = "[web] 2026-10-10T06:20:07.830420Z INFO:     " + rec.getMessage()
+    assert f'"WebSocket {path}?x&token&<name>&<value>"' in written, written
+    assert VALUE not in written and TOKEN not in written, written
+    assert redact_secret_urls_in_text(written) == written
+    from app.services import log_pull
+    assert log_pull.redact_log_text(written, []) == written
+
+
+@pytest.mark.parametrize("target", ["/ws/monitor?x&token", "/ws/monitor?<value>", "/ws/monitor?<name>&<value>&x"])
+def test_a_handshake_target_with_names_only_is_read_back_unchanged(target):
+    line = f'[web] INFO:     172.18.0.1:40112 - "WebSocket {target}" [accepted]'
+    assert redact_secret_urls_in_text(line) == line
+
+
+def test_a_handshake_target_with_a_value_beside_a_bare_part_is_still_reduced():
+    line = f'[web] INFO:     172.18.0.1:40112 - "WebSocket /ws/monitor?x&token={TOKEN}" [accepted]'
+    out = redact_secret_urls_in_text(line)
+    assert TOKEN not in out, out
+    assert '"WebSocket /ws/monitor?<value>&token" [accepted]' in out, out
+
+
 @pytest.mark.parametrize("quote", ["'", '"'])
 @pytest.mark.parametrize("fmt, extra", FORMATS)
 def test_a_handshake_line_with_a_raw_quote_in_its_target_read_back_serves_names_only(quote, fmt, extra):
