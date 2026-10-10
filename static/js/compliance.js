@@ -1483,6 +1483,7 @@
     function openPropose() {
         const s = sheet('cmp-propose-sheet', 'Propose an auditor');
         s.body.appendChild(el('p', 'text-secondary text-sm', 'The account needs an authenticator app, a password it set itself, and no change by an administrator to its sign-in details in the last 14 days. A second administrator, independent of you and of the account, approves it.'));
+        s.body.appendChild(el('p', 'text-tertiary text-sm cmp-propose-creator', 'No administrator in the line of whoever created the account (made an administrator by them, or who made them one) can approve its right or its cases. Where one administrator made all the others, have another create auditors\' accounts; otherwise only the server\'s operator can approve, on the host.'));
         const who = input('text', { placeholder: 'Username', autocomplete: 'off' });
         const note = input('textarea', { rows: '2', maxlength: '2000', placeholder: 'Why this account (optional; the approver reads it).' });
         const msg = el('div');

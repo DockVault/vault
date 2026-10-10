@@ -57,6 +57,11 @@ When you keep it on:
 - **Grant the auditor right sparingly**, to people whose job is investigations, and let it expire
   (`COMPLIANCE_AUDITOR_GRANT_DAYS`, a year at most); renewing it is a new grant by two administrators.
 - **Consider `COMPLIANCE_AUDITOR_NOT_ADMIN=true`**, so an auditor cannot also be an administrator.
+- **Have auditors' accounts created by an administrator who did not make the others.** No administrator in the
+  line of whoever created an auditor's account (one the creator made an administrator, directly or through others,
+  or one who made the creator one) may approve that auditor's right or cases. Where one administrator made all the
+  others and also creates the auditor's account, no administrator in the app can approve, and only the server's
+  operator decides, on the host (`dockvault.py cases`).
 - **Choose how vaults with a password are treated** (`COMPLIANCE_PASSWORD_VAULTS`): `refuse` (a case never opens
   them), `with_password` (the default: the auditor must give the password), or `override` (an approved case may
   open them without it). With `override`, an owner who sets a vault password is not protected from an
@@ -83,6 +88,12 @@ hold also tells the owner). The purpose "Regulator or authority request" does no
 
 - **Two administrators acting together can open a vault.** The owner is told at once and sees every file opened:
   the product detects this; it cannot prevent it.
+- **Two administrators made by the same administrator count as independent of each other.** If one administrator
+  makes two others, one of them can create an account and propose its auditor right and the other approve it and
+  its cases: the rule refuses an approver in the line of the account's creator, of the proposer or of the auditor,
+  not one beside them. Refusing those too would leave the usual install, where the first administrator made the
+  others, with no approver in the app. Every new administrator is announced to all the others, waits 14 days
+  before approving anything, and the owner is told at once and sees every file opened.
 - **What is shown can be captured.** A screenshot or a saved page is not recorded; the watermark on the viewer and
   the record of each file opened deter it.
 - **Email is configured by administrators.** Only the notice in the app is guaranteed; the email's address is the

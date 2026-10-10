@@ -70,6 +70,17 @@ def test_every_activity_read_carries_the_selected_case_and_its_receipts():
             in activity)
 
 
+def test_the_propose_sheet_says_who_the_accounts_creator_keeps_from_approving():
+    """Where one administrator made all the others and creates an auditor's account, no administrator in the app can
+    approve its right or its cases: the sheet that proposes the right says so before it is proposed."""
+    source = _read("js", "compliance.js")
+    propose = source[source.index("function openPropose() {"):]
+    propose = propose[:propose.index("\n    }\n")]
+    assert "'text-tertiary text-sm cmp-propose-creator'" in propose
+    assert "No administrator in the line of whoever created the account" in propose
+    assert "only the server" in propose and "can approve, on the host." in propose
+
+
 def test_signing_out_forgets_every_receipt_the_page_kept():
     """A vault's password given on the Compliance page (a case's receipts) or on Access to my vaults (the owner's)
     is forgotten when the dashboard closes: the next account signed in on this tab holds none of them."""
