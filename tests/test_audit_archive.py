@@ -1808,7 +1808,10 @@ def test_a_block_planted_with_the_days_next_part_number_leaves_that_day_and_arch
     assert "block-unsealed" in ai.open_failures(env.st.head_store().load())
 
 
-def test_a_block_planted_for_a_day_not_archived_yet_leaves_that_day_and_archives_the_next(env, monkeypatch):
+@pytest.mark.parametrize("number", [1, 7])
+def test_a_block_planted_for_a_day_not_archived_yet_leaves_that_day_and_archives_the_next(env, monkeypatch, number):
+    """A block planted for a day with no archive seal yet, as its first part or out of turn: the day is left as rows
+    with the finding, and the next day is archived."""
     monkeypatch.setattr(arc, "DAYS_PER_PASS", 1)
     second, third = DAY + timedelta(days=1), DAY + timedelta(days=2)
     for day in (DAY, second, third):
@@ -1817,9 +1820,10 @@ def test_a_block_planted_for_a_day_not_archived_yet_leaves_that_day_and_archives
     _archive(env)
     (block,) = _blocks(env)
     assert block.day == DAY
-    _plant(env, second, 1, block)
+    _plant(env, second, number, block)
     _archive(env)
-    assert {b.day for b in _blocks(env)} == {DAY, second, third} and _hot(env, second) == 1 and _hot(env, third) == 0
+    assert sorted((b.day, b.part) for b in _blocks(env)) == [(DAY, 1), (second, number), (third, 1)]
+    assert _hot(env, second) == 1 and _hot(env, third) == 0
     assert "block-unsealed" in ai.open_failures(env.st.head_store().load())
 
 
