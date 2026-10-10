@@ -8,7 +8,8 @@ administrator's. The live signal reaches a live auditor's own session. A case se
 rows and its vaults; its auditor, while it gives access, reads the names it lets them read (in its folders and time
 range, never zero-knowledge, a password vault once unlocked), and a page that shows one is recorded once per set of
 events in ten minutes. Where only the vault's password hides a name the case would show, its auditor (a member of the
-vault or not) is told so and offered it, and no one else. test_activity_auditor_live.py runs it on a stack.
+vault or not) is told so and offered it, and no one else; what their own unlock on the Activity page shows stays.
+test_activity_auditor_live.py runs it on a stack.
 """
 # ruff: noqa: F811 -- the fixtures of _case_access_helpers are imported by name and used as parameters
 import uuid
@@ -664,3 +665,37 @@ def test_the_events_route_offers_the_password_to_the_cases_auditor_only(db, peop
     theirs = asr.search_events(asr.EventsSearch(case=str(w.case.id), limit=100), request, current_user=people.bob,
                                db=db)
     assert not any(ac.UNLOCK_IN_CASE in e for e in theirs["events"])
+
+
+def test_what_the_viewers_own_unlock_shows_stays_and_is_not_offered_again(db, people, storage, monkeypatch):
+    """The case's auditor reads the vault and unlocked its names on the Activity page with their own receipt (an
+    administrator may hold the auditor right). With the case selected, through the Events list and one event, each
+    item keeps what that unlock shows (the name as recorded, or that none was) and nothing is offered. The control:
+    the same reader without their receipt is told the password hides the names, and offered it in the case."""
+    from app.core import audit_privacy
+    from app.core import vault_unlock_receipts as receipts
+    w = _locked_world(db, people, storage)
+    w.rows[0].recorded = {"names": {"vault": str(w.pv.id), "values": {
+        "file_name": {"fp": "fp1", "sealed": "sealed-file"}}}}
+    db.commit()
+    monkeypatch.setattr(audit_privacy, "open_name", lambda vault, row_id, key, sealed: f"opened:{sealed}")
+    monkeypatch.setattr(an, "readable_vault_ids", lambda db_, viewer, ids: set(ids))
+    own = receipts.issue(purpose=receipts.PURPOSE_ACTIVITY, session_hash=SESSION, vault_id=w.pv.id,
+                         user_id=people.uma.id, credential=receipts.credential_digest(w.pv.password_hash))[0]
+    wanted = [str(r.id) for r in w.rows]
+
+    def read(headers):
+        request = SimpleNamespace(headers=headers)
+        out = asr.search_events(asr.EventsSearch(case=str(w.case.id), limit=100), request, current_user=people.uma,
+                                db=db)
+        listed = {e["id"]: e for e in out["events"]}
+        one = api.activity_event(wanted[0], case=str(w.case.id), request=request, current_user=people.uma, db=db)
+        return [listed[i] for i in wanted], one
+
+    views, one = read({})
+    assert _offered(views) == OFFERED and one[ac.UNLOCK_IN_CASE] is True, "the control: hidden, and offered"
+    assert views[0]["names"]["item"] == one["names"]["item"] == an.PASSWORD_HIDDEN
+    views, one = read({an.UNLOCK_HEADER: f"{w.pv.id}:{own}"})
+    assert not any(_offered(views)) and ac.UNLOCK_IN_CASE not in one
+    assert views[0]["names"]["item"] == one["names"]["item"] == "opened:sealed-file"
+    assert [v["names"]["item"] for v in views[1:]] == [an.NOT_RECORDED] * 9 + [None]
