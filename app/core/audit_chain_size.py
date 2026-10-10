@@ -152,6 +152,18 @@ def counted(view, start_us: int, held: Set[int]) -> Tuple[Dict[datetime, int], L
     return hot, parts
 
 
+def cap_count(view, record: Optional[dict], now: datetime, delay: timedelta, *, server: bool = True) -> tuple:
+    """What the size cap counts now: (the window's start in microseconds, the seals held back, {hour: lagged bytes}
+    of the hours not archived, the archived parts as counted() gives them, and the total). The pruner's plan
+    (audit_retention.chain_size_plan) and the retention screen's Storage card (retention_storage.cap_counted) both
+    take it from here, so the card shows what the pruner counts. Off the server (a host's verify) nothing is held
+    back."""
+    start_us = window_start(view, record, now, delay, server=server)
+    held = held_back(view, record, start_us) if server else set()
+    by_hour, parts = counted(view, start_us, held)
+    return start_us, held, by_hour, parts, sum(by_hour.values()) + sum(c for _d, _p, c, _h in parts)
+
+
 def protected_hours(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
     """{hour: lagged protected bytes} of every hour with a unit of its own whose rows the size cap never deletes
     count more than nothing, archived or not: the protected bytes its root entries record, counted as the hour's

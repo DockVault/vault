@@ -221,11 +221,8 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
     plan = SizePlan()
     if not numbers.max_mb:
         return plan
-    start_us = chain_size.window_start(view, record, now, delay, server=server)
-    held = chain_size.held_back(view, record, start_us) if server else set()
-    by_hour, parts = chain_size.counted(view, start_us, held)
+    start_us, held, by_hour, parts, plan.counted_bytes = chain_size.cap_count(view, record, now, delay, server=server)
     cap = numbers.max_mb * MB
-    plan.counted_bytes = sum(by_hour.values()) + sum(c for _d, _p, c, _h in parts)
     plan.counted_before = from_us(start_us)
     plan.size = {"cap": cap, "delay": delay.days, "from": fmt.time_text(plan.counted_before),
                  "counted": plan.counted_bytes, "held_back": sorted(held)}

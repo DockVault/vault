@@ -59,7 +59,8 @@ def _archive(db) -> dict:
 
 def cap_counted(now: datetime, st=None) -> Optional[dict]:
     """The size cap and what it counts, when a cap is set: {cap_bytes, counted_bytes, fraction, warn}. None
-    without a cap, or while the chain has nothing verified to count."""
+    without a cap, or while the chain has nothing verified to count. The count is the pruner's own
+    (app/core/audit_chain_size.cap_count, on the server: another writer's seals held back)."""
     from app.core import audit_chain_size as chain_size
     from app.core import audit_integrity as ai
     from app.core import audit_retention as ar
@@ -70,11 +71,7 @@ def cap_counted(now: datetime, st=None) -> Optional[dict]:
     st = st or ai.state()
     if not st.view.position:
         return {"cap_bytes": cap, "counted_bytes": None, "fraction": None, "warn": False}
-    record = st.known_record()
-    start_us = chain_size.window_start(st.view, record, now, ar._delay(), server=True)
-    held = chain_size.held_back(st.view, record, start_us)
-    by_hour, parts = chain_size.counted(st.view, start_us, held)
-    counted = sum(by_hour.values()) + sum(c for _d, _p, c, _h in parts)
+    counted = chain_size.cap_count(st.view, st.known_record(), now, ar._delay())[4]
     fraction = counted / cap
     return {"cap_bytes": cap, "counted_bytes": counted, "fraction": round(fraction, 4), "warn": fraction >= WARN_AT}
 

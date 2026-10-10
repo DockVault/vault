@@ -85,6 +85,32 @@ def test_the_cap_and_what_it_counts_with_a_warning_from_80_percent(env, tmp_path
     assert rs.cap_counted(now, env.st)["warn"] is False
 
 
+def test_the_card_counts_what_the_pruner_counts_with_another_writers_inflated_hour_held_back(env, monkeypatch):
+    """Another writer's prune seal records 50 MB for an hour of 0.1 MB, and the host has not acknowledged it: the
+    card counts the hour's 0.1 MB, as the pruner's plan does (on the server, with the seal held back), not 50 MB
+    as a count without the held-back seals, or off the server, would."""
+    from app.core import audit_integrity as ai
+    from app.core.models import AuditLog
+    from test_audit_chain_size import KB, _big, _inflate
+    from test_audit_chain_trust import _run_to
+    target = T0 - timedelta(days=20)
+    _big(env, target, 100)
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 365, 1))
+    before = rs.cap_counted(env.clock(), env.st)["counted_bytes"]
+    assert 100 * KB <= before < ar.MB
+    inflated = _inflate(env, ai.hour_floor(target), 50 * 1024 * KB)
+    retention.run_pass(env.session, now=env.clock())          # accepted as a warning, not acknowledged
+    assert inflated in ai.unacknowledged_foreign(env.st.view, env.st.known_record())
+    now = env.clock()
+    shown = rs.cap_counted(now, env.st)
+    with env.session() as db:
+        plan = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), now, ar.current(), ar._delay())
+    assert shown["counted_bytes"] == plan.counted_bytes == before and inflated in plan.size["held_back"]
+    assert shown["warn"] is False
+
+
 def test_a_cap_before_the_chain_has_a_view_counts_nothing_yet(env, monkeypatch):
     monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 365, 5))
     env.fresh_process()
