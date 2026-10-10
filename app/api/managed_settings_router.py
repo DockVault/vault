@@ -85,13 +85,14 @@ def change_dict(change) -> Optional[dict]:
 @router.get("/settings/managed")
 def get_managed_settings(current_user: User = Depends(require_interactive_admin),
                          db: Session = Depends(get_db)):
-    """Every managed setting, from this process's copy, the changes waiting (read from the table), and when
-    the audit archive starts and what it holds."""
+    """Every managed setting, from this process's copy, the changes waiting as the audit log's integrity chain
+    holds them (app/core/audit_chain_pending.py: the database's rows neither add to that list nor hide an entry),
+    and when the audit archive starts and what it holds."""
     limit_statements(db)
-    from app.core import audit_archive
+    from app.core import audit_archive, audit_chain_pending
     return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
-            "pending": [change_dict(c) for c in setting_changes.pending_for(db)],
+            "pending": audit_chain_pending.entries(db), "pending_chain": audit_chain_pending.chain_state(),
             "archive": audit_archive.summary()}
 
 
@@ -204,22 +205,18 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
 def cancel_managed_setting_change(change_id: uuid.UUID,
                                   current_user: User = Depends(require_interactive_admin),
                                   db: Session = Depends(get_db)):
-    """Cancel a waiting change, with its audit row in the same transaction; every administrator is told."""
+    """Cancel a waiting change, with its audit row in the same transaction; every administrator is told. The
+    change is one the audit log's integrity chain holds waiting, whatever the database's row says: a row the
+    chain holds no request of is no change (404)."""
     limit_statements(db)
     try:
         try:
             with chain_seals.change_transaction(db.get_bind()) as w:
                 limit_statements(w.db)
-                change = chain_seals.cancel(w, change_id, current_user)
-                details = {"key": change.key, "old": change.old_value, "new": change.new_value,
-                           "requested_by": change.requested_by_name}
-                out = change_dict(change)
+                out = chain_seals.cancel(w, change_id, current_user)
         except audit_integrity.ChainStopped:
             # Saved now, honoured at once (it keeps data longer), sealed from the database once sealing runs.
-            change = setting_changes.cancel(db, change_id, actor=current_user)
-            details = {"key": change.key, "old": change.old_value, "new": change.new_value,
-                       "requested_by": change.requested_by_name}
-            out = change_dict(change)
+            out = chain_seals.cancel_while_stopped(db, change_id, current_user)
             db.commit()
     except audit_integrity.ChainBusy:
         db.rollback()
@@ -235,6 +232,7 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
         registry._say(f"Warning: a cancel of a waiting change was not saved ({type(exc).__name__}: {exc})")
         raise HTTPException(status_code=503, detail="The change was not cancelled: its audit record could not "
                                                     "be written. It is still waiting.")
+    details = {"key": out["key"], "old": out["old"], "new": out["new"], "requested_by": out["requested_by"]}
     setting_changes.announce(setting_changes.CANCELLED_BY_ADMIN, details, current_user.username)
     return {"status": "cancelled", "change": out}
 

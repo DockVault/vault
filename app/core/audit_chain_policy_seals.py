@@ -347,30 +347,67 @@ def refuse_cancel_of_applied(w, change_id, key: str) -> None:
         f"back to {registry.shown(spec, back) if spec is not None else back}.")
 
 
-def cancel(w, change_id, actor):
-    """An administrator's cancel of a waiting change in the chain writer ``w``'s transaction: refused for a
-    change another writer's seal applied, then the database's rows and audit row (setting_changes.cancel), and
-    its ``cancel`` seal."""
+def held_request(view, change_id) -> int:
+    """The seq of the setting request the chain holds for change ``change_id``, whether waiting or not. Raises
+    LookupError when the chain holds none: a row of the database alone names no change that can be cancelled."""
+    req = request_seq_for(view, change_id)
+    if req is None or (view.requests.get(req) or {}).get("what") != "setting":
+        raise LookupError(change_id)
+    return req
+
+
+def refuse_unless_waiting(view, req: int) -> None:
+    """SettingRefused, saying how it ended, unless the chain holds request ``req`` waiting."""
+    from app.core import audit_chain_pending as pending
+    if req not in view.pending_requests():
+        raise registry.SettingRefused(f"This change is no longer waiting: it was {pending.ended_as(view, req)}.")
+
+
+def cancel(w, change_id, actor) -> dict:
+    """An administrator's cancel of a waiting change in the chain writer ``w``'s transaction. The chain decides
+    which change is waiting (app/core/audit_chain_pending.py), whatever the database's row says: one it holds no
+    request of is refused (LookupError), one another writer's seal applied is refused with the way back, and one
+    no longer waiting is refused saying how it ended (SettingRefused). Then the row, when there is one, and the
+    audit row (setting_changes.cancel_held), and its ``cancel`` seal. Returns the change as the chain held it,
+    ended."""
+    from app.core import audit_chain_pending as pending
+    from app.core import setting_changes
+    view = w.st.view
+    req = held_request(view, change_id)
+    held = view.requests[req]
+    refuse_cancel_of_applied(w, change_id, held.get("setting"))
+    refuse_unless_waiting(view, req)
+    entry = pending.entry(w.db, view, w.record, req, w.st.clock())
+    out = setting_changes.cancel_held(w.db, change_id, entry, actor=actor, now=w.st.clock())
+    row = out.pop("_audit_row")
+    w.append("cancel", detail={"cancels": req, "request": held.get("request"),
+                               "audit_row": _uuid_text(getattr(row, "id", None)), **_actor_fields(actor)})
+    return out
+
+
+def cancel_while_stopped(db, change_id, actor, st=None) -> dict:
+    """An administrator's cancel while sealing is stopped, in ``db``'s transaction: the change must be one this
+    process's view holds waiting (else LookupError, or SettingRefused saying how it ended); its row is marked
+    cancelled with its audit row (setting_changes.cancel), and the next pass seals the cancel from the database.
+    A change whose row the database no longer shows waiting already does not apply: SettingRefused, saying so.
+    Returns the change as the chain holds it, ended."""
+    from app.core import audit_chain_pending as pending
     from app.core import setting_changes
     from app.core.models import ManagedSettingChange as Change
-    row = w.db.get(Change, change_id)
-    if row is not None:
-        refuse_cancel_of_applied(w, change_id, row.key)
-    change = setting_changes.cancel(w.db, change_id, actor=actor)
-    seal_cancel(w, change, actor)
-    return change
-
-
-def seal_cancel(w, change, actor) -> None:
-    view = w.st.view
-    req = request_seq_for(view, change.id)
-    w.commit_without_seal = True
-    refuse_cancel_of_applied(w, change.id, change.key)
-    if req is None or req not in view.pending_requests():
-        return
-    row = getattr(change, "_audit_row", None)
-    w.append("cancel", detail={"cancels": req, "request": str(change.id),
-                               "audit_row": _uuid_text(getattr(row, "id", None)), **_actor_fields(actor)})
+    st = st or _ai().state()
+    view = st.view
+    req = held_request(view, change_id)
+    refuse_unless_waiting(view, req)
+    entry = pending.entry(db, view, st.known_record(), req, st.clock())
+    row = db.get(Change, change_id)
+    if row is None or row.status != setting_changes.PENDING:
+        said = f"marks this change {row.status}" if row is not None else "holds no row of this change"
+        raise registry.SettingRefused(f"The database {said}, so it does not apply; the audit log records its end "
+                                      "once sealing runs again.")
+    now = st.clock()
+    setting_changes.cancel(db, change_id, actor=actor, now=now)
+    return dict(entry, status=setting_changes.CANCELLED, decided_by=actor.username, decided_at=now.isoformat() + "Z",
+                reason="cancelled")
 
 
 def request_seq_for(view, change_id) -> Optional[int]:

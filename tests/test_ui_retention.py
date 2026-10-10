@@ -4,7 +4,8 @@ Each setting shows the value in force with a badge saying where it comes from; a
 served its own description with one locked) and one only .env sets show the .env line instead of a field. A change
 that deletes records sooner first shows what it would delete (the preview) and asks to confirm: dismissed, nothing
 is sent; confirmed, it asks for the password and then waits in the list of changes, where any administrator can
-cancel it. The Storage card warns from 80 % of the size cap; an install that ran before this release is told what
+cancel it. That list is the audit chain's: it says beside a change what the database says when that differs, and
+which changes wait for the host operator. The Storage card warns from 80 % of the size cap; an install that ran before this release is told what
 changed, once per browser; the screen fits a phone. No console error.
 """
 import json
@@ -151,6 +152,57 @@ def test_a_change_waits_and_any_administrator_can_cancel_it(page: Page, admin_cr
         assert not [c for c in admin.get("/settings/managed").json()["pending"] if c["key"] == key]
     finally:
         _cancel_waiting(admin, key)
+
+
+def _waiting_entry(**over):
+    entry = {"id": "x", "request_seq": 11, "key": "security_record_days", "label": "Keep failed sign-ins in full for",
+             "old": 30, "new": 20, "setting": 20, "status": "pending", "requested_by": "ada",
+             "requested_at": "2026-10-01T10:00:00Z", "effective_at": "2026-10-08T10:00:00Z", "another_writer": False,
+             "waits_for_host": False, "applied_by": None, "counts_from": None, "cancellable": True, "database": None,
+             "decided_by": None, "decided_at": None, "reason": None}
+    entry.update(over)
+    return entry
+
+
+def test_the_waiting_list_says_what_the_chain_holds_beside_each_change(page: Page, admin_creds):
+    """The list is the audit chain's (served here): a change the database marks cancelled says so and can still be
+    cancelled; one another writer added waits for the host; one another writer's seal applied cannot be cancelled;
+    a stop of sealing is said above the list."""
+    def edit(data):
+        data["pending"] = [
+            _waiting_entry(id="a", request_seq=11, database="cancelled"),
+            _waiting_entry(id="b", request_seq=12, another_writer=True, waits_for_host=True),
+            _waiting_entry(id="c", request_seq=13, status="applied-waiting-for-host", applied_by=14,
+                           waits_for_host=True, cancellable=False)]
+        data["pending_chain"] = {"read": True, "stopped": "head-record-mismatch"}
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _serve_managed(page, edit)
+    _open(page)
+    box = page.locator("#retention-pending")
+    items = box.locator(".retention-change")
+    expect(items).to_have_count(3, timeout=10000)
+    expect(box).to_contain_text("Sealing is stopped just now (head-record-mismatch)")
+    expect(items.nth(0)).to_contain_text("The database marks this change cancelled")
+    expect(items.nth(0).locator(".retention-cancel")).to_have_count(1)
+    expect(items.nth(1)).to_contain_text("Another writer added this request")
+    expect(items.nth(1)).to_contain_text("waits for the host operator")
+    expect(items.nth(1).locator(".retention-cancel")).to_have_count(1)
+    expect(items.nth(2)).to_contain_text("Applied by seal 14")
+    expect(items.nth(2)).to_contain_text("can no longer be cancelled")
+    expect(items.nth(2).locator(".retention-cancel")).to_have_count(0)
+    expect(items.nth(1)).not_to_contain_text("The database")
+
+
+def test_before_the_chain_is_read_the_list_says_so(page: Page, admin_creds):
+    def edit(data):
+        data["pending"] = []
+        data["pending_chain"] = {"read": False, "stopped": None}
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _serve_managed(page, edit)
+    _open(page)
+    box = page.locator("#retention-pending")
+    expect(box).to_contain_text("which this server has not read yet", timeout=10000)
+    expect(box).not_to_contain_text("No change is waiting.")
 
 
 def test_the_storage_card_warns_from_80_percent_of_the_cap(page: Page, admin_creds):

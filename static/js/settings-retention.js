@@ -8,7 +8,9 @@
  * Each change is saved on its own: the server asks for the password every time (apiRequest prompts for it). A
  * change that deletes records sooner first shows what it would delete (the audit numbers: the preview, as the
  * audit job counts) and asks to confirm; it then waits the deployment's delay, during which any administrator can
- * cancel it from the list of waiting changes. The Storage card shows what the audit log and its archive take, what
+ * cancel it from the list of waiting changes. That list is the audit log's integrity chain's (what the pruner
+ * applies), never the database's rows: beside a change the database no longer shows waiting it says so, and a
+ * change another writer added says it waits for the host operator. The Storage card shows what the audit log and its archive take, what
  * the size cap counts (a warning from 80 % of it), the files' volume's free space, the archive's progress and the
  * integrity status. An install that ran before this release is told what it changed, once per browser.
  *
@@ -236,24 +238,56 @@
         if (!box || !S.data) return;
         box.replaceChildren();
         const pending = S.data.pending || [];
+        const chain = S.data.pending_chain || {};
+        if (chain.read === false) {
+            box.appendChild(el('p', 'text-secondary retention-pending-chain',
+                'The changes waiting are read from the audit log\'s integrity chain, which this server has not ' +
+                'read yet; no change applies until it has.'));
+        } else if (chain.stopped) {
+            box.appendChild(el('p', 'text-secondary retention-pending-chain',
+                `Sealing is stopped just now (${chain.stopped}): no change applies until it runs again.`));
+        }
         if (!pending.length) {
-            box.appendChild(el('p', 'text-secondary', 'No change is waiting.'));
+            if (chain.read !== false) box.appendChild(el('p', 'text-secondary', 'No change is waiting.'));
             return;
         }
+        // The list is the audit log's integrity chain's (what the pruner acts on), never the database's rows.
         pending.forEach((c) => {
             const row = rowOf(c.key);
             const item = el('div', 'retention-change');
             item.dataset.change = c.id;
-            const to = c.new == null ? `the deployment's value (${shown(row, row.deployment)})` : shown(row, c.new);
+            item.dataset.request = String(c.request_seq);
+            const to = c.setting == null ? `the deployment's value (${shown(row, c.new)})` : shown(row, c.new);
             item.appendChild(el('p', null, `${c.label}: ${shown(row, c.old)} to ${to}.`));
-            item.appendChild(el('p', 'text-secondary text-sm',
-                `Asked by ${c.requested_by || 'an administrator'} on ${when(c.requested_at)}; applies on ` +
-                `${when(c.effective_at)} unless an administrator cancels it.`));
-            const cancel = el('button', 'btn btn-outline btn-sm retention-cancel', 'Cancel this change');
-            cancel.type = 'button';
-            cancel.disabled = S.busy;
-            cancel.addEventListener('click', () => cancelChange(c));
-            item.appendChild(cancel);
+            const asked = `Asked by ${c.requested_by || 'an administrator'} on ${when(c.requested_at)}`;
+            let text;
+            if (c.applied_by != null) {
+                const counts = c.counts_from ? `from ${when(c.counts_from)}`
+                    : `once acknowledged, and no earlier than ${when(c.effective_at)}`;
+                text = `${asked}. Applied by seal ${c.applied_by}, which another writer added to the audit log and ` +
+                    `which waits for the host operator (dockvault.py audit acknowledge); its value counts ${counts}. ` +
+                    'It can no longer be cancelled: to keep the current value, change the setting back.';
+            } else if (c.waits_for_host) {
+                text = `${asked}. Another writer added this request to the audit log: it waits for the host ` +
+                    'operator (dockvault.py audit acknowledge), and applies no earlier than ' +
+                    `${when(c.effective_at)} unless an administrator cancels it.`;
+            } else {
+                text = `${asked}; applies on ${when(c.effective_at)} unless an administrator cancels it.`;
+            }
+            item.appendChild(el('p', 'text-secondary text-sm', text));
+            if (c.database) {
+                const said = c.database === 'missing' ? 'holds no row of this change' : `marks this change ${c.database}`;
+                item.appendChild(el('p', 'text-secondary text-sm retention-change-database',
+                    `The database ${said}: it does not apply while the database says so. Cancel it here to ` +
+                    'record the cancel in the audit log now.'));
+            }
+            if (c.cancellable) {
+                const cancel = el('button', 'btn btn-outline btn-sm retention-cancel', 'Cancel this change');
+                cancel.type = 'button';
+                cancel.disabled = S.busy;
+                cancel.addEventListener('click', () => cancelChange(c));
+                item.appendChild(cancel);
+            }
             box.appendChild(item);
         });
     }

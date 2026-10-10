@@ -241,6 +241,27 @@ def cancel(db, change_id, *, actor, now: Optional[datetime] = None):
     return change
 
 
+def cancel_held(db, change_id, held: dict, *, actor, now: Optional[datetime] = None) -> dict:
+    """Cancel a change the audit log's integrity chain holds waiting, by any administrator, in ``db``'s
+    transaction, with its audit row. ``held`` is the change as the chain holds it (an entry of
+    app/core/audit_chain_pending.py): the audit row and the answer say what the chain sealed, and the database's
+    row, when there is one, is marked cancelled whatever it said, so an edited or deleted row neither keeps the
+    change from being cancelled nor changes what is recorded. Returns the entry, ended, with the audit row under
+    ``_audit_row`` (for the cancel's seal)."""
+    from app.core.models import ManagedSettingChange as Change
+    now = now or utcnow()
+    _lock(db)
+    row = db.get(Change, change_id)
+    if row is not None:
+        _end(row, CANCELLED, by_id=actor.id, by_name=actor.username, now=now, reason="cancelled")
+    out = dict(held, status=CANCELLED, decided_by=actor.username, decided_at=now.isoformat() + "Z",
+               reason="cancelled")
+    out["_audit_row"] = _audit(db, CANCELLED_ACTION, user=actor, key=held["key"], details={
+        "key": held["key"], "change_id": str(change_id), "old": held["old"], "new": held["new"],
+        "setting": held["setting"], "requested_by": held["requested_by"]})
+    return out
+
+
 def apply_due(session_factory: Callable, *, now: Optional[datetime] = None, limit_statements=None) -> list:
     """Apply every pending change that is due, one per transaction, each with its audit row, and tell every
     administrator. A change the deployment has meanwhile locked or taken out of the panel's hands ends as

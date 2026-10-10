@@ -48,8 +48,7 @@ def _change(env, actor, key, value):
 
 def _cancel(env, actor, change_id):
     with ps.change_transaction(env.engine) as w:
-        change = sc.cancel(w.db, change_id, actor=actor, now=env.clock())
-        ps.seal_cancel(w, change, actor)
+        ps.cancel(w, change_id, actor)
 
 
 def _passes(env, hours, step=6):

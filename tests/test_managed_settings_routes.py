@@ -393,6 +393,87 @@ def test_a_cancel_whose_audit_row_cannot_be_written_leaves_the_change_waiting(en
     assert len(quiet["announced"]) == 1
 
 
+def _waiting(db, user):
+    return routes.get_managed_settings(current_user=user, db=db)["pending"]
+
+
+def _planted(db, user, key="keep_days"):
+    """A pending row written straight into the database, with no request seal."""
+    from datetime import datetime, timedelta
+    planted = uuid.uuid4()
+    now = datetime.utcnow()
+    db.add(ManagedSettingChange(id=planted, key=key, setting=1, old_value=30, new_value=1, status=sc.PENDING,
+                                requested_by=user.id, requested_by_name=user.username, requested_at=now,
+                                effective_at=now + timedelta(days=7)))
+    db.commit()
+    return planted
+
+
+def test_the_changes_waiting_and_their_cancel_come_from_the_chain_not_the_table(env, db, quiet):
+    """The row's values and date edited: the list shows what the request seal holds. The row marked cancelled:
+    still listed, with what the database says, and another administrator's cancel is sealed. A row planted with
+    no request seal: not listed, and its cancel is no change (404), with no audit row and no seal."""
+    from datetime import timedelta
+    from app.core.models import AuditSeal
+    alice, bob = _admin(db), _admin(db, "bob")
+    sealed = _put(db, alice, "keep_days", 10)["change"]
+    change_id = uuid.UUID(sealed["id"])
+    row = db.get(ManagedSettingChange, change_id)
+    row.new_value, row.setting, row.effective_at = 400, 400, row.effective_at + timedelta(days=300)
+    db.commit()
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["old"], e["setting"], e["new"], e["requested_by"]) == (sealed["id"], 30, 10, 10, "alice")
+    assert e["effective_at"].rstrip("Z") == sealed["effective_at"].rstrip("Z") and e["database"] is None
+    row.status = sc.CANCELLED
+    db.commit()
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (sealed["id"], "cancelled", True)
+    out = routes.cancel_managed_setting_change(change_id, current_user=bob, db=db)
+    assert (out["status"], out["change"]["decided_by"], out["change"]["new"]) == ("cancelled", "bob", 10)
+    assert quiet["announced"][-1] == (sc.CANCELLED_BY_ADMIN, "keep_days", 30, 10, "bob")
+    newest = db.query(AuditSeal).order_by(AuditSeal.seq.desc()).first()
+    assert (newest.kind, newest.detail["request"], newest.detail["by"]) == ("cancel", sealed["id"], "admin")
+    assert _waiting(db, alice) == []
+    planted = _planted(db, alice)
+    assert _waiting(db, alice) == []
+    seals, rows = db.query(AuditSeal).count(), db.query(AuditLog).count()
+    with refused(404):
+        routes.cancel_managed_setting_change(planted, current_user=bob, db=db)
+    assert (db.query(AuditSeal).count(), db.query(AuditLog).count()) == (seals, rows)
+    assert db.get(ManagedSettingChange, planted).status == sc.PENDING
+
+
+def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_waiting(env, db, quiet):
+    """The chain's tail cut: sealing stops, the view keeps what it authenticated. A cancel of the waiting change
+    is saved on its row (sealed from the database once sealing runs again); a row planted with no request seal is
+    no change (404); a waiting change whose row the database marks ended already does not apply (409, saying so)."""
+    from app.core.models import AuditSeal
+    alice = _admin(db)
+    first = uuid.UUID(_put(db, alice, "keep_days", 10)["change"]["id"])
+    second = uuid.UUID(_put(db, alice, "keep_days", 20)["change"]["id"])     # supersedes the first
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    seals = db.query(AuditSeal).count()
+    with refused(404):
+        routes.cancel_managed_setting_change(_planted(db, alice), current_user=alice, db=db)
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(first, current_user=alice, db=db)
+    assert caught.value.detail == "This change is no longer waiting: it was superseded."
+    db.get(ManagedSettingChange, second).status = sc.SUPERSEDED
+    db.commit()
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(second, current_user=alice, db=db)
+    assert "marks this change superseded, so it does not apply" in caught.value.detail
+    db.get(ManagedSettingChange, second).status = sc.PENDING
+    db.commit()
+    out = routes.cancel_managed_setting_change(second, current_user=alice, db=db)
+    assert (out["status"], out["change"]["setting"], out["change"]["decided_by"]) == ("cancelled", 20, "alice")
+    assert db.get(ManagedSettingChange, second).status == sc.CANCELLED
+    assert db.query(AuditSeal).count() == seals
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"]) == (str(second), "cancelled")
+
+
 def test_while_sealing_is_stopped_a_reduction_is_refused_and_a_longer_value_is_saved(env, db, chain):
     from app.core.models import AuditSeal
     db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
