@@ -40,7 +40,7 @@ def _node(body: str) -> dict:
     return json.loads(done.stdout)
 
 
-PAGE = """
+STUBS = """
 class N {
     constructor(tag, cls, text) { this.tag = tag; this.className = cls || ''; this.textContent = text || '';
                                   this.children = []; this.attrs = {}; this.handlers = {}; this.disabled = false; }
@@ -71,11 +71,16 @@ const get = async (path) => {
     return { id: S.selectedId, old: false };
 };
 const forms = (box) => box.children.filter((c) => c.tag === 'form');
-""" + _fn("reloadAfterUnlock") + _fn("auditorActions")
+"""
+
+
+def _page() -> str:
+    """The stand-ins, then the two shipped functions (read when a test runs, so a missing one fails that test)."""
+    return STUBS + _fn("reloadAfterUnlock") + _fn("auditorActions")
 
 
 def _offered(ev: dict, case="'case-1'", extra="") -> bool:
-    out = _node(PAGE + f"""
+    out = _node(_page() + f"""
 S.caseId = {case};
 {extra}
 const box = auditorActions({json.dumps(ev)}, 'vault-1', {json.dumps(ev.get("names", {}))});
@@ -106,7 +111,7 @@ def test_the_form_is_offered_nowhere_else(ev, case, extra):
 
 
 def test_the_password_goes_to_the_cases_unlock_and_the_details_are_read_again():
-    out = _node(PAGE + """
+    out = _node(_page() + """
 (async () => {
     const box = auditorActions({ id: 'ev-1', unlock_in_case: true }, 'vault-1', { item: 'x' });
     const form = forms(box)[0];
@@ -148,7 +153,7 @@ def test_the_password_goes_to_the_cases_unlock_and_the_details_are_read_again():
     ("S.rows = []; S.detailOpen = false;", [["reloadList", True], ["renderDetail", "old"]]),
 ])
 def test_after_an_unlock_the_details_never_keep_what_they_showed_before(state, expected):
-    out = _node(PAGE + state + """
+    out = _node(_page() + state + """
 (async () => {
     await reloadAfterUnlock();
     console.log(JSON.stringify({ calls }));
