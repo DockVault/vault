@@ -40,6 +40,7 @@ READABLE = "readable"
 CAP = "reveal_cap"
 BAD_REASON = "bad_reason"
 NO_REASON = "no_reason"
+LONG_REASON = "reason_too_long"
 
 TEXTS = {
     NO_SUCH_EVENT: "There is no such event in the log.",
@@ -51,9 +52,10 @@ TEXTS = {
     CAP: "You have revealed as many names today as this deployment allows (COMPLIANCE_REVEALS_PER_DAY).",
     BAD_REASON: "Choose the reason's category from the list.",
     NO_REASON: "Say why you reveal it.",
+    LONG_REASON: f"Say why you reveal it in at most {REASON_MAX:,} characters.",
 }
 STATUS = {NO_SUCH_EVENT: 404, NO_VAULT: 409, VAULT_GONE: 409, ZERO_KNOWLEDGE: 403, PASSWORD_VAULT: 403,
-          READABLE: 409, CAP: 429, BAD_REASON: 422, NO_REASON: 422}
+          READABLE: 409, CAP: 429, BAD_REASON: 422, NO_REASON: 422, LONG_REASON: 422}
 
 
 class RevealRefused(Exception):
@@ -80,13 +82,16 @@ def day_start(now: datetime) -> datetime:
 
 
 def check_reason(category: Optional[str], text: Optional[str]) -> str:
-    """The reason's text, stripped. Raises RevealRefused (422, not recorded) for one missing or not on the list."""
+    """The reason's text, stripped. Raises RevealRefused (422, not recorded) for one missing, not on the list, or
+    longer than REASON_MAX: the reason is sealed whole, never cut short."""
     if category not in REASONS:
         raise RevealRefused(BAD_REASON, record=False)
     cleaned = (text or "").strip()
     if not cleaned:
         raise RevealRefused(NO_REASON, record=False)
-    return cleaned[:REASON_MAX]
+    if len(cleaned) > REASON_MAX:
+        raise RevealRefused(LONG_REASON, record=False)
+    return cleaned
 
 
 def _event_vault(row) -> Optional[uuid.UUID]:

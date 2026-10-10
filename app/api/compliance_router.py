@@ -1510,6 +1510,8 @@ class _ClosingStreamingResponse(StreamingResponse):
 
 class RevealIn(BaseModel):
     reason_category: str = Field(..., min_length=1, max_length=32)
+    # The reason is sealed whole: a longer one is refused (422), never cut short. Room for surrounding spaces,
+    # which check_reason strips before it counts.
     reason_text: str = Field(..., min_length=1, max_length=4000)
 
 

@@ -96,6 +96,20 @@ def test_a_reason_is_required_and_its_category_is_from_the_list(db, people):
     assert db.query(m.ComplianceReveal).count() == 0 and _rows(db, nr.ACTION, "failure") == []
 
 
+def test_a_reason_longer_than_is_sealed_is_refused_never_cut_short(db, people):
+    """The reason is sealed whole: one past REASON_MAX characters (surrounding spaces aside) is refused, unrecorded
+    and revealing nothing; one of exactly REASON_MAX is sealed as given."""
+    from app.core.security import open_case_field
+    row = _event(db, people.v1, by=people.olga, names={"file_name": "payroll.xlsx"})
+    _, err = _call(_reveal, db, people.uma, row, "security_incident", "x" * (nr.REASON_MAX + 1))
+    assert err.status_code == 422 and err.detail["reason"] == nr.LONG_REASON
+    assert db.query(m.ComplianceReveal).count() == 0 and _rows(db, nr.ACTION, "failure") == []
+    whole = "  " + "y" * nr.REASON_MAX + "  "
+    assert _reveal(db, people.uma, row, "security_incident", whole)["names"] == {"file_name": "payroll.xlsx"}
+    (kept,) = db.query(m.ComplianceReveal).all()
+    assert open_case_field(kept.id, kept.reason_text_enc, "reveal_reason") == "y" * nr.REASON_MAX
+
+
 # --------------------------------------------------------------------------- what is revealed
 
 def test_the_values_kept_in_full_and_nothing_else(db, people, storage):
