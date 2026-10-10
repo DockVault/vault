@@ -9,6 +9,10 @@
     PUT  /settings/managed/{key}                       an administrator's value for one setting;
                                                        ``{"value": null}`` goes back to the deployment's value.
     POST /settings/managed/changes/{change_id}/cancel  cancel a waiting change, by any administrator.
+    GET  /settings/managed/storage                     what the audit log and its archive take, what the size
+                                                       cap counts, the free space of the files' volume, and
+                                                       whether the install ran before this release
+                                                       (app/core/retention_storage.py).
 
 A change that deletes data sooner waits before it applies, and any administrator may cancel it meanwhile
 (app/core/setting_changes.py); every administrator is told of every change. Changing a value asks for the
@@ -233,6 +237,14 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
                                                     "be written. It is still waiting.")
     setting_changes.announce(setting_changes.CANCELLED_BY_ADMIN, details, current_user.username)
     return {"status": "cancelled", "change": out}
+
+
+@router.get("/settings/managed/storage")
+def managed_storage(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """The page's Storage card (app/core/retention_storage.py): reads no row of the audit log."""
+    limit_statements(db)
+    from app.core import config, retention_storage
+    return retention_storage.summary(db, setting_changes.utcnow(), config.settings.file_storage_path)
 
 
 # A preview counts over the whole audit table, so it may take longer than a change.

@@ -2950,6 +2950,28 @@
                     <!-- Activity and records: what the audit log records (static/js/settings-records.js). Saved on its
                          own, with the password, never by "Save All Changes". -->
                     <div id="settings-tab-records" class="settings-tab-content">
+                        <!-- How long records are kept (static/js/settings-retention.js): each change is saved on its
+                             own, with the password, never by "Save All Changes". -->
+                        <div class="alert alert-info retention-banner mb-lg" id="retention-banner" role="status" hidden></div>
+                        <div class="card mb-lg" id="retention-card">
+                            <div class="card-header"><h3>How long records are kept</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">
+                                    The audit log is kept for good unless a limit below says otherwise: events stay as
+                                    rows for a while, then move into compressed daily blocks, which the Activity page
+                                    still searches. A change that deletes records sooner waits before it applies, and
+                                    any administrator can cancel it meanwhile; every administrator is told. Each change
+                                    asks for your password.
+                                </p>
+                                <div id="retention-groups"></div>
+                                <h4 class="mt-lg">Changes waiting</h4>
+                                <div id="retention-pending"></div>
+                            </div>
+                        </div>
+                        <div class="card mb-lg" id="retention-storage-card">
+                            <div class="card-header"><h3>Storage</h3></div>
+                            <div class="p-lg" id="retention-storage"></div>
+                        </div>
                         <div class="card mb-lg" id="recording-levels-card">
                             <div class="card-header"><h3>What is recorded</h3></div>
                             <div class="p-lg">
@@ -4073,6 +4095,7 @@
     <script src="/static/js/audit-integrity.js?v=20261005a"></script>
     <script src="/static/js/activity-archive.js?v=20261010a"></script>
     <script src="/static/js/settings-records.js?v=20261003a"></script>
+    <script src="/static/js/settings-retention.js?v=20261010a"></script>
     <script src="/static/js/settings-integrity.js?v=20261007a"></script>
     <script src="/static/js/notice-banner.js?v=20261002a"></script>
 </body>
