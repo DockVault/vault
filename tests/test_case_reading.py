@@ -183,8 +183,12 @@ def test_a_folder_case_lists_only_the_way_to_its_folders_above_them(db, people, 
         "the way to the case's folder, without its siblings or the files above it"
     assert [e["name"] for e in _tree(db, people, case, people.v1, board)["entries"]] == ["minutes.txt"]
     _, err = _call(_tree, db, people, case, people.v1, side)
-    assert err.status_code == 404 and err.detail["reason"] == ca.OUT_OF_SCOPE
-    assert (ca.OUT_OF_SCOPE, case.id) in _refused_rows(db)
+    unknown = SimpleNamespace(id=uuid.uuid4())
+    _, err_unknown = _call(_tree, db, people, case, people.v1, unknown)
+    assert err.status_code == err_unknown.status_code == 404
+    assert err.detail == err_unknown.detail == {"reason": ca.NO_SUCH_FOLDER, "text": "No such folder in this case."}, \
+        "a folder of the vault outside the case answers as one that does not exist"
+    assert _refused_rows(db)[-2:] == [(ca.NO_SUCH_FOLDER, case.id)] * 2
 
 
 def test_a_zero_knowledge_vault_lists_its_structure_and_sizes_but_no_name(db, people, storage):

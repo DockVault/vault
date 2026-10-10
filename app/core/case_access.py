@@ -581,7 +581,9 @@ def tree(db, case, user, vault_id, folder_id=None, *, unlocked: Iterable = (), n
     here = folders.chain(fid) if fid is not None else []
     covered = scope is None or (fid is not None and rules.in_scope(scope, fid, here[1:]))
     if fid is not None and not covered and fid not in leading:
-        raise Refused(OUT_OF_SCOPE)
+        # Answered (and recorded) as a folder the case does not know: whether that id is a folder of the vault
+        # outside the case is not the case's to tell.
+        raise Refused(NO_SUCH_FOLDER)
     kept_ok = _kept_readable(db)
     parent = rules.as_id(fid) if fid is not None else None
 
