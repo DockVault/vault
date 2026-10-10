@@ -207,13 +207,14 @@ CASE_TEXT = {"purpose": "internal_investigation", "legal_basis": "legal_obligati
              "owner_note": "Your vault is part of an internal review; nothing is changed in it."}
 
 
-def approved_case(admins, auditor, vault_ids, **extra):
-    """A case the auditor (account, client, recovery codes) asks for on ``vault_ids``, approved by bob, the
-    independent administrator of ``admins`` (_auditor_helpers.two_admins). Returns the case as bob sees it."""
+def approved_case(admins, auditor, vault_ids, *, scope=None, **extra):
+    """A case the auditor (account, client, recovery codes) asks for on ``vault_ids`` (or on ``scope``, its targets as
+    the request takes them), approved by bob, the independent administrator of ``admins``
+    (_auditor_helpers.two_admins). Returns the case as bob sees it."""
     from _auditor_helpers import compliance_receipt
     uma, uma_c, codes = auditor
-    r = uma_c.post("/compliance/cases", json={"scope": [{"kind": "vault", "target_id": v} for v in vault_ids],
-                                              **CASE_TEXT, **extra},
+    targets = scope if scope is not None else [{"kind": "vault", "target_id": v} for v in vault_ids]
+    r = uma_c.post("/compliance/cases", json={"scope": targets, **CASE_TEXT, **extra},
                    headers=compliance_receipt(uma_c, "compliance.case.request", uma["_password"], codes))
     assert r.status_code == 201, r.text
     bob, bob_c, bob_codes = admins["bob"]
