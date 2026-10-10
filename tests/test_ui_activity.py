@@ -1,6 +1,8 @@
 """UI — the Activity page: the summary band, the events list and its detail, wide and on a phone.
 
 Logs in as a THROWAWAY admin, so a skin or preference stored on the shared account cannot change the page."""
+import csv
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -125,9 +127,12 @@ def test_the_events_export_downloads_the_rows_that_match(page: Page, anon, activ
     with page.expect_download() as dl:
         page.click('[data-activity-export="csv"]')
     path = dl.value.path()
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8", newline="") as f:
+        table = list(csv.reader(f))
     assert dl.value.suggested_filename.startswith("activity-") and dl.value.suggested_filename.endswith(".csv")
-    assert text.count("\n") == 2 and name in text
+    # The header and the one row: the closing lines (the audit chain's head once the log is sealed) start with "#".
+    rows = [row for row in table if row and not row[0].startswith("#")]
+    assert len(rows) == 2 and name in rows[1]
     expect(page.locator(".toast").last).to_contain_text("Exported 1 event")
 
 
