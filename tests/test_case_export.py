@@ -491,6 +491,7 @@ def test_a_file_gone_or_now_due_for_its_purge_once_the_stream_began_is_listed_mi
     case = _case(db, people, _vaults(people.v1), can_export=True)
     kept = _kept(db, c)
     parts, _export_id = _stream(db, people, case, [a, b, c])
+    parts.now = ca.utcnow() - timedelta(minutes=5)     # fetched five minutes ago: the purge comes due since
     got = b""
     while len(storage.opened) < 1:
         got += next(parts)
