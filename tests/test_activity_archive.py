@@ -17,6 +17,7 @@ tests/test_activity_archive_live.py.
 """
 import random
 import uuid
+from pathlib import Path
 from datetime import datetime, time, timedelta
 
 import pytest
@@ -636,3 +637,38 @@ def test_the_archived_days_an_export_read_are_recorded_as_a_count():
     events = api.split('@app.get("/activity/events")', 1)[1].split("\n@app.", 1)[0]
     assert "except archive.TooBroad as exc:" in events and "status_code=400" in events
     assert 'out["archive"] = src.note' in events
+
+
+def test_an_exports_close_waits_for_a_batch_in_flight_and_ends_the_search_once():
+    import contextlib
+    import threading
+    closes = []
+    stack = contextlib.ExitStack()
+    stack.callback(lambda: closes.append(threading.current_thread().name))
+    held = archive.Held(stack)
+    started, release = threading.Event(), threading.Event()
+    order = []
+
+    def batch():
+        started.set()
+        release.wait(5)
+        order.append("batch")
+        return "rows"
+    reader = threading.Thread(target=lambda: order.append(held.read(batch)), name="reader")
+    reader.start()
+    assert started.wait(5)
+    closer = threading.Thread(target=lambda: (held.close(), order.append("closed")), name="closer")
+    closer.start()
+    closer.join(0.3)
+    assert closer.is_alive() and closes == []           # the close waits for the batch in flight
+    release.set()
+    reader.join(5)
+    closer.join(5)
+    assert order == ["batch", "rows", "closed"] and closes == ["closer"]
+    assert held.read(lambda: "more") is None             # nothing is read after the close
+    held.close()
+    assert closes == ["closer"]                          # closed once
+    src = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    export = src.split('@app.get("/activity/export")', 1)[1].split("\n@app.", 1)[0]
+    assert "return held.read(lambda: from_search(after)) or ([], None)" in export
+    assert "background=BackgroundTask(held.close)" in export

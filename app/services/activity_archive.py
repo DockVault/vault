@@ -381,6 +381,32 @@ def source(db, start: Optional[datetime], end: Optional[datetime], st=None) -> I
         yield Source(s.db, s.entity, note)
 
 
+class Held:
+    """A search an export streams from (``stack`` holds it open): its batches and its close one at a time. The
+    response's background task may close it while a batch is still being read in a worker thread (the client went
+    away); the close then waits for that batch, and a batch asked for after the close reads nothing. Closed once."""
+
+    def __init__(self, stack: contextlib.ExitStack):
+        import threading
+        self._stack = stack
+        self._lock = threading.Lock()
+        self.closed = False
+
+    def read(self, fn: Callable):
+        """``fn()``, or None once the search is closed."""
+        with self._lock:
+            if self.closed:
+                return None
+            return fn()
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            self._stack.close()
+
+
 # --------------------------------------------------------------------------- the summary band
 
 # The band's blocks that may count archived hours from aggregates; people and addresses never do.

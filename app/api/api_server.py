@@ -3092,10 +3092,12 @@ def activity_export(
         statuses=status, actions=action, username=user, user_exact=(user_match == "exact"),
         no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
         temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date))
-    # The archive search, when the range needs one, stays open until the export has streamed.
-    held = contextlib.ExitStack()
+    # The archive search, when the range needs one, stays open until the export has streamed; its batches and
+    # its close take turns (activity_archive.Held).
+    stack = contextlib.ExitStack()
+    held = archive.Held(stack)
     try:
-        src = held.enter_context(archive.source(db, filters["start"], filters["end"]))
+        src = stack.enter_context(archive.source(db, filters["start"], filters["end"]))
     except archive.TooBroad as exc:
         held.close()
         raise HTTPException(status_code=400, detail=str(exc))
@@ -3145,11 +3147,14 @@ def activity_export(
             view["recorded_names"] = recorded
         return views
 
+    def from_search(after):
+        got = ev.export_page(src.db.query(src.entity), src.entity, filters, after).all()
+        nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
+        return views_of(src.db, got), nxt
+
     def fetch(after):
-        if searched:                      # every batch from the search's one transaction
-            got = ev.export_page(src.db.query(src.entity), src.entity, filters, after).all()
-            nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
-            return views_of(src.db, got), nxt
+        if searched:                      # every batch from the search's one transaction, until it is closed
+            return held.read(lambda: from_search(after)) or ([], None)
         s = SessionLocal()
         try:
             got = ev.export_page(s.query(AuditLog), AuditLog, filters, after).all()
