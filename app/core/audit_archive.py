@@ -977,6 +977,15 @@ def unarchive_plan(db, view, record: Optional[dict], first: Optional[date], last
     days = _days_in(view, first, last)
     if not days:
         raise host.Refused("no archived day in that range")
+    # A later release's block (its row says so; the write phase checks the block itself) cannot be restored by this
+    # release: refused before anything is restored, rather than stopping at that day with the days before it rows.
+    from app.core.models import AuditArchiveBlock as B
+    later = sorted({_as_date(d).isoformat() for (d,) in db.query(B.day).filter(B.day.in_(days),
+                                                                               B.format > af.FORMAT).all()})
+    if later:
+        raise host.Refused(f"the archived days {', '.join(later)} hold blocks of a later block format, which a later "
+                           "release writes: this release cannot restore them. Leave them out of the range, or "
+                           "unarchive them with that release.")
     est = estimate(db, first, last)
     lines = [f"{len(days)} archived days, {days[0].isoformat()} to {days[-1].isoformat()}: {est['rows']} rows in "
              f"{est['blocks']} blocks, {est['compressed_bytes']} bytes compressed.",

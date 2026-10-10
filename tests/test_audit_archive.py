@@ -2172,11 +2172,34 @@ def test_a_later_releases_block_format_is_a_warning_and_its_day_is_left_as_it_is
     ar.prune(_pass(env), _numbers(max_days=95))
     assert [b.payload for b in _blocks(env)] == [block.payload]
     assert ai.open_failures(env.st.head_store().load()) == {}
-    with pytest.raises(arc.NotVerified, match="a later release writes"):
+    with pytest.raises(host.Refused, match="a later release writes"):         # refused in its read phase
         _unarchive(env)
     assert [b.payload for b in _blocks(env)] == [block.payload] and _hot(env) == 0
     daily = v.daily_check(env.session, env.st, now=env.clock(), force=True)
     assert failures(daily) == [] and "block-later-format" in daily.kinds(v.WARNING)
+
+
+def test_unarchive_refuses_a_later_releases_block_in_its_read_phase(env, monkeypatch):
+    """The read phase names the days whose blocks a later release wrote, and nothing is restored; a range without
+    them is planned as usual. (The write phase checks each block itself, as above.)"""
+    _sealed_day(env)
+    _sealed_day(env, day=DAY + timedelta(days=1))
+    monkeypatch.setattr(af, "FORMAT", 2)
+    _archive(env)
+    monkeypatch.setattr(af, "FORMAT", 1)
+    with env.session() as db:
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == DAY + timedelta(days=1)).update(
+            {AuditArchiveBlock.format: 1}, synchronize_session=False)
+        db.commit()
+    with pytest.raises(host.Refused, match=f"the archived days {DAY.isoformat()} hold blocks of a later block format"):
+        arc.unarchive(env.engine, env.st, None, None, read=True)
+    assert _hot(env) == 0 and len(_blocks(env)) == 2
+    seen = arc.unarchive(env.engine, env.st, DAY + timedelta(days=1), None, read=True)
+    assert seen["estimate"]["days"] == 1
+    # The row's format column is not what the write phase trusts: the block itself is of the later format.
+    with pytest.raises(arc.NotVerified, match="a later release writes"):
+        arc.unarchive(env.engine, env.st, DAY + timedelta(days=1), None, expect=seen["state"])
+    assert _hot(env) == 0 and len(_blocks(env)) == 2
 
 
 def test_a_block_of_this_releases_format_with_other_columns_is_altered(env):

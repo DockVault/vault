@@ -26,6 +26,7 @@ from sqlalchemy import func
 
 from _audit_chain_env import Env, T0, failures
 from app.core import audit_archive as arc
+from app.core import audit_archive_format as af
 from app.core import audit_chain_format as fmt
 from app.core import audit_integrity as ai
 from app.core import retention
@@ -384,6 +385,17 @@ def test_a_block_the_view_does_not_name_is_named_and_not_read(env, monkeypatch):
     with _search(env, at(ARCHIVED[0], 0), at(ARCHIVED[1], 0)) as s:
         assert s.unreadable == {ARCHIVED[0].isoformat(): "block-unsealed"}
         assert len(_ids(s.db, s.entity, {"start": at(ARCHIVED[0], 0), "end": at(ARCHIVED[1], 0)})) == 18
+
+
+def test_a_later_releases_block_is_named_and_not_read(env, monkeypatch):
+    _corpus(env, None)
+    monkeypatch.setattr(af, "FORMAT", 2)
+    _archive_all(env)
+    monkeypatch.setattr(af, "FORMAT", 1)
+    monkeypatch.setattr(archive, "RETRY_PAUSE", 0)
+    with _search(env, at(ARCHIVED[0], 0)) as s:
+        assert s.unreadable == {d.isoformat(): "block-later-format" for d in ARCHIVED}
+        assert s.db.query(func.count()).select_from(sa.table(archive.SEARCH_TABLE)).scalar() == 0
 
 
 def test_rows_of_an_account_deleted_since_they_were_archived_have_no_account(env):
