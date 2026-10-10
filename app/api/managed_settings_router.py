@@ -253,10 +253,12 @@ PREVIEW_STATEMENT_TIMEOUT_MS = 30000
 @router.get("/settings/managed/audit/preview")
 def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[int] = None,
                             admin_min_days: Optional[int] = None, max_mb: Optional[int] = None,
+                            bytes_now: bool = False,
                             current_user: User = Depends(require_interactive_admin),
                             db: Session = Depends(get_db)):
     """What the audit job would delete now if the three numbers were these (each left out: the value in
-    force): rows and bytes by age and by size, by the same conditions the job uses."""
+    force): rows and bytes by age and by size, by the same conditions the job uses. ``bytes_now``: the size cap
+    counts what the log takes now, as it will once growth has waited its delay (the Storage card's warning)."""
     limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)
     from app.core import audit_retention as ar
     numbers = ar.current()
@@ -272,7 +274,7 @@ def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[i
         asked[key] = value
     numbers = ar.Numbers(asked.get(ar.MAX_DAYS, numbers.max_days), asked.get(ar.MIN_DAYS, numbers.min_days),
                          asked.get(ar.ADMIN_MIN_DAYS, numbers.admin_min_days), asked.get(ar.MAX_MB, numbers.max_mb))
-    out = ar.preview(db, setting_changes.utcnow(), numbers)
+    out = ar.preview(db, setting_changes.utcnow(), numbers, bytes_now=bytes_now)
     out["numbers"] = {ar.MAX_DAYS: numbers.max_days, ar.MIN_DAYS: numbers.min_days,
                       ar.ADMIN_MIN_DAYS: numbers.admin_min_days, ar.MAX_MB: numbers.max_mb}
     return out

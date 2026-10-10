@@ -111,11 +111,43 @@ def test_the_card_counts_what_the_pruner_counts_with_another_writers_inflated_ho
     assert shown["warn"] is False
 
 
+def test_the_warning_is_on_the_bytes_now_and_says_when_the_cap_would_start_deleting(env, monkeypatch, tmp_path):
+    """A large row lands in the current hour: before it is sealed the bytes now count it and the card warns at once,
+    though the cap counts nothing new; once sealed, the card says from when the cap would delete (the hour's seal
+    plus the delay)."""
+    from test_audit_chain_size import KB, _big, _sealed_at
+    from test_audit_chain_trust import _run_to
+    for h in range(3):
+        _big(env, T0 - timedelta(days=30, hours=h), 200)
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 365, 1))
+
+    def card():
+        with env.session() as db:
+            return rs.summary(db, env.clock(), str(tmp_path), env.st)["cap"]
+    quiet = card()
+    assert 0 < quiet["counted_bytes"] <= quiet["now_bytes"] < 0.8 * ar.MB and quiet["warn"] is False
+    assert quiet["over_from"] is None
+    at = env.clock() - timedelta(minutes=10)
+    _big(env, at, 700)
+    grown = card()
+    assert grown["counted_bytes"] == quiet["counted_bytes"]
+    assert grown["now_bytes"] >= quiet["now_bytes"] + 700 * KB and grown["warn"] is True
+    assert grown["fraction"] == round(grown["now_bytes"] / ar.MB, 4) and grown["over_from"] is None
+    assert rs.cap_counted(env.clock(), env.st)["now_bytes"] < quiet["now_bytes"] + 700 * KB  # rows not sealed left out
+    _run_to(env, env.clock() + timedelta(hours=3))
+    sealed = card()
+    assert sealed["counted_bytes"] < ar.MB < sealed["now_bytes"] and sealed["warn"] is True
+    over = datetime.fromisoformat(sealed["over_from"].rstrip("Z"))
+    assert abs(over - (_sealed_at(env, at) + timedelta(days=7))) < timedelta(seconds=1)
+
+
 def test_a_cap_before_the_chain_has_a_view_counts_nothing_yet(env, monkeypatch):
     monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 365, 5))
     env.fresh_process()
-    assert rs.cap_counted(T0, env.st) == {"cap_bytes": 5 * ar.MB, "counted_bytes": None, "fraction": None,
-                                          "warn": False}
+    assert rs.cap_counted(T0, env.st) == {"cap_bytes": 5 * ar.MB, "counted_bytes": None, "now_bytes": None,
+                                          "fraction": None, "warn": False, "over_from": None}
 
 
 def test_a_volume_that_cannot_be_read_is_unknown(tmp_path):

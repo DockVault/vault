@@ -6,8 +6,9 @@ app/api/managed_settings_router.py; shown by static/js/settings-retention.js).
   (how far the archive has come: the oldest day still kept as rows);
 - the archive: its blocks, the rows they hold and their bytes, and what its table takes;
 - the size cap when one is set: the bytes it counts (the chain's figure, app/core/audit_chain_size.py: hot hours'
-  lagged bytes and archived parts' bound lengths, read from the verified view, no row read), the cap, and a
-  warning once they reach WARN_AT of it;
+  lagged bytes and archived parts' bound lengths, read from the verified view), the bytes the log takes now as the
+  cap will count them once growth has waited its delay (the hours' figures now and the rows not sealed yet), the
+  cap, and a warning once the bytes now reach WARN_AT of it, with the earliest day the cap would start deleting;
 - the free space of the volume the vault's files are stored in. The database's volume is in another container: the
   app cannot see its free space (``dockvault.py audit unarchive`` checks it on the host before it restores rows);
 - whether the install was running before this release: its audit log has rows older than the release's first
@@ -57,10 +58,35 @@ def _archive(db) -> dict:
             "table_bytes": int(table) if table is not None else None}
 
 
-def cap_counted(now: datetime, st=None) -> Optional[dict]:
-    """The size cap and what it counts, when a cap is set: {cap_bytes, counted_bytes, fraction, warn}. None
-    without a cap, or while the chain has nothing verified to count. The count is the pruner's own
-    (app/core/audit_chain_size.cap_count, on the server: another writer's seals held back)."""
+def _sealed_through(view) -> Optional[datetime]:
+    """The end of the newest hour the chain has sealed, or None before the first."""
+    end = None
+    for _start, unit_end, _last in view.units():
+        end = unit_end if end is None or unit_end > end else end
+    return end
+
+
+def unsealed_bytes(db, view) -> int:
+    """What the audit rows not sealed yet take (those after the newest sealed hour), as the size cap counts a row's
+    bytes; the timestamp's index finds them."""
+    from app.core import audit_retention as ar
+    from app.core.models import AuditLog
+    through = _sealed_through(view)
+    if through is None:
+        return 0
+    size = ar._row_bytes(AuditLog, db.get_bind().dialect.name)
+    return int(db.query(func.coalesce(func.sum(size), 0)).filter(AuditLog.timestamp >= through).scalar() or 0)
+
+
+def cap_counted(now: datetime, st=None, db=None) -> Optional[dict]:
+    """The size cap, when one is set: {cap_bytes, counted_bytes, now_bytes, fraction, warn, over_from}. None without
+    a cap. ``counted_bytes`` is what the cap counts (the chain's, which takes growth in only a delay of sealing after
+    it); ``now_bytes`` what the log takes now as the cap would count it once that delay has run: every hour's figure
+    now (app/core/audit_chain_size.now_count), and, given ``db``, the rows not sealed yet. The warning is on the
+    bytes now, from WARN_AT of the cap, so a sudden growth is warned of before the cap counts it; ``over_from`` is
+    the earliest the cap's count passes the cap on what is sealed now (None when it does not), the day it would
+    start deleting unless the cap is raised or the hold turned on. ``counted_bytes`` is None while the chain has
+    nothing verified to count."""
     from app.core import audit_chain_size as chain_size
     from app.core import audit_integrity as ai
     from app.core import audit_retention as ar
@@ -70,10 +96,16 @@ def cap_counted(now: datetime, st=None) -> Optional[dict]:
     cap = numbers.max_mb * ar.MB
     st = st or ai.state()
     if not st.view.position:
-        return {"cap_bytes": cap, "counted_bytes": None, "fraction": None, "warn": False}
-    counted = chain_size.cap_count(st.view, st.known_record(), now, ar._delay())[4]
-    fraction = counted / cap
-    return {"cap_bytes": cap, "counted_bytes": counted, "fraction": round(fraction, 4), "warn": fraction >= WARN_AT}
+        return {"cap_bytes": cap, "counted_bytes": None, "now_bytes": None, "fraction": None, "warn": False,
+                "over_from": None}
+    record = st.known_record()
+    counted = chain_size.cap_count(st.view, record, now, ar._delay())[4]
+    now_bytes = max(counted, chain_size.now_count(st.view, record, now)
+                    + (unsealed_bytes(db, st.view) if db is not None else 0))
+    over = chain_size.first_over(st.view, record, now, ar._delay(), cap) if now_bytes > cap else None
+    fraction = now_bytes / cap
+    return {"cap_bytes": cap, "counted_bytes": counted, "now_bytes": now_bytes, "fraction": round(fraction, 4),
+            "warn": fraction >= WARN_AT, "over_from": over.isoformat() + "Z" if over is not None else None}
 
 
 def volume(path: str) -> Optional[dict]:
@@ -98,5 +130,5 @@ def existing_install(db, st=None) -> bool:
 
 def summary(db, now: datetime, storage_path: str, st=None) -> dict:
     """Everything the page's Storage card shows (see the module's docstring)."""
-    return {"rows": _rows(db), "archive": _archive(db), "cap": cap_counted(now, st), "storage_volume":
+    return {"rows": _rows(db), "archive": _archive(db), "cap": cap_counted(now, st, db), "storage_volume":
             volume(storage_path), "database_volume": None, "existing_install": existing_install(db, st)}

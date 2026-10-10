@@ -206,14 +206,47 @@ def test_before_the_chain_is_read_the_list_says_so(page: Page, admin_creds):
 
 
 def test_the_storage_card_warns_from_80_percent_of_the_cap(page: Page, admin_creds):
+    """The warning is on the bytes now: the log takes 85 MB of a 100 MB cap, though the cap counts 40 MB so far
+    (growth counts only after the delay)."""
     def near(data):
-        data["cap"] = {"cap_bytes": 100 * 1048576, "counted_bytes": 85 * 1048576, "fraction": 0.85, "warn": True}
+        data["cap"] = {"cap_bytes": 100 * 1048576, "counted_bytes": 40 * 1048576, "now_bytes": 85 * 1048576,
+                       "fraction": 0.85, "warn": True, "over_from": None}
     _login(page, admin_creds["username"], admin_creds["password"])
     _serve_storage(page, near)
     _open(page)
     storage = page.locator("#retention-storage")
-    expect(storage).to_contain_text("the cap counts 85.0 MB of its 100.0 MB (85 %)")
-    expect(storage.locator(".retention-cap-warning")).to_contain_text("is at 85 % of its size cap")
+    expect(storage).to_contain_text("The audit log takes 85.0 MB of it now (85 %)")
+    expect(storage).to_contain_text("the cap counts 40.0 MB so far")
+    warning = storage.locator(".retention-cap-warning")
+    expect(warning).to_contain_text("is at 85 % of its size cap")
+    expect(warning).to_contain_text("Once it is reached, the oldest events are deleted")
+
+
+def test_over_the_cap_the_warning_says_from_when_and_what_it_would_delete(page: Page, admin_creds):
+    """Over the cap now: the card says the earliest day the cap starts deleting, and what the preview with the
+    bytes now counts (asked for only then)."""
+    asked = []
+
+    def over(data):
+        data["cap"] = {"cap_bytes": 100 * 1048576, "counted_bytes": 60 * 1048576, "now_bytes": 120 * 1048576,
+                       "fraction": 1.2, "warn": True, "over_from": "2026-11-02T10:00:00Z"}
+
+    def preview(route):
+        asked.append(route.request.url)
+        route.fulfill(status=200, json={"by_age": {"rows": 0, "bytes": 0, "newest": None},
+                                        "by_size": {"rows": 7, "bytes": 5 * 1048576, "newest": None},
+                                        "archived": {"by_age": {"rows": 0, "bytes": 0}, "by_size": {"rows": 3,
+                                                                                                  "bytes": 1048576}},
+                                        "cap_met": True, "counted_bytes": 0, "protected_bytes": 0})
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _serve_storage(page, over)
+    page.route(re.compile(r"/settings/managed/audit/preview\?bytes_now=true$"), preview)
+    _open(page)
+    warning = page.locator("#retention-storage .retention-cap-warning")
+    expect(warning).to_contain_text("is at 120 % of its size cap")
+    expect(warning).to_contain_text("at the earliest, the size cap deletes the oldest events")
+    expect(warning).to_contain_text("As things stand it would delete 10 events (6.0 MB)")
+    assert len(asked) == 1, asked
 
 
 def test_an_install_from_before_this_release_is_told_once(page: Page, admin_creds):

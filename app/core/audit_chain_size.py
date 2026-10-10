@@ -164,6 +164,40 @@ def cap_count(view, record: Optional[dict], now: datetime, delay: timedelta, *, 
     return start_us, held, by_hour, parts, sum(by_hour.values()) + sum(c for _d, _p, c, _h in parts)
 
 
+def now_count(view, record: Optional[dict], now: datetime) -> int:
+    """What the size cap would count if every hour counted its figure now rather than the least over the window:
+    each hour's newest entry (another writer's held back no more than the entry before it) and each archived part
+    the smaller of its bound length and those. Growth reaches it at once and the cap's count a delay later; the
+    retention screen warns on it, ahead of the cap."""
+    now_us = times.us(now)
+    by_hour, parts = counted(view, now_us, held_back(view, record, now_us))
+    return sum(by_hour.values()) + sum(c for _d, _p, c, _h in parts)
+
+
+def first_over(view, record: Optional[dict], now: datetime, delay: timedelta, limit: int) -> Optional[datetime]:
+    """The earliest the size cap's count passes ``limit`` from what is sealed now, if sealing keeps running and
+    nothing changes: each hour's newer figures count once the window's start has passed the seal that recorded
+    them, a delay after it (a gap in sealing only moves that later). None when the count never passes it."""
+    _, held, hot, parts, total = cap_count(view, record, now, delay)
+    if total > limit:
+        return now
+    start_us = window_start(view, record, now, delay)
+    length = int(delay.total_seconds() * 1000000)
+    archived = {h for _d, part in view.archived_parts() for h in part.hours()}
+    moving = {}
+    for start, end, last in view.units():
+        if end - start != _ai().HOUR or start in archived:
+            continue
+        entries = counted_entries(view.entry_chain(last), held)
+        if any(at > start_us for _seq, at, _n in entries):
+            moving[start] = entries
+    fixed = sum(c for _d, _p, c, _h in parts) + sum(n for h, n in hot.items() if h not in moving)
+    for t in sorted({at + length for entries in moving.values() for _seq, at, _n in entries if at > start_us}):
+        if fixed + sum(lagged(entries, t - length) for entries in moving.values()) > limit:
+            return times.dt(t)
+    return None
+
+
 def protected_hours(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
     """{hour: lagged protected bytes} of every hour with a unit of its own whose rows the size cap never deletes
     count more than nothing, archived or not: the protected bytes its root entries record, counted as the hour's

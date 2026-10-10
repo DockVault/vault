@@ -365,9 +365,11 @@ def prune(p, numbers: Optional[Numbers] = None):
     return result
 
 
-def preview(db, now: datetime, numbers: Numbers) -> dict:
+def preview(db, now: datetime, numbers: Numbers, *, bytes_now: bool = False) -> dict:
     """What the audit job would delete now under ``numbers``: rows and bytes by age and by size, and the
-    time of the newest row each deletes."""
+    time of the newest row each deletes. With ``bytes_now``, the size cap counts every hour's figure now, as it
+    will once growth has waited its delay: what the cap would delete then, as things stand (the retention screen's
+    warning)."""
     from app.core import retention
     from app.core.models import AuditLog
     dialect = db.get_bind().dialect.name
@@ -383,7 +385,8 @@ def preview(db, now: datetime, numbers: Numbers) -> dict:
     from app.core import audit_archive, audit_integrity
     st = audit_integrity.state()
     aged = by_age(AuditLog, now, numbers)
-    plan = chain_size_plan(db, AuditLog, st.view, st.known_record(), now, numbers, _delay())
+    plan = chain_size_plan(db, AuditLog, st.view, st.known_record(), now, numbers,
+                           timedelta(0) if bytes_now else _delay())
     sized = by_size(AuditLog, now, numbers, plan)
     if sized and aged:
         sized = sized + [not_(and_(*retention.deletable(AuditLog, now, *aged)))]

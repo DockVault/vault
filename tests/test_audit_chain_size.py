@@ -85,6 +85,35 @@ def test_a_large_row_in_the_current_hour_deletes_nothing_before_the_delay(env):
     assert failures(env.verify()) == [] and failures(_off(env)) == []
 
 
+def test_the_bytes_now_take_growth_in_at_once_and_the_cap_deletes_from_its_first_over(env):
+    """A large row in the current hour, sealed: the cap's count takes it in only a delay after the hour's seal,
+    the bytes now (what the retention screen warns on) at once. first_over names when the count first passes the
+    cap: the hour's seal plus the delay. The pruner deletes nothing before then and the oldest rows after it, as
+    many as the preview with the bytes now said."""
+    from app.core import audit_retention as ar
+    old = [_big(env, T0 - timedelta(days=30, hours=h), 200) for h in range(3)]    # 0.6 MB
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    at = env.clock() - timedelta(minutes=10)
+    big = _big(env, at, 700)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    counted = size.cap_count(st.view, st.known_record(), now, delay)[4]
+    grown = size.now_count(st.view, st.known_record(), now)
+    assert counted < ar.MB < grown and grown - counted >= 700 * KB
+    over = size.first_over(st.view, st.known_record(), now, delay, ar.MB)
+    assert over is not None and abs(over - (_sealed_at(env, at) + delay)) < timedelta(seconds=1)
+    assert size.first_over(st.view, st.known_record(), now, delay, grown) is None
+    with env.session() as db:
+        today = ar.preview(db, now, ar.current())["by_size"]["rows"]
+        as_counted = ar.preview(db, now, ar.current(), bytes_now=True)["by_size"]["rows"]
+    assert (today, as_counted) == (0, 2)
+    _run_to(env, over - timedelta(hours=1))
+    assert _kept(env, old) == set(old) and not _size_prunes(env)
+    _run_to(env, over + timedelta(hours=2))
+    assert len(_kept(env, old)) == 1 and big in _kept(env, [big])
+
+
 def test_growth_across_a_stop_counts_only_once_a_delay_of_sealing_has_run(env):
     old = [_big(env, T0 - timedelta(days=30, hours=h), 200) for h in range(3)]
     env.run_until_sealed()

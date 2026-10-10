@@ -10,9 +10,10 @@
  * audit job counts) and asks to confirm; it then waits the deployment's delay, during which any administrator can
  * cancel it from the list of waiting changes. That list is the audit log's integrity chain's (what the pruner
  * applies), never the database's rows: beside a change the database no longer shows waiting it says so, and a
- * change another writer added says it waits for the host operator. The Storage card shows what the audit log and its archive take, what
- * the size cap counts (a warning from 80 % of it), the files' volume's free space, the archive's progress and the
- * integrity status. An install that ran before this release is told what it changed, once per browser.
+ * change another writer added says it waits for the host operator. The Storage card shows what the audit log and
+ * its archive take, what the size cap counts and what the log takes now (a warning from 80 % of the cap on the
+ * bytes now, saying when the cap would start deleting and what), the files' volume's free space, the archive's
+ * progress and the integrity status. An install that ran before this release is told what it changed, once per browser.
  *
  * Uses app.js's helpers (apiRequest, showToast, showConfirm). Builds the page with createElement and textContent.
  */
@@ -30,7 +31,7 @@
     const PREVIEW = { audit_max_days: 'max_days', audit_min_days: 'min_days', audit_admin_min_days: 'admin_min_days',
         audit_max_mb: 'max_mb' };
     const BANNER_KEY = 'dockvault.retention.banner.dismissed';
-    const S = { data: null, storage: null, integrity: null, busy: false };
+    const S = { data: null, storage: null, integrity: null, capPreview: null, busy: false };
 
     function el(tag, cls, text) {
         const node = document.createElement(tag);
@@ -370,6 +371,24 @@
 
     // ---- storage, the archive and integrity ---------------------------------------------------------------
 
+    // The warning from 80 % of the size cap, on the bytes now: when the cap would start deleting, and what.
+    function capWarning(cap, pct) {
+        let text = `The audit log is at ${pct} % of its size cap.`;
+        if (!cap.over_from) {
+            return `${text} Once it is reached, the oldest events are deleted, except administration and security ` +
+                'events.';
+        }
+        text += ` From ${when(cap.over_from)} at the earliest, the size cap deletes the oldest events, except ` +
+            'administration and security events, unless the cap is raised or the hold is turned on.';
+        const p = S.capPreview;
+        if (p && p.by_size) {
+            const archived = (p.archived && p.archived.by_size) || { rows: 0, bytes: 0 };
+            text += ` As things stand it would delete ${p.by_size.rows + archived.rows} events ` +
+                `(${bytes(p.by_size.bytes + archived.bytes)}).`;
+        }
+        return text;
+    }
+
     function renderStorage() {
         const box = byId('retention-storage');
         if (!box) return;
@@ -387,11 +406,10 @@
                 add(`Size cap: ${bytes(s.cap.cap_bytes)}; what it counts is known once the log is sealed.`);
             } else {
                 const pct = Math.round(s.cap.fraction * 100);
-                add(`Size cap: the cap counts ${bytes(s.cap.counted_bytes)} of its ${bytes(s.cap.cap_bytes)} (${pct} %).`);
-                if (s.cap.warn) {
-                    add(`The audit log is at ${pct} % of its size cap. Once it is reached, the oldest events are ` +
-                        'deleted, except administration and security events.', 'text-warning retention-cap-warning');
-                }
+                add(`Size cap: ${bytes(s.cap.cap_bytes)}. The audit log takes ${bytes(s.cap.now_bytes)} of it now ` +
+                    `(${pct} %); the cap counts ${bytes(s.cap.counted_bytes)} so far, since growth counts only after ` +
+                    'the wait before a change that deletes sooner.');
+                if (s.cap.warn) add(capWarning(s.cap, pct), 'text-warning retention-cap-warning');
             }
         }
         if (s.storage_volume) {
@@ -436,6 +454,13 @@
             return;
         }
         try { S.storage = await apiRequest('/settings/managed/storage', { silent: true }); } catch (_) { S.storage = null; }
+        // Over the cap now: what the cap would delete once that counts (the preview with the bytes now).
+        S.capPreview = null;
+        if (S.storage && S.storage.cap && S.storage.cap.over_from) {
+            try {
+                S.capPreview = await apiRequest('/settings/managed/audit/preview?bytes_now=true', { silent: true });
+            } catch (_) { S.capPreview = null; }
+        }
         try { S.integrity = await apiRequest('/activity/integrity', { silent: true }); } catch (_) { S.integrity = null; }
         render();
     }
