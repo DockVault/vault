@@ -24,7 +24,8 @@ The algorithm, in order:
    hour's newest root seal, naming missing and added rows by id; an archived hour's rows come from the block
    of its day that holds it, read only once its length and digest are the ones the day's latest archive seal
    binds (block-altered, block-missing, block-unsealed), and a row of audit_logs in an archived hour is
-   row-in-archived-day;
+   row-in-archived-day; a block of a later release's block format is a warning (block-later-format), which this
+   release neither checks nor changes;
 8. outside the chain: rows naming an account that is not theirs, account rows unlinked from an account that
    still exists, rows before the chain's first hour or dated ahead, undated rows, and hooks on the tables.
 

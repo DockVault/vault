@@ -1742,3 +1742,48 @@ def test_after_a_part_is_rewritten_the_size_cap_and_the_preview_read_its_new_agg
         aged = ar.preview(db, env.clock(), _numbers(max_days=95, admin_min=365))
     assert (sum(after.rows), after.protected_rows) == (1, 1)
     assert aged["archived"]["by_age"]["rows"] == 0
+
+
+# --------------------------------------------------------------------------- a later release's block format
+
+def test_a_later_releases_block_format_is_a_warning_and_its_day_is_left_as_it_is(env, monkeypatch):
+    """A release that adds a column to audit_logs writes a later block format. Rolled back to this release, such a
+    block is bound by its archive seal, so a sealer wrote it, not someone altering it: verify and the daily check
+    warn that this release does not check it, and the pruner and unarchive leave its day as it is, reporting no
+    failure."""
+    _sealed_day(env)
+    monkeypatch.setattr(af, "FORMAT", 2)
+    _archive(env)
+    monkeypatch.setattr(af, "FORMAT", 1)
+    (block,) = _blocks(env)
+    assert _hot(env) == 0
+    report = env.verify()
+    assert failures(report) == [] and "block-later-format" in report.kinds(v.WARNING)
+    ar.prune(_pass(env), _numbers(max_days=95))
+    assert [b.payload for b in _blocks(env)] == [block.payload]
+    assert ai.open_failures(env.st.head_store().load()) == {}
+    with pytest.raises(arc.NotVerified, match="a later release writes"):
+        _unarchive(env)
+    assert [b.payload for b in _blocks(env)] == [block.payload] and _hot(env) == 0
+    daily = v.daily_check(env.session, env.st, now=env.clock(), force=True)
+    assert failures(daily) == [] and "block-later-format" in daily.kinds(v.WARNING)
+
+
+def test_a_block_of_this_releases_format_with_other_columns_is_altered(env):
+    """Only a later block format is left alone: a block of this release's format whose columns are not this
+    release's is altered."""
+    _sealed_day(env)
+    real_line = af._line
+
+    def with_another_column(values):
+        if isinstance(values, dict) and "columns" in values:
+            values = dict(values, columns=list(values["columns"]) + ["added_later"])
+        return real_line(values)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(af, "_line", with_another_column)
+        mp.setattr(arc, "_check_stored", lambda *a, **k: None)
+        _archive(env)
+    assert len(_blocks(env)) == 1
+    found = env.verify()
+    assert "block-altered" in failures(found) and "block-later-format" not in found.kinds(v.WARNING)

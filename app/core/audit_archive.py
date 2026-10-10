@@ -151,6 +151,11 @@ class NotVerified(Exception):
         self.hour = hour
 
 
+# A block of a later block format (audit_archive_format.LaterFormat): reported as a warning by a check, and the day
+# left as it is by every change (a change of rows, the size cap's, unarchive).
+LATER_FORMAT = "block-later-format"
+
+
 class NotArchivable(Exception):
     """A day, part or hour that is left as it is this time (not a finding)."""
 
@@ -341,6 +346,10 @@ def open_part(db, day: date, part, payload: Optional[bytes] = None) -> af.Block:
         raise NotVerified("block-altered", f"the block of {_label(day, part)} is not the one its archive seal names")
     try:
         return af.open_block(payload)
+    except af.LaterFormat as exc:
+        # Its archive seal binds it, so a sealer wrote it: a later release's, which this one leaves as it is.
+        raise NotVerified(LATER_FORMAT, f"the block of {_label(day, part)} is of {exc}: this release neither "
+                                        "checks nor changes it") from None
     except af.BlockError as exc:
         raise NotVerified("block-altered", f"the block of {_label(day, part)} cannot be read: {exc}") from None
 
@@ -695,7 +704,12 @@ def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform:
     out = Rewritten()
     new_parts = []
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
-        reader = PartReader(db, view, day, part)
+        try:
+            reader = PartReader(db, view, day, part)
+        except NotVerified as nv:
+            if nv.kind == LATER_FORMAT:
+                raise NotArchivable(str(nv)) from None
+            raise
         touched = pick(reader.rows())
         reader.finish()
         if not touched:
@@ -1070,13 +1084,16 @@ def check_block_set(db, view, report) -> None:
 
 
 def check_parts(db, view, report, parts: List[tuple]) -> None:
-    """Steps 5-7 for archived hours: each (day, part) read once, checked against its seal and its hours'."""
-    from app.core.audit_chain_verify import FAILURE
+    """Steps 5-7 for archived hours: each (day, part) read once, checked against its seal and its hours'. A block of
+    a later block format is a warning: this release does not check it."""
+    from app.core.audit_chain_verify import FAILURE, WARNING
     for day, part in parts:
         try:
             block = PartReader(db, view, day, part).finish().block
         except NotVerified as nv:
-            if nv.kind != "block-missing":       # check_block_set names a missing block
+            if nv.kind == LATER_FORMAT:
+                report.add(WARNING, nv.kind, str(nv), view.archives[day].seq)
+            elif nv.kind != "block-missing":     # check_block_set names a missing block
                 report.add(FAILURE, nv.kind, str(nv), view.archives[day].seq, nv.hour)
             continue
         report.rows_checked += block.count

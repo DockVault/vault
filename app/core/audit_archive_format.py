@@ -82,6 +82,11 @@ class BlockError(ValueError):
     """A payload that is not a block this release wrote."""
 
 
+class LaterFormat(BlockError):
+    """A block whose header names a block format newer than this release's: a later release wrote it (one that adds
+    a column to audit_logs changes the format), and this release neither reads its rows nor changes it."""
+
+
 def _write(kind: str, value):
     if value is None:
         return None
@@ -268,6 +273,9 @@ def open_block(payload: bytes) -> Block:
         header = json.loads(first)
     except ValueError:
         raise BlockError("the header is not JSON") from None
+    later = header.get("format") if isinstance(header, dict) else None
+    if isinstance(later, int) and not isinstance(later, bool) and later > FORMAT:
+        raise LaterFormat(f"block format {later}, which a later release writes")
     if not isinstance(header, dict) or header.get("format") != FORMAT:
         raise BlockError(f"format {header.get('format') if isinstance(header, dict) else '?'}")
     if list(header.get("columns") or []) != list(NAMES):

@@ -97,7 +97,7 @@ FAILURE_KINDS = frozenset({
     "backlog-count", "block-altered", "block-missing", "block-unsealed", "unjustified", "unjustified-input",
     "user-mismatch", "user-unlinked", "future-dated", "db-hooks"})
 WARNING_KINDS = frozenset({"late", "veto-from-database", "after-record", "sealed-at-backwards", "restore-pending",
-                           "head-record-unwritable", "key-change-waiting"})
+                           "head-record-unwritable", "key-change-waiting", "block-later-format"})
 
 
 def utcnow() -> datetime:
