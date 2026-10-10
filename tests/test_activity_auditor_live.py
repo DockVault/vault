@@ -4,8 +4,10 @@ An auditor whose right is in force reads the log (the events, one event, the sum
 the typeahead, saved searches, the export) and not the live views; their reading is recorded once in ten minutes.
 Their socket hears the live signal (an id and a category, nothing more) until the right ends. With their case
 selected, the events are the case's own and those on its vaults, a file's name shows because of the case, and N
-fetches of the same page write one ``case_names_viewed`` row. Anyone else, and an administrator the case concerns,
-is answered that there is no such case. test_activity_auditor.py covers the rules offline.
+fetches of the same page write one ``case_names_viewed`` row. In a vault with a vault password the auditor is no
+member of, the case's event says the password hides the file's name and offers it, and the password given in the
+case shows it. Anyone else, and an administrator the case concerns, is answered that there is no such case.
+test_activity_auditor.py covers the rules offline.
 """
 import json
 import time
@@ -148,3 +150,56 @@ def test_a_case_selected_shows_its_names_and_a_page_fetched_again_writes_no_more
     # The owner, who is no auditor, reads no log at all; an unknown case is not found.
     assert olga_c.get("/activity/events", params={"case": case["id"]}).status_code == 403
     assert uma_c.get("/activity/events", params={"case": "00000000-0000-0000-0000-000000000000"}).status_code == 404
+
+
+HIDDEN = "Name hidden: the vault has a password"
+NOT_SHOWN = "Not shown: you are not a member of this vault"
+
+
+def test_a_password_vault_in_the_case_is_offered_its_password_and_named_once_given(world):
+    """uma is no member of olga's vault with a vault password. With her case on it selected, the event of a file in it
+    says the password hides the name and offers it (unlock_in_case); without the case, or to an administrator
+    selecting it, nothing is offered. The password given in the case (its own route and receipt) shows the name."""
+    _uma, uma_c, _codes = world["uma"]
+    _olga, olga_c, _vid = world["olga"]
+    password = "Vault-Pass-2026!"
+    pv = olga_c.create_vault(name=unique("locked"), password=password)["id"]
+    case = None
+    try:
+        name = f"{unique('plan')}.txt"
+        up = olga_c.post(f"/vaults/{pv}/files", files=[("files", (name, b"the plan", "text/plain"))],
+                         headers={"X-Vault-Password": password})
+        assert up.status_code in (200, 201), up.text
+        fid = up.json()["files"][0]["id"]
+        case = approved_case(world["admins"], world["uma"], [pv])
+
+        def about_the_file(client, params, headers=None):
+            r = client.get("/activity/events", params={"limit": 100, **params}, headers=headers or {})
+            assert r.status_code == 200, r.text[:300]
+            found = [e for e in r.json()["events"] if e.get("resource_id") == fid]
+            assert found, "the upload's event is listed"
+            return found
+
+        mine = about_the_file(uma_c, {"case": case["id"]})
+        assert all(e["names"]["item"] == HIDDEN and e.get("unlock_in_case") is True for e in mine), mine
+        assert all(e["names"]["vault"] != NOT_SHOWN for e in mine), "the case shows its vault's name"
+        plain = about_the_file(uma_c, {"vault_id": pv})
+        assert all(e["names"]["item"] == NOT_SHOWN and "unlock_in_case" not in e for e in plain), plain
+        _ada, ada_c, _ = world["admins"]["ada"]
+        theirs = about_the_file(ada_c, {"case": case["id"]})
+        assert all("unlock_in_case" not in e and e["names"]["item"] != name for e in theirs), theirs
+        unlock = f"/compliance/cases/{case['id']}/vaults/{pv}/unlock"
+        assert uma_c.post(unlock, json={"password": "not the password"}).status_code == 403
+        r = uma_c.post(unlock, json={"password": password})
+        assert r.status_code == 200, r.text
+        given = {"X-Case-Unlock": f"{pv}={r.json()['receipt']}"}
+        named = about_the_file(uma_c, {"case": case["id"]}, given)
+        assert all(e["names"]["item"] == name and "unlock_in_case" not in e for e in named), named
+        one = uma_c.get(f"/activity/events/{named[0]['id']}", params={"case": case["id"]}, headers=given)
+        assert one.status_code == 200 and one.json()["names"]["item"] == name, one.text[:300]
+        # The receipt opens the vault in this case only: in the list without the case, the name stays hidden.
+        assert all(e["names"]["item"] == NOT_SHOWN for e in about_the_file(uma_c, {"vault_id": pv}, given))
+    finally:
+        if case is not None:
+            forget_cases([case["id"]], [pv])
+        olga_c.delete_vault(pv, vault_password=password)
