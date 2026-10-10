@@ -68,3 +68,13 @@ def test_every_activity_read_carries_the_selected_case_and_its_receipts():
     assert activity.count("unlockHeader(), caseHeader())") == 2
     assert ("'/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : '')"
             in activity)
+
+
+def test_signing_out_forgets_every_receipt_the_page_kept():
+    """A vault's password given on the Compliance page (a case's receipts) or on Access to my vaults (the owner's)
+    is forgotten when the dashboard closes: the next account signed in on this tab holds none of them."""
+    source = _read("js", "compliance.js")
+    forget = source[source.index("function forgetStanding() {"):]
+    forget = forget[:forget.index("\n    }\n")]
+    assert "CASE_RECEIPTS.clear();" in forget and "receipts.clear();" in forget
+    assert source.count("const receipts = new Map();") == 1 and source.count("const CASE_RECEIPTS = new Map();") == 1

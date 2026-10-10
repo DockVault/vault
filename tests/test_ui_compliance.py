@@ -7,7 +7,8 @@ auditor sees the badge, asks for a case on the new-case sheet (the owners' previ
 administrator finds it under "Waiting for my approval", reads the provenance and the justification, and approves it;
 the owner sees the banner; the auditor opens the workspace, moves through the files with j and k (each opened, with
 the watermark), exports them (one archive, through the download), and closes the case. Then, on one case approved
-through the API: the workspace on a phone (one screen at a time, nothing wider than the screen), the Activity page
+through the API: the workspace on a phone (one screen at a time, nothing wider than the screen), the case list, the
+new-case sheet and an administrator's tabs, sheets and case page on a phone (in both skins), the Activity page
 for the auditor (no administrator's panel asked for, the Reveal dialog, the Case chip), the badge and the nav for
 each kind of account, and the count of what waits for an administrator.
 
@@ -378,8 +379,9 @@ def test_the_workspace_on_a_phone_shows_one_screen_at_a_time(browser: Browser, w
         _close(page)
 
 
-def test_the_case_list_and_the_new_case_sheet_fit_a_phone(browser: Browser, world):
-    page = _page(browser, "v2", PHONE)
+@pytest.mark.parametrize("ui", ["v2", "v1"])
+def test_the_case_list_and_the_new_case_sheet_fit_a_phone(browser: Browser, world, ui):
+    page = _page(browser, ui, PHONE)
     try:
         _login(page, world["uma"], world["codes"])
         _compliance(page, drawer=True)
@@ -389,6 +391,47 @@ def test_the_case_list_and_the_new_case_sheet_fit_a_phone(browser: Browser, worl
         expect(sheet).to_be_visible()
         box = sheet.bounding_box()
         assert box["width"] <= PHONE["width"] + 1, box
+        _fits(page)
+        assert _errors(page) == [], _errors(page)
+    finally:
+        _close(page)
+
+
+def _sheet_fits(page: Page, sheet_id: str, opener: str):
+    page.locator(opener).click()
+    sheet = page.locator(f"#{sheet_id}.active .cmp-sheet-content")
+    expect(sheet).to_be_visible()
+    box = sheet.bounding_box()
+    assert box["width"] <= PHONE["width"] + 1, box
+    _fits(page)
+    page.locator(f"#{sheet_id}.active .modal-close").click()
+    expect(page.locator(f"#{sheet_id}.active")).to_have_count(0)
+
+
+@pytest.mark.parametrize("ui", ["v2", "v1"])
+def test_an_administrators_tabs_sheets_and_a_case_fit_a_phone(browser: Browser, world, ui):
+    """An administrator's Cases, Legal holds and Auditors tabs, the place-hold and propose sheets, and a case's page:
+    each no wider than a phone, in both skins."""
+    ada, _ada_c, ada_codes = world["admins"]["ada"]
+    page = _page(browser, ui, PHONE)
+    try:
+        _login(page, ada, ada_codes)
+        _compliance(page, drawer=True)
+        expect(page.locator(f'.cmp-case-row[data-case-id="{world["case"]["id"]}"]')).to_be_visible(timeout=15000)
+        _fits(page)
+        _tab(page, "holds")
+        expect(page.locator(".cmp-place-hold")).to_be_visible(timeout=15000)
+        _fits(page)
+        _sheet_fits(page, "cmp-hold-sheet", ".cmp-place-hold")
+        _tab(page, "auditors")
+        expect(page.locator(".cmp-propose")).to_be_visible(timeout=15000)
+        _fits(page)
+        _sheet_fits(page, "cmp-propose-sheet", ".cmp-propose")
+        _tab(page, "cases")
+        row = page.locator(f'.cmp-case-row[data-case-id="{world["case"]["id"]}"]')
+        expect(row).to_be_visible(timeout=15000)
+        row.click()
+        expect(page.locator(".cmp-case-head")).to_be_visible(timeout=15000)
         _fits(page)
         assert _errors(page) == [], _errors(page)
     finally:

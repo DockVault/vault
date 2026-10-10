@@ -692,6 +692,7 @@
         CP.cases = CP.holds = CP.grants = null; CP.screen = 'list'; CP.caseId = null;
         window.complianceAuditorLive = false;
         CASE_RECEIPTS.clear();
+        receipts.clear();
         const nav = document.getElementById('nav-compliance');
         if (nav) nav.style.display = 'none';
         if (CP.shownActivity) {

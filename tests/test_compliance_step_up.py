@@ -338,5 +338,8 @@ def test_the_web_app_shows_them_below_the_matrix_without_a_switch():
     fixed = script[script.index("function renderFixedStepUps(fixed) {"):script.index("window.renderFixedStepUps = ")]
     assert "innerHTML" not in script
     assert not [c for c in ("'input'", "'select'", "'button'", "'textarea'") if c in fixed]
+    # Nor through the file's own helpers that make one, nor by listening on what it draws.
+    assert not [c for c in ("button(", "input(", "select(", "check(", "addEventListener", "onclick",
+                            "contentEditable", "tabIndex") if c in fixed]
     assert app.count("window.renderFixedStepUps((data && data.fixed) || [])") == 1
     assert index.count('<script src="/static/js/compliance.js?v=') == 1
