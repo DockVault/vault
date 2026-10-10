@@ -7,11 +7,14 @@
   * the host revokes a right, recorded as operator@host;
   * a case is approved only with its reference typed again, and only while no independent administrator exists;
   * downgrade-blockers lists the records of data an older version cannot read, through the account tool too,
-    as `dockvault.py update` asks it.
+    as `dockvault.py update` asks it;
+  * when something stops it (the database out of reach, a start-up that refuses the configuration), it still
+    prints its one answer, with exit status 1.
 
 test_host_compliance.py and test_dockvault_cases.py cover the tool and the host side offline.
 """
 import json
+import secrets
 import subprocess
 import uuid
 
@@ -131,3 +134,28 @@ def test_downgrade_blockers_from_both_tools():
         assert answer["ok"] is False
     finally:
         psql(f"DELETE FROM data_requirements WHERE key = '{key}'")
+
+
+@pytest.mark.parametrize("setting, said", [
+    # The database refuses the connection.
+    ("DATABASE_URL=postgresql://sftp_user:{made_up}@127.0.0.1:1/sftp_db", "127.0.0.1"),
+    # The web app's start-up refuses the configuration and exits.
+    ("ENCRYPTION_KEY={made_up}", "encryption-key-invalid"),
+])
+def test_when_something_stops_it_it_still_prints_one_answer(setting, said):
+    # dockvault.py cases reads the one JSON line; it says the tool could not answer, with exit status 1. What
+    # happened is on standard error; the made-up value given to it is in neither stream.
+    made_up = "Not-A-Real-Value-" + secrets.token_hex(8)
+    cmd = ["docker", "exec", "-i", "-e", setting.format(made_up=made_up),
+           API, "python", "-m", "app.core.host_compliance", "list"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker unavailable: {exc}")
+    skip_if_container_absent(r, API)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    assert [json.loads(ln) for ln in lines] == [
+        {"ok": False, "error": "The compliance tool stopped before it could answer."}], (r.stdout, r.stderr[-800:])
+    assert r.returncode == 1
+    assert "Traceback" in r.stderr and said in r.stderr, r.stderr[-800:]
+    assert made_up not in r.stdout and made_up not in r.stderr

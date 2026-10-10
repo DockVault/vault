@@ -400,3 +400,47 @@ def test_the_account_tool_run_as_a_program_refuses_a_bad_version_with_its_own_an
         with pytest.raises(program._Answer) as done:
             program._run(program.build_parser().parse_args(argv), None)
         assert done.value.code == 2 and "--target" in done.value.obj["error"]
+
+
+STOPPED = {"ok": False, "error": "The compliance tool stopped before it could answer."}
+
+
+class _StartUpExits:
+    """An import finder that answers for the web app the way its start-up does when it refuses this
+    container's configuration: a message on standard error, then SystemExit(1)."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "app.api.api_server":
+            import sys
+            print("DockVault API startup failed [made-up]: refused at db.example.internal", file=sys.stderr)
+            raise SystemExit(1)
+        return None
+
+
+WHAT_STOPPED = {"while it imports": "ModuleNotFoundError", "when its start-up exits": "SystemExit",
+                "while it works": "RuntimeError"}
+
+
+@pytest.mark.parametrize("where", list(WHAT_STOPPED))
+def test_the_compliance_tool_answers_once_when_something_unexpected_stops_it(monkeypatch, capsys, where):
+    # dockvault.py cases reads one JSON object on standard output, as it does from the account tool. Something
+    # nothing expected (the database out of reach, say) must not leave it with nothing to read: the answer kept
+    # for that case is printed, with exit status 1, and what happened is on standard error, never in the answer.
+    import json
+    import sys
+    if where == "while it imports":
+        # Importing the web app is the first thing it does; a module set to None cannot be imported.
+        monkeypatch.setitem(sys.modules, "app.api.api_server", None)
+    elif where == "when its start-up exits":
+        monkeypatch.delitem(sys.modules, "app.api.api_server", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [_StartUpExits(), *sys.meta_path])
+    else:
+        def stops(args):
+            raise RuntimeError("the database at db.example.internal is out of reach")
+        monkeypatch.setattr(hc, "_run", stops)
+    code = hc.run(["list"])
+    out, err = capsys.readouterr()
+    assert code == 1
+    assert [json.loads(line) for line in out.splitlines() if line.strip()] == [STOPPED]
+    assert "Traceback" in err and WHAT_STOPPED[where] in err
+    assert "db.example.internal" not in out

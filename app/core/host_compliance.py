@@ -23,7 +23,8 @@ allowed.
 Safety: a change names its subject twice (the account's username, or the case's reference, the first eight
 characters of its id as ``list`` and ``show`` print it: a case has no number until it is approved), and nothing
 happens unless the two match. Answers are one JSON object on standard output; the exit status is 0 when it
-succeeded, 2 when it was refused (the answer's ``error`` says why).
+succeeded, 2 when it was refused (the answer's ``error`` says why), and 1 when something unexpected stopped it
+(the answer says it stopped; what happened is on standard error).
 
 The case steps (approving and turning down a case, confirming a hold) are run by the code that runs them for an
 administrator: the module that owns each registers it in CASE_STEPS with register_case_step, and an action whose
@@ -152,14 +153,21 @@ def run(argv=None) -> int:
     answer = {"ok": False, "error": "The compliance tool stopped before it could answer."}
     code = 1
     with contextlib.redirect_stdout(sys.stderr):
-        import app.api.api_server as api  # noqa: F401 -- sets up the configuration, the database and the cache
-        started_before = set(threading.enumerate())
         try:
-            _run(args)
-        except _Answer as done:
-            answer, code = done.obj, done.code
-        finally:
-            _wait_for_background_work(started_before)
+            import app.api.api_server as api  # noqa: F401 -- sets up the configuration, the database and the cache
+            started_before = set(threading.enumerate())
+            try:
+                _run(args)
+            except _Answer as done:
+                answer, code = done.obj, done.code
+            finally:
+                _wait_for_background_work(started_before)
+        except (Exception, SystemExit):  # noqa: BLE001 - whatever stopped it, the caller still gets one answer
+            # Something nothing here expected (the database out of reach, say, or a start-up that refused this
+            # container's configuration and exited): the answer above says the tool stopped, with exit status 1,
+            # and what happened goes to standard error, never into it. As the account tool does (host_operator).
+            import traceback
+            traceback.print_exc()
     sys.stdout.write(json.dumps(answer) + "\n")
     sys.stdout.flush()
     return code
