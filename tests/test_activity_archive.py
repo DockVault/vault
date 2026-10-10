@@ -535,17 +535,22 @@ def test_a_block_of_the_band_counts_hours_inside_its_own_time_filter(env):
     assert sum(n for _b, _a, n, _f, _u, _uf in got["events"]) < 4 * 18      # the events block: files only
 
 
-def test_the_band_counts_archived_hours_from_its_start_only(env):
+def test_the_band_counts_archived_hours_from_its_start_and_to_its_end_only(env):
     _corpus(env, None)
     _archive_all(env)
-    lo = at(ARCHIVED[2], 0)
+    # From noon of the third day (its 13:00, 17:00 and 22:00 rows) on; then to 09:00 of the fourth (its 01:00, 05:00).
+    lo = at(ARCHIVED[2], 12)
     win = summary.custom_window(lo, T0)
     with env.session() as db:
         got, note = archive.band_archive(db, win, summary.block_filters({"categories": ["files"]}), lo, None, T0,
                                          env.st)
-    # The category mix leaves out the category filter: every archived row from the start on, two days of 18.
-    assert sum(r[2] for r in got["categories"]) == 2 * 18
-    assert note["oldest_day"] == ARCHIVED[0].isoformat()        # where the archive is, not where the band starts
+        # The category mix leaves out the category filter: every archived row from the start on.
+        assert sum(r[2] for r in got["categories"]) == 9 + 18
+        assert note["oldest_day"] == ARCHIVED[0].isoformat()    # where the archive is, not where the band starts
+        until = at(ARCHIVED[3], 9)
+        got, _note = archive.band_archive(db, summary.custom_window(lo, until),
+                                          summary.block_filters({"categories": ["files"]}), lo, until, T0, env.st)
+        assert sum(r[2] for r in got["categories"]) == 9 + 6
 
 
 def test_under_a_filter_the_aggregates_cannot_answer_a_block_counts_rows_only(env):
