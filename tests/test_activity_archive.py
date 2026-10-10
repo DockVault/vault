@@ -520,6 +520,29 @@ def test_the_band_counts_archived_hours_per_bucket_as_the_rows_did(env, offset):
     assert any(wants)
 
 
+def test_in_a_half_hour_zone_an_hour_counts_in_the_bucket_that_holds_its_start(env):
+    """Six-hour buckets six and a half hours east of UTC start at 05:30, 11:30, 17:30 and 23:30 UTC: the 05:00 and
+    17:00 hours straddle a bucket's start, and count in the bucket that holds their start. Every row of the corpus is
+    at 01 to 15 minutes past its hour, so that is also the bucket each row is in."""
+    _corpus(env, None)
+    lo, hi = at(ARCHIVED[0], 0), at(ARCHIVED[3], 23)
+    win = summary.custom_window(lo, hi, tz_offset_minutes=390)
+    assert win.size == 6 * 3600 and any(b.minute == 30 for b in win.bounds)
+    with env.session() as db:
+        want = {}
+        for (t,) in db.query(AuditLog.timestamp).filter(AuditLog.timestamp >= lo, AuditLog.timestamp < hi).all():
+            bucket = win.bucket_of(t)
+            if bucket is not None:
+                want[bucket] = want.get(bucket, 0) + 1
+    _archive_all(env)
+    with env.session() as db:
+        got, _note = archive.band_archive(db, win, summary.block_filters({}), lo, hi, T0, env.st)
+    counted = {}
+    for bucket, _a, n, _f, _u, _uf in got["events"]:
+        counted[bucket] = counted.get(bucket, 0) + n
+    assert counted == want and sum(want.values()) > 0
+
+
 def test_a_block_of_the_band_counts_hours_inside_its_own_time_filter(env):
     _corpus(env, None)
     lo = at(ARCHIVED[0], 0)
