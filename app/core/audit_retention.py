@@ -19,9 +19,11 @@ chain's: each hour's bytes as the seals that set its roots bound them, lagged ov
 (RETENTION_REDUCTION_DELAY_DAYS) of time while sealing ran (app/core/audit_chain_size.py), so an hour counts
 its rows only once a delay of sealing has passed since the seal that took them in, and rows younger than the
 window are never deleted by it: whoever can make the app write rows, or write them into the table, cannot make
-it delete older ones before the delay. When the protected rows alone exceed the cap, the administrators are
-told, once a day, and nothing protected goes. The size of a row is what Postgres stores for it
-(pg_column_size of the row), measured by the sealer when it seals the row's hour.
+it delete older ones before the delay. How much of an hour it may never delete comes from its rows, but never
+more than the chain binds as the hour's protected bytes, so rows written into an old hour can only lower it.
+When the protected rows alone exceed the cap, the administrators are told, once a day, and nothing protected
+goes. The size of a row is what Postgres stores for it (pg_column_size of the row), measured by the sealer when
+it seals the row's hour.
 
 Each is a managed setting whose lowering deletes sooner, so it waits (app/core/setting_changes.py). The
 startup contract refuses a deployment whose .env contradicts itself: a protected minimum longer than the

@@ -271,3 +271,207 @@ def test_the_database_containers_free_space_is_read_as_dockvault_reads_it():
     assert r.returncode == 0, r.stderr
     free = dockvault.parse_df_available(r.stdout)
     assert isinstance(free, int) and free > 0, r.stdout
+
+
+SIZE_CAP = r'''
+ar.MB = 1
+from app.core import audit_chain_size as size
+from app.core import audit_archive_format as af
+from app.core.models import AuditArchiveBlock, AuditLog
+protected = ar.protected_actions()[0]
+
+
+def counted():
+    start = size.window_start(st.view, st.known_record(), clock[0], timedelta(days=7))
+    return size.counted(st.view, start, size.held_back(st.view, st.known_record(), start))
+
+
+def plan(cap):
+    db = SessionLocal()
+    try:
+        p = ar.chain_size_plan(db, AuditLog, st.view, st.known_record(), clock[0], ar.Numbers(0, 0, 0, cap),
+                               timedelta(days=7))
+        return [str(p.cutoff), p.protected_bytes]
+    finally:
+        db.close()
+
+
+def blob():
+    return json.dumps({"blob": os.urandom(15000).hex()})
+'''
+
+
+@pytest.mark.parametrize("edited", [False, True])
+def test_aggregates_edited_in_the_database_never_make_the_size_cap_delete_a_newer_archived_row_on_postgres(
+        throwaway, edited):
+    """Two archived days of one row each and a cap with room for the newer only. Edited to say the older day's row
+    is protected, its block's aggregates would move the cutoff a day newer: the protected share never exceeds what
+    the chain binds, so the plan is the honest one and the newer day's row stays."""
+    done = _script(throwaway, f"EDITED = {edited}\n" + SIZE_CAP + r'''
+older_day = DAY - timedelta(days=1)
+older = add_row(at(3, day=older_day), details=blob())
+newer = add_row(at(3), details=blob())
+clock[0] = real_now - timedelta(days=9)
+out["stopped"] = passes()
+archive()
+out["blocks"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+run_days(9)
+_hot, ((_d1, _p1, ca, _h1), (_d2, _p2, cb, _h2)) = counted()
+cap = cb + 1000
+out["fits"] = cap < ca + cb
+out["honest"] = plan(cap)
+if EDITED:
+    with engine.begin() as c:
+        agg = c.execute(text("SELECT aggregates::text FROM audit_archive_blocks WHERE day = :d"),
+                        {"d": older_day}).scalar()
+        agg = json.loads(agg)
+        agg["by"] = [[protected] + list(r[1:]) for r in agg["by"]]
+        c.execute(text("UPDATE audit_archive_blocks SET aggregates = CAST(:a AS json) WHERE day = :d"),
+                  {"a": json.dumps(agg), "d": older_day})
+out["planned"] = plan(cap)
+ar.prune(retention.Pass(SessionLocal, now=clock[0]), ar.Numbers(0, 0, 0, cap))
+left = {}
+for d, payload in q("SELECT day::text, payload FROM audit_archive_blocks"):
+    left[d] = [str(r["id"]) for r in af.open_block(bytes(payload)).rows()]
+out["left"], out["older"], out["newer"] = left, older, newer
+out["older_day"], out["newer_day"] = str(older_day), str(DAY)
+out["report"] = report()
+''')
+    assert done["stopped"] is None and done["blocks"] == 2 and done["fits"], done
+    assert done["planned"] == done["honest"], done
+    assert done["left"].get(done["newer_day"]) == [done["newer"]], done
+    assert done["left"].get(done["older_day"], []) == ([done["older"]] if edited else []), done
+    assert ("block-altered" in done["report"]["failure"]) is edited, done["report"]
+
+
+@pytest.mark.parametrize("added", [False, True])
+def test_a_protected_row_added_to_an_old_hour_never_makes_the_size_cap_delete_a_newer_row_on_postgres(
+        throwaway, added):
+    done = _script(throwaway, f"ADDED = {added}\n" + SIZE_CAP + r'''
+older = add_row(at(3), details=blob())
+newer = add_row(at(9), details=blob())
+clock[0] = real_now - timedelta(days=9)
+out["stopped"] = passes()
+run_days(9)
+hot, _parts = counted()
+cap = hot[at(9)] + 1000
+out["fits"] = cap < hot[at(3)] + hot[at(9)]
+out["honest"] = plan(cap)
+if ADDED:
+    add_row(at(3, 30), action=protected, details=blob())
+out["planned"] = plan(cap)
+ar.prune(retention.Pass(SessionLocal, now=clock[0]), ar.Numbers(0, 0, 0, cap))
+out["left"] = sorted(r[0] for r in q("SELECT id::text FROM audit_logs WHERE id IN (:a, :b)", a=older, b=newer))
+out["older"], out["newer"] = older, newer
+out["protected_bytes"] = q("SELECT (detail->>'protected_bytes')::bigint, row_bytes FROM audit_seals "
+                           "WHERE kind = 'hour' AND period_start = :h", h=at(3))
+out["report"] = report()
+''')
+    assert done["stopped"] is None and done["fits"], done
+    assert done["planned"] == done["honest"], done
+    assert done["left"] == sorted([done["older"], done["newer"]] if added else [done["newer"]]), done
+    assert ("rows-added" in done["report"]["failure"]) is added, done["report"]
+    assert done["protected_bytes"] and done["protected_bytes"][0][0] == 0 < done["protected_bytes"][0][1], done
+
+
+def test_a_block_planted_with_the_days_next_part_number_leaves_that_day_and_archives_the_next_on_postgres(
+        throwaway):
+    done = _script(throwaway, r'''
+arc.PART_ROWS = 3
+for h in (2, 9):
+    for i in range(3):
+        add_row(at(h, i))
+later = DAY + timedelta(days=1)
+add_row(at(5, day=later))
+out["stopped"] = passes()
+ai.ROW_BUDGET = 3
+archive()
+out["first"] = q("SELECT day::text, part FROM audit_archive_blocks ORDER BY day, part")
+q("INSERT INTO audit_archive_blocks (day, part, first_hour, last_hour, row_count, codec, format, payload, "
+  "raw_bytes, aggregates, created_at) SELECT day, 2, first_hour, last_hour, row_count, codec, format, payload, "
+  "raw_bytes, aggregates, created_at FROM audit_archive_blocks WHERE part = 1")
+ai.ROW_BUDGET = 100000
+archive()
+archive()
+out["blocks"] = q("SELECT day::text, part FROM audit_archive_blocks ORDER BY day, part")
+out["hot"] = q("SELECT count(*) FROM audit_logs WHERE timestamp < :e", e=at(0) + timedelta(days=1))[0][0]
+out["failures"] = sorted(ai.open_failures(st.head_store().load()))
+out["later"] = str(later)
+''')
+    assert done["stopped"] is None and len(done["first"]) == 1 and done["first"][0][1] == 1, done
+    assert [done["later"], 1] in done["blocks"] and done["hot"] == 3, done
+    assert "block-unsealed" in done["failures"], done
+
+
+ONE_STATE = r'''
+def during_the_check(change):
+    """audit verify (and the daily check) with ``change`` committed by another connection between the walk over
+    the seals and the reading of the blocks."""
+    real = arc.check_block_set
+    done = []
+
+    def first_the_change(db, view, report_):
+        if not done:
+            done.append(1)
+            change()
+        return real(db, view, report_)
+
+    arc.check_block_set = first_the_change
+    try:
+        return report()
+    finally:
+        arc.check_block_set = real
+
+
+def unarchive_both_phases(day):
+    seen = arc.unarchive(engine, st, day, day, read=True)
+    arc.unarchive(engine, st, day, day, expect=seen["state"])
+'''
+
+
+def test_verify_and_the_daily_check_read_one_state_while_the_archive_and_unarchive_commit_on_postgres(throwaway):
+    """audit verify while the archive job commits a day, and while the host's unarchive commits one, and the daily
+    check (its rolling part included) while an unarchive commits: each reads the state its walk read, so nothing
+    shows and the daily check records nothing in the head record."""
+    done = _script(throwaway, ONE_STATE + r'''
+other = DAY - timedelta(days=1)
+for h in (3, 4):
+    add_row(at(h))
+    add_row(at(h, day=other))
+clock[0] = real_now - timedelta(days=9)
+out["stopped"] = passes()
+run_days(9)
+out["archived_during"] = during_the_check(archive)
+out["blocks"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+out["unarchived_during"] = during_the_check(lambda: unarchive_both_phases(other))
+out["hot"] = q("SELECT count(*) FROM audit_logs WHERE timestamp >= :s AND timestamp < :e", s=at(0, day=other),
+               e=at(0))[0][0]
+out["left"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+real = arc.check_block_set
+calls = []
+
+
+def unarchive_first(db, view, report_):
+    if not calls:
+        calls.append(1)
+        unarchive_both_phases(DAY)
+    return real(db, view, report_)
+
+
+arc.check_block_set = unarchive_first
+v.ROLLING_DAYS = 1                           # the rolling part reads every hour and part in this check
+try:
+    daily = v.daily_check(SessionLocal, st, now=clock[0], force=True)
+finally:
+    arc.check_block_set = real
+out["daily"] = sorted(f.kind for f in daily.findings if f.severity == v.FAILURE)
+out["daily_rows"] = daily.rows_checked
+out["recorded"] = sorted(ai.open_failures(st.head_store().load()))
+out["after"] = report()
+out["blocks_after"] = q("SELECT count(*) FROM audit_archive_blocks")[0][0]
+''')
+    assert done["stopped"] is None, done
+    assert done["archived_during"]["failure"] == [] and done["blocks"] == 2, done
+    assert done["unarchived_during"]["failure"] == [] and done["hot"] == 2 and done["left"] == 1, done
+    assert done["daily"] == [] and done["recorded"] == [] and done["daily_rows"] >= 2, done
+    assert done["after"]["failure"] == [] and done["blocks_after"] == 0, done

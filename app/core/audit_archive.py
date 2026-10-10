@@ -1204,9 +1204,9 @@ _figures: Dict[tuple, PartFigures] = {}
 def part_figures(db, view) -> Dict[tuple, PartFigures]:
     """{(day, part): PartFigures} of every archived part, from the aggregates its block keeps beside the payload
     (checked against its rows whenever the payload is read: archiving, a change, the rolling check), read once per
-    payload (keyed by its digest). Like the rows of a hot hour, they decide only how much of a part's count the size
-    cap may never delete, and what the preview says, never what the cap counts; a part whose aggregates cannot be
-    read has none."""
+    payload (keyed by its digest). They decide what the preview says, and can only lower the share of a part's count
+    the size cap may never delete (which the chain bounds, part_units), never what the cap counts; a part whose
+    aggregates cannot be read has none."""
     from app.core.audit_retention import protected_actions
     from app.core.models import AuditArchiveBlock as B
     parts = {(d, p.part): p for d, p in view.archived_parts()}

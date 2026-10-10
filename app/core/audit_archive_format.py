@@ -28,8 +28,8 @@ came back unchanged.
 ``aggregates`` (kept in the block's row, beside the payload, and checked against the rows whenever the payload
 is read): ``{"by": [[action, status, channel, rows, line bytes, stored bytes], ...], "hours": [[hour, rows,
 stored bytes], ...]}``, sorted. The line bytes are the NDJSON lines' (with the dictionary); the stored bytes the
-sizes Postgres stored the rows in. The summaries over archived days read them, and so does the size cap for the
-part of an archived part it may never delete.
+sizes Postgres stored the rows in. The summaries over archived days read them, and the size cap, which takes
+from them no more of an archived part as never to be deleted than the chain binds for its hours.
 """
 from __future__ import annotations
 

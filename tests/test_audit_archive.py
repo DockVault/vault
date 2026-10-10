@@ -1744,6 +1744,25 @@ def test_after_a_part_is_rewritten_the_size_cap_and_the_preview_read_its_new_agg
     assert aged["archived"]["by_age"]["rows"] == 0
 
 
+def test_hot_hours_younger_than_the_minimum_are_protected_whole_whatever_the_chain_binds(env, monkeypatch):
+    """Rows younger than the minimum for every row are never deleted: an hour all of whose rows are that young
+    counts whole toward the share the cap may never delete, though the chain binds no protected bytes for it."""
+    _capped(env, monkeypatch)
+    env.row(T0 - timedelta(days=20), details=_blob(15000))
+    env.run_until_sealed()
+    _seal_days(env, 8)
+    hot, _parts = _counted(env)
+    hour = ai.hour_floor(T0 - timedelta(days=20))
+    assert hot[hour] > 0 and env.st.view.entry_for(hour).root.bytes > 0
+    with env.session() as db:
+        young = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(),
+                                   _numbers(max_days=0, max_mb=hot[hour] - 1, min_days=40), timedelta(days=7))
+        aged = ar.chain_size_plan(db, AuditLog, env.st.view, env.st.known_record(), env.clock(),
+                                  _numbers(max_days=0, max_mb=hot[hour] - 1, min_days=0), timedelta(days=7))
+    assert young.protected_bytes == young.counted_bytes >= hot[hour] and not young.met
+    assert aged.protected_bytes < hot[hour]
+
+
 # --------------------------------------------------------------------------- a later release's block format
 
 def test_a_later_releases_block_format_is_a_warning_and_its_day_is_left_as_it_is(env, monkeypatch):
