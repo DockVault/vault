@@ -441,3 +441,20 @@ def test_a_prune_seal_whose_hour_has_no_protected_bytes_is_unjustified(env):
                            "hours": [[fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(),
                                       root.root_c.hex(), root.ids_digest.hex()]]})
     assert any("no protected bytes" in m for m in _why(_off(env)))
+
+
+def test_the_sealers_late_seal_binds_the_protected_bytes_of_the_hours_rows(env):
+    from app.core.audit_retention import _row_bytes, protected_actions
+    when = T0 - timedelta(hours=3, minutes=20)
+    env.row(when)
+    env.run_until_sealed()
+    hour = ai.hour_floor(when)
+    admin = env.row(hour + timedelta(minutes=50), action=protected_actions()[0], details={"blob": "z" * KB})
+    env.clock.advance(minutes=30)
+    env.seal()
+    late = [s for s in env.seals() if s.kind == "late"][-1]
+    with env.session() as db:
+        admin_bytes = db.query(_row_bytes(AuditLog, "sqlite")).filter(AuditLog.id == admin).scalar()
+    assert late.detail["hour"] == fmt.hour_text(hour)
+    assert late.detail["protected_bytes"] == admin_bytes > KB and late.row_bytes > admin_bytes
+    assert failures(env.verify()) == []

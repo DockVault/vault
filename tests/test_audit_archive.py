@@ -1615,6 +1615,28 @@ def test_the_daily_checks_rolling_part_reads_the_state_its_walk_read(env, monkey
     assert done and failures(report) == [] and report.rows_checked >= 6
 
 
+def test_the_daily_check_records_no_failure_when_an_unarchive_commits_during_it(env, monkeypatch):
+    """The daily check writes its failures into the head record: an unarchive the host commits while the check
+    reads must not leave a block missing or rows in an archived day there."""
+    _wal(env)
+    _sealed_day(env)
+    _archive(env)
+    _seal_days(env, 8)
+    real = arc.check_block_set
+    done = []
+
+    def unarchive_first(db, view, report):
+        if not done:
+            done.append(1)
+            _unarchive(env)
+        return real(db, view, report)
+
+    monkeypatch.setattr(arc, "check_block_set", unarchive_first)
+    report = v.daily_check(env.session, env.st, now=env.clock(), force=True)
+    assert done and failures(report) == []
+    assert ai.open_failures(env.st.head_store().load()) == {}
+
+
 def test_a_check_needs_a_session_that_has_not_read_yet(env):
     env.run_until_sealed()
     with env.session() as db:
