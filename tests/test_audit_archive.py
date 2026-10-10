@@ -1621,3 +1621,102 @@ def test_a_check_needs_a_session_that_has_not_read_yet(env):
         db.query(AuditLog).count()
         with pytest.raises(RuntimeError, match="has not read yet"):
             v.verify(db, record=None, held={}, now=env.clock())
+
+
+# --------------------------------------------------------------------------- a payload, an unarchive, a hold, a rewrite
+
+def test_a_payload_of_the_right_length_is_refused_by_its_digest_before_it_is_decompressed(env, monkeypatch):
+    """A byte of the stored block changed, its length the same: a block keeps no checksum of its own, so it may
+    still decompress; the digest refuses it before anything is decompressed."""
+    _sealed_day(env)
+    _archive(env)
+    payload = bytearray(_blocks(env)[0].payload)
+    payload[len(payload) // 2] ^= 0x01
+    with env.session() as db:
+        db.query(AuditArchiveBlock).update({AuditArchiveBlock.payload: bytes(payload)}, synchronize_session=False)
+        db.commit()
+    opened = []
+    real = af.open_block
+    monkeypatch.setattr(af, "open_block", lambda p: opened.append(bytes(p)) or real(p))
+    assert "block-altered" in failures(env.verify())
+    assert bytes(payload) not in opened
+
+
+def test_unarchive_stops_at_a_later_day_the_server_changed_after_its_read(env, monkeypatch):
+    """Two archived days put back in one command; the server prunes after the first day's transaction commits,
+    which rewrites the later day. Unarchive stops there, saying so, and the first day's work stays done."""
+    other = DAY + timedelta(days=1)
+    _day_rows(env, {3: 2})
+    env.row(at(5, day=other))
+    env.row(at(6, day=other), action=ar.protected_actions()[0])
+    env.run_until_sealed()
+    _archive(env)
+    assert len(_blocks(env)) == 2
+    seen = arc.unarchive(env.engine, env.st, None, None, read=True)
+    restored = []
+    real_restore = arc.restore_day
+
+    def restore(w, day, now):
+        restored.append(day)
+        return real_restore(w, day, now)
+
+    monkeypatch.setattr(arc, "restore_day", restore)
+    real_writer = ai.ChainWriter
+    exits = []
+
+    class FirstDayThenTheServer(real_writer):
+        def __exit__(self, *exc):
+            out = super().__exit__(*exc)
+            exits.append(1)
+            if len(exits) == 1:             # the first day restored and committed: the server prunes the next
+                monkeypatch.setattr(ai, "ChainWriter", real_writer)
+                ar.prune(_pass(env), _numbers(max_days=95, admin_min=365))
+            return out
+
+    monkeypatch.setattr(ai, "ChainWriter", FirstDayThenTheServer)
+    with pytest.raises(host.Refused, match="changed after the read"):
+        arc.unarchive(env.engine, env.st, None, None, expect=seen["state"])
+    assert restored == [DAY] and {b.day for b in _blocks(env)} == {other}
+    assert failures(env.verify()) == []
+
+
+def test_archived_rows_are_not_deleted_while_a_restore_holds_deletion_even_when_called_directly(env, monkeypatch):
+    """The audit job checks the hold first; the pruner's archived phase checks it again under the chain lock, so a
+    restore marked between the two (or a caller that does not check) deletes nothing archived."""
+    _sealed_day(env)
+    _archive(env)
+    before = _ids_in_blocks(env, DAY)
+    numbers = _numbers(max_days=95)
+    p = _pass(env)
+
+    def prune_archived():
+        return audit_chain_prune.prune(
+            p, [AuditLog.id.is_(None)], reason="retention",
+            archived=lambda m: retention.deletable(m, p.now, *ar.by_age(m, p.now, numbers)),
+            before=p.now - timedelta(days=numbers.max_days))
+
+    monkeypatch.setattr(env.st, "restore_mark", lambda: {"marked": "now"})
+    assert prune_archived().deleted == 0 and _ids_in_blocks(env, DAY) == before
+    monkeypatch.setattr(env.st, "restore_mark", lambda: None)
+    assert prune_archived().deleted == len(before) and _ids_in_blocks(env, DAY) == []
+
+
+def test_after_a_part_is_rewritten_the_size_cap_and_the_preview_read_its_new_aggregates(env):
+    """What a part's aggregates say is read once per payload: a part rewritten (its rows changed) is read again,
+    so its protected share and what the preview counts follow the rows it now holds."""
+    admin = env.row(at(4), action=ar.protected_actions()[0])
+    _day_rows(env, {3: 2})
+    env.run_until_sealed()
+    _archive(env)
+    with env.session() as db:
+        first = arc.part_figures(db, env.st.view)[(DAY, 1)]
+        aged = ar.preview(db, env.clock(), _numbers(max_days=95, admin_min=365))
+    assert (sum(first.rows), first.protected_rows) == (3, 1)
+    assert aged["archived"]["by_age"]["rows"] == 2
+    ar.prune(_pass(env), _numbers(max_days=95, admin_min=365))   # the two other rows go: the part is rewritten
+    assert _ids_in_blocks(env, DAY) == [admin]
+    with env.session() as db:
+        after = arc.part_figures(db, env.st.view)[(DAY, 1)]
+        aged = ar.preview(db, env.clock(), _numbers(max_days=95, admin_min=365))
+    assert (sum(after.rows), after.protected_rows) == (1, 1)
+    assert aged["archived"]["by_age"]["rows"] == 0
