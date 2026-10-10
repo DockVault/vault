@@ -397,10 +397,12 @@ def test_the_case_list_and_the_new_case_sheet_fit_a_phone(browser: Browser, worl
         _close(page)
 
 
-def _sheet_fits(page: Page, sheet_id: str, opener: str):
+def _sheet_fits(page: Page, sheet_id: str, opener: str, shows: str = None):
     page.locator(opener).click()
     sheet = page.locator(f"#{sheet_id}.active .cmp-sheet-content")
     expect(sheet).to_be_visible()
+    if shows:
+        expect(sheet.locator(shows)).to_be_visible()
     box = sheet.bounding_box()
     assert box["width"] <= PHONE["width"] + 1, box
     _fits(page)
@@ -426,7 +428,8 @@ def test_an_administrators_tabs_sheets_and_a_case_fit_a_phone(browser: Browser, 
         _tab(page, "auditors")
         expect(page.locator(".cmp-propose")).to_be_visible(timeout=15000)
         _fits(page)
-        _sheet_fits(page, "cmp-propose-sheet", ".cmp-propose")
+        # The sheet says, before anyone proposes, whom the account's creator keeps from approving.
+        _sheet_fits(page, "cmp-propose-sheet", ".cmp-propose", shows=".cmp-propose-creator")
         _tab(page, "cases")
         row = page.locator(f'.cmp-case-row[data-case-id="{world["case"]["id"]}"]')
         expect(row).to_be_visible(timeout=15000)
