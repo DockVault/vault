@@ -423,6 +423,47 @@ def test_the_sender_sends_a_case_less_access_notice_and_records_it(db, cast):
     assert [r.details["kind"] for r in sent] == [an.KIND]
 
 
+def test_after_an_administrator_moved_the_owners_address_the_notice_goes_to_both(db, cast):
+    """An administrator changes the owner's address, then gives someone access: the notice also goes to the address
+    the owner had before (as a case's notice does), so moving the address first cannot hide the grant."""
+    from app.core import credential_changes as cc
+    db.add(m.CredentialChange(target_user_id=cast.olga.id, kind=cc.EMAIL, status=cc.MADE, requested_by_name="ada",
+                              requested_at=NOW - timedelta(days=3), applied_at=NOW - timedelta(days=3),
+                              payload={"previous_email": "olga.private@example.test",
+                                       "new_email": "olga@example.test"}))
+    db.commit()
+    grant(db, cast.ada, cast.v1, cast.xavier, "read")
+    db.commit()
+    [row] = outbox(db)
+    assert row.status == on.PENDING and row.next_attempt_at is not None
+    assert on.open_destination(row, on.ADDRESS) == "olga@example.test"
+    assert on.open_destination(row, on.PREVIOUS) == "olga.private@example.test"
+    [audit] = written(db)
+    assert audit.details["copy_to_previous"] is True and audit.details["email_status"] == on.CASE_QUEUED
+    reached = []
+    assert on._attempt(db, row, NOW, lambda _db, _row, _case, address, _name: reached.append(address)) == on.SENT
+    db.commit()
+    assert reached == ["olga@example.test", "olga.private@example.test"]
+    assert row.sent_to == [on.ADDRESS, on.PREVIOUS]
+    [sent] = db.query(m.AuditLog).filter(m.AuditLog.action == "owner_notice_email_sent").all()
+    assert sent.details["copy_to_previous"] is True
+
+
+def test_an_owner_with_no_address_is_told_in_the_app_and_no_email_is_queued_or_recorded_as_sent(db, cast):
+    cast.olga.email = None
+    db.commit()
+    grant(db, cast.ada, cast.v1, cast.xavier, "read")
+    db.commit()
+    assert len(notices(db, cast.olga)) == 1
+    [row] = outbox(db)
+    assert row.status == on.NO_ADDRESS and row.next_attempt_at is None
+    assert row.address_enc is None and row.previous_address_enc is None
+    [audit] = written(db)
+    assert audit.details["email_status"] == on.NO_ADDRESS and audit.details["copy_to_previous"] is False
+    assert on.due(db, NOW + timedelta(days=1)) is None, "the sender never picks it up"
+    assert not db.query(m.AuditLog).filter(m.AuditLog.action == "owner_notice_email_sent").all()
+
+
 def test_the_compliance_banner_neither_counts_nor_marks_access_notices(db, cast):
     grant(db, cast.ada, cast.v1, cast.xavier, "read")
     db.commit()

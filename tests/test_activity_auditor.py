@@ -452,6 +452,23 @@ def test_a_vault_the_case_may_no_longer_open_shows_no_name(db, people, storage, 
     assert views[0]["names"] == {"vault": an.NOT_SHOWN, "item": an.NOT_SHOWN} and shown == [set()]
 
 
+def test_a_file_with_its_own_password_is_named_through_a_case_only_under_the_override(db, people, storage, settings):
+    """A file with a password of its own is never named because of a case, unless the case passes passwords over
+    (as its content opens only then); the file beside it in the same vault is named."""
+    own = _file(db, storage, people.v1, name="private-plan.txt", password_hash="file-hash")
+    plain = _file(db, storage, people.v1, name="minutes.txt")
+    case = _case(db, people, _vaults(people.v1))
+    rows = [_event(db, "file_download", by=people.olga, resource_type="file", resource_id=x.id, vault=people.v1)
+            for x in (own, plain)]
+    views, shown, _sel = _shown(db, people, case, rows)
+    assert views[0]["names"] == {"vault": people.v1.name, "item": an.NOT_SHOWN}
+    assert views[1]["names"]["item"] == "minutes.txt" and "private-plan.txt" not in str(views)
+    settings[cs.PASSWORD_VAULTS] = cs.OVERRIDE
+    over = _case(db, people, _vaults(people.v1), password_override=True)
+    views, shown, _sel = _shown(db, people, over, rows)
+    assert [v["names"]["item"] for v in views] == ["private-plan.txt", "minutes.txt"]
+
+
 def test_an_item_of_another_vault_is_never_named_through_the_case(db, people, storage):
     """An event that says it is in the case's vault but is about a file of another vault: the file is not named."""
     elsewhere = _file(db, storage, people.v2, name="secret.txt")

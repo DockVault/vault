@@ -435,7 +435,20 @@ def test_the_resolver_writes_nothing_but_its_record():
 # --------------------------------------------------------------------------- static pins
 
 CASE_MODULES = ("case_access", "cases", "case_rules", "case_eligibility", "legal_holds", "auditor_rights",
-                "owner_access", "compliance_router")
+                "owner_access", "compliance_router", "case_export", "name_reveal", "activity_case",
+                "activity_viewer", "case_context")
+
+
+def test_the_case_module_list_names_every_module_that_opens_a_case_or_an_auditors_reading():
+    """The list the pins below read is complete: every module of the compliance code that opens a vault for a case,
+    exports it, reveals a recorded name, names items through a case or lets an auditor read the log is in it, so the
+    permission service, the SFTP server or get_vault importing one of them cannot go unnoticed; and each name is a
+    module of the app, so no entry guards nothing."""
+    for mod in ("case_access", "case_export", "name_reveal", "activity_case", "activity_viewer", "cases",
+                "case_rules", "legal_holds", "auditor_rights", "compliance_router", "case_context"):
+        assert mod in CASE_MODULES, mod
+    for mod in CASE_MODULES:
+        assert list((ROOT / "app").rglob(mod + ".py")), f"{mod} is no module of the app"
 
 
 def _imports(path: Path) -> set:

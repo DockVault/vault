@@ -1185,6 +1185,20 @@ def test_the_vault_picker_lets_an_administrator_in_and_refuses_anyone_else_not_a
     assert _rows(db, "case_picker_viewed")[-1].user_id == people.bob.id
 
 
+def test_the_vault_picker_gives_an_administrator_no_name_of_a_vault_they_cannot_read(db, people):
+    """Being an administrator reads no vault's name through the picker (the real permission service, no stub):
+    a name shows only for a vault the administrator could open anyway, here once made a member of it."""
+    out = cr.vault_picker(owner="olga", current_user=people.bob, db=db)
+    assert {v["id"]: v["name"] for v in out["vaults"]} == {str(people.v1.id): None, str(people.v2.id): None}
+    assert "Payroll" not in str(out)
+    db.execute(m.vault_members.insert().values(vault_id=people.v1.id, user_id=people.bob.id, read_permission=True,
+                                               write_permission=False, delete_permission=False,
+                                               manage_permission=False))
+    db.commit()
+    out = cr.vault_picker(owner="olga", current_user=people.bob, db=db)
+    assert {v["id"]: v["name"] for v in out["vaults"]} == {str(people.v1.id): "Payroll 2026", str(people.v2.id): None}
+
+
 # --------------------------------------------------------------------------- an administrator the case concerns
 
 def test_an_administrator_the_case_concerns_reads_no_reason_and_no_objection(db, people):
@@ -1460,6 +1474,13 @@ def test_a_person_named_by_id_and_by_username_is_named_once(db, people, no_codes
                           named_usernames=["carl", "Carl"], named_user_ids=[people.carl.id], **TEXT)
     view = cr.request_case(body, request=None, current_user=people.uma, db=db)
     assert _named(db, view) == [people.carl.id]
+
+
+def test_people_named_by_id_and_others_by_username_are_all_named(db, people, no_codes):
+    body = cr.CaseRequest(scope=[cr.ScopeItemIn(kind="vault", target_id=people.v1.id)],
+                          named_usernames=["carl"], named_user_ids=[people.otto.id], **TEXT)
+    view = cr.request_case(body, request=None, current_user=people.uma, db=db)
+    assert sorted(map(str, _named(db, view))) == sorted([str(people.otto.id), str(people.carl.id)])
 
 
 def test_a_username_that_names_no_account_is_refused_as_an_unknown_person_and_recorded(db, people, no_codes):

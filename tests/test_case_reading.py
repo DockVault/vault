@@ -34,6 +34,7 @@ from app.core import auditor_rights as rights  # noqa: E402
 from app.core import body_limit as bl  # noqa: E402
 from app.core import case_access as ca  # noqa: E402
 from app.core import case_rules as rules  # noqa: E402
+from app.core import cases  # noqa: E402
 from app.core import compliance_settings as cs  # noqa: E402
 from app.core import models as m  # noqa: E402
 from app.core import vault_unlock_receipts as receipts  # noqa: E402
@@ -94,6 +95,47 @@ def test_the_case_lists_its_vaults_with_their_names_and_how_each_opens(db, peopl
         "a zero-knowledge vault's label is what its members see while it is locked"
     (row,) = _rows(db, "case_folder_listed")
     assert row.case_id == case.id and row.resource_type == "case"
+
+
+def test_a_password_vault_the_rule_now_refuses_is_listed_without_its_name(db, people, storage, settings):
+    """Approved while password vaults open with their password, then the deployment refuses them: the stricter rule
+    applies, so the case's vault list shows that vault with why it is refused and without its name; a vault with no
+    password keeps its name."""
+    pv = _vault(db, people.olga, password="argon2-hash")
+    pv.name = "Payroll 2026"
+    db.commit()
+    case = _case(db, people, _vaults(people.v1, pv))
+    settings[cs.PASSWORD_VAULTS] = cs.REFUSE
+    listed = _tree(db, people, case)["vaults"]
+    out = {v["vault_id"]: v for v in listed}
+    assert out[str(pv.id)]["refused"] == ca.PASSWORD_REFUSED and out[str(pv.id)]["name"] is None
+    assert out[str(pv.id)]["has_password"] is True and "Payroll" not in str(listed)
+    assert out[str(people.v1.id)]["name"] == people.v1.name and out[str(people.v1.id)]["refused"] is None
+
+
+def test_a_vault_narrowed_out_of_the_case_leaves_its_vault_list_and_searches(db, people, storage):
+    """A vault left out by a narrowing covers nothing: it is no longer listed (no name, no figures), its tree and a
+    search in it are refused as no vault of the case, and a search names it neither as searched nor as not."""
+    people.v2.name, people.v2.file_count, people.v2.total_size_bytes = "Otto's contracts", 7, 123456
+    db.commit()
+    _file(db, storage, people.v1, name="report-kept.txt")
+    _file(db, storage, people.v2, name="report-left.txt")
+    case = _case(db, people, _vaults(people.v1, people.v2))
+    assert {v["vault_id"] for v in _tree(db, people, case)["vaults"]} == {str(people.v1.id), str(people.v2.id)}
+    cases.narrow(db, case, by=people.uma, scope=_vaults(people.v1))
+    db.commit()
+    listed = ca.vaults(db, case, people.uma, now=ca.utcnow() + timedelta(minutes=11))["vaults"]
+    assert [v["vault_id"] for v in listed] == [str(people.v1.id)]
+    assert "Otto" not in str(listed) and 123456 not in [v["bytes"] for v in listed]
+    assert _rows(db, "case_folder_listed")[-1].details["vault_ids"] == [str(people.v1.id)]
+    _, err = _call(_tree, db, people, case, people.v2)
+    assert err.status_code == 404 and err.detail["reason"] == ca.NO_SUCH_VAULT
+    out = _search(db, people, case, "report")
+    assert [r["name"] for r in out["results"]] == ["report-kept.txt"]
+    assert out["vaults_searched"] == [str(people.v1.id)] and out["vaults_not_searched"] == []
+    assert _rows(db, "case_search")[-1].details["vault_ids"] == [str(people.v1.id)]
+    _, err = _call(_search, db, people, case, "report", vault=people.v2)
+    assert err.status_code == 404 and err.detail["reason"] == ca.NO_SUCH_VAULT
 
 
 def test_a_folder_lists_folders_and_files_live_and_kept_with_their_status(db, people, storage):
