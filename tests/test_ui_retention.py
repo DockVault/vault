@@ -57,6 +57,18 @@ def _serve_storage(page: Page, edit):
     page.route(re.compile(r"/settings/managed/storage$"), handle)
 
 
+def _chain_started():
+    """The web process's pruner starts the audit chain a minute after the server starts, and a change that deletes
+    sooner is refused until it has: wait for its first policy seal on a fresh stack."""
+    import time
+    from _account_change_helpers import psql
+    for _ in range(80):
+        if psql("SELECT count(*) FROM audit_seals WHERE kind = 'policy'") not in ("", "0"):
+            return
+        time.sleep(3)
+    raise AssertionError("the audit chain never started")
+
+
 def _cancel_waiting(admin, key):
     for change in admin.get("/settings/managed").json()["pending"]:
         if change["key"] == key:
@@ -115,6 +127,7 @@ def test_a_change_that_deletes_sooner_shows_what_it_would_delete_before_anything
 
 def test_a_change_waits_and_any_administrator_can_cancel_it(page: Page, admin_creds, admin):
     key = "security_record_days"
+    _chain_started()
     _cancel_waiting(admin, key)
     try:
         _login(page, admin_creds["username"], admin_creds["password"])

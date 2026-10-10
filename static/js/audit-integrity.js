@@ -111,7 +111,13 @@
         window.initActivity = async function () {
             const out = await init.apply(this, arguments);
             const section = document.getElementById('activity-section');
-            if (section && section.classList.contains('active')) load();
+            // A page that is not this person's (a temporary credential, someone who is not an administrator) asks
+            // nothing, the strip's status included.
+            if (section && section.classList.contains('active') && !section.classList.contains('is-blocked')) load();
+            else {
+                const box = document.getElementById('act-integrity');
+                if (box) { box.replaceChildren(); box.hidden = true; }
+            }
             return out;
         };
     }
