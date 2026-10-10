@@ -14,6 +14,7 @@ on a throwaway SQLite database with a chain of its own (tests/_audit_chain_env.p
 - the host's unarchive (rows and each hour's working data back, the chain still clean), its two phases, and its
   estimate; compact; the acknowledgment of a removal made by an older release with blocks present.
 """
+import contextlib
 import os
 import uuid
 from datetime import datetime, time, timedelta
@@ -1961,9 +1962,44 @@ def test_the_daily_check_waits_for_the_chain_lock_and_runs_at_a_later_pass_when_
     assert v.daily_check(env.session, env.st, now=env.clock(), force=True) is not None
 
 
+def test_a_writer_that_commits_as_soon_as_the_check_releases_the_chain_lock_changes_nothing_it_reads(env,
+                                                                                                    monkeypatch):
+    """The lock is held while the snapshot is taken and the record read, and released before the check: a host
+    command that takes it at once and commits is in neither, so the check reports and records nothing."""
+    _wal(env)
+    _sealed_day(env)
+    _archive(env)
+    _seal_days(env, 8)
+    host_process = ai.ChainState(settings=env.settings, clock=env.clock)
+    real = ai.chain_lock
+    done = []
+
+    @contextlib.contextmanager
+    def then_a_writer(*args, **kw):
+        with real(*args, **kw):
+            yield
+        if not done:
+            done.append(1)
+            seen = arc.unarchive(env.engine, host_process, None, None, read=True)
+            arc.unarchive(env.engine, host_process, None, None, expect=seen["state"])
+
+    monkeypatch.setattr(ai, "chain_lock", then_a_writer)
+    report = v.daily_check(env.session, env.st, now=env.clock(), force=True)
+    assert done and not _blocks(env)
+    assert failures(report) == [] and ai.open_failures(env.st.head_store().load()) == {}
+    assert failures(env.verify()) == []
+
+
 def test_a_check_needs_a_session_that_has_not_read_yet(env):
     env.run_until_sealed()
     with env.session() as db:
+        db.query(AuditLog).count()
+        with pytest.raises(RuntimeError, match="has not read yet"):
+            v.verify(db, record=None, held={}, now=env.clock())
+    # A snapshot taken with the record holds for its own transaction only.
+    with env.session() as db:
+        v.one_state_and_record(db, env.st)
+        db.commit()
         db.query(AuditLog).count()
         with pytest.raises(RuntimeError, match="has not read yet"):
             v.verify(db, record=None, held={}, now=env.clock())
