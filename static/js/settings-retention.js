@@ -373,6 +373,7 @@
                 text += `Archiving ${new Date(a.starts_on) > new Date() ? 'starts' : 'started'} on ${when(a.starts_on)}. `;
             }
             text += a.days ? `${a.days} days are archived, ${a.oldest_day} to ${a.newest_day}.` : 'No day is archived yet.';
+            if (s.rows.oldest) text += ` The oldest day still kept as rows is ${s.rows.oldest.slice(0, 10)}.`;
             box.appendChild(el('p', 'text-sm retention-archive', text));
         }
         const i = S.integrity;

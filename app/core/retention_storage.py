@@ -2,7 +2,8 @@
 app/api/managed_settings_router.py; shown by static/js/settings-retention.js).
 
 - the rows: how many (on Postgres the planner's estimate, which reading every row to count would cost far more than
-  it is worth on a large log; elsewhere counted) and what the table takes with its indexes;
+  it is worth on a large log; elsewhere counted), what the table takes with its indexes, and the oldest row's time
+  (how far the archive has come: the oldest day still kept as rows);
 - the archive: its blocks, the rows they hold and their bytes, and what its table takes;
 - the size cap when one is set: the bytes it counts (the chain's figure, app/core/audit_chain_size.py: hot hours'
   lagged bytes and archived parts' bound lengths, read from the verified view, no row read), the cap, and a
@@ -29,16 +30,20 @@ def _is_pg(db) -> bool:
 
 
 def _rows(db) -> dict:
+    """How many audit rows there are, what they take, and the time of the oldest (the archive's progress: the oldest
+    day still kept as rows; the timestamp's index answers it without reading the table)."""
     from app.core.models import AuditLog
+    oldest = db.query(func.min(AuditLog.timestamp)).scalar()
+    out = {"oldest": oldest.isoformat() + "Z" if oldest is not None else None}
     if _is_pg(db):
         estimate = db.execute(text("SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('audit_logs')"))\
             .scalar()
         size = db.execute(text("SELECT pg_total_relation_size(to_regclass('audit_logs'))")).scalar()
         if estimate is not None and estimate >= 0:
-            return {"count": int(estimate), "exact": False, "bytes": int(size or 0)}
-        return {"count": int(db.query(func.count()).select_from(AuditLog).scalar() or 0), "exact": True,
-                "bytes": int(size or 0)}
-    return {"count": int(db.query(func.count()).select_from(AuditLog).scalar() or 0), "exact": True, "bytes": None}
+            return dict(out, count=int(estimate), exact=False, bytes=int(size or 0))
+        return dict(out, count=int(db.query(func.count()).select_from(AuditLog).scalar() or 0), exact=True,
+                    bytes=int(size or 0))
+    return dict(out, count=int(db.query(func.count()).select_from(AuditLog).scalar() or 0), exact=True, bytes=None)
 
 
 def _archive(db) -> dict:

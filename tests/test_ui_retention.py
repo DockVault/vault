@@ -87,6 +87,7 @@ def test_values_show_their_source_and_a_locked_one_its_env_line(page: Page, admi
     expect(page.locator('#retention-groups .retention-group[data-group="working_records"]')).to_contain_text("Fixed")
     expect(page.locator("#retention-storage")).to_contain_text("Audit rows:")
     expect(page.locator("#retention-storage")).to_contain_text("The database's volume is in another container")
+    expect(page.locator("#retention-storage .retention-archive")).to_contain_text("The oldest day still kept as rows is ")
     assert not errors, errors
 
 

@@ -12,6 +12,7 @@ def test_an_administrator_reads_what_the_audit_log_takes(admin):
     body = r.json()
     assert set(body) == {"rows", "archive", "cap", "storage_volume", "database_volume", "existing_install"}
     assert body["rows"]["count"] >= 0 and body["rows"]["bytes"] > 0 and isinstance(body["rows"]["exact"], bool)
+    assert body["rows"]["oldest"].endswith("Z")
     assert body["archive"]["blocks"] >= 0 and body["archive"]["table_bytes"] > 0
     assert body["cap"] is None and body["database_volume"] is None
     vol = body["storage_volume"]

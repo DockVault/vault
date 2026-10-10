@@ -42,7 +42,8 @@ def test_rows_archive_and_no_cap(env, tmp_path):
     env.run_until_sealed()
     with env.session() as db:
         out = rs.summary(db, T0, str(tmp_path), env.st)
-    assert out["rows"] == {"count": 10, "exact": True, "bytes": None}
+    assert out["rows"] == {"count": 10, "exact": True, "bytes": None,
+                           "oldest": datetime.combine(OLD, time(3, 0)).isoformat() + "Z"}
     assert out["archive"] == {"blocks": 0, "rows": 0, "bytes": 0, "table_bytes": None}
     assert out["cap"] is None and out["database_volume"] is None
     assert out["storage_volume"]["total"] >= out["storage_volume"]["free"] > 0
@@ -51,6 +52,7 @@ def test_rows_archive_and_no_cap(env, tmp_path):
         out = rs.summary(db, T0, str(tmp_path), env.st)
         (length,) = db.query(arc._length(AuditArchiveBlock.payload, db)).one()
     assert out["rows"]["count"] == 4
+    assert out["rows"]["oldest"] == datetime.combine((T0 - timedelta(days=2)).date(), time(3, 0)).isoformat() + "Z"
     assert out["archive"] == {"blocks": 1, "rows": 6, "bytes": length, "table_bytes": None}
     assert failures(env.verify()) == []
 
