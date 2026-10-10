@@ -1,4 +1,9 @@
-/* Activity page (administrators): what happened, who did it, and how it came in.
+/* Activity page (administrators, and auditors whose right is in force): what happened, who did it, and how it came in.
+ *
+ * An auditor (static/js/compliance.js says whether this account is one) reads the same page, without the "Now"
+ * panel and the temporary-credential lookups, which stay with administrators; a Case chip selects one of their
+ * active cases (its names show where the case may read them, sent with the case's vault receipts in
+ * X-Case-Unlock), and each event can be revealed (its names as recorded in full, with a reason) or start a new case.
  *
  * One page: a header (the time range, Pause, Export), a summary band whose marks are filters, and the
  * events list with the selected event's detail beside it. One state object (the range, the filters,
@@ -80,6 +85,8 @@
             saved: null, savedLoaded: null,
             layout: 'wide',
             undo: null,
+            // An auditor (not an administrator), and the case selected on the Case chip.
+            auditor: false, caseId: null, cases: null,
         };
     }
 
@@ -277,7 +284,7 @@
     function post(path, params) {
         return fetch(API_BASE + path, {
             method: 'POST',
-            headers: Object.assign({ Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, unlockHeader()),
+            headers: Object.assign({ Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, unlockHeader(), caseHeader()),
             body: JSON.stringify(bodyOf(params)),
         });
     }
@@ -291,6 +298,12 @@
         const parts = [];
         UNLOCKS.forEach((u, vid) => { if (u.expires > now) parts.push(`${vid}:${u.receipt}`); else UNLOCKS.delete(vid); });
         return parts.length ? { 'X-Activity-Unlock': parts.join(',') } : {};
+    }
+
+    // With a case selected, the receipts of its vaults unlocked with their password (static/js/compliance.js).
+    function caseHeader() {
+        if (!S.caseId || typeof window.complianceCaseUnlockHeader !== 'function') return {};
+        return window.complianceCaseUnlockHeader(S.caseId);
     }
 
     async function unlockVault(vid, password) {
@@ -327,13 +340,53 @@
         return wrap;
     }
 
+    // An auditor's steps on one event: its vault's password in the selected case, its recorded names revealed (with a
+    // reason; the owner is told), or a new case about its vault (static/js/compliance.js).
+    function auditorActions(ev, vid, names) {
+        const box = el('div', 'act-auditor-actions');
+        if (S.caseId && names.item === 'Name hidden: the vault has a password' && typeof window.complianceUnlockCaseVault === 'function') {
+            const form = el('form', 'act-unlock');
+            const input = el('input', 'form-control act-unlock-password');
+            input.type = 'password';
+            input.autocomplete = 'off';
+            input.placeholder = 'Vault password';
+            input.setAttribute('aria-label', 'Vault password');
+            const go = button('btn btn-sm btn-primary', 'Show names in this case');
+            go.type = 'submit';
+            const msg = el('span', 'act-unlock-msg text-secondary', 'For 15 minutes, in this case.');
+            form.append(input, go, msg);
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                go.disabled = true;
+                try {
+                    await window.complianceUnlockCaseVault(S.caseId, vid, input.value);
+                    await reloadList({ keepSelection: true });
+                    renderDetail();
+                } catch (err) { msg.textContent = err.message || 'Not unlocked.'; go.disabled = false; }
+                input.value = '';
+            });
+            box.appendChild(form);
+        }
+        if (typeof window.openRevealDialog === 'function') {
+            const reveal = button('btn btn-sm btn-secondary act-reveal', 'Reveal recorded names…');
+            reveal.addEventListener('click', () => window.openRevealDialog(ev));
+            box.appendChild(reveal);
+        }
+        if (typeof window.openNewCaseFor === 'function') {
+            const add = button('btn btn-sm btn-secondary act-new-case', 'Add to a new case');
+            add.addEventListener('click', () => window.openNewCaseFor(vid, names.vault || null));
+            box.appendChild(add);
+        }
+        return box;
+    }
+
     // A GET under /activity (or the session probe). A 401 is handed to the app's own sign-in handling;
     // a refusal for a temporary credential stops the page (see blockAsTemporary).
     async function get(path) {
         const [base, query] = path.split('?');
         const params = new URLSearchParams(query || '');
         const resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
-            : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader()) });
+            : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader(), caseHeader()) });
         if (resp.status === 401) {
             await apiRequest(path, { silent: true });          // the app signs out
             throw new RequestError('Your session has ended.', 401, null);
@@ -466,6 +519,7 @@
         if (f.tcId) p.set('temp_credential_id', f.tcId);
         else if (f.tcName) p.set('temp_credential', f.tcName);
         if (f.vault) p.set('vault_id', f.vault);
+        if (S.caseId) p.set('case', S.caseId);
         return p;
     }
 
@@ -1755,9 +1809,10 @@
                 [vid ? detailFilter('Show events for this vault', { vault: vid }) : null]);
         }
         if (names.item) field(what.dl, ev.resource_type === 'folder' ? 'Folder' : 'File', names.item);
-        if (vid && names.item === 'Name hidden: the vault has a password' && !UNLOCKS.has(vid)) {
+        if (vid && names.item === 'Name hidden: the vault has a password' && !UNLOCKS.has(vid) && !S.auditor) {
             field(what.dl, 'Names', unlockForm(vid));
         }
+        if (S.auditor && vid) field(what.dl, 'Compliance', auditorActions(ev, vid, names));
         if (ev.resource_type) {
             const text = `${ev.resource_type} ${ev.resource_id || ''}`.trim();
             const copy = button('act-d-filter', null, { 'aria-label': 'Copy', title: 'Copy' });
@@ -1815,6 +1870,7 @@
     }
 
     async function lookupTcState(id, name) {
+        if (S.auditor) return;                 // the credentials' lookup is for administrators
         if (id in S.tcStates || String(name).length < 2) return;
         S.tcStates[id] = null;
         try {
@@ -2104,7 +2160,7 @@
         S.selectedId = id;
         S.detail = null;
         try {
-            S.detail = await get('/activity/events/' + encodeURIComponent(id));
+            S.detail = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
             S.detailMissing = false;
             S.detailWhere = null;
         } catch (err) {
@@ -2431,6 +2487,7 @@
     }
 
     async function loadNow() {
+        if (S.auditor) return;                 // who is signed in now is for administrators
         if (S.blocked || !S.active || S.paused || document.hidden) return;
         const seq = ++S.nowSeq;
         try {
@@ -3913,6 +3970,7 @@
         typeahead(tInput, {
             min: 2,
             source: async (q) => {
+                if (S.auditor) return [];
                 const d = await get(`/activity/temp-credentials?q=${encodeURIComponent(q)}&limit=8`);
                 return (d.temp_credentials || []).map((t) => {
                     const exp = toDate(t.expires_at);
@@ -4630,7 +4688,7 @@
         box.replaceChildren();
         box.appendChild(el('p', 'act-blocked-text', kind === 'temp'
             ? "Activity needs your own administrator sign-in. You're signed in with a temporary credential, which can't open the activity log."
-            : 'Activity is for administrators. Ask an administrator if you need an event looked up.'));
+            : 'Activity is for administrators and auditors. Ask an administrator if you need an event looked up.'));
         box.hidden = false;
         $('activity-section').classList.add('is-blocked');
         dropHash();
@@ -4645,8 +4703,11 @@
     async function checkAccess() {
         if (S.blocked === 'temp') return false;
         const user = typeof currentUser !== 'undefined' ? currentUser : null;
-        if (!user || user.role !== 'admin') { block('admin'); return false; }
+        if (!user) { block('admin'); return false; }
         if (typeof isScopedTemp !== 'undefined' && isScopedTemp) { block('temp'); return false; }
+        // An auditor whose right is in force reads the page too (the server decides on each read).
+        S.auditor = user.role !== 'admin' && await auditorLive();
+        if (user.role !== 'admin' && !S.auditor) { block('admin'); return false; }
         let info = typeof sessionAccess !== 'undefined' ? sessionAccess : null;
         if (!info) {
             try {
@@ -4657,6 +4718,60 @@
         if (info && (info.is_temp_session || info.is_scoped_temp)) { block('temp'); return false; }
         if (S.blocked) unblock();
         return true;
+    }
+
+    async function auditorLive() {
+        if (window.complianceAuditorLive === true) return true;
+        try {
+            const r = await fetch(`${API_BASE}/compliance/me`, { headers: { Authorization: `Bearer ${authToken}` } });
+            if (!r.ok) return false;
+            const me = await r.json();
+            return !!(me && me.grant && me.grant.live);
+        } catch (_) { return false; }
+    }
+
+    // The auditor's Case chip: no case, or one of their active cases. A case selected narrows the list to it and
+    // shows the names it lets them read.
+    async function renderCaseChip() {
+        let box = $('act-case-box');
+        if (!S.auditor) { if (box) box.remove(); S.caseId = null; return; }
+        const cases = typeof window.complianceActiveCases === 'function' ? await window.complianceActiveCases() : [];
+        S.cases = cases;
+        if (window.complianceActivityCase && cases.some((c) => c.id === window.complianceActivityCase)) {
+            S.caseId = window.complianceActivityCase;
+        }
+        window.complianceActivityCase = null;
+        if (S.caseId && !cases.some((c) => c.id === S.caseId)) S.caseId = null;
+        if (!box) {
+            box = el('label', 'act-case-box');
+            box.id = 'act-case-box';
+            const sel = el('select', 'form-control form-control-sm act-case');
+            sel.id = 'act-case';
+            sel.setAttribute('aria-label', 'Case');
+            sel.addEventListener('change', () => {
+                S.caseId = sel.value || null;
+                if (S.detailOpen) closeDetail(false);
+                reloadList();
+                loadBand();
+            });
+            box.append(el('span', 'act-case-label', 'Case'), sel);
+            const bar = $('act-toolbar');
+            if (bar) bar.insertBefore(box, bar.firstChild);
+        }
+        const sel = $('act-case');
+        sel.replaceChildren();
+        const none = el('option', null, 'No case');
+        none.value = '';
+        sel.appendChild(none);
+        cases.forEach((c) => {
+            const o = el('option', null, 'Case ' + (c.number || c.id.slice(0, 8)));
+            o.value = c.id;
+            if (c.id === S.caseId) o.selected = true;
+            sel.appendChild(o);
+        });
+        sel.disabled = !cases.length;
+        const now = $('act-p-now');
+        if (now) now.hidden = true;
     }
 
     // ---- timers ------------------------------------------------------------------------------------
@@ -4899,6 +5014,7 @@
         if (!section.classList.contains('active')) return;
         S.active = true;
         if (!await checkAccess()) return;
+        await renderCaseChip();
         S.layout = layoutFor(section.clientWidth || 1200);
         S.socketState = window.dockvaultSocketState || 'connecting';
         if (S.socketState !== 'open' && !S.socketDownSince) {
@@ -4944,6 +5060,10 @@
 
     // Signing out forgets everything the page held: the next person on this tab starts afresh.
     window.resetActivity = function resetActivity() {
+        const caseBox = $('act-case-box');
+        if (caseBox) caseBox.remove();
+        const nowPanel = $('act-p-now');
+        if (nowPanel) nowPanel.hidden = false;
         stopTimers();
         closePanel(false);
         closeMenu();

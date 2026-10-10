@@ -7028,6 +7028,14 @@ function handleSocketFrame(data) {
             if (ev.notification_type === 'recording_levels_changed') {
                 try { window.dispatchEvent(new CustomEvent('dockvault:recording-levels')); } catch (_) {}
             }
+            // A notice about access to my vaults: its banner checks again (static/js/compliance.js).
+            if (ev.notification_type === 'compliance_access') {
+                try { window.dispatchEvent(new CustomEvent('dockvault:compliance-access')); } catch (_) {}
+            }
+            // A notice about the auditor right: what this account may do may have changed (static/js/compliance.js).
+            if (ev.notification_type === 'auditor_right') {
+                try { window.dispatchEvent(new CustomEvent('dockvault:auditor-right')); } catch (_) {}
+            }
         }
         return;
     }
@@ -7160,6 +7168,9 @@ async function onNotifClick(n) {
         if (item) item.click();
     } else if (_NOTIF_TARGET_OPEN[n.target]) {
         _NOTIF_TARGET_OPEN[n.target]();
+    } else if (n.target && typeof window.openNotifTarget === 'function') {
+        // A target that carries an id, such as one vault (static/js/compliance.js).
+        window.openNotifTarget(n.target);
     }
 }
 
@@ -8267,6 +8278,8 @@ async function loadMfaActions() {
     try { data = await apiRequest('/second-factor/actions', { silent: true }); }
     catch (_) { table.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load the action list.')); return; }
     renderMfaActions((data && data.actions) || []);
+    // The step-ups no switch changes are listed read-only below the matrix (static/js/compliance.js).
+    if (typeof window.renderFixedStepUps === 'function') window.renderFixedStepUps((data && data.fixed) || []);
 }
 
 // Toggles are edited LOCALLY; the admin saves the whole matrix once (one step-up), instead of an OTP
@@ -9485,6 +9498,8 @@ async function loadStorageStats() {
                 `${formatBytes(stats.allocated_bytes || 0)} allocated across ${stats.vault_count || 0} vault(s)`
                 + (stats.limit_bytes ? ` · limit ${formatBytes(stats.limit_bytes)}` : '');
         }
+        // What legal holds keep after deletion (static/js/compliance.js).
+        if (typeof window.renderKeptForCases === 'function') window.renderKeptForCases(stats);
     } catch (error) {
         console.log('Storage stats endpoint not available');
         // Show defaults
@@ -9789,48 +9804,57 @@ function buildActionRow(a, templates) {
 
     const head = document.createElement('div'); head.className = 'ear-head';
     const nm = document.createElement('span'); nm.className = 'ear-name'; nm.textContent = a.name; head.appendChild(nm);
+    const locked = a.category === 'locked';
     const badge = document.createElement('span');
-    badge.className = 'ear-badge ' + (a.category === 'system' ? 'ear-badge-system' : 'ear-badge-optional');
-    badge.textContent = a.category === 'system' ? 'System' : 'Optional';
+    badge.className = 'ear-badge ' + (a.category === 'optional' ? 'ear-badge-optional' : 'ear-badge-system');
+    badge.textContent = locked ? 'Locked' : (a.category === 'system' ? 'System' : 'Optional');
+    if (locked) badge.title = 'Its wording is fixed and it is always sent: it cannot be changed or turned off.';
     head.appendChild(badge);
     row.appendChild(head);
 
     const desc = document.createElement('div'); desc.className = 'ear-desc'; desc.textContent = a.description || ''; row.appendChild(desc);
 
     const controls = document.createElement('div'); controls.className = 'ear-controls';
-    // template picker
-    const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
-    tplWrap.appendChild(document.createTextNode('Template'));
-    const sel = document.createElement('select'); sel.className = 'form-control ear-template';
-    const optDefault = document.createElement('option');
-    optDefault.value = '';
-    optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
-    sel.appendChild(optDefault);
-    templates.forEach(t => {
-        const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
-        if (a.template_id === t.id) o.selected = true;
-        sel.appendChild(o);
-    });
-    sel.addEventListener('change', () => {
-        const picked = sel.value || null;
-        // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
-        // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
-        // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
-        if (!picked) {
-            const swCb = controls.querySelector('.ear-notify input');
-            if (swCb) {
-                swCb.checked = false; swCb.disabled = true;
-                const st = controls.querySelector('.ear-notify-state');
-                if (st) st.textContent = _earNotifyLabel(swCb);
+    if (locked) {
+        // Read-only: no template can be bound and nothing turns it off; only a test send is offered.
+        const fixed = document.createElement('span'); fixed.className = 'ear-field ear-locked';
+        fixed.textContent = 'Template: built-in wording (cannot be changed)';
+        controls.appendChild(fixed);
+    } else {
+        // template picker
+        const tplWrap = document.createElement('label'); tplWrap.className = 'ear-field';
+        tplWrap.appendChild(document.createTextNode('Template'));
+        const sel = document.createElement('select'); sel.className = 'form-control ear-template';
+        const optDefault = document.createElement('option');
+        optDefault.value = '';
+        optDefault.textContent = a.category === 'system' ? 'Built-in default' : '(none — don’t send)';
+        sel.appendChild(optDefault);
+        templates.forEach(t => {
+            const o = document.createElement('option'); o.value = t.id; o.textContent = t.name || '(untitled)';
+            if (a.template_id === t.id) o.selected = true;
+            sel.appendChild(o);
+        });
+        sel.addEventListener('change', () => {
+            const picked = sel.value || null;
+            // Only reflect the SAFE direction immediately: no template => the switch turns off + disables.
+            // Re-ENABLING waits for the reload after the bind is saved, so a click can't race the template
+            // PUT and fire a premature enable (which the server would 400). The reload is server-authoritative.
+            if (!picked) {
+                const swCb = controls.querySelector('.ear-notify input');
+                if (swCb) {
+                    swCb.checked = false; swCb.disabled = true;
+                    const st = controls.querySelector('.ear-notify-state');
+                    if (st) st.textContent = _earNotifyLabel(swCb);
+                }
             }
-        }
-        saveAction(a.key, { template_id: picked });
-    });
-    tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+            saveAction(a.key, { template_id: picked });
+        });
+        tplWrap.appendChild(sel); controls.appendChild(tplWrap);
+    }
 
     // Notify switch (optional actions only): a clear on/off, DISABLED until a template is chosen —
     // an email with no template has nothing to send, so it can't be turned on.
-    if (a.category !== 'system') {
+    if (a.category === 'optional') {
         const hasTpl = !!a.template_id;
         const field = document.createElement('div'); field.className = 'ear-notify';
         const sw = document.createElement('label'); sw.className = 'dv-switch';
@@ -10578,6 +10602,8 @@ async function openVault(vaultId, options) {
             descEl.textContent = vault.description || '';
             descEl.style.display = vault.description ? '' : 'none';  // no "No description" filler
         }
+        // The neutral banner of a vault under an authorised review (static/js/compliance.js).
+        if (typeof window.renderVaultReview === 'function') window.renderVaultReview(vault);
         window.scrollTo({ top: 0 });  // open a vault at the top, not at the grid's scroll position
         
         const lockIcon = document.getElementById('vault-view-lock-icon');
@@ -21716,6 +21742,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     loadGroups().catch(err => console.error('Failed to load groups:', err));
                 } else if (section === 'activity') {
                     if (typeof initActivity === 'function') initActivity();
+                } else if (section === 'compliance') {
+                    if (typeof initCompliance === 'function') initCompliance();
                 } else if (section === 'settings') {
                     initSettings();
                 } else if (section === 'dashboard') {

@@ -13,8 +13,8 @@ approve, and it expires after 7 days. With no other administrator who could appr
 change is refused, and the person who runs the server can make it on the host (``dockvault.py
 accounts``), where it is recorded as the host operator's.
 
-A different administrator means one independent of the change (refusal_reason, with the records in
-app/core/admin_grants.py). The approver:
+A different administrator means one independent of the change (refusal_reason in app/core/independence.py,
+the rule compliance access shares, with the records in app/core/admin_grants.py). The approver:
   0. is not the person whose account the change is for. With nobody else who may approve, a second
      change to an administrator's own account is refused, and only the host tool can make it;
   1. is not the administrator who asked;
@@ -70,11 +70,13 @@ from typing import Dict, Iterable, List, Optional, Set
 
 from app.core.models import CredentialChange, RoleEnum, User
 from app.core.password_origin import is_set_by_other
+# The rule on who may approve, and its reasons, are shared with compliance access (app/core/independence.py).
+from app.core.independence import (  # noqa: F401 -- these names are this module's as well
+    ASKED, BECAME_ADMIN_AFTER, CHANGED_ACCOUNT, MADE_BY_REQUESTER, MADE_REQUESTER, NEW_ADMIN, OWN_ACCOUNT,
+    PASSWORD_NOT_OWN, REQUESTER_GONE, TENURE, refusal_reason)
 
 WINDOW = timedelta(days=14)
 HOLD = timedelta(days=7)
-# How long an approver must have been an administrator before the request was made.
-TENURE = timedelta(days=14)
 
 # The name the records, the audit log and the notifications use for whoever runs the server, acting
 # through `dockvault.py accounts`. A username may not contain '@', so no account can carry it.
@@ -202,18 +204,10 @@ def can_approve(admin) -> bool:
             and not admin_locked(admin))
 
 
-# Why an administrator may not approve a held request (refusal_reason), in the order they are checked.
-# Each is said in plain words on the Users page, in the refusal of an approval (403), and in the refusal
-# of a second change nobody may approve (409): see app/api/api_server.py.
-ASKED = "asked"                  # the administrator who asked
-OWN_ACCOUNT = "own"              # the change is to their own account (rule 0)
-REQUESTER_GONE = "gone"          # the administrator who asked is no longer an active one
-MADE_BY_REQUESTER = "made"       # the one who asked made them an administrator (rule 3)
-MADE_REQUESTER = "maker"         # they made the one who asked an administrator (rule 3, the other way)
-CHANGED_ACCOUNT = "changed"      # they made or approved a change to that account (rule 2)
-BECAME_ADMIN_AFTER = "after"     # they became an administrator after the request was made (rule 4)
-NEW_ADMIN = "new"                # they had been one for less than TENURE when it was made (rule 4)
-PASSWORD_NOT_OWN = "password"    # their current password was set by someone else (rule 5)
+# Why an administrator may not approve a held request (refusal_reason, in app/core/independence.py, with the
+# reasons ASKED .. PASSWORD_NOT_OWN in the order they are checked). Each is said in plain words on the Users
+# page, in the refusal of an approval (403), and in the refusal of a second change nobody may approve (409):
+# see app/api/api_server.py.
 
 
 def changers(db, target_id, since: datetime) -> Set:
@@ -232,34 +226,6 @@ def changers(db, target_id, since: datetime) -> Set:
         if status == APPROVED and decided_by is not None:
             out.add(decided_by)
     return out
-
-
-def refusal_reason(approver_id, *, requester_id, approver_grant, requester_grant, changed: Set,
-                   requested_at: datetime, target_id=None,
-                   approver_password_set_by_other: bool = False) -> Optional[str]:
-    """Why ``approver_id`` may not approve a change to ``target_id`` that ``requester_id`` asked for at
-    ``requested_at``, or None when they may (the module docstring has the rules). ``approver_grant``
-    and ``requester_grant`` are their admin_grants records (None: none); ``changed`` is changers() for
-    the account since 14 days before the request; ``approver_password_set_by_other`` whether the
-    approver's current password was set by someone else (password_origin.is_set_by_other)."""
-    from app.core import admin_grants
-    if approver_id == requester_id:
-        return ASKED
-    if target_id is not None and approver_id == target_id:
-        return OWN_ACCOUNT
-    if admin_grants.made_by(approver_grant, requester_id):
-        return MADE_BY_REQUESTER
-    if admin_grants.made_by(requester_grant, approver_id):
-        return MADE_REQUESTER
-    if approver_id in changed:
-        return CHANGED_ACCOUNT
-    if admin_grants.granted_after(approver_grant, requested_at):
-        return BECAME_ADMIN_AFTER
-    if admin_grants.granted_after(approver_grant, requested_at - TENURE):
-        return NEW_ADMIN
-    if approver_password_set_by_other:
-        return PASSWORD_NOT_OWN
-    return None
 
 
 def refusals(db, requester_id, *, target_id=None, requested_at: Optional[datetime] = None,

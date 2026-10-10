@@ -134,3 +134,18 @@ def test_send_test_opens_a_styled_modal_with_user_search(admin_page: Page, admin
         expect(page.locator("#et-test-selected")).to_be_hidden()
     finally:
         admin.delete_user(u["id"])
+
+
+def test_the_locked_owner_notice_is_shown_read_only(admin_page: Page, admin):
+    page = admin_page
+    _open_email_tab(page)
+    row = page.locator('.email-action-row[data-action-key="compliance_access_notice"]')
+    expect(row).to_be_visible()
+    expect(row.locator(".ear-badge")).to_have_text("Locked")
+    expect(row.locator(".ear-locked")).to_contain_text("cannot be changed")
+    # Nothing to choose and nothing to turn off; a test send is still offered.
+    expect(row.locator("select.ear-template")).to_have_count(0)
+    expect(row.locator(".ear-notify")).to_have_count(0)
+    expect(row.locator(".ear-test")).to_be_visible()
+    # And the server refuses a change made around the page.
+    assert admin.put("/email/actions/compliance_access_notice", json={"template_id": None}).status_code == 409

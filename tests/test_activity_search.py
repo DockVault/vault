@@ -101,9 +101,9 @@ def test_each_post_runs_its_get_forms_handler_with_every_filter(monkeypatch, rou
         assert seen["range_" if name == "range" else name] == value
 
 
-def test_the_routes_are_plain_functions_only_an_interactive_administrator_reaches():
+def test_the_routes_are_plain_functions_an_administrator_or_a_live_auditor_reaches():
     from fastapi.routing import APIRoute, _IncludedRouter
-    from app.api import user_management_api as um
+    from app.api import activity_viewer as av
 
     def walk(found, prefix):
         for r in found:
@@ -118,7 +118,7 @@ def test_the_routes_are_plain_functions_only_an_interactive_administrator_reache
     assert len(found) == 3
     for route in found.values():
         assert not inspect.iscoroutinefunction(route.endpoint)
-        assert um.require_interactive_admin in {d.call for d in route.dependant.dependencies}
+        assert av.require_activity_viewer in {d.call for d in route.dependant.dependencies}
 
 
 # --------------------------------------------------------------------------- matching a fingerprint

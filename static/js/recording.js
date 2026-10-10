@@ -49,6 +49,14 @@
         data.who_can_see.forEach((line) => who.appendChild(el('li', null, line)));
         show('who-section');
 
+        const compliance = data.compliance;
+        if (compliance && Array.isArray(compliance.lines) && compliance.lines.length) {
+            const list = byId('compliance-notice');
+            list.replaceChildren();
+            compliance.lines.forEach((line) => list.appendChild(el('li', null, line)));
+            show('compliance-notice-section');
+        }
+
         byId('basis').textContent = data.legal_basis
             ? `Legal basis, as the operator states it: ${data.legal_basis}`
             : 'The operator of this vault has not stated a legal basis here.';

@@ -8,7 +8,8 @@ A filter can hold what someone typed: a person's name, an address, free text. In
 every line that records the request (the server's output and the log-access copy); in the body it reaches none.
 Each route takes the same filters, with the same bounds, as its GET form, and answers exactly as it does: the
 same handler runs. A name typed into the person filter also matches the rows that recorded it as a fingerprint
-(app/services/activity_events.py). Only an interactive administrator reaches them.
+(app/services/activity_events.py). An interactive administrator, or an auditor whose right is in force, reaches
+them (app/api/activity_viewer.py).
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.user_management_api import require_interactive_admin
+from app.api.activity_viewer import require_activity_viewer
 from app.core.database import get_db
 from app.core.models import User
 
@@ -40,6 +41,7 @@ class Filters(BaseModel):
     vault_id: Optional[str] = Field(None, max_length=64)
     from_date: Optional[str] = Field(None, max_length=64)
     to_date: Optional[str] = Field(None, max_length=64)
+    case: Optional[str] = Field(None, max_length=64)
 
 
 class EventsSearch(Filters):
@@ -65,7 +67,7 @@ class ExportSearch(Filters):
 
 
 @router.post("/activity/events/search")
-def search_events(body: EventsSearch, request: Request, current_user: User = Depends(require_interactive_admin),
+def search_events(body: EventsSearch, request: Request, current_user: User = Depends(require_activity_viewer),
                   db: Session = Depends(get_db)):
     """The Events list for the filters in the body."""
     from app.api.api_server import activity_events
@@ -73,7 +75,7 @@ def search_events(body: EventsSearch, request: Request, current_user: User = Dep
 
 
 @router.post("/activity/summary/search")
-def search_summary(body: SummarySearch, current_user: User = Depends(require_interactive_admin),
+def search_summary(body: SummarySearch, current_user: User = Depends(require_activity_viewer),
                    db: Session = Depends(get_db)):
     """The summary band for the filters in the body."""
     from app.api.api_server import activity_summary
@@ -83,7 +85,7 @@ def search_summary(body: SummarySearch, current_user: User = Depends(require_int
 
 
 @router.post("/activity/export")
-def export_events(body: ExportSearch, request: Request, current_user: User = Depends(require_interactive_admin),
+def export_events(body: ExportSearch, request: Request, current_user: User = Depends(require_activity_viewer),
                   db: Session = Depends(get_db)):
     """The export for the filters in the body."""
     from app.api.api_server import activity_export

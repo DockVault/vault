@@ -1,7 +1,11 @@
 /*
  * A banner across the top of the app after sign-in, for a notice the signed-in user has to read: shown until they
- * say they have read it. NoticeBanner.show({ id, text, linkText, href, onRead }) puts one up (one per id);
+ * say they have read it. NoticeBanner.show({ id, text, linkText, href, onOpen, onRead }) puts one up (one per id):
+ * its link opens ``href`` in a new tab, or, with ``onOpen``, calls it instead (a page inside the app);
  * NoticeBanner.hide(id) takes it down. Built with createElement and textContent only.
+ *
+ * Compliance access uses it too (static/js/compliance.js): a vault's owner sees it while a notice about access to
+ * their vaults is unread.
  *
  * The recording notice uses it: when the recording levels changed since the user last read the notice
  * (GET /privacy/recording/status), at sign-in and live when the server announces a change, the banner links to
@@ -42,11 +46,15 @@
         banner.dataset.notice = opts.id;
         banner.setAttribute('role', 'status');
         banner.appendChild(el('span', 'notice-banner-text', opts.text));
-        if (opts.href) {
+        if (opts.href || opts.onOpen) {
             const link = el('a', 'notice-banner-link', opts.linkText || 'Read it');
-            link.href = opts.href;
-            link.target = '_blank';
-            link.rel = 'noopener';
+            link.href = opts.href || '#';
+            if (opts.onOpen) {
+                link.addEventListener('click', (e) => { e.preventDefault(); opts.onOpen(); });
+            } else {
+                link.target = '_blank';
+                link.rel = 'noopener';
+            }
             banner.appendChild(link);
         }
         const read = el('button', 'btn btn-sm btn-primary notice-banner-read', "I've read it");

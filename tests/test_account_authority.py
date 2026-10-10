@@ -270,6 +270,7 @@ NOT_THE_ACCOUNT = {
     ("POST", "/devices/{device_id}/grants"): "a device's access to a vault, not the account",
     ("POST", "/ecc/vaults/{vault_id}/members"): "a zero-knowledge vault's key, not the account",
     ("POST", "/ecc/vaults/{vault_id}/rekey"): "a zero-knowledge vault's keys, not an account",
+    ("DELETE", "/users/{user_id}/auditor"): "the account's auditor right (a grant), taken back by an administrator",
 }
 
 # Routes that change the caller's own account and no one else's, with the reason.

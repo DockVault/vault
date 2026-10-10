@@ -18,7 +18,8 @@ session-level advisory lock on a connection of its own, and a pass that cannot t
 
 What a job may not delete. Other modules register row-keep rules for a table (register_keep): each gives a
 condition for rows that must stay (a category's protected minimum, rows a compliance case or a legal hold
-keeps), and every job over that table leaves them.
+keeps), and every job over that table leaves them. Those modules are listed in KEEP_MODULES and imported with
+this one.
 
 The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with RETENTION_HOLD=true the panel
 cannot turn it off) stops every job over logs and security records while it is on. The jobs over working
@@ -29,6 +30,7 @@ fallback rows, waiting settings changes) keep running. Turning the hold off dele
 from __future__ import annotations
 
 import asyncio
+import importlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -283,6 +285,57 @@ def prune_credential_changes(p: Pass) -> JobResult:
     return done
 
 
+def settle_auditor_grants(p: Pass) -> JobResult:
+    """Auditor grants whose time ran out (a proposal nobody approved lapses, a grant past its end expires), and
+    what a change to a holder's account calls for when no hook wrote it: a grant whose account no longer stands
+    as it requires is suspended, or ended (app/core/auditor_rights.py, settle). Deletes nothing: each grant's
+    row is kept as the record of who held the right."""
+    from app.core import auditor_rights
+    with p.transaction() as db:
+        auditor_rights.settle(db, p.now)
+    return JobResult()
+
+
+def run_compliance_cases(p: Pass) -> JobResult:
+    """The compliance cases' clock (app/core/cases.py): a case nobody approved within 7 days expires, and a case
+    whose access reached its end closes or keeps only its legal hold, its owners told in the same transaction.
+    Deletes nothing: a case's rows are its record. Not stopped by the hold switch."""
+    from app.core import cases
+    with p.transaction() as db:
+        cases.expire_pending(db, p.now)
+        cases.end_due(db, p.now)
+    return JobResult()
+
+
+def run_legal_holds(p: Pass) -> JobResult:
+    """The legal holds' clock (app/core/legal_holds.py): holds nobody confirmed in time lapse, those due a review
+    ask for one, and what released holds kept is purged once their delay is over (a batch per transaction, each
+    file's held_file_purged row in it, the blobs secure-deleted after its commit). Not stopped by the hold switch:
+    a hold's purge is the end of what a case kept, not a log."""
+    from app.core import legal_holds
+    with p.transaction() as db:
+        legal_holds.lapse_due(db, p.now)
+        legal_holds.prompt_reviews(db, p.now)
+    done = JobResult()
+
+    def record(db, count, table):
+        batch = JobResult(deleted=count)
+        p.record(db, batch, table)
+        done.add(count)
+
+    legal_holds.purge(p.session_factory, now=p.now, batch=p.batch_rows, time_left=p.time_left, record=record,
+                      limit_statements=limit_statements)
+    return done
+
+
+def prune_owner_notices(p: Pass) -> JobResult:
+    """The notices to vaults' owners outside a case (a recorded name revealed, someone else giving access), once
+    delivered or given up, COMPLIANCE_RECORD_MIN_DAYS after they were written (app/core/owner_notices.py). A
+    case's notices stay with the case. Stopped by the hold switch: they are records."""
+    from app.core import owner_notices
+    return owner_notices.prune(p)
+
+
 def prune_rate_limit_records(p: Pass) -> JobResult:
     """The sign-in throttle's fallback rows (written only while Redis is down), an hour after their window."""
     from app.core.models import RateLimitRecord
@@ -337,6 +390,14 @@ JOBS: list[Job] = [
     Job("sessions", "Finished sessions and sign-ins", prune_sessions),
     Job("key_proof_challenges", "Expired key-proof challenges", prune_key_proof_challenges),
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
+    Job("auditor_grants", "Auditor rights whose time ran out, or whose holder's account changed",
+        settle_auditor_grants),
+    Job("compliance_cases", "Compliance cases: those unapproved in time expire, access that ended closes them",
+        run_compliance_cases),
+    Job("legal_holds", "Legal holds: lapses, review prompts, and the purge of what released holds kept",
+        run_legal_holds),
+    Job("owner_notices", "Notices to vaults' owners outside a case, once delivered and past the record floor",
+        prune_owner_notices, held=True),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),
@@ -445,3 +506,10 @@ async def run_forever(*, first_delay: float = FIRST_PASS_SECONDS, interval: Opti
         except Exception as exc:  # noqa: BLE001
             _say(f"Warning: the pruner's pass failed ({type(exc).__name__})")
         await asyncio.sleep(interval())
+
+
+# The modules that register row-keep rules, imported with this one so that every pass reads their rules
+# (compliance access keeps a case's audit rows and the compliance rows: app/core/compliance_retention.py).
+KEEP_MODULES: tuple = ("app.core.compliance_retention",)
+for _name in KEEP_MODULES:
+    importlib.import_module(_name)

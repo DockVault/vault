@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, defer, joinedload
 from app.core.database import get_db
 from app.core.models import EmailAction, EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
 from app.core import email_sanitize, email_send
+from app.core.email_actions import LOCKED, SPEC_BY_KEY
 from app.core.security import decrypt_secret, encrypt_secret
 from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable, retry_after_seconds
 from app.services.audit_logger import AuditLogger
@@ -727,6 +728,11 @@ async def update_action(key: str, payload: ActionUpdateIn, request: Request,
     action = db.get(EmailAction, key)
     if action is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown email action.")
+    if SPEC_BY_KEY.get(key, {}).get("category") == LOCKED or action.category == LOCKED:
+        # Its wording is fixed and it is always on: nothing here may change it (app/core/email_actions.py).
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="This email's wording is fixed and it is always sent: it cannot be changed or "
+                                   "turned off.")
 
     if payload.template_id is not None:
         tpl = db.get(EmailTemplate, payload.template_id)

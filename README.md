@@ -19,6 +19,9 @@ Licensed under **AGPL-3.0** — self-host it freely.
 - **Temporary, scoped credentials** — hand out time-limited, least-privilege access to a
   vault or path.
 - **Organizational groups**, role-based access, and an audit log.
+- **Compliance access** — an auditor investigates vaults only in a case a second, independent administrator
+  approves; the owner is told at once and sees every file opened; legal holds keep what is deleted. See the
+  [hardening guide](docs/guides/hardening.md).
 - **Storage limits at three levels** — a deployment ceiling (`MAX_STORAGE_GB`, which an
   administrator can lower from the panel but never raise), a per-account quota users spend by
   allocating storage to vaults, and a per-vault size that the owner *and* vault managers can each
@@ -249,6 +252,13 @@ or when reset links are not configured, a temporary password) is shown once on y
 nowhere else. Each change is recorded and audited as the host operator's (`operator@host`), and the
 user is told.
 
+Compliance access (the Compliance page: cases, legal holds and the auditor right; see the
+[hardening guide](docs/guides/hardening.md) and the [DPIA template](docs/guides/dpia-compliance-access.md)) has a
+host side too: an auditor right is granted by two people, and a case is approved by a second one. When no administrator is independent enough to be that second person, `python dockvault.py
+cases` lets whoever runs the server approve an auditor right (the account's username typed again) or a case
+(its reference typed again), recorded as `operator@host`. It refuses while an administrator who can approve
+exists, and it also revokes a right and lists what is open.
+
 `python dockvault.py accounts --action user-managers` lists, and changes nothing, the accounts that may
 view or manage users without being administrators, with who granted each permission. A change of role
 resets an account's permissions to the new role's defaults, keeping those another administrator granted
@@ -377,6 +387,16 @@ path `DOCKVAULT_IMAGE` describes — pulling a release-image deployment, rebuild
 it never replaces a published image with a local build. The `build:` path stays in the compose
 files, so you can always build your own (modified) image, which the AGPL license requires you be
 able to do.
+
+### Upgrading to 0.34.0 with legal holds
+
+- **SFTP in its own container (the split profile, the trial compose):** update the SFTP container together with the
+  web one. A legal hold cannot be placed while an SFTP server of another version may be running: an older one would
+  delete what a hold keeps.
+- **Going back:** while a legal hold stands, or files a hold kept wait for their purge, a release before 0.34.0
+  refuses to start (from 0.33.1 on) and `dockvault.py update` refuses the rollback. Release the holds, wait for the
+  purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more, then roll back. Never roll back below 0.33.1
+  while holds exist: those releases do not check.
 
 ### Database migrations
 
@@ -555,6 +575,8 @@ all live at the root.
 - **Container hardening:** runs as a non-root user on a read-only root filesystem with no
   new privileges; login throttling and account lockout are built in.
 - **Secrets:** all keys and passwords come from `.env`. Use fresh encryption/JWT keys per deployment.
+- **What the operator can do outside the app**, what stays the operator's to do, and how compliance access is run
+  safely: the [hardening guide](docs/guides/hardening.md).
 
 ## Production checklist
 

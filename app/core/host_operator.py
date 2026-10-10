@@ -12,6 +12,7 @@ network::
     python -m app.core.host_operator user-managers
     python -m app.core.host_operator regranted-defaults
     python -m app.core.host_operator zk-status
+    python -m app.core.host_operator downgrade-blockers --target 0.33.2
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
@@ -43,7 +44,7 @@ import types
 import uuid
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
-           "regranted-defaults", "unlock", "zk-status")
+           "regranted-defaults", "unlock", "zk-status", "downgrade-blockers")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -85,6 +86,7 @@ def build_parser():
     p.add_argument("--request-id", dest="request_id", help="approve: the held request")
     p.add_argument("--temporary-password", dest="temporary_password", action="store_true",
                    help="reset-password: set a temporary password instead of creating a reset link")
+    p.add_argument("--target", help="downgrade-blockers: the version to go back to (X.Y.Z)")
     return p
 
 
@@ -317,6 +319,18 @@ def _run(args, api) -> int:
 
         if args.action == "zk-status":
             return _answer({"ok": True, "zero_knowledge": zk_status(db, api)})
+
+        if args.action == "downgrade-blockers":
+            # What stops this deployment going back to an older version (dockvault.py update asks before a
+            # downgrade): the records of data that version cannot read. Read-only. Refused with this module's
+            # own answer: run as a program, this module is __main__, and another module's refusal would not be
+            # the answer it catches.
+            from app.core import data_requirements, host_compliance
+            target = (args.target or "").strip().lstrip("vV")
+            if data_requirements._parse(target) is None:
+                return _refuse("Name the version to go back to with --target X.Y.Z.")
+            return _answer({"ok": True, "target": target,
+                            "blockers": host_compliance.downgrade_blockers(db, target)})
 
         if args.action == "approve":
             if not args.request_id:

@@ -486,7 +486,28 @@ class Settings(BaseSettings):
     log_prune_interval_minutes: int = Field(default=15)
     log_prune_batch_rows: int = Field(default=5000)
     retention_hold: bool = Field(default=False)
-    
+    # Compliance access: an auditor's investigation of a vault, approved by a second administrator and told
+    # to the vault's owner at once, and legal holds (app/core/compliance_settings.py has each setting's bounds;
+    # a value outside them refuses to start). Only .env sets them, never the admin panel. COMPLIANCE_ACCESS:
+    # enabled or disabled (holds stay in force). COMPLIANCE_PASSWORD_VAULTS: refuse, with_password or override.
+    # COMPLIANCE_EXPORT: allowed or disabled. The rest are days, hours, counts and a switch; a case never
+    # widens with a later change here: it uses the stricter of the value at its approval and the current one.
+    compliance_access: str = Field(default="enabled")
+    compliance_password_vaults: str = Field(default="with_password")
+    compliance_export: str = Field(default="allowed")
+    compliance_max_access_days: int = Field(default=30)
+    compliance_max_total_days: int = Field(default=90)
+    compliance_max_case_vaults: int = Field(default=25)
+    compliance_export_ttl_hours: int = Field(default=24)
+    compliance_hold_confirm_days: int = Field(default=7)
+    compliance_hold_purge_delay_days: int = Field(default=7)
+    compliance_hold_review_days: int = Field(default=180)
+    compliance_view_rate: int = Field(default=600)
+    compliance_reveals_per_day: int = Field(default=100)
+    compliance_auditor_not_admin: bool = Field(default=False)
+    compliance_auditor_grant_days: int = Field(default=365)
+    compliance_record_min_days: int = Field(default=2190)
+
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
     # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old
     # .env's LOG_FILE_PATH -- once shipped here but never written -- is ignored like any unknown key.

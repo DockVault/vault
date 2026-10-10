@@ -393,9 +393,28 @@ class _RevokeDB:
         pass
 
 
+class _Reach:
+    """Stands in for app/core/access_notices.Reach, which test_access_notices.py covers: records what the route
+    asks it."""
+    asked = []
+
+    def __init__(self, db, granter):
+        self.asked.append(("made", granter))
+
+    def watch(self, vault, user_ids, *, via, department=None):
+        self.asked.append(("watch", via, list(user_ids)))
+
+    def tell(self):
+        self.asked.append(("tell",))
+        return 0
+
+
 @pytest.fixture
 def revoke(monkeypatch):
     """Call the real route as an administrator, with what removing the row would do set by the test."""
+    from app.core import access_notices
+    _Reach.asked = []
+    monkeypatch.setattr(access_notices, "Reach", _Reach)
     audited = []
     monkeypatch.setattr(S, "_audit_access_change",
                         lambda db, actor, action, rtype, rid, details=None, status="success":
@@ -435,6 +454,8 @@ def test_removing_someone_elses_row_is_not_limited(revoke):
     result, db, audited = revoke(True, own_row=False)
     assert not isinstance(result, HTTPException), result
     assert len(db.executed) == 1
+    # Its owner is told when the row's removal lets the person's departments give them more.
+    assert [a[0] for a in _Reach.asked] == ["made", "watch", "tell"] and _Reach.asked[1][1] == "member_row_removed"
 
 
 # --------------------------------------------------------------------------- the routes ask first

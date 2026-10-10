@@ -107,6 +107,11 @@ STEPS: list[Step] = [
     create_index("ix_audit_logs_recorded_signin_name",
                  "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_recorded_signin_name ON audit_logs "
                  "((recorded->>'signin_name')) WHERE recorded IS NOT NULL"),
+    # The rows a compliance case wrote (audit_logs.case_id): a case's own log, and what the pruner keeps for
+    # it. Only those rows have the column set, so the index is partial and small.
+    create_index("ix_audit_logs_case_id",
+                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_case_id ON audit_logs (case_id) "
+                 "WHERE case_id IS NOT NULL"),
 ]
 
 _STATE_SQL = text(

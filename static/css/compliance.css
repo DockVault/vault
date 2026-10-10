@@ -1,0 +1,153 @@
+/* The Compliance page (static/js/compliance.js): cases, legal holds, the auditor right and a case's workspace,
+ * in both skins (theme variables only), on a desk and on a phone. Dense, with small headings. */
+
+.sidebar-count {
+    margin-left: auto;
+    min-width: 1.4em;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    background: var(--warning);
+    color: var(--text-inverse);
+    font-size: var(--text-xs);
+    line-height: 1.6;
+    text-align: center;
+}
+.sidebar-count[hidden] { display: none; }
+
+.auditor-badge {
+    margin-right: var(--space-sm);
+    cursor: pointer;
+    border: 0;
+    white-space: nowrap;
+}
+.auditor-badge-menu { font-size: var(--text-xs); color: var(--info); font-weight: 600; }
+
+.compliance .cmp-head { margin-bottom: var(--space-sm); }
+.compliance .cmp-title { font-size: var(--text-xl); font-weight: 600; margin: 0; }
+.compliance .cmp-sub { margin: 2px 0 0; }
+.compliance .cmp-tabs { margin: var(--space-sm) 0 var(--space-md); flex-wrap: wrap; }
+.compliance .cmp-toolbar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: var(--space-sm); margin-bottom: var(--space-sm);
+}
+.compliance .cmp-toolbar p { margin: 0; flex: 1 1 320px; }
+.compliance .cmp-chips { flex-wrap: wrap; }
+.compliance .cmp-off { margin-bottom: var(--space-sm); }
+.compliance .cmp-empty { margin: var(--space-md) 0; }
+.compliance .cmp-table-wrap { overflow-x: auto; max-width: 100%; }
+.compliance .cmp-table { width: 100%; font-size: var(--text-sm); }
+.compliance .cmp-table td, .compliance .cmp-table th { padding: 6px 8px; vertical-align: top; }
+.compliance .cmp-case-row { cursor: pointer; }
+.compliance .cmp-case-row:hover, .compliance .cmp-case-row:focus { background: var(--hover-overlay); outline: none; }
+.compliance .cmp-yours { margin-left: 4px; }
+.compliance .cmp-row-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.compliance .cmp-case-head, .compliance .cmp-ws-head {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-sm); margin-bottom: var(--space-sm);
+}
+.compliance .cmp-ends { font-weight: 600; }
+.compliance .cmp-told { font-size: var(--text-sm); }
+.compliance .cmp-card { padding: var(--space-md); margin-bottom: var(--space-sm); }
+.compliance .cmp-h, .cmp-sheet .cmp-h { font-size: var(--text-base); font-weight: 600; margin: 0 0 6px; }
+.compliance .cmp-text, .cmp-sheet .cmp-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.compliance .cmp-summary-line, .cmp-sheet .cmp-summary-line { margin: 0; overflow-wrap: anywhere; }
+.cmp-facts {
+    display: grid; grid-template-columns: minmax(120px, max-content) 1fr; gap: 2px 12px; margin: 0;
+    font-size: var(--text-sm);
+}
+.cmp-facts dt { color: var(--text-tertiary); }
+.cmp-facts dd { margin: 0; overflow-wrap: anywhere; }
+.compliance .cmp-actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin: var(--space-md) 0; }
+.compliance .cmp-msg { margin-bottom: var(--space-sm); }
+.compliance .cmp-hold-head { display: flex; align-items: center; gap: var(--space-sm); }
+
+/* Sheets (new case, a hold, a proposal, an export, a reveal): below the app's own dialogs, so a prompt or the
+   step-up opened from one shows above it. */
+.cmp-sheet { z-index: 990; }
+.cmp-sheet .cmp-sheet-content { max-width: 640px; width: calc(100% - 32px); max-height: 92vh; display: flex; flex-direction: column; }
+.cmp-sheet.cmp-sheet-wide .cmp-sheet-content { max-width: 880px; }
+.cmp-sheet .cmp-sheet-body { overflow-y: auto; }
+.cmp-sheet .cmp-sheet-foot { display: flex; justify-content: flex-end; gap: var(--space-sm); flex-wrap: wrap; }
+.cmp-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0 var(--space-md); }
+.cmp-field { margin-bottom: var(--space-sm); }
+.cmp-field[hidden] { display: none; }
+.cmp-check { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0; }
+.cmp-pick-row { display: flex; gap: var(--space-sm); }
+.cmp-pick-row input { flex: 1 1 auto; min-width: 0; }
+.cmp-vault-picker { margin: 4px 0 var(--space-sm); }
+.cmp-picked-row { display: flex; justify-content: space-between; align-items: center; gap: var(--space-sm); padding: 4px 0; border-top: 1px solid var(--surface-3); }
+.cmp-preview { border-left: 3px solid var(--info); padding: 6px 10px; margin: 0 0 var(--space-sm); background: var(--surface-1); font-size: var(--text-sm); }
+.cmp-new-summary { margin-top: var(--space-sm); font-size: var(--text-sm); }
+.cmp-revealed { margin-top: var(--space-sm); }
+
+/* The workspace: the case's vaults, the files, the open file; on a narrow screen one at a time. */
+.compliance .cmp-ws-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.compliance .cmp-ws-tab.active { background: var(--active-overlay); }
+.compliance .cmp-ws-main {
+    display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr) minmax(0, 1.2fr);
+    gap: var(--space-md); align-items: start;
+}
+.compliance .cmp-ws-main > section, .compliance .cmp-ws-main > nav { min-width: 0; }
+.compliance .cmp-ws-log { grid-column: 1 / -1; }
+.compliance .cmp-tree-vault { padding: 6px 4px; border-bottom: 1px solid var(--surface-3); }
+.compliance .cmp-tree-vault.active { background: var(--active-overlay); }
+.compliance .cmp-tree-btn { font-weight: 600; text-align: left; padding: 0; overflow-wrap: anywhere; }
+.compliance .cmp-unlock { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.compliance .cmp-unlock input { flex: 1 1 120px; min-width: 0; }
+.compliance .cmp-ws-search input { width: 100%; margin-bottom: 6px; }
+.compliance .cmp-ws-crumbs { margin-bottom: 4px; overflow-wrap: anywhere; }
+.compliance .cmp-folder-row .btn-link { display: inline-flex; align-items: center; gap: 4px; }
+.compliance .cmp-file-row { cursor: pointer; }
+.compliance .cmp-file-row.selected { background: var(--active-overlay); }
+.compliance .cmp-ws-viewer { position: relative; }
+.compliance .cmp-viewer-nav { display: none; gap: 6px; margin-bottom: 6px; }
+.compliance .cmp-viewer-stage {
+    position: relative; overflow: hidden; min-height: 200px; border: 1px solid var(--surface-3);
+    border-radius: var(--radius-md); background: var(--surface-1); margin-top: 6px;
+}
+.compliance .cmp-viewer-img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.compliance .cmp-viewer-frame { display: block; width: 100%; height: 70vh; border: 0; }
+.compliance .cmp-viewer-media { display: block; width: 100%; }
+.compliance .cmp-viewer-text { margin: 0; padding: 8px; max-height: 70vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-sm); }
+.compliance .cmp-viewer-why { padding: var(--space-md); margin: 0; }
+.compliance .cmp-watermark {
+    position: absolute; inset: 0; pointer-events: none; user-select: none; overflow: hidden;
+    display: flex; flex-wrap: wrap; align-content: space-around; justify-content: space-around;
+    transform: rotate(-18deg) scale(1.3); opacity: 0.09; color: var(--text-primary); font-size: var(--text-sm);
+}
+.compliance .cmp-watermark span { padding: 18px 24px; white-space: nowrap; }
+
+@media (max-width: 1100px) {
+    .compliance .cmp-ws-main { grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); }
+    .compliance .cmp-ws-tree { grid-column: 1 / -1; }
+}
+
+/* A phone: the list, then a file full screen (previous and next), then the log. */
+.compliance .cmp-ws.cmp-ws-phone .cmp-ws-main { display: block; }
+.compliance .cmp-ws.cmp-ws-phone .cmp-viewer-nav { display: flex; flex-wrap: wrap; }
+.compliance .cmp-ws.cmp-ws-phone[data-screen="list"] .cmp-ws-viewer { display: none; }
+.compliance .cmp-ws.cmp-ws-phone[data-screen="file"] .cmp-ws-tree,
+.compliance .cmp-ws.cmp-ws-phone[data-screen="file"] .cmp-ws-files { display: none; }
+.compliance .cmp-ws.cmp-ws-phone .cmp-ws-tools { margin-left: 0; }
+.compliance .cmp-ws.cmp-ws-phone .cmp-keys { display: none; }
+
+@media (max-width: 640px) {
+    /* Tables become cards: each cell on its own line, its column's name before it. */
+    .compliance .cmp-table thead { display: none; }
+    .compliance .cmp-table, .compliance .cmp-table tbody, .compliance .cmp-table tr, .compliance .cmp-table td { display: block; width: 100%; }
+    .compliance .cmp-table tr { border-bottom: 1px solid var(--surface-3); padding: 6px 0; }
+    .compliance .cmp-table td { padding: 1px 4px; }
+    .compliance .cmp-table td::before { content: attr(data-label); display: inline-block; min-width: 96px; color: var(--text-tertiary); }
+    .cmp-sheet .cmp-sheet-content { width: 100%; max-width: none; height: 100vh; max-height: 100vh; border-radius: 0; }
+    .cmp-facts { grid-template-columns: 1fr; }
+    .cmp-facts dd { margin-bottom: 4px; }
+    /* The top bar has no room for it on a phone: the account menu's header shows it there. */
+    .auditor-badge { display: none; }
+}
+
+/* The Activity page, for an auditor: the Case chip; the "Now" panel stays with administrators. */
+.act-case-box { display: inline-flex; align-items: center; gap: 6px; margin-right: var(--space-sm); }
+.act-case-box .act-case { width: auto; min-width: 9em; }
+.act-case-label { font-size: var(--text-sm); color: var(--text-secondary); }
+#act-p-now[hidden] { display: none !important; }
+.act-auditor-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }

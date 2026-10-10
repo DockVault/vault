@@ -78,6 +78,30 @@ def guard(action):
     return check
 
 
+def compliance_step_up(action):
+    """The check a compliance route calls inside its body, as ``check(db, user, request)``: guard() for an action
+    whose policy is the compliance one (the password and a TOTP or recovery code; never an email code; an
+    account with no TOTP enrollment is refused). Raises LookupError for any other action, so a compliance route
+    cannot be guarded by a weaker policy by mistake. Call it once, at the route module's import."""
+    if acts.fixed_policy(action) != pol.POLICY_COMPLIANCE:
+        raise LookupError(f"{action} is not a compliance step-up")
+    return guard(action)
+
+
+# What each policy asks for, in the words the step-up matrix shows beside the action (read-only).
+REQUIRES = {
+    pol.POLICY_COMPLIANCE: "Always: your password and an authenticator or recovery code (never an email code)",
+    pol.POLICY_PASSWORD_ALWAYS: "Always: your password, and your second factor when you have one",
+    pol.POLICY_FACTOR_WHEN_ENROLLED: "Your second factor, when you have one",
+}
+
+
+def describe() -> list:
+    """The fixed step-ups as the matrix lists them, read-only: key, name, policy and what it asks for."""
+    return [{"key": key, "name": name, "policy": policy, "requires": REQUIRES.get(policy, ""), "fixed": True}
+            for key, (name, policy) in acts.FIXED_STEP_UP_ACTIONS.items()]
+
+
 def contract_problems() -> list:
     """What breaks the rule that every fixed action is guarded by a route, and only those are."""
     listed = set(acts.FIXED_STEP_UP_ACTIONS)

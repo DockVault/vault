@@ -148,7 +148,7 @@ _IDENTIFIER_KEYS = (
     "user_ids", "vault_id", "vault_ids", "members", "opened_by_temp_credential_id", "record_id", "alert_id",
     # accounts, and who acted (real usernames, which administrators see on the Users page)
     "username", "target_username", "target_user", "created_username", "deleted_username", "updated_username",
-    "temp_username", "requested_by", "approved_by", "invited_by", "by", "made_by", "cleared_by",
+    "temp_username", "requested_by", "approved_by", "invited_by", "by", "made_by", "cleared_by", "auditor",
     "created_role", "new_role", "old_role", "role", "target_role", "already_member",
     # who set an account's password, and who added an SSH key (a username, or the host operator's name)
     "password_set_by", "added_by",
@@ -165,6 +165,35 @@ _IDENTIFIER_KEYS = (
     "at_promotion", "added_by_left_because", "link_made_by_other", "locked", "was_locked",
     # a zero-knowledge key change: the operation, and how it was proved ("key" or "absent"), never the proof
     "op", "proof",
+    # the auditor right: the grant, and who proposed it (a username)
+    "grant_id", "proposed_by",
+    # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)
+    "case_number", "confirm_by", "hold_only", "purge_after", "by_release", "kept_reason", "kept_at", "held_by_case",
+    # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes
+    # to the address before an administrator's change, and why a send failed (a category, never a server's answer)
+    "email_status", "copy_to_previous", "send_error",
+    # an owner's notice that someone else gave a person access to their vault (app/core/access_notices.py): the
+    # people given access (usernames, their accounts' dates and makers, whether a password was set by someone else)
+    # and how many more; never a vault's name
+    "people", "more_people",
+    # a case's steps: what it is for (a code), its days of access and their end, whether it holds, whether the
+    # server's operator approved it, how an objection came (from an owner or an administrator), whether its access
+    # ended, and a hold placed and confirmed by an approval
+    "purpose", "days", "ends_at", "hold", "by_operator", "by_owner", "access_ended", "by_approval",
+    # reading under a case: whether a password vault was opened without its password, and a view in the preview
+    "password_override", "preview",
+    # a listing or a search under a case: the folder listed, and of a search the query's length (never its text),
+    # how many names it read, whether it stopped early, and how many matched
+    "folder_id", "query_length", "scanned", "truncated", "matches",
+    # an export from a case: its id, how many files were exported, missing, unreadable, no longer in the case when
+    # their turn came or did not match their stored checksum, and the SHA-256 of its manifest (a digest of the
+    # export's own list, never of a file)
+    "export_id", "file_count", "manifest_sha256", "missing", "unreadable", "left_case", "mismatched",
+    # names shown on the Activity page because of a case: how many events, and a digest of their ids (never a name)
+    "events", "events_digest",
+    # a recorded name revealed outside a case: the event, and the reason's category from a fixed list (its text is
+    # sealed in compliance_reveals, never here)
+    "event_id", "reason_category",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
@@ -218,7 +247,7 @@ DETAIL_KEYS.update({
     "filters.category": IDENTIFIER, "filters.channel": IDENTIFIER, "filters.status": IDENTIFIER,
     "filters.action": IDENTIFIER, "filters.user_match": IDENTIFIER, "filters.no_account": IDENTIFIER,
     "filters.temp_credential_id": IDENTIFIER, "filters.vault_id": IDENTIFIER, "filters.from_date": IDENTIFIER,
-    "filters.to_date": IDENTIFIER,
+    "filters.to_date": IDENTIFIER, "filters.case": IDENTIFIER,
     "filters.user": SIGNIN_NAME, "filters.q": SIGNIN_NAME, "filters.temp_credential": SIGNIN_NAME,
     "filters.ip": ADDRESS,
 })

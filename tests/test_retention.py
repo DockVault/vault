@@ -202,7 +202,8 @@ def test_the_retention_settings_are_configured_documented_and_kept_by_the_tool(m
 def test_the_jobs_and_which_the_hold_switch_stops():
     assert [(j.name, j.held) for j in retention.JOBS] == [
         ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
-        ("credential_changes", False),
+        ("credential_changes", False), ("auditor_grants", False), ("compliance_cases", False),
+        ("legal_holds", False), ("owner_notices", True),
         ("rate_limit_records", False), ("security_alerts", True), ("security_records", True),
         ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True)]
 

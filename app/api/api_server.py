@@ -750,6 +750,9 @@ app.include_router(activity_search_router)
 # Unlocking a password-protected vault's names on the Activity page, with the vault password once.
 from app.api.activity_unlock_router import router as activity_unlock_router  # noqa: E402
 app.include_router(activity_unlock_router)
+# Compliance access: the auditor right, cases, legal holds and their step-ups.
+from app.api.compliance_router import router as compliance_router  # noqa: E402
+app.include_router(compliance_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -1393,6 +1396,9 @@ class VaultResponse(BaseModel):
     # requester and never anyone else's activity — distinct from last_accessed above, which is
     # the last access by any member.
     last_viewed_at: Optional[datetime] = None
+    # While an approved investigation covers the vault: until when, and whether deleted files are kept. Neutral:
+    # no case number, purpose, auditor or person concerned (app/core/owner_access.py, member_review).
+    compliance_review: Optional[dict] = None
 
     class Config:
         from_attributes = True
@@ -2493,8 +2499,11 @@ async def search_audit_log(
     return [_audit_row_to_dict(r) for r in rows]
 
 
+from app.api.activity_viewer import require_activity_viewer  # noqa: E402
+
+
 @app.get("/activity/catalog")
-def activity_catalog(current_user: User = Depends(require_interactive_admin)):
+def activity_catalog(current_user: User = Depends(require_activity_viewer)):
     """What the Events filters offer: the categories and their events, the channels and the statuses,
     and which events the summary band counts as each sign-in outcome (so a click on one of its rows
     filters the list to exactly the events it counted)."""
@@ -2539,13 +2548,15 @@ def activity_events(
     ids: List[str] = Query([], max_length=8000),
     count_only: bool = False,
     limit: int = 50,
+    case: Optional[str] = Query(None, max_length=64),
     request: Request = None,
-    current_user: User = Depends(require_interactive_admin),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
     """The Activity page's Events list: the audit log filtered by category, event, channel, status,
     user (containing or exactly), rows under no account, IP or CIDR, text (which also matches the
-    events' labels), temporary credential (by id or name), vault and time (admin only).
+    events' labels), temporary credential (by id or name), vault, time and compliance case (an
+    administrator, or an auditor: app/api/activity_viewer.py).
 
     Four ways to read it, which never mix:
     - numbered pages: `page` and `limit` (the page size), with the total and the page count. The page
@@ -2571,12 +2582,14 @@ def activity_events(
     from app.services import activity_events as ev
     limit = max(1, min(limit, ev.MAX_PAGE))
     wanted_ids = ev.split_ids(ids)
+    selection = _activity_case(db, current_user, case, request)
     base = ev.build_events_query(
         db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
         actions=action, username=user, user_exact=(user_match == "exact"), no_account=no_account,
         ip=ip, text=q, temp_credential_id=temp_credential_id, temp_credential=temp_credential,
         vault_id=vault_id, ids=wanted_ids,
-        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date),
+        **_case_filters(selection))
     newest_first = (AuditLog.timestamp.desc(), AuditLog.id.desc())
     out = {"events": [], "next_cursor": None, "total": None}
 
@@ -2638,6 +2651,7 @@ def activity_events(
         event["recorded_names"] = recorded
     show_unlocked(events, unlocked)
     temp_credential_names(db, events)
+    _case_names(db, selection, current_user, events, rows)
     out["events"] = events
     # The recording levels in force, so the page can mark a row recorded under other ones.
     from app.core import audit_privacy
@@ -2652,16 +2666,20 @@ def activity_events(
 
 @app.get("/activity/events/{event_id}")
 def activity_event(event_id: str,
+                   case: Optional[str] = Query(None, max_length=64),
                    request: Request = None,
-                   current_user: User = Depends(require_interactive_admin),
+                   current_user: User = Depends(require_activity_viewer),
                    db: Session = Depends(get_db)):
-    """One event, as the Events list shows it (admin only): for a copied link to an event."""
+    """One event, as the Events list shows it (an administrator, or an auditor): for a copied link to an event.
+    With a case selected, only an event of the case, with the names the case lets its auditor read."""
     from app.core.models import AuditLog
     from app.services import activity_events as ev
     from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
                                              unlocked_vaults)
+    selection = _activity_case(db, current_user, case, request)
     try:
-        row = db.query(AuditLog).filter(AuditLog.id == uuid.UUID(event_id)).first()
+        row = ev.build_events_query(db.query(AuditLog), AuditLog, **_case_filters(selection)).filter(
+            AuditLog.id == uuid.UUID(event_id)).first()
     except ValueError:
         row = None
     if row is None:
@@ -2672,14 +2690,38 @@ def activity_event(event_id: str,
     event["recorded_names"] = recorded_names_for(db, current_user, [row], unlocked)[0]
     show_unlocked([event], unlocked)
     temp_credential_names(db, [event])
+    _case_names(db, selection, current_user, [event], [row])
     return event
+
+
+def _activity_case(db, viewer, case, request):
+    """The compliance case selected on the Activity page (app/services/activity_case.py), or None. A route called as
+    a function (the search routes call these) may leave ``case`` as its Query default: no case."""
+    if not isinstance(case, str) or not case:
+        return None
+    from app.services import activity_case
+    return activity_case.select(db, viewer, case, unlock_header=request.headers.get("X-Case-Unlock") if request
+                                else None, session_hash=_current_session_hash(request) if request else None)
+
+
+def _case_filters(selection) -> dict:
+    return {} if selection is None else {"case_id": selection.case.id, "case_vaults": selection.vault_ids}
+
+
+def _case_names(db, selection, viewer, events, rows) -> None:
+    """With a case selected by its auditor, the names it lets them read, recorded before they are sent."""
+    if selection is None or not selection.names or not events:
+        return
+    from app.services import activity_case
+    shown = activity_case.case_names(db, selection, events, rows)
+    activity_case.note_names_viewed(db, selection, viewer, events, shown)
 
 
 @app.get("/activity/usernames")
 def activity_usernames(
     q: str = Query("", max_length=64),
     limit: int = Query(10, ge=1, le=20),
-    current_user: User = Depends(require_interactive_admin),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
     """Accounts whose username starts with `q`, for the Events filter's typeahead (admin only), each
@@ -2760,7 +2802,7 @@ def _set_default_saved_search(db, user, row) -> None:
 
 
 @app.get("/activity/saved-searches")
-def list_saved_searches(current_user: User = Depends(require_interactive_admin),
+def list_saved_searches(current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """The caller's own saved searches, by name, and how many one person may keep (admin only)."""
     return _saved_searches_payload(db, current_user)
@@ -2768,7 +2810,7 @@ def list_saved_searches(current_user: User = Depends(require_interactive_admin),
 
 @app.post("/activity/saved-searches")
 def create_saved_search(body: SavedSearchCreate,
-                        current_user: User = Depends(require_interactive_admin),
+                        current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """Save the Events filters under a name, optionally as the search the page opens with."""
     from app.core.models import ActivitySavedSearch
@@ -2802,7 +2844,7 @@ def create_saved_search(body: SavedSearchCreate,
 
 @app.patch("/activity/saved-searches/{search_id}")
 def update_saved_search(search_id: str, body: SavedSearchUpdate,
-                        current_user: User = Depends(require_interactive_admin),
+                        current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """Rename a saved search, replace its filters, or both."""
     rules = _saved_search_rules()
@@ -2831,7 +2873,7 @@ def update_saved_search(search_id: str, body: SavedSearchUpdate,
 
 @app.delete("/activity/saved-searches/{search_id}")
 def delete_saved_search(search_id: str,
-                        current_user: User = Depends(require_interactive_admin),
+                        current_user: User = Depends(require_activity_viewer),
                         db: Session = Depends(get_db)):
     """Delete a saved search. Deleting the default leaves the page opening on the plain list."""
     row = _own_saved_search(db, current_user, search_id)
@@ -2842,7 +2884,7 @@ def delete_saved_search(search_id: str,
 
 @app.post("/activity/saved-searches/{search_id}/default")
 def set_default_saved_search(search_id: str,
-                             current_user: User = Depends(require_interactive_admin),
+                             current_user: User = Depends(require_activity_viewer),
                              db: Session = Depends(get_db)):
     """Make a saved search the one the Activity page opens with; the previous default stops being one."""
     _lock_owner(db, current_user)
@@ -2854,7 +2896,7 @@ def set_default_saved_search(search_id: str,
 
 @app.delete("/activity/saved-searches/{search_id}/default")
 def clear_default_saved_search(search_id: str,
-                               current_user: User = Depends(require_interactive_admin),
+                               current_user: User = Depends(require_activity_viewer),
                                db: Session = Depends(get_db)):
     """Stop a saved search being the default; the page then opens on the plain list."""
     row = _own_saved_search(db, current_user, search_id)
@@ -2884,12 +2926,13 @@ def activity_summary(
     vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
-    current_user: User = Depends(require_interactive_admin),
+    case: Optional[str] = Query(None, max_length=64),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
-    """The Activity page's summary band, in one request (admin only): the events in each bucket of the
-    range by category, the category mix, sign-in outcomes, the most active usernames and addresses, and
-    what is happening now (signed-in sessions, web transfers).
+    """The Activity page's summary band, in one request (an administrator, or an auditor): the events in each
+    bucket of the range by category, the category mix, sign-in outcomes, the most active usernames and addresses,
+    and, for an administrator, what is happening now (signed-in sessions, web transfers).
 
     The range is the last 24 hours, 7 days or 30 days; a range the viewer chose (`range=custom`, from
     `range_from` to `range_to`, or to now without one); or all time (`range=all`, charted from the oldest
@@ -2916,7 +2959,8 @@ def activity_summary(
     filters = dict(categories=category, channels=channel, statuses=status, actions=action[:ev.MAX_ACTIONS],
                    username=user, user_exact=(user_match == "exact"), no_account=no_account, ip=ip, text=q,
                    temp_credential_id=temp_credential_id, temp_credential=temp_credential, vault_id=vault_id,
-                   start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date))
+                   start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date),
+                   **_case_filters(_activity_case(db, current_user, case, None)))
     win = since = until = None
     if range_ in summary.RANGES:
         win = summary.window(range_, now, tz_offset, zone)
@@ -2949,7 +2993,8 @@ def activity_summary(
     band, age = summary.cached(key, range_, compute)
     out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1),
            "fresh_seconds": round(summary.fresh_for(range_, age), 1)}
-    out["now"] = summary.now_panel(db, now, _activity_transfers())
+    # Live sessions and transfers are an administrator's, not log review.
+    out["now"] = summary.now_panel(db, now, _activity_transfers()) if current_user.role == RoleEnum.ADMIN else None
     return out
 
 
@@ -3003,11 +3048,13 @@ def activity_export(
     vault_id: Optional[str] = Query(None, max_length=64),
     from_date: Optional[str] = Query(None, max_length=64),
     to_date: Optional[str] = Query(None, max_length=64),
+    case: Optional[str] = Query(None, max_length=64),
     request: Request = None,
-    current_user: User = Depends(require_interactive_admin),
+    current_user: User = Depends(require_activity_viewer),
     db: Session = Depends(get_db),
 ):
-    """The Events list's rows as a CSV or NDJSON download, with the same filters (admin only).
+    """The Events list's rows as a CSV or NDJSON download, with the same filters (an administrator, or an
+    auditor). Names as the viewer could read them in the vaults themselves: never a name only a case shows.
 
     Streamed a batch at a time, each batch in its own short database session, so a large export neither
     holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
@@ -3018,13 +3065,15 @@ def activity_export(
     from app.core.models import AuditLog
     from app.services import activity_events as ev
     from app.services.activity_names import recorded_names_for, show_unlocked, temp_credential_names, unlocked_vaults
+    case = case if isinstance(case, str) and case else None        # a direct call leaves its Query default
     unlocked = unlocked_vaults(db, current_user, request)
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
         statuses=status, actions=action, username=user, user_exact=(user_match == "exact"),
         no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
-        temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date))
+        temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date),
+        **_case_filters(_activity_case(db, current_user, case, None)))
     total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
     # Recorded before a row is sent, and required: an export of up to EXPORT_CAP rows of personal data
     # that left no trace would be a gap in the log's own account of who read it. So when the row cannot
@@ -3041,7 +3090,8 @@ def activity_export(
                                               ("no_account", no_account), ("ip", ip), ("q", q),
                                               ("temp_credential_id", temp_credential_id),
                                               ("temp_credential", temp_credential), ("vault_id", vault_id),
-                                              ("from_date", from_date), ("to_date", to_date)) if v},
+                                              ("from_date", from_date), ("to_date", to_date),
+                                              ("case", case)) if v},
             })
     except Exception as e:                                   # noqa: BLE001 - refused below, whatever it was
         print(f"⚠ export refused: its audit row could not be written ({type(e).__name__})")
@@ -3733,12 +3783,13 @@ def _fire_action_email_bulk(db: Session, key: str, recipients, action_context=No
     has no switch, and an admin who resets its template to "Built-in default" leaves it unbound, which
     send_action_email answers with the built-in body. Only an optional action is gated here."""
     try:
-        from app.core.email_actions import OPTIONAL, SPEC_BY_KEY, SYSTEM
+        from app.core.email_actions import ALWAYS_ON, OPTIONAL, SPEC_BY_KEY
         from app.core.models import EmailAction
         a = db.get(EmailAction, key)
         category = a.category if a is not None else SPEC_BY_KEY.get(key, {}).get("category", OPTIONAL)
-        # An optional action only sends when explicitly enabled AND bound to a template.
-        if category != SYSTEM and not (a is not None and a.enabled and a.template_id is not None):
+        # An optional action only sends when explicitly enabled AND bound to a template; a system or locked one
+        # always does.
+        if category not in ALWAYS_ON and not (a is not None and a.enabled and a.template_id is not None):
             return
         pairs = [((e or "").strip(), u) for (e, u) in recipients if (e or "").strip()]
         if not pairs:
@@ -5696,7 +5747,29 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     maker is the account the link is handed to: ``actor_id`` for a change made at once, and for an
     approved request ``link_maker_id``, the approving administrator (None: the server's operator on the
     host), who receives the link to pass on; the one who asked never sees it. The maker's authority is
-    judged again when the link is used (_reset_link_refusal)."""
+    judged again when the link is used (_reset_link_refusal).
+
+    Once the change is made, an auditor right the account holds follows it in the same transaction
+    (app/core/auditor_rights.py, after_credential_change): whoever made it joins the grant's list of
+    changers, and the grant is suspended, or ended for a second-factor reset. A change by someone else is
+    also kept on every compliance case the account started (app/core/legal_holds.py, after_starter_change)."""
+    from app.core import auditor_rights, legal_holds
+    result = _make_credential_change(db, kind, target, payload, actor_id=actor_id, actor_name=actor_name,
+                                     request=request, for_someone_else=for_someone_else,
+                                     link_maker_id=link_maker_id)
+    approved = link_maker_id is not _LINK_MAKER_IS_ACTOR
+    someone_else = for_someone_else and actor_id != target.id
+    auditor_rights.after_credential_change(
+        db, target, kind, actor_id=actor_id, actor_name=actor_name, someone_else=someone_else,
+        approved=approved, approver_id=link_maker_id if approved else None)
+    if someone_else:
+        legal_holds.after_starter_change(db, target, kind)
+    return result
+
+
+def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, request=None,
+                            for_someone_else=True, link_maker_id=_LINK_MAKER_IS_ACTOR) -> dict:
+    """The change itself, for _apply_credential_change, which every caller uses."""
     from app.core import credential_changes as cc
     payload = payload or {}
     if kind == cc.PASSWORD:
@@ -6180,9 +6253,16 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     operator): record who and when, in the caller's transaction, for the two-administrator rule
     (app/core/admin_grants.py), and revoke the open reset links for them that someone who may not make
     one for an administrator made. ``inherited`` is an invitation's kept lineage. Call it only on the
-    change INTO the role."""
-    from app.core import admin_grants
+    change INTO the role.
+
+    Refused (409) while COMPLIANCE_AUDITOR_NOT_ADMIN is on and the account holds the auditor right or a
+    proposal for it (app/core/auditor_rights.py, promotion_refusal): the right is revoked first. Raised in the
+    caller's transaction, before anything of the promotion is committed."""
+    from app.core import admin_grants, auditor_rights
     from app.core import credential_changes as cc
+    refusal = auditor_rights.promotion_refusal(db, user)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
     admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
                         granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR),
                         inherited=inherited)
@@ -6519,10 +6599,14 @@ def _account_lost_standing(db, user, *, actor, because) -> _LostStanding:
     follows from an account losing its standing follows on every route. Call it BEFORE the change to
     ``user`` is made in the session, in the same transaction. What follows: their open requests are
     withdrawn and their pending administrator invitations revoked (_withdraw_requests_of), and the SSH
-    keys an administrator added to other people's accounts are reported (_report_keys_added_by). Returns
-    what _announce_lost_standing tells after the commit."""
+    keys an administrator added to other people's accounts are reported (_report_keys_added_by), and an
+    auditor right they hold is suspended (ended, when the account is deleted) and the auditor rights they
+    proposed are withdrawn (app/core/auditor_rights.py, after_lost_standing; told after the commit).
+    Returns what _announce_lost_standing tells after the commit."""
+    from app.core import auditor_rights
     withdrawn = _withdraw_requests_of(db, user, actor=actor, because=because)
     keys = _report_keys_added_by(db, user, actor=actor, because=because)
+    auditor_rights.after_lost_standing(db, user, actor=actor, because=because)
     return _LostStanding(withdrawn, keys)
 
 
@@ -6820,10 +6904,12 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     user.password_hash = hash_password(body.new_password)
     # Whose password it now is: a link another account made could have been used by its maker, so the
     # password counts as theirs; one the person asked for (or the host operator made) is the person's own.
-    from app.core import password_origin
+    from app.core import legal_holds, password_origin
     made_by_other = _reset_link_made_by_other(r)
     if made_by_other:
         password_origin.set_by_other(user, r.created_by)
+        # Kept on the compliance cases the account started, after the flag above clears.
+        legal_holds.after_starter_change(db, user, "password")
     else:
         password_origin.set_by_self(user)
     db.commit()
@@ -9258,9 +9344,15 @@ async def storage_stats(
     allocated = int(db.query(_f.coalesce(_f.sum(Vault.size_limit), 0)).filter(
         Vault.is_active == True).scalar() or 0)  # noqa: E712
     limit = deployment_storage_limit_bytes(db)
+    # Files a legal hold keeps after their deletion: on this disk, in no vault's counters.
+    from app.core import kept_tables
+    kept = kept_tables.totals(db)
     return {
         "total": total,
         "used": used,
+        "kept_for_cases": kept,
+        # What the vaults' files take on the disk: their counted bytes and the kept ones.
+        "on_disk_bytes": used + kept["bytes"],
         "available": available,
         "allocated_bytes": allocated,
         "limit_bytes": limit,
@@ -9312,19 +9404,23 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
 
 def _ws_sees_activity(user_id: str, is_temporary: bool) -> bool:
     """Whether a live socket's session may receive the Activity signal: an administrator's own
-    interactive session, the same rule as the Activity page (require_interactive_admin). A temporary
-    credential is not, even an administrator's. Fails closed on an error."""
+    interactive session, or an auditor's whose right is in force, the same rule as the Activity page
+    (app/api/activity_viewer.py). A temporary credential is not, even an administrator's. Fails closed
+    on an error."""
     if is_temporary:
         return False
     try:
+        from app.core import auditor_rights
         from app.core.database import SessionLocal
         from app.core.models import User as _U
         db = SessionLocal()
         try:
-            role = db.query(_U.role).filter(_U.id == uuid.UUID(str(user_id))).scalar()
+            user = db.query(_U).filter(_U.id == uuid.UUID(str(user_id))).first()
+            if user is None:
+                return False
+            return user.role == RoleEnum.ADMIN or auditor_rights.auditor_live(db, user).live
         finally:
             db.close()
-        return role == RoleEnum.ADMIN
     except Exception as e:  # noqa: BLE001
         print(f"[WS] activity access check failed (no signal): {type(e).__name__}")
         return False
@@ -10303,6 +10399,9 @@ async def disable_second_factor(
         SecondFactorRecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
     db.query(SecondFactorEnrollment).filter(
         SecondFactorEnrollment.user_id == current_user.id).delete(synchronize_session=False)
+    # An auditor right bound to this factor ends with it (app/core/auditor_rights.py).
+    from app.core import auditor_rights
+    auditor_rights.after_own_factor_removed(db, current_user)
     db.commit()
     try:
         AuditLogger(db).log_action(action="second_factor_disabled", status="success", user=current_user,
@@ -10350,7 +10449,9 @@ async def list_second_factor_actions(
 ):
     """The admin step-up policy matrix: one row per cataloged action with its two independent toggles
     (require_otp / require_password). Rendered in catalog order; a key with no stored row yet shows its
-    code default."""
+    code default. ``fixed`` lists the step-ups no toggle changes (app/core/fixed_step_up.py), shown read-only
+    with what they always ask for."""
+    from app.core import fixed_step_up
     from app.core.second_factor_actions import SECOND_FACTOR_ACTIONS
     rows = {r.key: r for r in db.query(SecondFactorAction).all()}
     return {"actions": [
@@ -10358,7 +10459,7 @@ async def list_second_factor_actions(
          "require_otp": bool(rows[key].require_otp) if key in rows else bool(default_otp),
          "require_password": bool(rows[key].require_password) if key in rows else False}
         for key, name, default_otp in SECOND_FACTOR_ACTIONS
-    ]}
+    ], "fixed": fixed_step_up.describe()}
 
 
 @app.put("/second-factor/actions/{key}")
@@ -16191,6 +16292,22 @@ async def add_group_members(
                 status_code=403,
                 detail="You cannot add yourself to this department: it has access to vaults or "
                        "shared items you cannot otherwise open. Ask another administrator.")
+    # The owners are told, in this transaction, of the vaults and shared items joining gives the new members
+    # (app/core/access_notices.py).
+    from app.core import access_notices
+    reach = access_notices.Reach(db, current_user)
+    joining = [uid for uid in dict.fromkeys(payload.user_ids) if uid not in existing]
+    if joining:
+        from app.core.models import vault_group_access
+        for vid, _perm in db.query(vault_group_access.c.vault_id, vault_group_access.c.permission).filter(
+                vault_group_access.c.group_id == group_id).all():
+            reach.watch(db.query(Vault).filter(Vault.id == vid).first(), joining,
+                        via=access_notices.JOINED, department=group.name)
+        for share in db.query(Share).filter(Share.claim_audience == "departments", Share.status == "active",
+                                            Share.expires_at > datetime.utcnow(),
+                                            Share.audience_department_ids.contains([str(group_id)])).all():
+            reach.watch_share(share, db.query(Vault).filter(Vault.id == share.vault_id).first(), joining,
+                              department=group.name)
     added = []
     for uid in payload.user_ids:
         if uid in existing:
@@ -16203,6 +16320,7 @@ async def add_group_members(
         ))
         existing.add(uid)
         added.append(uid)
+    reach.tell()
     db.commit()
     # Group membership IS access: a member inherits every vault the group can reach, so adding
     # someone here can widen their reach without any vault being touched. The row names WHO was
@@ -17008,6 +17126,7 @@ async def get_vault(
     for as long as the tab lived. A caller can only ever suppress their OWN bookmark by sending it,
     so a header needs no stronger guarantee than this.
     """
+    from app.core import owner_access as _owner_access
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
 
@@ -17079,6 +17198,8 @@ async def get_vault(
             'my_permission': _effective_vault_permission(vault, base_perms, current_user),
             'is_favorite': _is_vault_favorite(db, current_user.id, vault.id),
             'last_viewed_at': _vault_view_times(db, current_user, vault.id).get(vault.id),
+            # Here, never in VaultService.get_vault (which downloads, file operations and SFTP run too).
+            'compliance_review': _owner_access.member_review_shown(db, vault.id),
         }
         # Opening the detail view IS the view. Stamped after the payload is built, so the value
         # returned is the PREVIOUS visit rather than the current instant — otherwise every read
@@ -18243,6 +18364,12 @@ async def grant_vault_permission(
             vault_members.c.vault_id == vault_id,
             vault_members.c.user_id == permission.user_id).first() is not None
 
+        # The owner is told, in this transaction, when someone else gives this person access they did not hold
+        # (app/core/access_notices.py).
+        from app.core import access_notices
+        reach = access_notices.Reach(db, current_user)
+        reach.watch(vault, [user.id], via=access_notices.GRANT)
+
         # Set permissions based on level. 'manage' implies full read/write/delete.
         manage_perm = permission.level == 'manage'
         read_perm = permission.level in ['read', 'write', 'delete', 'manage']
@@ -18271,6 +18398,7 @@ async def grant_vault_permission(
                 'manage_permission': manage_perm,
             },
         ))
+        reach.tell()
         db.commit()
 
         # Someone can now open this vault who could not a moment ago. That is the single most
@@ -18370,6 +18498,12 @@ async def revoke_vault_permission(
             # being left active; and a rotation that starts after this sees them already removed.
             db.query(Vault).populate_existing().filter(Vault.id == vault_id).with_for_update().first()
 
+        # The owner is told, in this transaction, when removing this row lets the person's departments give
+        # them more than it did (app/core/access_notices.py).
+        from app.core import access_notices
+        reach = access_notices.Reach(db, current_user)
+        reach.watch(vault, [user_id], via=access_notices.ROW_REMOVED)
+
         # Delete permission entry
         from app.core.models import vault_members
         from sqlalchemy import delete as sql_delete
@@ -18413,6 +18547,7 @@ async def revoke_vault_permission(
                 mk.revoked_at = now
                 mk.revoked_by = current_user.id
 
+        reach.tell()
         db.commit()
 
         # Recorded AFTER the rowcount check, so the log says a revoke happened only when one did.
@@ -18504,7 +18639,8 @@ async def grant_vault_group_access(
     # locks it: a concurrent request that adds the caller to this department waits for this one and
     # then sees this grant, and the reverse, so the two cannot pass the self-access check below
     # together.
-    if not db.query(Group).filter(Group.id == payload.group_id).with_for_update().first():
+    group = db.query(Group).filter(Group.id == payload.group_id).with_for_update().first()
+    if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     # A receiver vault is share-frozen to READ (like the per-user permissions route): a department
     # granted write could alter or delete the arrived files and upload bypassing the receiver's policy.
@@ -18529,6 +18665,12 @@ async def grant_vault_group_access(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You belong to this department, so granting it access would give you access to "
                    "another person's vault; ask its owner or another administrator.")
+    # The owner is told, in this transaction, of the members this gives access they did not hold
+    # (app/core/access_notices.py).
+    from app.core import access_notices
+    reach = access_notices.Reach(db, current_user)
+    reach.watch(vault, [r[0] for r in db.execute(select(user_groups.c.user_id).where(
+        user_groups.c.group_id == payload.group_id)).fetchall()], via=access_notices.DEPARTMENT, department=group.name)
     existing = db.execute(
         select(vault_group_access).where(
             vault_group_access.c.vault_id == vault_id,
@@ -18549,6 +18691,7 @@ async def grant_vault_group_access(
                 added_at=datetime.now(timezone.utc), added_by=current_user.id,
             )
         )
+    reach.tell()
     db.commit()
     # `perm` is what was written. Logging the request's own string here recorded whatever the caller
     # typed, which is not what the vault ended up granting.
@@ -24887,6 +25030,25 @@ END $$;""",
                 print(f"⚠ users.email case-insensitive index skipped: {e}")
                 recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, str(e))
 
+            # The legal hold's kept tables and triggers (app/core/kept_tables.py). Last, after every
+            # statement that adds a column to files or folders: the kept tables gain the same columns and
+            # the trigger functions are generated for them. One transaction, so the triggers are replaced
+            # at once; the check below refuses to serve if this did not land.
+            kept_step = "conditional: the legal hold's kept tables and triggers, built from files and folders"
+            try:
+                from app.core import kept_tables
+                db.execute(text("SET LOCAL lock_timeout = 0"))
+                kept_tables.install(db)
+                db.commit()
+                recorder.record(kept_step, SchemaStep.OUTCOME_APPLIED)
+                # While holds stand or kept rows remain, an older release must not start on this data.
+                from app.core import legal_hold_marker
+                legal_hold_marker.check_at_start()
+            except Exception as e:
+                db.rollback()
+                print(f"⚠ Legal hold tables and triggers skipped: {e}")
+                recorder.record(kept_step, SchemaStep.OUTCOME_FAILED, str(e))
+
             recorder.forget_steps_no_longer_declared()
             recording_failed = recorder.broken
     except Exception as e:
@@ -24904,6 +25066,11 @@ END $$;""",
     from app.core.database import get_db_context as _ctx
     with _ctx() as _db:
         _verify_retired_object_id_triggers(_db)
+    # And without what a legal hold keeps, for the same reason: a hold that keeps nothing is a promise
+    # the deployment does not keep.
+    from app.core import kept_tables as _kept_tables
+    with _ctx() as _db:
+        _kept_tables.verify(_db)
 
     return not recording_failed
 
@@ -25192,6 +25359,9 @@ def _add_name_uniqueness():
                 if dup_groups:
                     vs = VaultService(db, PermissionService(db))
                     stale_blobs, removed = [], 0
+                    # What a legal hold keeps of these is kept as a duplicate the start removed.
+                    from app.core import kept_tables
+                    kept_tables.mark_deletes(db, "duplicate")
                     for grp in dup_groups:
                         for fid in list(grp.ids)[1:]:  # keep newest (index 0); delete the rest
                             f = db.query(File).filter(File.id == fid).first()
@@ -25331,6 +25501,12 @@ async def lifespan(app: FastAPI):
     # start. Only this process runs it. See app/core/retention.py.
     from app.core import retention
     retention_task = asyncio.create_task(retention.run_forever())
+
+    # The sender of the email notices that tell vaults' owners about compliance access to their vaults: written
+    # in the step's own transaction, sent from an outbox on a thread of its own, one process at a time, with
+    # retries. Only this process runs it. See app/core/owner_notices.py.
+    from app.core import owner_notices
+    owner_notices.start()
 
     # Keep the single-use invite/share tokens (which ride the URL) out of uvicorn's access log — they
     # would otherwise be written on every invite lookup/accept and the ?invite= landing hit.

@@ -17,8 +17,9 @@ otherwise give the row its id only when it is flushed. A hook changes the row in
 nothing. It must not raise: build_row runs inside the transaction of the change the row records, so an
 exception here fails that change. raw_details is a copy, and the caller's own dict is never changed.
 
-In this release privacy applies the recording levels (app/core/audit_privacy.py); the other hooks leave
-the row as it is, so their columns stay NULL.
+In this release privacy applies the recording levels (app/core/audit_privacy.py) and case puts the id of
+the compliance case the code acts under on the row; the other hooks leave the row as it is, so their
+columns stay NULL.
 """
 
 
@@ -27,7 +28,14 @@ def provenance(row) -> None:
 
 
 def case(row) -> None:
-    """The compliance case the request acts under. None yet: row.case_id stays NULL."""
+    """The compliance case the code acts under (app/core/case_context.py, acting_for), or NULL outside one."""
+    try:
+        from app.core.case_context import current
+        case_id = current()
+    except Exception:  # noqa: BLE001 -- a hook never fails the change its row records
+        return
+    if case_id is not None:
+        row.case_id = case_id
 
 
 def privacy(row, raw_details) -> None:

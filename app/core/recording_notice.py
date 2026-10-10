@@ -5,7 +5,9 @@ The notice (GET /privacy/recording, and the page /recording that shows it) says,
 sign-in: what the audit log records of each kind of personal data (the levels in force, app/core/audit_privacy.py),
 how long records are kept, who can see them, the legal basis and the contact the operator states, and every other
 place this vault keeps personal data with how long each keeps it (STORES). It shows the levels in force only;
-the versions before need sign-in.
+the versions before need sign-in. Its compliance section says, as configured now, what compliance access lets an
+auditor do, what a case can and cannot open, that owners are told, and how long its records are kept
+(compliance_notice).
 
 Each new version of the levels notifies every user (once per user and version) and shows a banner after sign-in
 until the user says they have read it. That records reading it, not consent: the levels are the operator's
@@ -59,6 +61,14 @@ def _alerts_kept() -> str:
             f"{_days(settings_registry.resolve(security_records.ALERT_RETENTION_KEY))}.")
 
 
+def _compliance_kept() -> str:
+    from app.core import compliance_settings as cs
+    return (f"The records of auditor rights, cases and legal holds for ever; their events at least "
+            f"{_days(cs.current(cs.RECORD_MIN_DAYS))} after a case closes, whatever the activity log's own retention "
+            f"says; notices to owners outside a case as long; what a legal hold keeps, until "
+            f"{_days(cs.current(cs.HOLD_PURGE_DELAY_DAYS))} after it is released.")
+
+
 def _sessions_kept() -> str:
     from app.core.session_retention import SESSION_DATA_RETENTION_DAYS
     return f"For the session's life, then {_days(SESSION_DATA_RETENTION_DAYS)}."
@@ -87,6 +97,10 @@ STORES = (
           "text they search for. A name typed at a failed sign-in is kept as the recording levels keep it.",
           lambda: "Until the administrator deletes the search, or their account is deleted.",
           table="activity_saved_searches"),
+    Store("compliance", "Compliance access: who holds the auditor right; each investigation (a case) and legal hold, "
+          "who asked for it and who approved it, its sealed reasons, the vaults it covers, the owners told and the "
+          "files opened; names revealed with their sealed reasons; files a legal hold keeps after they are deleted.",
+          _compliance_kept),
     Store("notifications", "Your notifications, including one telling you of a sign-in or a change to your account "
           "from an address.", lambda: "Until you dismiss them.", table="notifications"),
     Store("cache", "Counts of requests and failed sign-ins by address and by account, in the cache.",
@@ -138,6 +152,53 @@ LEVEL_WORDS = {
                    "first three groups of an IPv6 address)"),
     ap.FULL: "Recorded in full",
 }
+# Who else can see it, while compliance access is on.
+AUDITORS_CAN_SEE = ("Auditors (accounts two administrators gave the auditor right) see the activity log as administrators "
+                    "do, with vault, file and folder names only for vaults they can read themselves; in an "
+                    "investigation an independent administrator approved, the files of the vaults it covers, and "
+                    "their names.")
+COMPLIANCE_OFF = ("Compliance access is turned off on this server: nobody can open another person's vault through an "
+                  "investigation, and no auditor reads the activity log.")
+PASSWORD_WORDS = {
+    "refuse": "A case never opens a vault with a password.",
+    "with_password": "A vault with a password opens in a case only with its password, which the auditor must give.",
+    "override": ("On this server, an approved case may open a vault with a password without its password; its owner "
+                 "is told so when the case begins."),
+}
+
+
+def compliance_notice() -> dict:
+    """What compliance access lets anyone do here, as configured now, in plain words: whether it is on, what a case
+    opens and what it never opens, that owners are told, exports, reveals, holds, and how long it is all kept."""
+    from app.core import compliance_settings as cs
+    if cs.current(cs.ACCESS) == cs.DISABLED:
+        return {"enabled": False, "lines": [COMPLIANCE_OFF]}
+    exports = cs.current(cs.EXPORT) == cs.ALLOWED
+    return {"enabled": True, "lines": [
+        "An auditor is an account two administrators gave the auditor right: one proposes it, a second one, "
+        f"independent of them and of the account, approves it. It lasts {_days(cs.current(cs.AUDITOR_GRANT_DAYS))} at "
+        "most, and ends or is suspended when the account's sign-in details change.",
+        "In an investigation (a case) that an administrator independent of the auditor approves, the auditor can open "
+        f"the files of the vaults it covers, for {_days(cs.current(cs.MAX_ACCESS_DAYS))} at most at a time"
+        + (" and export copies of them." if exports else "; exports are turned off on this server.")
+        + " Each vault's owner is told at once in the app (and by email when this server sends email and the owner "
+        "has an address), and sees every file opened as it happens. "
+        "People named in a case can neither approve it nor see it.",
+        "A case never opens a zero-knowledge vault: the server cannot. " + PASSWORD_WORDS.get(
+            cs.current(cs.PASSWORD_VAULTS), PASSWORD_WORDS["with_password"]),
+        "An auditor can reveal a name an event recorded in full, outside a case, giving a reason; the vault's owner "
+        "is told, and sees each reveal on Access to my vaults. Never for a vault that has a password now, or a "
+        "zero-knowledge one.",
+        "A legal hold keeps what is deleted from a vault until it is released; its owner is told, and the people "
+        "using the vault see the deletion as done.",
+        "When anyone but a vault's owner gives another person access to it, or more access than they had, the owner "
+        "is told in the app, with who that person is and where their account came from; by email too when the one "
+        "who gave it could not open that vault themselves.",
+        f"The records of compliance access are kept at least {_days(cs.current(cs.RECORD_MIN_DAYS))} after a case "
+        "closes, whatever the activity log's own retention says.",
+    ]}
+
+
 NOTICE_KEYS = ("recording_notice_legal_basis", "recording_notice_contact")
 NOTICE_MAX_LENGTH = 1000
 
@@ -174,6 +235,10 @@ def build_notice(db) -> dict:
     policy = ap.current()
     levels = ap.effective(policy.levels)
     stated = _stated(db)
+    try:
+        compliance = compliance_notice()
+    except Exception:  # noqa: BLE001 -- a setting that cannot be read: the section says to ask the operator
+        compliance = {"enabled": None, "lines": ["Ask the operator whether compliance access is on."]}
     stores = []
     for store in STORES:
         try:
@@ -188,7 +253,8 @@ def build_notice(db) -> dict:
         "always": "Every event is recorded: who acted (an account's username), what happened, when and its outcome. "
                   "Passwords, codes and link tokens are never recorded.",
         "fingerprints": FINGERPRINT_CAVEAT if any(levels[k] == ap.FINGERPRINT for k in ap.POLICY_KEYS) else None,
-        "who_can_see": list(WHO_CAN_SEE),
+        "who_can_see": list(WHO_CAN_SEE) + ([AUDITORS_CAN_SEE] if compliance["enabled"] else []),
+        "compliance": compliance,
         "legal_basis": stated["recording_notice_legal_basis"],
         "contact": stated["recording_notice_contact"] or _contact_fallback(db),
         "stores": stores,
