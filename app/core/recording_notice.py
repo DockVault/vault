@@ -181,16 +181,19 @@ def compliance_notice() -> dict:
         "In an investigation (a case) that an administrator independent of the auditor approves, the auditor can open "
         f"the files of the vaults it covers, for {_days(cs.current(cs.MAX_ACCESS_DAYS))} at most at a time"
         + (" and export copies of them." if exports else "; exports are turned off on this server.")
-        + " Each vault's owner is told at once, in the app and by email, and sees every file opened as it happens. "
+        + " Each vault's owner is told at once in the app (and by email when this server sends email and the owner "
+        "has an address), and sees every file opened as it happens. "
         "People named in a case can neither approve it nor see it.",
         "A case never opens a zero-knowledge vault: the server cannot. " + PASSWORD_WORDS.get(
             cs.current(cs.PASSWORD_VAULTS), PASSWORD_WORDS["with_password"]),
         "An auditor can reveal a name an event recorded in full, outside a case, giving a reason; the vault's owner "
-        "is told. Never for a vault with a password or a zero-knowledge one.",
+        "is told, and sees each reveal on Access to my vaults. Never for a vault that has a password now, or a "
+        "zero-knowledge one.",
         "A legal hold keeps what is deleted from a vault until it is released; its owner is told, and the people "
         "using the vault see the deletion as done.",
-        "When someone who could not open a vault gives another person access to it, its owner is told, with who "
-        "that person is and where their account came from.",
+        "When anyone but a vault's owner gives another person access to it, or more access than they had, the owner "
+        "is told in the app, with who that person is and where their account came from; by email too when the one "
+        "who gave it could not open that vault themselves.",
         f"The records of compliance access are kept at least {_days(cs.current(cs.RECORD_MIN_DAYS))} after a case "
         "closes, whatever the activity log's own retention says.",
     ]}

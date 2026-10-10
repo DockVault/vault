@@ -70,8 +70,9 @@ When you keep it on:
 
 ### Owners are told at once: the tipping-off question
 
-A case tells each owner of a vault it covers at the moment it is approved, in the app and by email, and every file
-opened is listed for the owner as it happens. DockVault offers no delayed or silent access.
+A case tells each owner of a vault it covers at the moment it is approved, in the app (and by email when the server
+sends email and the owner has an address), and every file opened is listed for the owner as it happens. DockVault
+offers no delayed or silent access.
 
 Some laws forbid warning the person under investigation: anti-money-laundering rules on tipping-off, some
 law-enforcement requests, and national restrictions under GDPR Art. 23. **Where the law forbids telling the owner,
@@ -90,8 +91,20 @@ hold also tells the owner). The purpose "Regulator or authority request" does no
 - **Choosing vaults without their names is clumsy for an auditor.** The vault picker shows a name only where the
   auditor can read the vault already: the names of other people's vaults are not disclosed before a case is
   approved.
-- **An administrator a case concerns cannot see it**, but can see on the Activity page that recorded events of
-  compliance access exist (their ids, never their names), and so infer that a case exists.
+- **The vault picker shows any administrator, and any auditor whose right is in force, an account's vaults**: for
+  each, its type, whether it has a password, its number of files, its size and when it was made (an administrator
+  needs this to place a legal hold). It never shows a vault's name to someone who could not read the vault anyway,
+  and each look is recorded (`case_picker_viewed`, naming the account looked at).
+- **An administrator a case concerns cannot see it on the Compliance page, but can learn of it from the Activity
+  page**, which every administrator reads whole. The rows of compliance access are there with no vault or file
+  name: a case asked for or approved, a hold placed (with the vault's id), and an auditor's look at the vault
+  picker (with the id of the account whose vaults were listed). Such a row can tell that administrator that a case
+  about them exists, even one not yet approved. Hiding those rows from the administrators they concern would make
+  the log differ from one administrator to the next, so it is not done: weigh this before you open a case about an
+  administrator.
+- **A revealed name follows the vault's password as it is now**, as the names on the Activity page do: names
+  recorded while a vault had a password can be revealed once its owner removes the password, and a vault given a
+  password later no longer has any of its recorded names revealed, including those recorded before.
 
 ### Upgrading with SFTP in its own container
 

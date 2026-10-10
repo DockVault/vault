@@ -60,12 +60,18 @@ decide which vaults a case names]**
 
 ## 3. Transparency
 
-- **The owner is told at once**, when a case is approved, in the app and by email, with the case's number, purpose,
-  legal basis, auditor and approver, how long it lasts, and the auditor's note to them; every file opened is listed
-  for the owner as it happens, and the owner is told of extensions, narrowing, exports, the end and the close.
+- **The owner is told at once**, when a case is approved, in the app, and by email when the server sends email and
+  the owner has an address (with a copy to the address before an administrator's recent change of it), with the
+  case's number, purpose, legal basis, auditor and approver, how long it lasts, and the auditor's note to them;
+  every file opened is listed for the owner as it happens, and the owner is told of extensions, narrowing, exports,
+  the end and the close. **[fill in: whether this deployment sends email, and how you make sure owners have an
+  address]**
 - **Members of a covered vault** see a neutral banner: the vault is part of an authorised review until a date.
-- **When someone else gives a person access** to an owner's vault, the owner is told, with where that person's
-  account came from.
+- **When anyone but the owner gives a person access** to an owner's vault, the owner is told in the app, with who
+  that person is and where their account came from; by email too when the one who gave it could not open the vault
+  themselves.
+- **When an auditor reveals a recorded name** from an owner's vault outside a case, the owner is told (once a day
+  per auditor and vault) and sees each reveal on *Access to my vaults*: when, by whom and the reason's category.
 - **The page *What this vault records*** describes compliance access as configured.
 - **The product does not tell the people named in a case, or the people whose data is in the files.**
   **[fill in: how you inform them (Art. 13, 14), or the exemption you rely on]**
