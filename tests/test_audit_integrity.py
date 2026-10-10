@@ -370,3 +370,22 @@ def test_a_chain_started_after_its_first_rows_reports_no_backlog(env):
     env.seal()
     info = env.verify().kinds("information")
     assert "backlog-in-progress" not in info and "sealing-behind" in info
+
+
+def test_a_reader_under_the_chain_lock_waits_for_a_writer_of_its_own_process(env):
+    """A reader's chain lock takes the process's own writers' mutex as well as the advisory lock: without a database
+    lock (the offline database) the mutex is all that keeps a writer of the same process from committing between the
+    reader's snapshot and its read of the head record. While a writer holds it, the reader waits, then is told to
+    retry; once it is free, the reader takes it."""
+    env.seal()
+    assert env.st.mutex.acquire(timeout=1)
+    try:
+        with pytest.raises(ai.ChainBusy):
+            with ai.chain_lock(env.engine, env.st, wait=0.2):
+                pytest.fail("the reader took the lock a writer holds")
+    finally:
+        env.st.mutex.release()
+    with ai.chain_lock(env.engine, env.st, wait=1):
+        assert not env.st.mutex.acquire(blocking=False)       # the reader holds it now
+    assert env.st.mutex.acquire(blocking=False)
+    env.st.mutex.release()

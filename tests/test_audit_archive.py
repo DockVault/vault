@@ -1483,6 +1483,18 @@ def test_the_size_cutoff_is_never_at_a_unit_the_chain_keeps_whole_nor_at_one_tha
     assert ar.size_cutoff([], 10) is None
 
 
+def test_a_total_equal_to_the_cap_fits():
+    """The protected shares come to 140; from the newest unit, 80 - 20 more make 200, and the oldest unit's 100 make
+    300. A cap of exactly 300 keeps everything, and of exactly 200 keeps everything but the oldest unit's rest; a
+    byte less moves the cutoff to the newer unit."""
+    units = [(at(1), 100, 0, False), (at(2), 50, 50, True), (at(3), 0, 0, False), (at(4), 80, 20, False),
+             (at(5), 70, 70, True)]
+    assert ar.size_cutoff(units, 300) is None
+    assert ar.size_cutoff(units, 299) == at(2)
+    assert ar.size_cutoff(units, 200) == at(2)
+    assert ar.size_cutoff(units, 199) == at(5)
+
+
 def test_lowering_the_shares_of_units_not_kept_whole_never_moves_the_size_cutoff_newer():
     """What the rows decide, a share of a unit the chain does not keep whole, lowered in any way: at every cap the
     cutoff stays or moves older (or goes), never newer."""

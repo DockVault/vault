@@ -446,6 +446,54 @@ def test_rows_asked_for_by_id_are_looked_up_in_the_rows_before_the_archive(env):
         assert archive.ids_are_rows(db, ["not-an-id"]) is True                  # nothing that reads as an id
 
 
+def _same_length_older_copy(payload, day, part):
+    """A block of the same day, part and rows as ``payload``, one value of one row changed (a character of an
+    address, a name or a message) so that its compressed length is the same: what a backup taken before a rewrite
+    holds (an erase rewrites blocks). Returns (the copy, the changed row's id)."""
+    rows = list(af.open_block(payload).rows())
+    salts = af.open_block(payload).salts
+    for i, target in enumerate(rows):
+        for name in ("ip_address", "username", "error_message", "user_agent", "endpoint"):
+            value = target.get(name)
+            if not isinstance(value, str) or not value:
+                continue
+            for c in "0123456789abcdefxyz":
+                if c == value[-1]:
+                    continue
+                bw = af.BlockWriter(day, part, salts)
+                for j, row in enumerate(rows):
+                    bw.add(dict(row, **{name: value[:-1] + c}) if j == i else row)
+                copy = bw.finish()
+                if len(copy) == len(payload):
+                    return copy, target["id"]
+    pytest.fail("no change of one character gives a copy of the same length")
+
+
+def test_an_older_copy_of_a_block_is_left_out_by_its_digest_alone(env):
+    """The block row holds another well-formed block of the same day, part and row count, of the same length: only
+    its digest differs from the one its archive seal binds. It is left out and its day named, and none of its rows
+    is shown."""
+    _corpus(env, None)
+    _archive_all(env)
+    with env.session() as db:
+        block = db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == ARCHIVED[1]).one()
+        payload, part = bytes(block.payload), int(block.part)
+    rebuilt = af.BlockWriter(ARCHIVED[1], part, af.open_block(payload).salts)
+    for row in af.open_block(payload).rows():
+        rebuilt.add(row)
+    assert rebuilt.finish() == payload                     # the writer gives the same bytes from the same rows
+    copy, changed = _same_length_older_copy(payload, ARCHIVED[1], part)
+    assert copy != payload and len(copy) == len(payload)
+    assert (af.open_block(copy).header["day"], af.open_block(copy).header["part"]) == (ARCHIVED[1].isoformat(), part)
+    assert sum(1 for _r in af.open_block(copy).rows()) == sum(1 for _r in af.open_block(payload).rows())
+    _edit_block(env, ARCHIVED[1], payload=copy)
+    with _search(env, at(ARCHIVED[0], 0)) as s:
+        assert s.unreadable == {ARCHIVED[1].isoformat(): "block-altered"}
+        shown = set(_ids(s.db, s.entity, {"start": at(ARCHIVED[0], 0)}))
+        assert changed not in shown and len(shown) == (len(ARCHIVED) - 1 + len(HOT)) * 18
+        assert not shown & {r["id"] for r in af.open_block(copy).rows()}
+
+
 class _Recorded:
     """A stand-in session that records the statements a search's transaction opens with, as on Postgres."""
 
