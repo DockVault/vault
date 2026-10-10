@@ -3,8 +3,11 @@
  * app/api/audit_integrity_router.py): the chain's head, the line to keep somewhere else, how far the hours
  * are sealed, the last check, every failure and warning not yet acknowledged, and what the archive holds.
  *
- * Shown under the Activity page's header each time the page opens. Uses app.js's apiRequest; builds the
- * strip with createElement and textContent only.
+ * Shown under the Activity page's header each time the page opens, in one line (the status, the head shortened
+ * with its Copy, and Details) so the list still starts near the top of a small window; failures, warnings and a
+ * stop are shown in full below it, and Details holds the whole head, the last check, the key note, the archive and
+ * what the chain does and does not prove. Uses app.js's apiRequest; builds the strip with createElement and
+ * textContent only.
  */
 (function () {
     'use strict';
@@ -49,22 +52,39 @@
         else if (warned) words = 'The audit log is sealed; some events need a look.';
         else words = 'The audit log is sealed' + (s.sealed_through ? ' through ' + when(s.sealed_through) : '') + '.';
         line.appendChild(el('strong', null, words));
-        if (s.checked_at) line.appendChild(el('span', 'text-secondary', ' Last checked ' + when(s.checked_at) + '.'));
-        box.appendChild(line);
         if (s.head) {
-            const head = el('div', 'act-integrity-head');
+            const head = el('span', 'act-integrity-head');
             head.appendChild(el('span', 'text-secondary', 'Head: '));
             const code = el('code', 'act-integrity-code', s.head);
-            code.title = 'Keep this line somewhere else (a ticket, a printout): a later change to the history before it then shows.';
+            code.title = s.head;
             head.appendChild(code);
-            const copy = el('button', 'btn btn-outline btn-sm', 'Copy');
+            const copy = el('button', 'btn btn-outline btn-sm act-integrity-copy', 'Copy');
             copy.type = 'button';
             copy.addEventListener('click', () => {
                 if (navigator.clipboard) navigator.clipboard.writeText(s.head).catch(() => {});
             });
             head.appendChild(copy);
-            box.appendChild(head);
+            line.appendChild(head);
         }
+        const notes = [];
+        if (s.head) {
+            notes.push(['Head: ' + s.head, 'act-integrity-full']);
+            notes.push(['Keep this line somewhere else (a ticket, a printout): a later change to the history before it then shows.', '']);
+        }
+        if (s.checked_at) notes.push(['Last checked ' + when(s.checked_at) + '.', '']);
+        if (s.key_shared) {
+            notes.push(['The chain’s key is derived from ENCRYPTION_KEY; set AUDIT_CHAIN_KEY to give it a key of its own.', '']);
+        }
+        const archive = archiveText(s.archive);
+        if (archive) notes.push([archive, 'act-integrity-archive']);
+        if (s.claim) notes.push([s.claim, '']);
+        if (notes.length) {
+            const more = el('details', 'act-integrity-more');
+            more.appendChild(el('summary', 'text-secondary', 'Details'));
+            notes.forEach(([text, cls]) => more.appendChild(el('div', 'text-secondary text-sm ' + cls, text)));
+            line.appendChild(more);
+        }
+        box.appendChild(line);
         if (stopped) box.appendChild(el('div', 'act-integrity-failure', 'stopped: ' + (stopped.kind || '') + ': ' +
             (stopped.message || '')));
         [['failures', 'act-integrity-failure'], ['warnings', 'act-integrity-warning']].forEach(([key, cls]) => {
@@ -73,13 +93,6 @@
                     (f.first_seen ? ' (since ' + when(f.first_seen) + ')' : '')));
             });
         });
-        if (s.key_shared) {
-            box.appendChild(el('div', 'text-secondary text-sm',
-                'The chain’s key is derived from ENCRYPTION_KEY; set AUDIT_CHAIN_KEY to give it a key of its own.'));
-        }
-        const archive = archiveText(s.archive);
-        if (archive) box.appendChild(el('div', 'text-secondary text-sm act-integrity-archive', archive));
-        if (s.claim) box.appendChild(el('div', 'text-secondary text-sm', s.claim));
         box.hidden = false;
     }
 

@@ -94,15 +94,20 @@
 .act-blocked { padding: 48px 16px; text-align: center; color: var(--text-secondary); }
 .act-blocked-text { margin: 0 auto; max-width: 52ch; }
 /* The audit log's integrity strip (static/js/audit-integrity.js). */
-.act-integrity { margin: 8px 0 12px; padding: 8px 12px; border: 1px solid var(--border-color, rgba(127,127,127,.3)); border-radius: 8px; display: grid; gap: 4px; font-size: .9rem; }
+.act-integrity { margin: 6px 0 8px; padding: 4px 12px; border: 1px solid var(--border-color, rgba(127,127,127,.3)); border-radius: 8px; display: grid; gap: 4px; font-size: .9rem; }
 .act-integrity[data-state="failed"] { border-color: var(--danger, #c0392b); }
 .act-integrity[data-state="warning"] { border-color: var(--warning, #d68910); }
-.act-integrity-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
-.act-integrity-code { overflow-wrap: anywhere; word-break: break-all; font-size: .8rem; min-width: 0; }
-/* What the list and the band say of archived days (static/js/activity-archive.js). */
-.act-archive-note { margin: 6px 0 10px; overflow-wrap: anywhere; }
+.act-integrity-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.act-integrity-head { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.act-integrity-code { font-size: .8rem; min-width: 0; max-width: 16em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act-integrity-more { min-width: 0; }
+.act-integrity-more > summary { cursor: pointer; }
+.act-integrity-more[open] { flex-basis: 100%; }
+.act-integrity-full { overflow-wrap: anywhere; word-break: break-all; }
 .act-integrity-failure { color: var(--danger, #c0392b); }
 .act-integrity-warning { color: var(--warning, #d68910); }
+/* What the list and the band say of archived days (static/js/activity-archive.js). */
+.act-archive-note { margin: 6px 0 10px; overflow-wrap: anywhere; }
 #activity-section.is-blocked .act-band, #activity-section.is-blocked .act-toolbar,
 #activity-section.is-blocked .act-body, #activity-section.is-blocked .act-live,
 #activity-section.is-blocked .act-head-tools { display: none; }

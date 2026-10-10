@@ -331,7 +331,16 @@ def test_the_band_stays_one_row_in_classic_at_1280_px(page: Page, activity_admin
     }""")
     # One row, Most active's choice wrapped under its title: about 168 px, against 299 for two rows.
     assert at["rows"] == 1 and at["overflow"] == 0 and at["height"] < 190, at
-    assert rows(page).first.bounding_box()["y"] < 450
+    # The integrity strip above the band takes one line (tests/test_ui_activity_integrity_strip.py); the list starts
+    # where it would without it, that line further down.
+    strip = page.evaluate("""() => {
+        const s = document.getElementById('act-integrity');
+        if (!s || s.hidden) return 0;
+        const st = getComputedStyle(s);
+        return s.getBoundingClientRect().height + parseFloat(st.marginTop) + parseFloat(st.marginBottom);
+    }""")
+    assert strip <= 60, strip
+    assert rows(page).first.bounding_box()["y"] < 450 + strip
 
 
 @pytest.mark.parametrize("skin", ["v2", "v1"])
