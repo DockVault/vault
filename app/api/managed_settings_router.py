@@ -241,7 +241,8 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
 
 @router.get("/settings/managed/storage")
 def managed_storage(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
-    """The page's Storage card (app/core/retention_storage.py): reads no row of the audit log."""
+    """The page's Storage card (app/core/retention_storage.py). On Postgres it reads the planner's estimate of the
+    audit rows and counts them only on a table never analysed; the size cap's count comes from the chain's view."""
     limit_statements(db)
     from app.core import config, retention_storage
     return retention_storage.summary(db, setting_changes.utcnow(), config.settings.file_storage_path)
