@@ -5,7 +5,8 @@ GET /activity/events, and a query value can be a secret as well. Every line that
 uvicorn access line, the in-app access line, and a line read back through log access) prints the query's
 parameter names only. A part with no ``=`` may be a value on its own and prints as ``<value>``; a name
 that does not look like one prints as ``<name>``. A line already written with names only is read back as
-it was written: reduced a second time, each name would print as ``<value>``.
+it was written: reduced a second time, each name would print as ``<value>``. The rule holds for every route
+that reads a query, compliance's among them (a person, a vault, a folder or a case in the query).
 """
 import logging
 import pathlib
@@ -209,3 +210,65 @@ def test_the_in_app_line_uses_the_reduced_target():
     assert block.count("_access_target(request.url.path, request.url.query)") == 1
     assert "request.url.query}" not in block and "str(request.url)" not in block
     assert "_redact_log_path(request.url.path)" not in src
+
+
+def _query_parameters(dependant):
+    """The names of the query parameters a route reads, through its dependencies too."""
+    names = [p.alias for p in dependant.query_params]
+    for sub in dependant.dependencies:
+        names += _query_parameters(sub)
+    return names
+
+
+def _routes_that_read_a_query():
+    """(method, path, the names of its query parameters) for every route of the app that reads one."""
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from fastapi.routing import APIRoute, _IncludedRouter
+    from app.api.api_server import app
+
+    def walk(found, prefix):
+        for r in found:
+            if isinstance(r, _IncludedRouter):
+                yield from walk(r.original_router.routes, prefix + r.include_context.prefix)
+            elif isinstance(r, APIRoute):
+                yield prefix + r.path, r
+    out = []
+    for path, route in walk(app.router.routes, ""):
+        names = list(dict.fromkeys(_query_parameters(route.dependant)))
+        if names:
+            out += [(method, path, names) for method in sorted(route.methods)]
+    return out
+
+
+def test_every_route_that_reads_a_query_reaches_each_line_as_names_only():
+    """Every route that reads a query parameter, compliance's among them (whose vaults the vault picker lists, a
+    case's vault and folder, the case on the Activity page): with a value in each parameter, the uvicorn line,
+    the in-app line and a line read back from before the change hold its names and no value."""
+    routes = _routes_that_read_a_query()
+    paths = {path for _, path, _ in routes}
+    assert {"/compliance/vault-picker", "/compliance/cases/{case_id}/tree", "/activity/events"} <= paths, sorted(paths)
+    by_route = {(method, path): names for method, path, names in routes}
+    assert by_route[("GET", "/compliance/vault-picker")] == ["owner"]
+    assert {"vault_id", "folder_id"} <= set(by_route[("GET", "/compliance/cases/{case_id}/tree")])
+    assert "case" in by_route[("GET", "/activity/events")]
+    # The walk sees every route the API description lists with a query parameter (the instrument's check).
+    from app.api.api_server import app
+    described = {(method.upper(), path) for path, ops in app.openapi()["paths"].items() for method, op in ops.items()
+                 if isinstance(op, dict) and any(p.get("in") == "query" for p in op.get("parameters", []))}
+    assert len(described) >= 25 and described <= set(by_route), sorted(described - set(by_route))
+    for method, path, names in routes:
+        values = [f"vq{i}-marker.{len(path)}" for i in range(len(names))]
+        filled = log_redaction.redact_log_path(path.replace("{", "x").replace("}", "x"))
+        query = "&".join(f"{n}={v}" for n, v in zip(names, values))
+        expected = f"{filled}?{'&'.join(names)}"
+        bare = path.replace("{", "x").replace("}", "x")
+        lines = {
+            "uvicorn": _uvicorn_line(f"{bare}?{query}", method),
+            "in-app": access_target(bare, query),
+            "read back": redact_secret_urls_in_text(
+                f'[web] INFO: 172.18.0.1:40112 - "{method} {bare}?{query} HTTP/1.1" 200 OK'),
+        }
+        for kind, line in lines.items():
+            assert "marker" not in line, f"{method} {path}: a value reached the {kind} line: {line}"
+            assert expected in line, f"{method} {path}: the {kind} line does not hold {expected!r}: {line}"
