@@ -494,6 +494,23 @@ def test_an_older_copy_of_a_block_is_left_out_by_its_digest_alone(env):
         assert not shown & {r["id"] for r in af.open_block(copy).rows()}
 
 
+def test_a_value_goes_into_copy_as_copy_reads_it_back():
+    """On Postgres a search loads its rows with COPY's text format: NULL as \\N, and a backslash, tab, line end or
+    carriage return written escaped so that a literal \\N, a JSON escape or a control character reads back as it
+    was; a byte string in bytea's hex form; a time with its microseconds."""
+    from datetime import datetime as dt
+    f = archive._copy_field
+    assert f("text", None) == "\\N" and f("json", None) == "\\N" and f("bytes", None) == "\\N"
+    assert f("text", "\\N") == "\\\\N"
+    assert f("text", "a\tb\nc\rd\\e") == "a\\tb\\nc\\rd\\\\e"
+    assert f("text", "") == ""
+    assert f("bytes", b"\x00\xff\\") == "\\\\x00ff5c"
+    assert f("time", dt(2026, 10, 10, 12, 0, 0, 123456)) == "2026-10-10T12:00:00.123456"
+    assert f("uuid", uuid.UUID(int=1)) == "00000000-0000-0000-0000-000000000001"
+    assert f("int", 7) == "7"
+    assert f("json", '{"a": "x\\ty", "b": "café"}') == '{"a": "x\\\\ty", "b": "café"}'
+
+
 class _Recorded:
     """A stand-in session that records the statements a search's transaction opens with, as on Postgres."""
 

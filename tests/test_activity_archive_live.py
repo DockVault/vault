@@ -505,3 +505,85 @@ out["next_export"] = [sum(1 for line in text_.splitlines() if '"id"' in line), i
     assert got["stalled"][1] is not None, got["stalled"]
     assert got["idle_after"] == 0, got
     assert got["next_export"][0] == got["next_export"][1] > 72, got
+
+
+def test_archived_rows_read_back_identical_in_every_column_on_postgres(throwaway):
+    """A search loads the archived rows with COPY: every column of every row reads back as it was stored before it
+    was archived, the JSON column's stored text included, whatever the text holds (backslashes, tabs, line ends, a
+    literal \\N, quotes, characters outside ASCII), and NULLs stay NULL; a row of an account deleted since loses its
+    link."""
+    got = _script(throwaway, r'''
+from app.core.models import AuditLog
+NAMES = [c.name for c in AuditLog.__table__.columns]
+SPECIALS = ["back\\slash", "tab\there", "new\nline", "carriage\rreturn", "\\N", "\\x41", "quote\"s 'and' `ticks`",
+            "café ☃ \U0001F600", "", "comma, semi; pipe|", "tab\tand \\t written", " spaced "]
+uid = add_user("gone", RoleEnum.USER)
+kept = add_user("kept", RoleEnum.USER)
+db = SessionLocal()
+ids = []
+for i, sv in enumerate(SPECIALS):
+    row = AuditLog(id=uuid.uuid4(), user_id=(uid if i % 3 == 0 else kept if i % 3 == 1 else None), username=sv,
+                   action="file_uploaded", temp_credential_id=uuid.uuid4() if i % 2 else None,
+                   temp_credential_name=sv or None, resource_type="file", resource_id=sv,
+                   timestamp=at(ARCHIVED[1], 3, i) + timedelta(microseconds=123456 + i),
+                   ip_address=("2001:db8::%x" % i) if i % 2 else "203.0.113.%d" % i, user_agent=sv, method="PUT",
+                   endpoint="/api/files/{id}", channel=(None if i % 4 == 0 else "sftp"), status="success",
+                   details=({"s": sv, "nested": {"a": [1, 2.5, None, True], "big": 2 ** 63, "neg": -0.0}}
+                            if i % 5 else None),
+                   error_message=sv if i % 2 == 0 else None, seal_nonce=os.urandom(16) if i % 3 else None,
+                   privacy_version=i if i % 4 else None, recorded=({"names": [sv], "n": i} if i % 2 else None),
+                   ip_via=("trusted-proxy" if i % 2 else None), case_id=uuid.uuid4() if i % 3 == 2 else None)
+    db.add(row)
+    ids.append(row.id)
+db.commit()
+
+
+def norm(v):
+    if isinstance(v, memoryview):
+        v = bytes(v)
+    if isinstance(v, bytes):
+        return "b:" + v.hex()
+    return v
+
+
+def columns(session, entity):
+    out_ = {}
+    for r in session.query(entity).filter(entity.id.in_(ids)).all():
+        out_[str(r.id)] = {n: norm(getattr(r, n)) for n in NAMES}
+    return out_
+
+
+def stored_text(session, table):
+    return {str(i): (d, r) for i, d, r in session.execute(text(
+        f"SELECT id, details::text, recorded::text FROM {table} WHERE id = ANY(:ids)"), {"ids": ids}).all()}
+
+
+before = columns(db, AuditLog)
+before_text = stored_text(db, "audit_logs")
+db.close()
+out["stopped"] = passes()
+out["days"] = archive_all()
+db = SessionLocal()
+db.query(User).filter(User.id == uid).delete()
+db.commit()
+out["still_rows"] = db.query(func.count()).select_from(AuditLog).filter(AuditLog.id.in_(ids)).scalar()
+db.close()
+p = archive.plan(at(ARCHIVED[0], 0), None, st)
+with archive.search(engine, p, st) as s:
+    after = columns(s.db, s.entity)
+    after_text = stored_text(s.db, archive.SEARCH_TABLE)
+    out["unreadable"] = s.unreadable
+for rid, row in before.items():
+    if row["user_id"] is not None and str(row["user_id"]) == str(uid):
+        row["user_id"] = None
+out["rows"] = [len(before), len(after)]
+out["differ"] = {rid: {n: [row[n], after.get(rid, {}).get(n)] for n in NAMES if row[n] != after.get(rid, {}).get(n)}
+                 for rid, row in before.items() if row != after.get(rid)}
+out["text_differ"] = {rid: [t, after_text.get(rid)] for rid, t in before_text.items() if after_text.get(rid) != t}
+out["specials_seen"] = sorted(r["username"] for r in after.values()) == sorted(SPECIALS)
+''')
+    assert got["stopped"] is None and len(got["days"]) == 1, got
+    assert got["still_rows"] == 0 and got["unreadable"] == {}, got
+    assert got["rows"] == [12, 12], got
+    assert got["differ"] == {} and got["text_differ"] == {}, got
+    assert got["specials_seen"], got

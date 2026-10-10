@@ -192,31 +192,63 @@ def _entity(table):
     return aliased(AuditLog, rows, adapt_on_names=True)
 
 
+# Backslash, tab, newline and carriage return, as COPY's text format writes them inside a value.
+_COPY_ESCAPES = str.maketrans({"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r"})
+
+
+def _copy_field(kind: str, value) -> str:
+    """One value in COPY's text format: NULL as \\N, a byte string in bytea's hex form, a time in ISO form, the
+    rest as their text (a JSON column's stored text as it is); backslash, tab, newline and carriage return
+    escaped, so that COPY reads back exactly the value."""
+    if value is None:
+        return "\\N"
+    if kind == "bytes":
+        out = "\\x" + bytes(value).hex()
+    elif kind == "time":
+        out = value.isoformat()
+    else:
+        out = str(value)
+    return out.translate(_COPY_ESCAPES)
+
+
 def _insert(db, table, rows: List[dict]) -> None:
     """Insert archived rows into the search's table as they were stored (JSON columns from their stored text); a row
     whose account was deleted since it was archived has its link cleared, as the deletion cleared the rows still in
-    audit_logs."""
+    audit_logs. On Postgres with COPY, which is several times quicker than an insert of the same rows: most of a
+    search's time went into the insert."""
     from app.core import audit_archive_format as af
     from app.core import audit_chain_format as fmt
     from app.core.models import User
     users = {fmt.as_uuid(row["user_id"]) for row in rows if row.get("user_id") is not None}
     present = {fmt.as_uuid(u) for (u,) in db.query(User.id).filter(User.id.in_(list(users))).all()} if users else set()
-    pg = _is_pg(db)
+
+    def value(row, name):
+        if name == "user_id" and row.get(name) is not None and fmt.as_uuid(row[name]) not in present:
+            return None
+        return row.get(name)
+
+    if _is_pg(db):
+        import io
+        buf = io.StringIO()
+        for row in rows:
+            buf.write("\t".join(_copy_field(kind, value(row, name)) for name, kind in af.COLUMNS) + "\n")
+        buf.seek(0)
+        columns = ", ".join(f'"{name}"' for name in af.NAMES)
+        cursor = db.connection().connection.cursor()
+        try:
+            cursor.copy_expert(f"COPY {SEARCH_TABLE} ({columns}) FROM STDIN", buf)
+        finally:
+            cursor.close()
+        return
     values = {}
     for name, kind in af.COLUMNS:
         column = table.c[name]
         if kind == "json":
-            bound = sa.type_coerce(sa.bindparam("v_" + name), sa.Text)
-            values[name] = sa.cast(bound, column.type) if pg else bound
+            values[name] = sa.type_coerce(sa.bindparam("v_" + name), sa.Text)
         else:
             values[name] = sa.bindparam("v_" + name, type_=column.type)
-    batch = []
-    for row in rows:
-        v = {"v_" + name: row.get(name) for name in af.NAMES}
-        if row.get("user_id") is not None and fmt.as_uuid(row["user_id"]) not in present:
-            v["v_user_id"] = None
-        batch.append(v)
-    db.execute(sa.insert(table).values(values), batch)
+    db.execute(sa.insert(table).values(values), [{"v_" + name: value(row, name) for name in af.NAMES}
+                                                 for row in rows])
 
 
 def _hot_rows_between(db, start: datetime, end: datetime) -> int:
