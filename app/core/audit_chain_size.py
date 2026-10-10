@@ -19,6 +19,12 @@ first), unless the host has acknowledged its seal and both the time the server f
 sealed_at lie at or before the window's start. So it never raises what the hour counts before the host has
 seen it and a delay of sealing has passed.
 
+Each entry also binds the bytes of its hour's administration and security rows, which the size cap never deletes
+(``protected_bytes``). The share of an hour or a part the cap may never delete is taken from the rows (an archived
+part's aggregates), but never above those bytes counted the same way (protected_hours): a database writer who adds
+a protected row to an old hour, or edits an archived part's aggregates, can lower a share, which keeps more, but
+cannot raise one and so make the cap delete newer rows sooner.
+
 An archived part (app/core/audit_archive.py) counts the smaller of its bound length, the one its day's archive
 seal records, and the lagged bytes of the hours it holds: archiving shrinks what the cap counts, never adds to it,
 and a length another writer inflated changes nothing. Its hours then count only through it. A day archived over
@@ -141,6 +147,22 @@ def counted(view, start_us: int, held: Set[int]) -> Tuple[Dict[datetime, int], L
         parts.append((day, part, min(int(part.length), sum(hours.values())), hours))
     hot = {h: n for h, n in lagged_hours.items() if h not in archived}
     return hot, parts
+
+
+def protected_hours(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:
+    """{hour: lagged protected bytes} of every hour with a unit of its own whose rows the size cap never deletes
+    count more than nothing, archived or not: the protected bytes its root entries record, counted as the hour's
+    bytes are (a held-back entry no more than the entry before it, the least over the window). The cap's protected
+    share of an hour never exceeds it, so rows added in the database, or an archived part's aggregates edited
+    there, can only lower a share (which keeps more), never raise it."""
+    out = {}
+    for start, end, last in view.units():
+        if end - start != _ai().HOUR:
+            continue
+        n = lagged(counted_entries(view.entry_chain(last, protected=True), held), start_us)
+        if n:
+            out[start] = n
+    return out
 
 
 def hour_bytes(view, start_us: int, held: Set[int]) -> Dict[datetime, int]:

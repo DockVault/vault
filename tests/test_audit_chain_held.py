@@ -47,7 +47,7 @@ def _foreign_late(env, hour, added):
         fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt)
     prev = env.st.view.entry_for(hour).root.seq
     return _forge(env, "late", {"hour": fmt.hour_text(hour), "prev_seq": prev, "added": [str(a) for a in added],
-                                "by": "sealer"},
+                                "by": "sealer", "protected_bytes": 0},
                   period_start=hour, period_end=hour + ai.HOUR, row_count=fig.count, row_bytes=fig.bytes,
                   root_s=fig.root_s, root_c=fig.root_c, ids_digest=fig.ids_digest)
 

@@ -987,14 +987,28 @@ def test_the_size_cap_never_deletes_the_archived_rows_it_protects_and_counts_the
 
 def test_part_units_spread_a_parts_count_and_protected_share_over_its_hours():
     part = ArchivePart(1, at(3), at(6), 9, 1000, "ab" * 32)
+    lagged = {at(3): 400, at(4): 400, at(6): 400}
     figures = arc.PartFigures(rows=(3, 3, 0, 3), stored=(300, 300, 0, 300), protected_rows=3, protected_stored=300)
-    units = arc.part_units(part, 900, {at(3): 400, at(4): 400, at(6): 400}, figures, T0, 0)
+    # The chain binds the protected bytes of hour 3 only: its spread is protected, the other hours' are not.
+    units = arc.part_units(part, 900, lagged, {at(3): 400}, figures, T0, 0)
     assert [u[0] for u in units] == [at(3), at(4), at(6)]
-    assert sum(u[1] for u in units) == 900 and sum(u[2] for u in units) == 300
+    assert [u[1] for u in units] == [300, 300, 300] and [u[2] for u in units] == [300, 0, 0]
+    # Half an hour's bytes bound as protected: half its spread.
+    assert [u[2] for u in arc.part_units(part, 900, lagged, {at(4): 200}, figures, T0, 0)] == [0, 150, 0]
+    # A bound above the hour's bytes counts the whole hour, never more.
+    assert [u[2] for u in arc.part_units(part, 900, lagged, {at(6): 10 ** 9}, figures, T0, 0)] == [0, 0, 300]
+    # Aggregates that say more never raise a share; aggregates that say less lower it, from the oldest hour on.
+    more = arc.PartFigures(rows=(3, 3, 0, 3), stored=(300, 300, 0, 300), protected_rows=9, protected_stored=900)
+    assert [u[2] for u in arc.part_units(part, 900, lagged, {at(3): 400}, more, T0, 0)] == [300, 0, 0]
+    less = arc.PartFigures(rows=(3, 3, 0, 3), stored=(300, 300, 0, 300), protected_rows=1, protected_stored=100)
+    both = {at(3): 400, at(6): 400}
+    assert [u[2] for u in arc.part_units(part, 900, lagged, both, less, T0, 0)] == [0, 0, 100]
+    assert [u[2] for u in arc.part_units(part, 900, lagged, both, None, T0, 0)] == [0, 0, 0]
+    # Every hour younger than the minimum for every row: the whole part, whatever the chain binds.
+    young = arc.part_units(part, 900, lagged, {}, figures, at(6) + timedelta(days=5), 30)
+    assert sum(u[2] for u in young) == 900
     assert all(0 <= u[2] <= u[1] for u in units)
-    young = arc.part_units(part, 900, {at(3): 400, at(4): 400, at(6): 400}, figures, at(6) + timedelta(days=5), 30)
-    assert sum(u[2] for u in young) == 900                    # every hour younger than the minimum
-    assert arc.part_units(part, 0, {at(3): 1}, figures, T0, 0) == []
+    assert arc.part_units(part, 0, {at(3): 1}, {}, figures, T0, 0) == []
 
 
 def test_the_preview_counts_the_archived_rows_a_change_would_delete(env):
@@ -1362,3 +1376,109 @@ def test_the_protected_share_never_exceeds_the_parts_count_whatever_its_aggregat
     young = arc.PartFigures(rows=(1, 1), stored=(50, 50), protected_rows=0, protected_stored=0)
     assert arc.protected_share(part, 70, young, at(3) + timedelta(days=1), 30) == 70
     assert arc.protected_share(part, 70, None, T0, 0) == 0
+
+
+# --------------------------------------------------------------------------- what a database writer cannot make the cap do
+
+def _ids_in_blocks(env, day):
+    out = []
+    for blk in _blocks(env):
+        if blk.day == day:
+            out += [r["id"] for r in af.open_block(blk.payload).rows()]
+    return out
+
+
+def _say_every_row_is_protected(env, day):
+    """What a database writer without the key can do: edit the aggregates of ``day``'s block to say every row of
+    it is of an action the size cap never deletes."""
+    protected = ar.protected_actions()[0]
+    with env.session() as db:
+        blk = db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == day).one()
+        aggregates = dict(blk.aggregates)
+        aggregates["by"] = [[protected] + list(row[1:]) for row in aggregates["by"]]
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == day).update(
+            {AuditArchiveBlock.aggregates: aggregates}, synchronize_session=False)
+        db.commit()
+
+
+@pytest.mark.parametrize("edited", [False, True])
+def test_aggregates_edited_in_the_database_never_make_the_size_cap_delete_a_newer_archived_row(env, monkeypatch,
+                                                                                                 edited):
+    """Two archived days of one row each, and a cap with room for the newer day only. Aggregates edited to say the
+    older day's row is protected would raise that part's protected share, move the cutoff a day newer and delete
+    the newer day's row under a prune verify finds justified: a part's share never exceeds what the chain binds of
+    its hours, so the edit can only lower it."""
+    _capped(env, monkeypatch)
+    newer = DAY + timedelta(days=1)
+    older = env.row(at(3), details=_blob(15000))
+    kept = env.row(at(3, day=newer), details=_blob(15000))
+    env.run_until_sealed()
+    _archive(env)
+    assert len(_blocks(env)) == 2
+    _seal_days(env, 8)
+    _hot, ((_d1, _p1, older_count, _h1), (_d2, _p2, newer_count, _h2)) = _counted(env)
+    cap = newer_count + 1000
+    assert cap < older_count + newer_count
+    if edited:
+        _say_every_row_is_protected(env, DAY)
+    ar.prune(_pass(env), _numbers(max_days=0, max_mb=cap))
+    assert _ids_in_blocks(env, newer) == [kept]
+    # Honest, the cap takes the older day's row; edited, that block no longer gives its rows and stays as it is.
+    assert _ids_in_blocks(env, DAY) == ([older] if edited else [])
+    assert ("block-altered" in failures(env.verify())) is edited
+
+
+@pytest.mark.parametrize("added", [False, True])
+def test_a_protected_row_added_to_an_old_hour_never_makes_the_size_cap_delete_a_newer_row(env, monkeypatch, added):
+    """The same over rows not archived: a row of a protected action written into an older sealed hour in the
+    database would raise that hour's protected share and delete the newer hour's row. The share never exceeds the
+    protected bytes the chain binds for the hour."""
+    _capped(env, monkeypatch)
+    d = (T0 - timedelta(days=20)).date()
+    older = env.row(at(3, day=d), details=_blob(15000))
+    newer = env.row(at(9, day=d), details=_blob(15000))
+    env.run_until_sealed()
+    _seal_days(env, 8)
+    hot, _parts = _counted(env)
+    cap = hot[at(9, day=d)] + 1000
+    assert cap < hot[at(3, day=d)] + hot[at(9, day=d)]
+    if added:
+        env.row(at(3, 30, day=d), action=ar.protected_actions()[0], details=_blob(15000))
+    ar.prune(_pass(env), _numbers(max_days=0, max_mb=cap))
+    with env.session() as db:
+        left = {r[0] for r in db.query(AuditLog.id).filter(AuditLog.id.in_([older, newer])).all()}
+    # Honest, the cap takes the older hour's row; with a row added, that hour no longer gives its seal and stays.
+    assert left == ({older, newer} if added else {newer})
+    assert ("rows-added" in failures(env.verify())) is added
+
+
+def test_the_chain_binds_each_hours_protected_bytes_and_an_archived_parts_share_comes_from_them(env):
+    protected = ar.protected_actions()[0]
+    admin = env.row(at(3), action=protected, details=_blob(4000))
+    env.row(at(3, 5), details=_blob(4000))
+    env.row(at(4), details=_blob(4000))
+    env.run_until_sealed()
+    hour3 = next(s for s in env.seals() if s.kind == "hour" and s.period_start == at(3))
+    hour4 = next(s for s in env.seals() if s.kind == "hour" and s.period_start == at(4))
+    with env.session() as db:
+        admin_bytes = db.query(ar._row_bytes(AuditLog, "sqlite")).filter(AuditLog.id == admin).scalar()
+    assert hour3.detail["protected_bytes"] == admin_bytes and 0 < admin_bytes < hour3.row_bytes
+    assert hour4.detail["protected_bytes"] == 0
+    _archive(env)
+    _seal_days(env, 8)
+    st = env.st
+    start = chain_size.window_start(st.view, st.known_record(), env.clock(), timedelta(days=7))
+    bound = chain_size.protected_hours(st.view, start, chain_size.held_back(st.view, st.known_record(), start))
+    assert bound.get(at(3)) == admin_bytes and at(4) not in bound
+    _hot, ((_d, part, count, lagged),) = _counted(env)
+    with env.session() as db:
+        figures = arc.part_figures(db, st.view)[(DAY, part.part)]
+    units = arc.part_units(part, count, lagged, bound, figures, env.clock(), 0)
+    share3 = next(u for u in units if u[0] == at(3))
+    assert sum(u[2] for u in units) == share3[2] == share3[1] * admin_bytes // lagged[at(3)] > 0
+    # A prune that keeps the protected row records the hour's protected bytes beside its bytes.
+    ar.prune(_pass(env), _numbers(max_days=95, admin_min=365))
+    prune = [s for s in env.seals() if s.kind == "prune"][-1]
+    entry = next(h for h in prune.detail["hours"] if h[0] == fmt.hour_text(at(3)))
+    assert entry[7] == admin_bytes == entry[3]
+    assert _ids_in_blocks(env, DAY) == [admin] and failures(env.verify()) == []

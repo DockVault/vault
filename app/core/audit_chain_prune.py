@@ -173,8 +173,7 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None,
                 fig = ai.hour_figures(ai.iter_rows(w.db, hour, hour + ai.HOUR), None)
                 if wr is not None:
                     wr.row_ids = fig.ids
-                entries.append([fmt.hour_text(hour), root.seq, fig.count, fig.bytes, fig.root_s.hex(),
-                                fig.root_c.hex(), fig.ids_digest.hex()])
+                entries.append(ai.hour_entry(hour, root.seq, fig))
                 batch.add(len(gone), min(times) if times else None, max(times) if times else None)
             if not entries:
                 w.db.rollback()

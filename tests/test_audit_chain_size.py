@@ -146,8 +146,9 @@ def test_a_late_row_in_an_empty_hour_of_the_backlogs_run_counts_nothing_before_t
     assert _kept(env, genuine) == set()                   # oldest first, once the delay has run
 
 
-def _inflate(env, hour, nbytes):
-    """Another writer's prune seal for ``hour`` that keeps its roots and records ``nbytes``."""
+def _inflate(env, hour, nbytes, protected=0):
+    """Another writer's prune seal for ``hour`` that keeps its roots and records ``nbytes`` (``protected`` of them
+    protected)."""
     with env.session() as db:
         root = ai.hour_root(db, env.st.view, hour)
         newest = db.query(AuditSeal).filter(AuditSeal.kind == "policy").order_by(AuditSeal.seq.desc()).first()
@@ -161,7 +162,7 @@ def _inflate(env, hour, nbytes):
             break
     return _forge(env, "prune", {"reason": "retention", "policy_seq": newest.seq, "request_seq": None,
                                  "hours": [[fmt.hour_text(hour), prev_seq, root.count, nbytes, root.root_s.hex(),
-                                            root.root_c.hex(), root.ids_digest.hex()]]})
+                                            root.root_c.hex(), root.ids_digest.hex(), protected]]})
 
 
 def test_another_writers_inflated_bytes_are_held_back_and_a_size_cap_prune_lists_them(env):
@@ -258,7 +259,7 @@ def _size_cap_prune(env, **changed):
     return _append(env, "prune", {"reason": "size-cap", "policy_seq": newest[0], "request_seq": None,
                                   "size": figures, "hours": [[fmt.hour_text(hour), root.seq, root.count, root.bytes,
                                                               root.root_s.hex(), root.root_c.hex(),
-                                                              root.ids_digest.hex()]]})
+                                                              root.ids_digest.hex(), 0]]})
 
 
 def _shorter_delay(env, _counted):
@@ -334,3 +335,109 @@ def test_the_servers_window_takes_in_a_stop_another_writers_seals_hid(env):
     servers = from_us(size.window_start(view, record, now, timedelta(days=7)))
     assert chain_only > stop_start
     assert servers <= stop_start
+
+
+# --------------------------------------------------------------------------- the protected bytes the chain binds
+
+def _protected(env, hour, days=7):
+    """What the size cap's protected share of ``hour`` may come to at most now: its lagged protected bytes."""
+    st = env.st
+    start = size.window_start(st.view, st.known_record(), env.clock(), timedelta(days=days))
+    return size.protected_hours(st.view, start, size.held_back(st.view, st.known_record(), start)).get(hour, 0)
+
+
+def test_protected_rows_the_host_seals_into_an_old_hour_count_only_once_a_delay_of_sealing_has_run(env):
+    """A protected row written into an old hour, and sealed there by the host's acknowledgment, raises the hour's
+    bound like any growth: only once a delay of sealing has passed after the seal that took it in."""
+    from app.core import audit_chain_host as host
+    from app.core.audit_retention import protected_actions
+    target = T0 - timedelta(days=20)
+    _big(env, target, 100)
+    env.run_until_sealed()
+    _seal_to(env, T0 + timedelta(days=8))
+    hour = ai.hour_floor(target)
+    assert _protected(env, hour) == 0
+    env.row(hour + timedelta(minutes=30), action=protected_actions()[0], details={"blob": "y" * (50 * KB)})
+    seen = host.seal_late_rows(env.engine, env.st, hour, read=True)
+    host.seal_late_rows(env.engine, env.st, hour, expect=seen["state"])
+    late = [s for s in env.seals() if s.kind == "late"][-1]
+    assert late.detail["protected_bytes"] > 50 * KB
+    assert _protected(env, hour) == 0
+    _seal_to(env, env.clock() + timedelta(days=6))
+    assert _protected(env, hour) == 0
+    _seal_to(env, env.clock() + timedelta(days=2))
+    assert _protected(env, hour) == late.detail["protected_bytes"]
+
+
+def test_another_writers_protected_bytes_are_held_back_like_its_bytes(env):
+    """Another writer's prune seal that records an hour's bytes as protected counts, unacknowledged, no more than
+    the hour's entry before it, however long ago it was sealed."""
+    target = T0 - timedelta(days=20)
+    _big(env, target, 100)
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    hour = ai.hour_floor(target)
+    nbytes = env.st.view.entry_for(hour).root.bytes
+    forged = _inflate(env, hour, nbytes, protected=nbytes)
+    retention.run_pass(env.session, now=env.clock())          # accepted as a warning
+    _seal_to(env, env.clock() + timedelta(days=9))
+    assert forged in ai.unacknowledged_foreign(env.st.view, env.st.known_record())
+    assert _protected(env, hour) == 0
+    # Acknowledged by the host, it counts once a window starts after its acceptance.
+    accepted = env.clock()
+    _ack_by_host(env, [forged])
+    _seal_to(env, accepted + timedelta(days=7, hours=6))
+    assert _protected(env, hour) == nbytes
+
+
+def test_the_view_keeps_an_entrys_protected_bytes_no_larger_than_its_bytes():
+    from types import SimpleNamespace
+    view = ai.View()
+    hour = ai.hour_floor(T0)
+    for seq, figure in enumerate((10 ** 6, 40, True, "40", -5, None), 1):
+        start = hour + (seq - 1) * ai.HOUR
+        detail = {} if figure is None else {"protected_bytes": figure}
+        view.accept(SimpleNamespace(seq=seq, kind="hour", period_start=start, period_end=start + ai.HOUR,
+                                    row_count=1, row_bytes=100, root_s=b"", root_c=b"", ids_digest=b"",
+                                    detail=detail, sealed_at=T0, key_id="k"), b"\0" * 32)
+    got = [view.entry_chain(last, protected=True)[0][2] for _s, _e, last in view.units()]
+    assert got == [100, 40, 0, 0, 0, 0]
+    assert [view.entry_chain(last)[0][2] for _s, _e, last in view.units()] == [100] * 6
+
+
+@pytest.mark.parametrize("kind,row_bytes,detail,bad", [
+    ("hour", 100, {"protected_bytes": 40}, False),
+    ("hour", 100, {"protected_bytes": 100}, False),
+    ("hour", 0, {"protected_bytes": 0}, False),
+    ("hour", 100, {}, True),
+    ("hour", 100, {"protected_bytes": 101}, True),
+    ("hour", 100, {"protected_bytes": -1}, True),
+    ("hour", 100, {"protected_bytes": True}, True),
+    ("hour", 100, {"protected_bytes": 4.0}, True),
+    ("late", 100, {"hour": "x", "protected_bytes": 7}, False),
+    ("late", 100, {"hour": "x"}, True),
+    ("prune", 0, {"hours": [["h", 1, 1, 50, "", "", "", 50]]}, False),
+    ("prune", 0, {"hours": [["h", 1, 1, 50, "", "", ""]]}, True),
+    ("prune", 0, {"hours": [["h", 1, 1, 50, "", "", "", 51]]}, True),
+    ("rewrite", 0, {"hours": [["h", 1, 1, 50, "", "", "", 0], ["h", 1, 1, "x", "", "", "", 0]]}, True),
+    ("rewrite", 0, {"hours": [["h", 1, 1, 50, "", "", "", 0, 0]]}, True),
+    ("archive", 0, {}, False),
+])
+def test_verify_requires_each_hours_protected_bytes_from_0_to_its_bytes(kind, row_bytes, detail, bad):
+    from types import SimpleNamespace
+    from app.core import audit_chain_verify as v
+    problem = v.protected_problem(SimpleNamespace(kind=kind, row_bytes=row_bytes, detail=detail))
+    assert (problem is not None) is bad, problem
+
+
+def test_a_prune_seal_whose_hour_has_no_protected_bytes_is_unjustified(env):
+    env.row(T0 - timedelta(days=20))
+    env.run_until_sealed()
+    hour = ai.hour_floor(T0 - timedelta(days=20))
+    with env.session() as db:
+        root = ai.hour_root(db, env.st.view, hour)
+    newest = env.st.view.newest_policy()
+    _append(env, "prune", {"reason": "retention", "policy_seq": newest[0], "request_seq": None,
+                           "hours": [[fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(),
+                                      root.root_c.hex(), root.ids_digest.hex()]]})
+    assert any("no protected bytes" in m for m in _why(_off(env)))

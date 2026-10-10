@@ -1156,6 +1156,21 @@ class HourFigures:
     nonceless: int = 0
     missing_nonce: List = field(default_factory=list)
     unwritable: List = field(default_factory=list)
+    # The stored bytes of the rows of the actions the size cap never deletes (administration and security): the
+    # chain binds it beside ``bytes`` (``protected_bytes``), and the cap's protected share never exceeds it.
+    protected: int = 0
+
+
+_protected_names: Optional[frozenset] = None
+
+
+def protected_names() -> frozenset:
+    """The stored action names whose rows the size cap never deletes (app/core/audit_retention.py)."""
+    global _protected_names
+    if _protected_names is None:
+        from app.core.audit_retention import protected_actions
+        _protected_names = frozenset(protected_actions())
+    return _protected_names
 
 
 def row_nonce(row: dict, salt: Optional[bytes]) -> Optional[bytes]:
@@ -1173,6 +1188,7 @@ class FiguresBuilder:
     def __init__(self, salt: Optional[bytes] = None, c_prev: Optional[Dict] = None, exclude: Optional[set] = None):
         self.salt, self.c_prev, self.exclude = salt, c_prev, exclude
         self.out = HourFigures()
+        self._protected = protected_names()
         self._ts, self._tc = fmt.TreeBuilder(), fmt.TreeBuilder()
         self._ids = bytearray()
 
@@ -1182,6 +1198,8 @@ class FiguresBuilder:
         out = self.out
         out.count += 1
         out.bytes += row.get("_bytes", 0)
+        if row.get("action") in self._protected:
+            out.protected += row.get("_bytes", 0)
         rid = row["id"]
         if self.c_prev and rid in self.c_prev:
             c = self.c_prev[rid]
@@ -1206,6 +1224,13 @@ class FiguresBuilder:
         out.ids = bytes(self._ids)
         out.ids_digest = fmt.ids_digest_of_blob(out.ids)
         return out
+
+
+def hour_entry(hour: datetime, root_seq: int, fig: HourFigures) -> list:
+    """An hour's entry in a ``prune`` or ``rewrite`` seal: [hour, the root seal it follows, count, bytes, root_s,
+    root_c, ids digest, protected bytes]."""
+    return [fmt.hour_text(hour), root_seq, fig.count, fig.bytes, fig.root_s.hex(), fig.root_c.hex(),
+            fig.ids_digest.hex(), fig.protected]
 
 
 def hour_figures(rows, salt: Optional[bytes] = None, c_prev: Optional[Dict] = None,
@@ -1407,6 +1432,7 @@ def seal_hour(w: ChainWriter, start: datetime, now: datetime, open_since: Option
         if open_since is not None and open_since < end:
             open_mark = open_since
         detail = {"open_since": fmt.time_text(open_mark)} if open_mark else {}
+        detail["protected_bytes"] = 0
         return w.append("hour", period_start=start, period_end=end, row_count=0, row_bytes=0,
                         root_s=fmt.EMPTY_ROOT, root_c=fmt.EMPTY_ROOT, ids_dig=fmt.ids_digest([]), detail=detail,
                         row_ids=b"" if end - start == HOUR else None)
@@ -1415,6 +1441,7 @@ def seal_hour(w: ChainWriter, start: datetime, now: datetime, open_since: Option
     fig = hour_figures(iter_rows(db, start, start + HOUR), salt)
     salt = salt if fig.nonceless else None
     detail = {"open_since": fmt.time_text(open_mark)} if open_mark else {}
+    detail["protected_bytes"] = fig.protected
     return w.append("hour", period_start=start, period_end=start + HOUR, row_count=fig.count, row_bytes=fig.bytes,
                     root_s=fig.root_s, root_c=fig.root_c, ids_dig=fig.ids_digest, detail=detail, row_ids=fig.ids,
                     legacy_salt=salt)
@@ -1456,7 +1483,8 @@ def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) 
     # The new roots are over the rows as they are now, erased ones included: the late seal ends the hour's erase
     # entries, so the next check compares the rows with it alone.
     after = hour_figures(iter_rows(db, hour, hour + HOUR), use_salt)
-    detail = {"hour": fmt.hour_text(hour), "prev_seq": root.seq, "added": [str(a) for a in added], "by": "sealer"}
+    detail = {"hour": fmt.hour_text(hour), "prev_seq": root.seq, "added": [str(a) for a in added], "by": "sealer",
+              "protected_bytes": after.protected}
     seal = w.append("late", period_start=hour, period_end=hour + HOUR, row_count=after.count, row_bytes=after.bytes,
                     root_s=after.root_s, root_c=after.root_c, ids_dig=after.ids_digest, detail=detail,
                     row_ids=after.ids if wr is None else None, legacy_salt=new_salt if wr is None else None)

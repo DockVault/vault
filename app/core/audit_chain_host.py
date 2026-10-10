@@ -382,7 +382,8 @@ def seal_late_rows(engine, st, hour: datetime, *, expect: Optional[str] = None, 
         seal = w.append("late", period_start=hour, period_end=hour + ai.HOUR, row_count=after.count,
                         row_bytes=after.bytes, root_s=after.root_s, root_c=after.root_c, ids_dig=after.ids_digest,
                         detail={"hour": fmt.hour_text(hour), "prev_seq": plan["root"].seq,
-                                "added": [str(a) for a in plan["added"]], "by": "host"},
+                                "added": [str(a) for a in plan["added"]], "by": "host",
+                                "protected_bytes": after.protected},
                         row_ids=after.ids if wr is None else None,
                         legacy_salt=plan["new_salt"] if wr is None else None)
         seal.salt = use_salt

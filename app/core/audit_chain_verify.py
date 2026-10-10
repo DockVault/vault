@@ -296,9 +296,36 @@ def request_problem(view, seal) -> Optional[str]:
     return None
 
 
+def _not_a_share(value, nbytes) -> bool:
+    try:
+        most = int(nbytes)
+    except (TypeError, ValueError):
+        return True
+    return isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= most
+
+
+def protected_problem(seal) -> Optional[str]:
+    """Each hour an hour, late, prune or rewrite seal sets binds its protected bytes (the stored bytes of its rows
+    of the actions the size cap never deletes), a whole number from 0 to the hour's bytes. It is a bound, never
+    compared with the rows: which actions are protected can change between releases, and a figure below the rows'
+    only makes the cap keep more."""
+    d = seal.detail if isinstance(seal.detail, dict) else {}
+    if seal.kind in ("hour", "late"):
+        if _not_a_share(d.get("protected_bytes"), seal.row_bytes):
+            return f"a {seal.kind} seal whose protected bytes are not a figure from 0 to its bytes"
+    elif seal.kind in ("prune", "rewrite"):
+        for h in d.get("hours") or []:
+            if not isinstance(h, list) or len(h) != 8 or _not_a_share(h[7], h[3]):
+                return f"a {seal.kind} seal whose hour has no protected bytes from 0 to its bytes"
+    return None
+
+
 def other_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
     """Step 4 for the kinds other than policy and request. ``record``: the head record, on the server."""
     d = seal.detail if isinstance(seal.detail, dict) else {}
+    problem = protected_problem(seal)
+    if problem:
+        return problem
     if seal.kind == "cancel":
         if d.get("cancels") not in view.pending_requests():
             return "a cancel of a request that is not pending"

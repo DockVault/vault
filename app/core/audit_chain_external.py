@@ -165,8 +165,7 @@ def acknowledge_removed_before(engine, st, before: datetime, *, retention_days: 
                 prune_rows._materialise(w, h, s["salt"], s["wr"])
                 if s["wr"] is not None:
                     s["wr"].row_ids = fig.ids
-                entries.append([fmt.hour_text(h), s["root"].seq, fig.count, fig.bytes, fig.root_s.hex(),
-                                fig.root_c.hex(), fig.ids_digest.hex()])
+                entries.append(ai.hour_entry(h, s["root"].seq, fig))
             host_audit_row(w.db, ACTION, {"day": day.isoformat(), "hours": len(entries), "cutoff": cutoff["hour"],
                                           "retention_days": retention_days})
             seal = w.append("prune", detail={"reason": "external", "policy_seq": None, "request_seq": None,

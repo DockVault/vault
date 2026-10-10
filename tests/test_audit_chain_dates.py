@@ -246,7 +246,7 @@ def _forge_hours_across(env, until, step=11):
         end = ai.hour_floor(env.clock()) - ai.HOUR
         if end <= start:
             continue
-        _forge(env, "hour", {}, period_start=start, period_end=end, root_s=fmt.EMPTY_ROOT, root_c=fmt.EMPTY_ROOT,
+        _forge(env, "hour", {"protected_bytes": 0}, period_start=start, period_end=end, root_s=fmt.EMPTY_ROOT, root_c=fmt.EMPTY_ROOT,
                ids_digest=fmt.ids_digest([]))
 
 

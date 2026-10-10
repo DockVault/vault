@@ -59,6 +59,14 @@ def _clip(n) -> int:
     return max(0, min(n, INT64_MAX))
 
 
+def _protected(value, nbytes) -> int:
+    """An entry's protected bytes as the view keeps them: never more than its bytes, and 0 when the seal gives no
+    figure the checks would accept (they report it): a smaller figure only makes the size cap keep more."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return min(_clip(value), _clip(nbytes))
+
+
 def _b(v) -> Optional[bytes]:
     return bytes(v) if v is not None else None
 
@@ -200,6 +208,7 @@ class View:
         self._e_at = array("q")
         self._e_bytes = array("q")
         self._e_count = array("q")
+        self._e_prot = array("q")
         self._e_prev = array("i")
         self._e_kind = bytearray()
         self._e_roots = bytearray()
@@ -373,21 +382,25 @@ class View:
                                      if self._u_end[i] - self._u_start[i] == 1 else []))
         return out
 
-    def entry_chain(self, last: int) -> List[tuple]:
-        """(seq, sealed_at in microseconds, bytes) of a unit's root entries, oldest first."""
+    def entry_chain(self, last: int, protected: bool = False) -> List[tuple]:
+        """(seq, sealed_at in microseconds, bytes) of a unit's root entries, oldest first; with ``protected``, the
+        bytes of the rows the size cap never deletes in place of the bytes."""
+        figures = self._e_prot if protected else self._e_bytes
         out = []
         e = last
         while e >= 0:
-            out.append((self._e_seq[e], self._e_at[e], self._e_bytes[e]))
+            out.append((self._e_seq[e], self._e_at[e], figures[e]))
             e = self._e_prev[e]
         out.reverse()
         return out
 
-    def _new_entry(self, seq: int, at_us: int, count, nbytes, kind: str, prev: int, roots=None) -> int:
+    def _new_entry(self, seq: int, at_us: int, count, nbytes, kind: str, prev: int, roots=None,
+                   protected=0) -> int:
         self._e_seq.append(seq)
         self._e_at.append(at_us)
         self._e_bytes.append(_clip(nbytes))
         self._e_count.append(_clip(count))
+        self._e_prot.append(_protected(protected, nbytes))
         self._e_prev.append(prev)
         self._e_kind.append(_CODE.get(kind, _UNKNOWN))
         if self.keep_roots:
@@ -434,9 +447,9 @@ class View:
             at += 1
         return i + (1 if start < h else 0)
 
-    def _add_root(self, hour: datetime, seq: int, at_us: int, count, nbytes, kind: str, roots) -> None:
+    def _add_root(self, hour: datetime, seq: int, at_us: int, count, nbytes, kind: str, roots, protected=0) -> None:
         i = self._split_out(hour)
-        self._u_last[i] = self._new_entry(seq, at_us, count, nbytes, kind, self._u_last[i], roots)
+        self._u_last[i] = self._new_entry(seq, at_us, count, nbytes, kind, self._u_last[i], roots, protected)
         self._erases.pop(to_hours(hour), None)
 
     # -- accepting a seal
@@ -463,14 +476,16 @@ class View:
         elif kind == "hour":
             start, end = to_hours(seal.period_start), to_hours(seal.period_end)
             roots = (seal.root_s, seal.root_c, seal.ids_digest)
+            protected = d.get("protected_bytes") if end - start == 1 else 0
             j = bisect.bisect_right(self._u_start, start)
             if j > 0 and self._u_end[j - 1] > start or j < len(self._u_start) and self._u_start[j] < end:
                 # An hour seal over hours already in the index (only a seal the checks refuse can be one): it
                 # becomes the newest root entry of each hour it covers, as a late seal would.
                 for h in range(start, end):
-                    self._add_root(from_hours(h), seal.seq, at_us, seal.row_count, seal.row_bytes, kind, roots)
+                    self._add_root(from_hours(h), seal.seq, at_us, seal.row_count, seal.row_bytes, kind, roots,
+                                   protected)
             else:
-                e = self._new_entry(seal.seq, at_us, seal.row_count, seal.row_bytes, kind, -1, roots)
+                e = self._new_entry(seal.seq, at_us, seal.row_count, seal.row_bytes, kind, -1, roots, protected)
                 self._u_start.insert(j, start)
                 self._u_end.insert(j, end)
                 self._u_last.insert(j, e)
@@ -479,7 +494,7 @@ class View:
         elif kind == "late":
             hour = fmt.parse_time_text(d.get("hour")) if d.get("hour") else seal.period_start
             self._add_root(hour, seal.seq, at_us, seal.row_count, seal.row_bytes, kind,
-                           (seal.root_s, seal.root_c, seal.ids_digest))
+                           (seal.root_s, seal.root_c, seal.ids_digest), d.get("protected_bytes"))
             if d.get("by") != "host":
                 self.late_seqs.append(seal.seq)
         elif kind in ("prune", "rewrite"):
@@ -488,7 +503,8 @@ class View:
                 hour = fmt.parse_time_text(h[0])
                 days.add(hour.date())
                 self._add_root(hour, seal.seq, at_us, int(h[2]), int(h[3]), kind,
-                               (bytes.fromhex(h[4]), bytes.fromhex(h[5]), bytes.fromhex(h[6])))
+                               (bytes.fromhex(h[4]), bytes.fromhex(h[5]), bytes.fromhex(h[6])),
+                               h[7] if len(h) > 7 else 0)
             self.last_change = (seal.seq, frozenset(days))
             if d.get("request_seq") is not None and d.get("final"):
                 self.finals[int(d["request_seq"])] = seal.seq
@@ -572,6 +588,6 @@ class View:
     def memory(self) -> int:
         """The bytes the arrays take (the retention state's few seals aside)."""
         arrays = (self._at, self._u_start, self._u_end, self._u_last, self._e_seq, self._e_at, self._e_bytes,
-                  self._e_count, self._e_prev)
+                  self._e_count, self._e_prot, self._e_prev)
         return (len(self._links) + len(self._kind) + len(self._e_kind) + len(self._e_roots)
                 + sum(a.itemsize * len(a) for a in arrays))

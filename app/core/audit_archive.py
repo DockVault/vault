@@ -714,8 +714,7 @@ def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform:
             root = _root(db, view, h)
             f = builders[h].result()
             expected[h] = (f.count, f.root_s, f.root_c, f.ids_digest)
-            out.entries.append([fmt.hour_text(h), root.seq, f.count, f.bytes, f.root_s.hex(), f.root_c.hex(),
-                                f.ids_digest.hex()])
+            out.entries.append(ai.hour_entry(h, root.seq, f))
         times = list(touched.values())
         out.changed += len(touched)
         out.oldest = min([t for t in (out.oldest,) if t is not None] + times)
@@ -1210,10 +1209,12 @@ def _figures_of(part, agg, protected: set) -> Optional[PartFigures]:
 
 
 def protected_share(part, counted: int, figures: Optional[PartFigures], now: datetime, min_days: int) -> int:
-    """The part of a part's count the size cap may never delete, never more than the count: its administration and
-    security rows, or its rows younger than the minimum for every row (whole hours), whichever is larger, as a
-    share of its stored bytes. Rows another module's row-keep rule keeps are not known here: they count as
-    deletable, so the cap keeps more, never less (the deletion itself never takes them)."""
+    """What a part's aggregates say of its count the size cap may never delete, never more than the count: its
+    administration and security rows, or its rows younger than the minimum for every row (whole hours), whichever is
+    larger, as a share of its stored bytes; 0 when it has no aggregates that can be read. The aggregates are not
+    checked when the cap plans, so this only lowers what the chain binds (part_units), never raises it. Rows another
+    module's row-keep rule keeps are not known here: they count as deletable, so the cap keeps more, never less (the
+    deletion itself never takes them)."""
     if figures is None or counted <= 0:
         return 0
     total = sum(figures.stored)
@@ -1226,31 +1227,33 @@ def protected_share(part, counted: int, figures: Optional[PartFigures], now: dat
     return min(counted, counted * min(total, max(figures.protected_stored, young)) // total)
 
 
-def part_units(part, counted: int, lagged: Dict[datetime, int], figures: Optional[PartFigures], now: datetime,
-               min_days: int) -> List[tuple]:
+def part_units(part, counted: int, lagged: Dict[datetime, int], bound: Dict[datetime, int],
+               figures: Optional[PartFigures], now: datetime, min_days: int) -> List[tuple]:
     """(hour, counted, protected) of each hour of a part, for the size cap's walk from the newest: the part's count
-    spread over its hours by their lagged bytes, and its protected share (protected_share) by their stored bytes,
-    each never more than the hour's count. The shares add up to the part's count and protected share exactly."""
+    spread over its hours by their lagged bytes, each hour's protected share the same part of its spread as the
+    chain binds of its lagged bytes (``bound``: the hour's lagged protected bytes, audit_chain_size.protected_hours;
+    the whole hour when every row of it is younger than the minimum for every row). The part's aggregates
+    (protected_share), which are not checked when the cap plans, only lower the shares, from the oldest hour on: an
+    understated share keeps more, an overstated one would delete newer rows sooner. The shares add up to the part's
+    count exactly, and each protected share is never more than its hour's."""
     total = sum(lagged.values())
     if counted <= 0 or total <= 0:
         return []
-    protected = protected_share(part, counted, figures, now, min_days)
     hours = sorted(lagged)
     shares = [counted * lagged[h] // total for h in hours]
     shares[-1] += counted - sum(shares)
-    weights = dict(zip(part.hours(), figures.stored)) if figures is not None else {}
-    weight = [weights.get(h, 0) for h in hours]
-    if not sum(weight):
-        weight = shares
-    kept = [min(s, protected * w // sum(weight)) if sum(weight) else 0 for s, w in zip(shares, weight)]
-    # What the floors left over, given to the newest hours that still have room, so the shares add up.
-    left = protected - sum(kept)
-    for i in range(len(hours) - 1, -1, -1):
-        if left <= 0:
+    since = now - timedelta(days=min_days) if min_days > 0 else None
+    kept = []
+    for h, share in zip(hours, shares):
+        most = lagged[h] if since is not None and h >= since else min(lagged[h], bound.get(h, 0))
+        kept.append(share * most // lagged[h])
+    over = sum(kept) - protected_share(part, counted, figures, now, min_days)
+    for i in range(len(hours)):
+        if over <= 0:
             break
-        room = min(left, shares[i] - kept[i])
-        kept[i] += room
-        left -= room
+        cut = min(over, kept[i])
+        kept[i] -= cut
+        over -= cut
     return list(zip(hours, shares, kept))
 
 

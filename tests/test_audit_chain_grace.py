@@ -128,7 +128,7 @@ def test_verify_rejects_a_prune_sealed_inside_a_grace(env, factory):
     with ai.ChainWriter(ai._engine_of(c.factory), c.st) as w:
         w.append("prune", detail={"reason": "retention", "policy_seq": newest[0], "request_seq": None,
                                   "hours": [[fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(),
-                                             root.root_c.hex(), root.ids_digest.hex()]]})
+                                             root.root_c.hex(), root.ids_digest.hex(), 0]]})
     found = [f.message for f in _verify_off(factory).findings if f.kind == "unjustified"]
     assert any("inside the grace" in m for m in found), found
 
@@ -334,6 +334,6 @@ def test_verify_rejects_a_prune_sealed_after_the_grace_says_but_inside_it_with_t
     with ai.ChainWriter(ai._engine_of(c.factory), c.st) as w:
         w.append("prune", detail={"reason": "retention", "policy_seq": newest[0], "request_seq": None,
                                   "hours": [[fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(),
-                                             root.root_c.hex(), root.ids_digest.hex()]]})
+                                             root.root_c.hex(), root.ids_digest.hex(), 0]]})
     found = [f.message for f in _verify_off(factory).findings if f.kind == "unjustified"]
     assert any("inside the grace" in m for m in found), found

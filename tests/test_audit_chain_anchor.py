@@ -106,7 +106,7 @@ def _host_late_after_the_anchor(env):
         wr.row_ids = fig.ids
         db.commit()
     seq = _forge(env, "late", {"hour": fmt.hour_text(hour), "prev_seq": entry.root.seq, "added": [str(added)],
-                               "by": "host"},
+                               "by": "host", "protected_bytes": 0},
                  period_start=hour, period_end=hour + ai.HOUR, row_count=fig.count, row_bytes=fig.bytes,
                  root_s=fig.root_s, root_c=fig.root_c, ids_digest=fig.ids_digest)
     return anchor, hour, seq

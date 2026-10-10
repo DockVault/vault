@@ -141,7 +141,7 @@ def _root(env, hour):
 def _hour_entry(env, hour):
     root = _root(env, hour)
     return [fmt.hour_text(hour), root.seq, root.count, root.bytes, root.root_s.hex(), root.root_c.hex(),
-            root.ids_digest.hex()]
+            root.ids_digest.hex(), 0]
 
 
 # --------------------------------------------------------------------------- another writer's seals: the face check
@@ -169,7 +169,7 @@ def test_an_archive_seal_appended_after_the_record_meets_step_four(env):
 def test_an_hour_seal_that_does_not_start_where_the_last_ended_is_refused(env):
     _sealed_hours(env)
     start = env.st.view.newest_hour_end + ai.HOUR
-    _forge(env, "hour", {}, period_start=start, period_end=start + ai.HOUR, root_s=fmt.EMPTY_ROOT,
+    _forge(env, "hour", {"protected_bytes": 0}, period_start=start, period_end=start + ai.HOUR, root_s=fmt.EMPTY_ROOT,
            root_c=fmt.EMPTY_ROOT, ids_digest=fmt.ids_digest([]))
     assert "an hour seal starting at" in _stopped_by(env, "after-record-invalid")
 
@@ -179,7 +179,8 @@ def test_a_late_seal_that_does_not_follow_its_hours_root_is_refused_and_unjustif
     env.run_until_sealed()
     hour = ai.hour_floor(T0 - timedelta(hours=3, minutes=10))
     root = _root(env, hour)
-    _forge(env, "late", {"hour": fmt.hour_text(hour), "prev_seq": root.seq - 1, "added": [], "by": "sealer"},
+    _forge(env, "late", {"hour": fmt.hour_text(hour), "prev_seq": root.seq - 1, "added": [], "by": "sealer",
+                         "protected_bytes": 0},
            period_start=hour, period_end=hour + ai.HOUR, root_s=root.root_s, root_c=root.root_c,
            ids_digest=root.ids_digest, row_count=root.count)
     assert "does not follow its hour's root seal" in _stopped_by(env, "after-record-invalid")
@@ -275,7 +276,7 @@ def test_an_anchor_that_names_another_link_is_a_mismatch(env):
 def test_hour_seals_must_tile_time(env):
     _sealed_hours(env)
     start = env.st.view.newest_hour_end + 2 * ai.HOUR
-    _append(env, "hour", {}, period_start=start, period_end=start + ai.HOUR, root_s=fmt.EMPTY_ROOT,
+    _append(env, "hour", {"protected_bytes": 0}, period_start=start, period_end=start + ai.HOUR, root_s=fmt.EMPTY_ROOT,
             root_c=fmt.EMPTY_ROOT, ids_dig=fmt.ids_digest([]))
     assert "hour-missing" in failures(_off(env))
 
@@ -283,7 +284,7 @@ def test_hour_seals_must_tile_time(env):
 def test_a_run_of_hours_holding_rows_is_unjustified(env):
     _sealed_hours(env)
     start = env.st.view.newest_hour_end
-    _append(env, "hour", {}, period_start=start, period_end=start + 2 * ai.HOUR, row_count=3,
+    _append(env, "hour", {"protected_bytes": 0}, period_start=start, period_end=start + 2 * ai.HOUR, row_count=3,
             root_s=fmt.EMPTY_ROOT, root_c=fmt.EMPTY_ROOT, ids_dig=fmt.ids_digest([]))
     assert any("holds rows" in m for m in _why(_off(env)))
 

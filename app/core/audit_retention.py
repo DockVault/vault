@@ -205,7 +205,8 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
     bytes over a window of one delay of time while sealing ran, and each archived part the smaller of its bound
     length and its hours' lagged bytes (app/core/audit_chain_size.py); the total is the chain's, and the rows
     (an archived part's aggregates, app/core/audit_archive.py) decide only which part of a figure the cap may
-    never delete. It keeps the newest hours and parts, protected rows first, that fit under the cap; the
+    never delete, never more than the protected bytes the chain binds for its hours (rows only lower a share).
+    It keeps the newest hours and parts, protected rows first, that fit under the cap; the
     unprotected rows of older ones go, and never a row younger than the window's start."""
     from app.core import audit_archive
     from app.core import audit_chain_format as fmt
@@ -225,6 +226,11 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
     if not plan.counted_bytes:
         return plan
     # (hour, counted, protected): an archived part's spread over its hours (app/core/audit_archive.py part_units).
+    # A share comes from the rows, but never above what the chain binds as that hour's protected bytes (or the
+    # whole hour, when every row of it is younger than the minimum for every row), so rows added in the database
+    # can only lower it.
+    bound = chain_size.protected_hours(view, start_us, held)
+    young = now - timedelta(days=numbers.min_days) if numbers.min_days > 0 else None
     units = []
     if by_hour:
         dialect = db.get_bind().dialect.name
@@ -232,11 +238,14 @@ def chain_size_plan(db, model, view, record, now: datetime, numbers: Numbers, de
         rows = (db.query(hour.label("hour"), func.sum(_row_bytes(model, dialect)))
                 .filter(_size_protected(model, now, numbers)).group_by(hour).all())
         protected_rows = {_as_time(h): int(size or 0) for h, size in rows}
-        units += [(h, counted, min(protected_rows.get(h, 0), counted)) for h, counted in by_hour.items()]
+        for h, counted in by_hour.items():
+            most = counted if young is not None and h >= young else bound.get(h, 0)
+            units.append((h, counted, min(protected_rows.get(h, 0), counted, most)))
     if any(c for _d, _p, c, _h in parts):
         figures = audit_archive.part_figures(db, view)
         for d, part, c, lagged in parts:
-            units += audit_archive.part_units(part, c, lagged, figures.get((d, part.part)), now, numbers.min_days)
+            units += audit_archive.part_units(part, c, lagged, bound, figures.get((d, part.part)), now,
+                                              numbers.min_days)
     plan.protected_bytes = sum(p for _w, _c, p in units)
     left = plan.protected_bytes
     for when, counted, protected in sorted(units, key=lambda u: u[0], reverse=True):
