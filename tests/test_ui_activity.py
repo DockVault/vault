@@ -86,6 +86,7 @@ def test_an_open_events_recheck_reads_only_its_own_instant(page: Page, anon, act
     """When the list is read again with an event open, the page asks whether that event still matches with the
     list's filters and the range narrowed to the event's own instant (to the millisecond after it): over archived
     days the server then reads only the part that holds it, not every archived day of the range."""
+    import json
     from datetime import datetime, timedelta, timezone
     from urllib.parse import parse_qs, urlparse
     name = unique("ghost")
@@ -99,14 +100,22 @@ def test_an_open_events_recheck_reads_only_its_own_instant(page: Page, anon, act
     rows.first.click()
     expect(page.locator("#act-detail")).to_be_visible()
     ts = admin.get("/activity/events", params={"user": name, "user_match": "exact"}).json()["events"][0]["timestamp"]
-    with page.expect_request(lambda r: "/activity/events?" in r.url and "ids=" in r.url) as recheck:
-        page.click("#act-range [data-range='7d']")
-    asked = parse_qs(urlparse(recheck.value.url).query)
+    def is_recheck(r):
+        # A list read with a typed filter (the person here) goes as a POST with the filters in its body.
+        return "/activity/events" in r.url and ("ids=" in r.url or '"ids"' in (r.post_data or ""))
+
+    with page.expect_request(is_recheck) as recheck:
+        page.click("#act-range [data-range='30d']")         # the page opens on 7 days
+    request = recheck.value
+    if request.method == "POST":
+        asked = {k: v if isinstance(v, list) else [v] for k, v in json.loads(request.post_data).items()}
+    else:
+        asked = parse_qs(urlparse(request.url).query)
     moment = datetime.fromisoformat(ts).astimezone(timezone.utc)
     end = moment.replace(microsecond=moment.microsecond // 1000 * 1000) + timedelta(milliseconds=1)
     assert asked["from_date"] == [ts], asked
     assert asked["to_date"] == [end.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"], asked
-    assert asked["user"] == [name]
+    assert asked["user"] == [name] and len(asked["ids"]) == 1, asked
     expect(page.locator("#act-detail")).to_be_visible()
     expect(page.locator("#act-detail")).to_contain_text(name)
 

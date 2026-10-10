@@ -473,6 +473,7 @@ async def stalled(resp, pause):
 
 archive.IDLE_TIMEOUT_MS = 1500
 ev.EXPORT_BATCH = 10
+ev.export_page.__defaults__ = (10,)
 resp = call(api.activity_export, **dict(EXPORT, format="ndjson", from_date=start.isoformat()))
 out["stalled"] = list(asyncio.run(stalled(resp, 4)))
 out["idle_after"] = idle_in_transaction()
