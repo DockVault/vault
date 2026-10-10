@@ -128,7 +128,7 @@ def test_the_documents_say_the_output_is_rotated_and_where_it_is_not():
 
 
 @pytest.mark.parametrize("size, ok", [("10m", True), ("50MB", True), ("1g", True), ("1.5g", True), ("512k", True),
-                                      ("2 MiB", True), ("100", True), ("", True), ("0", False), ("0m", False),
+                                      ("2 MiB", True), ("0.5k", True), ("100", True), ("", True), ("0", False), ("0m", False),
                                       ("0.5", False), ("-1", False), ("10x", False), ("ten", False), ("1.2.3m", False),
                                       ("10 m b", False)])
 def test_a_log_size_docker_refuses_is_named(size, ok):
