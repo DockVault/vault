@@ -196,13 +196,13 @@ FAIL_GET = {'true' if fails else 'false'};
     assert out["detail"] == detail
 
 
-def _linked(state: str, during: str = "null") -> dict:
+def _linked(state: str, during: str = "null", event: str = "ev-9") -> dict:
     return _node(STUBS + _fn("openLinkedEvent") + f"""
 S.rows = [{{ id: 'ev-2' }}];
 {state}
 DURING_GET = {during};
 (async () => {{
-    await openLinkedEvent('ev-9');
+    await openLinkedEvent({json.dumps(event)});
     console.log(JSON.stringify({{ calls, detail: S.detail, selected: S.selectedId,
                                   missing: S.detailMissing === undefined ? null : S.detailMissing }}));
 }})();
@@ -234,6 +234,15 @@ def test_a_linked_event_is_not_opened_over_a_choice_made_while_it_is_read(state,
     assert out["calls"][0] == ["get", "/activity/events/ev-9?case=case-1"]
     out["calls"] = out["calls"][1:]
     assert out == expected
+
+
+@pytest.mark.parametrize("state,event,path", [
+    ("", "a b/c", "/activity/events/a%20b%2Fc?case=case-1"),
+    ("S.caseId = null;", "ev-9", "/activity/events/ev-9"),
+])
+def test_a_linked_event_is_read_by_its_id_under_the_selected_case(state, event, path):
+    out = _linked(state, event=event)
+    assert out["calls"] == [["get", path], ["openDetail", event]] and out["selected"] == event
 
 
 def test_a_linked_event_on_the_page_is_selected_there_without_a_read():
