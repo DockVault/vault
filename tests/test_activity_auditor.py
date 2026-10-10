@@ -522,7 +522,8 @@ def test_the_events_route_selects_the_case_through_its_search_form(db, people, s
 def _locked_world(db, people, storage):
     """olga's vault with a vault password, its folders Company > Board minutes and Company > Holidays, and the events
     a case on Board minutes (files changed in the last 30 days) is about: a file in it, a kept one, one with a password
-    of its own, an old one, one beside it, one deleted for good; the three folders; the vault itself."""
+    of its own, an old one, one beside it, an old one changed in the last days; one deleted for good; the three
+    folders; the vault itself."""
     pv = _vault(db, people.olga, password="argon2-hash")
     top = _folder(db, pv, None, "Company")
     board = _folder(db, pv, top, "Board minutes")
@@ -533,10 +534,15 @@ def _locked_world(db, people, storage):
     old = _file(db, storage, pv, name="old.txt", folder=board)
     old.created_at = old.updated_at = ca.utcnow() - timedelta(days=400)
     beside = _file(db, storage, pv, name="beach.jpg", folder=side)
+    # Uploaded long before the case's range, changed inside it: the case names it by the change.
+    changed = _file(db, storage, pv, name="agenda.txt", folder=board)
+    changed.created_at = ca.utcnow() - timedelta(days=400)
+    changed.updated_at = ca.utcnow() - timedelta(days=2)
     db.commit()
+    assert changed.created_at < ca.utcnow() - timedelta(days=30) < changed.updated_at, "the times stay as set"
     case = _case(db, people, [{"kind": "folder", "target_id": board.id}], files_from=ca.utcnow() - timedelta(days=30))
     rows = [_event(db, "file_download", by=people.olga, resource_type="file", resource_id=x.id, vault=pv)
-            for x in (inside, held, own, old, beside)]
+            for x in (inside, held, own, old, beside, changed)]
     rows.append(_event(db, "file_delete", by=people.olga, resource_type="file", resource_id=uuid.uuid4(), vault=pv))
     rows += [_event(db, "folder_create", by=people.olga, resource_type="folder", resource_id=x.id, vault=pv)
              for x in (board, top, side)]
@@ -544,12 +550,12 @@ def _locked_world(db, people, storage):
     return SimpleNamespace(pv=pv, case=case, rows=rows)
 
 
-# Where the case's auditor is offered the vault's password: the file in the case's folder, the kept one, the folder
-# and the way to it; never a file with a password of its own, an old one, one beside it, one deleted for good, the
-# folder beside it or the vault itself.
-OFFERED = [True, True, False, False, False, False, True, True, False, False]
-NAMED_ONCE_UNLOCKED = ["salaries.csv", "draft.txt", an.NOT_SHOWN, an.NOT_SHOWN, an.NOT_SHOWN, an.NOT_SHOWN,
-                       "Board minutes", "Company", an.NOT_SHOWN, None]
+# Where the case's auditor is offered the vault's password: the file in the case's folder, the kept one, the old one
+# changed in the case's range, the folder and the way to it; never a file with a password of its own, an old one, one
+# beside it, one deleted for good, the folder beside it or the vault itself.
+OFFERED = [True, True, False, False, False, True, False, True, True, False, False]
+NAMED_ONCE_UNLOCKED = ["salaries.csv", "draft.txt", an.NOT_SHOWN, an.NOT_SHOWN, an.NOT_SHOWN, "agenda.txt",
+                       an.NOT_SHOWN, "Board minutes", "Company", an.NOT_SHOWN, None]
 
 
 def _offered(views):
