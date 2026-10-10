@@ -6,8 +6,9 @@ off, a script that never loaded, injected markup) then sends nothing, to this or
 
 Pinned here: the header the middleware sets on an HTML response, over http and over https (TLS in the server
 or at a trusted proxy), carries exactly one form-action directive, and it is 'none'; and every form on every
-served page has a submit handler in the page's own scripts that calls preventDefault, so nothing the pages do
-relies on the browser sending a form.
+served page, and every form a script makes (an invitation's or a reset's password, a vault's password in the
+Activity page or a compliance case, a search in a case), has a submit handler that calls preventDefault, so
+nothing the pages do relies on the browser sending a form.
 tests/test_csp_form_action_live.py and tests/test_ui_forms_before_the_app_loads.py check it in a browser.
 """
 import pathlib
@@ -94,7 +95,7 @@ def test_the_pages_and_their_forms_are_all_seen():
         assert len(_forms(html)) == len(re.findall(r"<form\b", html, re.I)), f"{page}: a form has no id"
         total += len(_forms(html))
     assert total >= 19, total
-    # No script builds a form in markup either: every form is in a page's own HTML.
+    # No script writes a form as markup either; a form a script makes element by element is checked below.
     for js in sorted((STATIC / "js").glob("*.js")):
         assert not re.search(r"<form\b", js.read_text(encoding="utf-8"), re.I), js.name
 
@@ -157,3 +158,96 @@ def test_the_handler_check_flags_a_form_without_one():
           "function sendF(e) {\n    send();\n}\nfunction later(e) { e.preventDefault(); }\n")
     assert [_handler_prevents_default(js, f) for f in ("a-form", "b-form", "c-form", "d-form", "e-form",
                                                         "f-form")] == [True, True, False, False, False, False]
+
+
+# --------------------------------------------------------------------------------------------------
+# Forms a script makes element by element: no id in a page's markup, so the checks above never see them.
+# --------------------------------------------------------------------------------------------------
+
+def _element_makers(js):
+    """The script's own functions that make an element of the tag they are given, such as el(tag, cls, text)."""
+    makers = set()
+    for m in re.finditer(r"function\s+(\w+)\s*\(\s*(\w+)[^)]*\)\s*\{", js):
+        if re.search(r"createElement\(\s*" + re.escape(m.group(2)) + r"\s*\)", _block(js, m.end())):
+            makers.add(m.group(1))
+    return makers
+
+
+def _made_forms(js):
+    """(position, the variable that holds it or None) of each form the script makes: through
+    document.createElement('form') or one of its own element makers called with 'form'."""
+    makers = {"createElement"} | _element_makers(js)
+    out = []
+    for m in re.finditer(r"\b(\w+)\(\s*['\"]form['\"]\s*[,)]", js):
+        if m.group(1) in makers:
+            held = re.search(r"(?:const|let|var)\s+(\w+)\s*=\s*(?:document\.)?$", js[max(0, m.start() - 80):m.start()])
+            out.append((m.start(), held.group(1) if held else None))
+    return out
+
+
+def _made_form_prevents_default(js, start, held):
+    """Whether the form made at ``start`` and held in ``held`` is given, in the block that makes it, a submit
+    handler whose opening lines call preventDefault."""
+    if held is None:
+        return False
+    block = _block(js, start)
+    for b in re.finditer(r"\b" + re.escape(held) + r"\s*\??\.addEventListener\(\s*['\"]submit['\"]\s*,\s*", block):
+        rest = block[b.end():]
+        inline = re.match(r"(?:async\s+)?(?:function\s*)?\(?\s*\w*\s*\)?\s*(?:=>)?\s*\{", rest)
+        named = re.match(r"(\w+)\s*\)", rest)
+        if inline:
+            body = _block(rest, inline.end())
+        elif named:
+            fn = re.search(r"function\s+" + re.escape(named.group(1)) + r"\s*\([^)]*\)\s*\{", js)
+            body = _block(js, fn.end()) if fn else ""
+        else:
+            body = ""
+        if "preventDefault()" in body[:300]:
+            return True
+    return False
+
+
+SCRIPTS = sorted(p.name for p in (STATIC / "js").glob("*.js"))
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_every_form_a_script_makes_is_sent_by_its_own_handler(script):
+    js = (STATIC / "js" / script).read_text(encoding="utf-8")
+    missing = [js.count("\n", 0, start) + 1 for start, held in _made_forms(js)
+               if not _made_form_prevents_default(js, start, held)]
+    assert not missing, (f"{script}: forms made on these lines have no submit handler that calls "
+                         f"preventDefault: {missing}")
+
+
+def test_the_forms_scripts_make_are_all_seen():
+    """The scan finds the element makers and the forms made through them in the scripts that make some."""
+    made = {}
+    for script in SCRIPTS:
+        js = (STATIC / "js" / script).read_text(encoding="utf-8")
+        made[script] = len(_made_forms(js))
+    # The invitation and the reset password forms (app.js), a vault's password in the Activity page and in a
+    # compliance case (activity.js), and a vault's password and the file search in a case (compliance.js).
+    assert made["app.js"] >= 2 and made["activity.js"] >= 2 and made["compliance.js"] >= 2, made
+    for script, maker in (("app.js", "_el"), ("activity.js", "el"), ("compliance.js", "el")):
+        assert maker in _element_makers((STATIC / "js" / script).read_text(encoding="utf-8")), script
+
+
+def test_the_made_form_check_flags_a_form_without_a_handler():
+    """The instrument, checked against a control."""
+    js = ("function mk(tag, cls) {\n    const n = document.createElement(tag);\n    return n;\n}\n"
+          "function hide(id) { byId(id).hidden = true; }\n"
+          "function one() {\n    const a = mk('form', 'x');\n"
+          "    a.addEventListener('submit', async (e) => {\n        e.preventDefault();\n        await go();\n    });\n}\n"
+          "function two() {\n    const b = mk('form');\n    b.addEventListener('submit', (e) => { go(); });\n}\n"
+          "function three() {\n    const c = document.createElement('form');\n    return c;\n}\n"
+          "function four() {\n    box.append(mk('form'));\n}\n"
+          "function five() {\n    const d = mk('form');\n    d.addEventListener('click', (e) => { e.preventDefault(); });\n}\n"
+          "function six() {\n    const f = mk('form');\n    f.addEventListener('submit', sendF);\n}\n"
+          "function sendF(e) {\n    e.preventDefault();\n}\n"
+          "function seven() {\n    const g = mk('form');\n}\n"
+          "function eight() {\n    g.addEventListener('submit', (e) => { e.preventDefault(); });\n    hide('form');\n}\n")
+    assert _element_makers(js) == {"mk"}
+    forms = _made_forms(js)
+    assert [held for _, held in forms] == ["a", "b", "c", None, "d", "f", "g"]
+    assert [_made_form_prevents_default(js, start, held) for start, held in forms] == [
+        True, False, False, False, False, True, False]
