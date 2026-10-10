@@ -21,7 +21,8 @@ Opening a file checks, in this order, and stops at the first refusal:
 4. The audit row, committed: the first view of a file in ten minutes writes ``case_file_viewed`` (later views and
    byte ranges in those ten minutes add none) and commits it before anything is read; a row that cannot be written
    refuses the view. A new view past COMPLIANCE_VIEW_RATE views in the last hour is refused: bulk reading belongs
-   in an export.
+   in an export. The auditor's account row is locked from the check to the commit, so views made at once are
+   counted, and recorded, one after the other.
 5. Only then is the stored file opened (VaultService._open_stored_file, which opens a kept file as it opens a live
    one: the ids its keys bind are the original ones).
 
@@ -463,6 +464,14 @@ def _vault_service(db):
     return VaultService(db, PermissionService(db))
 
 
+def _lock_auditor(db, user) -> None:
+    """Lock the auditor's account row until this read's record commits: two first views of one file at once write
+    one row, and views in flight cannot pass the hourly rate together (as two reveals at once cannot pass theirs).
+    The read that needs no row commits at once, so the lock is never held while a file is sent."""
+    from app.core.models import User
+    db.query(User.id).filter(User.id == user.id).with_for_update().first()
+
+
 def view_details(found: Found, opening: Opening, **extra) -> dict:
     details = {"vault_id": str(found.vault.id), "status": found.status, **extra}
     if opening.override:
@@ -479,11 +488,14 @@ def open_file(db, case_id, file_id, user, *, unlocked_given: Optional[Mapping[st
     found = file_for(db, case, file_id, now=now)                              # 2
     unlocked = unlocked_vaults(db, case, user, session_hash, unlocked_given or {})
     opening = content_opening(case, found, unlocked)                          # 3
-    if not _recent(db, case, user, "case_file_viewed", str(found.item.id), now):    # 4
+    _lock_auditor(db, user)                                                   # 4
+    if not _recent(db, case, user, "case_file_viewed", str(found.item.id), now):
         if views_in_last_hour(db, user, now) >= view_rate(case):
             raise Refused(VIEW_RATE)
         record(db, case, user, "case_file_viewed", resource_type="file", resource_id=found.item.id,
                details=view_details(found, opening, **({"preview": True} if preview else {})))
+    else:
+        db.commit()                                                           # the lock, released
     download = _vault_service(db)._open_stored_file(found.item, found.vault, found.item.id, whole=False)   # 5
     return case, found, download
 

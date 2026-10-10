@@ -5,17 +5,20 @@ kept after its owner deleted it; every read is recorded under the case and the o
 A view whose record cannot be written (a fault in the database) is refused with no byte of the file sent. Reading
 changes nothing of the vault. Refusals (not the case's auditor, a temporary credential, a device's secret, access
 ended, the right revoked) are each recorded. A password vault opens only with its password, and the
-vault-password throttle is the auditor's for the vault across two cases.
+vault-password throttle is the auditor's for the vault across two cases. First views of one file made at once
+write one row, and a limited session keeps its statement timeout in every transaction.
 
 test_case_access.py and test_case_reading.py cover the rules offline.
 """
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
+import requests
 
-from _account_change_helpers import psql
+from _account_change_helpers import DB, in_api_container, psql
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault
 from conftest import ApiClient, BASE_URL, unique
@@ -208,6 +211,98 @@ def test_refusals_are_each_recorded(world):
     assert r.status_code == 403 and r.json()["detail"]["reason"] == "auditor_not_live"
 
     assert _refusals(case["id"]) == ["not_your_case", "temporary_credential", "access_ended", "auditor_not_live"]
+
+
+
+# Each first view's row waits in its INSERT while the test holds this advisory lock: every view of the burst is past
+# its ten-minute check before any row commits, as when they truly arrive at once.
+_HOLD_KEY = (7340, 21)
+_HOLD = f"""
+CREATE OR REPLACE FUNCTION test_hold_case_view() RETURNS trigger AS $$
+BEGIN PERFORM pg_advisory_xact_lock_shared({_HOLD_KEY[0]}, {_HOLD_KEY[1]}); RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER test_hold_case_view BEFORE INSERT ON audit_logs
+FOR EACH ROW WHEN (NEW.action = 'case_file_viewed') EXECUTE FUNCTION test_hold_case_view();
+"""
+
+
+def _waiting_on_locks() -> int:
+    return int(psql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                    "AND datname = current_database() AND pid <> pg_backend_pid()"))
+
+
+def test_first_views_of_one_file_made_at_once_write_one_row(world):
+    """Six first views of one file at once: the auditor's row is locked from the ten-minute check to the commit, so
+    one view writes case_file_viewed and the five after it find that row; all six are answered."""
+    _uma, uma_c, _codes = world["uma"]
+    _olga, _c, vid = world["olga"]
+    case = _case(world, [vid])
+    url = f"{BASE_URL}/compliance/cases/{case['id']}/files/{world['files']['notes']}/content"
+    headers = dict(uma_c.session.headers)
+    psql(_HOLD)
+    holder = subprocess.Popen(["docker", "exec", "-i", DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-Atc",
+                               f"SELECT pg_advisory_lock({_HOLD_KEY[0]}, {_HOLD_KEY[1]}); SELECT pg_sleep(120)"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def release():
+        psql("SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND granted "
+             f"AND classid = {_HOLD_KEY[0]} AND objid = {_HOLD_KEY[1]} AND mode = 'ExclusiveLock' "
+             "AND pid <> pg_backend_pid()")
+
+    try:
+        for _ in range(120):
+            if psql("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock' "
+                    f"AND classid = {_HOLD_KEY[0]} AND objid = {_HOLD_KEY[1]}") == "1":
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError("the hold was not taken")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            answers = [pool.submit(requests.get, url, headers=headers, timeout=60) for _ in range(6)]
+            for _ in range(60):
+                if _waiting_on_locks() >= 6:
+                    break
+                time.sleep(0.05)
+            waiting = _waiting_on_locks()
+            release()
+            statuses = [a.result().status_code for a in answers]
+    finally:
+        release()
+        holder.kill()
+        holder.wait(timeout=30)
+        psql("DROP TRIGGER IF EXISTS test_hold_case_view ON audit_logs; "
+             "DROP FUNCTION IF EXISTS test_hold_case_view()")
+    assert waiting >= 6, f"only {waiting} views reached the database's locks"
+    assert statuses == [200] * 6, statuses
+    assert _rows("case_file_viewed", case["id"]) == 1
+
+
+_SHOW_LIMITS = """
+from sqlalchemy import text
+from app.api import compliance_router as cr
+from app.core.database import SessionLocal
+show = lambda s: s.execute(text('SHOW statement_timeout')).scalar()
+s = SessionLocal()
+cr.limit_statements(s)
+seen = [show(s)]
+s.commit()
+seen.append(show(s))
+s.rollback()
+seen.append(show(s))
+s.close()
+t = SessionLocal()
+seen.append(show(t))
+t.close()
+print(' '.join(seen))
+"""
+
+
+def test_the_statement_timeout_holds_in_every_transaction_of_a_limited_session():
+    """On Postgres: a session limited by the compliance routes keeps the statement timeout after it commits or rolls
+    back (a read commits its record and goes on reading); a session never limited has none of it."""
+    out = in_api_container(_SHOW_LIMITS)
+    limited_first, after_commit, after_rollback, plain = out.stdout.strip().splitlines()[-1].split()
+    assert limited_first == after_commit == after_rollback == "5s"
+    assert plain != "5s"
 
 
 def _redis_del(pattern):

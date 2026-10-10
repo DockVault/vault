@@ -513,6 +513,38 @@ def test_each_reading_route_is_a_plain_def_with_a_statement_timeout_and_no_group
         assert forbidden not in source, forbidden
 
 
+def test_the_statement_timeout_is_set_again_in_each_transaction_after_a_commit(monkeypatch):
+    """A read commits its own record and goes on reading: the session sets the timeout again at the start of every
+    later transaction (after a commit or a rollback), once per transaction however often it is asked; a session
+    never limited sets nothing. (Postgres runs the real statement: test_case_access_live.py.)"""
+    from sqlalchemy import create_engine, event, text
+    from sqlalchemy.orm import Session
+    engine = create_engine("sqlite://")
+    monkeypatch.setattr(engine.dialect, "name", "postgresql")
+    monkeypatch.setattr(cr, "_STATEMENT_LIMIT", "SELECT 'the statement limit'")
+    seen = []
+    event.listen(engine, "before_cursor_execute", lambda conn, cursor, statement, *a: seen.append(statement))
+    limited = Session(engine)
+    limited.execute(text("SELECT 1"))
+    cr.limit_statements(limited)
+    cr.limit_statements(limited)
+    assert seen == ["SELECT 1", cr._STATEMENT_LIMIT, cr._STATEMENT_LIMIT]
+    for end in (limited.commit, limited.rollback):
+        end()
+        seen.clear()
+        limited.execute(text("SELECT 2"))
+        limited.execute(text("SELECT 3"))
+        assert seen == [cr._STATEMENT_LIMIT, "SELECT 2", "SELECT 3"], end.__name__
+    limited.close()
+    seen.clear()
+    plain = Session(engine)
+    plain.execute(text("SELECT 4"))
+    plain.commit()
+    plain.execute(text("SELECT 5"))
+    plain.close()
+    assert seen == ["SELECT 4", "SELECT 5"]
+
+
 def test_the_reading_routes_bodies_have_the_small_class():
     for path in ("/compliance/cases/{case_id}/search", "/compliance/cases/{case_id}/vaults/{vault_id}/unlock"):
         concrete = path.replace("{case_id}", str(uuid.uuid4())).replace("{vault_id}", str(uuid.uuid4()))

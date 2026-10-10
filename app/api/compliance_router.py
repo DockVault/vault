@@ -51,6 +51,7 @@ import anyio
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import event
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -83,10 +84,26 @@ ACCESS_OFF = ("Compliance access is turned off on this deployment (COMPLIANCE_AC
               "can be proposed or approved.")
 
 
+_STATEMENT_LIMIT = f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
+_LIMITED = "compliance_statement_limit"
+
+
+def _limit_again(session, transaction, connection) -> None:
+    connection.exec_driver_sql(_STATEMENT_LIMIT)
+
+
 def limit_statements(db: Session) -> None:
+    """Every statement of the request's session runs under STATEMENT_TIMEOUT_MS: the transaction under way now, and
+    each one the session begins after a commit (a read commits its own record and goes on reading: a folder's names,
+    the vault's entry, the file to send), from its start. SET LOCAL ends with its transaction, so the session sets
+    it again as each one begins."""
     bind = db.get_bind()
-    if bind is not None and bind.dialect.name == "postgresql":
-        db.execute(sql_text(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    db.execute(sql_text(_STATEMENT_LIMIT))
+    if not db.info.get(_LIMITED):
+        db.info[_LIMITED] = True
+        event.listen(db, "after_begin", _limit_again)
 
 
 async def require_interactive_account(current_user: User = Depends(get_current_user)) -> User:
