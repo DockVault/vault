@@ -274,6 +274,9 @@ def test_going_back_to_the_deployments_value_waits_when_it_deletes_sooner(env, d
     _put(db, user, "keep_days", 400)
     out = _put(db, user, "keep_days", None)
     assert (out["status"], out["change"]["setting"], out["change"]["new"]) == ("pending", None, 30)
+    # The list says what the request seal asks for (no setting) and the value it resolves to when it applies.
+    (waiting,) = routes.get_managed_settings(current_user=user, db=db)["pending"]
+    assert (waiting["old"], waiting["setting"], waiting["new"]) == (400, None, 30)
 
 
 def test_the_same_value_again_changes_nothing_and_writes_no_row(env, db, quiet):
