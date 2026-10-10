@@ -1561,3 +1561,63 @@ def test_a_part_whose_block_is_gone_or_of_another_length_stops_its_days_next_par
         db.commit()
     _archive(env)
     assert _hot(env) == 3 and "block-missing" in ai.open_failures(env.st.head_store().load())
+
+
+# --------------------------------------------------------------------------- one state for a check
+
+def _wal(env):
+    """SQLite lets a writer commit while a reader keeps its snapshot only in WAL mode (Postgres always does)."""
+    with env.engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+
+
+def test_verify_reads_one_state_when_an_unarchive_commits_during_it(env, monkeypatch):
+    """The check walks the seals, then reads the blocks and the rows: an unarchive by the host that commits in
+    between shows nothing, since every read is of the state the walk saw."""
+    _wal(env)
+    _sealed_day(env)
+    _archive(env)
+    assert failures(env.verify()) == []
+    real = arc.check_block_set
+    done = []
+
+    def unarchive_first(db, view, report):
+        if not done:
+            done.append(1)
+            _unarchive(env)                 # another process's transaction, committed now
+        return real(db, view, report)
+
+    monkeypatch.setattr(arc, "check_block_set", unarchive_first)
+    assert failures(env.verify()) == [] and done
+    monkeypatch.setattr(arc, "check_block_set", real)
+    assert failures(env.verify()) == [] and not _blocks(env) and _hot(env) == 6
+
+
+def test_the_daily_checks_rolling_part_reads_the_state_its_walk_read(env, monkeypatch):
+    """The daily check's rolling part reads the parts and hours of the state its walk read: an unarchive the host
+    commits after the walk shows nothing (the process's own view is not what it reads by)."""
+    _wal(env)
+    _sealed_day(env)
+    _archive(env)
+    _seal_days(env, 8)
+    real = v._rolling
+    done = []
+
+    def unarchive_first(db, view, report, before, rolling_from):
+        if not done:
+            done.append(1)
+            _unarchive(env)
+        return real(db, view, report, before, rolling_from)
+
+    monkeypatch.setattr(v, "_rolling", unarchive_first)
+    monkeypatch.setattr(v, "ROLLING_DAYS", 1)            # every hour and part in this check
+    report = v.daily_check(env.session, env.st, now=env.clock(), force=True)
+    assert done and failures(report) == [] and report.rows_checked >= 6
+
+
+def test_a_check_needs_a_session_that_has_not_read_yet(env):
+    env.run_until_sealed()
+    with env.session() as db:
+        db.query(AuditLog).count()
+        with pytest.raises(RuntimeError, match="has not read yet"):
+            v.verify(db, record=None, held={}, now=env.clock())

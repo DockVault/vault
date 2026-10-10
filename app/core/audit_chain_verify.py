@@ -74,6 +74,8 @@ class Report:
     seals: int = 0
     hours_checked: int = 0
     rows_checked: int = 0
+    # The view the check built from the seals it read: what a later step over the same snapshot reads by.
+    view: Optional[object] = field(default=None, repr=False, compare=False)
 
     def add(self, severity, kind, message, seq=None, hour=None) -> None:
         self.findings.append(Finding(severity, kind, message, seq, hour))
@@ -481,6 +483,22 @@ def _record_after(record, generation) -> Dict[int, dict]:
             if e.get("generation") == generation and not e.get("discarded")}
 
 
+def one_state(db) -> None:
+    """Make every read of ``db``'s transaction from here on see the database as it was at the first: the seals,
+    the blocks and the rows of one state, whatever another process commits meanwhile (a host's ``audit unarchive``,
+    the server's archive job or pruner). Without it a check walks the seals, then reads blocks and rows a change
+    committed after the walk, and reports failures that are not there. REPEATABLE READ on Postgres; on SQLite (the
+    offline tests) a read transaction begun now, which needs WAL for a writer to commit meanwhile. ``db`` must not
+    have read yet."""
+    if db.in_transaction():
+        raise RuntimeError("a check reads one state of the database: it needs a session that has not read yet")
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+    elif dialect == "sqlite":
+        db.execute(text("BEGIN"))
+
+
 def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, current_key_id: Optional[str] = None,
            anchor: Optional[str] = None, from_hour: Optional[datetime] = None, to_hour: Optional[datetime] = None,
            check_rows: bool = True, now: Optional[datetime] = None, key_shared: bool = False,
@@ -488,12 +506,16 @@ def verify(db, *, record: Optional[dict] = None, held: Optional[dict] = None, cu
     """Verify the chain in ``db``. ``record`` is the head record (None off the server); ``held`` the keys
     this verifier holds, by id. Rows are rebuilt for the hours in [from_hour, to_hour) (all when None).
     ``information`` False leaves out what each seal did (the daily check keeps only failures and warnings, and
-    a long chain holds a prune seal for nearly every hour)."""
+    a long chain holds a prune seal for nearly every hour). Every read is of one state of the database (one_state):
+    ``db`` must be a session that has not read yet, and a caller that reads more for the same check uses it and
+    ``report.view``."""
     ai = _ai()
+    one_state(db)
     now = now or ai.utcnow()
     report = Report()
     held = held or {}
     view = ai.View(keep_roots=True)
+    report.view = view
     generation = int((record or {}).get("generation") or 1)
     view.reset(generation, int((record or {}).get("discards") or 0))
     rec_seq = int(record["seq"]) if record and record.get("seq") else None
@@ -1066,7 +1088,9 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
                         from_hour=ai.hour_floor(now) - timedelta(days=7), now=now,
                         key_shared=st.current_key().source == "encryption", information=False)
         rolling_from = (record.get("check") or {}).get("rolling_from")
-        next_from = _rolling(db, st.view, report, ai.hour_floor(now) - timedelta(days=7),
+        # The same snapshot and the view built from it: the process's own view can be older than the snapshot
+        # (a host command committed meanwhile), and a part it still lists would read as gone.
+        next_from = _rolling(db, report.view, report, ai.hour_floor(now) - timedelta(days=7),
                              fmt.parse_time_text(rolling_from) if rolling_from else None)
     finally:
         db.close()
