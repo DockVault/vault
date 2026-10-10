@@ -32,7 +32,7 @@ retention period suits your organisation, are yours to decide.
 | [Database](#database) | PostgreSQL, volume `vault_pg_data` | Per table, below. |
 | [Cache](#cache-redis) | Redis. The shipped compose files keep its data in memory only (`/data` is a tmpfs). | Each key expires on its own, from minutes to a day (30 days for a lock with no end on a name that is no account). A restart of the Redis container empties it. |
 | [Files](#files) | Volume `vault_storage` | The file is deleted or expires. |
-| [Logs](#logs) | The container output, and a size-capped file in volume `vault_logs` | Rotation (the file) or your Docker logging settings (the output). |
+| [Logs](#logs) | The container output, and a size-capped file in volume `vault_logs` | Rotation: the file at 5 MB, the output at `DOCKER_LOG_MAX_SIZE` (10m) per file and `DOCKER_LOG_MAX_FILE` (5) files per container. |
 | [Email](#email) | Your SMTP server and the recipients' mailboxes | Outside DockVault. It keeps no copy of what it sends. |
 | [Exports and backups](#exports-backups-and-host-tools) | Wherever the person who made them saves them | Outside DockVault. |
 | [The browser](#the-browser) | Each person's browser storage | Sign-out, or the person clearing it. |
@@ -250,10 +250,13 @@ files except to serve them, and cannot read zero-knowledge ones.
   names or passwords. A database error's text leaves out the statement's values (**new in 0.33.0**),
   and an unexpected error, or a failed audit, notification or security-event write, is logged by its
   class and where it was raised. The database driver's own text can still name a value that broke a
-  uniqueness rule (a username, an address), and some older error lines print it. How long Docker
-  keeps this is set by the host's Docker logging
-  configuration; the shipped compose files set no limit, so set `max-size` and `max-file` for the
-  logging driver if you need one.
+  uniqueness rule (a username, an address), and some older error lines print it. The shipped compose
+  files rotate it (**new in 0.34.0**): Docker's `json-file` driver keeps at most `DOCKER_LOG_MAX_FILE`
+  files (5) of `DOCKER_LOG_MAX_SIZE` (10m) per container, so the oldest lines go as new ones arrive. A
+  deployment that updates only by pulling images keeps the compose files it was set up with, which
+  never rotate it, until it updates its checkout. A host whose Docker sends container output to
+  journald, syslog or a log shipper keeps it there only once the block is removed (README,
+  "Container logs").
 - **The log-access file** (volume `vault_logs`, `LOG_PULL_SINK_PATH`): the same web lines, and the
   SFTP server's in the combined single-container mode. It rotates at 5 MB and keeps two older files,
   about 15 MB in all, so the oldest lines go as new ones arrive. Administrators can read it through

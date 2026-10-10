@@ -277,6 +277,79 @@ RETENTION_ENV_KEYS = (
     ("audit_archive_start_after_days", "AUDIT_ARCHIVE_START_AFTER_DAYS", "14"),
 )
 
+# How much container output (`docker logs`) Docker keeps: every service of the shipped compose files rotates it
+# (json-file, at most DOCKER_LOG_MAX_FILE files of DOCKER_LOG_MAX_SIZE). (config key, .env name, the compose
+# files' default): written only when they differ from the default, and kept across a fresh volume set.
+CONTAINER_LOG_ENV_KEYS = (
+    ("docker_log_max_size", "DOCKER_LOG_MAX_SIZE", "10m"),
+    ("docker_log_max_file", "DOCKER_LOG_MAX_FILE", "5"),
+)
+# A size as Docker reads it (a number, then k/m/g/t/p, optionally "i" and "b"; decimal units).
+_LOG_SIZE = re.compile(r"^(\d+(?:\.\d+)?) ?([kmgtp])?i?b?$", re.IGNORECASE)
+_LOG_SIZE_UNITS = {None: 1, "k": 10 ** 3, "m": 10 ** 6, "g": 10 ** 9, "t": 10 ** 12, "p": 10 ** 15}
+
+
+def container_log_problems(env):
+    """What in ``env`` (a parsed .env) Docker would refuse as the rotation of container output: [] when nothing.
+    Docker creates no container whose log size is not a positive size or whose file count is below 1, so a stack
+    recreated with one would not come back; empty values take the compose files' defaults."""
+    problems = []
+    size = (env.get("DOCKER_LOG_MAX_SIZE") or "").strip()
+    if size:
+        m = _LOG_SIZE.match(size)
+        if not m or int(float(m.group(1)) * _LOG_SIZE_UNITS[(m.group(2) or "").lower() or None]) < 1:
+            problems.append("DOCKER_LOG_MAX_SIZE=%s is not a size Docker reads (for example 10m, 50m, 1g)" % size)
+    count = (env.get("DOCKER_LOG_MAX_FILE") or "").strip()
+    if count and not (re.match(r"^\+?\d+$", count) and int(count) >= 1):
+        problems.append("DOCKER_LOG_MAX_FILE=%s is not a whole number of files, 1 or more" % count)
+    return problems
+
+
+def host_log_driver(run=None):
+    """The Docker daemon's default logging driver ("json-file", "journald", ...), or None when it cannot be read."""
+    run = run or subprocess.run
+    try:
+        r = run(["docker", "info", "--format", "{{.LoggingDriver}}"], capture_output=True, text=True, timeout=25,
+                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    driver = (getattr(r, "stdout", "") or "").strip()
+    return driver if getattr(r, "returncode", 1) == 0 and driver else None
+
+
+def compose_sets_logging(root):
+    """Whether the secure compose file under ``root`` gives its services a ``logging:`` block: True, False (a
+    checkout from before the rotation, or one whose operator removed it to keep the host's own driver), or None
+    when there is no such file."""
+    try:
+        with open(os.path.join(root, "deploy", "docker-compose.secure.yml"), encoding="utf-8") as handle:
+            return re.search(r"^\s+logging:", handle.read(), re.MULTILINE) is not None
+    except OSError:
+        return None
+
+
+def container_log_note(root, run=None):
+    """A note for the operator about where container output goes, or None when there is nothing to say: the
+    checkout's compose files rotate nothing (they predate the rotation, or it was removed), or they rotate it in
+    json-file files while the host's Docker sends container output to another driver by default (which then no
+    longer gets DockVault's)."""
+    sets = compose_sets_logging(root)
+    if sets is None:
+        return None
+    driver = host_log_driver(run)
+    if not sets:
+        if driver not in (None, "json-file"):
+            return None      # the host's own driver keeps the output: the reason to remove the block
+        return ("The compose files of this checkout do not rotate container output, so Docker keeps it as this "
+                "host's settings say (with Docker's defaults, without limit). Update the checkout to get the rotation "
+                "(README, \"Container logs\").")
+    if driver in (None, "json-file"):
+        return None
+    return ("This host's Docker sends container output to '%s' by default, but DockVault's compose files keep "
+            "their containers' output in rotated json-file files instead (DOCKER_LOG_MAX_SIZE x DOCKER_LOG_MAX_FILE), "
+            "so '%s' does not get it. To keep '%s' for DockVault, see README, \"Container logs\"."
+            % (driver, driver, driver))
+
 # What the audit log may record of personal data at most: setup offers three presets for the AUDIT_MAX_* limits
 # (see .env.example). The panel then chooses the levels at or below them. "full" is the app's default (nothing is
 # written); with --lock-recording-levels each limit is also the level (SETTINGS_LOCKED_KEYS gains audit_levels).
@@ -573,6 +646,10 @@ def build_env_lines(cfg):
     # The limits on how long records are kept (see .env.example). Written only when they differ from the
     # app's defaults, so an install that never mentions them authors the .env it always did.
     for _cfg_key, _env_name, _default in RETENTION_ENV_KEYS:
+        if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
+            bare(_env_name, str(cfg[_cfg_key]).strip())
+    # And how much container output Docker keeps, same rule.
+    for _cfg_key, _env_name, _default in CONTAINER_LOG_ENV_KEYS:
         if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
             bare(_env_name, str(cfg[_cfg_key]).strip())
     # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
@@ -1359,6 +1436,9 @@ def new_set_config(current_env, new_prefix, new_id):
         # And its limits on how long records are kept.
         **{cfg_key: (current_env.get(env_name) or "").strip() or None
            for cfg_key, env_name, _default in RETENTION_ENV_KEYS},
+        # And how much container output Docker keeps.
+        **{cfg_key: (current_env.get(env_name) or "").strip() or None
+           for cfg_key, env_name, _default in CONTAINER_LOG_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
         # A new set is new data: its audit fingerprints get a key of their own, and so does its audit chain.
         "audit_fingerprint_key": gen_hex(32),
@@ -3473,7 +3553,10 @@ class DockVault:
     def restart(self, args=None):
         """Recreate the deployment (compose down + start, health-checked) so a changed .env takes
         effect. Data volumes are untouched. No prompt: this is an explicit in-place action, not the
-        standalone `down`."""
+        standalone `down`. A container-log rotation Docker would refuse stops it before anything is
+        taken down."""
+        if not self._container_logs_readable():
+            raise SystemExit(1)
         self._tear_down_containers()
         self.start(args)
 
@@ -3616,6 +3699,7 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        self._note_host_log_driver()
         # PROVE the container can read the TLS pair before starting anything. Host permissions do not
         # predict the container's view, and getting this wrong costs an endless restart loop whose
         # only symptom is uvicorn's "PermissionError: [Errno 13]" buried in the logs.
@@ -4098,9 +4182,26 @@ class DockVault:
         without the check the documented "re-run setup to upgrade" path would rebuild over a
         release image an operator deliberately chose — the same clobber the Update menu's pull path
         already avoids."""
+        if not self._container_logs_readable():
+            return False
         if uses_release_image(self._load_env()):
             return self._pull_release_image() and self._recreate_stack(build=False)
         return self._recreate_stack(build=True)
+
+    def _container_logs_readable(self):
+        """False, having said why, when .env sets a container-log rotation Docker would refuse: the stack is
+        then left as it is, rather than recreated into containers that cannot be created."""
+        problems = container_log_problems(self._load_env())
+        for problem in problems:
+            print(self.pal.paint("  %s; fix it in .env (or remove the line for the default). Nothing was "
+                                 "recreated." % problem, "red"))
+        return not problems
+
+    def _note_host_log_driver(self):
+        """Say where container output goes when the operator may not expect it (container_log_note)."""
+        note = container_log_note(self.root)
+        if note:
+            print(self.pal.paint("  Note: " + note, "yellow"))
 
     def _pull_release_image(self):
         """Pull the release image .env pins. Reports the remedy itself, since a failure here is
@@ -4122,6 +4223,8 @@ class DockVault:
         """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
         build=False recreates from the already-present image (the pull-update path - must NOT rebuild,
         or it would overwrite the just-pulled release image with a local build)."""
+        if not self._container_logs_readable():
+            return False
         if not self._remove_inactive_profile():
             return False
         args = ["up", "-d", "--force-recreate", "--remove-orphans"]
@@ -5312,6 +5415,8 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        if not self._container_logs_readable():
+            raise SystemExit(1)
         env = self._load_env()
         current, version_source = self._running_version(env.get("COMPOSE_PROFILES", "combined"))
         interactive = not (args and getattr(args, "non_interactive", False))
@@ -5326,6 +5431,7 @@ class DockVault:
                 "  %s is set in .env: this deployment starts even on data a newer version changed "
                 "in a way it cannot read. Remove it once you are back on that version or have "
                 "undone the change." % NEWER_DATA_ESCAPE, "yellow"))
+        self._note_host_log_driver()
 
         tag = getattr(args, "tag", None) if args else None
         from_source = bool(getattr(args, "source", False)) if args else False

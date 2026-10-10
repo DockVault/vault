@@ -163,6 +163,32 @@ jobs:
             || { echo "::error::the container healthcheck still fails after the thaw"; exit 1; }
           echo "A2b: frozen SFTP reported as unresponsive, healthcheck failed; recovered on thaw"
 
+      - name: Scenario A4 — container output is rotated
+        # Unbounded `docker logs` output fills the host's disk. Every service of the shipped compose
+        # files keeps it in rotated json-file files (DOCKER_LOG_MAX_SIZE x DOCKER_LOG_MAX_FILE, 10m x 5
+        # by default). Read the rendered file in both modes, then what Docker applied to each container
+        # it runs: a block compose renders but Docker never applies would rotate nothing.
+        run: |
+          set -euo pipefail
+          dc() { docker compose -f docker-compose.secure.yml "$@"; }
+          dc --profile combined --profile split config --format json | python3 -c '
+          import json, sys
+          services = json.load(sys.stdin)["services"]
+          want = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "5"}}
+          bad = sorted(name for name, s in services.items() if s.get("logging") != want)
+          print("rendered services:", ", ".join(sorted(services)))
+          sys.exit("not rotated in the rendered compose file: %s" % bad if bad or len(services) < 5 else 0)'
+          ids="$(dc ps -q)"
+          test -n "$ids" || { echo "::error::no running container to check"; exit 1; }
+          for cid in $ids; do
+            got="$(docker inspect -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "$cid")"
+            case "$got" in
+              *" json-file 10m 5") echo "rotated: $got" ;;
+              *) echo "::error::container output not rotated: $got"; exit 1 ;;
+            esac
+          done
+          echo "A4: every service rotates its output, rendered and applied"
+
       - name: Plant data to prove continuity against
         run: |
           set -euo pipefail
@@ -690,6 +716,16 @@ jobs:
           done
           test "$state" = healthy \
             || { echo "::error::Docker calls the published image's container '$state', not healthy"; exit 1; }
+
+          # The rotation of container output is in the compose files, not the image: with these files
+          # the previous release's containers rotate theirs too.
+          for cid in $(docker compose -f docker-compose.secure.yml ps -q); do
+            got="$(docker inspect -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "$cid")"
+            case "$got" in
+              *" json-file 10m 5") ;;
+              *) echo "::error::the published image's container output is not rotated: $got"; exit 1 ;;
+            esac
+          done
 
           # And it has to actually serve.
           for attempt in $(seq 1 20); do

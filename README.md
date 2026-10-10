@@ -308,6 +308,36 @@ but the on-disk layout still reveals **structure** — vault/file/folder counts,
 size (to within the format's fixed overhead), and modification times. That residual metadata channel is
 an explicit non-goal; host full-disk encryption is again the control against a volume reader.
 
+## Container logs
+
+Docker keeps each container's output (`docker logs`: the web access log and the application's own
+lines). The shipped compose files rotate it on every service: Docker's `json-file` driver, at most
+`DOCKER_LOG_MAX_FILE` files (default 5) of `DOCKER_LOG_MAX_SIZE` (default `10m`) each, so about 50 MB per
+container. To change either, set it in `.env` (for example `DOCKER_LOG_MAX_SIZE=50m`) and run
+`python dockvault.py restart`: Docker applies log settings when it creates a container.
+
+**Which deployments have it.** The rotation is in the compose files, not in the image. A deployment set up
+or updated from a 0.34.0 checkout (or later) has it. A deployment that updates only by pulling a newer
+image (`DOCKVAULT_IMAGE`, the Update menu's default) keeps the compose files it was set up with, and with
+them output that is never rotated: update the checkout to the release you run (for example
+`git fetch --tags && git checkout v0.34.0`), or add the `logging:` block of `deploy/docker-compose.secure.yml`
+to each service of your compose file by hand. To see what Docker applied to each container:
+
+```bash
+docker inspect -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{.HostConfig.LogConfig.Config}}' \
+  $(docker compose -f docker-compose.secure.yml ps -q)
+```
+
+**A host that sends every container's output elsewhere.** A service's own `logging:` replaces the host's
+default for that container. If your Docker daemon sends container output to journald, syslog or a log
+shipper (`log-driver` in `/etc/docker/daemon.json`), DockVault's containers would no longer go there. To
+keep the host's driver, delete the `logging: *logging` line from each service in
+`deploy/docker-compose.secure.yml` (and `deploy/docker-compose.yml` for the local trial), then run
+`python dockvault.py restart`; the host's own settings, including any rotation they set, apply again. Pointing
+the block at journald or syslog instead does not work: they refuse the `max-size` and `max-file` options.
+An update of the checkout brings the lines back, so remove them again after each one. `dockvault.py setup`
+and `update` say so when the daemon's default driver is not `json-file`.
+
 ## Update notifications (opt-in)
 
 DockVault can tell an admin when a newer release is available. It is **off by default**; set

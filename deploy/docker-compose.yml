@@ -16,6 +16,17 @@
 
 name: dockvault-vault
 
+# Container output (`docker logs`) is kept in rotated json-file files on every service: at most
+# DOCKER_LOG_MAX_FILE files of DOCKER_LOG_MAX_SIZE each per container (10m x 5 by default; set either in
+# .env). Unbounded output fills the host's disk. A service's own `logging:` replaces the host's default
+# driver for that container: on a host whose Docker sends every container's output elsewhere (journald,
+# syslog, a log shipper), see the README, "Container logs", before you remove these lines.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+
 services:
   vault-db:
     # Pinned to the 15 major ON PURPOSE — do not let a Dependabot bump carry this to 18+.
@@ -61,6 +72,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-redis:
     image: redis:8-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
@@ -94,6 +106,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-api:
     build:
@@ -178,6 +191,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-sftp:
     image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
@@ -264,6 +278,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
 volumes:
   # Labelled so dockvault.py can enumerate this deployment's volumes as one bundle (see the
