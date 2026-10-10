@@ -4,7 +4,8 @@ The form asks for a vault's password inside the selected case, and only where th
 the event's item once the vault is unlocked in it (``unlock_in_case``, app/services/activity_case.py): whether the
 auditor is a member of the vault or not, and never because of the words the item reads alone. The password goes to
 the case's own unlock route (the same rules and receipt as the case workspace), and the details are read again
-afterwards, on their own when the event is not on the list's page. The tests run the SHIPPED functions, lifted out
+afterwards, on their own when the event is not on the list's page. Another row or case chosen while that read, or the
+read of an event opened from a link, is under way stands. The tests run the SHIPPED functions, lifted out
 of ``static/js/activity.js`` verbatim, against stand-ins for the page; test_ui_activity_case_unlock.py runs the form
 in a browser.
 """
@@ -64,12 +65,19 @@ let S = { caseId: 'case-1', detailOpen: true, selectedId: 'ev-1', detail: { id: 
           rows: [{ id: 'ev-1' }] };
 const reloadList = async (o) => { calls.push(['reloadList', o && o.keepSelection]); };
 const renderDetail = () => { calls.push(['renderDetail', S.detail && S.detail.old ? 'old' : 'new']); };
-let FAIL_GET = false;
+let FAIL_GET = false;          // true: the read fails; a number: it fails with that status
+let DURING_GET = null;         // what the user does while a read is under way
 const get = async (path) => {
     calls.push(['get', path]);
-    if (FAIL_GET) throw new Error('down');
-    return { id: S.selectedId, old: false };
+    if (DURING_GET) { await null; DURING_GET(); }
+    if (FAIL_GET) throw Object.assign(new Error('down'), { status: FAIL_GET === true ? 500 : FAIL_GET });
+    return { id: decodeURIComponent(path.split('?')[0].split('/').pop()), old: false };
 };
+// A click on another row, while a read is under way: it selects that row and draws its details.
+const CLICK = () => { calls.push(['click']); S.selectedId = 'ev-2'; S.detail = { id: 'ev-2', clicked: true }; };
+const select = (id, o) => { calls.push(['select', id, !!(o && o.open)]); S.selectedId = id; };
+const openDetail = () => { calls.push(['openDetail', S.detail && S.detail.id]); };
+const showError = (text) => { calls.push(['showError', text]); };
 const forms = (box) => box.children.filter((c) => c.tag === 'form');
 """
 
@@ -160,6 +168,83 @@ def test_after_an_unlock_the_details_never_keep_what_they_showed_before(state, e
 })();
 """)
     assert out["calls"] == expected
+
+
+@pytest.mark.parametrize("during,expected,detail", [
+    # Nothing chosen meanwhile (the control): the event read again is drawn.
+    ("() => {}", [["get", "/activity/events/ev-1?case=case-1"], ["renderDetail", "new"]], {"id": "ev-1", "old": False}),
+    # Another row clicked: its details stand; the earlier event is neither kept nor drawn.
+    ("CLICK", [["get", "/activity/events/ev-1?case=case-1"], ["click"]], {"id": "ev-2", "clicked": True}),
+    # Another case chosen: what was read under the earlier case is not drawn under it.
+    ("() => { S.caseId = 'case-2'; }", [["get", "/activity/events/ev-1?case=case-1"]], {"id": "ev-1", "old": True}),
+    ("() => { S.caseId = null; }", [["get", "/activity/events/ev-1?case=case-1"]], {"id": "ev-1", "old": True}),
+])
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_choice_made_while_the_details_are_read_again_stands(during, expected, detail, fails):
+    if fails and during == "() => {}":
+        expected, detail = [expected[0], ["renderDetail", "old"]], {"id": "ev-1", "old": True}
+    out = _node(_page() + f"""
+S.rows = [{{ id: 'ev-2' }}];
+DURING_GET = {during};
+FAIL_GET = {'true' if fails else 'false'};
+(async () => {{
+    await reloadAfterUnlock();
+    console.log(JSON.stringify({{ calls, detail: S.detail }}));
+}})();
+""")
+    assert out["calls"] == [["reloadList", True]] + expected
+    assert out["detail"] == detail
+
+
+def _linked(state: str, during: str = "null") -> dict:
+    return _node(STUBS + _fn("openLinkedEvent") + f"""
+S.rows = [{{ id: 'ev-2' }}];
+{state}
+DURING_GET = {during};
+(async () => {{
+    await openLinkedEvent('ev-9');
+    console.log(JSON.stringify({{ calls, detail: S.detail, selected: S.selectedId,
+                                  missing: S.detailMissing === undefined ? null : S.detailMissing }}));
+}})();
+""")
+
+
+@pytest.mark.parametrize("state,during,expected", [
+    # Nothing chosen meanwhile (the controls): opened, said to be missing, or the error shown.
+    ("", "null", {"calls": [["openDetail", "ev-9"]], "detail": {"id": "ev-9", "old": False}, "selected": "ev-9",
+                  "missing": False}),
+    ("FAIL_GET = 404;", "null", {"calls": [["openDetail", None]], "detail": None, "selected": "ev-9",
+                                 "missing": True}),
+    ("FAIL_GET = 500;", "null", {"calls": [["showError", "The event could not be loaded: down"]], "detail": None,
+                                 "selected": "ev-9", "missing": False}),
+    # Another row clicked meanwhile: that choice stands, read or not, and nothing more is shown.
+    ("", "CLICK", {"calls": [["click"]], "detail": {"id": "ev-2", "clicked": True}, "selected": "ev-2",
+                   "missing": None}),
+    ("FAIL_GET = 404;", "CLICK", {"calls": [["click"]], "detail": {"id": "ev-2", "clicked": True}, "selected": "ev-2",
+                                  "missing": None}),
+    ("FAIL_GET = 500;", "CLICK", {"calls": [["click"]], "detail": {"id": "ev-2", "clicked": True}, "selected": "ev-2",
+                                  "missing": None}),
+    # Another case chosen meanwhile: the event read under the earlier one is not opened.
+    ("", "() => { S.caseId = 'case-2'; }", {"calls": [], "detail": None, "selected": "ev-9", "missing": None}),
+    ("FAIL_GET = 404;", "() => { S.caseId = null; }", {"calls": [], "detail": None, "selected": "ev-9",
+                                                       "missing": None}),
+])
+def test_a_linked_event_is_not_opened_over_a_choice_made_while_it_is_read(state, during, expected):
+    out = _linked(state, during)
+    assert out["calls"][0] == ["get", "/activity/events/ev-9?case=case-1"]
+    out["calls"] = out["calls"][1:]
+    assert out == expected
+
+
+def test_a_linked_event_on_the_page_is_selected_there_without_a_read():
+    out = _node(STUBS + _fn("openLinkedEvent") + """
+S.rows = [{ id: 'ev-2' }];
+(async () => {
+    await openLinkedEvent('ev-2');
+    console.log(JSON.stringify({ calls, selected: S.selectedId }));
+})();
+""")
+    assert out == {"calls": [["select", "ev-2", True]], "selected": "ev-2"}
 
 
 def test_the_administrators_unlock_reads_the_details_again_the_same_way():

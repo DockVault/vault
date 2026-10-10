@@ -315,14 +315,19 @@
 
     // After a vault's names were unlocked: the list read again, and the event in the details read again on its own
     // when it is not on the list's page (opened from a link), so the details never keep the names and the form from
-    // before the unlock.
+    // before the unlock. When another event or case is chosen while that read is under way, the details are left to
+    // the new choice.
     async function reloadAfterUnlock() {
         await reloadList({ keepSelection: true });
         const id = S.detailOpen ? S.selectedId : null;
         if (id && !S.rows.some((r) => r.id === id)) {
+            const caseId = S.caseId;
+            let ev = null;
             try {
-                S.detail = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+                ev = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
             } catch (_) { /* the details stay as they were; reading the list again says what went wrong */ }
+            if (S.selectedId !== id || S.caseId !== caseId) return;
+            if (ev) S.detail = ev;
         }
         renderDetail();
     }
@@ -2168,17 +2173,22 @@
         });
     }
 
-    // Open an event named in the URL (a copied link): from the list when it is there, else on its own.
+    // Open an event named in the URL (a copied link): from the list when it is there, else on its own. When another
+    // event or case is chosen while it is read, that choice stands and this one is not opened.
     async function openLinkedEvent(id) {
         if (S.rows.some((r) => r.id === id)) { select(id, { open: true, focus: false, scroll: true }); return; }
         S.selectedId = id;
         S.detail = null;
+        const caseId = S.caseId;
+        const moved = () => S.selectedId !== id || S.caseId !== caseId;
         try {
-            S.detail = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+            const ev = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+            if (moved()) return;
+            S.detail = ev;
             S.detailMissing = false;
             S.detailWhere = null;
         } catch (err) {
-            if (S.blocked) return;
+            if (S.blocked || moved()) return;
             S.detailMissing = err.status === 404 || err.status === 422;
             if (!S.detailMissing) { showError(`The event could not be loaded: ${err.message}`); return; }
         }
