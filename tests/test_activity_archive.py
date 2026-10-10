@@ -413,6 +413,52 @@ def test_the_searchs_table_goes_with_it(env):
         assert s.db.query(func.count()).select_from(sa.table(archive.SEARCH_TABLE)).scalar() == 4 * 18
 
 
+def test_a_search_reads_only_the_archived_rows_of_its_range(env):
+    _corpus(env, None)
+    _archive_all(env)
+    # From noon of the second day (its 13:00, 17:00 and 22:00 rows) to 09:00 of the fourth (its 01:00 and 05:00).
+    with _search(env, at(ARCHIVED[1], 12), at(ARCHIVED[3], 9)) as s:
+        assert s.db.query(func.count()).select_from(sa.table(archive.SEARCH_TABLE)).scalar() == 9 + 18 + 6
+
+
+_open_part = arc.open_part
+
+
+def _altered(monkeypatch, change):
+    """open_part, with each block it opens changed by ``change(block)`` once its digest has been checked."""
+    real = _open_part
+
+    def opened(db, day, part, payload=None):
+        block = real(db, day, part, payload)
+        change(block)
+        return block
+    monkeypatch.setattr(arc, "open_part", opened)
+
+
+def test_a_block_that_says_it_is_another_part_or_holds_a_row_of_another_hour_is_left_out(env, monkeypatch):
+    _corpus(env, None)
+    _archive_all(env)
+    monkeypatch.setattr(archive, "RETRY_PAUSE", 0)
+    _altered(monkeypatch, lambda block: block.header.__setitem__("part", 7))
+    with _search(env, at(ARCHIVED[3], 0)) as s:
+        assert s.unreadable == {ARCHIVED[3].isoformat(): "block-altered"}
+        assert s.db.query(func.count()).select_from(sa.table(archive.SEARCH_TABLE)).scalar() == 0
+
+    def moved(block):
+        rows = block.rows
+
+        def shifted():
+            for i, row in enumerate(rows()):
+                if i == 4:
+                    row = dict(row, timestamp=row["timestamp"] - timedelta(days=1))
+                yield row
+        block.rows = shifted
+    _altered(monkeypatch, moved)
+    with _search(env, at(ARCHIVED[3], 0)) as s:
+        assert s.unreadable == {ARCHIVED[3].isoformat(): "block-altered"}
+        assert s.db.query(func.count()).select_from(sa.table(archive.SEARCH_TABLE)).scalar() == 0
+
+
 # --------------------------------------------------------------------------- the band
 
 def _band_want(env, win, filters, lo, hi, block="events"):
@@ -474,6 +520,19 @@ def test_a_block_of_the_band_counts_hours_inside_its_own_time_filter(env):
         got, _note = archive.band_archive(db, win, per_block, lo, None, T0, env.st)
     assert _band_got(got["categories"]) == want != {}
     assert sum(n for _b, _a, n, _f, _u, _uf in got["events"]) < 4 * 18      # the events block: files only
+
+
+def test_the_band_counts_archived_hours_from_its_start_only(env):
+    _corpus(env, None)
+    _archive_all(env)
+    lo = at(ARCHIVED[2], 0)
+    win = summary.custom_window(lo, T0)
+    with env.session() as db:
+        got, note = archive.band_archive(db, win, summary.block_filters({"categories": ["files"]}), lo, None, T0,
+                                         env.st)
+    # The category mix leaves out the category filter: every archived row from the start on, two days of 18.
+    assert sum(r[2] for r in got["categories"]) == 2 * 18
+    assert note["oldest_day"] == ARCHIVED[0].isoformat()        # where the archive is, not where the band starts
 
 
 def test_under_a_filter_the_aggregates_cannot_answer_a_block_counts_rows_only(env):
