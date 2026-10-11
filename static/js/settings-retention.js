@@ -147,6 +147,7 @@
     function renderRow(row) {
         const item = el('div', 'retention-row');
         item.dataset.key = row.key;
+        item.dataset.setting = row.key;   // its level, "New" and the provider's lock (settings-levels.js)
         const head = el('div', 'retention-head');
         const label = el('label', 'retention-label', row.label);
         label.htmlFor = `retention-input-${row.key}`;
@@ -201,8 +202,8 @@
             item.appendChild(value);
             let why;
             if (row.locked) {
-                why = `Locked by the deployment (SETTINGS_LOCKED_KEYS). To change it, set ${envLine(row)} in .env to ` +
-                    'the value you want, then run docker compose up -d.';
+                why = `Set by your provider and locked (SETTINGS_LOCKED_KEYS). Whoever runs the vault changes it: ` +
+                    `${envLine(row)} in .env, then docker compose up -d.`;
             } else if (row.editable === 'env_only') {
                 why = `Set in .env: ${envLine(row)}. Change it there, then run docker compose up -d.`;
             } else {
@@ -224,6 +225,7 @@
             if (!mine.length) return;
             const section = el('section', 'retention-group');
             section.dataset.group = group;
+            section.dataset.settingGroup = '';   // hidden while every setting in it is (settings-levels.js)
             section.appendChild(el('h4', null, title));
             mine.forEach((r) => section.appendChild(renderRow(r)));
             box.appendChild(section);

@@ -8392,6 +8392,7 @@ function renderRateLimitSettings(rows, apiEnabled) {
 function _rlBuildRow(row) {
     const wrap = _el('div', 'rl-row');
     wrap.dataset.key = row.key;
+    wrap.dataset.setting = row.key;   // its level, "New" and the provider's lock (settings-levels.js)
     wrap.style.cssText = 'border:1px solid var(--border, #e5e7eb); border-radius:8px; padding:10px 12px; margin-bottom:8px;';
 
     // Header: label (+unit) and an info toggle.

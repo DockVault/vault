@@ -13,6 +13,7 @@ import re
 
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -31,6 +32,7 @@ def _open(page: Page):
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    show_advanced(page, "records")
     expect(page.locator("#retention-groups .retention-row").first).to_be_visible(timeout=10000)
 
 
@@ -89,7 +91,8 @@ def test_values_show_their_source_and_a_locked_one_its_env_line(page: Page, admi
     _open(page)
     hot = _row(page, "audit_hot_days")
     expect(hot.locator(".retention-source")).to_have_text("Locked")
-    expect(hot).to_contain_text("Locked by the deployment (SETTINGS_LOCKED_KEYS). To change it, set AUDIT_HOT_DAYS=")
+    expect(hot).to_contain_text("Set by your provider and locked (SETTINGS_LOCKED_KEYS). Whoever runs the vault changes "
+                                "it: AUDIT_HOT_DAYS=")
     expect(hot.locator("input")).to_have_count(0)
     start = _row(page, "audit_archive_start_after_days")
     expect(start).to_contain_text("Set in .env: AUDIT_ARCHIVE_START_AFTER_DAYS=")
@@ -262,6 +265,7 @@ def test_an_install_from_before_this_release_is_told_once(page: Page, admin_cred
     page.click("#retention-banner-dismiss")
     expect(banner).to_be_hidden()
     page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    show_advanced(page, "records")
     page.wait_for_timeout(800)
     expect(banner).to_be_hidden()
     page.evaluate("() => { try { localStorage.removeItem('dockvault.retention.banner.dismissed'); } catch (e) {} }")

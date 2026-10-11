@@ -6,6 +6,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import unique
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -22,6 +23,7 @@ def _login(page: Page, username: str, password: str):
 def _open_notelinks(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     page.click('#settings-section .tab-btn[data-tab="notelinks"]')
+    show_advanced(page, "notelinks")
     expect(page.locator("#settings-tab-notelinks")).to_be_visible(timeout=10000)
 
 

@@ -5,6 +5,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import unique
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -23,6 +24,7 @@ def _login(page: Page, username: str, password: str):
 def _open_uploadlinks_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     page.click('#settings-section .tab-btn[data-tab="uploadlinks"]')
+    show_advanced(page, "uploadlinks")
     expect(page.locator("#settings-tab-uploadlinks")).to_be_visible(timeout=10000)
 
 

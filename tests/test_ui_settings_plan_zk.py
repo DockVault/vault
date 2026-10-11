@@ -10,6 +10,7 @@ import json
 
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -45,6 +46,7 @@ def _open_sftp_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
     page.click('.tab-btn[data-tab="sftp"]')
+    show_advanced(page, "sftp")
     expect(page.locator("#settings-tab-sftp")).to_be_visible()
 
 

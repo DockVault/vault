@@ -7,6 +7,8 @@ import time
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import show_advanced
+
 pytestmark = pytest.mark.ui
 
 
@@ -23,6 +25,7 @@ def _open_general(page, admin_creds):
     _login(page, admin_creds["username"], admin_creds["password"])
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-tab-general")).to_be_visible(timeout=10000)
+    show_advanced(page, "general")         # the update checks are an advanced setting
 
 
 def _mock_status(page, payload):

@@ -9,6 +9,7 @@ import json
 
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -28,6 +29,7 @@ def _open(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.click('#settings-section .tab-btn[data-tab="records"]')
+    show_advanced(page, "records")
     expect(page.locator(TAB)).to_be_visible()
     expect(page.locator("#recording-levels-table tbody tr")).to_have_count(5, timeout=10000)
 
@@ -97,6 +99,7 @@ def test_the_table_fits_a_phone(page: Page, admin_creds):
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    show_advanced(page, "records")
     expect(page.locator("#recording-levels-table tbody tr")).to_have_count(5, timeout=10000)
     width = page.evaluate("() => document.getElementById('recording-levels-card').scrollWidth")
     assert width <= 375, width

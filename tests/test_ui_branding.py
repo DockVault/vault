@@ -19,6 +19,7 @@ import subprocess
 
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 # a real 1x1 PNG (valid signature) for the A4 logo-upload e2e; base64 keeps the source ASCII.
 _PNG_1x1 = base64.b64decode(
@@ -189,6 +190,7 @@ def test_admin_branding_editor_saves_live(page: Page, admin_creds, admin):
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
         page.click('.tab-btn[data-tab="branding"]')
+        show_advanced(page, "branding")
         tagline = page.locator("#setting-brand-tagline")
         expect(tagline).to_be_visible(timeout=10000)
         tagline.fill("Editor Wired Tagline")
@@ -221,6 +223,7 @@ def test_admin_uploads_logo_via_form(page: Page, admin_creds, admin, tmp_path):
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
         page.click('.tab-btn[data-tab="branding"]')
+        show_advanced(page, "branding")
         expect(page.locator("#brand-logo-upload")).to_be_visible(timeout=10000)
         page.set_input_files("#brand-logo-file", str(png))
         page.click("#brand-logo-upload")

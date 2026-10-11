@@ -8,6 +8,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import skip_for_older_deployment
+from _settings_ui import show_advanced
 
 
 def _endpoint_present(admin):
@@ -31,6 +32,7 @@ def _login(page: Page, username: str, password: str):
 def _open_log_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     page.click('.tab-btn[data-tab="logs"]')
+    show_advanced(page, "logs")
     expect(page.locator("#settings-tab-logs")).to_be_visible(timeout=10000)
 
 

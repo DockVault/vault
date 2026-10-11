@@ -8,6 +8,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import unique
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -25,6 +26,7 @@ def _open_sharing_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
     page.click('.tab-btn[data-tab="sharing"]')
+    show_advanced(page, "sharing")
     expect(page.locator("#settings-tab-sharing")).to_be_visible()
     # initSettings deliberately keeps Save disabled while /settings, /groups, and the other
     # asynchronous form dependencies populate controls. Do not mutate a switch or open a picker
