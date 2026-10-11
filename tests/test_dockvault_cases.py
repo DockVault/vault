@@ -5,7 +5,8 @@ Offline: the container is replaced by a stand-in that records what it was asked 
 What must hold: the menu and the command exist; an auditor right is approved only with the account's username
 typed again and a case only with its reference typed again, both checked before the container is asked to
 change anything; a refusal stops with its reason; text from the server cannot act on the terminal; the tool runs
-in the web service of either layout. test_host_compliance_live.py runs the tool on a running stack.
+in the web service of either layout; the data inventory says what each action prints and records.
+test_host_compliance_live.py runs the tool on a running stack.
 """
 import importlib.util
 from pathlib import Path
@@ -185,3 +186,35 @@ def test_the_tool_runs_in_the_web_service_of_either_layout(app, monkeypatch):
     assert app._run_case_tool("list") == {"ok": True, "grants": [], "cases": []}
     assert [a[2] for a in asked] == ["vault", "vault-api"]
     assert asked[0][3:] == ("python", "-m", "app.core.host_compliance", "list")
+
+
+# What the data inventory says of each of the tool's actions: every one is named there, so an action added without
+# saying what it prints or records fails here.
+INVENTORY_SAYS = {
+    "list": "lists the open auditor rights and cases",
+    "show": "shows where an auditor's account came from",
+    "grant-approve": "approving an auditor right",
+    "approve": "approving an auditor right or a case",
+    "reject": "turning a case down",
+    "confirm-hold": "confirming a case's legal hold",
+    "revoke-auditor": "revoking an auditor right",
+    "downgrade-blockers": "What stops going back to an older version is listed without any personal data",
+}
+
+
+def test_the_data_inventory_says_what_the_tool_prints_and_what_it_records():
+    inventory = (ROOT / "docs" / "data-inventory.md").read_text(encoding="utf-8")
+    assert inventory.count("**`python dockvault.py cases`**") == 1
+    # The bullet as one line, so a sentence is found wherever the file wraps it.
+    flat = " ".join(inventory.split())
+    said = flat[flat.index("- **`python dockvault.py cases`** on the host (new in 0.34.0):"):]
+    said = said[:said.index(" ## ")]
+    assert set(INVENTORY_SAYS) == {k for k, _ in dv.CASE_ACTIONS}
+    for action, claim in INVENTORY_SAYS.items():
+        assert claim in said, (action, claim)
+    for claim in ("(usernames, states, dates, a case's purpose and legal basis)",
+                  "(when and by whom it was created, who set its password, whether it has an authenticator)",
+                  "only when the server's operator may approve a case, the case's justification",
+                  "Printed on the host's terminal and not audited, since the operator can read the database anyway",
+                  "are audited as the host operator"):
+        assert claim in said, claim

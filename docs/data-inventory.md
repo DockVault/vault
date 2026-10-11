@@ -322,8 +322,9 @@ the recipients' mailboxes.
   (usernames, states, dates, a case's purpose and legal basis), shows where an auditor's account came from
   (when and by whom it was created, who set its password, whether it has an authenticator) and, only when
   the server's operator may approve a case, the case's justification. Printed on the host's terminal and not
-  audited, since the operator can read the database anyway; approving, turning down and revoking are
-  audited as the host operator.
+  audited, since the operator can read the database anyway; approving an auditor right or a case, turning a
+  case down, confirming a case's legal hold and revoking an auditor right are audited as the host operator.
+  What stops going back to an older version is listed without any personal data.
 
 ## The browser
 

@@ -7,7 +7,9 @@ once in ten minutes; live sessions, transfers, the temporary-credential typeahea
 administrator's. The live signal reaches a live auditor's own session. A case selected limits the events to its own
 rows and its vaults; its auditor, while it gives access, reads the names it lets them read (in its folders and time
 range, never zero-knowledge, a password vault once unlocked), and a page that shows one is recorded once per set of
-events in ten minutes. test_activity_auditor_live.py runs it on a stack.
+events in ten minutes. Where only the vault's password hides a name the case would show, its auditor (a member of the
+vault or not) is told so and offered it, and no one else; what their own unlock on the Activity page shows stays.
+test_activity_auditor_live.py runs it on a stack.
 """
 # ruff: noqa: F811 -- the fixtures of _case_access_helpers are imported by name and used as parameters
 import uuid
@@ -323,11 +325,13 @@ def test_a_zero_knowledge_vault_shows_its_label_and_a_password_vault_its_names_o
             _event(db, "file_download", by=people.olga, resource_type="file", resource_id=pf.id, vault=pv)]
     views, _shown_, _sel = _shown(db, people, case, rows)
     assert views[0]["names"] == {"vault": zk.name, "item": an.NOT_SHOWN}
-    assert views[1]["names"] == {"vault": pv.name, "item": an.NOT_SHOWN}, "locked: no file names"
+    assert views[1]["names"] == {"vault": pv.name, "item": an.PASSWORD_HIDDEN}, "locked: no file names"
+    assert ac.UNLOCK_IN_CASE not in views[0] and views[1][ac.UNLOCK_IN_CASE] is True
     unlock = f"{pv.id}={_receipt(case, pv, people.uma)}"
     views, _shown_, _sel = _shown(db, people, case, rows, unlock=unlock)
     assert views[1]["names"]["item"] == "salaries.csv"
     assert views[0]["names"]["item"] == an.NOT_SHOWN
+    assert not any(ac.UNLOCK_IN_CASE in v for v in views)
 
 
 def test_a_member_of_the_vault_sees_nothing_because_of_the_case(db, people, storage, monkeypatch):
@@ -512,3 +516,212 @@ def test_the_events_route_selects_the_case_through_its_search_form(db, people, s
     assert len(_rows(db, ac.VIEWED)) == 1
     plain = asr.search_events(asr.EventsSearch(limit=100), request, current_user=people.uma, db=db)
     assert str(other.id) in {e["id"] for e in plain["events"]}, "without the case, every event"
+
+
+# --------------------------------------------------------------------------- a password vault in the case
+
+def _locked_world(db, people, storage):
+    """olga's vault with a vault password, its folders Company > Board minutes and Company > Holidays, and the events
+    a case on Board minutes (files changed in the last 30 days) is about: a file in it, a kept one, one with a password
+    of its own, an old one, one beside it, an old one changed in the last days; one deleted for good; the three
+    folders; the vault itself."""
+    pv = _vault(db, people.olga, password="argon2-hash")
+    top = _folder(db, pv, None, "Company")
+    board = _folder(db, pv, top, "Board minutes")
+    side = _folder(db, pv, top, "Holidays")
+    inside = _file(db, storage, pv, name="salaries.csv", folder=board)
+    held = _kept(db, _file(db, storage, pv, name="draft.txt", folder=board))
+    own = _file(db, storage, pv, name="private.txt", folder=board, password_hash="file-hash")
+    old = _file(db, storage, pv, name="old.txt", folder=board)
+    old.created_at = old.updated_at = ca.utcnow() - timedelta(days=400)
+    beside = _file(db, storage, pv, name="beach.jpg", folder=side)
+    # Uploaded long before the case's range, changed inside it: the case names it by the change.
+    changed = _file(db, storage, pv, name="agenda.txt", folder=board)
+    changed.created_at = ca.utcnow() - timedelta(days=400)
+    changed.updated_at = ca.utcnow() - timedelta(days=2)
+    db.commit()
+    assert changed.created_at < ca.utcnow() - timedelta(days=30) < changed.updated_at, "the times stay as set"
+    case = _case(db, people, [{"kind": "folder", "target_id": board.id}], files_from=ca.utcnow() - timedelta(days=30))
+    rows = [_event(db, "file_download", by=people.olga, resource_type="file", resource_id=x.id, vault=pv)
+            for x in (inside, held, own, old, beside, changed)]
+    rows.append(_event(db, "file_delete", by=people.olga, resource_type="file", resource_id=uuid.uuid4(), vault=pv))
+    rows += [_event(db, "folder_create", by=people.olga, resource_type="folder", resource_id=x.id, vault=pv)
+             for x in (board, top, side)]
+    rows.append(_event(db, "vault_settings_changed", by=people.olga, resource_type="vault", resource_id=pv.id))
+    return SimpleNamespace(pv=pv, case=case, rows=rows)
+
+
+# Where the case's auditor is offered the vault's password: the file in the case's folder, the kept one, the old one
+# changed in the case's range, the folder and the way to it; never a file with a password of its own, an old one, one
+# beside it, one deleted for good, the folder beside it or the vault itself.
+OFFERED = [True, True, False, False, False, True, False, True, True, False, False]
+NAMED_ONCE_UNLOCKED = ["salaries.csv", "draft.txt", an.NOT_SHOWN, an.NOT_SHOWN, an.NOT_SHOWN, "agenda.txt",
+                       an.NOT_SHOWN, "Board minutes", "Company", an.NOT_SHOWN, None]
+
+
+def _offered(views):
+    return [v.get(ac.UNLOCK_IN_CASE) is True for v in views]
+
+
+def test_a_non_member_auditor_is_told_the_vault_password_hides_what_the_case_would_name(db, people, storage):
+    """Not a member of the vault, the case's auditor reads its name and, for each item the case would name once the
+    vault is unlocked in the case, that its password hides it (the page offers the password there). That is not a
+    name: nothing is recorded as shown for it. Once unlocked: the names, and nothing offered."""
+    w = _locked_world(db, people, storage)
+    views, shown, _sel = _shown(db, people, w.case, w.rows)
+    assert _offered(views) == OFFERED
+    assert [v["names"]["item"] for v in views] == [
+        an.PASSWORD_HIDDEN if offered else (None if v["resource_type"] == "vault" else an.NOT_SHOWN)
+        for v, offered in zip(views, OFFERED)]
+    assert all(v["names"]["vault"] == w.pv.name for v in views)
+    assert all(s == {"vault"} for s in shown), "a hidden name is not a name shown because of the case"
+    unlock = f"{w.pv.id}={_receipt(w.case, w.pv, people.uma)}"
+    views, shown, _sel = _shown(db, people, w.case, w.rows, unlock=unlock)
+    assert [v["names"]["item"] for v in views] == NAMED_ONCE_UNLOCKED
+    assert not any(_offered(views))
+    # A receipt given to another session unlocks nothing: still offered.
+    other = f"{w.pv.id}={_receipt(w.case, w.pv, people.uma, session='another-session')}"
+    views, _shown_, _sel = _shown(db, people, w.case, w.rows, unlock=other)
+    assert _offered(views) == OFFERED
+
+
+def test_no_one_else_is_offered_the_password_in_a_case(db, people, storage, settings, monkeypatch):
+    """Without the case selected, to an administrator selecting it (member of the vault or not), under a deployment
+    that refuses password vaults to cases or a case that passes passwords over, once the case gives no access, and in
+    a zero-knowledge vault: nothing is offered, and nobody is told more than they were."""
+    w = _locked_world(db, people, storage)
+    plain = _views(w.rows)
+    for view, names in zip(plain, an.names_for(db, people.uma, plain)):
+        view["names"] = names
+    assert not any(_offered(plain)) and all(v["names"]["item"] in (an.NOT_SHOWN, None) for v in plain), "no case"
+    views, _s, _sel = _shown(db, people, w.case, w.rows, viewer=people.bob)
+    assert not any(_offered(views)) and all(v["names"]["item"] in (an.NOT_SHOWN, None) for v in views)
+    with monkeypatch.context() as member:
+        member.setattr(an, "readable_vault_ids", lambda db_, viewer, ids: set(ids))
+        views, _s, _sel = _shown(db, people, w.case, w.rows, viewer=people.bob)
+        assert not any(_offered(views)), "an administrator who reads the vault unlocks it on the Activity page"
+        assert views[0]["names"]["item"] == views[4]["names"]["item"] == an.PASSWORD_HIDDEN
+        # An auditor who is also a member: offered exactly where the case would name the item.
+        views, _s, _sel = _shown(db, people, w.case, w.rows)
+        assert _offered(views) == OFFERED and views[4]["names"]["item"] == an.PASSWORD_HIDDEN
+    settings[cs.PASSWORD_VAULTS] = cs.REFUSE
+    views, _s, _sel = _shown(db, people, w.case, w.rows)
+    assert not any(_offered(views)) and all(v["names"]["vault"] == an.NOT_SHOWN for v in views), "refused"
+    settings[cs.PASSWORD_VAULTS] = cs.OVERRIDE
+    over = _case(db, people, _vaults(w.pv), password_override=True)
+    views, _s, _sel = _shown(db, people, over, w.rows)
+    assert not any(_offered(views)) and views[0]["names"]["item"] == "salaries.csv", "opened without the password"
+    settings[cs.PASSWORD_VAULTS] = cs.WITH_PASSWORD
+    w.case.access_ends_at = ca.utcnow() - timedelta(seconds=1)
+    db.commit()
+    views, _s, sel = _shown(db, people, w.case, w.rows)
+    assert not sel.names and not any(_offered(views)), "the case gives no access now"
+    zk = _vault(db, people.olga, kind="zero_knowledge", password="argon2-hash")
+    zf = _file(db, storage, zk, name="sealed.bin")
+    zcase = _case(db, people, _vaults(zk))
+    row = _event(db, "file_download", by=people.olga, resource_type="file", resource_id=zf.id, vault=zk)
+    views, _s, _sel = _shown(db, people, zcase, [row])
+    assert not any(_offered(views)) and views[0]["names"]["item"] == an.NOT_SHOWN
+
+
+def test_the_offer_follows_the_cases_range_by_upload_or_by_change(db, people, storage):
+    """A case on a vault with a vault password, for files uploaded or changed between 30 and 10 days ago. Its auditor
+    is offered the password for a file uploaded in the range and changed after it, and for one uploaded before it and
+    changed in it, both named once it is given; never for one uploaded before the range and changed after it."""
+    pv = _vault(db, people.olga, password="argon2-hash")
+    now = ca.utcnow()
+
+    def made(name, uploaded, changed):
+        f = _file(db, storage, pv, name=name)
+        f.created_at, f.updated_at = now - timedelta(days=uploaded), now - timedelta(days=changed)
+        return f
+    files = [made("uploaded-in.txt", 20, 2), made("changed-in.txt", 40, 15), made("neither.txt", 40, 2)]
+    db.commit()
+    assert [(f.created_at, f.updated_at) for f in files] == [
+        (now - timedelta(days=u), now - timedelta(days=c)) for u, c in ((20, 2), (40, 15), (40, 2))]
+    case = _case(db, people, _vaults(pv), files_from=now - timedelta(days=30), files_to=now - timedelta(days=10))
+    rows = [_event(db, "file_download", by=people.olga, resource_type="file", resource_id=f.id, vault=pv)
+            for f in files]
+    views, _s, _sel = _shown(db, people, case, rows)
+    assert _offered(views) == [True, True, False]
+    assert [v["names"]["item"] for v in views] == [an.PASSWORD_HIDDEN, an.PASSWORD_HIDDEN, an.NOT_SHOWN]
+    views, _s, _sel = _shown(db, people, case, rows, unlock=f"{pv.id}={_receipt(case, pv, people.uma)}")
+    assert [v["names"]["item"] for v in views] == ["uploaded-in.txt", "changed-in.txt", an.NOT_SHOWN]
+    assert not any(_offered(views))
+
+
+def test_telling_a_name_is_hidden_decrypts_no_name(db, people, storage):
+    """Whether the case would name an item of a locked vault is read from its columns: no file or folder (live or
+    kept) is loaded, so no name is decrypted before the vault is unlocked in the case."""
+    from sqlalchemy import event as sa_event
+    w = _locked_world(db, people, storage)
+    models = (m.File, m.Folder, m.HeldFile, m.HeldFolder)
+    for obj in [o for o in db.identity_map.values() if isinstance(o, models)]:
+        db.expunge(obj)                     # read from the database, not handed back from the session
+    loaded = []
+
+    def spy(target, *_args):
+        loaded.append(type(target).__name__)
+    for model in models:
+        sa_event.listen(model, "load", spy)
+    try:
+        views, _s, _sel = _shown(db, people, w.case, w.rows)
+        assert _offered(views) == OFFERED
+        assert loaded == []
+        # The control: once unlocked in the case, the items it names are loaded (their names decrypted) and seen here.
+        views, _s, _sel = _shown(db, people, w.case, w.rows, unlock=f"{w.pv.id}={_receipt(w.case, w.pv, people.uma)}")
+        assert views[0]["names"]["item"] == "salaries.csv" and {"File", "HeldFile", "Folder"} <= set(loaded)
+    finally:
+        for model in models:
+            sa_event.remove(model, "load", spy)
+
+
+def test_the_events_route_offers_the_password_to_the_cases_auditor_only(db, people, storage):
+    """Through the Events list and one event: the case's auditor is told the name is hidden by the vault's password
+    and offered it there; an administrator selecting the case is not."""
+    w = _locked_world(db, people, storage)
+    request = SimpleNamespace(headers={})
+    out = asr.search_events(asr.EventsSearch(case=str(w.case.id), limit=100), request, current_user=people.uma, db=db)
+    mine = {e["id"]: e for e in out["events"]}
+    first = mine[str(w.rows[0].id)]
+    assert first["names"]["item"] == an.PASSWORD_HIDDEN and first[ac.UNLOCK_IN_CASE] is True
+    assert ac.UNLOCK_IN_CASE not in mine[str(w.rows[4].id)]
+    one = api.activity_event(str(w.rows[0].id), case=str(w.case.id), request=request, current_user=people.uma, db=db)
+    assert one["names"]["item"] == an.PASSWORD_HIDDEN and one[ac.UNLOCK_IN_CASE] is True
+    theirs = asr.search_events(asr.EventsSearch(case=str(w.case.id), limit=100), request, current_user=people.bob,
+                               db=db)
+    assert not any(ac.UNLOCK_IN_CASE in e for e in theirs["events"])
+
+
+def test_what_the_viewers_own_unlock_shows_stays_and_is_not_offered_again(db, people, storage, monkeypatch):
+    """The case's auditor reads the vault and unlocked its names on the Activity page with their own receipt (an
+    administrator may hold the auditor right). With the case selected, through the Events list and one event, each
+    item keeps what that unlock shows (the name as recorded, or that none was) and nothing is offered. The control:
+    the same reader without their receipt is told the password hides the names, and offered it in the case."""
+    from app.core import audit_privacy
+    from app.core import vault_unlock_receipts as receipts
+    w = _locked_world(db, people, storage)
+    w.rows[0].recorded = {"names": {"vault": str(w.pv.id), "values": {
+        "file_name": {"fp": "fp1", "sealed": "sealed-file"}}}}
+    db.commit()
+    monkeypatch.setattr(audit_privacy, "open_name", lambda vault, row_id, key, sealed: f"opened:{sealed}")
+    monkeypatch.setattr(an, "readable_vault_ids", lambda db_, viewer, ids: set(ids))
+    own = receipts.issue(purpose=receipts.PURPOSE_ACTIVITY, session_hash=SESSION, vault_id=w.pv.id,
+                         user_id=people.uma.id, credential=receipts.credential_digest(w.pv.password_hash))[0]
+    wanted = [str(r.id) for r in w.rows]
+
+    def read(headers):
+        request = SimpleNamespace(headers=headers)
+        out = asr.search_events(asr.EventsSearch(case=str(w.case.id), limit=100), request, current_user=people.uma,
+                                db=db)
+        listed = {e["id"]: e for e in out["events"]}
+        one = api.activity_event(wanted[0], case=str(w.case.id), request=request, current_user=people.uma, db=db)
+        return [listed[i] for i in wanted], one
+
+    views, one = read({})
+    assert _offered(views) == OFFERED and one[ac.UNLOCK_IN_CASE] is True, "the control: hidden, and offered"
+    assert views[0]["names"]["item"] == one["names"]["item"] == an.PASSWORD_HIDDEN
+    views, one = read({an.UNLOCK_HEADER: f"{w.pv.id}:{own}"})
+    assert not any(_offered(views)) and ac.UNLOCK_IN_CASE not in one
+    assert views[0]["names"]["item"] == one["names"]["item"] == "opened:sealed-file"
+    assert [v["names"]["item"] for v in views[1:]] == [an.NOT_RECORDED] * 9 + [None]

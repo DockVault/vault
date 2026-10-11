@@ -12,6 +12,13 @@ whose contents the case may open (never zero-knowledge; a password vault once un
 under the override); and the names the recording levels kept in full in the log, on the same terms. A name never
 leaves a vault the case does not cover.
 
+Where the case would name an item but the vault's password, not yet given in the case, hides it, the item reads
+"Name hidden: the vault has a password" (also for an auditor who is not a member of the vault) and the event carries
+``unlock_in_case``: the page offers the vault's password there, sent to the case's own unlock route (the same rules
+and receipt as the case workspace). No one else is told, and no event without it. An item the viewer already reads
+through their own unlock of the vault on the Activity page (an administrator's: the name as recorded, or that none
+was) keeps what that shows, and is not offered.
+
 ``case_names_viewed`` is written only when a page shows at least one name because of the case (a name the auditor
 would not see without it), and at most once per auditor, case and set of such events in ten minutes. Every
 committed row signals the open page, which fetches it: a row per page would feed itself. The row carries
@@ -28,6 +35,8 @@ from typing import Dict, List, Optional, Set
 
 QUIET = timedelta(minutes=10)
 VIEWED = "case_names_viewed"
+# On an event whose item the case would name once the vault's password is given in the case.
+UNLOCK_IN_CASE = "unlock_in_case"
 
 
 def utcnow() -> datetime:
@@ -116,15 +125,34 @@ class _Reader:
 
     def item(self, vault_id, kind: str, item_id):
         """The item (a file or a folder, live or kept) when the case may name it, else None."""
+        if item_id is None or not self.items_open(vault_id):
+            return None
+        return self._in_case(vault_id, kind, item_id)
+
+    def hidden_by_password(self, vault_id, kind: str, item_id) -> bool:
+        """Whether only the vault's password keeps this item's name from the case's auditor: the case opens the vault
+        with its password and it is not unlocked in the case, and the item (live or kept) is one the case names once
+        it is (in its folders and time range, never a file with a password of its own). Reads only the columns those
+        checks need, so no name is decrypted for it."""
+        opening = self.openings.get(vault_id)
+        if item_id is None or opening is None or not opening.locked:
+            return False
+        return self._in_case(vault_id, kind, item_id, names=False) is not None
+
+    def _in_case(self, vault_id, kind: str, item_id, *, names: bool = True):
+        """The item when it is in the case's vault, folders and time range (with ``names``, the row itself, its name
+        decrypted on load; without, only the columns the checks read), else None."""
         from app.core import case_access as ca
         from app.core import case_rules as rules
         from app.core.models import File, Folder, HeldFile, HeldFolder
-        if item_id is None or not self.items_open(vault_id):
-            return None
         live, kept = (File, HeldFile) if kind == "file" else (Folder, HeldFolder)
-        obj = self.db.get(live, item_id)
+        if names:
+            obj = self.db.get(live, item_id)
+        else:
+            obj = self.db.query(*_check_columns(live)).filter(live.id == item_id).first()
         if obj is None and ca._kept_readable(self.db):
-            obj = self.db.query(kept).filter(kept.id == item_id, ca._not_due(kept, self.now)).first()
+            q = self.db.query(kept) if names else self.db.query(*_check_columns(kept))
+            obj = q.filter(kept.id == item_id, ca._not_due(kept, self.now)).first()
         if obj is None or obj.vault_id != vault_id:
             return None
         scope = self._scope(vault_id)
@@ -144,10 +172,19 @@ class _Reader:
         return obj
 
 
+# What _Reader._in_case checks of an item, and nothing else: its name stays sealed.
+_CHECKED = ("id", "vault_id", "folder_id", "created_at", "updated_at", "password_hash")
+
+
+def _check_columns(model):
+    return [getattr(model, c) for c in _CHECKED if hasattr(model, c)]
+
+
 def case_names(db, selection: Selection, events: List[dict], rows, *, now: Optional[datetime] = None) -> List[set]:
     """Show in ``events`` (with their "names" and "recorded_names" already set for the viewer) the names the case
-    lets its auditor read, in place. Returns, per event, the keys shown because of the case (empty: none)."""
-    from app.services.activity_names import VAULT_NAME_KEY, targets
+    lets its auditor read, in place, and mark the events whose item the vault's password given in the case would name
+    (UNLOCK_IN_CASE). Returns, per event, the keys shown because of the case (empty: none)."""
+    from app.services.activity_names import NOT_SHOWN, PASSWORD_HIDDEN, VAULT_NAME_KEY, targets
     now = now or utcnow()
     shown: List[set] = [set() for _ in events]
     if not selection.names:
@@ -169,6 +206,12 @@ def case_names(db, selection: Selection, events: List[dict], rows, *, now: Optio
             if name and names.get("item") != name:
                 names["item"] = name
                 shown[i].add("item")
+            elif (obj is None and names.get("item") in (NOT_SHOWN, PASSWORD_HIDDEN)
+                  and reader.hidden_by_password(vault_id, kind, item_id)):
+                # Not a name: what hides it, and that the vault's password given in the case shows it. Only over
+                # what hid it from the viewer anyway: what their own unlock of the vault shows them stays.
+                names["item"] = PASSWORD_HIDDEN
+                event[UNLOCK_IN_CASE] = True
         recorded = _recorded(db, reader, row, vault_id, kind, item_id)
         if recorded:
             mine = event.get("recorded_names") or {}

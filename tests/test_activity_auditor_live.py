@@ -4,17 +4,23 @@ An auditor whose right is in force reads the log (the events, one event, the sum
 the typeahead, saved searches, the export) and not the live views; their reading is recorded once in ten minutes.
 Their socket hears the live signal (an id and a category, nothing more) until the right ends. With their case
 selected, the events are the case's own and those on its vaults, a file's name shows because of the case, and N
-fetches of the same page write one ``case_names_viewed`` row. Anyone else, and an administrator the case concerns,
-is answered that there is no such case. test_activity_auditor.py covers the rules offline.
+fetches of the same page write one ``case_names_viewed`` row. In a vault with a vault password the auditor is no
+member of, the case's event says the password hides the file's name and offers it, and the password given in the
+case shows it; with a case on one folder for a time range, only where the case names the item. An administrator who
+holds the right and unlocked a vault's names on the Activity page keeps what that shows with their case selected.
+Anyone else, and an administrator the case concerns, is answered that there is no such case.
+test_activity_auditor.py covers the rules offline.
 """
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from _account_change_helpers import psql
+from _account_change_helpers import own_password, psql, signed_in
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault, wait_for
+from _sf_helpers import enroll_totp
 from conftest import ApiClient, unique
 
 websocket = pytest.importorskip("websocket")  # websocket-client
@@ -148,3 +154,172 @@ def test_a_case_selected_shows_its_names_and_a_page_fetched_again_writes_no_more
     # The owner, who is no auditor, reads no log at all; an unknown case is not found.
     assert olga_c.get("/activity/events", params={"case": case["id"]}).status_code == 403
     assert uma_c.get("/activity/events", params={"case": "00000000-0000-0000-0000-000000000000"}).status_code == 404
+
+
+HIDDEN = "Name hidden: the vault has a password"
+NOT_SHOWN = "Not shown: you are not a member of this vault"
+
+
+def test_a_password_vault_in_the_case_is_offered_its_password_and_named_once_given(world):
+    """uma is no member of olga's vault with a vault password. With her case on it selected, the event of a file in it
+    says the password hides the name and offers it (unlock_in_case); without the case, or to an administrator
+    selecting it, nothing is offered. The password given in the case (its own route and receipt) shows the name."""
+    _uma, uma_c, _codes = world["uma"]
+    _olga, olga_c, _vid = world["olga"]
+    password = "Vault-Pass-2026!"
+    pv = olga_c.create_vault(name=unique("locked"), password=password)["id"]
+    case = None
+    try:
+        name = f"{unique('plan')}.txt"
+        up = olga_c.post(f"/vaults/{pv}/files", files=[("files", (name, b"the plan", "text/plain"))],
+                         headers={"X-Vault-Password": password})
+        assert up.status_code in (200, 201), up.text
+        fid = up.json()["files"][0]["id"]
+        case = approved_case(world["admins"], world["uma"], [pv])
+
+        def about_the_file(client, params, headers=None):
+            r = client.get("/activity/events", params={"limit": 100, **params}, headers=headers or {})
+            assert r.status_code == 200, r.text[:300]
+            found = [e for e in r.json()["events"] if e.get("resource_id") == fid]
+            assert found, "the upload's event is listed"
+            return found
+
+        mine = about_the_file(uma_c, {"case": case["id"]})
+        assert all(e["names"]["item"] == HIDDEN and e.get("unlock_in_case") is True for e in mine), mine
+        assert all(e["names"]["vault"] != NOT_SHOWN for e in mine), "the case shows its vault's name"
+        plain = about_the_file(uma_c, {"vault_id": pv})
+        assert all(e["names"]["item"] == NOT_SHOWN and "unlock_in_case" not in e for e in plain), plain
+        _ada, ada_c, _ = world["admins"]["ada"]
+        theirs = about_the_file(ada_c, {"case": case["id"]})
+        assert all("unlock_in_case" not in e and e["names"]["item"] != name for e in theirs), theirs
+        unlock = f"/compliance/cases/{case['id']}/vaults/{pv}/unlock"
+        assert uma_c.post(unlock, json={"password": "not the password"}).status_code == 403
+        r = uma_c.post(unlock, json={"password": password})
+        assert r.status_code == 200, r.text
+        given = {"X-Case-Unlock": f"{pv}={r.json()['receipt']}"}
+        named = about_the_file(uma_c, {"case": case["id"]}, given)
+        assert all(e["names"]["item"] == name and "unlock_in_case" not in e for e in named), named
+        one = uma_c.get(f"/activity/events/{named[0]['id']}", params={"case": case["id"]}, headers=given)
+        assert one.status_code == 200 and one.json()["names"]["item"] == name, one.text[:300]
+        # The receipt opens the vault in this case only: in the list without the case, the name stays hidden.
+        assert all(e["names"]["item"] == NOT_SHOWN for e in about_the_file(uma_c, {"vault_id": pv}, given))
+    finally:
+        if case is not None:
+            forget_cases([case["id"]], [pv])
+        olga_c.delete_vault(pv, vault_password=password)
+
+
+def test_a_case_on_one_folder_offers_the_password_only_where_it_would_name_the_item(world):
+    """A case on one folder of olga's vault with a vault password, for files changed in the last 30 days; uma is no
+    member of the vault. The password is offered, and once given in the case the names show, exactly where the case
+    names the item: the folder, a new file in it, and an old file in it changed in the range. Never an old file in it
+    left alone, a file in the folder beside it, a file at the top of the vault or the folder beside it; never to an
+    administrator selecting the case."""
+    _uma, uma_c, _codes = world["uma"]
+    _olga, olga_c, _vid = world["olga"]
+    password = "Vault-Pass-2026!"
+    pv = olga_c.create_vault(name=unique("folders"), password=password)["id"]
+    sent = {"X-Vault-Password": password}
+    case = None
+    try:
+        def folder(name):
+            r = olga_c.post(f"/vaults/{pv}/folders", json={"name": name, "parent_folder_id": None}, headers=sent)
+            assert r.status_code in (200, 201), r.text
+            return r.json()["folder"]["id"]
+
+        def upload(name, folder_id=None):
+            r = olga_c.post(f"/vaults/{pv}/files", files=[("files", (name, b"x", "text/plain"))],
+                            params={"folder_id": folder_id} if folder_id else None, headers=sent)
+            assert r.status_code in (200, 201), r.text
+            return r.json()["files"][0]["id"]
+
+        inside, beside = folder("Inside"), folder("Beside")
+        names = {key: f"{unique(key)}.txt" for key in ("new", "changed", "old", "beside", "top")}
+        ids = {"new": upload(names["new"], inside), "changed": upload(names["changed"], inside),
+               "old": upload(names["old"], inside), "beside": upload(names["beside"], beside),
+               "top": upload(names["top"]), "inside": inside, "beside_folder": beside}
+        long_ago = "(now() at time zone 'utc') - interval '400 days'"
+        psql(f"UPDATE files SET created_at = {long_ago}, updated_at = {long_ago} WHERE id = '{ids['old']}'")
+        psql(f"UPDATE files SET created_at = {long_ago}, updated_at = (now() at time zone 'utc') - interval '2 days' "
+             f"WHERE id = '{ids['changed']}'")
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        case = approved_case(world["admins"], world["uma"], [], scope=[{"kind": "folder", "target_id": inside}],
+                             files_from=since)
+
+        def read(client, headers=None):
+            r = client.get("/activity/events", params={"case": case["id"], "vault_id": pv, "limit": 200},
+                           headers=headers or {})
+            assert r.status_code == 200, r.text[:300]
+            got, events = {}, {}
+            for e in r.json()["events"]:
+                for key, rid in ids.items():
+                    if e.get("resource_id") == rid:
+                        got.setdefault(key, set()).add((e["names"]["item"], e.get("unlock_in_case")))
+                        events[key] = e["id"]
+            assert set(got) == set(ids), got
+            return got, events
+
+        offered = {"new", "changed", "inside"}
+        locked, events = read(uma_c)
+        assert locked == {key: {(HIDDEN, True) if key in offered else (NOT_SHOWN, None)} for key in ids}, locked
+        one = uma_c.get(f"/activity/events/{events['changed']}", params={"case": case["id"]})
+        assert one.status_code == 200 and one.json().get("unlock_in_case") is True, one.text[:300]
+        _ada, ada_c, _ = world["admins"]["ada"]
+        theirs, _events = read(ada_c)
+        assert not any(mark for got in theirs.values() for _name, mark in got), theirs
+        r = uma_c.post(f"/compliance/cases/{case['id']}/vaults/{pv}/unlock", json={"password": password})
+        assert r.status_code == 200, r.text
+        named, _events = read(uma_c, {"X-Case-Unlock": f"{pv}={r.json()['receipt']}"})
+        shown = {"new": names["new"], "changed": names["changed"], "inside": "Inside"}
+        assert named == {key: {(shown[key], None)} if key in offered else {(NOT_SHOWN, None)} for key in ids}, named
+    finally:
+        if case is not None:
+            forget_cases([case["id"]], [pv])
+        olga_c.delete_vault(pv, vault_password=password)
+
+
+def test_an_administrators_own_unlock_is_kept_with_their_case_selected(world):
+    """An administrator may hold the auditor right. dan, one who does, is a member of olga's vault with a vault
+    password and unlocked its names on the Activity page. With dan's case on that vault selected, the file's event
+    reads what dan's own unlock shows without the case, and nothing is offered. The control: without that unlock, the
+    case says the password hides the name and offers it."""
+    admin = world["admin"]
+    _olga, olga_c, _vid = world["olga"]
+    dan = own_password(admin.create_user(role="admin"))
+    dan_c = signed_in(dan)
+    _secret, codes = enroll_totp(dan, dan_c)
+    grant_right(world["admins"], dan["id"])
+    password = "Vault-Pass-2026!"
+    pv = olga_c.create_vault(name=unique("shared"), password=password)["id"]
+    sent = {"X-Vault-Password": password}
+    case = None
+    try:
+        up = olga_c.post(f"/vaults/{pv}/files", files=[("files", (f"{unique('memo')}.txt", b"memo", "text/plain"))],
+                         headers=sent)
+        assert up.status_code in (200, 201), up.text
+        fid = up.json()["files"][0]["id"]
+        r = olga_c.post(f"/vaults/{pv}/permissions", json={"user_id": dan["id"], "level": "read"}, headers=sent)
+        assert r.status_code in (200, 201), r.text
+        case = approved_case(world["admins"], (dan, dan_c, codes), [pv])
+
+        def about_the_file(params, headers=None):
+            r = dan_c.get("/activity/events", params={"vault_id": pv, "limit": 100, **params}, headers=headers or {})
+            assert r.status_code == 200, r.text[:300]
+            found = {(e["names"]["item"], e.get("unlock_in_case")) for e in r.json()["events"]
+                     if e.get("resource_id") == fid}
+            assert found, "the upload's event is listed"
+            return found
+
+        assert about_the_file({"case": case["id"]}) == {(HIDDEN, True)}, "the control: hidden, and offered"
+        r = dan_c.post(f"/activity/vaults/{pv}/unlock", json={"password": password})
+        assert r.status_code == 200, r.text
+        own = {"X-Activity-Unlock": f"{pv}:{r.json()['receipt']}"}
+        alone = about_the_file({}, own)
+        assert len(alone) == 1 and not {name for name, _mark in alone} & {HIDDEN, NOT_SHOWN}, alone
+        assert about_the_file({"case": case["id"]}, own) == alone, "the case keeps what dan's own unlock shows"
+    finally:
+        if case is not None:
+            forget_cases([case["id"]], [pv])
+        forget_grants(dan["id"])
+        olga_c.delete_vault(pv, vault_password=password)
+        admin.delete_user(dan["id"])

@@ -310,7 +310,25 @@
         const out = await apiRequest(`/activity/vaults/${encodeURIComponent(vid)}/unlock`,
             { method: 'POST', body: JSON.stringify({ password }), silent: true });
         UNLOCKS.set(vid, { receipt: out.receipt, expires: Date.parse(out.expires_at) || (Date.now() + 15 * 60000) });
+        await reloadAfterUnlock();
+    }
+
+    // After a vault's names were unlocked: the list read again, and the event in the details read again on its own
+    // when it is not on the list's page (opened from a link), so the details never keep the names and the form from
+    // before the unlock. When another event or case is chosen while that read is under way, the details are left to
+    // the new choice.
+    async function reloadAfterUnlock() {
         await reloadList({ keepSelection: true });
+        const id = S.detailOpen ? S.selectedId : null;
+        if (id && !S.rows.some((r) => r.id === id)) {
+            const caseId = S.caseId;
+            let ev = null;
+            try {
+                ev = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+            } catch (_) { /* the details stay as they were; reading the list again says what went wrong */ }
+            if (S.selectedId !== id || S.caseId !== caseId) return;
+            if (ev) S.detail = ev;
+        }
         renderDetail();
     }
 
@@ -341,10 +359,12 @@
     }
 
     // An auditor's steps on one event: its vault's password in the selected case, its recorded names revealed (with a
-    // reason; the owner is told), or a new case about its vault (static/js/compliance.js).
+    // reason; the owner is told), or a new case about its vault (static/js/compliance.js). The password is asked for
+    // only where the server says the case would name the item once its vault is unlocked in the case (unlock_in_case:
+    // app/services/activity_case.py), member of the vault or not; it goes to the case's own unlock route.
     function auditorActions(ev, vid, names) {
         const box = el('div', 'act-auditor-actions');
-        if (S.caseId && names.item === 'Name hidden: the vault has a password' && typeof window.complianceUnlockCaseVault === 'function') {
+        if (S.caseId && ev.unlock_in_case === true && typeof window.complianceUnlockCaseVault === 'function') {
             const form = el('form', 'act-unlock');
             const input = el('input', 'form-control act-unlock-password');
             input.type = 'password';
@@ -360,8 +380,7 @@
                 go.disabled = true;
                 try {
                     await window.complianceUnlockCaseVault(S.caseId, vid, input.value);
-                    await reloadList({ keepSelection: true });
-                    renderDetail();
+                    await reloadAfterUnlock();
                 } catch (err) { msg.textContent = err.message || 'Not unlocked.'; go.disabled = false; }
                 input.value = '';
             });
@@ -2154,17 +2173,22 @@
         });
     }
 
-    // Open an event named in the URL (a copied link): from the list when it is there, else on its own.
+    // Open an event named in the URL (a copied link): from the list when it is there, else on its own. When another
+    // event or case is chosen while it is read, that choice stands and this one is not opened.
     async function openLinkedEvent(id) {
         if (S.rows.some((r) => r.id === id)) { select(id, { open: true, focus: false, scroll: true }); return; }
         S.selectedId = id;
         S.detail = null;
+        const caseId = S.caseId;
+        const moved = () => S.selectedId !== id || S.caseId !== caseId;
         try {
-            S.detail = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+            const ev = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+            if (moved()) return;
+            S.detail = ev;
             S.detailMissing = false;
             S.detailWhere = null;
         } catch (err) {
-            if (S.blocked) return;
+            if (S.blocked || moved()) return;
             S.detailMissing = err.status === 404 || err.status === 422;
             if (!S.detailMissing) { showError(`The event could not be loaded: ${err.message}`); return; }
         }
