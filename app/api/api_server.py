@@ -741,6 +741,9 @@ app.include_router(managed_settings_router)
 # What the audit log records of personal data (Settings -> Activity and records).
 from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
 app.include_router(recording_levels_router)
+# What the Settings pages need to sort, mark and search every setting (its level, release and lock).
+from app.api.settings_catalogue_router import router as settings_catalogue_router  # noqa: E402
+app.include_router(settings_catalogue_router)
 # What users are told the audit log records: the public notice, its page, and the banner after a change.
 from app.api.recording_notice_router import router as recording_notice_router  # noqa: E402
 app.include_router(recording_notice_router)
@@ -10152,15 +10155,24 @@ _PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size",
                                          "activity_range"})
 
 
+# Preferences the app writes itself rather than picks from a list, each kept only when its value has the shape
+# given: the release at which an administrator last opened the Settings pages (written only by
+# POST /settings/catalogue/seen, app/api/settings_catalogue_router.py; PUT /users/me/preferences cannot set it).
+_PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")}
+
+
 def _sanitize_preferences(data) -> dict:
-    """Keep only known keys whose value is in that key's whitelist; drop the rest."""
+    """Keep only known keys whose value is in that key's whitelist (or has its pattern's shape); drop the rest."""
     if not isinstance(data, dict):
         return {}
-    return {
+    kept = {
         key: data[key]
         for key, allowed in _PREF_ALLOWED.items()
         if isinstance(data.get(key), str) and data[key] in allowed
     }
+    kept.update({key: data[key] for key, pattern in _PREF_PATTERNS.items()
+                 if isinstance(data.get(key), str) and pattern.fullmatch(data[key])})
+    return kept
 
 
 class PreferencesUpdate(BaseModel):

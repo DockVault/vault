@@ -39,6 +39,8 @@ NOT_RECORDED = {
         "an unconfirmed enrollment; the second factor is recorded when it is switched on",
     ("app/api/api_server.py", "PUT /users/me/preferences"):
         "the person's own display preferences (skin, sort order)",
+    ("app/api/settings_catalogue_router.py", "POST /settings/catalogue/seen"):
+        "the person's own display preference: the release they last opened Settings at, for its New marks",
     ("app/api/api_server.py", "PUT /note-links/{link_id}/token-copy"):
         "stores the owner's sealed copy of a link address they already made; the link is recorded",
     ("app/api/api_server.py", "PUT /public-links/{link_id}/token-copy"):
