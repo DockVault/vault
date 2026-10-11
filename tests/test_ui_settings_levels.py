@@ -376,3 +376,33 @@ def test_nothing_is_wider_than_a_phone(page: Page, levels_admin, skin):
         b = part.bounding_box()
         assert b["x"] >= 0 and b["x"] + b["width"] <= PHONE["width"] + 1, b
     assert page.evaluate("() => document.documentElement.scrollWidth") <= PHONE["width"] + 1
+
+
+def test_the_search_leaves_out_a_setting_the_app_hides(page: Page, levels_admin):
+    """The update checks' controls show only while the checks are on; while they are off the search does not
+    offer them (going to them would find nothing to show)."""
+    status = {"enabled": False}
+    page.route("**/api/update-status*", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({"enabled": status["enabled"], "managed": False, "current": "0.6.0", "latest": "0.6.0",
+                         "update_available": False, "checked_at": 1700000000, "interval_minutes": 360})))
+    _login(page, levels_admin)
+    _open(page)
+    expect(page.locator("#update-controls")).to_be_hidden()
+    box = page.locator("#settings-search")
+    hit = page.locator('#settings-search-results .settings-search-hit[data-key="update_check_interval"]')
+    box.fill("update checks")
+    expect(page.locator("#settings-search-results")).to_contain_text("No setting matches.")
+    expect(hit).to_have_count(0)
+    box.press("Escape")
+    # On: the Settings pages read the status again when they open, and the search offers the checks.
+    status["enabled"] = True
+    page.click('.sidebar-item[data-section="dashboard"]')
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator("#update-controls")).to_be_attached()
+    page.wait_for_function("() => document.getElementById('update-controls').style.display !== 'none'",
+                           timeout=10000)
+    box.fill("update checks")
+    expect(hit).to_be_visible()
+    hit.click()
+    expect(page.locator("#update-controls")).to_be_visible()

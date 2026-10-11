@@ -37,6 +37,9 @@
 
     function section() { return document.getElementById('settings-section'); }
 
+    // A value inside a selector: the server's keys are plain names, but a selector never trusts that.
+    function q(value) { return window.CSS && CSS.escape ? CSS.escape(String(value)) : String(value); }
+
     function pageEls() {
         const root = section();
         return root ? Array.from(root.querySelectorAll('.settings-tab-content[id^="settings-tab-"]')) : [];
@@ -48,7 +51,7 @@
     }
 
     function pageName(page) {
-        const tab = document.querySelector(`#settings-section .tab-btn[data-tab="${page}"]`);
+        const tab = document.querySelector(`#settings-section .tab-btn[data-tab="${q(page)}"]`);
         return tab ? tab.textContent.trim() : page;
     }
 
@@ -175,7 +178,7 @@
             const item = el('li', 'settings-provider-item');
             item.dataset.foldKey = row.key;
             const head = el('div', 'settings-provider-head');
-            const nodes = Array.from(pageEl.querySelectorAll(`[data-setting="${row.key}"]`));
+            const nodes = Array.from(pageEl.querySelectorAll(`[data-setting="${q(row.key)}"]`));
             head.appendChild(el('strong', null, row.label || (nodes.length ? titleText(nodes[0]) : '') || row.key));
             if (row.value) head.appendChild(el('span', 'settings-provider-value', row.value));
             item.appendChild(head);
@@ -252,24 +255,32 @@
 
     // ------------------------------------------------------------------ the search
 
+    // What the search can find: every marked setting on the pages, and every entry of the catalogue (a row a
+    // page draws only when it opens is found by its catalogue label). A setting the app itself hides (the
+    // update checks while they are off) is left out.
     function candidates() {
         const found = {};
         pageEls().forEach((pageEl) => {
             pageEl.querySelectorAll('[data-setting]').forEach((node) => {
                 const key = node.dataset.setting;
-                if (found[key]) return;
-                found[key] = { key, page: pageOf(node), label: titleText(node), help: helpText(node) };
+                const item = found[key] || (found[key] = {
+                    key, page: pageOf(node), label: titleText(node), help: helpText(node), drawn: true, shown: false,
+                });
+                if (present(node)) item.shown = true;
             });
         });
         if (S.data) {
             S.data.entries.forEach((e) => {
-                const item = found[e.key] || (found[e.key] = { key: e.key, page: e.page, label: '', help: '' });
+                const item = found[e.key] || (found[e.key] = {
+                    key: e.key, page: e.page, label: '', help: '', drawn: false, shown: false,
+                });
                 if (e.label) item.label = e.label;
                 if (e.help && item.help.indexOf(e.help) < 0) item.help = `${e.help} ${item.help}`.trim();
                 item.page = e.page;
             });
         }
-        return Object.values(found).filter((item) => item.label || item.help);
+        return Object.values(found).filter((item) => (item.label || item.help)
+            && (!item.drawn || item.shown));
     }
 
     function search(query) {
@@ -339,25 +350,25 @@
     function firstPresent(page, key) {
         const pageEl = document.getElementById(`settings-tab-${page}`);
         if (!pageEl) return null;
-        return Array.from(pageEl.querySelectorAll(`[data-setting="${key}"]`)).find(present) || null;
+        return Array.from(pageEl.querySelectorAll(`[data-setting="${q(key)}"]`)).find(present) || null;
     }
 
     async function go(key) {
         const entry = entryOf(key);
-        const node = document.querySelector(`#settings-section [data-setting="${key}"]`);
+        const node = document.querySelector(`#settings-section [data-setting="${q(key)}"]`);
         const page = entry ? entry.page : node && pageOf(node);
         if (!page) return;
         closeResults();
         const input = document.getElementById('settings-search');
         if (input) input.value = '';
-        const tab = document.querySelector(`#settings-section .tab-btn[data-tab="${page}"]`);
+        const tab = document.querySelector(`#settings-section .tab-btn[data-tab="${q(page)}"]`);
         if (tab && !tab.classList.contains('active')) tab.click();
         let target;
         if (isFolded(entry)) {
             applyNow();
-            const box = document.querySelector(`#settings-tab-${page} > .settings-provider-fold`);
+            const box = document.querySelector(`#settings-tab-${q(page)} > .settings-provider-fold`);
             if (box) box.open = true;
-            target = box && box.querySelector(`[data-fold-key="${key}"]`);
+            target = box && box.querySelector(`[data-fold-key="${q(key)}"]`);
         } else {
             if (isAdvanced(entry)) S.show[page] = true;
             applyNow();
