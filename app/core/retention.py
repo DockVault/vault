@@ -55,31 +55,37 @@ INTERVAL_KEY = "log_prune_interval_minutes"
 BATCH_KEY = "log_prune_batch_rows"
 
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=HOLD_KEY, kind="bool", default=False, env="retention_hold", reduction=registry.LOWER,
     floor="retention_hold",
     group="retention", label="Hold all deletion of logs",
     help="While on, nothing deletes audit rows, security records or security alerts: for an incident, or "
          "while records must be kept. Turning it off deletes sooner, so it waits before it takes effect."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=INTERVAL_KEY, kind="int", default=15, env="log_prune_interval_minutes", minimum=1, maximum=1440,
     editable=registry.ENV_ONLY, group="retention", unit="minutes",
     label="Time between two passes of the pruner",
     help="At most 360 minutes take effect: the audit log's integrity chain needs a seal at least every 12 "
          "hours, or every pending reduction waits the time between two passes longer."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=BATCH_KEY, kind="int", default=5000, env="log_prune_batch_rows", minimum=100, maximum=100000,
     editable=registry.ENV_ONLY, group="retention", unit="rows",
     label="Rows the pruner deletes in one transaction"))
 # Fixed windows, listed so the panel can say what the vault keeps and for how long. Each is tied to a rule.
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key="session_records_days", kind="int", default=30, editable=registry.FIXED, group="working_records",
     unit="days", label="Finished sessions and sign-ins waiting for a second factor",
     help="Kept 30 days after they end (longer when a sign-in's token lives longer), then deleted."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key="credential_change_records_days", kind="int", default=14, editable=registry.FIXED,
     group="working_records", unit="days", label="Records of changes to people's sign-in details",
     help="Kept 14 days after the change, or after the request was decided, then deleted."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key="rate_limit_records_hours", kind="int", default=1, editable=registry.FIXED, group="working_records",
     unit="hours", label="Sign-in throttle records kept while the cache is unavailable",
     help="Deleted an hour after their window starts."))

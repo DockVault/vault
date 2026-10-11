@@ -70,6 +70,7 @@ HOUR = timedelta(hours=1)
 
 LAG_KEY = "audit_seal_lag_minutes"
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=LAG_KEY, kind="int", default=60, env="audit_seal_lag_minutes", minimum=0, maximum=1440,
     editable=registry.ENV_ONLY, group="audit_integrity", unit="minutes",
     label="Wait after an hour closes before its audit rows are sealed",

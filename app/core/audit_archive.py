@@ -69,11 +69,13 @@ HOT_DAYS_KEY = "audit_hot_days"
 START_AFTER_KEY = "audit_archive_start_after_days"
 
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=HOT_DAYS_KEY, kind="int", default=90, env="audit_hot_days", minimum=31, maximum=3650,
     group="audit_retention", unit="days", label="Keep audit rows uncompressed for",
     help="Older days are compressed into daily blocks, each checked against the log's seals before its rows "
          "are removed. Nothing is deleted: the rows can be restored with dockvault.py audit unarchive."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=START_AFTER_KEY, kind="int", default=14, env="audit_archive_start_after_days", minimum=0, maximum=90,
     editable=registry.ENV_ONLY, group="audit_retention", unit="days",
     label="Days after this release first ran before archiving begins",

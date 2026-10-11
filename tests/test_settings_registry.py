@@ -53,7 +53,7 @@ def clean(monkeypatch):
                           hold=False, mode="fast")
     monkeypatch.setattr(reg, "_deployment_settings", lambda: env)
     reg.all_specs()                                   # import the spec modules before setting them aside
-    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS)]
+    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS, reg._FIELDS)]
     contracts = list(reg._CONTRACTS)
     for table, _ in saved:
         table.clear()
@@ -66,10 +66,14 @@ def clean(monkeypatch):
     reg._CONTRACTS[:] = contracts
 
 
+# Where a throwaway listed key or group is placed on the Settings pages.
+_PLACE = dict(level=reg.ADVANCED, since="0.34.0", page="security")
+
+
 def _days(**kw):
     base = dict(key="keep_days", kind="int", default=90, env="keep_days", minimum=1, maximum=3650,
                 floor="keep_floor", ceiling="keep_ceiling", unlimited=0, reduction=reg.LOWER, group="keeping",
-                label="Keep for")
+                label="Keep for", level=reg.ADVANCED, since="0.34.0")
     base.update(kw)
     return reg.SettingSpec(**base)
 
@@ -189,7 +193,8 @@ def test_the_lock_names_that_match_nothing_are_reported(clean):
 
 def test_a_switch_is_clamped_by_its_floor(clean):
     clean.hold = True
-    spec = reg.SettingSpec(key="hold_on", kind="bool", default=False, floor="hold", reduction=reg.LOWER)
+    spec = reg.SettingSpec(key="hold_on", kind="bool", default=False, floor="hold", reduction=reg.LOWER,
+                           level=reg.ADVANCED, since="0.34.0")
     with registered(spec):
         _store("hold_on", False)
         assert reg.resolve("hold_on") is True
@@ -231,7 +236,7 @@ def test_each_kind_checks_its_values(spec, value, ok):
 
 def test_a_list_in_env_is_written_comma_separated(clean):
     clean.mode = "a, b ,,c"
-    spec = reg.SettingSpec(key="modes", kind="list", default=[], env="mode")
+    spec = reg.SettingSpec(key="modes", kind="list", default=[], env="mode", level=reg.ADVANCED, since="0.34.0")
     with registered(spec):
         assert reg.resolve("modes") == ["a", "b", "c"]
 
@@ -573,7 +578,7 @@ def test_an_invalid_env_value_is_never_the_value_in_force(clean, value):
 # --------------------------------------------------------------------------- what else the lock can name
 
 def test_a_key_another_store_keeps_is_locked_by_its_key_its_group_or_everything(clean):
-    reg.register_listed("some_limit", group="limits", label="Some limit")
+    reg.register_listed("some_limit", group="limits", label="Some limit", **_PLACE)
     assert reg.listed_locked("some_limit") is False
     for tokens in ("some_limit", "LIMITS", "*", "other, some_limit"):
         clean.settings_locked_keys = tokens
@@ -584,25 +589,25 @@ def test_a_key_another_store_keeps_is_locked_by_its_key_its_group_or_everything(
 
 
 def test_a_listed_key_is_never_refused_by_put_settings_and_never_a_managed_row(clean):
-    reg.register_listed("some_limit", group="limits")
+    reg.register_listed("some_limit", group="limits", **_PLACE)
     assert "some_limit" not in reg.refused_settings_keys()
     assert reg.describe() == []
     assert [e.key for e in reg.all_listed()] == ["some_limit"]
 
 
 def test_a_listed_key_is_listed_once_and_named_like_a_setting(clean):
-    reg.register_listed("some_limit", group="limits")
+    reg.register_listed("some_limit", group="limits", **_PLACE)
     with pytest.raises(ValueError, match="twice"):
-        reg.register_listed("some_limit", group="limits")
+        reg.register_listed("some_limit", group="limits", **_PLACE)
     with pytest.raises(ValueError, match="lower-case"):
-        reg.register_listed("Some-Limit", group="limits")
+        reg.register_listed("Some-Limit", group="limits", **_PLACE)
     with registered(_days()):
         with pytest.raises(ValueError, match="twice"):
-            reg.register_listed("keep_days", group="limits")
+            reg.register_listed("keep_days", group="limits", **_PLACE)
 
 
 def test_a_group_with_a_table_of_its_own_is_locked_by_its_name_or_everything(clean):
-    reg.register_lock_group("audit_levels", "Recording levels")
+    reg.register_lock_group("audit_levels", label="Recording levels", **_PLACE)
     assert reg.group_locked("audit_levels") is False
     for tokens in ("audit_levels", "AUDIT_LEVELS", "*"):
         clean.settings_locked_keys = tokens
@@ -610,8 +615,8 @@ def test_a_group_with_a_table_of_its_own_is_locked_by_its_name_or_everything(cle
 
 
 def test_the_lock_names_a_listed_key_its_group_and_a_group_without_specs(clean):
-    reg.register_listed("some_limit", group="limits")
-    reg.register_lock_group("audit_levels")
+    reg.register_listed("some_limit", group="limits", **_PLACE)
+    reg.register_lock_group("audit_levels", **_PLACE)
     clean.settings_locked_keys = "some_limit, limits, audit_levels, nothing_here"
     assert reg.unknown_locked_tokens() == ["nothing_here"]
 

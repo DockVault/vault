@@ -44,14 +44,31 @@ changes in the panel, whatever store keeps it:
 
 A module whose settings must agree with each other adds a check to the startup contract with
 register_contract(): it is given the deployment's settings and returns what contradicts, in plain words.
+
+Every setting the Settings pages show is an entry here, so that the pages can sort, mark and search them
+from one place. Besides the three kinds above, a field (register_field) is a setting another store keeps
+that the lock does not cover (most of the general settings): it is listed for the pages only, and
+SETTINGS_LOCKED_KEYS never names it. Every entry of every kind carries:
+
+- ``level``: ESSENTIAL or ADVANCED. One rule decides it: a setting is essential when most administrators
+  change it in their first month with the vault; everything else is advanced. A page shows its essential
+  settings, and "Show advanced settings (N)" reveals the rest, each marked Advanced.
+- ``since``: the release (X.Y.Z) in which the setting first appeared on the Settings pages. A setting is
+  new (is_new) when it arrived in the current release line or the one before it, or after the release at
+  which this administrator last opened the Settings pages; the pages mark it "New".
+- ``page``: the Settings page (PAGES) it is on.
+
+register(), register_listed(), register_lock_group() and register_field() refuse an entry without a valid
+level, since or page, so no entry reaches the pages unclassified.
 """
 from __future__ import annotations
 
 import importlib
 import os
+import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping, Optional, Union
 
@@ -76,10 +93,25 @@ SOURCE_LOCKED = "locked"
 # The modules that register specs, imported the first time the registry is read.
 SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setting_changes", "app.core.retention",
                                  "app.core.audit_retention", "app.core.security_records",
-                                 "app.core.audit_privacy", "app.core.audit_integrity", "app.core.audit_archive")
+                                 "app.core.audit_privacy", "app.core.audit_integrity", "app.core.audit_archive",
+                                 "app.core.settings_pages")
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too.
 ENV_ONLY_KEYS: frozenset[str] = frozenset({"audit_chain_key", "audit_chain_head_file"})
+
+# How prominently the Settings pages show a setting: essential ones on the page, advanced ones behind "Show
+# advanced settings (N)". The rule: essential is what most administrators change in their first month.
+ESSENTIAL = "essential"
+ADVANCED = "advanced"
+LEVELS = (ESSENTIAL, ADVANCED)
+
+# The Settings pages, by the name of their tab in the web app.
+PAGES = ("general", "branding", "security", "storage", "email", "sftp", "sharing", "notelinks", "uploadlinks",
+         "accounts", "logs", "records")
+# The page that shows the settings this registry resolves (the managed settings).
+MANAGED_PAGE = "records"
+
+_VERSION = re.compile(r"(\d{1,4})\.(\d{1,4})\.(\d{1,4})")
 
 REFRESH_SECONDS = 5.0
 # A bound on each read of the table, so a refresh can never hang on it.
@@ -120,22 +152,58 @@ class SettingSpec:
     group: str = ""
     label: str = ""
     help: str = ""
+    # The release (X.Y.Z) the setting first appeared on the Settings pages.
     since: str = ""
     # What a number counts ("days", "MB"), for the text that names a value.
     unit: str = ""
+    # How prominently the Settings pages show it (LEVELS), and the page it is on.
+    level: str = ""
+    page: str = MANAGED_PAGE
 
 
 @dataclass(frozen=True)
 class ListedKey:
-    """A setting another store keeps, listed so that SETTINGS_LOCKED_KEYS can name it."""
+    """A setting another store keeps, listed so that SETTINGS_LOCKED_KEYS can name it. ``env`` names the .env
+    setting that gives its value while it is locked, and ``shown`` says that value in words."""
     key: str
     group: str
     label: str = ""
+    level: str = ""
+    since: str = ""
+    page: str = ""
+    help: str = ""
+    env: str = ""
+    shown: Optional[Callable[[], str]] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class LockGroup:
+    """A group of settings that keep a table of their own, named so that SETTINGS_LOCKED_KEYS can lock it.
+    ``env`` names the .env settings that give their values while it is locked, and ``shown`` says them."""
+    name: str
+    label: str = ""
+    level: str = ""
+    since: str = ""
+    page: str = ""
+    help: str = ""
+    env: str = ""
+    shown: Optional[Callable[[], str]] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class FieldEntry:
+    """A setting another store keeps that the lock does not cover, listed for the Settings pages only: its
+    key is the name the page gives it (data-setting)."""
+    key: str
+    page: str
+    level: str
+    since: str
 
 
 _SPECS: dict[str, SettingSpec] = {}
 _LISTED: dict[str, ListedKey] = {}
-_LOCK_GROUPS: dict[str, str] = {}
+_LOCK_GROUPS: dict[str, LockGroup] = {}
+_FIELDS: dict[str, FieldEntry] = {}
 _CONTRACTS: list = []
 _modules_loaded = False
 _modules_lock = threading.Lock()
@@ -145,8 +213,9 @@ def register(spec: SettingSpec) -> SettingSpec:
     """Add a spec. A key is registered once; a spec that cannot be right is refused here."""
     if not spec.key or spec.key != spec.key.lower() or not spec.key.replace("_", "").isalnum():
         raise ValueError(f"a setting key is lower-case letters, digits and underscores: {spec.key!r}")
-    if spec.key in _SPECS or spec.key in _LISTED:
+    if _is_taken(spec.key):
         raise ValueError(f"{spec.key} is registered twice")
+    _check_placing(spec.key, spec.level, spec.since, spec.page)
     if spec.kind not in KINDS:
         raise ValueError(f"{spec.key}: unknown kind {spec.kind!r}")
     if spec.editable not in _EDITABLE:
@@ -166,24 +235,67 @@ def _name_is_valid(name: str) -> bool:
     return bool(name) and name == name.lower() and name.replace("_", "").isalnum()
 
 
-def register_listed(key: str, *, group: str, label: str = "") -> ListedKey:
+def _is_taken(key: str) -> bool:
+    """Whether ``key`` names an entry of any kind already: every kind shares one name space on the pages."""
+    return key in _SPECS or key in _LISTED or key in _LOCK_GROUPS or key in _FIELDS
+
+
+def parse_version(text) -> Optional[tuple]:
+    """(major, minor, patch) of a release written X.Y.Z, or None."""
+    match = _VERSION.fullmatch(text) if isinstance(text, str) else None
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _check_placing(key: str, level: str, since: str, page: str) -> None:
+    """Refuse an entry the Settings pages could not place: no level of LEVELS, no since written X.Y.Z, or a
+    page that is not one of PAGES."""
+    if level not in LEVELS:
+        raise ValueError(f"{key}: a setting needs its level, one of {', '.join(LEVELS)} (got {level!r})")
+    if parse_version(since) is None:
+        raise ValueError(f"{key}: a setting needs the release it arrived in, written X.Y.Z (got {since!r})")
+    if page not in PAGES:
+        raise ValueError(f"{key}: unknown Settings page {page!r}")
+
+
+def register_listed(key: str, *, group: str, level: str, since: str, page: str, label: str = "",
+                    help: str = "", env: str = "", shown: Optional[Callable[[], str]] = None) -> ListedKey:
     """List a setting another store keeps, so that the lock can name it (and its group)."""
     if not _name_is_valid(key) or not _name_is_valid(group):
         raise ValueError(f"a listed key and its group are lower-case letters, digits and underscores: "
                          f"{key!r}, {group!r}")
-    if key in _LISTED or key in _SPECS:
+    if _is_taken(key):
         raise ValueError(f"{key} is registered twice")
-    entry = ListedKey(key=key, group=group, label=label)
+    _check_placing(key, level, since, page)
+    entry = ListedKey(key=key, group=group, label=label, level=level, since=since, page=page, help=help,
+                      env=env, shown=shown)
     _LISTED[key] = entry
     return entry
 
 
-def register_lock_group(name: str, label: str = "") -> str:
+def register_lock_group(name: str, *, level: str, since: str, page: str, label: str = "",
+                        help: str = "", env: str = "", shown: Optional[Callable[[], str]] = None) -> str:
     """Name a group of settings that keep a table of their own, so that the lock can name it."""
     if not _name_is_valid(name):
         raise ValueError(f"a group is lower-case letters, digits and underscores: {name!r}")
-    _LOCK_GROUPS[name] = label
+    if name in _SPECS or name in _LISTED or name in _FIELDS:
+        raise ValueError(f"{name} is registered twice")
+    _check_placing(name, level, since, page)
+    _LOCK_GROUPS[name] = LockGroup(name=name, label=label, level=level, since=since, page=page, help=help,
+                                   env=env, shown=shown)
     return name
+
+
+def register_field(key: str, *, page: str, level: str, since: str) -> FieldEntry:
+    """List a setting of the Settings pages that another store keeps and the lock does not cover, under the
+    name the page gives it (its data-setting)."""
+    if not _name_is_valid(key):
+        raise ValueError(f"a field is lower-case letters, digits and underscores: {key!r}")
+    if _is_taken(key):
+        raise ValueError(f"{key} is registered twice")
+    _check_placing(key, level, since, page)
+    entry = FieldEntry(key=key, page=page, level=level, since=since)
+    _FIELDS[key] = entry
+    return entry
 
 
 def register_contract(check: Callable[[Any], list]) -> Callable[[Any], list]:
@@ -217,6 +329,47 @@ def spec_for(key: str) -> Optional[SettingSpec]:
 def all_listed() -> list[ListedKey]:
     _load_spec_modules()
     return list(_LISTED.values())
+
+
+def all_lock_groups() -> list[LockGroup]:
+    _load_spec_modules()
+    return list(_LOCK_GROUPS.values())
+
+
+def all_fields() -> list[FieldEntry]:
+    _load_spec_modules()
+    return list(_FIELDS.values())
+
+
+def all_entries() -> list:
+    """Every entry the Settings pages show, of every kind: specs, listed keys, lock groups and fields."""
+    return [*all_specs(), *all_listed(), *all_lock_groups(), *all_fields()]
+
+
+def entry_key(entry) -> str:
+    """The name an entry of any kind goes by on the Settings pages."""
+    return entry.name if isinstance(entry, LockGroup) else entry.key
+
+
+def _line(version: tuple) -> tuple:
+    return version[:2]
+
+
+def is_new(since: str, current: str, seen: Optional[str] = None) -> bool:
+    """Whether a setting that arrived in release ``since`` is new to an administrator running ``current``
+    who last opened the Settings pages at release ``seen`` (None: never, or not known).
+
+    New when it arrived in the current release line (X.Y) or the one just before it, or in any release after
+    ``seen``. A line X.0 has no line before it that this can name, so there only the current line counts.
+    A ``since`` or ``current`` that cannot be read is never new."""
+    arrived, running = parse_version(since), parse_version(current)
+    if arrived is None or running is None:
+        return False
+    major, minor = _line(running)
+    if _line(arrived) >= (major, minor - 1 if minor > 0 else minor):
+        return True
+    last = parse_version(seen) if seen is not None else None
+    return last is not None and arrived > last
 
 
 def refused_settings_keys() -> frozenset[str]:
@@ -379,8 +532,8 @@ def locked_tokens(settings=None) -> frozenset[str]:
 
 def is_locked(spec: SettingSpec, settings=None) -> bool:
     """Whether the deployment has locked ``spec``: its key, its group or ``*`` is in SETTINGS_LOCKED_KEYS,
-    and the spec may be locked."""
-    if not spec.lockable:
+    and the spec may be locked. A fixed setting is the same on every install, so nothing locks it."""
+    if not spec.lockable or spec.editable == FIXED:
         return False
     tokens = locked_tokens(settings)
     return "*" in tokens or spec.key in tokens or bool(spec.group and spec.group.lower() in tokens)
@@ -456,6 +609,7 @@ def describe(keys: Optional[Iterable[str]] = None) -> list[dict]:
         floor, ceiling = bounds(spec, settings)
         rows.append({
             "key": spec.key, "group": spec.group, "label": spec.label, "help": spec.help, "since": spec.since,
+            "level": spec.level, "page": spec.page,
             "kind": spec.kind, "choices": list(spec.choices), "min": spec.minimum, "max": spec.maximum,
             "unlimited": spec.unlimited, "unit": spec.unit, "floor": floor, "ceiling": ceiling,
             "editable": spec.editable,

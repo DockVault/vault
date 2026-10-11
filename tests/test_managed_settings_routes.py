@@ -43,15 +43,17 @@ def env(monkeypatch):
                                retention_reduction_delay_days=7)
     monkeypatch.setattr(reg, "_deployment_settings", lambda: settings)
     reg.all_specs()
-    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS)]
+    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS, reg._FIELDS)]
     delay = reg._SPECS[sc.DELAY_KEY]
     for table, _ in saved:
         table.clear()
     reg.register(delay)
     reg.register(reg.SettingSpec(key="keep_days", kind="int", default=90, env="keep_days", minimum=1,
                                  maximum=3650, floor="keep_floor", ceiling="keep_ceiling", unlimited=0,
-                                 reduction=reg.LOWER, group="keeping", label="Keep for"))
-    reg.register(reg.SettingSpec(key="env_days", kind="int", default=5, editable=reg.ENV_ONLY))
+                                 reduction=reg.LOWER, group="keeping", label="Keep for", level=reg.ADVANCED,
+                                 since="0.34.0"))
+    reg.register(reg.SettingSpec(key="env_days", kind="int", default=5, editable=reg.ENV_ONLY, level=reg.ADVANCED,
+                                 since="0.34.0"))
     yield settings
     for table, before in saved:
         table.clear()

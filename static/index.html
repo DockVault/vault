@@ -1624,7 +1624,7 @@
                                         <strong id="security-banner-text"></strong>
                                     </div>
                                 </div>
-                                <div class="form-group" id="update-controls" style="display:none;">
+                                <div data-setting="update_check_interval" class="form-group" id="update-controls" style="display:none;">
                                     <label>Update checks</label>
                                     <div class="flex items-center gap-sm" style="flex-wrap:wrap;">
                                         <button type="button" id="update-check-now-btn" class="btn btn-outline btn-sm">Check for updates</button>
@@ -1638,21 +1638,21 @@
                                     </div>
                                     <small class="text-secondary" style="display:block;margin-top:.35rem;">All admins see a banner when a newer release is found. Minimum 15 minutes; the check makes at most one request per interval.</small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="app_name" class="form-group">
                                     <label for="setting-app-name">Application Name</label>
                                     <input type="text" id="setting-app-name" class="form-control" placeholder="e.g. Secure Vault">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="app_description" class="form-group">
                                     <label for="setting-app-description">Application Description</label>
                                     <textarea id="setting-app-description" class="form-control" rows="3" placeholder="Secure file transfer and storage platform"></textarea>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="max_file_size" class="form-group">
                                     <label for="setting-max-file-size">Max File Upload Size (MB)</label>
                                     <input type="number" id="setting-max-file-size" class="form-control" placeholder="Deployment default" min="1">
                                     <small class="text-secondary">May only LOWER the deployment's <code>MAX_FILE_SIZE_MB</code> ceiling. <strong>Blank = use that ceiling.</strong></small>
                                     <small id="setting-sftp-eff-limit" class="text-warning" style="display:none"></small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="allowed_file_types" class="form-group">
                                     <label for="setting-allowed-types">Allowed File Types (comma-separated)</label>
                                     <input type="text" id="setting-allowed-types" class="form-control" placeholder="pdf,docx,xlsx,zip,png,jpg">
                                     <small class="text-secondary">Leave empty to allow all file types</small>
@@ -1663,49 +1663,49 @@
 
                     <!-- Branding Settings Tab (A3: white-label — edits drive /branding + the shell live) -->
                     <div id="settings-tab-branding" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header">
                                 <h3>Brand Identity</h3>
                             </div>
                             <div class="p-lg">
                                 <p class="text-secondary mb-md">Customize how this instance is named and presented. Changes apply live — no restart. Leave a field blank to fall back to the built-in default. The application name lives on the General tab.</p>
-                                <div class="form-group">
+                                <div data-setting="brand_full_name" class="form-group">
                                     <label for="setting-brand-full-name">Full Product Name</label>
                                     <input type="text" id="setting-brand-full-name" class="form-control" maxlength="150" placeholder="e.g. Secure File Transfer Platform">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_tagline" class="form-group">
                                     <label for="setting-brand-tagline">Tagline</label>
                                     <input type="text" id="setting-brand-tagline" class="form-control" maxlength="200" placeholder="A short marketing tagline">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_company_name" class="form-group">
                                     <label for="setting-brand-company-name">Company Name</label>
                                     <input type="text" id="setting-brand-company-name" class="form-control" maxlength="120" placeholder="e.g. My Company Inc.">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_support_email" class="form-group">
                                     <label for="setting-brand-support-email">Support Email</label>
                                     <input type="email" id="setting-brand-support-email" class="form-control" maxlength="254" placeholder="support@example.com">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_copyright_holder" class="form-group">
                                     <label for="setting-brand-copyright-holder">Copyright Holder</label>
                                     <input type="text" id="setting-brand-copyright-holder" class="form-control" maxlength="120" placeholder="e.g. My Company Inc.">
                                 </div>
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Links</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="brand_company_url" class="form-group">
                                     <label for="setting-brand-company-url">Company URL</label>
                                     <input type="url" id="setting-brand-company-url" class="form-control" maxlength="500" placeholder="https://example.com">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_website_url" class="form-group">
                                     <label for="setting-brand-website-url">Website URL</label>
                                     <input type="url" id="setting-brand-website-url" class="form-control" maxlength="500" placeholder="https://example.com">
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_docs_url" class="form-group">
                                     <label for="setting-brand-docs-url">Documentation URL</label>
                                     <input type="url" id="setting-brand-docs-url" class="form-control" maxlength="500" placeholder="https://example.com/docs">
                                 </div>
@@ -1713,63 +1713,63 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Theme Colors</h3>
                             </div>
                             <div class="p-lg">
                                 <p class="text-secondary mb-md">Hex colors (<code>#2563eb</code> or <code>#25f</code>) applied to the interface theme. Blank keeps the default.</p>
                                 <div class="grid grid-cols-2 gap-md">
-                                    <div class="form-group">
+                                    <div data-setting="brand_primary_color" class="form-group">
                                         <label for="setting-brand-primary-color">Primary</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-primary-color-pick" class="brand-color-pick" aria-label="Primary color picker">
                                             <input type="text" id="setting-brand-primary-color" class="form-control" placeholder="#2563eb">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_secondary_color" class="form-group">
                                         <label for="setting-brand-secondary-color">Secondary</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-secondary-color-pick" class="brand-color-pick" aria-label="Secondary color picker">
                                             <input type="text" id="setting-brand-secondary-color" class="form-control" placeholder="#7c3aed">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_accent_color" class="form-group">
                                         <label for="setting-brand-accent-color">Accent</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-accent-color-pick" class="brand-color-pick" aria-label="Accent color picker">
                                             <input type="text" id="setting-brand-accent-color" class="form-control" placeholder="#10b981">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_success_color" class="form-group">
                                         <label for="setting-brand-success-color">Success</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-success-color-pick" class="brand-color-pick" aria-label="Success color picker">
                                             <input type="text" id="setting-brand-success-color" class="form-control" placeholder="#10b981">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_warning_color" class="form-group">
                                         <label for="setting-brand-warning-color">Warning</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-warning-color-pick" class="brand-color-pick" aria-label="Warning color picker">
                                             <input type="text" id="setting-brand-warning-color" class="form-control" placeholder="#f59e0b">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_error_color" class="form-group">
                                         <label for="setting-brand-error-color">Error</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-error-color-pick" class="brand-color-pick" aria-label="Error color picker">
                                             <input type="text" id="setting-brand-error-color" class="form-control" placeholder="#ef4444">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_text_color" class="form-group">
                                         <label for="setting-brand-text-color">Text</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-text-color-pick" class="brand-color-pick" aria-label="Text color picker">
                                             <input type="text" id="setting-brand-text-color" class="form-control" placeholder="#1f2937">
                                         </div>
                                     </div>
-                                    <div class="form-group">
+                                    <div data-setting="brand_background_color" class="form-group">
                                         <label for="setting-brand-background-color">Background</label>
                                         <div class="flex items-center gap-sm">
                                             <input type="color" id="setting-brand-background-color-pick" class="brand-color-pick" aria-label="Background color picker">
@@ -1780,13 +1780,13 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Logo &amp; Favicon</h3>
                             </div>
                             <div class="p-lg">
                                 <p class="text-secondary mb-md">Upload a logo and favicon (PNG, JPG, WebP, GIF, ICO or SVG, up to 2&nbsp;MB). Uploaded assets are stored on the server and survive restarts. Reset restores the built-in default.</p>
-                                <div class="form-group">
+                                <div data-setting="brand_logo" class="form-group">
                                     <label>Logo</label>
                                     <div class="flex items-center gap-md flex-wrap">
                                         <img id="brand-logo-preview" alt="Logo preview" style="height:48px;max-width:180px;object-fit:contain;background:var(--surface-1);border-radius:6px;padding:4px;">
@@ -1796,7 +1796,7 @@
                                     </div>
                                     <small class="text-secondary" id="brand-logo-status"></small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="brand_favicon" class="form-group">
                                     <label>Favicon</label>
                                     <div class="flex items-center gap-md flex-wrap">
                                         <img id="brand-favicon-preview" alt="Favicon preview" style="height:32px;width:32px;object-fit:contain;background:var(--surface-1);border-radius:6px;padding:2px;">
@@ -1812,17 +1812,17 @@
 
                     <!-- Security Settings Tab -->
                     <div id="settings-tab-security" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header">
                                 <h3>Security & Authentication</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="password_min_length" class="form-group">
                                     <label for="setting-password-min-length">Minimum Password Length</label>
                                     <input type="number" id="setting-password-min-length" class="form-control" placeholder="8" min="8" max="128">
                                     <small class="text-secondary">Enforced on account creation and password change. The floor is 8; a higher value tightens it.</small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="password_requirements" class="form-group">
                                     <label>Password Requirements</label>
                                     <div class="flex flex-col gap-sm">
                                         <label class="flex items-center gap-sm">
@@ -1843,7 +1843,7 @@
                                         </label>
                                     </div>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="session_timeout" class="form-group">
                                     <label for="setting-session-timeout">Session Timeout (minutes)</label>
                                     <input type="number" id="setting-session-timeout" class="form-control" placeholder="Deployment default" min="5" max="43200">
                                     <small class="text-secondary">How long a sign-in lasts, 5 minutes to 43200 (30 days). Overrides <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. <strong>Blank = use the deployment's value.</strong> A longer sign-in stays usable longer if a device is lost or a session is stolen, so keep it as short as your people tolerate.</small>
@@ -1852,12 +1852,12 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Two-factor authentication (MFA)</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="mfa_mode" class="form-group">
                                     <label for="setting-mfa-mode">Requirement</label>
                                     <select id="setting-mfa-mode" class="form-control">
                                         <option value="optional">Optional — users may enable it themselves</option>
@@ -1869,7 +1869,7 @@
                                     <label>Allowed methods</label>
                                     <p class="text-secondary text-sm" style="margin-top:4px;">Authenticator app (TOTP) only. Email codes are not available yet.</p>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="mfa_sftp_policy" class="form-group">
                                     <label for="setting-mfa-sftp-policy">SFTP access for MFA users</label>
                                     <select id="setting-mfa-sftp-policy" class="form-control">
                                         <option value="allow">Allow — SFTP uses the account password / SSH key</option>
@@ -1877,7 +1877,7 @@
                                     </select>
                                     <small id="setting-mfa-sftp-warning" class="text-secondary"></small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="mfa_email_ttl" class="form-group">
                                     <label for="setting-mfa-email-ttl">Email code lifetime (minutes)</label>
                                     <input type="number" id="setting-mfa-email-ttl" class="form-control" min="1" max="60">
                                     <small class="text-secondary">Applies once email codes are available (1–60).</small>
@@ -1888,7 +1888,7 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting="step_up_actions" class="card mt-lg">
                             <div class="card-header">
                                 <h3>Step-up: actions that require a second factor</h3>
                             </div>
@@ -1901,7 +1901,7 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Rate limits</h3>
                             </div>
@@ -1922,7 +1922,7 @@
                                 <h3>Storage Configuration</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="deployment_storage_limit" class="form-group">
                                     <label for="setting-deployment-storage">Deployment storage limit (GB)</label>
                                     <div class="flex items-center gap-sm">
                                         <input type="number" id="setting-deployment-storage" class="form-control" min="0" step="1" style="max-width: 12rem;">
@@ -1933,22 +1933,22 @@
                                     </div>
                                     <small class="text-secondary" id="setting-deployment-storage-help">The most this deployment may store in total. Only files actually stored count — empty vaults cost nothing.</small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="default_quota" class="form-group">
                                     <label for="setting-default-quota">Default per-account storage quota (GB)</label>
                                     <input type="number" id="setting-default-quota" class="form-control" placeholder="Unlimited" min="0" step="1">
                                     <small class="text-secondary">How much storage one account may allocate to vaults, in total. Spent when storage is allocated, refunded when it is reclaimed. <strong>Defaults to 50 GB; blank = unlimited.</strong> Admins are exempt, and a single account can be given its own quota in <strong>Users</strong>.</small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="max_vaults_per_user" class="form-group">
                                     <label for="setting-max-vaults-per-user">Maximum vaults per user</label>
                                     <input type="number" id="setting-max-vaults-per-user" class="form-control" placeholder="Unlimited" min="0" step="1">
                                     <small class="text-secondary">The most vaults one account may own. <strong>Defaults to 50; blank = unlimited.</strong> Admins are exempt.</small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="max_vault_size" class="form-group">
                                     <label for="setting-max-vault-size">Maximum size per vault (GB)</label>
                                     <input type="number" id="setting-max-vault-size" class="form-control" placeholder="Unlimited" min="0" step="1">
                                     <small class="text-secondary">The largest any single vault may be set to, however many people contribute storage to it. <strong>Blank = unlimited.</strong></small>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting-exempt class="form-group">
                                     <label for="setting-storage-path">Storage Path (Read-Only)</label>
                                     <input type="text" id="setting-storage-path" class="form-control" readonly placeholder="/data/uploads">
                                     <small class="text-secondary">Storage path is configured in the server configuration</small>
@@ -1977,7 +1977,7 @@
 
                     <!-- Email Settings Tab -->
                     <div id="settings-tab-email" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting="email_profiles" class="card">
                             <div class="card-header">
                                 <h3>Email — Sending profiles</h3>
                             </div>
@@ -2044,7 +2044,7 @@
                         </div>
 
                         <!-- ============ Email templates ============ -->
-                        <div class="card mt-lg">
+                        <div data-setting="email_templates" class="card mt-lg">
                             <div class="card-header"><h3>Email templates</h3></div>
                             <div class="p-lg">
                                 <div class="email-hint">Author HTML emails that send through a chosen profile. Insert images from your resource folder and personalization tokens; the preview renders exactly what recipients receive.</div>
@@ -2053,7 +2053,7 @@
                         </div>
 
                         <!-- ============ Automated emails (actions) ============ -->
-                        <div class="card mt-lg">
+                        <div data-setting="email_actions" class="card mt-lg">
                             <div class="card-header"><h3>Automated emails</h3></div>
                             <div class="p-lg">
                                 <div class="email-hint">These are the emails the vault sends automatically. <strong>System</strong> emails always send and use a built-in template until you choose your own; <strong>optional</strong> ones send only when you turn on <em>Notify by email</em>. Pick a template per action — delivery and personalization are handled for you.</div>
@@ -2062,7 +2062,7 @@
                         </div>
 
                         <!-- Inline template editor -->
-                        <div id="email-template-editor" class="card mt-lg" hidden>
+                        <div data-setting="email_templates" id="email-template-editor" class="card mt-lg" hidden>
                             <div class="card-header et-editor-head">
                                 <h3 id="et-editor-title">New template</h3>
                                 <div class="et-editor-headbtns">
@@ -2189,24 +2189,24 @@
 
                     <!-- SFTP & Encryption Settings Tab -->
                     <div id="settings-tab-sftp" class="settings-tab-content">
-                        <div class="card mb-lg">
+                        <div data-setting-group class="card mb-lg">
                             <div class="card-header">
                                 <h3>SFTP Authentication Policy</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="sftp_temp_credential_departments" class="form-group">
                                     <label>Require a temporary credential for SFTP</label>
                                     <p class="text-secondary text-sm mb-sm">Members of the selected departments may only authenticate to SFTP with a temporary credential — direct password and SSH-key auth are refused. This is per-department by design, so SSH-key automation in other departments keeps working.</p>
                                     <div id="sftp-temp-cred-group-picker"></div>
                                 </div>
                             </div>
                         </div>
-                        <div class="card mb-lg">
+                        <div data-setting-group class="card mb-lg">
                             <div class="card-header">
                                 <h3>User Directory</h3>
                             </div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="directory_search_scope" class="form-group">
                                     <label for="setting-directory-search-scope">Who a vault sharer can find in user search</label>
                                     <p class="text-secondary text-sm mb-sm">Controls the recipient search in the “Grant access” picker. <strong>Whole deployment</strong> (default) lets a sharer find any active account by username or email. <strong>Same department only</strong> restricts the search to accounts that share a department with the searcher.</p>
                                     <select id="setting-directory-search-scope" class="form-control" style="max-width:360px;">
@@ -2216,18 +2216,20 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header">
                                 <h3>Zero-Knowledge Vaults</h3>
                             </div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-zero-knowledge-enabled">
-                                    <span>Allow creating zero-knowledge vaults</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, users can create vaults whose contents are encrypted in the browser — the server stores only opaque ciphertext and can never read them. Zero-knowledge vaults are web-only (they are not exposed over SFTP).</p>
+                                <div data-setting="zero_knowledge_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-zero-knowledge-enabled">
+                                        <span>Allow creating zero-knowledge vaults</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, users can create vaults whose contents are encrypted in the browser — the server stores only opaque ciphertext and can never read them. Zero-knowledge vaults are web-only (they are not exposed over SFTP).</p>
+                                </div>
 
-                                <div class="mt-lg">
+                                <div data-setting="force_zero_knowledge" class="mt-lg">
                                     <label class="flex items-center gap-sm">
                                         <input type="checkbox" id="setting-force-zero-knowledge">
                                         <span>Require zero-knowledge for all new vaults</span>
@@ -2239,29 +2241,31 @@
                                         Zero-knowledge is <strong>required by your plan</strong> — every new vault is encrypted in the browser and this can’t be turned off here.
                                     </p>
                                 </div>
-                                <div class="form-group mt-md">
+                                <div data-setting="zk_exempt_departments" class="form-group mt-md">
                                     <label>Departments exempt from the requirement</label>
                                     <div id="standard-vault-allowed-group-picker"></div>
                                 </div>
-                                <div class="form-group mt-md">
+                                <div data-setting="zk_idle_lock_minutes" class="form-group mt-md">
                                     <label for="setting-zk-idle-lock-minutes">Auto-lock encryption key after inactivity (minutes, 0 = never)</label>
                                     <input type="number" id="setting-zk-idle-lock-minutes" class="form-control" min="0" max="1440" style="max-width:200px;">
                                     <p class="text-secondary text-sm mt-sm">When set, the in-browser zero-knowledge key is dropped from memory after this many minutes of inactivity, so the user must re-enter their encryption passphrase to open a zero-knowledge vault again. Independent of the login session timeout.</p>
                                 </div>
                             </div>
                         </div>
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Temporary Vault Passcodes</h3>
                             </div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-temp-passcodes-enabled">
-                                    <span>Allow issuing temporary vault passcodes</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, a temporary credential can carry a short-lived <strong>passcode</strong> that opens a standard vault in place of its real password — scoped, expiring, revocable, and rate-limited. Passcodes are a standard-vault feature only; zero-knowledge vaults never get a passcode (their contents are decryptable only with the account passphrase). Leave off to keep today’s behavior (a holder must know the real vault password).</p>
+                                <div data-setting="temp_passcodes_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-temp-passcodes-enabled">
+                                        <span>Allow issuing temporary vault passcodes</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, a temporary credential can carry a short-lived <strong>passcode</strong> that opens a standard vault in place of its real password — scoped, expiring, revocable, and rate-limited. Passcodes are a standard-vault feature only; zero-knowledge vaults never get a passcode (their contents are decryptable only with the account passphrase). Leave off to keep today’s behavior (a holder must know the real vault password).</p>
+                                </div>
 
-                                <div class="mt-lg">
+                                <div data-setting="temp_passcode_one_time_default" class="mt-lg">
                                     <label class="flex items-center gap-sm">
                                         <input type="checkbox" id="setting-temp-passcode-one-time-default">
                                         <span>Default new passcodes to one-time use</span>
@@ -2269,7 +2273,7 @@
                                     <p class="text-secondary text-sm mt-sm">A one-time passcode is burned after a single redemption (safest for untrusted devices / break-glass). Multi-use can still be chosen per passcode at mint time.</p>
                                 </div>
 
-                                <div class="mt-lg">
+                                <div data-setting="temp_passcode_single_vault_only" class="mt-lg">
                                     <label class="flex items-center gap-sm">
                                         <input type="checkbox" id="setting-temp-passcode-single-vault-only">
                                         <span>Restrict a passcode to a single vault</span>
@@ -2277,7 +2281,7 @@
                                     <p class="text-secondary text-sm mt-sm">Forbid one passcode from spanning multiple vaults in a batch mint.</p>
                                 </div>
 
-                                <div class="mt-lg">
+                                <div data-setting="temp_passcode_allow_custom" class="mt-lg">
                                     <label class="flex items-center gap-sm">
                                         <input type="checkbox" id="setting-temp-passcode-allow-custom">
                                         <span>Allow minter-chosen (custom) passcodes</span>
@@ -2285,19 +2289,19 @@
                                     <p class="text-secondary text-sm mt-sm">When off, passcodes are always system-generated at high entropy (strongest against offline cracking). When on, a minter may type a custom passcode that must satisfy the complexity policy below.</p>
                                 </div>
 
-                                <div class="form-group mt-md">
+                                <div data-setting="temp_passcode_min_length" class="form-group mt-md">
                                     <label for="setting-temp-passcode-min-length">Minimum passcode length (also the generated length)</label>
                                     <input type="number" id="setting-temp-passcode-min-length" class="form-control" min="8" max="128" style="max-width:200px;">
                                     <p class="text-secondary text-sm mt-sm">At least 8. Applies to custom passcodes and sets the length of generated ones.</p>
                                 </div>
 
-                                <div class="form-group mt-md">
+                                <div data-setting="max_temp_creds_per_user" class="form-group mt-md">
                                     <label for="setting-max-temp-creds-per-user">Maximum active temporary credentials per user</label>
                                     <input type="number" id="setting-max-temp-creds-per-user" class="form-control" min="0" max="100000" step="1" placeholder="Unlimited" style="max-width:200px;">
                                     <p class="text-secondary text-sm mt-sm">The most simultaneously-active temporary credentials one account may hold (all temporary credentials, not only passcode-protected ones). <strong>Defaults to 10; blank = unlimited.</strong></p>
                                 </div>
 
-                                <div class="form-group mt-md">
+                                <div data-setting="temp_passcode_complexity" class="form-group mt-md">
                                     <label>Custom-passcode complexity</label>
                                     <p class="text-secondary text-sm mb-sm">Requirements a <em>custom</em> passcode must meet (generated passcodes are always high-entropy). Tuned separately from the account-password policy.</p>
                                     <label class="flex items-center gap-sm"><input type="checkbox" id="setting-temp-passcode-require-uppercase"><span>Require an uppercase letter</span></label>
@@ -2306,13 +2310,13 @@
                                     <label class="flex items-center gap-sm mt-sm"><input type="checkbox" id="setting-temp-passcode-require-special"><span>Require a special character</span></label>
                                 </div>
 
-                                <div class="form-group mt-md">
+                                <div data-setting="temp_passcode_max_lifetime" class="form-group mt-md">
                                     <label for="setting-temp-passcode-max-lifetime">Maximum passcode lifetime (minutes, 0 = no extra cap)</label>
                                     <input type="number" id="setting-temp-passcode-max-lifetime" class="form-control" min="0" style="max-width:200px;">
                                     <p class="text-secondary text-sm mt-sm">Optional ceiling on how long a passcode stays valid; it never exceeds the temporary credential’s own lifetime.</p>
                                 </div>
 
-                                <div class="mt-lg">
+                                <div data-setting="temp_cred_allow_zk_vaults" class="mt-lg">
                                     <label class="flex items-center gap-sm">
                                         <input type="checkbox" id="setting-temp-cred-allow-zk-vaults">
                                         <span>Allow zero-knowledge vaults in a temporary credential’s scope</span>
@@ -2321,36 +2325,40 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header">
                                 <h3>Vault Password Handling</h3>
                             </div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-force-no-remember-vault-password">
-                                    <span>Never remember vault passwords in the browser</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, every vault’s unlock window is forced to 0 deployment-wide — a user must re-enter a vault’s password each time it is opened, and the per-user “remember” preference is locked on. Use for shared or untrusted devices. Leave off to let each vault keep its own unlock window.</p>
+                                <div data-setting="force_no_remember_vault_password">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-force-no-remember-vault-password">
+                                        <span>Never remember vault passwords in the browser</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, every vault’s unlock window is forced to 0 deployment-wide — a user must re-enter a vault’s password each time it is opened, and the per-user “remember” preference is locked on. Use for shared or untrusted devices. Leave off to let each vault keep its own unlock window.</p>
+                                </div>
                             </div>
                         </div>
                     </div>
 
                     <!-- Sharing Tab -->
                     <div id="settings-tab-sharing" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header">
                                 <h3>Sharing</h3>
                             </div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-sharing-enabled">
-                                    <span>Enable sharing</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, users may share a file, folder, or whole standard vault with other authenticated members of this deployment, governed by the tags below. Sharing is never anonymous — every recipient must sign in. Leave off to disable sharing entirely.</p>
+                                <div data-setting="sharing_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-sharing-enabled">
+                                        <span>Enable sharing</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, users may share a file, folder, or whole standard vault with other authenticated members of this deployment, governed by the tags below. Sharing is never anonymous — every recipient must sign in. Leave off to disable sharing entirely.</p>
+                                </div>
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting="share_tags" class="card mt-lg">
                             <div class="card-header flex justify-between items-center">
                                 <h3>Share Tags</h3>
                                 <button type="button" id="share-tag-add-btn" class="btn btn-secondary">Add tag</button>
@@ -2473,10 +2481,10 @@
 
                     <!-- Note Links Tab: public-link sharing of notes (anonymous, snapshot). -->
                     <div id="settings-tab-notelinks" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header"><h3>Notes</h3></div>
                             <div class="p-lg">
-                                <div class="form-group" style="max-width:280px;">
+                                <div data-setting="note_max_chars" class="form-group" style="max-width:280px;">
                                     <label for="setting-note-max-chars">Maximum note size (characters)</label>
                                     <input type="number" id="setting-note-max-chars" class="form-control" min="100" max="1000000" step="100">
                                     <p class="text-secondary text-sm mt-sm">The largest a single note's text may be (100–1,000,000). Applies to all notes.</p>
@@ -2484,15 +2492,17 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header"><h3>Public note links</h3></div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-public-note-links-enabled">
-                                    <span>Allow users to create public note links</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, users may turn a note into a shareable link that anyone with the link can open (no sign-in). Each link is a <strong>snapshot</strong> — later edits don't change what a link shows — governed by the tags below. Turning this off immediately <strong>pauses</strong> every public link (they stop opening) but does not delete them — turn it back on and they work again. To permanently stop links, revoke them under "All public links" below (per link, or "Revoke all active"). Internal member-to-member sharing is unaffected.</p>
-                                <div class="form-group mt-md" style="max-width:280px;">
+                                <div data-setting="public_note_links_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-public-note-links-enabled">
+                                        <span>Allow users to create public note links</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, users may turn a note into a shareable link that anyone with the link can open (no sign-in). Each link is a <strong>snapshot</strong> — later edits don't change what a link shows — governed by the tags below. Turning this off immediately <strong>pauses</strong> every public link (they stop opening) but does not delete them — turn it back on and they work again. To permanently stop links, revoke them under "All public links" below (per link, or "Revoke all active"). Internal member-to-member sharing is unaffected.</p>
+                                </div>
+                                <div data-setting="public_note_link_user_cap" class="form-group mt-md" style="max-width:280px;">
                                     <label for="setting-public-note-link-user-cap">Maximum active links per user</label>
                                     <input type="number" id="setting-public-note-link-user-cap" class="form-control" min="1" max="10000" step="1">
                                     <p class="text-secondary text-sm mt-sm">An anti-abuse cap on how many active public links one user may hold.</p>
@@ -2500,22 +2510,24 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header"><h3>Public file &amp; folder links</h3></div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-public-file-links-enabled">
-                                    <span>Allow users to create public links to files and folders</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, a user can turn a file or folder in a Standard vault into a link that anyone can download from (no sign-in). Unlike note links these serve the <strong>live</strong> file, not a snapshot. They are governed by the <strong>same tags below</strong> — a tag only offers file/folder links when its "Can be used for" list includes them — and share the <strong>same per-user cap</strong> as note links. Turning this off immediately <strong>pauses</strong> every public file link (they stop opening) without deleting them; revoke them under "All public file &amp; folder links" below to stop them permanently.</p>
-                                <div id="pfl-no-tag-warning" class="alert alert-warning mt-md" hidden>
-                                    <svg class="icon icon-sm"><use href="#i-alert-triangle"/></svg>
-                                    <div class="alert-content">This is <strong>on</strong>, but no Link tag allows files or folders yet — so no one can actually create these links. Edit a tag below (or add one) and include <strong>Files</strong> and/or <strong>Folders</strong> in its “Can be used for” list.</div>
+                                <div data-setting="public_file_links_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-public-file-links-enabled">
+                                        <span>Allow users to create public links to files and folders</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, a user can turn a file or folder in a Standard vault into a link that anyone can download from (no sign-in). Unlike note links these serve the <strong>live</strong> file, not a snapshot. They are governed by the <strong>same tags below</strong> — a tag only offers file/folder links when its "Can be used for" list includes them — and share the <strong>same per-user cap</strong> as note links. Turning this off immediately <strong>pauses</strong> every public file link (they stop opening) without deleting them; revoke them under "All public file &amp; folder links" below to stop them permanently.</p>
+                                    <div id="pfl-no-tag-warning" class="alert alert-warning mt-md" hidden>
+                                        <svg class="icon icon-sm"><use href="#i-alert-triangle"/></svg>
+                                        <div class="alert-content">This is <strong>on</strong>, but no Link tag allows files or folders yet — so no one can actually create these links. Edit a tag below (or add one) and include <strong>Files</strong> and/or <strong>Folders</strong> in its “Can be used for” list.</div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting="link_tags" class="card mt-lg">
                             <div class="card-header flex justify-between items-center">
                                 <h3>Link tags</h3>
                                 <button type="button" id="nl-tag-add-btn" class="btn btn-secondary">Add tag</button>
@@ -2649,15 +2661,17 @@
 
                     <!-- Upload Links Tab: receivers (anonymous inbound uploads into a dedicated vault). -->
                     <div id="settings-tab-uploadlinks" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header"><h3>Upload links</h3></div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-public-receivers-enabled">
-                                    <span>Allow users to create upload links</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When enabled, a user can create a link that lets anyone (no sign-in) upload files into a new, dedicated vault that only that user can open. Links are governed by the tags below. Turning this off immediately <strong>pauses</strong> every upload link (they stop accepting uploads) without deleting anything; revoke a link under "All upload links" below to close it permanently.</p>
-                                <div class="form-group mt-md" style="max-width:280px;">
+                                <div data-setting="public_receivers_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-public-receivers-enabled">
+                                        <span>Allow users to create upload links</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When enabled, a user can create a link that lets anyone (no sign-in) upload files into a new, dedicated vault that only that user can open. Links are governed by the tags below. Turning this off immediately <strong>pauses</strong> every upload link (they stop accepting uploads) without deleting anything; revoke a link under "All upload links" below to close it permanently.</p>
+                                </div>
+                                <div data-setting="public_receiver_user_cap" class="form-group mt-md" style="max-width:280px;">
                                     <label for="setting-public-receiver-user-cap">Maximum active links per user</label>
                                     <input type="number" id="setting-public-receiver-user-cap" class="form-control" min="1" max="10000" step="1">
                                     <p class="text-secondary text-sm mt-sm">An anti-abuse cap on how many active upload links one user may hold.</p>
@@ -2665,7 +2679,7 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting="receiver_tags" class="card mt-lg">
                             <div class="card-header flex justify-between items-center">
                                 <h3>Upload-link tags</h3>
                                 <button type="button" id="rt-tag-add-btn" class="btn btn-secondary">Add tag</button>
@@ -2780,27 +2794,31 @@
 
                     <!-- Accounts & Access Tab -->
                     <div id="settings-tab-accounts" class="settings-tab-content">
-                        <div class="card">
+                        <div data-setting-group class="card">
                             <div class="card-header"><h3>Account onboarding</h3></div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-invite-enabled">
-                                    <span>Let admins invite people by link</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When on, an administrator can generate an invitation link for a new account. No email is sent — you copy the link and share it. On by default; an invitation link exists only once an administrator creates one.</p>
-                                <label class="flex items-center gap-sm mt-md">
-                                    <input type="checkbox" id="setting-signup-enabled">
-                                    <span>Let people sign themselves up</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When on, a visitor can create their own account from the login screen. Off by default.</p>
-                                <p id="setting-signup-locked-note" class="text-warning text-sm mt-sm" style="display:none">Not available on this deployment: whoever runs it has turned self-signup off.</p>
+                                <div data-setting="invite_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-invite-enabled">
+                                        <span>Let admins invite people by link</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When on, an administrator can generate an invitation link for a new account. No email is sent — you copy the link and share it. On by default; an invitation link exists only once an administrator creates one.</p>
+                                </div>
+                                <div data-setting="signup_enabled">
+                                    <label class="flex items-center gap-sm mt-md">
+                                        <input type="checkbox" id="setting-signup-enabled">
+                                        <span>Let people sign themselves up</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When on, a visitor can create their own account from the login screen. Off by default.</p>
+                                    <p id="setting-signup-locked-note" class="text-warning text-sm mt-sm" style="display:none">Not available on this deployment: whoever runs it has turned self-signup off.</p>
+                                </div>
                             </div>
                         </div>
 
-                        <div class="card mt-lg" id="accounts-invite-card">
+                        <div data-setting-group class="card mt-lg" id="accounts-invite-card">
                             <div class="card-header"><h3>Invitations</h3></div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="invite_ttl_hours" class="form-group">
                                     <label for="setting-invite-ttl-hours">Invitation link lifetime (hours)</label>
                                     <input type="number" id="setting-invite-ttl-hours" class="form-control" min="1" max="720" step="1">
                                     <p class="text-secondary text-sm mt-sm">How long an invitation link stays valid — from 1 hour to 720 (30 days).</p>
@@ -2808,10 +2826,10 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg" id="accounts-signup-card">
+                        <div data-setting-group class="card mt-lg" id="accounts-signup-card">
                             <div class="card-header"><h3>Self-signup</h3></div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="signup_domain_mode" class="form-group">
                                     <label for="setting-signup-domain-mode">Email domain gate</label>
                                     <select id="setting-signup-domain-mode" class="form-control">
                                         <option value="off">Off — any email domain</option>
@@ -2820,7 +2838,7 @@
                                     </select>
                                     <p class="text-secondary text-sm mt-sm">Restrict which email domains may sign up or accept an invitation.</p>
                                 </div>
-                                <div class="form-group" id="accounts-domains-group">
+                                <div data-setting="signup_domains" class="form-group" id="accounts-domains-group">
                                     <label for="setting-signup-domain-input">Domains</label>
                                     <div class="flex gap-sm">
                                         <input type="text" id="setting-signup-domain-input" class="form-control" placeholder="example.com" autocomplete="off" aria-describedby="accounts-domain-help">
@@ -2832,10 +2850,10 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header"><h3>Identity &amp; email</h3></div>
                             <div class="p-lg">
-                                <div class="form-group">
+                                <div data-setting="email_requirement" class="form-group">
                                     <label for="setting-email-requirement">Email address</label>
                                     <select id="setting-email-requirement" class="form-control">
                                         <option value="required">Required for every account</option>
@@ -2843,7 +2861,7 @@
                                     </select>
                                     <p class="text-secondary text-sm mt-sm">Applies the same way to admin-created accounts, invitations, and self-signup.</p>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="login_identifier" class="form-group">
                                     <label for="setting-login-identifier">Sign in with</label>
                                     <select id="setting-login-identifier" class="form-control">
                                         <option value="username">Username only</option>
@@ -2853,12 +2871,14 @@
                                     <p class="text-secondary text-sm mt-sm">What people type to sign in. “Email only” is refused only if it would lock out every administrator; anyone without an email is warned below.</p>
                                     <div id="login-identifier-warning" class="mt-sm" style="display:none;"></div>
                                 </div>
-                                <label class="flex items-center gap-sm mt-md">
-                                    <input type="checkbox" id="setting-email-change-verification">
-                                    <span>Require a verification code to change one’s own email</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm" id="accounts-email-verify-help">A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Requires email (SMTP) to be configured — set it up on the Email tab first.</p>
-                                <div class="form-group mt-md">
+                                <div data-setting="email_change_verification">
+                                    <label class="flex items-center gap-sm mt-md">
+                                        <input type="checkbox" id="setting-email-change-verification">
+                                        <span>Require a verification code to change one’s own email</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm" id="accounts-email-verify-help">A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Requires email (SMTP) to be configured — set it up on the Email tab first.</p>
+                                </div>
+                                <div data-setting="email_change_code_lifetime" class="form-group mt-md">
                                     <label for="setting-email-change-otp-ttl-minutes">Verification code lifetime (minutes)</label>
                                     <input type="number" id="setting-email-change-otp-ttl-minutes" class="form-control" min="1" max="60" step="1">
                                     <p class="text-secondary text-sm mt-sm">How long the email-change verification code stays valid — from 1 to 60 minutes.</p>
@@ -2866,15 +2886,17 @@
                             </div>
                         </div>
 
-                        <div class="card mt-lg">
+                        <div data-setting-group class="card mt-lg">
                             <div class="card-header"><h3>Password reset</h3></div>
                             <div class="p-lg">
-                                <label class="flex items-center gap-sm">
-                                    <input type="checkbox" id="setting-password-reset-enabled">
-                                    <span>Let people reset their own password</span>
-                                </label>
-                                <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured.</p>
-                                <div class="form-group mt-md">
+                                <div data-setting="password_reset_enabled">
+                                    <label class="flex items-center gap-sm">
+                                        <input type="checkbox" id="setting-password-reset-enabled">
+                                        <span>Let people reset their own password</span>
+                                    </label>
+                                    <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured.</p>
+                                </div>
+                                <div data-setting="password_reset_link_lifetime" class="form-group mt-md">
                                     <label for="setting-password-reset-ttl-minutes">Reset link lifetime (minutes)</label>
                                     <input type="number" id="setting-password-reset-ttl-minutes" class="form-control" min="1" max="60" step="1">
                                     <p class="text-secondary text-sm mt-sm">How long a password-reset link stays valid — from 1 to 60 minutes.</p>
@@ -2892,7 +2914,7 @@
 
                     <!-- Log Access Tab -->
                     <div id="settings-tab-logs" class="settings-tab-content">
-                        <div class="card mb-lg">
+                        <div data-setting-group class="card mb-lg">
                             <div class="card-header"><h3>Log access</h3></div>
                             <div class="p-lg">
                                 <p class="text-secondary mb-md">
@@ -2903,11 +2925,11 @@
                                     once; only its hash is stored.
                                 </p>
                                 <div id="log-ceiling-note" class="text-secondary mb-md" style="display:none;"></div>
-                                <div class="form-group">
+                                <div data-setting="log_components" class="form-group">
                                     <label>Components exposed to <code>/logs</code></label>
                                     <div id="log-flags"></div>
                                 </div>
-                                <div class="form-group">
+                                <div data-setting="log_hide_endpoint" class="form-group">
                                     <label class="flex items-center gap-sm">
                                         <input type="checkbox" id="log-stealth-toggle">
                                         <span>Hide the endpoint from unauthenticated callers</span>
@@ -2922,7 +2944,7 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="card">
+                        <div data-setting="log_tokens" class="card">
                             <div class="card-header flex justify-between items-center">
                                 <h3>Pull tokens</h3>
                                 <button id="log-token-generate-btn" class="btn btn-primary" type="button">Generate token</button>
@@ -2972,7 +2994,7 @@
                             <div class="card-header"><h3>Storage</h3></div>
                             <div class="p-lg" id="retention-storage"></div>
                         </div>
-                        <div class="card mb-lg" id="recording-levels-card">
+                        <div data-setting="audit_levels" class="card mb-lg" id="recording-levels-card">
                             <div class="card-header"><h3>What is recorded</h3></div>
                             <div class="p-lg">
                                 <p class="text-secondary mb-md">
@@ -2994,11 +3016,11 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="card mb-lg">
+                        <div data-setting="audit_levels" class="card mb-lg">
                             <div class="card-header"><h3>Earlier versions</h3></div>
                             <div class="p-lg"><ol id="recording-levels-history" class="recording-history"></ol></div>
                         </div>
-                        <div class="card" id="recording-notice-card">
+                        <div data-setting="recording_notice" class="card" id="recording-notice-card">
                             <div class="card-header"><h3>The notice users see</h3></div>
                             <div class="p-lg">
                                 <p class="text-secondary mb-md">

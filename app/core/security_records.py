@@ -41,12 +41,14 @@ CLEARED_NAME = "(name removed)"
 CLEARED_ADDRESS = "(address removed)"
 
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=WINDOW_KEY, kind="int", default=30, env="security_record_days", minimum=1, maximum=3650,
     floor="security_record_min_days", ceiling="security_record_max_days", reduction=registry.LOWER,
     group="retention", unit="days", label="Keep failed sign-ins in full for",
     help="Each failed sign-in, with the name typed and the address, for blocking and investigating attacks. "
          "Security alerts lose their names and addresses after the same time."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=ALERT_RETENTION_KEY, kind="int", default=90, env="security_alert_retention_days", minimum=1,
     maximum=3650, editable=registry.ENV_ONLY, group="retention", unit="days",
     label="Keep resolved security alerts for"))

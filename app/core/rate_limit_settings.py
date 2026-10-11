@@ -278,12 +278,39 @@ OVERRIDE_KEYS: frozenset[str] = frozenset(_BY_KEY)
 # The group SETTINGS_LOCKED_KEYS names to lock every rate limit at once.
 LOCK_GROUP = "rate_limits"
 
+# The release each limit first appeared on the Settings pages (Security, Rate limits). A limit added later
+# needs its line here: the registry refuses a listed setting without one.
+SINCE: dict[str, str] = {
+    "max_login_attempts": "0.6.0", "lockout_duration": "0.6.0",
+    "rate_limit_api_default": "0.9.0", "rate_limit_api_default_window": "0.9.0",
+    "rate_limit_api_auth": "0.9.0", "rate_limit_api_auth_window": "0.9.0",
+    "rate_limit_api_upload": "0.9.0", "rate_limit_api_upload_window": "0.9.0",
+    "rate_limit_api_download": "0.9.0", "rate_limit_api_download_window": "0.9.0",
+    "rate_limit_api_upload_chunk": "0.14.0", "rate_limit_api_upload_chunk_window": "0.14.0",
+    "rate_limit_api_poll": "0.14.0", "rate_limit_api_poll_window": "0.14.0",
+    "rate_limit_login_window_seconds": "0.23.0", "rate_limit_vault_attempts": "0.23.0",
+    "rate_limit_vault_attempts_admin": "0.23.0", "rate_limit_vault_window_seconds": "0.23.0",
+    "rate_limit_sftp_key_attempts": "0.23.0", "rate_limit_device_sync_attempts": "0.30.0",
+    "rate_limit_device_sync_window_seconds": "0.30.0",
+    "lockout_backstop_multiplier": "0.33.0",
+}
+
 
 def _list_in_registry() -> None:
     from app.core import settings_registry
     for spec in REGISTRY:
         if spec.key not in settings_registry._LISTED:
-            settings_registry.register_listed(spec.key, group=LOCK_GROUP, label=spec.label)
+            # Few administrators change a throttle in their first month: every limit is advanced.
+            settings_registry.register_listed(spec.key, group=LOCK_GROUP, label=spec.label,
+                                              help=spec.description, level=settings_registry.ADVANCED,
+                                              since=SINCE.get(spec.key, ""), page="security",
+                                              env=spec.deployment_attr.upper(),
+                                              shown=lambda key=spec.key: _in_words(key))
+
+
+def _in_words(key: str) -> str:
+    """The limit ``key`` in force while it is locked (its deployment value), with its unit."""
+    return f"{deployment_default(key)} {_BY_KEY[key].unit}"
 
 
 _list_in_registry()

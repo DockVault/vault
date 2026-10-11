@@ -909,7 +909,17 @@ def _reset_for_tests() -> None:
 # The lock names this group, so that SETTINGS_LOCKED_KEYS=audit_levels makes each .env limit the level.
 def _register() -> None:
     from app.core import settings_registry
-    settings_registry.register_lock_group(LOCK_GROUP, "Recording levels")
+    settings_registry.register_lock_group(
+        LOCK_GROUP, label="Recording levels", level=settings_registry.ADVANCED, since="0.34.0", page="records",
+        help="What the audit log keeps of the personal data that comes with an event, each at most its .env "
+             "limit.",
+        env=", ".join(ENV_NAMES[key] for key in POLICY_KEYS), shown=_limits_in_words)
+
+
+def _limits_in_words() -> str:
+    """The level of each kind while the levels are locked: its .env limit."""
+    limits = env_limits()
+    return "; ".join(f"{LABELS[key]}: {limits[key]}" for key in POLICY_KEYS)
 
 
 _register()

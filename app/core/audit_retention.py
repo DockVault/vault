@@ -63,21 +63,25 @@ MARKER = "audit_env_retention_scheduled"
 MB = 1024 * 1024
 
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=MAX_DAYS, kind="int", default=0, env="audit_log_retention_days", minimum=1, maximum=36500,
     unlimited=0, ceiling="plan_log_max_days", reduction=registry.LOWER, group=GROUP, unit="days",
     label="Keep audit rows for at most",
     help="Older rows are deleted. No limit keeps them for ever."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=MIN_DAYS, kind="int", default=0, env="audit_min_retention_days", minimum=0, maximum=36500,
     floor="audit_min_retention_days", reduction=registry.LOWER, group=GROUP, unit="days",
     label="Keep every audit row for at least",
     help="No row younger than this is deleted, whatever the maximum or the size cap."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=ADMIN_MIN_DAYS, kind="int", default=365, env="audit_protected_min_days", minimum=0, maximum=36500,
     floor="audit_protected_min_days", reduction=registry.LOWER, group=GROUP, unit="days",
     label="Keep administration and security rows for at least",
     help="These rows record what administrators did and the security events. Only .env can lower this."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=MAX_MB, kind="int", default=0, env="audit_log_max_mb", minimum=1, maximum=10_000_000, unlimited=0,
     ceiling="plan_log_max_mb", reduction=registry.LOWER, group=GROUP, unit="MB",
     label="Size cap on audit rows",

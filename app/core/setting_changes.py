@@ -42,6 +42,7 @@ SUPERSEDED = "superseded"
 DELAY_KEY = "retention_reduction_delay_days"
 
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=DELAY_KEY, kind="int", default=7, env="retention_reduction_delay_days", minimum=1, maximum=90,
     editable=registry.ENV_ONLY, group="retention", unit="days",
     label="Wait before a change that deletes records sooner",
