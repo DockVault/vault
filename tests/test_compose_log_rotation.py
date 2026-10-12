@@ -200,6 +200,8 @@ COMPOSE_READS = [
     ('DOCKER_LOG_MAX_FILE=" 5"', {}, (ABSENT, " 5")),
     ("DOCKER_LOG_MAX_FILE=5 # five", {}, (ABSENT, "5")),
     ("# DOCKER_LOG_MAX_SIZE=50m", {}, (ABSENT, ABSENT)),
+    ("\ufeffDOCKER_LOG_MAX_SIZE=20m", {}, ("20m", ABSENT)),            # a byte order mark at the start
+    ("\ufeff# a comment\nDOCKER_LOG_MAX_FILE=3", {}, (ABSENT, "3")),
 ]
 _NAMES = ("DOCKER_LOG_MAX_SIZE", "DOCKER_LOG_MAX_FILE")
 
@@ -257,6 +259,30 @@ def test_the_check_before_a_recreate_reads_env_as_compose_does(tmp_path, monkeyp
     monkeypatch.setenv("DOCKER_LOG_MAX_SIZE", "0m")
     assert tool._recreate_stack(build=True) is False
     assert "DOCKER_LOG_MAX_SIZE=0m is not a size" in capsys.readouterr().out
+
+
+def test_a_byte_order_mark_at_the_start_of_env_is_read_past(tmp_path, monkeypatch, capsys):
+    """Windows PowerShell 5.1 writes UTF-8 with a byte order mark, and docker compose reads past one at the start of
+    .env: the check before a recreate reads the first line's value too, and so does every other reader of .env
+    here; a key on that line is found when it is changed or removed, and the mark is not written back."""
+    for name in _NAMES:
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+    tool = _tool(tmp_path, "\ufeffDOCKER_LOG_MAX_SIZE=0m\nCOMPOSE_PROFILES=combined\n")
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a) or _Proc(0, ""))
+    assert tool._recreate_stack(build=True) is False and calls == []
+    assert "DOCKER_LOG_MAX_SIZE=0m is not a size" in capsys.readouterr().out
+    text = "\ufeffCOMPOSE_PROFILES=split\nDOCKER_LOG_MAX_SIZE=20m\n"
+    assert dv.parse_env(text) == {"COMPOSE_PROFILES": "split", "DOCKER_LOG_MAX_SIZE": "20m"}
+    path = tmp_path / ".env"
+    path.write_text(text, encoding="utf-8")
+    tool._set_env_key(str(path), "COMPOSE_PROFILES", "combined")
+    assert path.read_text(encoding="utf-8") == "COMPOSE_PROFILES=combined\nDOCKER_LOG_MAX_SIZE=20m\n"
+    path.write_text(text, encoding="utf-8")
+    assert tool._remove_env_keys(str(path), ["COMPOSE_PROFILES"]) is True
+    assert path.read_text(encoding="utf-8") == "DOCKER_LOG_MAX_SIZE=20m\n"
+    # One mark, as compose reads past one: a second is part of the name, which compose refuses.
+    assert dv.without_bom("\ufeff\ufeffX=1") == "\ufeffX=1" and dv.without_bom(None) == ""
 
 
 def _cfg(**extra):

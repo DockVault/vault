@@ -294,6 +294,14 @@ _ENV_REFERENCE = re.compile(r"\$\$|\$\{(\w+)(?:(:?)-([^}]*))?\}|\$(\w+)")
 _DOUBLE_QUOTE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "$": "$$"}
 
 
+def without_bom(text):
+    """``text`` (.env's) without a byte order mark at its start, which an editor may write there (Windows
+    PowerShell 5.1 writes UTF-8 with one): docker compose reads past it, so every reader of .env here does too,
+    and the first line keeps its name."""
+    text = text or ""
+    return text[1:] if text.startswith("\ufeff") else text
+
+
 def _env_replace(value, lookup):
     def one(m):
         if m.group(0) == "$$":
@@ -339,14 +347,14 @@ def compose_env_values(text, names, environ=None):
     and its ${...} replaced, anything after the closing quote ignored; an unquoted one is cut at " #" (a space, then
     #), trimmed, and its ${...} replaced, from the process environment or the lines above it. parse_env differs on
     purpose: it keeps what the setup scripts wrote. A value whose quote is never closed is None: compose refuses
-    the file."""
+    the file. A byte order mark at the start of the file is read past, as compose does."""
     environ = os.environ if environ is None else environ
     read = {}
 
     def lookup(name):
         return environ[name] if name in environ else read.get(name)
 
-    for raw in (text or "").splitlines():
+    for raw in without_bom(text).splitlines():
         line = raw.strip(" \t\r")
         if not line or line.startswith("#"):
             continue
@@ -489,10 +497,11 @@ def gen_hex(nbytes):
 
 def parse_env(text):
     """Parse a KEY=VALUE .env into a dict. First occurrence of a key wins; a single surrounding
-    matching quote pair is stripped; tolerant of CRLF + whitespace around the key/'='. Pure —
-    mirrors the setup scripts' read_env so a re-run reads its own output back correctly."""
+    matching quote pair is stripped; tolerant of CRLF + whitespace around the key/'=', and of a byte
+    order mark at the start (without_bom). Pure — mirrors the setup scripts' read_env so a re-run reads
+    its own output back correctly."""
     out = {}
-    for raw in (text or "").splitlines():
+    for raw in without_bom(text).splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -4061,10 +4070,11 @@ class DockVault:
         return (mode or "selfsigned", email, cpath, kpath)
 
     def _set_env_key(self, path, key, value):
-        """Replace/append KEY=value in .env (bare value), preserving perms."""
+        """Replace/append KEY=value in .env (bare value), preserving perms. A byte order mark at the start is
+        read past (without_bom) and not written back."""
         lines, found = [], False
         if os.path.exists(path):
-            for raw in open(path, encoding="utf-8").read().splitlines():
+            for raw in without_bom(open(path, encoding="utf-8").read()).splitlines():
                 if re.match(r"^\s*%s\s*=" % re.escape(key), raw):
                     lines.append("%s=%s" % (key, value)); found = True
                 else:
@@ -4077,12 +4087,13 @@ class DockVault:
 
     def _remove_env_keys(self, path, keys):
         """Remove any KEY= lines for the given keys from .env (preserving perms). Returns True if any
-        line was removed. Comments and every other line are kept verbatim."""
+        line was removed. Comments and every other line are kept verbatim; a byte order mark at the start is
+        read past (without_bom), and not written back when a line is removed."""
         if not os.path.exists(path):
             return False
         keyset = set(keys)
         out, removed = [], False
-        for raw in open(path, encoding="utf-8").read().splitlines():
+        for raw in without_bom(open(path, encoding="utf-8").read()).splitlines():
             m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", raw)
             if m and m.group(1) in keyset:
                 removed = True
