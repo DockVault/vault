@@ -9,8 +9,9 @@
 with their preferences (user_preferences, ``settings_seen``): the page reads the catalogue, then says it has
 been seen. Saying so is a preference like the skin, not a change to the vault, so it is not audited.
 
-Both routes are plain ``def`` (the thread pool runs them), every statement is bounded by a statement timeout,
-and only an interactive administrator reaches them: the Settings pages are theirs alone.
+Both routes are plain ``def`` (the thread pool runs them), every statement is bounded by a statement timeout
+(set before the first, and again after a rollback), and only an interactive administrator reaches them: the
+Settings pages are theirs alone.
 """
 from __future__ import annotations
 
@@ -64,10 +65,10 @@ def mark_settings_seen(current_user: User = Depends(require_interactive_admin),
                        db: Session = Depends(get_db)):
     """Keep the running release as the one this administrator last opened the Settings pages at. A release
     that cannot be read is not kept (nothing would count from it)."""
+    limit_statements(db)
     current = running_version()
     if registry.parse_version(current) is None:
         return {"seen": last_seen(db, current_user)}
-    limit_statements(db)
     _store_seen(db, current_user, current)
     try:
         db.commit()

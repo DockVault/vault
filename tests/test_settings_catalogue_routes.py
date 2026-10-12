@@ -4,7 +4,9 @@ GET /settings/catalogue and POST /settings/catalogue/seen are plain functions fo
 only. The release at which an administrator last opened the Settings pages is kept with their preferences
 (user_preferences, settings_seen), with their other preferences left as they were, and counts for "New";
 one that cannot be read counts as never, a running release that cannot be read is never kept, and
-PUT /users/me/preferences can neither set it nor drop it. These run on a throwaway SQLite database.
+PUT /users/me/preferences can neither set it nor drop it. Both routes bound their statements before the
+first (and the seen write again after a rollback), and the seen write locks the row it merges into. These
+run on a throwaway SQLite database.
 """
 import inspect
 import tempfile
@@ -118,3 +120,74 @@ def test_the_preferences_keep_the_release_and_put_cannot_set_it():
         assert "settings_seen" not in api._sanitize_preferences({"settings_seen": bad}), bad
     assert "settings_seen" not in api.PreferencesUpdate.model_fields
     assert api.PreferencesUpdate(**{"settings_seen": "0.1.0"}).model_dump(exclude_none=True) == {}
+
+
+def _statements(db, monkeypatch):
+    """Every statement ``db`` sends, in order, with "BOUND" where a route bounds the transaction's statements
+    (limit_statements: a statement timeout on Postgres, nothing to send on SQLite)."""
+    seen = []
+    sa.event.listen(db.get_bind(), "before_cursor_execute",
+                    lambda _conn, _cursor, statement, *_a: seen.append(statement))
+    monkeypatch.setattr(routes, "limit_statements", lambda session: seen.append("BOUND"))
+    return seen
+
+
+@pytest.mark.parametrize("release", ["0.34.0", ""])
+def test_every_statement_of_both_routes_is_bounded_from_the_first(db, monkeypatch, release):
+    """GET and POST bound the transaction before their first statement: on a release that cannot be read too,
+    where POST only reads the stored release back."""
+    monkeypatch.setattr(routes, "running_version", lambda: release)
+    alice = _admin(db)
+    db.add(UserPreference(user_id=alice.id, preferences={"settings_seen": "0.30.0"}))
+    db.commit()
+    seen = _statements(db, monkeypatch)
+    for call in (routes.get_settings_catalogue, routes.mark_settings_seen):
+        db.expire_all()
+        seen.clear()
+        call(current_user=alice, db=db)
+        assert seen[:1] == ["BOUND"] and len(seen) > 1, (call.__name__, seen)
+
+
+def test_a_retried_seen_write_is_bounded_again_after_its_rollback(db, monkeypatch):
+    """Another request made the row first: the commit fails, the rollback ends the bound, and the retry bounds
+    its statements again before it reads the row."""
+    from sqlalchemy.exc import IntegrityError
+    monkeypatch.setattr(routes, "running_version", lambda: "0.34.0")
+    alice = _admin(db)
+    seen = _statements(db, monkeypatch)
+    real, tries = db.commit, []
+
+    def commit():
+        tries.append(1)
+        if len(tries) == 1:
+            seen.append("REFUSED")
+            raise IntegrityError("INSERT INTO user_preferences", {}, Exception("another request made the row"))
+        return real()
+    monkeypatch.setattr(db, "commit", commit)
+    assert routes.mark_settings_seen(current_user=alice, db=db) == {"seen": "0.34.0"}
+    assert seen[0] == "BOUND" and "REFUSED" in seen
+    after = seen[seen.index("REFUSED") + 1:]
+    assert after[:1] == ["BOUND"] and len(after) > 1, seen
+    assert db.query(UserPreference).filter(UserPreference.user_id == alice.id).one().preferences == {
+        "settings_seen": "0.34.0"}
+
+
+def test_the_seen_write_locks_the_preferences_row_it_merges_into(db, monkeypatch):
+    """PUT /users/me/preferences changes the same row: the seen write reads it FOR UPDATE (as Postgres gets the
+    statement), so neither write loses the other's preferences."""
+    from sqlalchemy.dialects import postgresql
+    monkeypatch.setattr(routes, "running_version", lambda: "0.34.0")
+    alice = _admin(db)
+    db.add(UserPreference(user_id=alice.id, preferences={"ui": "v1"}))
+    db.commit()
+    compiled = []
+
+    def keep(state):
+        if state.is_select:
+            compiled.append(str(state.statement.compile(dialect=postgresql.dialect())))
+    sa.event.listen(db, "do_orm_execute", keep)
+    routes.mark_settings_seen(current_user=alice, db=db)
+    reads = [c for c in compiled if "FROM user_preferences" in c]
+    assert reads and all(c.rstrip().endswith("FOR UPDATE") for c in reads), compiled
+    assert db.query(UserPreference).filter(UserPreference.user_id == alice.id).one().preferences == {
+        "ui": "v1", "settings_seen": "0.34.0"}
