@@ -454,7 +454,8 @@ def test_the_changes_waiting_and_their_cancel_come_from_the_chain_not_the_table(
 def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_waiting(env, db, quiet, chain):
     """The chain's tail cut: sealing stops, the view keeps what it authenticated. A cancel of the waiting change
     is saved on its row (sealed from the database once sealing runs again); a row planted with no request seal is
-    no change (404); a waiting change whose row the database marks ended already does not apply (409, saying so)."""
+    no change (404); a waiting change whose row the database marks ended already does not apply (409, saying so),
+    and the list offers no cancel for it while sealing is stopped."""
     from app.core.models import AuditSeal
     alice = _admin(db)
     first = uuid.UUID(_put(db, alice, "keep_days", 10)["change"]["id"])
@@ -470,8 +471,13 @@ def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_wait
     with refused(409) as caught:
         routes.cancel_managed_setting_change(first, current_user=alice, db=db)
     assert caught.value.detail == "This change is no longer waiting: it was superseded."
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(second), None, True)
     db.get(ManagedSettingChange, second).status = sc.SUPERSEDED
     db.commit()
+    # The list offers no cancel for it while sealing is stopped: the cancel could only be refused.
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(second), "superseded", False)
     with refused(409) as caught:
         routes.cancel_managed_setting_change(second, current_user=alice, db=db)
     assert "marks this change superseded, so it does not apply" in caught.value.detail
@@ -482,7 +488,7 @@ def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_wait
     assert db.get(ManagedSettingChange, second).status == sc.CANCELLED
     assert db.query(AuditSeal).count() == seals
     (e,) = _waiting(db, alice)
-    assert (e["id"], e["database"]) == (str(second), "cancelled")
+    assert (e["id"], e["database"], e["cancellable"]) == (str(second), "cancelled", False)
 
 
 def test_while_sealing_is_stopped_a_reduction_is_refused_and_a_longer_value_is_saved(env, db, chain):

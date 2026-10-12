@@ -16,7 +16,9 @@ The pruner acts on the same view, so the list shows what it will do. A row of ``
 neither add an entry, nor hide one, nor change what an entry says or when it applies. The table is read only to
 say, beside an entry, that the database no longer shows it waiting: a cancel saved while sealing was stopped (the
 chain records it at its next pass), or an edit; while the database says so the change does not apply, and an
-administrator may cancel it on the screen to record the cancel in the chain now.
+administrator may cancel it on the screen to record the cancel in the chain now. While sealing is stopped such an
+entry cannot be cancelled (a cancel then is saved on the row, which already does not show it waiting): its end
+is recorded once sealing runs again.
 
 A cancel is addressed to the request the chain holds (``held``): a change the chain holds no waiting request of
 is refused, whatever the table says.
@@ -155,10 +157,15 @@ def entries(db, st=None, now: Optional[datetime] = None) -> List[dict]:
         out.append(e)
     out.sort(key=lambda e: e["request_seq"])
     statuses = _row_statuses(db, [e["id"] for e in out if e["status"] == WAITING])
+    stopped = st.stopped is not None
     for e in out:
         if e["status"] == WAITING:
             status = statuses.get(e["id"], "missing")
             e["database"] = None if status == WAITING else status
+            if stopped and e["database"] is not None:
+                # While sealing is stopped a cancel is saved on the change's row, which no longer shows it
+                # waiting: the change already does not apply, and its end is sealed once sealing runs again.
+                e["cancellable"] = False
     return out
 
 

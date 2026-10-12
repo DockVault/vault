@@ -280,9 +280,11 @@
             item.appendChild(el('p', 'text-secondary text-sm', text));
             if (c.database) {
                 const said = c.database === 'missing' ? 'holds no row of this change' : `marks this change ${c.database}`;
+                // While sealing is stopped the server offers no cancel for it (it already does not apply).
+                const then = c.cancellable ? 'Cancel it here to record the cancel in the audit log now.'
+                    : 'The audit log records its end once sealing runs again.';
                 item.appendChild(el('p', 'text-secondary text-sm retention-change-database',
-                    `The database ${said}: it does not apply while the database says so. Cancel it here to ` +
-                    'record the cancel in the audit log now.'));
+                    `The database ${said}: it does not apply while the database says so. ${then}`));
             }
             if (c.cancellable) {
                 const cancel = el('button', 'btn btn-outline btn-sm retention-cancel', 'Cancel this change');
@@ -377,6 +379,13 @@
     function capWarning(cap, pct) {
         let text = `The audit log is at ${pct} % of its size cap.`;
         if (!cap.over_from) {
+            if (cap.now_bytes >= cap.cap_bytes) {
+                // At or over the cap with no date: what the cap counts has not passed it on what is sealed now.
+                return `${text} The cap does not count all of it yet (rows count once they are sealed, and growth ` +
+                    'only after the wait before a change that deletes sooner), so nothing is deleted for now; once ' +
+                    'its count passes the cap, the oldest events are deleted, except administration and security ' +
+                    'events, unless the cap is raised or the hold is turned on.';
+            }
             return `${text} Once it is reached, the oldest events are deleted, except administration and security ` +
                 'events.';
         }
