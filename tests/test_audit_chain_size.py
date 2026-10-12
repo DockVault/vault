@@ -372,7 +372,9 @@ def test_the_pruner_the_card_and_when_count_on_the_servers_window_across_a_stop_
     11 hours: on the chain's timeline a delay of sealing has run since the row's seal, on the server's the stop
     is a gap. The pruner's plan, the retention screen's card and its "when" all take the server's window: at the
     restart nothing counts the row and nothing is deleted, and the cap starts deleting once seven days of sealing
-    have run since the row's seal, the stop left out (two days before it, five after the restart)."""
+    have run since the row's seal, the stop left out (two days before it, five after the restart). A smaller row
+    sealed a day later counts a day later, whichever timeline is the server's."""
+    from app.core import audit_chain_times as times
     from app.core import audit_retention as ar
     from app.core import retention_storage as rs
     from app.core.audit_chain_view import from_us
@@ -385,7 +387,12 @@ def test_the_pruner_the_card_and_when_count_on_the_servers_window_across_a_stop_
     big = _big(env, at, 700)
     _run_to(env, env.clock() + timedelta(hours=3))
     sealed = _sealed_at(env, at)
-    _run_to(env, env.clock() + timedelta(days=2))
+    _run_to(env, env.clock() + timedelta(days=1))
+    at2 = env.clock() - timedelta(minutes=10)
+    _big(env, at2, 100)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    sealed2 = _sealed_at(env, at2)
+    _run_to(env, env.clock() + timedelta(days=1))
     last = env.st.view.newest_at()                           # the newest seal before the stop
     stop = env.clock()
     _forge_hours_across(env, stop + timedelta(days=10))
@@ -406,6 +413,16 @@ def test_the_pruner_the_card_and_when_count_on_the_servers_window_across_a_stop_
     over = size.first_over(view, record, restart, delay, ar.MB)
     assert over is not None and abs(over - due) < timedelta(seconds=1), (over, due)
     assert card["over_from"] == over.isoformat() + "Z"
+    # A limit only both rows pass: the window's start at each moment to come is the earlier of the two timelines'
+    # (on the chain's it passed the smaller row's seal days before the server's does), whichever is which.
+    both = counted + sum(view.entry_for(ai.hour_floor(t)).root.bytes for t in (at, at2)) - 1
+    due2 = restart + delay - (last - sealed2)
+    assert abs(size.first_over(view, record, restart, delay, both) - due2) < timedelta(seconds=1)
+    real = times.timelines
+    with pytest.MonkeyPatch.context() as swap:
+        swap.setattr(times, "timelines", lambda *a, **k: tuple(reversed(real(*a, **k))))
+        assert size.first_over(view, record, restart, delay, ar.MB) == over
+        assert abs(size.first_over(view, record, restart, delay, both) - due2) < timedelta(seconds=1)
     _run_to(env, over - timedelta(hours=1))
     assert _kept(env, old) == set(old) and not _size_prunes(env)
     _run_to(env, over + timedelta(hours=2))
