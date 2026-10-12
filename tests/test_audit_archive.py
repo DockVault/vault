@@ -978,6 +978,40 @@ def test_when_counts_an_archived_part_once_the_window_passes_its_hours_seals(env
     assert failures(env.verify()) == []
 
 
+def test_when_counts_a_part_whose_hours_were_sealed_at_different_times(env):
+    """A part holding an hour the window has passed and one a late row grew two hours after its seal, archived
+    with the window's start between the two seals: the part counts the first hour's bytes and the second's first
+    figure (its length is larger than both hours' bytes). "when" names the moment the window passes the late seal,
+    the first hour counted as it counts now and the second with its growth."""
+    env.row(at(3))
+    env.row(at(6))
+    env.run_until_sealed()
+    env.clock.advance(hours=2)
+    env.row(at(6, 30))
+    assert env.seal().late == 1
+    view = env.st.view
+    first, grew = view.entry_for(at(3)).root.sealed_at, view.entry_for(at(6)).root.sealed_at
+    assert grew - first == timedelta(hours=2)
+    _seal_until(env, first + timedelta(days=7, hours=1))
+    _archive(env)
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    view, record = st.view, st.known_record()
+    ((_d, part, counted, hours),) = _counted(env)[1]
+    grown = view.entry_for(at(6)).root.bytes
+    assert counted == hours[at(3)] + hours[at(6)] and 0 < hours[at(6)] < grown and part.length > hours[at(3)] + grown
+    total = chain_size.cap_count(view, record, now, delay)[4]
+    limit = total - hours[at(6)] + grown - 1
+    over = chain_size.first_over(view, record, now, delay, limit)
+    assert over is not None and abs(over - (grew + delay)) < timedelta(seconds=1), (over, grew)
+    _seal_until(env, over - timedelta(hours=1))
+    st = env.st
+    assert chain_size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] == total <= limit
+    _seal_until(env, over + timedelta(hours=1))
+    st = env.st
+    assert chain_size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] == limit + 1
+    assert failures(env.verify()) == []
+
+
 def _capped(env, monkeypatch):
     """The chain's own cap of 1, in bytes: a size-cap prune under a test's larger cap is then justified."""
     monkeypatch.setattr(ar, "MB", 1)
