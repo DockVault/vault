@@ -10,6 +10,9 @@
  *     Advanced; a container marked data-setting-group hides when every setting in it is hidden;
  *   - a setting that arrived recently, or after the release this administrator last opened Settings at, is
  *     marked New;
+ *   - the marks are for the eye (aria-hidden, so a label's accessible name stays as it was); what they say
+ *     reaches assistive technology as a visually hidden note right after the setting's title, which each of
+ *     the setting's own fields names as its description;
  *   - the settings the provider has locked leave their place for one collapsed list at the foot of the page,
  *     "Set by your provider (N)", read-only, each with its value and the reason.
  * A search box above the tabs finds a setting by its label and help text on every page, and goes to it (its
@@ -117,6 +120,52 @@
         }));
     }
 
+    // What the marks say, for assistive technology: a visually hidden note right after the title, named by each
+    // of the setting's own fields as its description (beside any description the field had).
+    let notes = 0;
+
+    function noteText(entry) {
+        const parts = [];
+        if (entry && entry.new) parts.push(`New in ${entry.since}.`);
+        if (isAdvanced(entry)) parts.push('An advanced setting.');
+        return parts.join(' ');
+    }
+
+    function ownFields(node) {
+        return Array.from(node.querySelectorAll('input:not([type="hidden"]), select, textarea'))
+            .filter((field) => field.closest('[data-setting]') === node);
+    }
+
+    function describedBy(field, id, on) {
+        const ids = (field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
+        if ((ids.indexOf(id) >= 0) === on) return;
+        const next = on ? ids.concat(id) : ids.filter((one) => one !== id);
+        if (next.length) field.setAttribute('aria-describedby', next.join(' '));
+        else field.removeAttribute('aria-describedby');
+    }
+
+    function setNote(node, entry) {
+        const title = titleOf(node);
+        const text = title ? noteText(entry) : '';
+        let note = Array.from(node.querySelectorAll('.setting-marks-note'))
+            .find((one) => one.closest('[data-setting]') === node) || null;
+        if (!text) {
+            if (note) {
+                ownFields(node).forEach((field) => describedBy(field, note.id, false));
+                note.remove();
+            }
+            return;
+        }
+        if (!note) {
+            notes += 1;
+            note = el('span', 'setting-marks-note');
+            note.id = `setting-marks-note-${notes}`;
+        }
+        if (note.previousElementSibling !== title || note.parentNode !== title.parentNode) title.after(note);
+        setText(note, text);
+        ownFields(node).forEach((field) => describedBy(field, note.id, true));
+    }
+
     function toggleClass(node, cls, on) {
         if (node.classList.contains(cls) !== on) node.classList.toggle(cls, on);
     }
@@ -201,6 +250,7 @@
             toggleClass(node, 'setting-advanced', isAdvanced(entry));
             toggleClass(node, 'setting-level-hidden', !folded && isAdvanced(entry) && !show);
             setChips(node, entry);
+            setNote(node, entry);
             if (folded || !present(node)) return;
             (isAdvanced(entry) ? advanced : essential).add(key);
         });

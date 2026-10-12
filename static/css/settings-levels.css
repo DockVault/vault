@@ -24,6 +24,12 @@
     border-color: color-mix(in srgb, var(--text-tertiary) 30%, transparent);
 }
 
+/* What the marks say, for assistive technology only (each of the setting's fields names it as its description). */
+.setting-marks-note {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
 /* "Show advanced settings (N)" at the top of a page. */
 .settings-level-bar {
     display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px;

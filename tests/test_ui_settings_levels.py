@@ -5,9 +5,12 @@ marked Advanced, and a container left with no setting showing goes too (the rate
 groups of how long records are kept). A page whose every setting is advanced says so. "New" follows the
 catalogue, and its mark leaves a field's label as it was for assistive technology. The settings the provider
 has locked leave their place for one collapsed, read-only list at the foot of their page, "Set by your
-provider (N)", with each one's value and reason. A search box above the tabs finds a setting by its label or
-its help text on any page and goes to it, revealing it where it is advanced. Hiding a setting never changes
-what "Save All Changes" sends. Nothing is wider than a phone. No console error.
+provider (N)", with each one's value and reason, and the toggle's N leaves them out. What the marks say
+reaches assistive technology as each field's description. Opening Settings again reads the catalogue again.
+A search box above the tabs finds a setting by its label or its help text on any page (label hits first, at
+most twelve listed) and goes to it, revealing it where it is advanced; it and N follow what the app shows or
+hides. Hiding a setting never changes what "Save All Changes" sends. Nothing is wider than a phone. No console
+error.
 
 The catalogue is the server's (GET /settings/catalogue), or served with an edit (a lock, a "New") where a test
 needs one the stack does not have. The tests sign in as a throwaway administrator, so a skin stored on the
@@ -96,6 +99,20 @@ _VISIBLE_ADVANCED = """name => new Set([...document.querySelectorAll(`#settings-
     .filter(n => n.offsetParent !== null).map(n => n.dataset.setting)).size"""
 
 
+def _settled(page: Page):
+    """Two animation frames: a change to the page has been applied (each pass runs in the next frame)."""
+    page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+
+
+def _shown_count(page: Page, name):
+    """N of a page's "Show advanced settings (N)", once the page's last change has been applied."""
+    _settled(page)
+    text = _toggle(page, name).inner_text().strip()
+    found = re.fullmatch(r"Show advanced settings \((\d+)\)", text)
+    assert found, text
+    return int(found.group(1))
+
+
 @pytest.mark.parametrize("skin", ["v1", "v2"])
 def test_a_page_shows_its_essential_settings_and_reveals_the_advanced_ones(page: Page, levels_admin, skin):
     errors = _errors(page)
@@ -172,10 +189,55 @@ def test_the_new_marks_follow_the_catalogue_and_leave_labels_as_they_were(page: 
     expect(_setting(page, "app_name").locator(".setting-chip-new")).to_have_text("New")
     expect(_setting(page, "max_file_size").locator(".setting-chip-new")).to_have_count(0)
     expect(page.locator("#setting-app-name")).to_have_accessible_name("Application Name")   # not in the name
+    # What the marks say reaches assistive technology as the field's description.
+    expect(page.locator("#setting-app-name")).to_have_accessible_description(re.compile(r"^New in \d+\.\d+\.\d+\.$"))
+    expect(page.locator("#setting-max-file-size")).to_have_accessible_description("")
+    # The note is read right after the label, outside it.
+    note = _setting(page, "app_name").locator(".setting-marks-note")
+    assert note.evaluate("n => [n.previousElementSibling.tagName, n.closest('label')]") == ["LABEL", None]
     _toggle(page, "general").click()
     chips = _setting(page, "app_description").locator(".setting-chip")
     expect(chips).to_have_text(["New", "Advanced"])
+    expect(page.locator("#setting-app-description")).to_have_accessible_name("Application Description")
+    expect(page.locator("#setting-app-description")).to_have_accessible_description(
+        re.compile(r"^New in \d+\.\d+\.\d+\. An advanced setting\.$"))
+    # A field that had a description keeps it, and the mark's is added beside it.
+    _tab(page, "accounts")
+    _toggle(page, "accounts").click()
+    domains = page.locator("#setting-signup-domain-input")
+    expect(domains).to_be_visible()
+    assert "accounts-domain-help" in domains.get_attribute("aria-describedby").split()
+    expect(domains).to_have_accessible_description(re.compile(r"^Type a domain .* An advanced setting\.$"))
     assert not errors, errors
+
+
+def test_reopening_settings_reads_the_catalogue_again_and_says_seen_again(page: Page, levels_admin):
+    """Each time Settings opens, the catalogue is read again (what is new may have changed) and the release is
+    said to have been seen again; a mark the new read no longer gives goes, with what it said."""
+    reads = []
+
+    def mark(data):
+        reads.append(1)
+        for e in data["entries"]:
+            e["new"] = e["key"] in ("app_name", "app_description") and len(reads) == 1
+    _serve_catalogue(page, mark)
+    _login(page, levels_admin)
+    with page.expect_request(lambda r: r.url.endswith("/settings/catalogue/seen") and r.method == "POST"):
+        _open(page)
+    expect(_setting(page, "app_name").locator(".setting-chip-new")).to_have_text("New")
+    expect(page.locator("#setting-app-name")).to_have_accessible_description(re.compile(r"^New in "))
+    _toggle(page, "general").click()
+    expect(page.locator("#setting-app-description")).to_have_accessible_description(
+        re.compile(r"^New in \S+ An advanced setting\.$"))
+    page.click('.sidebar-item[data-section="dashboard"]')
+    expect(page.locator("#settings-section")).to_be_hidden()
+    with page.expect_request(lambda r: r.url.endswith("/settings/catalogue/seen") and r.method == "POST"):
+        page.click('.sidebar-item[data-section="settings"]')
+    assert len(reads) == 2
+    expect(_setting(page, "app_name").locator(".setting-chip-new")).to_have_count(0)
+    expect(page.locator("#setting-app-name")).to_have_accessible_description("")
+    expect(_setting(page, "app_name").locator(".setting-marks-note")).to_have_count(0)
+    expect(page.locator("#setting-app-description")).to_have_accessible_description("An advanced setting.")
 
 
 def test_the_new_marks_on_a_page_are_the_servers(page: Page, levels_admin, admin):
@@ -244,17 +306,23 @@ def test_locked_settings_fold_into_the_providers_list_on_their_page(page: Page, 
     expect(item.locator(".settings-provider-reason")).to_contain_text("AUDIT_HOT_DAYS")
     expect(fold.locator('.settings-provider-item[data-fold-key="audit_levels"]')).to_contain_text("Recording levels")
     expect(fold.locator("input, select, textarea, button")).to_have_count(0)
-    # Revealing the advanced settings shows the others, never a locked one.
+    # Revealing the advanced settings shows the others, never a locked one; the toggle counts only those.
+    count = _shown_count(page, "records")
     _toggle(page, "records").click()
     expect(_setting(page, "audit_max_days")).to_be_visible()
     expect(_setting(page, "audit_hot_days")).to_be_hidden()
     expect(page.locator("#recording-levels-card")).to_be_hidden()
+    assert page.evaluate(_VISIBLE_ADVANCED, "records") == count
     _tab(page, "security")
     expect(page.locator("#settings-tab-security > .settings-provider-fold summary")).to_have_text(
         "Set by your provider (1)")
+    expect(page.locator('#rate-limit-settings .rl-row[data-key="rate_limit_vault_attempts"]')).to_be_attached(
+        timeout=10000)
+    count = _shown_count(page, "security")
     _toggle(page, "security").click()
     expect(_setting(page, "rate_limit_api_default")).to_be_visible()
     expect(page.locator('#rate-limit-settings .rl-row[data-key="rate_limit_vault_attempts"]')).to_be_hidden()
+    assert page.evaluate(_VISIBLE_ADVANCED, "security") == count
     assert not errors, errors
 
 
@@ -406,3 +474,73 @@ def test_the_search_leaves_out_a_setting_the_app_hides(page: Page, levels_admin)
     expect(hit).to_be_visible()
     hit.click()
     expect(page.locator("#update-controls")).to_be_visible()
+
+
+def _update_status(enabled):
+    return {"enabled": enabled, "managed": False, "current": "0.6.0", "latest": "0.6.0", "update_available": False,
+            "checked_at": 1700000000, "interval_minutes": 360}
+
+
+def test_the_count_and_the_search_follow_what_the_app_shows_or_hides_after_the_catalogue(page: Page, levels_admin):
+    """The update checks' controls show while the checks are on. Once the catalogue has been applied, the app
+    hides them by their style (the checks turned off) and shows them again: the General page's count and the
+    search follow each time."""
+    page.route("**/api/update-status*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(_update_status(True))))
+    _login(page, levels_admin)
+    _open(page)
+    page.wait_for_function("() => document.getElementById('update-controls').style.display !== 'none'",
+                           timeout=10000)
+    shown = _shown_count(page, "general")
+    box = page.locator("#settings-search")
+    results = page.locator("#settings-search-results")
+    hit = results.locator('.settings-search-hit[data-key="update_check_interval"]')
+    box.fill("update checks")
+    expect(hit).to_be_visible()
+    box.press("Escape")
+    page.evaluate("us => renderUpdateStatus(us)", _update_status(False))
+    expect(page.locator("#update-controls")).to_be_hidden()
+    expect(_toggle(page, "general")).to_have_text(f"Show advanced settings ({shown - 1})")
+    box.fill("update checks")
+    expect(results).to_contain_text("No setting matches.")
+    expect(hit).to_have_count(0)
+    box.press("Escape")
+    page.evaluate("us => renderUpdateStatus(us)", _update_status(True))
+    expect(_toggle(page, "general")).to_have_text(f"Show advanced settings ({shown})")
+    box.fill("update checks")
+    expect(hit).to_be_visible()
+
+
+def test_the_search_lists_label_hits_before_help_hits(page: Page, levels_admin):
+    """A word in one setting's label and in another's help text: the label's setting comes first, though its page
+    comes after the other's."""
+    def edit(data):
+        for e in data["entries"]:
+            if e["key"] == "app_name":
+                e["help"] = "Shown beside the zebrafish."
+            elif e["key"] == "brand_tagline":
+                e["label"] = "Zebrafish tagline"
+    _serve_catalogue(page, edit)
+    _login(page, levels_admin)
+    _open(page)
+    page.locator("#settings-search").fill("zebrafish")
+    hits = page.locator("#settings-search-results .settings-search-hit")
+    expect(hits).to_have_count(2)
+    expect(hits.nth(0)).to_have_attribute("data-key", "brand_tagline")
+    expect(hits.nth(1)).to_have_attribute("data-key", "app_name")
+
+
+def test_the_search_lists_at_most_twelve_hits_and_says_how_many_more(page: Page, levels_admin):
+    _login(page, levels_admin)
+    _open(page)
+    box = page.locator("#settings-search")
+    results = page.locator("#settings-search-results")
+    box.fill("a")
+    expect(results.locator(".settings-search-hit")).to_have_count(12)
+    total = page.evaluate("q => SettingsLevels.search(q).length", "a")
+    assert total > 12, total
+    expect(results.locator(".settings-search-more")).to_have_text(
+        f"{total - 12} more: type more of the name to narrow them.")
+    box.fill("tagline")
+    expect(results.locator(".settings-search-hit")).to_have_count(1)
+    expect(results.locator(".settings-search-more")).to_have_count(0)
