@@ -491,6 +491,35 @@ def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_wait
     assert (e["id"], e["database"], e["cancellable"]) == (str(second), "cancelled", False)
 
 
+@pytest.mark.parametrize("how", [sc.APPLIED, "missing"])
+def test_while_sealing_is_stopped_no_cancel_is_offered_for_a_change_whose_row_is_applied_or_gone(env, db, quiet,
+                                                                                                  chain, how):
+    """While sealing is stopped, a waiting change whose row the database marks applied, or no longer holds,
+    already does not apply: the list says so and offers no cancel, since the cancel could only be refused (409,
+    saying what the database shows), and nothing is written."""
+    alice = _admin(db)
+    change = uuid.UUID(_put(db, alice, "keep_days", 10)["change"]["id"])
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    assert chain.seal_all().stopped == "head-record-mismatch"
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(change), None, True)
+    row = db.get(ManagedSettingChange, change)
+    if how == "missing":
+        db.delete(row)
+    else:
+        row.status = how
+    db.commit()
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(change), how, False)
+    seals, rows = db.query(AuditSeal).count(), db.query(AuditLog).count()
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(change, current_user=alice, db=db)
+    said = "holds no row of this change" if how == "missing" else "marks this change applied"
+    assert f"The database {said}, so it does not apply" in caught.value.detail
+    assert (db.query(AuditSeal).count(), db.query(AuditLog).count()) == (seals, rows)
+
+
 def test_while_sealing_is_stopped_a_reduction_is_refused_and_a_longer_value_is_saved(env, db, chain):
     from app.core.models import AuditSeal
     db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
