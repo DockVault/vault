@@ -64,18 +64,18 @@ def window_start(view, record: Optional[dict], now: datetime, delay: timedelta, 
     return start
 
 
-def held_back(view, record: Optional[dict], start_us: int, *, before_seq: Optional[int] = None) -> Set[int]:
-    """The seals whose entries a pass with this window holds back: another writer's seals after the head
-    record, unless the host has acknowledged the seal and both its acceptance and its sealed_at lie at or
-    before the window's start. ``before_seq``: only acknowledgments sealed before that seal count (a check of
-    an earlier prune)."""
+def release_points(view, record: Optional[dict], *, before_seq: Optional[int] = None) -> Dict[int, Optional[int]]:
+    """{seq: release} of another writer's seals after the head record: the window start from which a seal's
+    entries count in full (microseconds), the later of the time the server first accepted it and its sealed_at,
+    once the host has acknowledged it; None while the host has not. ``before_seq``: only seals before that seal,
+    and only acknowledgments sealed before it count (a check of an earlier prune)."""
     ai = _ai()
     foreign = ai.foreign_entries(view, record)
-    out = set()
+    out = {}
     for seq, entry in foreign.items():
         if seq > view.position or (before_seq is not None and seq >= before_seq):
             continue
-        released = False
+        release = None
         if entry.get("acknowledged"):
             acks = [a for a in view.acked.get(seq, ()) if a not in foreign
                     and (before_seq is None or a < before_seq)]
@@ -84,10 +84,19 @@ def held_back(view, record: Optional[dict], start_us: int, *, before_seq: Option
                     accepted = to_us(fmt.parse_time_text(entry.get("accepted_at")))
                 except (TypeError, ValueError):
                     accepted = None
-                released = accepted is not None and accepted <= start_us and view.at_us(seq) <= start_us
-        if not released:
-            out.add(seq)
+                if accepted is not None:
+                    release = max(accepted, view.at_us(seq))
+        out[seq] = release
     return out
+
+
+def held_back(view, record: Optional[dict], start_us: int, *, before_seq: Optional[int] = None) -> Set[int]:
+    """The seals whose entries a pass with this window holds back: another writer's seals after the head
+    record, unless the host has acknowledged the seal and both its acceptance and its sealed_at lie at or
+    before the window's start (release_points). ``before_seq``: only acknowledgments sealed before that seal
+    count (a check of an earlier prune)."""
+    return {seq for seq, release in release_points(view, record, before_seq=before_seq).items()
+            if release is None or release > start_us}
 
 
 def counted_entries(chain: List[tuple], held: Set[int]) -> List[tuple]:
@@ -176,32 +185,49 @@ def now_count(view, record: Optional[dict], now: datetime) -> int:
 
 def first_over(view, record: Optional[dict], now: datetime, delay: timedelta, limit: int) -> Optional[datetime]:
     """The earliest the size cap's count passes ``limit`` from what is sealed now, if sealing keeps running and
-    nothing changes: each hour's newer figures count once the window's start has passed the seal that recorded
-    them, a delay of sealing after it. Every gap in sealing since that seal (on either timeline: the server's
-    window is the longer of the two) moves that on; a gap still to come would only move it later. None when the
-    count never passes it."""
-    start_us, held, hot, parts, total = cap_count(view, record, now, delay)
-    if total > limit:
+    nothing changes. The count changes only when the window's start passes a point: a seal that recorded a newer
+    figure of an hour, archived or not (the figure counts from then on), or the release of another writer's seal
+    the host has acknowledged (release_points: its entries count in full from then on). The start passes a point
+    a delay of sealing after it; every gap in sealing since (on either timeline: the server's window is the
+    longer of the two) moves that on, and a gap still to come would only move it later. At each such moment the
+    count is the one the pruner would take then (total, with the seals held back then). None when the count never
+    passes ``limit``."""
+    start_us, held, hot, parts, count = cap_count(view, record, now, delay)
+    if count > limit:
         return now
     now_us = times.us(now)
     length = int(delay.total_seconds() * 1000000)
     lines = times.timelines(view, record)
-    archived = {h for _d, part in view.archived_parts() for h in part.hours()}
-    moving = {}
+    releases = {seq: at for seq, at in release_points(view, record).items() if seq in held and at is not None}
+    # The hours whose count can still change: those with an entry sealed after the start, or one a seal held back
+    # now but released later gives. Every other hour, and every archived part that holds none of them, counts at
+    # each moment to come what it counts now.
+    chains = {}
     for start, end, last in view.units():
-        if end - start != _ai().HOUR or start in archived:
+        if end - start != _ai().HOUR:
             continue
-        entries = counted_entries(view.entry_chain(last), held)
-        if any(at > start_us for _seq, at, _n in entries):
-            moving[start] = entries
-    fixed = sum(c for _d, _p, c, _h in parts) + sum(n for h, n in hot.items() if h not in moving)
+        chain = view.entry_chain(last)
+        if any(at > start_us or seq in releases for seq, at, _n in chain):
+            chains[start] = chain
+    archived = {h for _d, part, _c, _h in parts for h in part.hours()}
+    changing = [(part, hours) for _d, part, _c, hours in parts if any(h in chains for h in part.hours())]
+    fixed = (sum(c for _d, part, c, _h in parts if not any(h in chains for h in part.hours()))
+             + sum(n for h, n in hot.items() if h not in chains))
+
+    def count_then(then: int) -> int:
+        held_then = held_back(view, record, then)
+        by_hour = {h: lagged(counted_entries(chain, held_then), then) for h, chain in chains.items()}
+        n = fixed + sum(v for h, v in by_hour.items() if h not in archived)
+        for part, hours in changing:
+            n += min(int(part.length), sum(by_hour[h] if h in by_hour else hours.get(h, 0) for h in part.hours()))
+        return n
+
+    points = {at for chain in chains.values() for _seq, at, _n in chain if at > start_us} | set(releases.values())
     # The window's start at a moment to come is the earlier of the two timelines' (window_start), so it passes a
-    # seal at the later of the two moments each timeline's start passes it.
-    due = {max(line.reached(at, now_us, length) for line in lines)
-           for entries in moving.values() for _seq, at, _n in entries if at > start_us}
+    # point at the later of the two moments each timeline's start passes it.
+    due = {max(line.reached(p, now_us, length) for line in lines) for p in points}
     for t in sorted(due):
-        then = min(line.window_start_then(now_us, t, length) for line in lines)
-        if fixed + sum(lagged(entries, then) for entries in moving.values()) > limit:
+        if count_then(min(line.window_start_then(now_us, t, length) for line in lines)) > limit:
             return times.dt(t)
     return None
 

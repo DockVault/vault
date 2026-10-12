@@ -942,6 +942,42 @@ def test_an_inflated_part_length_counts_no_more_than_its_hours(env):
     assert _counted(env)[1][0][2] == sum(hours.values()) >= counted
 
 
+def _seal_until(env, when):
+    """Sealing at most six hours apart until the clock reaches ``when`` (no job deletes)."""
+    while env.clock() + timedelta(hours=6) < when:
+        env.clock.advance(hours=6)
+        env.seal()
+    env.clock.advance(seconds=(when - env.clock()).total_seconds())
+    env.seal()
+
+
+def test_when_counts_an_archived_part_once_the_window_passes_its_hours_seals(env):
+    """A day archived as soon as its hours are sealed: its part counts nothing until a delay of sealing has passed
+    after its hours' seals, then the smaller of its length and their bytes. The retention screen's "when" names
+    that moment, as for an hour not archived: an hour before it the cap's count is still under a limit only the
+    part's count passes, and an hour after it the count passes it."""
+    _sealed_day(env)
+    _archive(env)
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    view, record = st.view, st.known_record()
+    ((_d, part, counted, _hours),) = _counted(env)[1]
+    hours = (at(3), at(4), at(6))
+    full = min(part.length, sum(view.entry_for(h).root.bytes for h in hours))
+    total = chain_size.cap_count(view, record, now, delay)[4]
+    assert counted == 0 and full > 0
+    limit = total + full - 1
+    over = chain_size.first_over(view, record, now, delay, limit)
+    sealed = max(view.entry_for(h).root.sealed_at for h in hours)
+    assert over is not None and abs(over - (sealed + delay)) < timedelta(seconds=1), (over, sealed)
+    _seal_until(env, over - timedelta(hours=1))
+    st = env.st
+    assert chain_size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] <= limit
+    _seal_until(env, over + timedelta(hours=1))
+    st = env.st
+    assert chain_size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] == total + full > limit
+    assert failures(env.verify()) == []
+
+
 def _capped(env, monkeypatch):
     """The chain's own cap of 1, in bytes: a size-cap prune under a test's larger cap is then justified."""
     monkeypatch.setattr(ar, "MB", 1)

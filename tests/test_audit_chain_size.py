@@ -9,7 +9,11 @@
 - another writer's inflated byte figures are held back: each counts no more than the hour's entry before it
   counts, until the host acknowledges it and a delay has passed after both its acceptance and its sealed_at;
   a size-cap prune meanwhile lists them, and verify recomputes its total;
-- verify rejects a size-cap prune whose total, window or held-back seals the chain does not give.
+- verify rejects a size-cap prune whose total, window or held-back seals the chain does not give;
+- the retention screen's "when" (first_over) names the moment the pruner starts deleting: a growth counted a delay
+  of sealing after its seal, the release of another writer's figure the host acknowledged, an hour that counts
+  already and grows, whichever timeline is the server's; and the window at a moment to come is the one window_start
+  gives over the timeline that seals on until then.
 
 Runs on a throwaway SQLite database with a chain of its own (tests/_audit_chain_env.py)."""
 from datetime import timedelta
@@ -432,6 +436,122 @@ def test_the_pruner_the_card_and_when_count_on_the_servers_window_across_a_stop_
     assert failures(env.verify()) == [] and failures(_off(env)) == []
 
 
+def _entries_of(view, hour):
+    """(seq, sealed_at, bytes) of the entries of ``hour``'s own unit, oldest first."""
+    return view.entry_chain(next(last for start, _end, last in view.units() if start == hour))
+
+
+def _released_later(env, read_after=timedelta(0)):
+    """1.0 MB of rows under the cap of 1 MB, and another writer's prune seal recording 50 MB for the hour of the
+    newest of them, read by the server ``read_after`` its own sealed_at (sealing ran meanwhile, so no gap) and
+    acknowledged by the host: (that hour's row, the older rows, the seal, its sealed_at, the server's
+    acceptance)."""
+    target = T0 - timedelta(days=20)
+    small = _big(env, target, 100)
+    others = [_big(env, T0 - timedelta(days=30, hours=h), 300) for h in range(3)]     # 1.0 MB in all
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    forged = _inflate(env, ai.hour_floor(target), 50 * 1024 * KB)
+    forged_at = env.clock()
+    env.clock.advance(seconds=read_after.total_seconds())
+    retention.run_pass(env.session, now=env.clock())          # the server reads it: accepted as a warning
+    accepted = fmt.parse_time_text(
+        [e for e in env.st.known_record()["after_record"] if e["seq"] == forged][0]["accepted_at"])
+    _ack_by_host(env, [forged])
+    return small, others, forged, forged_at, accepted
+
+
+def test_when_names_the_release_of_another_writers_figure_the_host_acknowledged(env):
+    """Another writer's prune seal records 50 MB for an old hour, and the host acknowledges it: the cap's count
+    takes the figure in only once the window starts after both its acceptance and its sealed_at, a delay of
+    sealing on, and the bytes now take it in at once. So the retention screen warns, and its "when" names the
+    moment the count takes it in: the pruner deletes nothing an hour before it and the oldest rows after it."""
+    from app.core import audit_retention as ar
+    from app.core import retention_storage as rs
+    small, others, forged, _forged_at, accepted = _released_later(env)
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    view, record = st.view, st.known_record()
+    assert forged in size.held_back(view, record, size.window_start(view, record, now, delay))
+    assert size.cap_count(view, record, now, delay)[4] <= ar.MB < size.now_count(view, record, now)
+    over = size.first_over(view, record, now, delay, ar.MB)
+    assert over is not None and abs(over - (accepted + delay)) < timedelta(seconds=1), (over, accepted)
+    card = rs.cap_counted(now, st)
+    assert card["warn"] is True and card["over_from"] == over.isoformat() + "Z"
+    _run_to(env, over - timedelta(hours=1))
+    assert _kept(env, [small] + others) == set([small] + others) and not _size_prunes(env)
+    _run_to(env, over + timedelta(hours=2))
+    assert _kept(env, [small]) == set() and _size_prunes(env)
+    assert failures(env.verify()) == [] and failures(_off(env)) == []
+
+
+def test_when_names_a_release_that_comes_after_the_window_has_passed_the_seals_own_time(env):
+    """The same seal, read by the server eleven hours after its own sealed_at: a window that starts between the
+    two has passed the seal, so no entry of the hour is newer than its start, and still holds the seal back.
+    "when" names the moment its start reaches the acceptance, and the pruner agrees."""
+    from app.core import audit_retention as ar
+    from app.core.audit_chain_view import from_us
+    small, others, forged, forged_at, accepted = _released_later(env, read_after=timedelta(hours=11))
+    assert accepted - forged_at == timedelta(hours=11)
+    _run_to(env, forged_at + timedelta(days=7, hours=5))
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    view, record = st.view, st.known_record()
+    start = size.window_start(view, record, now, delay)
+    assert forged_at <= from_us(start) < accepted and forged in size.held_back(view, record, start)
+    entries = _entries_of(view, ai.hour_floor(T0 - timedelta(days=20)))
+    assert forged in [seq for seq, _at, _n in entries] and all(at <= start for _seq, at, _n in entries)
+    over = size.first_over(view, record, now, delay, ar.MB)
+    assert over is not None and abs(over - (accepted + delay)) < timedelta(seconds=1), (over, accepted)
+    _run_to(env, over - timedelta(hours=1))
+    assert _kept(env, [small] + others) == set([small] + others) and not _size_prunes(env)
+    _run_to(env, over + timedelta(hours=2))
+    assert _kept(env, [small]) == set() and _size_prunes(env)
+    assert failures(env.verify()) == [] and failures(_off(env)) == []
+
+
+def test_when_counts_an_hour_that_already_counts_and_grows_once_beside_a_later_hour(env):
+    """An hour sealed with a row grows by a late row two hours later, and a day later a new hour is sealed. Once
+    the window has passed the hour's first seal and not yet its late seal, the hour counts its first figure; the
+    cap's count takes the growth in a delay after the late seal, and the new hour a delay after its seal. Only both
+    pass the cap, so "when" names the second moment: the hour that grew counts its figure then, never its first
+    figure as well. The pruner deletes nothing an hour before it and the oldest row after it."""
+    from app.core import audit_retention as ar
+    old = [_big(env, T0 - timedelta(days=30, hours=h), 200) for h in range(3)]    # 0.6 MB
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    at = env.clock() - timedelta(minutes=10)
+    hour = ai.hour_floor(at)
+    first = _big(env, at, 100)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    first_sealed = _sealed_at(env, at)
+    late = _big(env, at + timedelta(minutes=5), 250)          # within six hours of the hour's seal: a late seal
+    retention.run_pass(env.session, now=env.clock())
+    grew = _sealed_at(env, at)
+    assert [s for s in env.seals() if s.kind == "late"][-1].sealed_at == grew > first_sealed + timedelta(hours=1)
+    _run_to(env, env.clock() + timedelta(days=1))
+    at2 = env.clock() - timedelta(minutes=10)
+    new = _big(env, at2, 200)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    sealed = _sealed_at(env, at2)
+    _run_to(env, first_sealed + timedelta(days=7, minutes=30))
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    view, record = st.view, st.known_record()
+    _start, _held, hot, _parts, counted = size.cap_count(view, record, now, delay)
+    (_s1, t1, before), (_s2, t2, grown) = _entries_of(view, hour)
+    added = view.entry_for(ai.hour_floor(at2)).root.bytes
+    assert t1 <= _start < t2 and hot[hour] == before and grown > before
+    # Once the hour has grown it counts its figure then; with its old figure counted as well it would pass too.
+    assert counted - before + grown <= ar.MB < counted + grown
+    assert counted - before + grown + added > ar.MB
+    over = size.first_over(view, record, now, delay, ar.MB)
+    assert over is not None and abs(over - (sealed + delay)) < timedelta(seconds=1), (over, sealed, grew)
+    assert sealed - grew > timedelta(hours=12)
+    _run_to(env, over - timedelta(hours=1))
+    assert _kept(env, old + [first, late, new]) == set(old + [first, late, new]) and not _size_prunes(env)
+    _run_to(env, over + timedelta(hours=2))
+    assert len(_kept(env, old)) == 2 and _kept(env, [first, late, new]) == {first, late, new}
+    assert failures(env.verify()) == [] and failures(_off(env)) == []
+
+
 def _timeline_cases():
     """(seal times, seqs placed elsewhere and where, now, delay) of random timelines: seals 1 to 6 hours apart with
     gaps of 13 to 200 hours, some still open at now, and a run of seals placed at the time of the seal after them
@@ -469,6 +589,46 @@ def test_the_first_moment_the_window_passes_a_seal_counts_every_gap_since_it():
                 assert line.window_start_then(now, t - 1, length) < seal, (at, placed, now, length, seal)
                 checked += 1
     assert checked > 1000
+
+
+def _window_sealed_on(at, placed, now, then, length):
+    """window_start at ``then`` over the timeline that seals on from now, a seal every hour until ``then``."""
+    hour = 3600 * 1000000
+    ext, t = list(at), now
+    while t <= then:
+        if t > ext[-1]:
+            ext.append(t)
+        t += hour
+    return size.times.Timeline(ext, size.times.gap_ends(ext), placed).window_start(then, length)
+
+
+def test_the_window_at_a_moment_to_come_is_the_window_of_the_timeline_that_seals_on_until_then():
+    """Timeline.window_start_then and reached against window_start itself, over the timeline extended with a seal
+    every hour from now on (sealing running on, with no gap): at now the window is window_start's; at a moment to
+    come it is window_start's over the extended timeline; at the moment reached gives, that window starts at or
+    after the seal and a microsecond earlier before it. Whether the newest seal is minutes, hours or days old: a
+    wait of under 12 hours since it is no gap."""
+    hour, minute = 3600 * 1000000, 60 * 1000000
+    checked = waits = 0
+    for n, (at, placed, now, length) in enumerate(_timeline_cases()):
+        nows = [now] + ([at[-1] + 7 * minute, at[-1] + 11 * hour + 59 * minute, at[-1] + 13 * hour] if n < 60 else [])
+        for now in nows:
+            waits += 0 < now - at[-1] <= 12 * hour
+            for p in ({}, placed):
+                line = size.times.Timeline(at, size.times.gap_ends(at), p)
+                assert line.window_start_then(now, now, length) == line.window_start(now, length), (at, p, now)
+                for k in (1, 30, 200):
+                    then = now + k * hour + 17
+                    assert line.window_start_then(now, then, length) == _window_sealed_on(at, p, now, then, length), (
+                        at, p, now, then)
+                for seal in at[::3]:
+                    if line.window_start(now, length) >= seal:
+                        continue                                 # passed already
+                    t = line.reached(seal, now, length)
+                    assert _window_sealed_on(at, p, now, t, length) >= seal > _window_sealed_on(at, p, now, t - 1,
+                                                                                               length), (at, p, now)
+                    checked += 1
+    assert checked > 500 and waits > 100
 
 
 # --------------------------------------------------------------------------- the protected bytes the chain binds
