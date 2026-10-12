@@ -6,7 +6,8 @@ groups of how long records are kept). A page whose every setting is advanced say
 catalogue, and its mark leaves a field's label as it was for assistive technology. The settings the provider
 has locked leave their place for one collapsed, read-only list at the foot of their page, "Set by your
 provider (N)", with each one's value and reason, and the toggle's N leaves them out. What the marks say
-reaches assistive technology as each field's description. Opening Settings again reads the catalogue again.
+reaches assistive technology as each field's description, never on screen: each field names the note once,
+beside a description of its own, which stays when the mark goes. Opening Settings again reads the catalogue again.
 A search box above the tabs finds a setting by its label or its help text on any page (label hits first, at
 most twelve listed) and goes to it, revealing it where it is advanced; it and N follow what the app shows or
 hides. Hiding a setting never changes what "Save All Changes" sends. Nothing is wider than a phone. No console
@@ -238,6 +239,82 @@ def test_reopening_settings_reads_the_catalogue_again_and_says_seen_again(page: 
     expect(page.locator("#setting-app-name")).to_have_accessible_description("")
     expect(_setting(page, "app_name").locator(".setting-marks-note")).to_have_count(0)
     expect(page.locator("#setting-app-description")).to_have_accessible_description("An advanced setting.")
+
+
+_NOTE_BOX = """n => { const r = n.getBoundingClientRect(), s = getComputedStyle(n);
+    return [r.width <= 1 && r.height <= 1, s.position, s.overflow]; }"""
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+def test_the_note_is_never_seen_and_each_field_names_it_once_however_often_the_page_is_applied(
+        page: Page, levels_admin, skin):
+    """The note that carries what the marks say is for assistive technology only: a box of at most one pixel with
+    its overflow clipped, so its words never show beside the title. Each field names it once in its description
+    (beside its own), however many times the page is applied again: the advanced settings shown and hidden, rows
+    drawn into the section, another page opened."""
+    errors = _errors(page)
+
+    def mark(data):
+        for e in data["entries"]:
+            e["new"] = e["key"] in ("app_name", "app_description", "signup_domains")
+    _serve_catalogue(page, mark)
+    _login(page, levels_admin, skin)
+    _open(page)
+    _toggle(page, "general").click()
+    for key in ("app_name", "app_description"):
+        note = _setting(page, key).locator(".setting-marks-note")
+        expect(note).to_have_count(1)
+        assert note.evaluate(_NOTE_BOX) == [True, "absolute", "hidden"], key
+    for _ in range(3):
+        _toggle(page, "general").click()
+        _settled(page)
+        page.evaluate("""() => { const s = document.getElementById('settings-section');
+            const d = document.createElement('div'); s.append(d); d.remove(); }""")
+        _settled(page)
+    _tab(page, "accounts")
+    _toggle(page, "accounts").click()
+    _settled(page)
+    _tab(page, "general")
+    _settled(page)
+    for field in ("#setting-app-name", "#setting-app-description", "#setting-signup-domain-input"):
+        ids = page.locator(field).get_attribute("aria-describedby").split()
+        notes = [i for i in ids if i.startswith("setting-marks-note-")]
+        assert len(notes) == 1 and len(ids) == len(set(ids)), (field, ids)
+    assert "accounts-domain-help" in page.locator("#setting-signup-domain-input").get_attribute(
+        "aria-describedby").split()
+    assert not errors, errors
+
+
+def test_a_fields_own_description_stays_when_its_mark_goes(page: Page, levels_admin):
+    """The signup domains field has a description of its own, its help. While its setting is marked, the mark's
+    note is named beside the help; when a new read of the catalogue no longer marks it, the note goes and the
+    field is described by its help alone, as it was."""
+    reads = []
+
+    def mark(data):
+        reads.append(1)
+        for e in data["entries"]:
+            if e["key"] == "signup_domains":
+                e["new"] = len(reads) == 1
+                e["level"] = "advanced" if len(reads) == 1 else "essential"
+    _serve_catalogue(page, mark)
+    _login(page, levels_admin)
+    _open(page)
+    _tab(page, "accounts")
+    _toggle(page, "accounts").click()
+    domains = page.locator("#setting-signup-domain-input")
+    expect(domains).to_be_visible()
+    expect(domains).to_have_accessible_description(re.compile(r"^Type a domain .* New in \S+ An advanced setting\.$"))
+    page.click('.sidebar-item[data-section="dashboard"]')
+    expect(page.locator("#settings-section")).to_be_hidden()
+    with page.expect_request(lambda r: r.url.endswith("/settings/catalogue/seen") and r.method == "POST"):
+        page.click('.sidebar-item[data-section="settings"]')
+    assert len(reads) == 2
+    _tab(page, "accounts")
+    expect(_setting(page, "signup_domains").locator(".setting-marks-note")).to_have_count(0)
+    expect(domains).to_be_visible()
+    assert domains.get_attribute("aria-describedby") == "accounts-domain-help"
+    expect(domains).to_have_accessible_description(re.compile(r"^Type a domain [^.]*\. Domains are [^.]*\.$"))
 
 
 def test_a_setting_drawn_inside_another_is_described_by_its_own_marks_only(page: Page, levels_admin):
