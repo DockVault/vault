@@ -189,6 +189,73 @@ def test_when_the_cap_would_start_deleting_counts_the_archived_days_too(env, mon
     assert size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] > limit
 
 
+def test_when_counts_an_archived_day_once_after_a_prune_rewrites_it_inside_the_window(env):
+    """A prune deletes some rows of an archived day, which gives its hours entries sealed inside the window: the day
+    still counts through its part alone, never through its hours as well, so the count passes a limit only once a
+    large row sealed later counts, at its seal plus the delay."""
+    from app.core import audit_chain_size as size
+    from test_audit_chain_size import KB, _big, _sealed_at
+    from test_audit_chain_trust import _run_to
+    import os
+    protected = ar.protected_actions()[0]
+    for h in range(4):              # what does not compress: an archived part counts its block's length
+        env.row(datetime.combine(OLD, time(h, 0)), details={"blob": os.urandom(40 * KB).hex()})
+        env.row(datetime.combine(OLD, time(h, 30)), action=protected, details={"blob": os.urandom(40 * KB).hex()})
+    env.run_until_sealed()
+    for _ in range(3):
+        arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    assert env.st.view.archives, "nothing was archived"
+    _run_to(env, T0 + timedelta(days=8))
+    ar.prune(retention.Pass(env.session, now=env.clock()), ar.Numbers(95, 0, 365, 0))   # the day is rewritten
+    hours = {datetime.combine(OLD, time(h, 0)) for h in range(4)}
+    st, delay = env.st, timedelta(days=7)
+    start_us = size.window_start(st.view, st.known_record(), env.clock(), delay)
+    archived = {h for _d, part in st.view.archived_parts() for h in part.hours()}
+    assert hours <= archived
+    units = {start: last for start, _end, last in st.view.units()}
+    assert all(any(at > start_us for _seq, at, _n in st.view.entry_chain(units[h])) for h in hours), \
+        "the prune gave the archived hours no entry inside the window"
+    at = env.clock() - timedelta(minutes=10)
+    _big(env, at, 300)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    now = env.clock()
+    grown = size.now_count(st.view, st.known_record(), now)
+    counted = size.cap_count(st.view, st.known_record(), now, delay)[4]
+    assert grown - counted >= 300 * KB
+    limit = grown - 100 * KB                 # passed only once the large row counts
+    over = size.first_over(st.view, st.known_record(), now, delay, limit)
+    assert over is not None and abs(over - (_sealed_at(env, at) + delay)) < timedelta(seconds=1), over
+    _run_to(env, over - timedelta(hours=1))
+    assert size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] <= limit
+    _run_to(env, over + timedelta(hours=1))
+    assert size.cap_count(st.view, st.known_record(), env.clock(), delay)[4] > limit
+
+
+def test_rows_not_sealed_yet_count_from_the_first_microsecond_after_the_newest_sealed_hour(env):
+    """What the rows not sealed yet take: a row at the very start of the first hour not sealed counts, one in the
+    newest sealed hour (a late row, the sealer's) does not."""
+    from app.core.models import AuditLog
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    view = env.st.view
+    through = rs._sealed_through(view)
+    assert through is not None
+
+    def unsealed():
+        with env.session() as db:
+            return rs.unsealed_bytes(db, view)
+
+    def size(row_id):
+        with env.session() as db:
+            return int(db.query(ar._row_bytes(AuditLog, db.get_bind().dialect.name))
+                       .filter(AuditLog.id == row_id).scalar())
+    before = unsealed()
+    late = env.row(through - timedelta(microseconds=1), details={"blob": "y" * 2000})
+    assert unsealed() == before and size(late) > 2000
+    first = env.row(through, details={"blob": "x" * 3000})
+    assert unsealed() == before + size(first)
+
+
 def test_a_cap_before_the_chain_has_a_view_counts_nothing_yet(env, monkeypatch):
     monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 365, 5))
     env.fresh_process()
