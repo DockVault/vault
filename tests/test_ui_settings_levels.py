@@ -240,6 +240,29 @@ def test_reopening_settings_reads_the_catalogue_again_and_says_seen_again(page: 
     expect(page.locator("#setting-app-description")).to_have_accessible_description("An advanced setting.")
 
 
+def test_a_setting_drawn_inside_another_is_described_by_its_own_marks_only(page: Page, levels_admin):
+    """A setting a page's script draws inside another: each field is described by the marks of the setting that
+    holds it most closely, never by an outer one's."""
+    _login(page, levels_admin)
+    _open(page)
+    _toggle(page, "general").click()
+    page.evaluate("""() => {
+        const outer = document.querySelector('#settings-tab-general [data-setting="app_description"]');
+        const inner = document.createElement('div');
+        inner.dataset.setting = 'app_name';
+        const label = document.createElement('label');
+        label.htmlFor = 'levels-inner-field';
+        label.textContent = 'Inner';
+        const field = document.createElement('input');
+        field.id = 'levels-inner-field';
+        inner.append(label, field);
+        outer.appendChild(inner);
+    }""")
+    _settled(page)
+    expect(page.locator("#setting-app-description")).to_have_accessible_description("An advanced setting.")
+    expect(page.locator("#levels-inner-field")).to_have_accessible_description("")
+
+
 def test_the_new_marks_on_a_page_are_the_servers(page: Page, levels_admin, admin):
     _login(page, levels_admin)
     _open(page)
