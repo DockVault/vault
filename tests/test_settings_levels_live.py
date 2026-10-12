@@ -3,16 +3,19 @@
 GET /settings/catalogue gives every setting of the Settings pages with its page, level and release, once each,
 to an administrator only; "New" counts from the running release and from the release at which this
 administrator last opened the pages, which POST /settings/catalogue/seen keeps with their preferences, where
-PUT /users/me/preferences can neither set it nor lose it. Inside the web container, with SETTINGS_LOCKED_KEYS
+PUT /users/me/preferences can neither set it nor lose it; while another transaction holds the row, the seen
+write waits for it and keeps what it wrote. Inside the web container, with SETTINGS_LOCKED_KEYS
 set for one process, the catalogue the real configuration builds folds what is locked with its value and
 reason. test_settings_levels.py covers the registry, the markup and the routes offline.
 """
 import json
 import re
+import subprocess
+import time
 
 import pytest
 
-from _account_change_helpers import in_api_container
+from _account_change_helpers import API, in_api_container
 from conftest import ApiClient
 
 pytestmark = pytest.mark.integration
@@ -72,6 +75,61 @@ def test_the_release_last_opened_at_is_kept_with_the_preferences(fresh_admin):
     assert fresh_admin.put("/users/me/preferences", json={"settings_seen": "0.1.0", "ui": "v2"}).status_code == 200
     prefs = fresh_admin.get("/users/me/preferences").json()
     assert prefs.get("settings_seen") == running and prefs.get("ui") == "v2"
+
+
+
+_HOLD_THE_ROW = """
+import sys, time, uuid
+from app.core.config import bootstrap_entrypoint
+bootstrap_entrypoint('settings-levels-test')
+from app.core.database import SessionLocal
+from app.core.models import UserPreference
+db = SessionLocal()
+row = db.query(UserPreference).filter(UserPreference.user_id == uuid.UUID(sys.argv[1])).with_for_update().one()
+print("held", flush=True)
+time.sleep(2.5)
+prefs = dict(row.preferences)
+prefs["ui"] = "v2"
+row.preferences = prefs
+db.commit()
+print("written", flush=True)
+"""
+
+
+def test_the_seen_write_waits_for_another_write_of_the_row_and_keeps_it(admin):
+    """Another transaction holds this administrator's preferences row and changes another preference: the seen
+    write waits for it, then keeps both (a write that merged into the row as it read it before would put the
+    old preference back)."""
+    account = admin.create_user(role="admin")
+    try:
+        client = ApiClient()
+        client.login(account["_username"], account["_password"])
+        assert client.put("/users/me/preferences", json={"ui": "v1"}).status_code == 200
+        try:
+            holder = subprocess.Popen(["docker", "exec", "-i", API, "python", "-c", _HOLD_THE_ROW, account["id"]],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError as exc:
+            pytest.skip(f"docker unavailable: {exc}")
+        try:
+            line = holder.stdout.readline().strip()
+            if line != "held":
+                holder.wait(timeout=30)
+                if "No such container" in (holder.stderr.read() or ""):
+                    pytest.skip(f"no {API} container on this host")
+                raise AssertionError(f"the row was not held: {line!r} {holder.stderr.read()[-500:]!r}")
+            started = time.monotonic()
+            r = client.post("/settings/catalogue/seen")
+            waited = time.monotonic() - started
+            assert r.status_code == 200, r.text
+            assert holder.wait(timeout=30) == 0, holder.stderr.read()[-500:]
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+        assert waited > 1.0, waited                       # it waited for the other transaction
+        prefs = client.get("/users/me/preferences").json()
+        assert prefs.get("ui") == "v2" and prefs.get("settings_seen") == r.json()["seen"], prefs
+    finally:
+        admin.delete_user(account["id"])
 
 
 _LOCKED = """
