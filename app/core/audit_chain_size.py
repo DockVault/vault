@@ -177,12 +177,15 @@ def now_count(view, record: Optional[dict], now: datetime) -> int:
 def first_over(view, record: Optional[dict], now: datetime, delay: timedelta, limit: int) -> Optional[datetime]:
     """The earliest the size cap's count passes ``limit`` from what is sealed now, if sealing keeps running and
     nothing changes: each hour's newer figures count once the window's start has passed the seal that recorded
-    them, a delay after it (a gap in sealing only moves that later). None when the count never passes it."""
-    _, held, hot, parts, total = cap_count(view, record, now, delay)
+    them, a delay of sealing after it. Every gap in sealing since that seal (on either timeline: the server's
+    window is the longer of the two) moves that on; a gap still to come would only move it later. None when the
+    count never passes it."""
+    start_us, held, hot, parts, total = cap_count(view, record, now, delay)
     if total > limit:
         return now
-    start_us = window_start(view, record, now, delay)
+    now_us = times.us(now)
     length = int(delay.total_seconds() * 1000000)
+    lines = times.timelines(view, record)
     archived = {h for _d, part in view.archived_parts() for h in part.hours()}
     moving = {}
     for start, end, last in view.units():
@@ -192,8 +195,13 @@ def first_over(view, record: Optional[dict], now: datetime, delay: timedelta, li
         if any(at > start_us for _seq, at, _n in entries):
             moving[start] = entries
     fixed = sum(c for _d, _p, c, _h in parts) + sum(n for h, n in hot.items() if h not in moving)
-    for t in sorted({at + length for entries in moving.values() for _seq, at, _n in entries if at > start_us}):
-        if fixed + sum(lagged(entries, t - length) for entries in moving.values()) > limit:
+    # The window's start at a moment to come is the earlier of the two timelines' (window_start), so it passes a
+    # seal at the later of the two moments each timeline's start passes it.
+    due = {max(line.reached(at, now_us, length) for line in lines)
+           for entries in moving.values() for _seq, at, _n in entries if at > start_us}
+    for t in sorted(due):
+        then = min(line.window_start_then(now_us, t, length) for line in lines)
+        if fixed + sum(lagged(entries, then) for entries in moving.values()) > limit:
             return times.dt(t)
     return None
 

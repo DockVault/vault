@@ -367,6 +367,93 @@ def test_the_servers_window_takes_in_a_stop_another_writers_seals_hid(env):
     assert servers <= stop_start
 
 
+def test_the_pruner_the_card_and_when_count_on_the_servers_window_across_a_stop_another_writers_seals_hid(env):
+    """A large row sealed two days before a stop of ten days, across which another writer appended hour seals every
+    11 hours: on the chain's timeline a delay of sealing has run since the row's seal, on the server's the stop
+    is a gap. The pruner's plan, the retention screen's card and its "when" all take the server's window: at the
+    restart nothing counts the row and nothing is deleted, and the cap starts deleting once seven days of sealing
+    have run since the row's seal, the stop left out (two days before it, five after the restart)."""
+    from app.core import audit_retention as ar
+    from app.core import retention_storage as rs
+    from app.core.audit_chain_view import from_us
+    from test_audit_chain_dates import _forge_hours_across
+    delay = timedelta(days=7)
+    old = [_big(env, T0 - timedelta(days=30, hours=h), 200) for h in range(3)]    # 0.6 MB
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    at = env.clock() - timedelta(minutes=10)
+    big = _big(env, at, 700)
+    _run_to(env, env.clock() + timedelta(hours=3))
+    sealed = _sealed_at(env, at)
+    _run_to(env, env.clock() + timedelta(days=2))
+    last = env.st.view.newest_at()                           # the newest seal before the stop
+    stop = env.clock()
+    _forge_hours_across(env, stop + timedelta(days=10))
+    retention.run_pass(env.session, now=env.clock())         # the restart accepts them
+    restart = env.clock()
+    assert _kept(env, old) == set(old) and not _size_prunes(env)
+    st = env.st
+    view, record = st.view, st.known_record()
+    start, _held, _hot, _parts, counted = size.cap_count(view, record, restart, delay)
+    assert from_us(start) < sealed and counted < ar.MB
+    assert size.cap_count(view, record, restart, delay, server=False)[4] > ar.MB     # what the chain alone gives
+    with env.session() as db:
+        plan = ar.chain_size_plan(db, AuditLog, view, record, restart, ar.current(), delay)
+    assert (plan.counted_before, plan.counted_bytes) == (from_us(start), counted)
+    card = rs.cap_counted(restart, st)
+    assert card["counted_bytes"] == counted and card["now_bytes"] > ar.MB and card["warn"] is True
+    due = restart + delay - (last - sealed)
+    over = size.first_over(view, record, restart, delay, ar.MB)
+    assert over is not None and abs(over - due) < timedelta(seconds=1), (over, due)
+    assert card["over_from"] == over.isoformat() + "Z"
+    _run_to(env, over - timedelta(hours=1))
+    assert _kept(env, old) == set(old) and not _size_prunes(env)
+    _run_to(env, over + timedelta(hours=2))
+    assert len(_kept(env, old)) == 1 and big in _kept(env, [big])
+    prunes = _size_prunes(env)
+    assert prunes and fmt.parse_time_text(prunes[0].detail["size"]["from"]) < last
+    assert failures(env.verify()) == [] and failures(_off(env)) == []
+
+
+def _timeline_cases():
+    """(seal times, seqs placed elsewhere and where, now, delay) of random timelines: seals 1 to 6 hours apart with
+    gaps of 13 to 200 hours, some still open at now, and a run of seals placed at the time of the seal after them
+    (another writer's seals the server accepted then)."""
+    import random
+    hour = 3600 * 1000000
+    rnd = random.Random(34)
+    for _ in range(300):
+        t, at = 0, []
+        for i in range(30):
+            t += rnd.choice([1, 2, 6, 6, 6, 13, 50, 200]) * hour if i else 0
+            at.append(t)
+        placed = {}
+        if rnd.random() < 0.5:
+            first, n = rnd.randrange(2, 25), rnd.randrange(1, 5)
+            for seq in range(first, first + n):
+                placed[seq] = at[first + n - 1] - 1              # just before seal first + n
+        yield at, placed, at[-1] + rnd.choice([0, 2, 30, 300]) * hour, rnd.choice([24, 168]) * hour
+
+
+def test_the_first_moment_the_window_passes_a_seal_counts_every_gap_since_it():
+    """Timeline.reached against window_start_then: at the moment it gives, the window (sealing running on from
+    now) starts at or after the seal, and a microsecond earlier before it; whatever gaps lie after the seal, one
+    the seal lies inside on the server's timeline, or one still open at now."""
+    checked = 0
+    for at, placed, now, length in _timeline_cases():
+        for line in (size.times.Timeline(at, size.times.gap_ends(at)),
+                     size.times.Timeline(at, size.times.gap_ends(at), placed)):
+            for seal in at:
+                if line.window_start(now, length) >= seal:
+                    continue                                     # passed already
+                t = line.reached(seal, now, length)
+                assert t > now
+                assert line.window_start_then(now, t, length) >= seal, (at, placed, now, length, seal)
+                assert line.window_start_then(now, t - 1, length) < seal, (at, placed, now, length, seal)
+                checked += 1
+    assert checked > 1000
+
+
 # --------------------------------------------------------------------------- the protected bytes the chain binds
 
 def _protected(env, hour, days=7):

@@ -23,7 +23,8 @@ The dates (app/core/audit_chain_policy_seals.py and the size cap use them):
   applied it, with only the gaps that open before that date (so the date is fixed once sealing has run past
   it);
 - the size cap's window: one delay of time while sealing ran, counted back from now, each gap it takes in
-  lengthening it again.
+  lengthening it again; and, for the retention screen's "when", where that window will start at a later
+  moment if sealing runs on from now, and the first moment its start passes a given seal.
 
 Times are microseconds since the epoch (app/core/audit_chain_view.py), as the view keeps them.
 """
@@ -104,6 +105,35 @@ class Timeline:
             if b > start:
                 start -= b - a
         return start
+
+    def _gaps_until(self, now_us: int) -> List[Tuple[int, int]]:
+        """(start, end) of every gap, the one open at ``now`` ending there: sealing runs on from now."""
+        out = [(a, b) for _g, a, b in self._gaps]
+        if self.open_gap(now_us):
+            out.append((self.newest(), now_us))
+        return out
+
+    def window_start_then(self, now_us: int, then_us: int, length_us: int) -> int:
+        """The start of the window at ``then`` (now or later) if sealing runs on from now with no gap: as
+        window_start, with the gap open at now ending at now."""
+        start = then_us - length_us
+        for a, b in sorted(self._gaps_until(now_us), key=lambda x: x[1], reverse=True):
+            if b > start:
+                start -= b - a
+        return start
+
+    def reached(self, at_us: int, now_us: int, length_us: int) -> int:
+        """The first moment at which the window's start (window_start_then) is at or after ``at``, if sealing runs
+        on from now with no gap. A start never falls inside a gap: from ``at``, or from the end of a gap ``at``
+        falls inside, the length plus every gap that ends after that."""
+        gaps = self._gaps_until(now_us)
+        start, moved = at_us, True
+        while moved:
+            moved = False
+            for a, b in gaps:
+                if a < start < b:
+                    start, moved = b, True
+        return start + length_us + sum(b - a for a, b in gaps if b > start)
 
 
 def gap_ends(times) -> List[int]:
