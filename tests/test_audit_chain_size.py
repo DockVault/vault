@@ -180,9 +180,9 @@ def test_a_late_row_in_an_empty_hour_of_the_backlogs_run_counts_nothing_before_t
     assert _kept(env, genuine) == set()                   # oldest first, once the delay has run
 
 
-def _inflate(env, hour, nbytes, protected=0):
+def _inflate(env, hour, nbytes, protected=0, **body):
     """Another writer's prune seal for ``hour`` that keeps its roots and records ``nbytes`` (``protected`` of them
-    protected)."""
+    protected); ``body``: its other fields (its sealed_at)."""
     with env.session() as db:
         root = ai.hour_root(db, env.st.view, hour)
         newest = db.query(AuditSeal).filter(AuditSeal.kind == "policy").order_by(AuditSeal.seq.desc()).first()
@@ -196,7 +196,7 @@ def _inflate(env, hour, nbytes, protected=0):
             break
     return _forge(env, "prune", {"reason": "retention", "policy_seq": newest.seq, "request_seq": None,
                                  "hours": [[fmt.hour_text(hour), prev_seq, root.count, nbytes, root.root_s.hex(),
-                                            root.root_c.hex(), root.ids_digest.hex(), protected]]})
+                                            root.root_c.hex(), root.ids_digest.hex(), protected]]}, **body)
 
 
 def test_another_writers_inflated_bytes_are_held_back_and_a_size_cap_prune_lists_them(env):
@@ -506,6 +506,35 @@ def test_when_names_a_release_that_comes_after_the_window_has_passed_the_seals_o
     _run_to(env, over + timedelta(hours=2))
     assert _kept(env, [small]) == set() and _size_prunes(env)
     assert failures(env.verify()) == [] and failures(_off(env)) == []
+
+
+def test_a_seal_dated_ahead_of_the_servers_clock_is_released_from_its_sealed_at(env):
+    """Another writer's seal dated four minutes ahead of the server's clock (within the tolerance) and read at once:
+    accepted at the server's clock, then acknowledged. A window that starts at its acceptance, or a microsecond
+    before its sealed_at, still holds it back; one that starts at its sealed_at counts it in full; and "when" names
+    the moment the window's start reaches the sealed_at, not the acceptance."""
+    from app.core import audit_retention as ar
+    from app.core.audit_chain_view import to_us
+    target = T0 - timedelta(days=20)
+    _big(env, target, 100)
+    for h in range(3):
+        _big(env, T0 - timedelta(days=30, hours=h), 300)                         # 1.0 MB in all
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(days=8))
+    ahead = env.clock() + timedelta(minutes=4)
+    forged = _inflate(env, ai.hour_floor(target), 50 * 1024 * KB, sealed_at=ahead)
+    retention.run_pass(env.session, now=env.clock())
+    _ack_by_host(env, [forged])
+    st, now, delay = env.st, env.clock(), timedelta(days=7)
+    view, record = st.view, st.known_record()
+    accepted = fmt.parse_time_text([e for e in record["after_record"] if e["seq"] == forged][0]["accepted_at"])
+    assert accepted == now < ahead
+    assert size.release_points(view, record)[forged] == to_us(ahead)
+    assert forged in size.held_back(view, record, to_us(accepted))
+    assert forged in size.held_back(view, record, to_us(ahead) - 1)
+    assert forged not in size.held_back(view, record, to_us(ahead))
+    over = size.first_over(view, record, now, delay, ar.MB)
+    assert over is not None and abs(over - (ahead + delay)) < timedelta(seconds=1), (over, ahead)
 
 
 def test_when_counts_an_hour_that_already_counts_and_grows_once_beside_a_later_hour(env):
