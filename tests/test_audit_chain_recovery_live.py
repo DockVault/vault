@@ -487,10 +487,11 @@ out["hour"] = fmt.hour_text(ai.hour_floor(at(hours=12)))
     assert first["stopped"] is None, first
     _code, _found, sealed = _verify(throwaway)
     anchor = sealed["head"]
+    # Into the hour the first script sealed: this script's clock may have passed the next hour since.
     added = _script(throwaway, r"""
-out["added"] = add_row(ai.hour_floor(at(hours=12)) + timedelta(minutes=50))
+out["added"] = add_row(fmt.parse_time_text(HOUR) + timedelta(minutes=50))
 out["back"] = passes()
-""")
+""".replace("HOUR", repr(first["hour"])))
     _seen, done = _two(throwaway, "acknowledge", "--late-rows", first["hour"])
     assert done["added"] == 1, (added, done)
     after = _script(throwaway, r"""
