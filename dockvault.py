@@ -258,6 +258,7 @@ RETENTION_ENV_KEYS = (
     ("audit_min_retention_days", "AUDIT_MIN_RETENTION_DAYS", "0"),
     ("audit_protected_min_days", "AUDIT_PROTECTED_MIN_DAYS", "365"),
     ("audit_log_max_mb", "AUDIT_LOG_MAX_MB", "0"),
+    ("erase_blocked_by_protected_minimum", "ERASE_BLOCKED_BY_PROTECTED_MINIMUM", "false"),
     ("plan_log_max_days", "PLAN_LOG_MAX_DAYS", "-1"),
     ("plan_log_max_mb", "PLAN_LOG_MAX_MB", "-1"),
     ("security_record_days", "SECURITY_RECORD_DAYS", "30"),

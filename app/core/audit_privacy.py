@@ -175,6 +175,8 @@ _IDENTIFIER_KEYS = (
     "late_rows", "day", "hours", "cutoff",
     # how many archived days an export read
     "archived_days",
+    # a per-person erase: its request and the placeholder it writes (never the name it removes)
+    "request_id", "placeholder",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
@@ -231,6 +233,9 @@ DETAIL_KEYS.update({
     "filters.to_date": IDENTIFIER,
     "filters.user": SIGNIN_NAME, "filters.q": SIGNIN_NAME, "filters.temp_credential": SIGNIN_NAME,
     "filters.ip": ADDRESS,
+    # what a per-person erase changed in each store: the store's name, then a count
+    "stores": NESTED,
+    "stores.*": COUNT,
 })
 
 

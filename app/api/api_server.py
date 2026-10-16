@@ -738,6 +738,9 @@ app.include_router(email_studio_router, prefix="/email")
 # The settings the panel manages through the settings registry (app/core/settings_registry.py)
 from app.api.managed_settings_router import router as managed_settings_router
 app.include_router(managed_settings_router)
+# Per-person erase (Settings -> Activity and records): a deleted account's name removed from the records.
+from app.api.person_erase_router import router as person_erase_router  # noqa: E402
+app.include_router(person_erase_router)
 # What the audit log records of personal data (Settings -> Activity and records).
 from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
 app.include_router(recording_levels_router)
@@ -852,9 +855,14 @@ def _validate_new_username(v):
     Rejects control, format and other invisible characters (Unicode category C): an escape byte in a
     username acts on the terminal of whoever prints it (the host tool, a log viewer), and an invisible
     one makes two usernames look the same.
-    NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode."""
+    NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode.
+    Rejects a name that starts with "erased-", in any case: a per-person erase writes such placeholders into
+    the audit log (app/core/person_erase.py), and an account named like one would read as their owner."""
     import unicodedata
+    from app.core.person_erase import is_reserved_name
     v = _reject_markup_chars(v, 'username')
+    if v is not None and is_reserved_name(v):
+        raise ValueError("usernames that start with 'erased-' are kept for erased records")
     if v is not None and '@' in v:
         raise ValueError("username may not contain '@'")
     if v is not None and any(unicodedata.category(ch).startswith('C') for ch in v):

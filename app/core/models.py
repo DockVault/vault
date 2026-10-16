@@ -244,7 +244,11 @@ class User(Base):
         secondaryjoin='Vault.id == vault_members.c.vault_id',
         back_populates='members'
     )
-    audit_logs = relationship('AuditLog', back_populates='user', foreign_keys='AuditLog.user_id')
+    # Deleting an account leaves its audit rows to the database's ON DELETE SET NULL (passive_deletes): the ORM
+    # neither loads every row of the account nor writes them one by one. audit_logs.user_id is neither a stable
+    # nor a committed column of the integrity chain, so clearing it changes no seal.
+    audit_logs = relationship('AuditLog', back_populates='user', foreign_keys='AuditLog.user_id',
+                              passive_deletes=True)
     key_pair = relationship('UserKeyPair', back_populates='user', uselist=False, cascade='all, delete-orphan')
     # Organizational group memberships (read-only view; writes via /groups endpoints)
     groups = relationship(
@@ -1366,6 +1370,39 @@ class ManagedSettingChange(Base):
     decided_by_name = Column(String(255), nullable=True)
     decided_at = Column(DateTime, nullable=True)
     reason = Column(String(255), nullable=True)
+
+
+class EraseRequest(Base):
+    """A per-person erase (app/core/person_erase.py, app/core/audit_chain_erase.py): a deleted account's username,
+    or a name typed at sign-in, removed from the audit log and the other records once the delay has passed.
+
+    The name waits in ``name_token`` only, sealed (AES-256-GCM under a key derived from ENCRYPTION_KEY, bound to
+    the request's id), and is deleted with the run's last seal or the cancel. The audit log's integrity chain
+    holds the request: its ``request`` seal carries a commitment to the name and the placeholder the erase
+    writes, and the pruner acts on that seal, never on this row alone; ``placeholder``, ``request_seq``,
+    ``effective_at`` and ``through`` are copies for the page. ``status`` is pending, running, completed or
+    cancelled; ``waiting`` says why a due erase has not run yet. ``counts`` says what it changed in each store,
+    never the name. Created by create_all; an older release ignores the table.
+    """
+    __tablename__ = 'erase_requests'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status = Column(String(16), nullable=False, index=True)
+    name_token = Column(Text, nullable=True)
+    placeholder = Column(String(16), nullable=False, unique=True)
+    request_seq = Column(BigInteger, nullable=True)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=True)
+    requested_at = Column(DateTime, nullable=False)
+    effective_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    through = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    waiting = Column(String(255), nullable=True)
+    counts = Column(JSON, nullable=True)
 
 
 class AuditSeal(Base):

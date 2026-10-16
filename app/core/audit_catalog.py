@@ -278,6 +278,11 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("audit_archive_restored", "administration", "Archived audit day restored as rows", "notice"),
     # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
     AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
+    # A per-person erase (app/core/person_erase.py): asked for, cancelled by any administrator, and completed by
+    # the server once due. Each names the placeholder the erase writes, never the name it removes.
+    AuditAction("person_erase_requested", "administration", "Erase of a person's records requested", "warning"),
+    AuditAction("person_erase_cancelled", "administration", "Erase of a person's records cancelled", "notice"),
+    AuditAction("person_erased", "administration", "A person's records erased", "warning", automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
     # A managed setting (app/core/settings_registry.py): the row carries the values before and after.

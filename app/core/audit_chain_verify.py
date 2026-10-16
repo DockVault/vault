@@ -285,6 +285,8 @@ def request_problem(view, seal) -> Optional[str]:
         ph = d.get("placeholder")
         if not isinstance(ph, str) or not PLACEHOLDER.match(ph) or not d.get("subject"):
             return "an erase request without its subject and placeholder"
+        if any(d.get(f) is not None for f in ("setting", "old", "new")):
+            return "an erase request naming a setting or a value"
         for other in view.requests.values():
             if other.get("placeholder") == ph:
                 return "an erase request sharing another's placeholder"
@@ -387,6 +389,9 @@ def other_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
         req_seq = d.get("request_seq")
         if req_seq not in view.pending_requests():
             return "an erase seal for a request that is not pending"
+        newest = view.newest_policy()
+        if newest is None or d.get("policy_seq") != newest[0]:
+            return "an erase seal that does not name the policy seal in force"
         try:
             not_before = fmt.parse_time_text(req.get("not_before"))
         except (TypeError, ValueError):
@@ -1126,6 +1131,14 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
         # (a host command committed meanwhile), and a part it still lists would read as gone.
         next_from = _rolling(db, report.view, report, ai.hour_floor(now) - timedelta(days=7),
                              fmt.parse_time_text(rolling_from) if rolling_from else None)
+        # Step 4 for each pending erase, which only a holder of ENCRYPTION_KEY can do: its row opens to the name its
+        # request seal commits to, with the placeholder the seal names (app/core/audit_chain_erase.py).
+        try:
+            from app.core import audit_chain_erase
+            for message in audit_chain_erase.pending_input_problems(db, report.view, st.cfg()):
+                report.add(FAILURE, "unjustified-input", message)
+        except Exception as exc:  # noqa: BLE001 -- the next check tries again
+            ai._say(f"Warning: the waiting erases were not checked ({type(exc).__name__})")
     finally:
         db.close()
     failures = {f.kind: f.message for f in report.findings if f.severity == FAILURE}

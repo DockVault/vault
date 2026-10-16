@@ -425,10 +425,10 @@ def test_two_erase_requests_may_not_share_a_placeholder(env):
     assert any("sharing another's placeholder" in m for m in _why(_off(env)))
 
 
-def _erase(env, req, placeholder, hour, rows, *, final=False):
+def _erase(env, req, placeholder, hour, rows, *, final=False, policy_seq=None):
     return _append(env, "erase", {"hour": fmt.hour_text(hour), "request_seq": req, "request_id": None,
-                                  "placeholder": placeholder, "bytes_now": 0, "through": fmt.hour_text(hour),
-                                  "final": final, "rows": rows})
+                                  "placeholder": placeholder, "policy_seq": policy_seq or _newest_policy(env)[0],
+                                  "bytes_now": 0, "through": fmt.hour_text(hour), "final": final, "rows": rows})
 
 
 def test_a_row_erased_twice_is_unjustified(env):
@@ -457,6 +457,23 @@ def test_an_erase_seal_for_a_request_that_is_not_pending_is_unjustified(env, how
         _erase(env, req, placeholder, hour, [], final=True)
     _erase(env, req, placeholder, hour, [])
     assert any("not pending" in m for m in _why(_off(env)))
+
+
+def test_an_erase_seal_naming_another_policy_seal_than_the_one_in_force_is_unjustified(env):
+    env.row(T0 - timedelta(hours=3))
+    env.run_until_sealed()
+    hour = ai.hour_floor(T0 - timedelta(hours=3))
+    req, placeholder = _erase_request(env)
+    _wait_days(env, 8)
+    _erase(env, req, placeholder, hour, [], final=True, policy_seq=_newest_policy(env)[0] - 1)
+    assert any("does not name the policy seal in force" in m for m in _why(_off(env)))
+
+
+def test_an_erase_request_naming_a_setting_or_a_value_is_unjustified(env):
+    env.run_until_sealed()
+    _append(env, "request", _request("erase", subject="ab" * 32, placeholder="erased-" + secrets.token_hex(4),
+                                     setting="audit_max_days"))
+    assert any("naming a setting or a value" in m for m in _why(_off(env)))
 
 
 def test_a_cancel_of_a_pending_request_is_justified(env):

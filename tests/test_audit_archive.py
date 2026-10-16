@@ -4,8 +4,9 @@ on a throwaway SQLite database with a chain of its own (tests/_audit_chain_env.p
 - the block format: every model column, a round trip identical in every column, the dictionary, aggregates;
 - the job: only sealed days older than the row window, nothing inside the grace period after the chain's
   genesis, a day the host put back left as rows for a grace of its own, parts of whole hours, a day over several
-  passes, verified before the rows go (a corrupt block or a changed row keeps the rows), an hour an erase or
-  another writer's unacknowledged seal holds left as rows, a crash between the steps, the data marker with the
+  passes, verified before the rows go (a corrupt block or a changed row keeps the rows), an hour another
+  writer's unacknowledged seal holds left as rows (an hour an erase changed is archived like any:
+  tests/test_audit_chain_erase.py), a crash between the steps, the data marker with the
   first block and gone with the last;
 - the chain: the archive seal's rules, audit verify over blocks (altered, missing, unsealed, moved, a row put
   back), the daily check reading blocks in turn, an anchor checked without the key;
@@ -34,7 +35,7 @@ from app.core import audit_chain_verify as v
 from app.core import audit_integrity as ai
 from app.core import audit_retention as ar
 from app.core import retention
-from app.core.audit_chain_view import ArchivePart, to_hours
+from app.core.audit_chain_view import ArchivePart
 from app.core.models import AuditArchiveBlock, AuditLog, RoleEnum, User
 
 pytestmark = pytest.mark.unit
@@ -488,13 +489,6 @@ def test_the_daily_check_puts_the_marker_back(env):
     assert _marker(env) is not None
 
 
-def test_an_hour_an_erase_follows_is_left_as_rows(env):
-    _sealed_day(env)
-    # An erase seal after hour 4's seal, as the view would hold it (seal 2, which reads back cleanly and erases
-    # no row, stands in for one: no writer of erase seals yet).
-    env.st.view._erases[to_hours(at(4))] = [2]
-    _archive(env)
-    assert _hot(env) == 6 and _blocks(env) == []
 
 
 def test_an_hour_another_writer_resealed_is_left_as_rows_until_the_host_acknowledges_it(env):

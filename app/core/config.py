@@ -474,6 +474,11 @@ class Settings(BaseSettings):
     audit_min_retention_days: int = Field(default=0)
     audit_protected_min_days: int = Field(default=365)
     audit_log_max_mb: int = Field(default=0)
+    # A per-person erase (app/core/person_erase.py) waits, with this true, while any audit row it would change is
+    # younger than the protected minimum for its kind (AUDIT_MIN_RETENTION_DAYS for every row, the panel's
+    # protected minimum for administration and security rows): for deployments whose records must be kept
+    # intact that long. False (the default): an erase runs once its delay has passed.
+    erase_blocked_by_protected_minimum: bool = Field(default=False)
     plan_log_max_days: int = Field(default=-1)
     plan_log_max_mb: int = Field(default=-1)
     # How long records are kept is managed in the panel (app/core/settings_registry.py), within the limits

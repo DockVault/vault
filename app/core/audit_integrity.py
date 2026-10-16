@@ -311,6 +311,10 @@ class ChainState:
         # Archived days the audit job found nothing to delete in, by (day, archive seq, reason): (the UTC date of
         # that look, the time before which it looked). It looks again the next day, or once that time moves on.
         self.archive_checked: Dict[tuple, Any] = {}
+        # What a running per-person erase found in each archived day, by (its request seal, the day): (the day's
+        # archive seq when read, the rows of the name, the newest of them, the newest protected one). A day whose
+        # archive seal changes is read again (app/core/audit_chain_erase.py).
+        self.erase_scans: Dict[tuple, Any] = {}
 
     def cfg(self):
         return self.settings or _settings()

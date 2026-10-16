@@ -144,6 +144,7 @@ def _run_erase(env, req, placeholder, hour, rows):
             entries.append([str(rid), c_prev.hex(), fmt.commitment(fmt.ZERO_NONCE, row).hex()])
         return w.append("erase", detail={"hour": fmt.hour_text(hour), "request_seq": req.seq,
                                          "request_id": req.detail["request"], "placeholder": placeholder,
+                                         "policy_seq": w.st.view.newest_policy()[0],
                                          "bytes_now": 0, "through": fmt.hour_text(hour), "final": True,
                                          "rows": entries})
 

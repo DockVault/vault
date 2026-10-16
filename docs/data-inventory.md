@@ -107,6 +107,7 @@ Visits to a link and uploads through one are also in the audit log.
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
 | `audit_seals` **New in 0.34.0** | The audit log's integrity chain: one seal per closed hour of audit rows (two hashes over the hour's rows and the ids of its rows), and one per retention change, cancel, acknowledgment and deletion of audit rows. A retention change's seal names the setting, its values, the change's id and the administrator's account id; an acknowledgment's names the seals it acknowledges. An hour's seal also keeps the 16-byte ids of its rows, and, for rows written without a nonce, a random value per hour from which their nonces are derived. No username, address, name or text of a row: those enter only as a hash, under each row's random nonce. | Finding changes made to the audit log in the database. | For ever: seals are never deleted, and they stay when the rows they cover are deleted. | Nothing deletes a seal. Deleting rows writes a seal that says so; an erase destroys the rows' nonces, so the old hashes reveal nothing. |
 | `audit_archive_blocks` **New in 0.34.0** | Audit rows older than the row window (`AUDIT_HOT_DAYS`, 90 days by default), compressed: each block is a part of one UTC day and holds every column of every row it took from `audit_logs`, so the same personal data as those rows (see [The audit log](#the-audit-log)), and the per-hour values from which the nonces of rows written without one are derived. A count of rows and bytes by action, status and channel, and by hour, and of rows by hour, action, status and channel, per block, for the summaries and the size cap. The Activity page and its exports read archived days for a time range that reaches them, through a temporary table that goes with the request. | The audit log, kept compressed: it is kept for ever by default. Archiving starts `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) days after 0.34.0 first ran here (when it began sealing the audit log); a day `audit unarchive` put back stays rows that long again. While any block exists, a row in `data_requirements` keeps 0.33.1 and later from starting. | As long as the audit rows it holds: the audit log's retention applies to archived rows as to the others (the maximum, the size cap, the protected minimums, the hold). | The pruner deletes archived rows by the audit log's retention, rewriting the block; `dockvault.py audit unarchive` puts days back as rows and removes their blocks. **Not** deleted with the account: a block keeps the account id of a deleted account (a restored row has it cleared, as the database clears it on a row, and the Activity page shows it cleared). |
+| `erase_requests` **New in 0.34.0** | For each per-person erase: the name it removes, only sealed (AES-256-GCM under a key derived from `ENCRYPTION_KEY`, bound to the request), the placeholder it writes, who asked for it and who cancelled it (id and username), when, why it waits, and what it changed in each place (counts). | The erase waits its delay before it runs, and any administrator can cancel it meanwhile. | For ever, as a record alongside the audit log; the sealed name is deleted when the erase completes or is cancelled. | Nothing deletes a row. The sealed name is deleted with the erase's end; the account ids are cleared when the account is deleted. |
 | `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. What waits, and what the pruner applies, is the audit log's integrity chain's: the retention screen lists the waiting changes from it, not from this table. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
 
 ### Other tables
@@ -350,22 +351,37 @@ and the unlock state.
    Cache entries expire on their own within a day (a lock with no end on a name that is no account:
    30 days); those about names typed at sign-in hold only a keyed stand-in.
 3. **Removing what stays**, if you decide it must go (audit records are often kept to establish or
-   defend legal claims; that is your decision): set `AUDIT_LOG_RETENTION_DAYS`, or delete rows in the
-   database. For example, in the database container:
+   defend legal claims; that is your decision): **erase the name** (Settings, Activity and records,
+   "Erase a person's records"; new in 0.34.0). Type the name exactly as the records hold it: a deleted
+   account's username, or a name typed at a failed sign-in. The preview counts what it would change in
+   each place below, lists the near misses (the same name in another case or another form, each erased
+   only by an erase of its own), and says what it does not reach. Asking asks for your password, and the
+   erase waits `RETENTION_REDUCTION_DELAY_DAYS` (7 days by default); any administrator can cancel it
+   until it begins, and every administrator is told. It is refused while an account, a temporary
+   credential or an invitation still waiting has the name, and for any name that starts with `erased-`.
 
-   ```sql
-   -- Back up first. These deletions are not themselves audited.
-   DELETE FROM audit_logs WHERE username = 'the-username';
-   DELETE FROM security_alerts WHERE username = 'the-username';
-   DELETE FROM security_records WHERE name = 'the-username';
-   DELETE FROM account_invitations WHERE username = 'the-username';
-   ```
+   When it runs, every row of the audit log whose username is exactly that name, and every archived row,
+   gets a placeholder (`erased-` and 8 random characters) in its place: its address, browser
+   description, temporary credential's name, error text and `recorded` values are cleared, and of its
+   details only ids, counts and the other values always recorded stay, never one that holds the name.
+   The integrity chain records each changed row (its hash before and after) and still verifies. The same
+   run gives the placeholder to the name in `security_records` (its address is cleared too),
+   `security_alerts` (its address too), `credential_changes`, `admin_grants`, ended
+   `account_invitations` (the email address is cleared), other administrators' saved searches,
+   notifications, received notes, `managed_setting_changes`, `managed_settings`,
+   `audit_privacy_policies`, `user_ssh_keys` and `erase_requests`. The name it removes is kept only
+   sealed in `erase_requests` until then, and deleted when the erase completes or is cancelled; the
+   audit rows of the request, the cancel and the completion name the placeholder, never the person.
 
-   The same statements remove a name typed at sign-in that is no account. A name can also appear
-   inside other rows' `details`; search them with `details::text LIKE '%the-username%'` before
-   deciding.
+   It waits while the hold switch is on, while a restore is not finished, and, with
+   `ERASE_BLOCKED_BY_PROTECTED_MINIMUM=true` (for deployments whose records must be kept intact), until
+   every audit row it would change is older than the protected minimum for its kind.
 
-There is no built-in per-person erasure yet.
+   **What an erase does not reach:** backups, exports and copies made before it (and the database's own
+   files until their space is reused: the erase runs a plain `VACUUM`, and `dockvault.py audit compact`
+   rewrites the tables); container output and the log-access file; email already sent; other people's
+   audit rows that name the person in their details (an administrator's row recording the deletion of
+   their account, for example); and audit rows with no time.
 
 ## Retention settings
 
@@ -378,6 +394,7 @@ There is no built-in per-person erasure yet.
 | `PLAN_LOG_MAX_DAYS`, `PLAN_LOG_MAX_MB` | `-1` (none) | Ceilings on the audit log's maximum days and size cap. |
 | `RETENTION_REDUCTION_DELAY_DAYS` | `7` | How long a change that deletes sooner waits; any administrator can cancel it meanwhile. |
 | `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
+| `ERASE_BLOCKED_BY_PROTECTED_MINIMUM` | `false` | When `true`, a per-person erase waits until every audit row it would change is older than the protected minimum for its kind. |
 | `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records (and seals the audit log's hours). At most 360 take effect: the integrity chain needs a seal at least every 12 hours. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |
 | `SECURITY_RECORD_DAYS` | `30` | Failed sign-ins kept in full, and the names and addresses in security alerts (between `SECURITY_RECORD_MIN_DAYS`, 7, and `SECURITY_RECORD_MAX_DAYS`, 365). |

@@ -25,15 +25,15 @@ The pruner's ``audit_archive`` job, after the audit job, each pass:
    the day has so far. Anything that does not check out rolls the whole transaction back: the rows stay, and a
    mismatch with the seals is reported as a failure.
 
-An hour is left as rows (not a finding) while an erase seal follows its root seal (an erase over blocks comes
-with per-person erase), and while its root seal, or an erase after it, is a seal another writer appended after
-the head record that the host has not acknowledged.
+An hour is left as rows (not a finding) while its root seal, or an erase after it, is a seal another writer
+appended after the head record that the host has not acknowledged. An hour an erase changed is archived like any
+other: its erased rows count by the commitment before the erase, and must hold what the erase seal says it wrote.
 
 A day archived over several transactions gets one ``archive`` seal per transaction; the one whose parts cover
 all the day's hours the chain covers says ``complete``.
 
-Changing archived rows (the audit job's deletions now; the erase and the address rewrite later) goes through
-rewrite_day(), the block-rewrite primitive: every block of the day is checked against the day's ``archive``
+Changing archived rows (the audit job's deletions; the address rewrite later) goes through rewrite_day(), the
+block-rewrite primitive (a per-person erase writes its blocks the same way, app/core/audit_chain_erase.py): every block of the day is checked against the day's ``archive``
 seal (length, digest) and its hours against their seals, and a part the change touches is written again and
 checked the same way, all in one transaction, so a check that fails anywhere leaves every block as it was; the
 change's own seal (a ``prune``) and then an ``archive`` seal of cause ``rewrite`` naming it commit with them. A
@@ -249,16 +249,27 @@ def _root(db, view, hour: datetime):
         raise NotVerified("link-broken", str(stop), fmt.hour_text(hour)) from None
 
 
-def _c_prev(db, view, hour: datetime) -> Dict:
-    """The earlier commitments of the rows an erase seal after ``hour``'s root seal changed."""
+def erase_entries(db, view, hour: datetime) -> Dict:
+    """For each row an erase seal after ``hour``'s root seal changed: (its commitment before, its commitment after,
+    the placeholder the erase wrote), each seal read again and its link checked. Raises NotVerified (link-broken)."""
     ai = _ai()
     own = view.own_entry(hour)
     if own is None or not own.erases:
         return {}
+    out: Dict = {}
     try:
-        return ai.erase_c_prev(db, view, own)
+        for seq in own.erases:
+            d = ai.read_authenticated(db, view, seq).detail or {}
+            for rid, c_prev, c_next in d.get("rows") or []:
+                out.setdefault(fmt.as_uuid(rid), (bytes.fromhex(c_prev), bytes.fromhex(c_next), d.get("placeholder")))
     except ai.ChainStopped as stop:
         raise NotVerified("link-broken", str(stop), fmt.hour_text(hour)) from None
+    return out
+
+
+def _c_prev(db, view, hour: datetime) -> Dict:
+    """The earlier commitments of the rows an erase seal after ``hour``'s root seal changed."""
+    return {rid: e[0] for rid, e in erase_entries(db, view, hour).items()}
 
 
 def held_hour(view, record: Optional[dict], hour: datetime) -> Optional[int]:
@@ -363,9 +374,15 @@ class PartReader:
     ``expected``), and the block's aggregates. Nothing holds the rows, so a part of any size is read in fixed
     memory (only each hour's ids grow with it). A caller that stops early calls finish(), which reads the rest and
     runs the checks; a check that fails raises NotVerified, and the caller's transaction then rolls back whatever
-    it did with the rows."""
+    it did with the rows.
 
-    def __init__(self, db, view, day: date, part, *, expected: Optional[Dict[datetime, tuple]] = None):
+    A row an erase changed counts by its commitment before the erase, and must hold what the erase seal says it
+    wrote (the placeholder, and values whose commitment under a zero nonce is the seal's ``c_next``). ``c_prev``
+    and ``erased`` ({hour: {id: c_prev}} and {hour: {id: (c_next, placeholder)}}) replace the erase seals' for a
+    part an erase is writing, whose seals are not in the view yet."""
+
+    def __init__(self, db, view, day: date, part, *, expected: Optional[Dict[datetime, tuple]] = None,
+                 c_prev: Optional[Dict] = None, erased: Optional[Dict] = None):
         self.db, self.view, self.day, self.part, self.expected = db, view, day, part, expected
         self.block = open_part(db, day, part)
         if self.block.header.get("day") != day.isoformat() or self.block.header.get("part") != part.part:
@@ -378,7 +395,14 @@ class PartReader:
         if any(h not in set(self.hours) for h in self.salts):
             raise NotVerified("block-altered", f"the block of {_label(day, part)} keeps a salt of an hour it does "
                                                "not hold")
-        self.c_prev = {h: _c_prev(db, view, h) for h in self.hours} if expected is None else {}
+        if c_prev is not None:
+            self.c_prev, self.erased = c_prev, erased or {}
+        elif expected is None:
+            entries = {h: erase_entries(db, view, h) for h in self.hours}
+            self.c_prev = {h: {rid: e[0] for rid, e in es.items()} for h, es in entries.items()}
+            self.erased = {h: {rid: (e[1], e[2]) for rid, e in es.items()} for h, es in entries.items()}
+        else:
+            self.c_prev, self.erased = {}, {}
         self.figs: Dict[datetime, object] = {}
         self.checked = False
         self._iter = None
@@ -405,6 +429,11 @@ class PartReader:
                     current = hour
                     builder = ai.FiguresBuilder(self.salts.get(hour), self.c_prev.get(hour) or None)
                 builder.add(row)
+                erased = (self.erased.get(hour) or {}).get(row["id"])
+                if erased is not None and (row.get("username") != erased[1]
+                                           or fmt.commitment(fmt.ZERO_NONCE, row) != erased[0]):
+                    raise NotVerified("unjustified", f"erased row {row['id']} is not what its erase seal says",
+                                      fmt.hour_text(hour))
                 yield row
         except af.BlockError as exc:
             raise NotVerified("block-altered", f"the block of {_label(self.day, self.part)} cannot be read: "
@@ -476,13 +505,14 @@ def _insert_block(db, day: date, number: int, first: datetime, last: datetime, b
 
 
 def _check_stored(db, view, day: date, part, bw: af.BlockWriter,
-                  expected: Optional[Dict[datetime, tuple]] = None) -> None:
+                  expected: Optional[Dict[datetime, tuple]] = None, *, c_prev: Optional[Dict] = None,
+                  erased: Optional[Dict] = None) -> None:
     """The block as the table now holds it: its length, digest, rows (every column), hours and aggregates.
-    Raises NotVerified."""
+    ``c_prev`` and ``erased``: an erase's, whose seals are not in the view yet (PartReader). Raises NotVerified."""
     lengths = stored_blocks(db, day)
     if lengths.get((day, part.part)) != part.length:
         raise NotVerified("block-altered", f"the block of {_label(day, part)} was not stored whole")
-    block = PartReader(db, view, day, part, expected=expected).finish().block
+    block = PartReader(db, view, day, part, expected=expected, c_prev=c_prev, erased=erased).finish().block
     if block.identity.digest() != bw.identity.digest():
         raise NotVerified("block-altered", f"the block of {_label(day, part)} does not give back the rows written "
                                            "into it")
@@ -555,9 +585,6 @@ def archive_next_part(w, day: date, now: datetime):
             if counts.get(h):
                 raise NotArchivable(f"{fmt.hour_text(h)} has rows and no seal")
             continue
-        own = view.own_entry(h)
-        if own is not None and own.erases:
-            raise NotArchivable(f"{fmt.hour_text(h)} has an erase after its seal")
         held = held_hour(view, w.record, h)
         if held is not None:
             raise NotArchivable(f"{fmt.hour_text(h)}'s seal {held} was appended by another writer and waits for "
@@ -694,8 +721,9 @@ def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform:
     it. Every block is checked first (each part read once to pick, and checked to its end); a part with rows
     picked is read again and written anew, the nonces of its changed hours' rows materialised and those hours'
     salts dropped, and checked as stored. Returns what changed, or None when nothing did. The caller then writes
-    its change's seal with ``entries`` and calls seal_rewrite(). Raises NotVerified, or NotArchivable when an hour
-    it would change waits (another writer's seal the host has not acknowledged, or an erase after its seal)."""
+    its change's seal with ``entries`` and calls seal_rewrite(): the new roots are over the rows as they are now,
+    so an erase after an hour's root seal is then part of them. Raises NotVerified, or NotArchivable when an hour it
+    would change waits (another writer's seal the host has not acknowledged)."""
     from app.core.models import AuditArchiveBlock as B
     ai = _ai()
     db, view = w.db, w.st.view
@@ -723,9 +751,6 @@ def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform:
             if held is not None:
                 raise NotArchivable(f"{fmt.hour_text(h)}'s seal {held} was appended by another writer and waits "
                                     "for the host")
-            own = view.own_entry(h)
-            if own is not None and own.erases:
-                raise NotArchivable(f"{fmt.hour_text(h)} has an erase after its seal")
         salts = reader.salts
         new_salts = {h: salt for h, salt in salts.items() if h not in changed_hours}
         builders = {h: ai.FiguresBuilder() for h in changed_hours}

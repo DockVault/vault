@@ -399,6 +399,13 @@ def prune_audit_logs(p: Pass) -> JobResult:
     return audit_retention.prune(p)
 
 
+def run_person_erases(p: Pass) -> JobResult:
+    """Per-person erases whose delay has run (app/core/audit_chain_erase.py): a name given a placeholder in the audit
+    log, its archive and the other records, under the audit chain. Held by the hold switch."""
+    from app.core import audit_chain_erase
+    return audit_chain_erase.run_job(p)
+
+
 def archive_audit_rows(p: Pass) -> JobResult:
     """Audit days older than the row window, moved whole into compressed daily blocks once checked against
     their seals (app/core/audit_archive.py). Deletes nothing, so the hold does not stop it."""
@@ -417,6 +424,7 @@ JOBS: list[Job] = [
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),
     Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),
     Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
+    Job("person_erase", "Per-person erases that are due", run_person_erases, held=True),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
     Job("audit_archive", "Audit days moved into compressed daily blocks", archive_audit_rows),
 ]
