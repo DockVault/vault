@@ -98,19 +98,21 @@ def scrub_details(value, name: str, prefix: str = ""):
     out = {}
     for key, v in value.items():
         path = prefix + str(key)
-        if holds(key, name) or holds(v, name):
+        if holds(key, name):
             continue
         kind = ap.kind_of(path)
-        if kind == ap.IDENTIFIER:
+        if kind == ap.NESTED and isinstance(v, dict):
+            inner = scrub_details(v, name, path + ".")
+            if inner:
+                out[key] = inner
+        elif holds(v, name):
+            continue
+        elif kind == ap.IDENTIFIER:
             out[key] = v
         elif kind == ap.COUNT and isinstance(v, int) and not isinstance(v, bool):
             out[key] = v
         elif kind == ap.ERROR and isinstance(v, str) and _TYPE_NAME.fullmatch(v):
             out[key] = v
-        elif kind == ap.NESTED and isinstance(v, dict):
-            inner = scrub_details(v, name, path + ".")
-            if inner:
-                out[key] = inner
     return out or None
 
 

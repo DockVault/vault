@@ -137,6 +137,17 @@ st = ai.ChainState(clock=lambda: clock[0])
 ai.set_state(st)
 DAY = (now - timedelta(days=100)).date()
 NAME = "erase-run-" + uuid.uuid4().hex[:8]
+from app.services import audit_logger as _logger
+
+
+class _AtTheClock(datetime):
+    """The audit rows the app writes itself are dated by the scenario's clock."""
+    @classmethod
+    def now(cls, tz=None):
+        return clock[0].replace(tzinfo=tz) if tz is not None else clock[0]
+
+
+_logger.datetime = _AtTheClock
 
 
 def at(hour, minute=0, day=None):
@@ -175,8 +186,9 @@ def run_days(days):
 
 
 archived = [add_row(at(3, 5), NAME), add_row(at(5, 5), NAME, nonce=False), add_row(at(5, 25), "alice", nonce=False)]
-hot = [add_row(now - timedelta(hours=30), NAME), add_row(now - timedelta(hours=30, minutes=-5), NAME, nonce=False),
-       add_row(now - timedelta(hours=30, minutes=-10), "alice", nonce=False)]
+hour = ai.hour_floor(now - timedelta(hours=30))
+hot = [add_row(hour + timedelta(minutes=5), NAME), add_row(hour + timedelta(minutes=10), NAME, nonce=False),
+       add_row(hour + timedelta(minutes=15), "alice", nonce=False)]
 with SessionLocal() as db:
     db.add(SecurityRecord(id=uuid.uuid4(), at=now, kind="password", name=NAME, address="198.51.100.9"))
     db.add(SecurityAlert(id=uuid.uuid4(), event_type="failed_login", severity="warning", timestamp=now,
@@ -195,7 +207,6 @@ with SessionLocal() as db:
     with ps.change_transaction(engine) as w:
         asked = pe.request(w, NAME, w.db.get(User, admin.id))
 out["placeholder"] = asked["placeholder"]
-hour = ai.hour_floor(now - timedelta(hours=30))
 with SessionLocal() as db:
     out["salt_before"] = bytes(ai.working_row(db, hour).legacy_salt).hex()
 run_days(8)
@@ -261,6 +272,7 @@ out["orm_updates"] = len(updates)
 with SessionLocal() as db:
     out["orphan"] = db.query(func.count()).select_from(AuditLog).filter(
         AuditLog.username == "gone-" + NAME[-8:], AuditLog.user_id.is_(None)).scalar()
+with SessionLocal() as db:
     report = v.verify(db, record=st.head_store().load(), held=held, current_key_id=st.current_key().key_id,
                       now=clock[0])
 out["failures_after_delete"] = [[f.kind, f.message] for f in report.findings if f.severity == "failure"]

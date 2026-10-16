@@ -68,6 +68,10 @@ def test_names_no_record_can_hold_are_refused(name, why):
     assert why in pe.name_problem(name)
 
 
+def test_a_name_as_long_as_the_column_holds_may_be_erased():
+    assert pe.name_problem("x" * 255) is None
+
+
 def test_the_names_the_server_writes_for_itself_are_refused():
     names = pe.system_names()
     assert {"operator@host", "server configuration"} <= names
@@ -120,11 +124,16 @@ def test_a_name_someone_has_is_refused(env, who):
     assert [s.kind for s in env.seals()].count("request") == 0
 
 
-def test_an_invitation_that_ended_does_not_hold_the_name(env):
+@pytest.mark.parametrize("how", ["expired", "accepted", "revoked"])
+def test_an_invitation_that_ended_does_not_hold_the_name(env, how):
     env.run_until_sealed()
+    later = env.clock() + timedelta(days=1)
     with env.session() as db:
         db.add(AccountInvitation(id=uuid.uuid4(), username="eve", role="user", token_prefix="p",
-                                 token_hash=uuid.uuid4().hex, expires_at=env.clock() - timedelta(days=1)))
+                                 token_hash=uuid.uuid4().hex,
+                                 expires_at=env.clock() - timedelta(days=1) if how == "expired" else later,
+                                 accepted_at=env.clock() if how == "accepted" else None,
+                                 revoked_at=env.clock() if how == "revoked" else None))
         db.commit()
     assert env.ask("eve")["status"] == pe.PENDING
 
@@ -200,7 +209,11 @@ def test_a_placeholder_already_taken_is_drawn_again(env, monkeypatch):
     first = env.ask("eve")
     taken = first["placeholder"][len("erased-"):]
     env.admin("erased-77777777")
-    draws = iter([taken, "77777777", "0a0b0c0d"])
+    with env.session() as db:            # a row the chain holds no request of still holds its placeholder
+        db.add(EraseRequest(id=uuid.uuid4(), status=pe.PENDING, placeholder="erased-88888888",
+                            requested_at=env.clock()))
+        db.commit()
+    draws = iter([taken, "77777777", "88888888", "0a0b0c0d"])
     monkeypatch.setattr(pe.secrets, "token_hex", lambda n: next(draws))
     second = env.ask("mallory")
     assert second["placeholder"] == "erased-0a0b0c0d"
@@ -279,6 +292,30 @@ def test_an_erase_that_has_begun_or_completed_cannot_be_cancelled(env, monkeypat
         env.cancel(asked["id"], env.admin("carol"))
 
 
+def test_a_cancel_while_sealing_is_stopped_is_refused_for_an_erase_that_has_begun(env, monkeypatch):
+    from app.core import audit_chain_erase as ae
+    from app.core import retention
+    env.row(T0 - timedelta(hours=30), username="eve")
+    env.row(T0 - timedelta(hours=20), username="eve")
+    env.run_until_sealed()
+    asked = env.ask("eve")
+    env.passes(24 * 7 - 6)
+    real = ae.step
+
+    def one_unit(p, w, seq, findings, tried):
+        out = real(p, w, seq, findings, tried)
+        if out[0] == ae.ERASED:
+            p.deadline = 0
+        return out
+    monkeypatch.setattr(ae, "step", one_unit)
+    env.clock.advance(hours=6)
+    retention.run_pass(env.session, now=env.clock())
+    with env.session() as db:
+        with pytest.raises(pe.Refused, match="has begun"):
+            pe.cancel_while_stopped(db, asked["id"], env.admin("bob"))
+    assert env.request_row(asked["id"]).name_token is not None
+
+
 def test_a_cancel_of_an_erase_the_chain_does_not_hold_is_no_erase(env):
     env.run_until_sealed()
     with pytest.raises(LookupError):
@@ -318,6 +355,9 @@ def test_the_preview_counts_every_store_and_lists_near_misses(env):
     with env.session() as db:
         p = pe.preview(db, "eve", env.clock(), env.st)
     assert p["audit_rows"] == 2 and p["near_misses"] == ["EVE"] and p["refused"] is None
+    with env.session() as db:
+        # Typed in another form, the name's compatible form finds the rows of the plain one as near misses.
+        assert pe.preview(db, "ＥＶＥ", env.clock(), env.st)["near_misses"] == ["EVE", "eve"]
     counts = {s["key"]: s["count"] for s in p["stores"]}
     assert counts["security_records"] == 1 and counts["security_alerts"] == 1 and counts["notifications"] == 1
     assert set(counts) == {s.key for s in pe.STORES}
@@ -342,6 +382,17 @@ def test_the_preview_counts_rows_recorded_as_a_fingerprint_and_says_rows_with_no
         p = pe.preview(db, "eve", env.clock(), env.st)
     assert p["audit_rows"] == 2 and p["undated_rows"] == 1
     assert "1 audit rows with no time" in p["not_reached"]
+
+
+def test_a_waiting_erase_the_chain_holds_no_request_of_is_reported(env):
+    from app.core import audit_chain_verify as v
+    env.run_until_sealed()
+    with env.session() as db:
+        db.add(EraseRequest(id=uuid.uuid4(), status=pe.PENDING, placeholder="erased-feedfeed",
+                            requested_at=env.clock()))
+        db.commit()
+    report = v.daily_check(env.session, env.st, env.clock(), force=True)
+    assert any("no request seal" in f.message for f in report.findings if f.kind == "unjustified-input")
 
 
 def test_the_list_says_each_erase_as_the_chain_holds_it(env):

@@ -82,7 +82,10 @@ def test_an_erase_gives_the_placeholder_clears_the_values_and_keeps_the_chain_va
     h1 = T0 - timedelta(hours=30)
     mine = [_put(env, h1 + timedelta(minutes=m), details={"vault_id": "v1", "file_name": "secret.txt", "count": 2, "n": 3,
                                                            "username": "eve", "reason": "eve did it",
-                                                           "email": "eve@example.com", "x_unclassified": 1},
+                                                           "email": "eve@example.com", "x_unclassified": 1,
+                                                           "recipients": 3, "sent": "a,b", "error": "KeyError",
+                                                           "changes": {"email": "eve@example.com", "role": "user"},
+                                                           "token": "secret"},
                  recorded={"ip": "203.0.113.0/24"}, error_message="eve not found", temp_credential_name="tc-eve")
             for m in (5, 15)]
     mine.append(_put(env, T0 - timedelta(hours=20), endpoint="/raw/path/eve", error_message="ValueError"))
@@ -97,7 +100,8 @@ def test_an_erase_gives_the_placeholder_clears_the_values_and_keeps_the_chain_va
         assert row.username == asked["placeholder"] and row.ip_address is None and row.user_agent is None
         assert row.recorded is None and row.temp_credential_name is None and row.error_message is None
         assert row.endpoint == "/vaults/{vault_id}/files"
-        assert row.details == {"vault_id": "v1", "count": 2}        # unclassified keys go too
+        assert row.details == {"vault_id": "v1", "count": 2, "recipients": 3, "error": "KeyError",
+                               "changes": {"role": "user"}}         # unclassified keys go too
         assert bytes(row.seal_nonce) == fmt.ZERO_NONCE
     third = _rows(env, id=mine[2])[0]
     assert third.endpoint is None and third.error_message == "ValueError"
@@ -285,6 +289,49 @@ def test_the_vacuum_after_an_erase_keeps_to_its_budget(monkeypatch):
     assert ae.VACUUM_TABLES[0] == "audit_seals" and ae.VACUUM_TABLES[-1] == "audit_logs"
 
 
+@pytest.mark.parametrize("model, column", [
+    ("AdminGrant", "granted_by_name"), ("Note", "sent_from_name"), ("ManagedSettingChange", "requested_by_name"),
+    ("ManagedSettingChange", "decided_by_name"), ("ManagedSetting", "updated_by_name"),
+    ("AuditPrivacyPolicy", "created_by_name"), ("UserSSHKey", "created_by_name"),
+    ("EraseRequest", "requested_by_name"), ("CredentialChange", "requested_by_name"),
+    ("CredentialChange", "decided_by_name")])
+def test_a_name_column_of_each_store_gets_the_placeholder(env, model, column):
+    import sqlalchemy as sa
+    from app.core import models
+    m = getattr(models, model)
+    _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    values = {}
+    for c in m.__table__.columns:
+        if c.primary_key:
+            values[c.name] = uuid.uuid4() if isinstance(c.type, sa.Uuid) else (
+                "k-" + uuid.uuid4().hex[:8] if isinstance(c.type, sa.String) else 1)
+        elif not c.nullable:
+            values[c.name] = _filler(c)
+    values[column] = "eve"
+    with env.engine.begin() as conn:
+        conn.execute(m.__table__.insert().values(**values))
+    asked = _due(env)
+    with env.engine.begin() as conn:
+        assert conn.execute(sa.select(m.__table__.c[column])).scalar() == asked["placeholder"]
+
+
+def _filler(column):
+    import sqlalchemy as sa
+    t = column.type
+    if isinstance(t, sa.Uuid):
+        return uuid.uuid4()
+    if isinstance(t, sa.DateTime):
+        return T0
+    if isinstance(t, (sa.Integer, sa.Boolean)):
+        return 0
+    if isinstance(t, sa.JSON):
+        return {}
+    if isinstance(t, sa.Enum):
+        return list(t.enums)[0]
+    return "x"
+
+
 def test_every_other_store_gets_the_placeholder_in_the_final_transaction(env):
     _put(env, T0 - timedelta(hours=30))
     env.run_until_sealed()
@@ -325,6 +372,48 @@ def test_every_other_store_gets_the_placeholder_in_the_final_transaction(env):
 
 
 # --------------------------------------------------------------------------- what it waits for
+
+def test_nothing_is_due_while_a_gap_in_sealing_is_open(env):
+    rid = _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    env.ask("eve")
+    env.passes(24 * 7 - 6)
+    env.clock.advance(hours=18)                 # no seal for 18 hours: a gap is open
+    assert ae.due(env.view(), env.st.known_record(), env.clock()) == []
+    env.erase_job()
+    assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
+    # Sealing again closes the gap, which moved the delay on by its length: due 18 hours after its date.
+    env.seal()
+    env.erase_job()
+    env.clock.advance(hours=5)
+    env.seal()
+    env.erase_job()
+    assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
+    env.clock.advance(hours=1)
+    env.seal()
+    env.erase_job()
+    assert _rows(env, id=rid)[0].username != "eve"
+
+
+def test_an_hour_another_writer_resealed_waits_for_the_host(env):
+    from test_audit_chain_held import _foreign_late
+    from test_audit_archive import _ack_by_host
+    rid = _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    hour = ai.hour_floor(T0 - timedelta(hours=30))
+    extra = _put(env, hour + timedelta(minutes=40), username="alice")
+    late = _foreign_late(env, hour, [extra])
+    env.clock.advance(minutes=30)
+    assert env.seal().stopped is None
+    asked = env.ask("eve")
+    env.passes(24 * 8)
+    assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
+    assert "waits for the host operator" in env.request_row(asked["id"]).waiting
+    _ack_by_host(env, [late])
+    env.passes(6)
+    assert _rows(env, id=rid)[0].username == asked["placeholder"]
+    assert failures(env.verify()) == []
+
 
 def test_the_hold_switch_defers_it(env, monkeypatch):
     rid = _put(env, T0 - timedelta(hours=30))
@@ -416,10 +505,12 @@ def test_a_database_that_holds_the_row_back_vetoes_the_erase(env, how):
         else:
             row.name_token = None
         db.commit()
-    env.passes(24 * 8)
-    assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
+    env.passes(6)                               # vetoed at once: it does not wait for its delay
     cancels = [s for s in env.seals() if s.kind == "cancel"]
     assert len(cancels) == 1 and cancels[0].detail["by"] == "database"
+    env.passes(24 * 8)
+    assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
+    assert len([s for s in env.seals() if s.kind == "cancel"]) == 1
     assert cancels[0].seq in ai.database_seqs(env.view())
 
 
