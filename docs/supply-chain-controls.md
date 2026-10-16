@@ -77,11 +77,16 @@ standard library, bound to Python 3.14.7, whose release already carries their fi
 Alpine's `zlib` 1.3.2-r0, which the build's `apk upgrade` replaces with the fixed 1.3.2-r1. They
 suppressed nothing, so they were removed. Before the local scan, the workflow renders the template
 for the tested source revision, the versioned image reference, and the local image content ID.
-After push, it overwrites the release asset with the exact registry manifest digest. Every
+After push, it renders the release asset again for the exact registry manifest digest. Every
 statement must contain both the immutable OCI digest PURL and the versioned image reference, and
-the renderer refuses one that does not. The GitHub Release publishes the rendered VEX beside the
-SBOM, with an empty statement list when there is no exception: applied to the scan, it suppresses
-nothing. Any exception requires a source-reviewed template change.
+the renderer refuses one that does not. Any exception requires a source-reviewed template change.
+
+The GitHub Release publishes the rendered VEX beside the SBOMs only when the template holds at least
+one statement. OpenVEX requires a document to hold at least one, so a release with no reviewed
+exception has no VEX to publish: the renderer writes no file and the release attaches none, and the
+release is refused before it is created if any file it does list is missing. The scans still apply
+the document they render for the image they scan; with no statement it suppresses nothing, and it is
+never published.
 
 Each statement names the exact package versions it was reviewed for, so an image that has moved on
 (a newer base image, or a newer Alpine package from the build's `apk upgrade`) is no longer covered

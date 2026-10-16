@@ -1195,3 +1195,113 @@ def test_not_knowing_whether_a_release_is_out_stops_the_publication(tmp_path, an
     assert run.returncode != 0
     assert "cannot tell whether v0.34.0 has already been published" in run.stdout
     assert shown in run.stdout
+
+
+# OpenVEX requires a document to hold at least one statement, so a release with no reviewed exception
+# has no VEX to attach. The step that renders the release VEX decides that and names the asset; the
+# release step attaches only what it names, and refuses to start if a listed file is missing. The
+# step runs here with the real renderer, against a template without and with a statement.
+_RELEASE_VEX_ENV = {
+    "IMAGE": "ghcr.io/dockvault/vault",
+    "TAG": "v0.33.4",
+    "DIGEST": "sha256:" + "a" * 64,
+    "SOURCE_REVISION": "b" * 40,
+}
+
+
+def _run_release_vex_step(tmp_path: Path, statements: list):
+    bash = _bash()
+    if bash is None:
+        if os.environ.get("CI"):
+            pytest.fail("no bash to run the publish step with; this check would silently not run")
+        pytest.skip("no bash on this machine")
+    import yaml
+
+    steps = yaml.safe_load(_WORKFLOW)["jobs"]["publish"]["steps"]
+    (step,) = [s for s in steps if s.get("id") == "release_vex"]
+    assert set(step["env"]) == set(_RELEASE_VEX_ENV)
+    assert step["env"]["DIGEST"] == "${{ steps.push.outputs.digest }}"
+    work = tmp_path / "work"
+    (work / ".github" / "scripts").mkdir(parents=True)
+    shutil.copy(_ROOT / ".github" / "scripts" / "render_release_vex.py", work / ".github" / "scripts")
+    (work / "security").mkdir()
+    template = json.loads((_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8"))
+    template["statements"] = statements
+    (work / "security" / "vex.openvex.json").write_text(json.dumps(template), encoding="utf-8")
+    (tmp_path / "step.sh").write_text(step["run"], encoding="utf-8", newline="\n")
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    # `python3` is the interpreter running this test, whatever the machine calls its own.
+    (stub_dir / "python3").write_text(
+        f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
+        encoding="utf-8", newline="\n")
+    (stub_dir / "python3").chmod(0o755)
+    (tmp_path / "output").write_text("", encoding="utf-8")
+    env = {
+        **os.environ,
+        **_RELEASE_VEX_ENV,
+        "STUB_BIN": str(stub_dir),
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
+        "MSYS_NO_PATHCONV": "1",
+    }
+    run = subprocess.run(
+        [bash, "-c",
+         'PATH="$( (cygpath -u "$STUB_BIN") 2>/dev/null || printf %s "$STUB_BIN"):$PATH"; '
+         '. "$1"', "vex-step", str(tmp_path / "step.sh")],
+        cwd=work, env=env, capture_output=True, text=True, timeout=60)
+    return run, (tmp_path / "output").read_text(encoding="utf-8"), work / "dockvault-v0.33.4.openvex.json"
+
+
+def test_a_release_without_a_reviewed_exception_attaches_no_vex(tmp_path):
+    run, output, asset = _run_release_vex_step(tmp_path, [])
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert not asset.exists()
+    assert output == "", "the release step must be given no VEX to attach"
+    assert "there is no VEX to publish" in run.stdout
+
+
+def test_a_release_with_a_reviewed_exception_attaches_its_vex(tmp_path):
+    subs = [{"@id": "pkg:generic/python@3.14.8"}]
+    statement = {
+        "vulnerability": {"name": "CVE-0000-0001"},
+        "products": [
+            {"@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+             "subcomponents": subs},
+            {"@id": "__IMAGE_REFERENCE__", "subcomponents": subs},
+        ],
+        "status": "not_affected",
+        "justification": "vulnerable_code_not_present",
+        "impact_statement": "Reviewed for source revision __SOURCE_REVISION__.",
+        "timestamp": "__GENERATED_AT__",
+    }
+    run, output, asset = _run_release_vex_step(tmp_path, [statement])
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert output == "asset=dockvault-v0.33.4.openvex.json\n"
+    document = json.loads(asset.read_text(encoding="utf-8"))
+    assert len(document["statements"]) == 1
+    assert {p["@id"] for p in document["statements"][0]["products"]} == {
+        f"pkg:oci/vault@{_RELEASE_VEX_ENV['DIGEST']}?repository_url=ghcr.io/dockvault/vault",
+        "ghcr.io/dockvault/vault:v0.33.4",
+    }
+
+
+def test_the_release_attaches_exactly_the_files_it_lists():
+    import yaml
+
+    steps = yaml.safe_load(_WORKFLOW)["jobs"]["publish"]["steps"]
+    (release,) = [s for s in steps if s.get("name") == "Create GitHub Release"]
+    # A listed file that is missing refuses the release before it is created (the action checks
+    # every pattern first), so a release can never go out without an SBOM or the matrix.
+    assert release["with"]["fail_on_unmatched_files"] is True
+    # The VEX line is the render step's answer: its file name, or empty, which the action drops.
+    assert release["with"]["files"].splitlines() == [
+        "dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json",
+        "dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json",
+        "${{ steps.release_vex.outputs.asset }}",
+        "upgrade.json",
+    ]
+    names = [s.get("name") for s in steps]
+    assert names.index("Bind release VEX to the published registry digest") < names.index(
+        "Create GitHub Release")

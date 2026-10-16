@@ -389,19 +389,29 @@ jobs:
             echo "anonymous pull OK: ${platform} ${manifest}"
           done
 
+      # The VEX the release attaches, bound to the published digest. OpenVEX requires a document to
+      # hold at least one statement, so a release with no reviewed exception has no VEX to publish:
+      # the renderer then writes no file, and this step names no asset for the release to attach.
+      # The scans above applied their own rendered document, which then suppressed nothing.
       - name: Bind release VEX to the published registry digest
+        id: release_vex
         env:
           IMAGE: ${{ steps.publish_gate.outputs.image }}
           TAG: ${{ steps.publish_gate.outputs.tag }}
           DIGEST: ${{ steps.push.outputs.digest }}
           SOURCE_REVISION: ${{ needs.validate.outputs.sha }}
         run: |
+          set -euo pipefail
           python3 .github/scripts/render_release_vex.py \
             --template security/vex.openvex.json \
             --output "dockvault-${TAG}.openvex.json" \
             --image-digest "$DIGEST" \
             --image-reference "${IMAGE}:${TAG}" \
-            --source-revision "$SOURCE_REVISION"
+            --source-revision "$SOURCE_REVISION" \
+            --publish
+          if test -f "dockvault-${TAG}.openvex.json"; then
+            echo "asset=dockvault-${TAG}.openvex.json" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Attest build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -442,6 +452,10 @@ jobs:
       # the newest PUBLISHED release as latest, which a maintenance release of an older line would
       # take from the highest version, and it picks the base itself. The body is a first line for a
       # maintenance release; GitHub puts the generated notes after it.
+      #
+      # Every file listed must exist, or the release is refused before it is created. The VEX line
+      # is the name the step that rendered it gave, and empty when it wrote none; the action drops an
+      # empty line.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
@@ -450,8 +464,9 @@ jobs:
           make_latest: ${{ steps.auth_gate.outputs.make_latest }}
           previous_tag: ${{ steps.auth_gate.outputs.previous_tag }}
           body: ${{ steps.auth_gate.outputs.notes_preamble }}
+          fail_on_unmatched_files: true
           files: |
             dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json
             dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json
-            dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json
+            ${{ steps.release_vex.outputs.asset }}
             upgrade.json

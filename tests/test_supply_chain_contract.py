@@ -384,7 +384,10 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert "::error::the published index does not advertise $platform" in publish
     assert "dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json" in publish
     assert "dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json" in publish
-    assert "dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json" in publish
+    # The release VEX is attached under the name its render step gave, and only when it wrote one
+    # (tests/test_release_workflow_contract.py runs that step).
+    assert '--output "dockvault-${TAG}.openvex.json"' in publish
+    assert "${{ steps.release_vex.outputs.asset }}" in publish
 
     for action, sha in (
         ("anchore/sbom-action", "e22c389904149dbc22b58101806040fa8d37a610"),
@@ -429,7 +432,11 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert "There is no blanket `only-fixed` bypass" in evidence
     assert "fails for every unexcepted vulnerability" in evidence
     assert "It holds no statements now." in evidence
-    assert "with an empty statement list when there is no exception" in evidence
+    flat = " ".join(evidence.split())
+    assert ("The GitHub Release publishes the rendered VEX beside the SBOMs only when the template "
+            "holds at least one statement.") in flat
+    assert "OpenVEX requires a document to hold at least one" in flat
+    assert "with an empty statement list" not in flat
     assert "and\nthe renderer refuses one that does not" in evidence
     assert "exact registry manifest digest" in evidence
     # Publication copies the scanned index (no push digest is scraped), and every tag it writes,
@@ -474,15 +481,16 @@ def _template_with_a_statement(tmp_path, **statement_over) -> Path:
 
 
 def test_the_committed_vex_renders_with_no_statements(tmp_path):
-    """No reviewed exception today: the committed template renders to a document bound to the source
-    revision, with an empty statement list, which a scan applies and which suppresses nothing."""
-    output = tmp_path / "release.openvex.json"
+    """No reviewed exception today: for a scan, the committed template renders to a document bound to
+    the source revision, with an empty statement list, which the scan applies and which suppresses
+    nothing."""
+    output = tmp_path / "scan.openvex.json"
     revision = "b" * 40
     document = _RENDERER.render(
         _ROOT / "security" / "vex.openvex.json",
         output,
         image_digest=f"sha256:{'a' * 64}",
-        image_reference="ghcr.io/dockvault/vault:v0.33.4",
+        image_reference="ghcr.io/dockvault/vault:v0.33.4-amd64",
         source_revision=revision,
         generated_at="2026-10-16T00:00:00Z",
     )
@@ -490,6 +498,38 @@ def test_the_committed_vex_renders_with_no_statements(tmp_path):
     assert document["@id"] == f"https://github.com/DockVault/vault/security/vex/{revision}"
     assert document["timestamp"] == "2026-10-16T00:00:00Z"
     assert "__" not in output.read_text(encoding="utf-8")
+
+
+def test_a_release_publishes_no_vex_without_a_statement(tmp_path):
+    """OpenVEX requires a document to hold at least one statement, so the committed template, which
+    holds none, renders no release asset: nothing is written, and a file already at the output path
+    is removed, so the release cannot attach an invalid or a stale document."""
+    kwargs = dict(image_digest=f"sha256:{'a' * 64}", image_reference="ghcr.io/dockvault/vault:v0.33.4",
+                  source_revision="b" * 40, generated_at="2026-10-16T00:00:00Z", publish=True)
+    output = tmp_path / "dockvault-v0.33.4.openvex.json"
+    document = _RENDERER.render(_ROOT / "security" / "vex.openvex.json", output, **kwargs)
+    assert document["statements"] == []
+    assert not output.exists()
+
+    output.write_text('{"statements": []}\n', encoding="utf-8")
+    _RENDERER.render(_ROOT / "security" / "vex.openvex.json", output, **kwargs)
+    assert not output.exists(), "a file left at the output path would be attached as the release VEX"
+
+
+def test_a_release_publishes_the_vex_when_it_holds_a_statement(tmp_path):
+    output = tmp_path / "dockvault-v0.33.4.openvex.json"
+    document = _RENDERER.render(
+        _template_with_a_statement(tmp_path),
+        output,
+        image_digest=f"sha256:{'a' * 64}",
+        image_reference="ghcr.io/dockvault/vault:v0.33.4",
+        source_revision="b" * 40,
+        publish=True,
+    )
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written == document
+    assert len(written["statements"]) == 1
+    assert written["statements"][0]["vulnerability"] == {"name": "CVE-0000-0001"}
 
 
 def test_vex_renderer_refuses_a_statement_that_does_not_bind_the_image_or_revision(tmp_path):
