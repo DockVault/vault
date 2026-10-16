@@ -12492,9 +12492,10 @@ def _publiclink_clear_fails(token_hash: str) -> None:
             pass
 
 
-def _publiclink_issue_grant(link_id, client_ip: str) -> str:
+def _publiclink_issue_grant(link_id, client_ip: str, minted_at=None) -> str:
     """Mint a single-use download grant bound to (link_id, client_ip), stored HASHED in Redis with a
-    short TTL. Raises RuntimeError if Redis is unavailable — a grant that cannot be stored is never
+    short TTL, recording when it was minted (naive UTC, the time the redeem checked the link's expiry
+    against). Raises RuntimeError if Redis is unavailable — a grant that cannot be stored is never
     handed out (the caller answers 503). While the breaker is open we raise before the socket."""
     if redis_circuit_open():
         raise RuntimeError("grant store unavailable")
@@ -12504,7 +12505,8 @@ def _publiclink_issue_grant(link_id, client_ip: str) -> str:
     if r is None:
         raise RuntimeError("grant store unavailable")
     grant = _secrets.token_urlsafe(32)
-    payload = f"{link_id}|{client_ip or ''}"
+    minted_at = minted_at or datetime.utcnow()
+    payload = f"{link_id}|{client_ip or ''}|{minted_at.isoformat()}"
     try:
         # NX so a (astronomically unlikely) hash collision never overwrites a live grant.
         ok = redis_guard.timed_redis(
@@ -12517,11 +12519,13 @@ def _publiclink_issue_grant(link_id, client_ip: str) -> str:
     return grant
 
 
-def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
-    """Consume a download grant: it must exist, be bound to THIS link and client IP, and be removed by
-    THIS request (single-winner) — so a grant is good for exactly one download. Any miss returns False
-    (the caller answers with the uniform 404). A Redis outage means the grant can't be found → False;
-    while the breaker is open we return False before the socket."""
+def _publiclink_consume_grant(grant: str, link_id, client_ip: str, expires_at=None) -> bool:
+    """Consume a download grant: it must exist, be bound to THIS link and client IP, have been minted
+    before the link's expiry (`expires_at`, naive UTC; None = the link never expires), and be removed
+    by THIS request (single-winner) — so a grant is good for exactly one download. A grant whose record
+    is not (link, address, mint time) is refused, including one an older release minted in the minute
+    before an upgrade. Any miss returns False (the caller answers with the uniform 404). A Redis outage means the grant can't be found → False; while the breaker is open we return
+    False before the socket."""
     if redis_circuit_open():
         return False
     from app.core.rate_limiter import rate_limiter as _rl
@@ -12536,9 +12540,20 @@ def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
     if raw is None:
         return False
     val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
-    want = f"{link_id}|{client_ip or ''}"
-    if val != want:
+    parts = val.split("|")
+    if len(parts) != 3 or parts[0] != str(link_id) or parts[1] != (client_ip or ""):
         return False
+    try:
+        minted_at = datetime.fromisoformat(parts[2])
+    except ValueError:
+        return False
+    if minted_at.tzinfo is not None:
+        return False
+    if expires_at is not None:
+        if expires_at.tzinfo is not None:
+            expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if minted_at >= expires_at:
+            return False
     # Single-winner delete: two concurrent downloads with the same grant — only the one whose DELETE
     # actually removed the key proceeds.
     try:
@@ -12546,6 +12561,22 @@ def _publiclink_consume_grant(grant: str, link_id, client_ip: str) -> bool:
     except Exception:
         return False
     return removed >= 1
+
+
+def _publiclink_discard_grant(grant: str) -> None:
+    """Delete a grant that must never deliver: one minted by a redeem that then lost the race for the
+    link's last use, or whose use could not be recorded. It was never handed out, and it expires on its
+    own short TTL, so this is best-effort; while the breaker is open we skip the socket."""
+    if redis_circuit_open():
+        return
+    from app.core.rate_limiter import rate_limiter as _rl
+    r = getattr(_rl, "redis", None)
+    if r is None:
+        return
+    try:
+        redis_guard.timed_redis("_publiclink_discard_grant", lambda: r.delete(_publiclink_grant_key(grant)))
+    except Exception:
+        pass
 
 
 def _link_owner_if_live(db, owner_id):
@@ -13255,25 +13286,32 @@ async def redeem_public_link(
 
     # Mint the single-use download grant BEFORE consuming a use, so a Redis outage (→ 503) can never
     # burn a use: nothing is consumed until the grant is safely stored. Fail-closed — a grant that
-    # cannot be stored is never handed out.
+    # cannot be stored is never handed out. It records `now`, the time the update below checks the
+    # link's expiry against, so the download can tell a grant minted before the link expired.
     try:
-        grant = _publiclink_issue_grant(link.id, client_ip)
+        grant = _publiclink_issue_grant(link.id, client_ip, now)
     except RuntimeError:
         _audit("failure", reason="grant_store_unavailable", link_id=link.id)
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
 
-    # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced. If
-    # this loses the race (the link was exhausted/revoked/expired concurrently) the freshly minted
-    # grant is simply orphaned — it is bound to THIS link, which the download path re-checks as active,
-    # and it expires on its own 60s TTL.
+    # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced. This
+    # use is what the download spends: the download no longer asks whether the link has a use left, so
+    # a grant whose redeem did not record a use must never deliver. If the update matches no row (the
+    # link was exhausted, revoked or expired concurrently) or fails, the grant is discarded before the
+    # answer goes out; it was never handed out.
     stmt = (_sa_update(PublicLink)
             .where(PublicLink.id == link.id, PublicLink.revoked.is_(False),
                    _or(PublicLink.max_uses.is_(None), PublicLink.use_count < PublicLink.max_uses),
                    _or(PublicLink.expires_at.is_(None), PublicLink.expires_at > now))
             .values(use_count=PublicLink.use_count + 1, last_used_at=now))
-    res = db.execute(stmt)
-    db.commit()
+    try:
+        res = db.execute(stmt)
+        db.commit()
+    except Exception:
+        _publiclink_discard_grant(grant)
+        raise
     if res.rowcount == 0:
+        _publiclink_discard_grant(grant)
         _audit("failure", reason="not_available", link_id=link.id)
         raise HTTPException(status_code=404, detail="This link is not available.")
 
@@ -13291,11 +13329,14 @@ async def download_public_link(
     x_download_grant: Optional[str] = Header(None),
 ):
     """PUBLIC: stream one file of a redeemed public link. The download GRANT rides an X-Download-Grant
-    HEADER (never a query string, which proxies/history record) and is single-use. Every gate from
-    redemption is RE-CHECKED here (master switch, link active, vault Standard+not-pw, owner active +
-    still holds READ, target present + not password-protected), plus the requested file_id must lie
-    inside the link's target subtree (id_scope). Any failure is the uniform 404. No principal is
-    synthesised: the blob is opened directly once every gate passes."""
+    HEADER (never a query string, which proxies/history record) and is single-use. The redeem that
+    minted the grant spent the link's use, so the download spends nothing and does NOT ask whether the
+    link has a use left: a link capped at N downloads delivers N. It re-checks every other gate from
+    redemption (master switch, link present and not revoked, vault Standard+not-pw, owner active +
+    still holds READ, target present + not password-protected), requires the grant to have been minted
+    before the link expired, and confines the requested file_id to the link's target subtree
+    (id_scope). Any failure is the uniform 404. No principal is synthesised: the blob is opened
+    directly once every gate passes."""
     import time as _t
     from app.core.id_scope import id_in_scope
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -13327,7 +13368,10 @@ async def download_public_link(
 
     token_hash = _publiclink_token_hash(token)
     link = db.query(PublicLink).filter(PublicLink.token_hash == token_hash).first()
-    if not link or _notelink_status(link) != "active":
+    # Not _notelink_status: a link whose last use this grant's redeem spent reads "exhausted", and one
+    # that expired after the grant was minted reads "expired", yet both still owe this download. The
+    # expiry is checked against the grant's mint time when the grant is consumed, below.
+    if not link or link.revoked:
         _deny()
 
     live = _publiclink_resolve_live(db, link)
@@ -13353,8 +13397,9 @@ async def download_public_link(
     if protected is not None:
         _deny()
 
-    # Consume the single-use grant (bound to this link + client IP). A miss = uniform 404.
-    if not _publiclink_consume_grant(x_download_grant, link.id, client_ip):
+    # Consume the single-use grant (bound to this link + client IP, minted before the link expired).
+    # A miss = uniform 404.
+    if not _publiclink_consume_grant(x_download_grant, link.id, client_ip, expires_at=link.expires_at):
         _deny()
 
     # Everything authorized: open the blob for streaming (no principal — the equivalent of the authed

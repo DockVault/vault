@@ -233,7 +233,8 @@ headers and the same `textContent`-only discipline — and `static/js/public-lin
 rate limits, the secret prompt/lockout, the kill switch (`public_file_links_enabled` off ⇒ 404 for
 every minted link), the uniform 404, the atomic consume. What it returns differs: not content, but a
 **download grant** — a short-lived, single-use bearer bound to `(link, client ip)`, minted with
-`secrets.token_urlsafe(32)` and stored hashed in Redis for 60 s. It is deliberately not an
+`secrets.token_urlsafe(32)` and stored hashed in Redis for 60 s, with the link, the address and the
+time it was minted. It is deliberately not an
 `otp_codes` record (that store is single-active per user, and an anonymous grant has no user), and it
 is **fail-closed**: if Redis is unavailable `/redeem` answers `503` and mints nothing — a grant that
 cannot be stored is never handed out, and the download endpoint refuses any grant it cannot find. For a
@@ -250,13 +251,18 @@ first use (single winner, like the OTP service), the `file_id` must lie inside t
 `BoundedDownload` / `verified_stream` (`app/services/download_stream.py`) under a
 `transfer_admission` slot, exactly as the authenticated download is. `Content-Disposition` goes
 through the existing filename hardening. One redemption = one use = one grant = one download; a
-folder link therefore counts one use per file fetched (Q3 again). The IP binding is only as good as the
+folder link therefore counts one use per file fetched (Q3 again). The redeem spends the use, so the
+download does not ask whether the link has a use left: a link capped at N delivers N downloads. A
+redeem whose conditional update finds the use already gone (a concurrent redeem took it) deletes the
+grant it minted before it answers 404, so no grant exists without a use behind it. The IP binding is only as good as the
 deployment's trusted-proxy configuration (`ClientIPMiddleware`), which the public page's documentation
 must say.
 
 **No `User` is ever synthesised for the anonymous caller.** The path bypasses `get_vault` (which
 requires a principal) and instead re-validates, on every request and in this order: master switch on;
-link active (not revoked / expired / exhausted); vault active, Standard, not password-protected; target
+the link present and not revoked (the redeem also refuses an expired or exhausted link; the download
+instead requires its grant to have been minted before the link expired, since the grant's redeem has
+already spent the use); vault active, Standard, not password-protected; target
 still present and still inside the link's subtree; **neither the target file nor any ancestor folder
 has acquired a `password_hash` since the link was minted** (creation refuses those, and a password
 added later must bite on the next request just as it would for a share recipient); the **owner's**

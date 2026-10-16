@@ -64,6 +64,7 @@ def test_publiclink_lockout_and_grant_fail_closed_off_the_socket_while_open(_ope
     with pytest.raises(RuntimeError):
         S._publiclink_issue_grant("lid", "192.0.2.10")     # a grant that can't be stored is never issued
     assert S._publiclink_consume_grant("g", "lid", "192.0.2.10") is False   # uniform 404
+    S._publiclink_discard_grant("g")                    # skip (no raise, no socket)
     assert _open_breaker_with_a_tripwire_redis.calls == []
 
 
