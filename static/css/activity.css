@@ -725,6 +725,12 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
 .retention-change { padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); }
 .retention-storage-list { margin: 0 0 .75rem; padding-left: 1.25rem; overflow-wrap: anywhere; }
 
+/* Settings -> Activity and records: erase a person's records (static/js/settings-erase.js). */
+.erase-preview-list, .erase-not-reached { margin: 0 0 .75rem; padding-left: 1.25rem; overflow-wrap: anywhere; }
+.erase-request { padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); min-width: 0; }
+.erase-request p { overflow-wrap: anywhere; margin: .25rem 0; }
+.erase-status { margin-left: .5rem; }
+
 /* A notice the signed-in user has to read, across the top of the app (static/js/notice-banner.js). */
 .notice-banners { position: sticky; top: 0; z-index: 900; }
 .notice-banner {

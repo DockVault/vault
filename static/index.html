@@ -24,7 +24,7 @@
          ui-boot.js + the Interface switcher in the profile dropdown. -->
     <link rel="stylesheet" href="/static/css/redesign.css?v=20260929a" id="skin-v1" disabled>
     <link rel="stylesheet" href="/static/css/ui-v2.css?v=20260929a" id="skin-v2">
-    <link rel="stylesheet" href="/static/css/activity.css?v=20260929a">
+    <link rel="stylesheet" href="/static/css/activity.css?v=20261017a">
     <link rel="stylesheet" href="/static/css/settings-levels.css?v=20261013a">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260929a">
@@ -2995,6 +2995,37 @@
                             <div class="card-header"><h3>Storage</h3></div>
                             <div class="p-lg" id="retention-storage"></div>
                         </div>
+                        <!-- Erase a person's records (static/js/settings-erase.js): previewed first, asked for with the
+                             password, and run after the delay unless an administrator cancels it. -->
+                        <div class="card mb-lg" id="erase-card">
+                            <div class="card-header"><h3>Erase a person's records</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">
+                                    Removes a name from the audit log, its archive and the other records: every row
+                                    with that name gets a placeholder (<code>erased-</code> and 8 characters) in its
+                                    place, and the personal values that came with it are cleared. Only for a deleted
+                                    account&apos;s username or a name typed at a failed sign-in, matched exactly.
+                                    Preview it first; asking asks for your password, and it waits before it runs.
+                                </p>
+                                <p class="text-secondary text-sm mb-md" id="erase-protected" hidden>
+                                    This deployment keeps records intact for the protected minimum
+                                    (<code>ERASE_BLOCKED_BY_PROTECTED_MINIMUM=true</code>): an erase also waits until every
+                                    row it would change is older than that.
+                                </p>
+                                <div class="form-group">
+                                    <label for="erase-name">Name, exactly as the records hold it</label>
+                                    <input type="text" id="erase-name" class="form-control" maxlength="255"
+                                           autocomplete="off" spellcheck="false" autocapitalize="off">
+                                </div>
+                                <div class="flex gap-sm">
+                                    <button id="erase-preview-btn" class="btn btn-outline" type="button">Preview</button>
+                                    <button id="erase-ask" class="btn btn-danger" type="button" disabled>Ask for this erase</button>
+                                </div>
+                                <div id="erase-preview" class="mt-md" aria-live="polite"></div>
+                                <h4 class="mt-lg">Erases</h4>
+                                <div id="erase-list"></div>
+                            </div>
+                        </div>
                         <div data-setting="audit_levels" class="card mb-lg" id="recording-levels-card">
                             <div class="card-header"><h3>What is recorded</h3></div>
                             <div class="p-lg">
@@ -4119,6 +4150,7 @@
     <script src="/static/js/activity-archive.js?v=20261010a"></script>
     <script src="/static/js/settings-records.js?v=20261003a"></script>
     <script src="/static/js/settings-retention.js?v=20261013a"></script>
+    <script src="/static/js/settings-erase.js?v=20261017a"></script>
     <script src="/static/js/settings-integrity.js?v=20261007a"></script>
     <script src="/static/js/settings-levels.js?v=20261013a"></script>
     <script src="/static/js/notice-banner.js?v=20261002a"></script>
