@@ -22,7 +22,8 @@ What it holds:
                             the request it cancels; each erase or removal a final seal completed, for every
                             generation
     hours                   hour summaries of the last 30 days: the seal that last set an hour's roots, its
-                            count, roots, ids digest and salt; and, while sealing is stopped, the hours that
+                            count, roots and ids digest (never the hour's salt: every write clears one that a
+                            record of an earlier build held); and, while sealing is stopped, the hours that
                             closed, computed from their rows and marked unsealed
     days, days_through      a digest per day older than the summaries (over every hour's figures, and without the
                             personal values' root), and the last day digested
@@ -334,7 +335,9 @@ def merge(disk: Optional[Dict[str, Any]], mine: Dict[str, Any], now: datetime) -
         if (other.get("status") or {}).get("at", "") > (base.get("status") or {}).get("at", ""):
             result["status"] = copy.deepcopy(other["status"])
     cutoff = (now - timedelta(days=SUMMARY_DAYS)).strftime("%Y-%m-%dT%H:00:00Z")
-    result["hours"] = {h: v for h, v in result.get("hours", {}).items() if h >= cutoff}
+    # No summary keeps an hour's salt, whichever copy it came from (audit_integrity._summarise says why).
+    result["hours"] = {h: dict(v, salt=None) if isinstance(v, dict) else v
+                       for h, v in result.get("hours", {}).items() if h >= cutoff}
     result["version"] = VERSION
     return result
 

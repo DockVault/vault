@@ -3,9 +3,9 @@ app/core/audit_head_record.py), offline:
 
 - the retention checkpoints: the newest policy seal with the entries where the honoured state differs from it,
   each cancel with the link of the request it cancels;
-- the hour summaries of the last 30 days, with the salt of an hour whose rows have no nonce while the hour is
-  unchanged (an erase seal takes it out, as a prune's summary holds none), and, while sealing is stopped, the
-  hours that close, computed from their rows and marked unsealed;
+- the hour summaries of the last 30 days, never with an hour's salt (rows without a nonce of their own): not
+  after an hour seal, not after an erase seal however it names its hour, and not from a record an earlier build
+  wrote; and, while sealing is stopped, the hours that close, computed from their rows and marked unsealed;
 - a digest per day older than the summaries (over every hour's figures, and without the personal values'
   root), computed again when a later seal re-roots one of its hours;
 - the link of every 64th seal, by generation.
@@ -65,33 +65,79 @@ def test_the_checkpoint_keeps_the_honoured_form_of_a_value_another_writer_set(en
     assert cp["honoured"]["audit_max_days"]["value"] == 0      # the pruner keeps the log for ever meanwhile
 
 
-def test_an_hour_of_rows_without_a_nonce_keeps_its_salt_in_its_summary(env):
+def test_an_hour_of_rows_without_a_nonce_has_no_salt_in_its_summary(env):
+    """The hour's salt stays in the database only (its working row), never in the head record: the summary holds
+    the seal's figures, and the stable ones are what a restore compares such an hour by."""
     env.row(T0 - timedelta(hours=5), nonce=False)
     env.run_until_sealed()
     hour = ai.hour_floor(T0 - timedelta(hours=5))
     summary = _record(env)["hours"][fmt.hour_text(hour)]
     with env.session() as db:
         wr = ai.working_row(db, hour)
-        assert summary["salt"] == bytes(wr.legacy_salt).hex() and summary["unsealed"] is False
-        fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), bytes.fromhex(summary["salt"]))
-    assert fig.root_c.hex() == summary["root_c"] and fig.count == summary["count"] == 1
+        salt = bytes(wr.legacy_salt)
+        fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt)
+    assert summary["salt"] is None and summary["unsealed"] is False
+    assert (fig.count, fig.root_s.hex(), fig.root_c.hex(), fig.ids_digest.hex()) == (
+        summary["count"], summary["root_s"], summary["root_c"], summary["ids_digest"]) and fig.count == 1
+    with open(env.settings.audit_chain_head_file, encoding="utf-8") as f:
+        assert salt.hex() not in f.read()
 
 
-def test_an_erase_seal_takes_its_hours_salt_out_of_the_summary(env):
-    """The record write after an erase seal (which sets no roots) drops that hour's salt from its summary, as
-    the erase deletes it from the database; another hour keeps its own."""
+def test_the_copy_a_process_keeps_when_the_file_cannot_be_written_holds_no_salt_either(env, monkeypatch):
+    """When the file cannot be written the process goes on from its own copy, which is never merged: its
+    summaries hold no salt all the same."""
+    from app.core import audit_head_record as hr
+    env.run_until_sealed()
+
+    def refuse(path, record):
+        raise PermissionError(13, "Permission denied", path)
+    monkeypatch.setattr(hr, "_write_file", refuse)
+    env.row(T0 + timedelta(minutes=10), nonce=False)
+    env.clock.advance(hours=3)
+    env.run_until_sealed()
+    store = env.st.head_store()
+    hour = fmt.hour_text(ai.hour_floor(T0 + timedelta(minutes=10)))
+    assert store.unwritable and hour in store.memory["hours"]
+    assert all(v.get("salt") is None for v in store.memory["hours"].values())
+
+
+@pytest.mark.parametrize("named", ["hour_text", "time_text"])
+def test_an_erase_seal_leaves_no_salt_in_any_summary_however_it_names_its_hour(env, named):
+    """An erase seal sets no roots: the record write after it changes no summary, and no summary holds a salt,
+    whether the seal names its hour as fmt.hour_text or as fmt.time_text (both of which verify accepts)."""
     env.row(T0 - timedelta(hours=5), nonce=False)
     env.row(T0 - timedelta(hours=4), nonce=False)
     env.run_until_sealed()
     record = _record(env)
-    erased, kept = (fmt.hour_text(ai.hour_floor(T0 - timedelta(hours=h))) for h in (5, 4))
-    assert record["hours"][erased]["salt"] and record["hours"][kept]["salt"]
-    salt = record["hours"][kept]["salt"]
+    hour = ai.hour_floor(T0 - timedelta(hours=5))
+    before = {k: dict(v) for k, v in record["hours"].items()}
     seal = ai.Seal(env.st.view.position + 1, "erase", None, None, fmt.FORMAT, 0, 0, None, None, None,
-                   {"hour": erased, "rows": [], "request_seq": 3, "final": True}, "k1", env.clock())
+                   {"hour": getattr(fmt, named)(hour), "rows": [], "request_seq": 3, "final": True}, "k1",
+                   env.clock())
     ai._summarise(record, env.st.view, seal)
-    assert record["hours"][erased]["salt"] is None and record["hours"][kept]["salt"] == salt
-    assert record["hours"][erased]["count"] == 1          # the rest of the summary stands
+    assert record["hours"] == before
+    assert all(v.get("salt") is None for v in record["hours"].values())
+    assert record["hours"][fmt.hour_text(hour)]["count"] == 1
+
+
+def test_a_salt_a_record_of_an_earlier_build_held_is_cleared_at_the_next_write(env):
+    """A record on disk whose summaries hold salts (as an earlier build wrote them) loses them at the next
+    write, whichever copy wins the merge."""
+    env.row(T0 - timedelta(hours=5), nonce=False)
+    env.run_until_sealed()
+    hour = fmt.hour_text(ai.hour_floor(T0 - timedelta(hours=5)))
+    store = env.st.head_store()
+    record = store.load()
+    record["hours"][hour]["salt"] = "ab" * 32
+    from app.core import audit_head_record as hr
+    hr._write_file(env.settings.audit_chain_head_file, record)
+    assert store.load()["hours"][hour]["salt"] == "ab" * 32
+    env.row(T0 + timedelta(minutes=10))
+    env.clock.advance(hours=3)
+    env.run_until_sealed()
+    assert all(v.get("salt") is None for v in store.load()["hours"].values())
+    with open(env.settings.audit_chain_head_file, encoding="utf-8") as f:
+        assert "ab" * 32 not in f.read()
 
 
 def test_while_sealing_is_stopped_the_hours_that_close_are_summarised_unsealed(env):

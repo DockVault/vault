@@ -1006,16 +1006,12 @@ def day_digests(db, view: View, record: dict, now: datetime, seals: List[Seal]) 
 
 
 def _summarise(record: dict, view: View, seal: Seal) -> None:
-    """Hour summaries for a seal that sets roots. A summary keeps its hour's salt (rows without a nonce of their
-    own) only while the hour is unchanged, as the database does: a prune or rewrite replaces it with none, and
-    an erase, which sets no roots, drops it; kept beside the erase's earlier commitments, it would let erased
-    low-entropy values be tested."""
+    """Hour summaries for a seal that sets roots. A summary never holds its hour's salt (rows without a nonce of
+    their own): a copy of the head record outlives the hour's salt in the database, and kept beside an erase's
+    earlier commitments it would let erased low-entropy values be tested. A restore compares such an hour by
+    its stable root (app/core/audit_chain_restore.py lost_hours), as it compares a day. An erase sets no roots
+    and changes no summary."""
     hours = record.setdefault("hours", {})
-    if seal.kind == "erase":
-        entry = hours.get(str((seal.detail or {}).get("hour")))
-        if entry is not None:
-            entry["salt"] = None
-        return
     entries = []
     if seal.kind in ("hour", "late"):
         start = seal.period_start
@@ -1029,13 +1025,12 @@ def _summarise(record: dict, view: View, seal: Seal) -> None:
             entries.append((start, start + HOUR, int(h[2]), bytes.fromhex(h[4]), bytes.fromhex(h[5]),
                             bytes.fromhex(h[6])))
     for start, end, count, rs, rc, idd in entries:
-        salt = seal.salt if seal.kind in ("hour", "late") else None
         hours[fmt.hour_text(start)] = {"end": fmt.hour_text(end), "seq": seal.seq,
                                        "link": view.link_at(seal.seq).hex(), "sealed_at": fmt.time_text(seal.sealed_at),
                                        "count": count, "root_s": _b(rs).hex() if rs else None,
                                        "root_c": _b(rc).hex() if rc else None,
                                        "ids_digest": _b(idd).hex() if idd else None,
-                                       "salt": salt.hex() if salt else None, "unsealed": False,
+                                       "salt": None, "unsealed": False,
                                        "generation": view.generation}
 
 

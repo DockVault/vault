@@ -237,12 +237,13 @@ def lost_hours(db, view, record: dict, now: datetime) -> dict:
         return out
     out["lost"] = [fmt.hour_text(start), fmt.hour_text(end - ai.HOUR)]
     compared = []
-    # Hours the summaries cover.
+    # Hours the summaries cover. A summary holds no salt (audit_integrity._summarise), so the personal values of
+    # rows without a nonce cannot be compared: such an hour is compared by its stable root, as a day is; a salt
+    # in a record an earlier build wrote is not used either, so one rule holds whatever the record's age.
     for h in sorted(x for x in summaries if start <= x < end):
         s = summaries[h]
-        salt = bytes.fromhex(s["salt"]) if s.get("salt") else None
-        fig = ai.hour_figures(ai.iter_rows(db, h, h + ai.HOUR), salt)
-        personal = s.get("unsealed") or salt is not None or not fig.nonceless
+        fig = ai.hour_figures(ai.iter_rows(db, h, h + ai.HOUR), None)
+        personal = s.get("unsealed") or not fig.nonceless
         same = (fig.count == s.get("count") and fig.root_s.hex() == s.get("root_s")
                 and fig.ids_digest.hex() == s.get("ids_digest")
                 and (not personal or fig.root_c.hex() == s.get("root_c")))

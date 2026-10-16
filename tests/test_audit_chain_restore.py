@@ -699,3 +699,42 @@ def test_a_cut_hour_whose_summary_holds_no_salt_is_compared_by_its_stable_root(e
         db.query(AuditLog).filter(AuditLog.id == ids[0]).update({AuditLog.action: "logout"})
         db.commit()
     assert changed() == [fmt.hour_text(hour)]
+
+
+@pytest.mark.parametrize("summary", ["as written", "an earlier build's salt"])
+def test_a_cut_hour_of_rows_without_a_nonce_is_compared_by_its_stable_root_whatever_its_summary_holds(env,
+                                                                                                       summary):
+    """The head record keeps no salt, so a lost hour of rows without a nonce is compared by its stable root: an
+    edited personal value is not reported, an edited stable value is; a salt that a record of an earlier build
+    kept is not used either. An hour whose rows carry nonces is still compared in full."""
+    ids = [env.row(T0 - timedelta(hours=10, minutes=-m * 10), nonce=False) for m in range(3)]
+    full = env.row(T0 - timedelta(hours=9, minutes=-20))
+    env.run_until_sealed()
+    _run_to(env, T0 + timedelta(hours=12))
+    hour = ai.hour_floor(T0 - timedelta(hours=10))
+    record = env.st.head_store().load()
+    assert record["hours"][fmt.hour_text(hour)]["salt"] is None
+    if summary != "as written":
+        with env.session() as db:
+            record["hours"][fmt.hour_text(hour)]["salt"] = bytes(ai.working_row(db, hour).legacy_salt).hex()
+    _cut_from(env, env.st.view.entry_for(hour).root.seq)
+    held = _host(env).keys_held()
+
+    def changed():
+        with env.session() as db:
+            view, problems = restore.database_chain(db, held, 2)
+            assert problems == []
+            return [c[0] for c in restore.lost_hours(db, view, record, env.clock())["changed"]]
+    assert changed() == []
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == ids[1]).update({AuditLog.username: "mallory"})
+        db.commit()
+    assert changed() == []
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == full).update({AuditLog.username: "mallory"})
+        db.commit()
+    assert changed() == [fmt.hour_text(ai.hour_floor(T0 - timedelta(hours=9)))]
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == ids[0]).update({AuditLog.action: "logout"})
+        db.commit()
+    assert sorted(changed()) == sorted([fmt.hour_text(hour), fmt.hour_text(ai.hour_floor(T0 - timedelta(hours=9)))])
