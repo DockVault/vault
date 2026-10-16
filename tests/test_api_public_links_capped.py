@@ -4,13 +4,16 @@ Redeeming a link spends one use and returns a single-use download grant; the dow
 spends nothing more. The download must therefore not refuse a link because that redeem spent its
 last use: a one-download link has to deliver its one download, and a folder link capped at one has to
 deliver one file. What the download does still refuse: a link that is gone or revoked, the switched-
-off feature, an owner or vault that may no longer publish, a file outside the link, and a grant that
-was used, belongs to another link or address, or was minted after the link expired.
+off feature, an owner or vault that may no longer publish, a file outside the link or in a folder that
+has acquired a password, and a grant that was used, belongs to another link or address, was minted
+after the link expired, or is stored the way earlier releases stored it, without its mint time.
 
 The caps are checked from both sides: the bytes a recipient actually receives, and the counters the
 owner sees on the link (use_count for redeems, download_count for completed transfers).
 """
+import hashlib
 import os
+import secrets
 import subprocess
 import threading
 import time
@@ -23,6 +26,7 @@ from conftest import unique
 
 pytestmark = pytest.mark.integration
 
+_API_CONTAINER = os.environ.get("VAULT_API_CONTAINER", "vault-api")
 _DB_CONTAINER = os.environ.get("VAULT_DB_CONTAINER", "vault-db")
 _REDIS_CONTAINER = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
 _PASSWORD = "Recipient-Pass9"
@@ -92,8 +96,11 @@ def _upload(admin, vault_id, name, content, folder_id=None):
     return next(it["id"] for it in items if it.get("name") == name and it.get("type") == "file")
 
 
-def _folder(admin, vault_id, name):
-    r = admin.post(f"/vaults/{vault_id}/folders", json={"name": name})
+def _folder(admin, vault_id, name, parent=None):
+    body = {"name": name}
+    if parent:
+        body["parent_folder_id"] = parent
+    r = admin.post(f"/vaults/{vault_id}/folders", json=body)
     assert r.status_code in (200, 201), r.text
     return r.json()["folder"]["id"]
 
@@ -412,3 +419,114 @@ def test_a_grant_minted_after_the_link_expired_is_refused(admin, base_url, files
     _psql(f"UPDATE public_links SET expires_at = (now() AT TIME ZONE 'utc') - interval '1 hour' "
           f"WHERE id = '{link['id']}'")
     assert _download(person, link["token"], file_id, grant).status_code == 404
+
+
+def test_a_folder_password_added_after_the_redeem_refuses_the_download(admin, base_url, files_enabled,
+                                                                       vault):
+    """A folder that acquires a password between the redeem and the download stops the download: the
+    link's own folder stops every file of the link, a subfolder stops the files inside it. Folder
+    passwords are not set through the API, so the password is written into the database. A refused
+    download does not use its grant up, so the same grant then shows that only the password refused
+    it."""
+    target = _folder(admin, vault["id"], unique("dir"))
+    sub = _folder(admin, vault["id"], "inner", parent=target)
+    top_content, inner_content = os.urandom(4_000), os.urandom(4_000)
+    top = _upload(admin, vault["id"], "top.txt", top_content, folder_id=target)
+    inner = _upload(admin, vault["id"], "inner.txt", inner_content, folder_id=sub)
+    link = _link(admin, vault["id"], _tag(admin, cap=2), folder_id=target, max_uses=2)
+    person = _recipient(base_url)
+
+    def protect(folder_id, protected):
+        value = "'x'" if protected else "NULL"
+        assert _psql(f"UPDATE folders SET password_hash = {value} WHERE id = '{folder_id}'") == "UPDATE 1"
+
+    # The link's own folder.
+    grant = _redeem(person, link["token"]).json()["grant"]
+    protect(target, True)
+    try:
+        assert _download(person, link["token"], top, grant).status_code == 404
+        assert _download(person, link["token"], inner, grant).status_code == 404
+    finally:
+        protect(target, False)
+    got = _download(person, link["token"], inner, grant)
+    assert got.status_code == 200 and got.content == inner_content
+
+    # A subfolder: its file is refused, a file outside it still delivers.
+    grant = _redeem(person, link["token"]).json()["grant"]
+    protect(sub, True)
+    try:
+        assert _download(person, link["token"], inner, grant).status_code == 404
+        got = _download(person, link["token"], top, grant)
+        assert got.status_code == 200 and got.content == top_content
+    finally:
+        protect(sub, False)
+    _counts(admin, link["id"], 2, 2)
+
+
+def _download_from_the_api_container(token, file_id, grant):
+    """The download sent from inside the API container to its own port, over the scheme it serves (the
+    container's own health check builds that address): the server sees it come from its loopback."""
+    script = (
+        "import ssl, sys, urllib.error, urllib.request\n"
+        "from app.core.healthcheck import health_url\n"
+        "url, https = health_url()\n"
+        "request = urllib.request.Request(url[:-len('/health')] + sys.argv[1],\n"
+        "                                 headers={'X-Download-Grant': sys.argv[2]})\n"
+        "context = ssl._create_unverified_context() if https else None\n"
+        "try:\n"
+        "    print(urllib.request.urlopen(request, context=context, timeout=30).status)\n"
+        "except urllib.error.HTTPError as refused:\n"
+        "    print(refused.code)\n")
+    result = subprocess.run(
+        ["docker", "exec", _API_CONTAINER, "python", "-c", script,
+         f"/public-links/{token}/download/{file_id}", grant],
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr or result.stdout
+    return int(result.stdout.strip())
+
+
+def test_a_grant_is_refused_from_another_address_and_still_delivers_to_its_own(admin, base_url,
+                                                                               files_enabled, vault):
+    """A grant is bound to the address that redeemed it. Sent from inside the API container, the
+    download comes from the container's loopback, not from the address this test redeemed from: it is
+    refused without using the grant up, and the redeeming address then gets the file."""
+    content = os.urandom(20_000)
+    file_id = _upload(admin, vault["id"], "bound.bin", content)
+    link = _link(admin, vault["id"], _tag(admin, password=True, cap=1), file_id=file_id,
+                 max_uses=1, password=_PASSWORD)
+    person = _recipient(base_url)
+    grant = _redeem(person, link["token"], secret=_PASSWORD).json()["grant"]
+    [held] = _grants_held_for(link["id"])
+    address = _redis("GET", held).strip().split("|")[1]
+    if address in ("127.0.0.1", "::1"):
+        pytest.skip("the API sees this test's requests from its own loopback, the address the "
+                    "container would send from")
+
+    assert _download_from_the_api_container(link["token"], file_id, grant) == 404
+    assert _grants_held_for(link["id"]) == [held], "a refused download used the grant up"
+    got = _download(person, link["token"], file_id, grant)
+    assert got.status_code == 200 and got.content == content
+    _counts(admin, link["id"], 1, 1)
+
+
+def test_a_grant_stored_without_its_mint_time_is_refused(admin, base_url, files_enabled, vault):
+    """Earlier releases stored a grant as its link and address only. A grant stored that way (one
+    minted in the minute before an upgrade) has no mint time to hold against the link's expiry, so the
+    download refuses it; the grant this release minted for the same link and address delivers."""
+    content = os.urandom(20_000)
+    file_id = _upload(admin, vault["id"], "older.bin", content)
+    link = _link(admin, vault["id"], _tag(admin, cap=2), file_id=file_id, max_uses=2)
+    person = _recipient(base_url)
+    grant = _redeem(person, link["token"]).json()["grant"]
+    [held] = _grants_held_for(link["id"])
+    link_id, address, _minted_at = _redis("GET", held).strip().split("|")
+    older = secrets.token_urlsafe(32)
+    older_key = "publiclink:grant:" + hashlib.sha256(older.encode()).hexdigest()
+    assert _redis("SET", older_key, f"{link_id}|{address}", "EX", "60").strip() == "OK"
+    try:
+        assert _download(person, link["token"], file_id, older).status_code == 404
+    finally:
+        _redis("DEL", older_key)
+    got = _download(person, link["token"], file_id, grant)
+    assert got.status_code == 200 and got.content == content
+    _counts(admin, link["id"], 1, 1)
