@@ -40,7 +40,7 @@ class EraseEnv(Env):
         super().__init__(monkeypatch, tmp, **kw)
         add_tables(self.engine)
         self.told = []
-        monkeypatch.setattr(pe, "announce", lambda event, details, by=None: self.told.append((event, dict(details))))
+        monkeypatch.setattr(pe, "tell_administrators", lambda event, facts, by=None: self.told.append((event, dict(facts))))
         monkeypatch.setattr(pe, "WAIT_RULES", [])
 
     def admin(self, name="ada"):

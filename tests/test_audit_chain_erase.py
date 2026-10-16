@@ -227,6 +227,64 @@ def test_the_head_record_holds_no_salt_of_an_erased_hour(env):
     assert failures(env.verify()) == []
 
 
+def test_rows_of_a_name_recorded_as_a_fingerprint_are_erased_too(env):
+    fp = pe.signin_fingerprint("eve", env.settings)
+    typed = _put(env, T0 - timedelta(hours=30), username=None, recorded={"signin_name": fp}, action="login_failed",
+                 status="failure")
+    other = _put(env, T0 - timedelta(hours=30, minutes=-5), username=None, action="login_failed", status="failure",
+                 recorded={"signin_name": pe.signin_fingerprint("mallory", env.settings)})
+    env.run_until_sealed()
+    asked = _due(env)
+    row = _rows(env, id=typed)[0]
+    assert row.username == asked["placeholder"] and row.recorded is None and row.ip_address is None
+    assert _rows(env, id=other)[0].username is None and _rows(env, id=other)[0].recorded is not None
+    assert failures(env.verify()) == []
+
+
+def test_the_scans_of_an_erase_are_forgotten_once_it_ends(env):
+    _archived_day(env)
+    asked = _due(env)
+    assert _done(env, asked["id"])
+    assert not [k for k in env.st.erase_scans if k[0] == asked["request_seq"]]
+
+
+class _Conn:
+    def __init__(self, log, clock, cost):
+        self.log, self.clock, self.cost = log, clock, cost
+
+    def execution_options(self, **kw):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, statement):
+        self.log.append(str(statement))
+        if str(statement).startswith("VACUUM"):
+            self.clock[0] += self.cost
+
+
+def test_the_vacuum_after_an_erase_keeps_to_its_budget(monkeypatch):
+    import time as _time
+    clock = [1000.0]
+    monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
+    log = []
+
+    class Engine:
+        dialect = type("D", (), {"name": "postgresql"})()
+
+        def connect(self):
+            return _Conn(log, clock, 40.0)
+    done = ae.vacuum(Engine(), budget=100.0)
+    assert done == list(ae.VACUUM_TABLES[:3])
+    timeouts = [int(x.split("= ")[1]) for x in log if x.startswith("SET statement_timeout")]
+    assert timeouts == [100000, 60000, 20000]
+    assert ae.VACUUM_TABLES[0] == "audit_seals" and ae.VACUUM_TABLES[-1] == "audit_logs"
+
+
 def test_every_other_store_gets_the_placeholder_in_the_final_transaction(env):
     _put(env, T0 - timedelta(hours=30))
     env.run_until_sealed()

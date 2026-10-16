@@ -378,7 +378,7 @@ and the unlock state.
    every audit row it would change is older than the protected minimum for its kind.
 
    **What an erase does not reach:** backups, exports and copies made before it (and the database's own
-   files until their space is reused: the erase runs a plain `VACUUM`, and `dockvault.py audit compact`
+   files until their space is reused: the erase runs a plain VACUUM, and `dockvault.py audit compact`
    rewrites the tables); container output and the log-access file; email already sent; other people's
    audit rows that name the person in their details (an administrator's row recording the deletion of
    their account, for example); and audit rows with no time.

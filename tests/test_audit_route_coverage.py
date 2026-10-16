@@ -81,6 +81,8 @@ NOT_RECORDED = {
         "issues a one-time challenge; the key change it is for is recorded by its own route",
     ("app/api/email_studio_router.py", "POST /templates/preview"):
         "renders a preview; nothing is stored or sent",
+    ("app/api/person_erase_router.py", "POST /settings/erase-requests/preview"):
+        "counts what an erase would change; nothing is stored (asking for the erase is recorded)",
 }
 
 

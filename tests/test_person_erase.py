@@ -68,6 +68,37 @@ def test_names_no_record_can_hold_are_refused(name, why):
     assert why in pe.name_problem(name)
 
 
+def test_the_names_the_server_writes_for_itself_are_refused():
+    names = pe.system_names()
+    assert {"operator@host", "server configuration"} <= names
+    for name in names:
+        assert "writes for itself" in pe.name_problem(name)
+
+
+@pytest.mark.parametrize("text, name, want", [
+    ("An administrator changed it", "admin", "An administrator changed it"),
+    ("eve.smith shared a file", "eve", "eve.smith shared a file"),
+    ("john.eve shared a file", "eve", "john.eve shared a file"),
+    ("Shared by eve.", "eve", "Shared by erased-0a0b0c0d."),
+    ("eve, bob and eve", "eve", "erased-0a0b0c0d, bob and erased-0a0b0c0d"),
+    ("mail eve@example.com", "eve", "mail eve@example.com"),
+    ("(eve) was here", "eve", "(erased-0a0b0c0d) was here"),
+    ("jo was here", "jo", "jo was here"),
+    ("a+b* was here", "a+b*", "erased-0a0b0c0d was here"),
+])
+def test_a_name_in_free_text_is_replaced_as_a_whole_word_only(text, name, want):
+    assert pe.replace_text(text, name, "erased-0a0b0c0d") == want
+
+
+def test_a_json_value_equal_to_the_name_or_its_fingerprint_is_replaced_whatever_its_length():
+    fp = "fp1:0a0b0c0d:" + "a" * 32
+    value = {"user": "jo", "q": "jo smith", "fp": fp, "list": ["jo", "x"], "jo": 1, "who": "said eve did"}
+    assert pe.replace_json(value, "jo", "erased-0", (fp,)) == {
+        "user": "erased-0", "q": "jo smith", "fp": "erased-0", "list": ["erased-0", "x"], "erased-0": 1,
+        "who": "said eve did"}
+    assert pe.replace_json({"who": "said eve did"}, "eve", "erased-0") == {"who": "said erased-0 did"}
+
+
 @pytest.mark.parametrize("who", ["account", "credential", "invitation"])
 def test_a_name_someone_has_is_refused(env, who):
     env.run_until_sealed()
@@ -156,11 +187,11 @@ def test_a_request_writes_its_row_its_seal_and_an_audit_row_that_never_name_the_
 
 
 def test_the_notices_name_the_placeholder_never_the_person(env):
-    title, body = pe.notice_text("asked", {"placeholder": "erased-0a1b2c3d", "effective_at": "2026-10-27T09:00:00Z"},
+    title, body = pe.notice_words("asked", {"placeholder": "erased-0a1b2c3d", "effective_at": "2026-10-27T09:00:00Z"},
                                  "ada")
     assert "erased-0a1b2c3d" in body and "27 October 2026" in body
     for event in ("cancelled", "completed"):
-        title, body = pe.notice_text(event, {"placeholder": "erased-0a1b2c3d", "audit_rows": 3, "other_rows": 2})
+        title, body = pe.notice_words(event, {"placeholder": "erased-0a1b2c3d", "audit_rows": 3, "other_rows": 2})
         assert "erased-0a1b2c3d" in body
 
 
@@ -296,6 +327,21 @@ def test_the_preview_counts_every_store_and_lists_near_misses(env):
         assert pe.preview(db, "owner", env.clock(), env.st)["refused"].startswith("an account has this name")
         with pytest.raises(pe.Refused):
             pe.preview(db, "erased-00000000", env.clock(), env.st)
+
+
+def test_the_preview_counts_rows_recorded_as_a_fingerprint_and_says_rows_with_no_time_are_not_reached(env):
+    fp = pe.signin_fingerprint("eve", env.settings)
+    env.row(T0 - timedelta(hours=30), username=None, recorded={"signin_name": fp})
+    env.row(T0 - timedelta(hours=30), username=None, recorded={"signin_name": "fp1:00000000:" + "b" * 32})
+    env.row(T0 - timedelta(hours=29), username="eve")
+    env.run_until_sealed()
+    with env.engine.begin() as c:            # a row with no time, as early releases wrote some
+        c.execute(text("INSERT INTO audit_logs (id, action, status, username) VALUES (:i, 'login_failed', "
+                       "'failure', 'eve')"), {"i": uuid.uuid4().hex})
+    with env.session() as db:
+        p = pe.preview(db, "eve", env.clock(), env.st)
+    assert p["audit_rows"] == 2 and p["undated_rows"] == 1
+    assert "1 audit rows with no time" in p["not_reached"]
 
 
 def test_the_list_says_each_erase_as_the_chain_holds_it(env):

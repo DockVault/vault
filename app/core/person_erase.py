@@ -2,11 +2,16 @@
 
 Whose name. Only a name no account has: a deleted account's username, or a name typed at a failed sign-in. An
 account's own name is refused (its trail is still being written: delete the account first), and so is the name of a
-temporary credential that exists, a name an invitation still waiting is for, and any name that starts with
-"erased-", in any case (the placeholders an erase writes: erasing one would erase rows already erased). The name is
-matched exactly, byte for byte, as the audit log stores it: no case folding, no Unicode normalisation. The preview
-lists the near misses (the same name in another case, or the same letters in another form) for the administrator to
-ask for separately.
+temporary credential that exists, a name an invitation still waiting is for, any name that starts with "erased-",
+in any case (the placeholders an erase writes: erasing one would erase rows already erased), and the names the
+server writes for itself (the host's operator, the server). The name is matched exactly, byte for byte, as the
+audit log stores it: no case folding, no Unicode normalisation; a name typed at a failed sign-in that the audit log
+recorded as a fingerprint is matched by its fingerprint under the key in use. The preview lists the near misses (the
+same name in another case, or the same letters in another form) for the administrator to ask for separately.
+
+Inside free text (a notification, an alert's notes, a change record's summary) the name is replaced as a whole word
+only, and only when it is at least TEXT_MIN characters long; a JSON value equal to the name, or to its fingerprint,
+is replaced whatever its length.
 
 Asking. An administrator previews what an erase would change in each store (preview()), then asks for it with the
 step-up (the password every time, ``admin.retention.write``). In one transaction, under the audit chain's lock
@@ -170,7 +175,18 @@ def name_problem(name) -> Optional[str]:
     if is_reserved_name(name):
         return ("Names that start with 'erased-' are the placeholders erases write: rows with such a name are "
                 "already erased.")
+    if name in system_names():
+        return "This name is one the server writes for itself (the host's operator, the server), not a person's."
     return None
+
+
+def system_names() -> frozenset:
+    """The names the app writes into the records for itself, which are no person's: the host's operator, the
+    server's own configuration, and the server acting from .env."""
+    from app.core.audit_chain_policy_seals import SERVER_NAME
+    from app.core.audit_privacy import SERVER_CONFIGURATION
+    from app.core.credential_changes import HOST_OPERATOR
+    return frozenset({HOST_OPERATOR, SERVER_CONFIGURATION, SERVER_NAME})
 
 
 def holder(db, name: str, now: datetime) -> Optional[str]:
@@ -241,40 +257,60 @@ def draw_placeholder(db, view) -> str:
 
 # --------------------------------------------------------------------------- the stores
 
-def _replace_text(text, name: str, placeholder: str):
-    """``text`` with every occurrence of ``name`` replaced (a name of one character is never replaced inside
-    text: it would change other words)."""
-    if not isinstance(text, str) or len(name) < 2 or name not in text:
+# A name inside free text is replaced only as a whole word, and only when it is at least this long: a shorter one
+# would change other words, as would a name inside another word (an erase of "admin" leaves "administrator").
+TEXT_MIN = 3
+
+
+def _word(name: str):
+    return re.compile(r"(?<![\w@.-])" + re.escape(name) + r"(?![\w@-]|\.\w)")
+
+
+def replace_text(text, name: str, placeholder: str):
+    """``text`` with every whole-word occurrence of ``name`` given the placeholder (a name shorter than TEXT_MIN is
+    never replaced inside text)."""
+    if not isinstance(text, str) or len(name) < TEXT_MIN or name not in text:
         return text
-    return text.replace(name, placeholder)
+    return _word(name).sub(placeholder, text)
 
 
-def replace_json(value, name: str, placeholder: str):
-    """``value`` (decoded JSON) with every string equal to ``name``, or holding it, given the placeholder in its
-    place (keys too)."""
+def replace_json(value, name: str, placeholder: str, also: tuple = ()):
+    """``value`` (decoded JSON) with every string equal to ``name`` (or to one of ``also``: its fingerprint) given the
+    placeholder, and every whole-word occurrence of ``name`` inside a longer string (keys too)."""
     if isinstance(value, str):
-        return placeholder if value == name else _replace_text(value, name, placeholder)
+        return placeholder if value == name or value in also else replace_text(value, name, placeholder)
     if isinstance(value, list):
-        return [replace_json(v, name, placeholder) for v in value]
+        return [replace_json(v, name, placeholder, also) for v in value]
     if isinstance(value, dict):
-        return {replace_json(k, name, placeholder): replace_json(v, name, placeholder) for k, v in value.items()}
+        return {replace_json(k, name, placeholder, also): replace_json(v, name, placeholder, also)
+                for k, v in value.items()}
     return value
 
 
-def json_mentions(column, name: str):
-    """A condition for a JSON column whose text holds ``name`` (as it is, or as JSON escapes it)."""
+def json_mentions(column, name: str, also: tuple = ()):
+    """A condition for a JSON column whose text holds ``name`` (as it is, or as JSON escapes it) or one of ``also``:
+    a prefilter, which replace_json decides."""
     from sqlalchemy import Text, cast, or_
     import json as _json
     text = cast(column, Text)
-    escaped = _json.dumps(name)[1:-1]
-    forms = {name, escaped}
+    forms = {name, _json.dumps(name)[1:-1]} | {a for a in also if a}
     return or_(*[text.contains(f, autoescape=True) for f in forms])
 
 
+def signin_fingerprint(name: str, cfg=None) -> Optional[str]:
+    """The fingerprint the audit log records a name typed at a failed sign-in as, at the fingerprint level, under
+    the fingerprint key in use (None when there is no key)."""
+    from app.core import audit_fingerprints as afp
+    try:
+        return afp.fingerprint(afp.SIGNIN, name, settings=cfg)
+    except Exception:  # noqa: BLE001 -- no key: nothing is recorded as a fingerprint either
+        return None
+
+
 class Store:
-    """A place outside the audit log where a person's name can stay after the account is gone: how many rows
-    name ``name`` (count), and the change that gives them the placeholder (erase, returning how many it
-    changed)."""
+    """A place outside the audit log where a person's name can stay after the account is gone: how many rows the
+    erase would change there (count), and the change that gives them the placeholder (erase, returning how many it
+    changed). Each takes (db, name, placeholder, also, now): ``also`` holds the name's fingerprint."""
 
     def __init__(self, key: str, label: str, count: Callable, erase: Callable):
         self.key, self.label, self.count, self.erase = key, label, count, erase
@@ -285,162 +321,159 @@ def _models():
     return models
 
 
-def _exact_columns(model, columns):
-    from sqlalchemy import or_
-
-    def where(name):
-        return or_(*[getattr(model, c) == name for c in columns])
-    return where
-
-
 def _simple_store(key: str, label: str, table: str, columns: tuple) -> Store:
     """A store whose name columns hold a username exactly (who made, decided or sent something)."""
+    from sqlalchemy import or_
 
     def model():
         return getattr(_models(), table)
 
-    def count(db, name, now):
+    def found(db, name):
         m = model()
-        return db.query(m).filter(_exact_columns(m, columns)(name)).count()
+        return db.query(m).filter(or_(*[getattr(m, c) == name for c in columns]))
 
-    def erase(db, name, placeholder, now):
-        m = model()
+    def count(db, name, placeholder, also, now):
+        return found(db, name).count()
+
+    def erase(db, name, placeholder, also, now):
         n = 0
-        for c in columns:
-            n += db.query(m).filter(getattr(m, c) == name).update({getattr(m, c): placeholder},
-                                                                  synchronize_session=False)
+        for row in found(db, name).all():
+            for c in columns:
+                if getattr(row, c) == name:
+                    setattr(row, c, placeholder)
+            n += 1
         return n
     return Store(key, label, count, erase)
 
 
-def _security_records():
-    def count(db, name, now):
+class _Probe:
+    """A copy of a row's values, which a store's change() may change without touching the row."""
+
+    def __init__(self, row):
+        import copy
+        for c in row.__table__.columns:
+            setattr(self, c.key, copy.deepcopy(getattr(row, c.key)))
+
+
+def _changing_store(key: str, label: str, rows: Callable, change: Callable) -> Store:
+    """A store whose rows a prefilter finds (``rows``) and ``change`` decides: it changes a row in place and says
+    whether anything changed. The count is of the rows it would change, worked out on a copy of each."""
+
+    def count(db, name, placeholder, also, now):
+        return sum(1 for row in rows(db, name, also, now) if change(_Probe(row), name, placeholder, also))
+
+    def erase(db, name, placeholder, also, now):
+        return sum(1 for row in rows(db, name, also, now) if change(row, name, placeholder, also))
+    return Store(key, label, count, erase)
+
+
+def _set(obj, field: str, value) -> bool:
+    if getattr(obj, field) != value:
+        setattr(obj, field, value)
+        return True
+    return False
+
+
+def _security_records() -> Store:
+    def rows(db, name, also, now):
         m = _models().SecurityRecord
-        return db.query(m).filter(m.name == name).count()
+        return db.query(m).filter(m.name == name).all()
 
-    def erase(db, name, placeholder, now):
-        m = _models().SecurityRecord
-        return db.query(m).filter(m.name == name).update(
-            {m.name: placeholder, m.address: None, m.ip_via: None, m.account_id: None}, synchronize_session=False)
-    return Store("security_records", "Failed sign-ins kept in full", count, erase)
+    def change(r, name, placeholder, also):
+        done = _set(r, "name", placeholder)
+        for f in ("address", "ip_via", "account_id"):
+            done = _set(r, f, None) or done
+        return done
+    return _changing_store("security_records", "Failed sign-ins kept in full", rows, change)
 
 
-def _security_alerts():
+def _security_alerts() -> Store:
     from sqlalchemy import or_
 
-    def rows(db, name):
+    def rows(db, name, also, now):
         m = _models().SecurityAlert
-        return db.query(m).filter(or_(m.username == name, m.resolved_by == name)).all()
+        return db.query(m).filter(or_(m.username == name, m.resolved_by == name,
+                                      m.resolution_notes.contains(name, autoescape=True))).all()
 
-    def count(db, name, now):
-        return len(rows(db, name))
-
-    def erase(db, name, placeholder, now):
+    def change(a, name, placeholder, also):
         from app.core import security_records as sr
-        n = 0
-        for alert in rows(db, name):
-            if alert.username == name:
-                alert.message = sr._scrubbed(alert.message or "", name, alert.ip_address)
-                details = replace_json(alert.details, name, placeholder)
-                if alert.ip_address:
-                    details = replace_json(details, alert.ip_address, sr.CLEARED_ADDRESS)
-                alert.details = details
-                alert.resolution_notes = _replace_text(alert.resolution_notes, name, placeholder)
-                alert.username = placeholder
-                alert.ip_address = None
-                alert.ip_via = None
-                alert.user_id = None
-            if alert.resolved_by == name:
-                alert.resolved_by = placeholder
-            n += 1
-        return n
-    return Store("security_alerts", "Security alerts", count, erase)
+        done = False
+        if a.username == name:
+            done = _set(a, "message", sr._scrubbed(a.message or "", name, a.ip_address)) or done
+            details = replace_json(a.details, name, placeholder, also)
+            if a.ip_address:
+                details = replace_json(details, a.ip_address, sr.CLEARED_ADDRESS)
+            done = _set(a, "details", details) or done
+            done = _set(a, "username", placeholder) or done
+            for f in ("ip_address", "ip_via", "user_id"):
+                done = _set(a, f, None) or done
+        if a.resolved_by == name:
+            done = _set(a, "resolved_by", placeholder) or done
+        return _set(a, "resolution_notes", replace_text(a.resolution_notes, name, placeholder)) or done
+    return _changing_store("security_alerts", "Security alerts", rows, change)
 
 
-def _credential_changes():
+def _credential_changes() -> Store:
     from sqlalchemy import or_
 
-    def rows(db, name):
+    def rows(db, name, also, now):
         m = _models().CredentialChange
         return db.query(m).filter(or_(m.requested_by_name == name, m.decided_by_name == name,
                                       m.summary.contains(name, autoescape=True),
-                                      json_mentions(m.payload, name), json_mentions(m.approval_snapshot, name))).all()
+                                      json_mentions(m.payload, name, also),
+                                      json_mentions(m.approval_snapshot, name, also))).all()
 
-    def count(db, name, now):
-        return len(rows(db, name))
-
-    def erase(db, name, placeholder, now):
-        n = 0
-        for c in rows(db, name):
-            if c.requested_by_name == name:
-                c.requested_by_name = placeholder
-            if c.decided_by_name == name:
-                c.decided_by_name = placeholder
-            c.summary = _replace_text(c.summary, name, placeholder)
-            if c.payload is not None:
-                c.payload = replace_json(c.payload, name, placeholder)
-            if c.approval_snapshot is not None:
-                c.approval_snapshot = replace_json(c.approval_snapshot, name, placeholder)
-            n += 1
-        return n
-    return Store("credential_changes", "Records of changes to sign-in details", count, erase)
+    def change(c, name, placeholder, also):
+        done = False
+        for f in ("requested_by_name", "decided_by_name"):
+            if getattr(c, f) == name:
+                done = _set(c, f, placeholder) or done
+        done = _set(c, "summary", replace_text(c.summary, name, placeholder)) or done
+        for f in ("payload", "approval_snapshot"):
+            if getattr(c, f) is not None:
+                done = _set(c, f, replace_json(getattr(c, f), name, placeholder, also)) or done
+        return done
+    return _changing_store("credential_changes", "Records of changes to sign-in details", rows, change)
 
 
-def _invitations():
+def _invitations() -> Store:
     from sqlalchemy import or_
 
-    def ended(m, now):
-        return or_(m.accepted_at.isnot(None), m.revoked_at.isnot(None), m.expires_at <= now)
-
-    def count(db, name, now):
+    def rows(db, name, also, now):
         m = _models().AccountInvitation
-        return db.query(m).filter(m.username == name, ended(m, now)).count()
+        return db.query(m).filter(m.username == name, or_(m.accepted_at.isnot(None), m.revoked_at.isnot(None),
+                                                          m.expires_at <= now)).all()
 
-    def erase(db, name, placeholder, now):
-        m = _models().AccountInvitation
-        return db.query(m).filter(m.username == name, ended(m, now)).update(
-            {m.username: placeholder, m.email: None}, synchronize_session=False)
-    return Store("account_invitations", "Invitations that named them", count, erase)
+    def change(i, name, placeholder, also):
+        changed = _set(i, "username", placeholder)
+        return _set(i, "email", None) or changed
+    return _changing_store("account_invitations", "Invitations that named them", rows, change)
 
 
-def _saved_searches():
-    def rows(db, name):
+def _saved_searches() -> Store:
+    def rows(db, name, also, now):
         m = _models().ActivitySavedSearch
-        return db.query(m).filter(json_mentions(m.filters, name)).all()
+        return db.query(m).filter(json_mentions(m.filters, name, also)).all()
 
-    def count(db, name, now):
-        return len(rows(db, name))
-
-    def erase(db, name, placeholder, now):
-        n = 0
-        for s in rows(db, name):
-            s.filters = replace_json(s.filters, name, placeholder)
-            n += 1
-        return n
-    return Store("activity_saved_searches", "Saved Activity searches that name them", count, erase)
+    def change(s, name, placeholder, also):
+        return _set(s, "filters", replace_json(s.filters, name, placeholder, also))
+    return _changing_store("activity_saved_searches", "Saved Activity searches that name them", rows, change)
 
 
-def _notifications():
+def _notifications() -> Store:
     from sqlalchemy import or_
 
-    def rows(db, name):
+    def rows(db, name, also, now):
         m = _models().Notification
-        if len(name) < 2:
+        if len(name) < TEXT_MIN:
             return []
         return db.query(m).filter(or_(m.title.contains(name, autoescape=True),
                                       m.body.contains(name, autoescape=True))).all()
 
-    def count(db, name, now):
-        return len(rows(db, name))
-
-    def erase(db, name, placeholder, now):
-        n = 0
-        for note in rows(db, name):
-            note.title = _replace_text(note.title, name, placeholder)
-            note.body = _replace_text(note.body, name, placeholder)
-            n += 1
-        return n
-    return Store("notifications", "Other people's notifications that name them", count, erase)
+    def change(n, name, placeholder, also):
+        changed = _set(n, "title", replace_text(n.title, name, placeholder))
+        return _set(n, "body", replace_text(n.body, name, placeholder)) or changed
+    return _changing_store("notifications", "Other people's notifications that name them", rows, change)
 
 
 STORES: List[Store] = [
@@ -536,9 +569,34 @@ def _near_misses(db, name: str) -> List[str]:
     return sorted(r[0] for r in found if r[0])
 
 
+def audit_matches(model, name: str, fp: Optional[str]):
+    """A condition for the audit rows of ``name``: its username exactly, or (a name typed at a failed sign-in recorded
+    at the fingerprint level) no username and its fingerprint in ``recorded``. A prefilter: row_matches decides."""
+    from sqlalchemy import Text, and_, cast, or_
+    if not fp:
+        return model.username == name
+    return or_(model.username == name, and_(model.username.is_(None), cast(model.recorded, Text).contains(fp)))
+
+
+def row_matches(row: dict, name: str, fp: Optional[str]) -> bool:
+    """Whether an audit row (``recorded`` as its stored text, or decoded) is one of ``name``'s."""
+    if row.get("username") == name:
+        return True
+    if not fp or row.get("username") is not None or not row.get("recorded"):
+        return False
+    recorded = row["recorded"]
+    if isinstance(recorded, str):
+        try:
+            import json as _json
+            recorded = _json.loads(recorded)
+        except ValueError:
+            return False
+    return isinstance(recorded, dict) and recorded.get("signin_name") == fp
+
+
 def preview(db, name: str, now: datetime, st=None) -> dict:
     """What erasing ``name`` would change now, store by store, and what it leaves. Raises Refused."""
-    from sqlalchemy import func, not_
+    from sqlalchemy import func
     from app.core.models import AuditLog as A
     why = name_problem(name)
     if why:
@@ -546,12 +604,14 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
     st = st or _ai().state()
     view = st.view
     has = holder(db, name, now)
-    rows = db.query(func.count()).select_from(A).filter(A.username == name).scalar() or 0
-    newest = db.query(func.max(A.timestamp)).filter(A.username == name).scalar()
-    oldest = db.query(func.min(A.timestamp)).filter(A.username == name).scalar()
-    stores = []
-    for store in STORES:
-        stores.append({"key": store.key, "label": store.label, "count": int(store.count(db, name, now) or 0)})
+    fp = signin_fingerprint(name, st.cfg())
+    mine = audit_matches(A, name, fp)
+    dated = db.query(A.username, A.recorded, A.timestamp).filter(mine, A.timestamp.isnot(None)).all()
+    times = [t for u, r, t in dated if row_matches({"username": u, "recorded": r}, name, fp)]
+    undated = db.query(func.count()).select_from(A).filter(A.username == name, A.timestamp.is_(None)).scalar() or 0
+    placeholder = PREFIX + "00000000"
+    stores = [{"key": s.key, "label": s.label, "count": int(s.count(db, name, placeholder, (fp,) if fp else (), now)
+                                                             or 0)} for s in STORES]
     mentions = None
     try:
         with db.begin_nested():
@@ -559,19 +619,23 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
                 A.username != name, json_mentions(A.details, name)).scalar() or 0)
     except Exception:  # noqa: BLE001 -- a slow count is not needed to ask
         mentions = None
-    archived_days = sum(1 for e in view.archives.values() if e.parts)
+    not_reached = [COVERAGE["exports and backups"], COVERAGE["logs"], COVERAGE["email"],
+                   "other people's audit rows that name them in their details are not changed",
+                   "a name typed at a failed sign-in recorded as a fingerprint under an earlier fingerprint key"]
+    if undated:
+        not_reached.append(f"{undated} audit rows with no time")
     return {
         "refused": has,
-        "audit_rows": int(rows),
-        "oldest": oldest.isoformat() + "Z" if oldest else None,
-        "newest": newest.isoformat() + "Z" if newest else None,
-        "archived_days": archived_days,
+        "audit_rows": len(times),
+        "oldest": min(times).isoformat() + "Z" if times else None,
+        "newest": max(times).isoformat() + "Z" if times else None,
+        "undated_rows": int(undated),
+        "archived_days": sum(1 for e in view.archives.values() if e.parts),
         "stores": stores,
         "near_misses": _near_misses(db, name),
         "mentioned_by_others": mentions,
         "delay_days": _delay_days(view, st),
-        "not_reached": [COVERAGE["exports and backups"], COVERAGE["logs"], COVERAGE["email"],
-                        "other people's audit rows that name them in their details are not changed"],
+        "not_reached": not_reached,
     }
 
 
@@ -625,7 +689,7 @@ def request(w, name: str, actor, *, now: Optional[datetime] = None) -> dict:
     delay = timedelta(days=_delay_days(view, st))
     effective = now + delay
     row = AuditLogger(db).build_row(
-        action=REQUESTED_ACTION, status="success", user=actor, resource_type=RESOURCE_TYPE,
+        action="person_erase_requested", status="success", user=actor, resource_type=RESOURCE_TYPE,
         resource_id=str(request_id),
         details={"request_id": str(request_id), "placeholder": placeholder,
                  "effective_at": effective.isoformat() + "Z"})
@@ -691,7 +755,7 @@ def _end_row(db, row, request_id, placeholder, actor, now):
         row.decided_at = now
         row.waiting = None
     audit = AuditLogger(db).build_row(
-        action=CANCELLED_ACTION, status="success", user=actor, resource_type=RESOURCE_TYPE,
+        action="person_erase_cancelled", status="success", user=actor, resource_type=RESOURCE_TYPE,
         resource_id=str(request_id), details={"request_id": str(request_id), "placeholder": placeholder})
     db.add(audit)
     return audit
@@ -787,30 +851,30 @@ def _date(text) -> str:
         return str(text or "")
 
 
-def notice_text(event: str, details: dict, by: Optional[str] = None) -> tuple:
+def notice_words(event: str, facts: dict, by: Optional[str] = None) -> tuple:
     """(title, body) of the notice every administrator gets. Names the placeholder, never the name."""
     by = by or "An administrator"
-    ph = details.get("placeholder") or "a placeholder"
+    ph = facts.get("placeholder") or "a placeholder"
     if event == "asked":
         return ("An erase of a person's records is waiting",
                 f"{by} asked to erase a person's name from the audit log and the other records; it will read "
-                f"{ph} there. It runs on {_date(details.get('effective_at'))} unless an administrator cancels it "
+                f"{ph} there. It runs on {_date(facts.get('effective_at'))} unless an administrator cancels it "
                 "on the Settings page.")
     if event == "cancelled":
         return ("A waiting erase was cancelled", f"{by} cancelled the erase that would have written {ph}. Nothing "
                                                  "changes.")
     return ("An erase of a person's records is complete",
-            f"The erase {ph} is complete: {details.get('audit_rows', 0)} audit rows and "
-            f"{details.get('other_rows', 0)} other records now read {ph}.")
+            f"The erase {ph} is complete: {facts.get('audit_rows', 0)} audit rows and "
+            f"{facts.get('other_rows', 0)} other records now read {ph}.")
 
 
-def announce(event: str, details: dict, by: Optional[str] = None) -> None:
+def tell_administrators(event: str, facts: dict, by: Optional[str] = None) -> None:
     """Tell every active administrator, in the app and by email, after the commit. Never raises."""
     try:
         from app.api import api_server as api
         from app.core.database import get_db_context
         from app.core.models import RoleEnum, User
-        title, body = notice_text(event, details, by)
+        title, body = notice_words(event, facts, by)
         with get_db_context() as db:
             admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
             recipients = [(a.email, a.username) for a in admins]

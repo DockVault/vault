@@ -234,8 +234,8 @@ def test_the_jobs_and_which_the_hold_switch_stops():
         ("audit_seals", False), ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
         ("credential_changes", False),
         ("rate_limit_records", False), ("security_alerts", True), ("security_records", True),
-        ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True),
-        ("audit_archive", False)]
+        ("security_alert_values", True), ("audit_env_retention", False), ("person_erase", True),
+        ("audit_logs", True), ("audit_archive", False)]
 
 
 def test_finished_sessions_and_sign_ins_go_after_their_window(env, factory):

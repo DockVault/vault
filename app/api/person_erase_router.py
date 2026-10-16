@@ -93,7 +93,7 @@ def request_erase(body: EraseName, request: Request, current_user: User = Depend
         registry._say(f"Warning: an erase was not asked for ({type(exc).__name__})")
         raise HTTPException(status_code=503, detail="The erase was not asked for: its audit record could not be "
                                                     "written. Nothing was changed.")
-    pe.announce("asked", entry, current_user.username)
+    pe.tell_administrators("asked", entry, current_user.username)
     return {"status": "pending", "request": entry}
 
 
@@ -126,5 +126,5 @@ def cancel_erase(request_id: uuid.UUID, current_user: User = Depends(require_int
         registry._say(f"Warning: a cancel of an erase was not saved ({type(exc).__name__})")
         raise HTTPException(status_code=503, detail="The erase was not cancelled: its audit record could not be "
                                                     "written. It is still waiting.")
-    pe.announce("cancelled", entry, current_user.username)
+    pe.tell_administrators("cancelled", entry, current_user.username)
     return {"status": "cancelled", "request": entry}
