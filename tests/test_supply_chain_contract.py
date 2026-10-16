@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import re
@@ -32,7 +31,7 @@ _RENDERER_SPEC.loader.exec_module(_RENDERER)
 
 _PYTHON_DIGEST = (
     "python:3.14-alpine@"
-    "sha256:a1321512d6a287428c50dcdf2ab3857761127e03a23b1f648e9c1c0de59288f8"
+    "sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72"
 )
 _POSTGRES_DIGEST = (
     "postgres:15-alpine@"
@@ -42,18 +41,6 @@ _REDIS_DIGEST = (
     "redis:8-alpine@"
     "sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241"
 )
-_CPYTHON_SNAPSHOT = "07efb08123ba9367a7107325adb9d5626dca1ca9"
-_BACKPORT_HASHES = {
-    Path("security/cpython-backports/Lib/tarfile.py"): (
-        "3c8d585a77d7d376aea66e5e11a4d53c2605100d4c05a71b5385ed54bc526f51"
-    ),
-    Path("security/cpython-backports/Lib/html/parser.py"): (
-        "5c5ed245889135564e75dfed9a47aeb6b4d3e5a2e9614d918a986767e3747539"
-    ),
-    Path("security/cpython-backports/PSF-LICENSE.txt"): (
-        "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231"
-    ),
-}
 
 
 def _publish_job() -> str:
@@ -134,32 +121,25 @@ def test_apk_upgrade_is_the_only_unpinned_install():
             % (pat, _DOCKERFILE[max(0, m.start() - 15):m.start() + 25]))
 
 
-def test_cpython_security_backports_are_exact_and_verified_during_build():
-    readme = (_ROOT / "security" / "cpython-backports" / "README.md").read_text(
-        encoding="utf-8"
-    )
-    for relative_path, expected_hash in _BACKPORT_HASHES.items():
-        payload = (_ROOT / relative_path).read_bytes()
-        assert hashlib.sha256(payload).hexdigest() == expected_hash
-        assert expected_hash in _DOCKERFILE
-        assert expected_hash in readme
+def test_the_image_keeps_the_base_images_own_standard_library():
+    """The image runs the pinned base image's standard library as shipped. An earlier image copied
+    two files over it from a reviewed CPython snapshot, and the base later carried newer fixes in one
+    of them, so the copy would have taken that file back to an older version with no scanner
+    noticing. Nothing in the build may write into the standard library again without first checking
+    the base's own file, which this pin makes a reviewed change rather than a quiet one."""
+    instructions = [line.strip() for line in _DOCKERFILE.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+    assert not [line for line in instructions if "/usr/local/lib/python" in line]
+    assert not [line for line in instructions if re.match(r"COPY\s+security/", line)]
+    assert not (_ROOT / "security" / "cpython-backports").exists()
+    # The one COPY of the whole tree comes after the dependency install, and copies into /app only.
+    copies = [line for line in instructions if line.startswith("COPY ")]
+    assert copies == ["COPY requirements.lock .", "COPY . ."]
+    assert re.search(r"^WORKDIR /app$", _DOCKERFILE, re.MULTILINE)
 
-    assert _CPYTHON_SNAPSHOT in readme
-    assert "COPY security/cpython-backports /tmp/cpython-backports" in _DOCKERFILE
-    assert "cp Lib/tarfile.py /usr/local/lib/python3.14/tarfile.py" in _DOCKERFILE
-    assert (
-        "cp Lib/html/parser.py /usr/local/lib/python3.14/html/parser.py" in _DOCKERFILE
-    )
-    assert (
-        "cp PSF-LICENSE.txt /usr/share/licenses/cpython-backports/PSF-LICENSE.txt"
-    ) in _DOCKERFILE
-    for cve, upstream_commit in (
-        ("CVE-2026-11940", "79c06bd5c6afa3c440d50faf7ee1b147c8832b4c"),
-        ("CVE-2026-11972", "e86666c9dd256d52d0fbef6feb1ea4a51768fdec"),
-        ("CVE-2026-15308", _CPYTHON_SNAPSHOT),
-    ):
-        assert cve in readme
-        assert upstream_commit in readme
+    evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
+    assert "The image runs the base image's standard library unmodified." in evidence
+    assert "must check the base image's own file hash" in evidence
 
 
 def test_production_lock_is_fully_pinned_and_hashed():

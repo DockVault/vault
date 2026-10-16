@@ -1,8 +1,8 @@
 name: Image scan (PR)
 
 # Vulnerability-scan the container image on the pull requests that can actually change its
-# vulnerability surface -- the base image, the locked dependencies, or the CPython backports --
-# so a High/Critical CVE introduced by a bump is caught before merge rather than at release time.
+# vulnerability surface -- the base image, the locked dependencies, or the reviewed VEX -- so a
+# High/Critical CVE introduced by a bump is caught before merge rather than at release time.
 # The release workflow still scans both published platform images at publish time; this is the
 # earlier, cheaper gate. It is path-filtered, so app-only PRs (which cannot introduce a new
 # dependency CVE) do not pay for it.
@@ -27,7 +27,7 @@ on:
     branches: ["main", "release/[0-9]+.[0-9]+"]
     # These paths mirror what the Dockerfile bakes into the image's scannable package set: the
     # pinned base (Dockerfile), the hash-locked pip install (requirements.lock / requirements.txt),
-    # the CPython backports and the reviewed VEX (security/**), and what COPY . . excludes
+    # the reviewed VEX (security/**), and what COPY . . excludes
     # (.dockerignore). Keep this list in sync with the Dockerfile's install inputs -- a new
     # dependency-source file added there but not here would silently skip this gate.
     paths:

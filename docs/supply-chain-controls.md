@@ -61,19 +61,14 @@ process says at start what to change. An IPv6 check is reported as skipped where
 relays no IPv6 loopback. Run it locally with `python3 .github/scripts/proxy_matrix.py --image <image>`; it removes
 everything it created when it ends.
 
-The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from
-CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the 3.14 backports for
-`CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build checks the vendored file
-and PSF-license hashes before copying them over the base standard library, and removes pip after
-the locked dependency installation. The file origins and expected hashes are recorded in
-`security/cpython-backports/README.md`.
-
-**Since the base moved to 3.14.7 those two files are byte-identical to the ones they replace**, so
-the copy is a verified no-op rather than a substitution. It is retained deliberately: the hash
-check is what makes the property hold independently of whichever base digest is pinned, and it
-fails the build loudly rather than quietly if a future base does not carry the fixes. Retiring the
-vendored snapshot is a separate decision, and wants a release scan against 3.14.7 as its evidence
-rather than this reasoning.
+The image runs the base image's standard library unmodified. Releases up to 0.33.3 copied
+`Lib/tarfile.py` and `Lib/html/parser.py` over it from a reviewed CPython 3.14 snapshot, checked by
+hash during the build. Python 3.14.8, the base from 0.33.4, carries newer fixes in `tarfile.py` than
+that snapshot, so the copy would have replaced the file with an older one, undoing a fix without any
+scanner noticing (a scanner reads the Python version, not the file). The copy was retired with the
+move to 3.14.8. A future patch to the standard library must check the base image's own file hash
+before it overwrites anything, so that a base which has moved on fails the build instead of being
+undone. The Docker build removes pip after the locked dependency installation.
 
 The reviewed OpenVEX template, `security/vex.openvex.json`, holds the findings the maintainers have
 reviewed as not affecting the image, each with its justification. It holds no statements now. The
