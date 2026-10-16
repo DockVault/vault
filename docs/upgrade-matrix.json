@@ -4607,6 +4607,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.33.4": {
+      "released": "2026-10-16",
+      "notes": "Public file and folder links with a download limit deliver every download they allow. Since public file links first shipped in 0.21.0, the download after a link's last allowed use was refused. A link limited to one download, which is what the shipped Confidential tag makes, never delivered its file: the recipient saw \"That file is no longer available\", and the link then counted as used up. A link limited to N downloads, or a folder link limited to N files, delivered N-1. Links without a limit were not affected. A link the fault already used up stays used up; create a new one. The base image moves to Python 3.14.8, which fixes CVE-2026-19445 and CVE-2026-19553 (which scanners rate Critical and High) and several Medium and Low findings in Python. Scanners report them on 0.33.3 and earlier, but DockVault does not reach the affected code: the first needs a TLS server that switches certificates through an SNI callback, and the second a TLS connection opened without a host name to check, and DockVault does neither. The image now runs Python's standard library unmodified. Earlier images replaced two of its files with reviewed copies, which on 3.14.8 would have replaced a newer file with an older one. This release fixes no advisory: neither Python finding is reachable, and the link fault only refused downloads; it never served a file it should not have. This release attaches no VEX document: it holds no reviewed scanner exception, so scanners need none.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -5016,6 +5024,13 @@
     {
       "from": "0.33.2",
       "to": "0.33.3",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.3",
+      "to": "0.33.4",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
