@@ -125,8 +125,9 @@ Check, without logging in to the registry:
 
 - `:vX.Y.Z`, `:vX.Y` and, for the highest release, `:latest` resolve to the digest the workflow
   scanned, and the image's version label and `VERSION` name the release;
-- the release assets are attached, and the `upgrade.json` asset equals the matrix of the tagged
-  commit;
+- the release assets are attached: an SPDX SBOM for each platform, `upgrade.json`, which equals the
+  matrix of the tagged commit, and a VEX document only when the release holds a reviewed exception
+  (see [supply-chain controls](../supply-chain-controls.md));
 - GitHub's "latest release" is the highest version;
 - `main`'s matrix declares every released tag, including this one;
 - the upgrades page of the documentation site lists the new release, its edges and its advisories.

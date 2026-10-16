@@ -61,27 +61,32 @@ process says at start what to change. An IPv6 check is reported as skipped where
 relays no IPv6 loopback. Run it locally with `python3 .github/scripts/proxy_matrix.py --image <image>`; it removes
 everything it created when it ends.
 
-The image replaces `Lib/tarfile.py` and `Lib/html/parser.py` with their exact versions from
-CPython commit `07efb08123ba9367a7107325adb9d5626dca1ca9`, which contains the 3.14 backports for
-`CVE-2026-11940`, `CVE-2026-11972`, and `CVE-2026-15308`. The Docker build checks the vendored file
-and PSF-license hashes before copying them over the base standard library, and removes pip after
-the locked dependency installation. The file origins and expected hashes are recorded in
-`security/cpython-backports/README.md`.
+The image runs the base image's standard library unmodified. Releases up to 0.33.3 copied
+`Lib/tarfile.py` and `Lib/html/parser.py` over it from a reviewed CPython 3.14 snapshot, checked by
+hash during the build. Python 3.14.8, the base from 0.33.4, carries newer fixes in `tarfile.py` than
+that snapshot, so the copy would have replaced the file with an older one, undoing a fix without any
+scanner noticing (a scanner reads the Python version, not the file). The copy was retired with the
+move to 3.14.8. A future patch to the standard library must check the base image's own file hash
+before it overwrites anything, so that a base which has moved on fails the build instead of being
+undone. The Docker build removes pip after the locked dependency installation.
 
-**Since the base moved to 3.14.7 those two files are byte-identical to the ones they replace**, so
-the copy is a verified no-op rather than a substitution. It is retained deliberately: the hash
-check is what makes the property hold independently of whichever base digest is pinned, and it
-fails the build loudly rather than quietly if a future base does not carry the fixes. Retiring the
-vendored snapshot and the VEX statements below is a separate decision, and wants a release scan
-against 3.14.7 as its evidence rather than this reasoning.
+The reviewed OpenVEX template, `security/vex.openvex.json`, holds the findings the maintainers have
+reviewed as not affecting the image, each with its justification. It holds no statements now. The
+last four were bound to package versions the image no longer contains: three findings in Python's
+standard library, bound to Python 3.14.7, whose release already carries their fixes, and one in
+Alpine's `zlib` 1.3.2-r0, which the build's `apk upgrade` replaces with the fixed 1.3.2-r1. They
+suppressed nothing, so they were removed. Before the local scan, the workflow renders the template
+for the tested source revision, the versioned image reference, and the local image content ID.
+After push, it renders the release asset again for the exact registry manifest digest. Every
+statement must contain both the immutable OCI digest PURL and the versioned image reference, and
+the renderer refuses one that does not. Any exception requires a source-reviewed template change.
 
-The reviewed OpenVEX template uses `vulnerable_code_not_present` for those three CPython
-findings and the `pkg:generic/python@3.14.7` subcomponent. Before the local scan, the workflow
-renders it for the tested source revision, the versioned image reference, and the local image
-content ID. After push, it overwrites the release asset with the exact registry manifest digest.
-Every statement contains both the immutable OCI digest PURL and versioned image reference; the
-GitHub Release publishes that rendered VEX beside the SBOM. Any additional exception requires a
-source-reviewed template change.
+The GitHub Release publishes the rendered VEX beside the SBOMs only when the template holds at least
+one statement. OpenVEX requires a document to hold at least one, so a release with no reviewed
+exception has no VEX to publish: the renderer writes no file and the release attaches none, and the
+release is refused before it is created if any file it does list is missing. The scans still apply
+the document they render for the image they scan; with no statement it suppresses nothing, and it is
+never published.
 
 Each statement names the exact package versions it was reviewed for, so an image that has moved on
 (a newer base image, or a newer Alpine package from the build's `apk upgrade`) is no longer covered
@@ -90,19 +95,9 @@ by it. The image scan checks this before it scans: it writes the image's SPDX SB
 packages the SBOM lists, ignoring purl qualifiers such as the architecture. A version the image no
 longer contains fails the scan, pull requests and release candidates alike, with the statement's
 finding and the version the image has instead. The statement then lives in three places: the
-template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph below. It is removed
+template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph in this document. It is removed
 from all three, or, if the new version is still affected and the reasoning still holds, reviewed
 again and its version changed in all three.
-
-One further exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
-`CVE-2026-85091`, a heap buffer overflow in the base image's `zlib` (1.3.1.2 through 1.3.2), reached
-only through the gz file API's write path —
-`gzprintf()` or `gzvprintf()` after a stalled non-blocking `gzwrite()`. There is no fixed Alpine
-package yet. No binary in the image imports any gz write function (zlib's consumers there, Python's
-`zlib` module and `apk`, use the deflate/inflate stream API), and no Python code loads zlib through
-`ctypes`, so the vulnerable code is not reachable. The statement binds the
-`pkg:apk/alpine/zlib@1.3.2-r0` subcomponent: the image build's `apk upgrade` picks up a fixed package
-as soon as Alpine ships one, and the pin then stops matching instead of carrying the exception forward.
 
 ### Base-package patching: a deliberate reproducibility exception
 

@@ -50,6 +50,7 @@ _REGISTRY = {
         "_notelink_locked": ("B", 1), "_notelink_record_fail": ("B", 2), "_notelink_clear_fails": ("B", 1),
         "_publiclink_locked": ("B", 1), "_publiclink_record_fail": ("B", 2), "_publiclink_clear_fails": ("B", 1),
         "_publiclink_issue_grant": ("B", 1), "_publiclink_consume_grant": ("B", 2),
+        "_publiclink_discard_grant": ("B", 1),   # skip while open: the grant was never handed out
         "_receiver_locked": ("B", 1), "_receiver_record_fail": ("B", 2), "_receiver_clear_fails": ("B", 1),
         "upload_file": ("E", 3),                 # space reservation: skip the eval when open -> fallback
         "websocket_monitor_endpoint": ("E", 1),  # .pubsub() off-loop (subscribe/get via run_in_executor)

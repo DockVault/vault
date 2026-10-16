@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import re
@@ -32,7 +31,7 @@ _RENDERER_SPEC.loader.exec_module(_RENDERER)
 
 _PYTHON_DIGEST = (
     "python:3.14-alpine@"
-    "sha256:a1321512d6a287428c50dcdf2ab3857761127e03a23b1f648e9c1c0de59288f8"
+    "sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72"
 )
 _POSTGRES_DIGEST = (
     "postgres:15-alpine@"
@@ -42,18 +41,6 @@ _REDIS_DIGEST = (
     "redis:8-alpine@"
     "sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241"
 )
-_CPYTHON_SNAPSHOT = "07efb08123ba9367a7107325adb9d5626dca1ca9"
-_BACKPORT_HASHES = {
-    Path("security/cpython-backports/Lib/tarfile.py"): (
-        "3c8d585a77d7d376aea66e5e11a4d53c2605100d4c05a71b5385ed54bc526f51"
-    ),
-    Path("security/cpython-backports/Lib/html/parser.py"): (
-        "5c5ed245889135564e75dfed9a47aeb6b4d3e5a2e9614d918a986767e3747539"
-    ),
-    Path("security/cpython-backports/PSF-LICENSE.txt"): (
-        "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231"
-    ),
-}
 
 
 def _publish_job() -> str:
@@ -134,32 +121,25 @@ def test_apk_upgrade_is_the_only_unpinned_install():
             % (pat, _DOCKERFILE[max(0, m.start() - 15):m.start() + 25]))
 
 
-def test_cpython_security_backports_are_exact_and_verified_during_build():
-    readme = (_ROOT / "security" / "cpython-backports" / "README.md").read_text(
-        encoding="utf-8"
-    )
-    for relative_path, expected_hash in _BACKPORT_HASHES.items():
-        payload = (_ROOT / relative_path).read_bytes()
-        assert hashlib.sha256(payload).hexdigest() == expected_hash
-        assert expected_hash in _DOCKERFILE
-        assert expected_hash in readme
+def test_the_image_keeps_the_base_images_own_standard_library():
+    """The image runs the pinned base image's standard library as shipped. An earlier image copied
+    two files over it from a reviewed CPython snapshot, and the base later carried newer fixes in one
+    of them, so the copy would have taken that file back to an older version with no scanner
+    noticing. Nothing in the build may write into the standard library again without first checking
+    the base's own file, which this pin makes a reviewed change rather than a quiet one."""
+    instructions = [line.strip() for line in _DOCKERFILE.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+    assert not [line for line in instructions if "/usr/local/lib/python" in line]
+    assert not [line for line in instructions if re.match(r"COPY\s+security/", line)]
+    assert not (_ROOT / "security" / "cpython-backports").exists()
+    # The one COPY of the whole tree comes after the dependency install, and copies into /app only.
+    copies = [line for line in instructions if line.startswith("COPY ")]
+    assert copies == ["COPY requirements.lock .", "COPY . ."]
+    assert re.search(r"^WORKDIR /app$", _DOCKERFILE, re.MULTILINE)
 
-    assert _CPYTHON_SNAPSHOT in readme
-    assert "COPY security/cpython-backports /tmp/cpython-backports" in _DOCKERFILE
-    assert "cp Lib/tarfile.py /usr/local/lib/python3.14/tarfile.py" in _DOCKERFILE
-    assert (
-        "cp Lib/html/parser.py /usr/local/lib/python3.14/html/parser.py" in _DOCKERFILE
-    )
-    assert (
-        "cp PSF-LICENSE.txt /usr/share/licenses/cpython-backports/PSF-LICENSE.txt"
-    ) in _DOCKERFILE
-    for cve, upstream_commit in (
-        ("CVE-2026-11940", "79c06bd5c6afa3c440d50faf7ee1b147c8832b4c"),
-        ("CVE-2026-11972", "e86666c9dd256d52d0fbef6feb1ea4a51768fdec"),
-        ("CVE-2026-15308", _CPYTHON_SNAPSHOT),
-    ):
-        assert cve in readme
-        assert upstream_commit in readme
+    evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
+    assert "The image runs the base image's standard library unmodified." in evidence
+    assert "must check the base image's own file hash" in evidence
 
 
 def test_production_lock_is_fully_pinned_and_hashed():
@@ -355,8 +335,8 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     # The scanned image must wear the RELEASE reference, and each per-platform VEX must name the
     # same reference. A VEX statement applies only to a product it lists, so scanning under an
     # unrelated local name suppresses NOTHING: every reviewed exception goes unapplied and the
-    # release fails on the CPython findings the VEX exists to account for. That is not
-    # hypothetical — it is how the first multi-architecture release failed.
+    # release fails on the findings the VEX exists to account for. That is not hypothetical — it is
+    # how the first multi-architecture release failed.
     scan_ref = "${{ steps.publish_gate.outputs.image }}:${{ steps.publish_gate.outputs.tag }}"
     for platform in ("amd64", "arm64"):
         assert f"image: {scan_ref}-{platform}" in publish
@@ -404,7 +384,10 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert "::error::the published index does not advertise $platform" in publish
     assert "dockvault-${{ steps.publish_gate.outputs.tag }}-amd64.spdx.json" in publish
     assert "dockvault-${{ steps.publish_gate.outputs.tag }}-arm64.spdx.json" in publish
-    assert "dockvault-${{ steps.publish_gate.outputs.tag }}.openvex.json" in publish
+    # The release VEX is attached under the name its render step gave, and only when it wrote one
+    # (tests/test_release_workflow_contract.py runs that step).
+    assert '--output "dockvault-${TAG}.openvex.json"' in publish
+    assert "${{ steps.release_vex.outputs.asset }}" in publish
 
     for action, sha in (
         ("anchore/sbom-action", "e22c389904149dbc22b58101806040fa8d37a610"),
@@ -437,60 +420,24 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     vex = json.loads(
         (_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8")
     )
-    # The three CPython findings the vendored backport removes, plus the zlib gz-write finding
-    # DockVault never reaches. Any OTHER exception must be a deliberate, reviewed addition.
-    cpython_cves = {"CVE-2026-11940", "CVE-2026-11972", "CVE-2026-15308"}
-    zlib_cve = "CVE-2026-85091"
-    by_name = {s["vulnerability"]["name"]: s for s in vex["statements"]}
-    assert set(by_name) == cpython_cves | {zlib_cve}
-
-    for name in cpython_cves:
-        statement = by_name[name]
-        assert statement["status"] == "not_affected"
-        assert statement["justification"] == "vulnerable_code_not_present"
-        assert statement["products"] == [
-            {
-                "@id": (
-                    "pkg:oci/vault@__IMAGE_DIGEST__"
-                    "?repository_url=ghcr.io/dockvault/vault"
-                ),
-                "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}],
-            },
-            {
-                "@id": "__IMAGE_REFERENCE__",
-                "subcomponents": [{"@id": "pkg:generic/python@3.14.7"}],
-            },
-        ]
-        assert _CPYTHON_SNAPSHOT in statement["impact_statement"]
-        assert "__SOURCE_REVISION__" in statement["impact_statement"]
-
-    # The zlib finding (CVE-2026-85091) is a heap overflow reached only through gzprintf()/
-    # gzvprintf() after a stalled gzwrite(); nothing in the image imports the gz write API. Bound to
-    # the exact package version, so a fixed zlib ends the exception instead of inheriting it.
-    zlib = by_name[zlib_cve]
-    assert zlib["status"] == "not_affected"
-    assert zlib["justification"] == "vulnerable_code_not_in_execute_path"
-    zlib_subs = [{"@id": "pkg:apk/alpine/zlib@1.3.2-r0"}]
-    assert zlib["products"] == [
-        {
-            "@id": (
-                "pkg:oci/vault@__IMAGE_DIGEST__"
-                "?repository_url=ghcr.io/dockvault/vault"
-            ),
-            "subcomponents": zlib_subs,
-        },
-        {"@id": "__IMAGE_REFERENCE__", "subcomponents": zlib_subs},
-    ]
-    assert "__SOURCE_REVISION__" in zlib["impact_statement"]
-    assert "gzprintf" in zlib["impact_statement"]
+    # No reviewed exception: the scan applies the document and it suppresses nothing. The last
+    # statements were bound to package versions the image no longer contains, so they suppressed
+    # nothing either, and check_vex_sbom.py fails the image scan on such a pin. An exception is a
+    # deliberate, reviewed addition: its statement, its entry here and its paragraph in the evidence
+    # document, together.
+    assert vex["statements"] == []
+    assert vex["@id"].endswith("/__SOURCE_REVISION__")
 
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "There is no blanket `only-fixed` bypass" in evidence
     assert "fails for every unexcepted vulnerability" in evidence
-    assert _CPYTHON_SNAPSHOT in evidence
-    assert "vulnerable_code_not_present" in evidence
-    assert "vulnerable_code_not_in_execute_path" in evidence
-    assert "CVE-2026-85091" in evidence
+    assert "It holds no statements now." in evidence
+    flat = " ".join(evidence.split())
+    assert ("The GitHub Release publishes the rendered VEX beside the SBOMs only when the template "
+            "holds at least one statement.") in flat
+    assert "OpenVEX requires a document to hold at least one" in flat
+    assert "with an empty statement list" not in flat
+    assert "and\nthe renderer refuses one that does not" in evidence
     assert "exact registry manifest digest" in evidence
     # Publication copies the scanned index (no push digest is scraped), and every tag it writes,
     # the moving ones included, is checked against the scanned digest.
@@ -509,6 +456,113 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
         assert control in evidence
 
 
+def _template_with_a_statement(tmp_path, **statement_over) -> Path:
+    """A template shaped like the committed one, holding one statement as a reviewed exception is
+    written: the subcomponent under the digest product and under the image reference."""
+    subs = [{"@id": "pkg:generic/python@3.14.8"}]
+    statement = {
+        "vulnerability": {"name": "CVE-0000-0001"},
+        "products": [
+            {"@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+             "subcomponents": subs},
+            {"@id": "__IMAGE_REFERENCE__", "subcomponents": subs},
+        ],
+        "status": "not_affected",
+        "justification": "vulnerable_code_not_present",
+        "impact_statement": "Reviewed for source revision __SOURCE_REVISION__.",
+        "timestamp": "__GENERATED_AT__",
+    }
+    statement.update(statement_over)
+    document = json.loads((_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8"))
+    document["statements"] = [statement]
+    path = tmp_path / "template.openvex.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def test_the_committed_vex_renders_with_no_statements(tmp_path):
+    """No reviewed exception today: for a scan, the committed template renders to a document bound to
+    the source revision, with an empty statement list, which the scan applies and which suppresses
+    nothing."""
+    output = tmp_path / "scan.openvex.json"
+    revision = "b" * 40
+    document = _RENDERER.render(
+        _ROOT / "security" / "vex.openvex.json",
+        output,
+        image_digest=f"sha256:{'a' * 64}",
+        image_reference="ghcr.io/dockvault/vault:v0.33.4-amd64",
+        source_revision=revision,
+        generated_at="2026-10-16T00:00:00Z",
+    )
+    assert document["statements"] == []
+    assert document["@id"] == f"https://github.com/DockVault/vault/security/vex/{revision}"
+    assert document["timestamp"] == "2026-10-16T00:00:00Z"
+    assert "__" not in output.read_text(encoding="utf-8")
+
+
+def test_a_release_publishes_no_vex_without_a_statement(tmp_path):
+    """OpenVEX requires a document to hold at least one statement, so the committed template, which
+    holds none, renders no release asset: nothing is written, and a file already at the output path
+    is removed, so the release cannot attach an invalid or a stale document."""
+    kwargs = dict(image_digest=f"sha256:{'a' * 64}", image_reference="ghcr.io/dockvault/vault:v0.33.4",
+                  source_revision="b" * 40, generated_at="2026-10-16T00:00:00Z", publish=True)
+    output = tmp_path / "dockvault-v0.33.4.openvex.json"
+    document = _RENDERER.render(_ROOT / "security" / "vex.openvex.json", output, **kwargs)
+    assert document["statements"] == []
+    assert not output.exists()
+
+    output.write_text('{"statements": []}\n', encoding="utf-8")
+    _RENDERER.render(_ROOT / "security" / "vex.openvex.json", output, **kwargs)
+    assert not output.exists(), "a file left at the output path would be attached as the release VEX"
+
+
+def test_a_release_publishes_the_vex_when_it_holds_a_statement(tmp_path):
+    output = tmp_path / "dockvault-v0.33.4.openvex.json"
+    document = _RENDERER.render(
+        _template_with_a_statement(tmp_path),
+        output,
+        image_digest=f"sha256:{'a' * 64}",
+        image_reference="ghcr.io/dockvault/vault:v0.33.4",
+        source_revision="b" * 40,
+        publish=True,
+    )
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written == document
+    assert len(written["statements"]) == 1
+    assert written["statements"][0]["vulnerability"] == {"name": "CVE-0000-0001"}
+
+
+def test_vex_renderer_refuses_a_statement_that_does_not_bind_the_image_or_revision(tmp_path):
+    output = tmp_path / "release.openvex.json"
+    kwargs = dict(image_digest=f"sha256:{'a' * 64}",
+                  image_reference="ghcr.io/dockvault/vault:v0.8.0", source_revision="b" * 40)
+    only_digest = [{"@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+                    "subcomponents": [{"@id": "pkg:generic/python@3.14.8"}]}]
+    with pytest.raises(ValueError, match="bind the digest and versioned image"):
+        _RENDERER.render(_template_with_a_statement(tmp_path, products=only_digest), output, **kwargs)
+    with pytest.raises(ValueError, match="bind the reviewed source revision"):
+        _RENDERER.render(_template_with_a_statement(tmp_path, impact_statement="Reviewed."),
+                         output, **kwargs)
+    # A template that does not name its revision in its own @id is refused too.
+    bare = tmp_path / "bare.openvex.json"
+    bare.write_text(json.dumps({"@id": "x", "timestamp": "__GENERATED_AT__",
+                                "note": "__SOURCE_REVISION__", "statements": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="@id must name the reviewed source revision"):
+        _RENDERER.render(bare, output, **kwargs)
+    missing = tmp_path / "missing.openvex.json"
+    missing.write_text(json.dumps({"@id": "x/__SOURCE_REVISION__", "statements": []}),
+                       encoding="utf-8")
+    with pytest.raises(ValueError, match="missing required token __GENERATED_AT__"):
+        _RENDERER.render(missing, output, **kwargs)
+    # An empty list is allowed; no list at all is a broken template.
+    listless = tmp_path / "listless.openvex.json"
+    listless.write_text(json.dumps({"@id": "x/__SOURCE_REVISION__",
+                                    "timestamp": "__GENERATED_AT__"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain a statements list"):
+        _RENDERER.render(listless, output, **kwargs)
+    assert not output.exists(), "a refused template must leave no rendered document behind"
+
+
 def test_vex_renderer_binds_digest_version_and_revision(tmp_path):
     output = tmp_path / "release.openvex.json"
     digest = f"sha256:{'a' * 64}"
@@ -516,7 +570,7 @@ def test_vex_renderer_binds_digest_version_and_revision(tmp_path):
     image_reference = "ghcr.io/dockvault/vault:v0.8.0"
 
     document = _RENDERER.render(
-        _ROOT / "security" / "vex.openvex.json",
+        _template_with_a_statement(tmp_path),
         output,
         image_digest=digest,
         image_reference=image_reference,
@@ -531,6 +585,7 @@ def test_vex_renderer_binds_digest_version_and_revision(tmp_path):
         f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault",
         image_reference,
     }
+    assert len(document["statements"]) == 1
     for statement in document["statements"]:
         assert {
             product["@id"] for product in statement["products"]
@@ -556,15 +611,17 @@ def test_vex_names_the_per_platform_image_the_release_actually_scans(tmp_path):
     digest = f"sha256:{'a' * 64}"
     revision = "b" * 40
 
+    template = _template_with_a_statement(tmp_path)
     for platform in ("amd64", "arm64"):
         reference = f"ghcr.io/dockvault/vault:v0.10.0-{platform}"
         document = _RENDERER.render(
-            _ROOT / "security" / "vex.openvex.json",
+            template,
             output,
             image_digest=digest,
             image_reference=reference,
             source_revision=revision,
         )
+        assert len(document["statements"]) == 1
         for statement in document["statements"]:
             assert reference in {product["@id"] for product in statement["products"]}
 

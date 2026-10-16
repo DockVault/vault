@@ -1,4 +1,4 @@
-FROM python:3.14-alpine@sha256:a1321512d6a287428c50dcdf2ab3857761127e03a23b1f648e9c1c0de59288f8
+FROM python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72
 
 # Patch base-OS packages against the alpine security repository. The pinned base image is rebuilt
 # less often than the repo publishes fixes, so it can still carry an openssl (libcrypto3/libssl3)
@@ -23,23 +23,11 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock \
     && pip check \
     && python -m pip uninstall --yes pip
 
-# Three reviewed 3.14-branch security fixes reached the base image in 3.14.7, so the two files
-# copied below are now byte-identical to the ones they replace -- verified against the pinned
-# digest, not assumed. The copy is kept rather than deleted because it is what makes the property
-# independent of the base: if a future base moves backwards, or a digest bump lands before the fix
-# it was assumed to carry, this still pins the reviewed bytes and the build fails loudly on a hash
-# mismatch instead of shipping quietly. Retiring it, and the VEX statements below, is a separate
-# decision that wants a release scan against 3.14.7 as evidence.
-COPY security/cpython-backports /tmp/cpython-backports
-RUN cd /tmp/cpython-backports \
-    && echo "3c8d585a77d7d376aea66e5e11a4d53c2605100d4c05a71b5385ed54bc526f51  Lib/tarfile.py" | sha256sum -c - \
-    && echo "5c5ed245889135564e75dfed9a47aeb6b4d3e5a2e9614d918a986767e3747539  Lib/html/parser.py" | sha256sum -c - \
-    && echo "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231  PSF-LICENSE.txt" | sha256sum -c - \
-    && cp Lib/tarfile.py /usr/local/lib/python3.14/tarfile.py \
-    && cp Lib/html/parser.py /usr/local/lib/python3.14/html/parser.py \
-    && mkdir -p /usr/share/licenses/cpython-backports \
-    && cp PSF-LICENSE.txt /usr/share/licenses/cpython-backports/PSF-LICENSE.txt \
-    && rm -rf /tmp/cpython-backports
+# The standard library is the base image's own, unmodified. Earlier images copied two files over it
+# from a reviewed CPython snapshot; once the base carried those fixes and newer ones, the copy could
+# only take a file back to an older version, so it was retired. A future patch to the standard
+# library must first check the base image's own file hash, so that a base which has moved on fails
+# the build instead of being quietly undone.
 
 # Copy application code
 COPY . .
