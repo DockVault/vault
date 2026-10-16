@@ -28,6 +28,11 @@ _TOKENS = {
     "__SOURCE_REVISION__",
     "__GENERATED_AT__",
 }
+# The tokens the document itself carries: its @id names the reviewed source revision and its
+# timestamp the render. The image tokens belong to the statements, so a template with no statements
+# (no reviewed exception at all) has none of them; every statement it does hold must bind both, which
+# the checks below enforce statement by statement.
+_DOCUMENT_TOKENS = ("__SOURCE_REVISION__", "__GENERATED_AT__")
 
 
 def render(
@@ -56,22 +61,29 @@ def render(
         "__SOURCE_REVISION__": source_revision,
         "__GENERATED_AT__": timestamp,
     }
-    for token, value in replacements.items():
+    for token in _DOCUMENT_TOKENS:
         if token not in source:
             raise ValueError(f"template is missing required token {token}")
+    for token, value in replacements.items():
         source = source.replace(token, value)
     if any(token in source for token in _TOKENS):
         raise ValueError("rendered VEX still contains an unresolved token")
 
     document = json.loads(source)
+    if not str(document.get("@id", "")).endswith(source_revision):
+        raise ValueError("the VEX document @id must name the reviewed source revision")
     expected_products = {
         f"pkg:oci/vault@{image_digest}?repository_url=ghcr.io/dockvault/vault",
         image_reference,
     }
     statements = document.get("statements")
-    if not isinstance(statements, list) or not statements:
-        raise ValueError("rendered VEX must contain statements")
+    if not isinstance(statements, list):
+        raise ValueError("rendered VEX must contain a statements list")
+    # An empty list is a release with no reviewed exception: the scan applies the document and it
+    # suppresses nothing, so every High or Critical finding still fails the scan.
     for statement in statements:
+        if not isinstance(statement, dict):
+            raise ValueError("every VEX statement must be an object")
         products = {product["@id"] for product in statement.get("products", [])}
         if products != expected_products:
             raise ValueError(

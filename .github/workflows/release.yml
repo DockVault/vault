@@ -238,7 +238,7 @@ jobs:
           set -euo pipefail
           # Each document must NAME the image it will be applied to. A VEX statement applies only
           # to a product it lists, so a mismatch here is silent: nothing is suppressed, and the
-          # scan fails on the reviewed CPython findings as though they were new.
+          # scan fails on the reviewed findings as though they were new.
           for platform in amd64 arm64; do
             local_digest="$(docker image inspect --format '{{.Id}}' "${IMAGE}:${TAG}-${platform}")"
             python3 .github/scripts/render_release_vex.py \

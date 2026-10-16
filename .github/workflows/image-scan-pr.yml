@@ -105,10 +105,11 @@ jobs:
             --vex security/vex.openvex.json \
             --sbom scan-amd64.spdx.json
 
-      # The reviewed OpenVEX marks the accepted CPython findings not_affected. Without it the scan
-      # would fail on findings the release has already reviewed, so the PR gate reuses the exact
-      # same document the release renders -- bound to this locally built image's config digest and
-      # the commit under test. It is a denylist of accepted CVEs only; it cannot mask a new one.
+      # The reviewed OpenVEX marks accepted findings not_affected (it may hold none, and then it
+      # suppresses nothing). Without it the scan would fail on findings the release has already
+      # reviewed, so the PR gate reuses the exact same document the release renders -- bound to this
+      # locally built image's config digest and the commit under test. It is a denylist of accepted
+      # CVEs only; it cannot mask a new one.
       - name: Render the scan VEX
         env:
           SOURCE_REVISION: ${{ github.sha }}
