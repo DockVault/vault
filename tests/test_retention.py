@@ -481,15 +481,19 @@ def test_the_notification_window_waits_for_the_audit_chain_and_keeps_the_longer(
     assert wr.notification_days() == 60
 
 
-def test_the_notifications_job_deletes_nothing_while_the_chain_cannot_give_its_window(env, factory, monkeypatch):
+def test_the_notifications_job_deletes_nothing_while_the_chain_cannot_give_its_window(env, factory, monkeypatch,
+                                                                                     capsys):
     from app.core import audit_chain_policy_seals as ps
     db = factory()
     user = _user(db)
     row = _notification(db, user, OLD)
     _notification_days(env, 30)
     monkeypatch.setattr(ps, "numbers", lambda st=None: None)
+    capsys.readouterr()
     assert _pass(factory)["notifications"].deleted == 0
     assert _ids(factory, Notification) == {row}
+    # It says why, as the audit job does.
+    assert "The pruner's notifications job waits for the audit chain" in capsys.readouterr().out
 
 
 def test_the_working_record_jobs_go_on_under_the_hold(env, factory):

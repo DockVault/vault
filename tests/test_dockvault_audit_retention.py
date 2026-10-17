@@ -111,7 +111,16 @@ def test_retention_shows_what_the_server_has(tmp_path, monkeypatch, capsys):
                  "15 MB", "only .env changes it", "Fixed periods", "fixed",
                  "Waiting", "Keep audit rows for at most: 0 -> 30 from 2026-10-27T12:00:00Z, asked by ada"):
         assert text in out, text
+    # A switch's floor of off holds nothing, so nothing is said of it.
+    assert "at least off" not in out and "kept on by" not in out
     assert _env(tmp_path) == "EXISTING=1\n"
+
+
+def test_a_switch_held_on_by_env_says_so():
+    held = dict(SETTINGS[2], floor=True)
+    lines = dv.describe_retention({"settings": [held]})
+    assert any("from .env; set by RETENTION_HOLD; kept on by RETENTION_HOLD" in line for line in lines), lines
+    assert not any("at least" in line for line in lines)
 
 
 def test_a_failure_of_the_server_fails_the_command(tmp_path, monkeypatch):
