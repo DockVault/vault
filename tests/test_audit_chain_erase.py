@@ -701,17 +701,49 @@ def test_an_erased_row_changed_in_a_block_is_found(env, monkeypatch):
     assert "unjustified" in failures(env.verify())
 
 
-def test_an_hour_an_erase_changed_is_archived_and_pruned_like_any(env):
+def test_an_hour_an_erase_changed_is_archived_and_pruned_like_any(monkeypatch, tmp_path):
+    """The erase runs while the hour is still rows (archiving starts 14 days after the chain's first start); once
+    archiving starts the erased hour goes into a block like any other, verify reads its erased row back, and the
+    audit job deletes archived rows of that hour."""
     from app.core import audit_chain_prune
-    rows = [_put(env, at(3, 5)), _put(env, at(3, 15), username="alice")]
-    env.run_until_sealed()
+    env = EraseEnv(monkeypatch, tmp_path, audit_archive_start_after_days=14)
+    arc._marker_checked.clear()
+    arc._figures.clear()
+    try:
+        rows = [_put(env, at(3, 5)), _put(env, at(3, 15), username="alice")]
+        env.run_until_sealed()
+        asked = _due(env)
+        assert _blocks(env) == [] and _rows(env, id=rows[0])[0].username == asked["placeholder"]
+        env.passes(24 * 8)                          # archiving begins
+        assert len(_blocks(env)) == 1 and _rows(env, id=rows[0]) == []
+        assert _block_rows(env)[rows[0]]["username"] == asked["placeholder"]
+        assert failures(env.verify()) == []
+        p = retention.Pass(env.session, now=env.clock())
+        audit_chain_prune.prune(p, [AuditLog.username == "alice"], reason="retention",
+                                archived=lambda m: [m.username == "alice"], before=env.clock())
+        assert set(_block_rows(env)) == {rows[0]}
+        assert failures(env.verify()) == []
+    finally:
+        env.close()
+
+
+def test_a_block_whose_erased_row_is_not_what_its_erase_seal_says_is_found(env):
+    """Reading a block, an erased row must hold the placeholder and values whose commitment is the erase seal's
+    c_next: the roots alone cannot tell, since the row counts by its commitment before the erase."""
+    ids = _archived_day(env)
     asked = _due(env)
-    arc.archive_job(retention.Pass(env.session, now=env.clock()))
-    assert len(_blocks(env)) == 1 and _rows(env, id=rows[0]) == []
-    assert _block_rows(env)[rows[0]]["username"] == asked["placeholder"]
-    assert failures(env.verify()) == []
-    p = retention.Pass(env.session, now=env.clock())
-    audit_chain_prune.prune(p, [AuditLog.username == "alice"], reason="retention",
-                            archived=lambda m: [m.username == "alice"], before=env.clock())
-    assert set(_block_rows(env)) == {rows[0]}
-    assert failures(env.verify()) == []
+    with env.session() as db:
+        view = env.st.view
+        day, part = list(view.archived_parts())[0]
+        hours = arc.hours_between(part.first_hour, part.last_hour)
+        entries = {h: arc.erase_entries(db, view, h) for h in hours}
+        c_prev = {h: {rid: e[0] for rid, e in es.items()} for h, es in entries.items()}
+        right = {h: {rid: (e[1], e[2]) for rid, e in es.items()} for h, es in entries.items()}
+        assert ids["eve"][0] in right[at(3)]
+        arc.PartReader(db, view, day, part, c_prev=c_prev, erased=right).finish()
+        for bad in ((bytes(32), asked["placeholder"]), (right[at(3)][ids["eve"][0]][0], "erased-ffffffff")):
+            wrong = {h: dict(v) for h, v in right.items()}
+            wrong[at(3)][ids["eve"][0]] = bad
+            with pytest.raises(arc.NotVerified) as nv:
+                arc.PartReader(db, view, day, part, c_prev=c_prev, erased=wrong).finish()
+            assert nv.value.kind == "unjustified"

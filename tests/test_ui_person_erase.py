@@ -108,9 +108,13 @@ def test_an_erase_asked_for_is_listed_by_its_placeholder_and_any_administrator_c
     assert name not in page.locator("#erase-list").inner_text()
     stored = page.evaluate("() => JSON.stringify(Object.assign({}, localStorage, sessionStorage))")
     assert name not in stored
+    # Another name previewed and not asked for: the list, drawn again by the cancel, never shows it either.
+    other = "ui-erase-" + uuid.uuid4().hex[:8]
+    _preview(page, other)
     waiting.locator(".erase-cancel").click()
     expect(page.locator(f'#erase-list .erase-request[data-status="cancelled"]:has-text("{placeholder}")')).to_be_visible(
         timeout=15000)
+    assert other not in page.locator("#erase-list").inner_text()
 
 
 def test_an_accounts_name_is_previewed_as_refused_and_cannot_be_asked_for(page: Page, admin_creds):
