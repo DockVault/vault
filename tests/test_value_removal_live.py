@@ -121,6 +121,17 @@ st = ai.ChainState(clock=lambda: clock[0])
 ai.set_state(st)
 DAY = (now - timedelta(days=100)).date()
 MODE = os.environ.get("SCENARIO")
+from app.services import audit_logger as _logger
+
+
+class _AtTheClock(datetime):
+    """The audit rows the app writes itself are dated by the scenario's clock."""
+    @classmethod
+    def now(cls, tz=None):
+        return clock[0].replace(tzinfo=tz) if tz is not None else clock[0]
+
+
+_logger.datetime = _AtTheClock
 
 
 def add_row(t, details=None, ip="203.0.113.5"):
@@ -168,7 +179,7 @@ with SessionLocal() as db:
 if MODE == "removal":
     with engine.begin() as c:
         c.execute(text("INSERT INTO audit_privacy_policies (version, names, signin_names, emails, ip, user_agent, "
-                       "reason, created_at, created_by_name) SELECT max(version) + 1, 'none', 'full', 'none', "
+                       "reason, created_at, created_by_name) SELECT coalesce(max(version), 1) + 1, 'none', 'full', 'none', "
                        "'shortened', 'none', 'admin', :t, 'test' FROM audit_privacy_policies"), {"t": clock[0]})
     with SessionLocal() as db:
         admin = User(id=uuid.uuid4(), username="ada-" + uuid.uuid4().hex[:8], email=None, password_hash="x",

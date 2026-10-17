@@ -101,7 +101,8 @@ def test_a_removal_is_previewed_confirmed_asked_for_with_the_password_and_cancel
     finally:
         admin.post(f"/settings/value-removals/{request_id}/cancel")     # never left waiting on the stack
     assert psql(f"SELECT status FROM audit_value_removals WHERE id = '{request_id}'") == "cancelled"
-    assert errors == []
+    # The one console line: the browser's own for the 403 that asks for the password (the step-up).
+    assert [e for e in errors if "status of 403" not in e] == [], errors
 
 
 def test_the_card_fits_a_phone(page: Page, admin_creds):

@@ -227,3 +227,70 @@ def test_the_setting_is_a_chain_setting_kept_in_step_with_env_example_the_host_t
     import dockvault
     assert ("audit_ip_full_days", "AUDIT_IP_FULL_DAYS", "0") in dockvault.RETENTION_ENV_KEYS
     assert "`AUDIT_IP_FULL_DAYS`" in (ROOT / "docs" / "data-inventory.md").read_text(encoding="utf-8")
+
+
+def test_an_archived_day_the_days_reach_into_is_shortened_only_before_them(monkeypatch, tmp_path):
+    env = _env(monkeypatch, tmp_path, 100)
+    try:
+        cut = ai.hour_floor(T0 - timedelta(days=100))
+        early, late = env.put(cut - timedelta(hours=3)), env.put(cut + timedelta(hours=3))
+        env.run_until_sealed()
+        arc.archive_job(retention.Pass(env.session, now=env.clock()))
+        with env.session() as db:
+            assert db.query(AuditLog).filter(AuditLog.id.in_([early, late])).count() == 0
+        rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+        with env.session() as db:
+            block = db.query(AuditArchiveBlock).one()
+            part = env.st.view.archives[block.day].parts[0]
+            rows = {r["id"]: r for r in arc.PartReader(db, env.st.view, block.day, part).rows()}
+        assert rows[early]["ip_address"] is None and rows[late]["ip_address"] == "203.0.113.9"
+        assert failures(env.verify()) == []
+    finally:
+        env.close()
+
+
+def test_a_transaction_stops_at_the_batch_and_the_rest_follows(env30):
+    env = env30
+    first = env.put(T0 - timedelta(days=40, hours=2))
+    second = env.put(T0 - timedelta(days=40, hours=1))
+    env.run_until_sealed()
+    p = retention.Pass(env.session, now=env.clock(), batch_rows=1)
+    rw.shorten_job(p)
+    seals = env.rewrite_seals()
+    assert [len(s.detail["hours"]) for s in seals] == [1, 1]
+    assert _shortened(env.get(first)) and _shortened(env.get(second))
+    assert failures(env.verify()) == []
+
+
+def test_an_hour_the_prefilter_takes_but_with_nothing_to_shorten_is_passed_over(env30):
+    env = env30
+    nothing = env.put(T0 - timedelta(days=41), ip_address=None, details={"client_ip": None})
+    real = env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    nonce = bytes(env.get(nothing).seal_nonce)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(real)) and bytes(env.get(nothing).seal_nonce) == nonce
+    assert [len(s.detail["hours"]) for s in env.rewrite_seals()] == [1]
+
+
+def test_a_rewrite_that_would_change_more_than_the_values_writes_nothing(env30, monkeypatch):
+    env = env30
+    row = env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    before = len(env.seals())
+    real = rw._write_row
+
+    def also_the_action(db, row_id, new, nonce):
+        real(db, row_id, new, nonce)
+        db.query(AuditLog).filter(AuditLog.id == row_id).update({AuditLog.action: "file_deleted"},
+                                                                synchronize_session=False)
+    monkeypatch.setattr(rw, "_write_row", also_the_action)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(row).ip_address == "203.0.113.9" and env.get(row).action == "file_uploaded"
+    assert len(env.seals()) == before
+    assert "rows-altered" in ((env.st.head_store().load() or {}).get("failures") or {})
+    monkeypatch.setattr(rw, "_write_row", lambda db, row_id, new, nonce: None)
+    rw._cursors.clear()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(row).ip_address == "203.0.113.9" and len(env.seals()) == before
+    assert "unjustified" in ((env.st.head_store().load() or {}).get("failures") or {})

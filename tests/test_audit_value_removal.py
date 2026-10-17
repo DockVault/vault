@@ -316,3 +316,45 @@ def test_a_forged_removal_rewrite_is_found_by_verify(env):
                                     "request_seq": seq, "hours": [], "through": fmt.hour_text(before - timedelta(hours=1)),
                                     "final": True})
     assert failures(env.verify()) != []
+
+
+def test_a_removal_over_archived_days_and_rows_reaches_both(env):
+    archived = env.put(_at(3, 5))
+    hot = env.put(T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    asked = env.ask_removal()
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(hot).ip_address is None
+    with env.session() as db:
+        block = db.query(AuditArchiveBlock).one()
+        part = env.st.view.archives[block.day].parts[0]
+        rows = {r["id"]: r for r in arc.PartReader(db, env.st.view, block.day, part).rows()}
+    assert rows[archived]["ip_address"] is None
+    assert env.removal_row(asked["id"]).counts == {"rows": 1, "archived_rows": 1}
+    assert failures(env.verify()) == []
+
+
+def test_the_job_itself_rewrites_nothing_while_the_chain_holds(env, monkeypatch):
+    from app.core import audit_chain_policy_seals as ps
+    ids = _hot(env)
+    asked = env.ask_removal()
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    numbers = ps.numbers
+    monkeypatch.setattr(ps, "numbers", lambda st=None: dict(numbers(st), logs_hold=True))
+    env.removal_job()                 # run directly: a pass skips a held job before it starts
+    assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    assert env.removal_row(asked["id"]).waiting == "It waits while the hold switch is on."
+
+
+def test_a_removal_request_not_well_formed_is_found_by_verify(env):
+    _hot(env)
+    with ai.ChainWriter(env.engine, env.st) as w:
+        w.append("request", detail=lambda seq, sealed_at: {
+            "what": "removal", "request": str(uuid.uuid4()), "setting": None, "old": None,
+            "new": {"levels": {k: ap.FULL for k in ap.POLICY_KEYS}, "before": fmt.hour_text(ai.hour_floor(sealed_at))},
+            "subject": None, "placeholder": None, "not_before": fmt.time_text(sealed_at + timedelta(days=7)),
+            "audit_row": None, "by": "admin", "user_id": None})
+    assert failures(env.verify()) != []
