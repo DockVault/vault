@@ -251,20 +251,13 @@ def _root(db, view, hour: datetime):
 
 def erase_entries(db, view, hour: datetime) -> Dict:
     """For each row an erase seal after ``hour``'s root seal changed: (its commitment before, its commitment after,
-    the placeholder the erase wrote), each seal read again and its link checked. Raises NotVerified (link-broken)."""
+    the placeholder the erase wrote), each seal read again and its link checked (audit_integrity.erase_entries).
+    Raises NotVerified (link-broken)."""
     ai = _ai()
-    own = view.own_entry(hour)
-    if own is None or not own.erases:
-        return {}
-    out: Dict = {}
     try:
-        for seq in own.erases:
-            d = ai.read_authenticated(db, view, seq).detail or {}
-            for rid, c_prev, c_next in d.get("rows") or []:
-                out.setdefault(fmt.as_uuid(rid), (bytes.fromhex(c_prev), bytes.fromhex(c_next), d.get("placeholder")))
+        return ai.erase_entries(db, view, view.own_entry(hour))
     except ai.ChainStopped as stop:
         raise NotVerified("link-broken", str(stop), fmt.hour_text(hour)) from None
-    return out
 
 
 def _c_prev(db, view, hour: datetime) -> Dict:
@@ -430,8 +423,7 @@ class PartReader:
                     builder = ai.FiguresBuilder(self.salts.get(hour), self.c_prev.get(hour) or None)
                 builder.add(row)
                 erased = (self.erased.get(hour) or {}).get(row["id"])
-                if erased is not None and (row.get("username") != erased[1]
-                                           or fmt.commitment(fmt.ZERO_NONCE, row) != erased[0]):
+                if erased is not None and not ai.erased_as_sealed(row, erased[0], erased[1]):
                     raise NotVerified("unjustified", f"erased row {row['id']} is not what its erase seal says",
                                       fmt.hour_text(hour))
                 yield row

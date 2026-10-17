@@ -6,7 +6,8 @@ that is exactly a time cutoff over the sealed rows, checked against every sealed
 
 - the cutoff hour is the hour of the earliest sealed row kept; every sealed hour before it lost all its rows,
   in the cutoff hour the missing rows are exactly the first ones of its (timestamp, id) list, and no hour after
-  it lost a row, nor holds a row its seal does not, nor changed (every hour checks out against its seal);
+  it lost a row, nor holds a row its seal does not, nor changed (every hour checks out against its seal); in
+  every hour, the cutoff hour too, each row an erase changed is what its erase seal says;
 - every archive block matches its archive seal and verifies intact: a release without the chain deletes from
   audit_logs only, so a genuine rollback prune leaves the blocks whole, and the prefix rule above is over the
   hours not archived;
@@ -39,7 +40,10 @@ def _ai():
 
 
 def _hour_state(db, view, hour: datetime) -> dict:
-    """An hour's sealed list against its rows now: {sealed, present, missing, added, fig, root, wr, salt}."""
+    """An hour's sealed list against its rows now: {sealed, present, missing, added, check, fig, root, wr, salt}.
+    ``check``: the figures to compare with the hour's root seal (an erased row by its commitment before the erase);
+    ``fig``: the rows as they are, which a new root seal is over. Refused when an erased row is not what its erase
+    seal says: no removal is sealed over an edit of one (audit_integrity.check_hour_rows)."""
     ai = _ai()
     root = ai.hour_root(db, view, hour)
     wr = ai.working_row(db, hour)
@@ -48,11 +52,15 @@ def _hour_state(db, view, hour: datetime) -> dict:
         raise Refused(f"the list of rows sealed for {fmt.hour_text(hour)} no longer matches its seal")
     sealed = [sealed_blob[i:i + 16] for i in range(0, len(sealed_blob), 16)]
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
-    fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt)
+    check = ai.check_hour_rows(db, view, hour, salt)
+    if check.altered:
+        raise Refused(f"an erased row of {fmt.hour_text(hour)} is not what its erase seal says: run audit verify")
+    fig = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt) if check.c_prev else check.fig
     present = [fig.ids[i:i + 16] for i in range(0, len(fig.ids), 16)]
     present_set, sealed_set = set(present), set(sealed)
     return {"sealed": sealed, "present": present, "missing": [i for i in sealed if i not in present_set],
-            "added": [i for i in present if i not in sealed_set], "fig": fig, "root": root, "wr": wr, "salt": salt}
+            "added": [i for i in present if i not in sealed_set], "check": check, "fig": fig, "root": root,
+            "wr": wr, "salt": salt}
 
 
 def latest_stop_end(view) -> Optional[datetime]:
@@ -98,9 +106,7 @@ def removal_plan(db, view, record: Optional[dict], before: datetime, retention_d
             raise Refused(f"in the cutoff hour {fmt.hour_text(h)} the rows missing are not its first ones: not a "
                           "time cutoff")
         if not s["missing"]:
-            fig, root = s["fig"], s["root"]
-            if (fig.count, fig.root_s, fig.root_c, fig.ids_digest) != (root.count, root.root_s, root.root_c,
-                                                                      root.ids_digest):
+            if not s["check"].gives(s["root"]):
                 raise Refused(f"{fmt.hour_text(h)} does not check out against its seal: run audit verify")
         elif h == cutoff:
             kept_rows = [r for r in ai.iter_rows(db, h, h + ai.HOUR)]

@@ -945,7 +945,7 @@ def check_hour(db, view, entry, hour: datetime, report: Report) -> None:
         row = next((r for r in ai.iter_rows(db, hour, hour + ai.HOUR) if r["id"] == rid), None)
         if row is None:
             continue
-        if row.get("username") != placeholder or fmt.commitment(fmt.ZERO_NONCE, row) != c_next:
+        if not ai.erased_as_sealed(row, c_next, placeholder):
             report.add(FAILURE, "unjustified", f"erased row {rid} is not what its erase seal says", hour=label)
     if fig.missing_nonce:
         report.add(FAILURE, "nonce-missing", f"{len(fig.missing_nonce)} rows in {label} have no nonce and the hour "

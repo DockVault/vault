@@ -4,8 +4,9 @@ The pruner deletes audit rows one sealed hour at a time, and at most one UTC day
 transaction, under the chain lock:
 
 1. verifies each hour first: its rows (with the nonces its salt gives, and an erase's earlier commitments)
-   must give the roots of the hour's newest root seal in the verified view; an hour that does not is left
-   as it is, and the failure is reported, so a prune never seals over a tamper or destroys its evidence;
+   must give the roots of the hour's newest root seal in the verified view, and each row an erase changed must
+   still hold what its erase seal says (audit_integrity.check_hour_rows); an hour that does not is left as it
+   is, and the failure is reported, so a prune never seals over a tamper or destroys its evidence;
 2. writes the derived nonces of rows written without one into their rows and deletes the hour's salt, which
    changes no leaf;
 3. deletes the rows and writes the ``prune`` seal with each changed hour's new count, bytes, roots and ids,
@@ -48,7 +49,12 @@ def _hours_matching(db, conditions, before: datetime, limit: int) -> List[dateti
 
 
 class HourNotVerified(Exception):
-    pass
+    """An hour whose rows do not check out: ``kind`` is the finding (rows-altered, or unjustified for an erased row
+    that is not what its erase seal says)."""
+
+    def __init__(self, message: str, kind: str = "rows-altered"):
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass
@@ -63,22 +69,21 @@ class Selection:
 
 def _verify_hour(w, hour: datetime):
     """(the hour's root entry, its working row, its salt, the erase commitments) once its rows check out, read
-    streamed."""
+    streamed: they give the root, and each erased row is what its erase seal says."""
     ai = _ai()
     view = w.st.view
-    own = view.own_entry(hour)
     try:
         root = ai.hour_root(w.db, view, hour)
     except ai.ChainStopped:
         raise HourNotVerified(fmt.hour_text(hour))
     wr = ai.working_row(w.db, hour)
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
-    c_prev = ai.erase_c_prev(w.db, view, own) if own is not None and own.erases else {}
-    fig = ai.hour_figures(ai.iter_rows(w.db, hour, hour + ai.HOUR), salt, c_prev)
-    if (fig.count, fig.root_s, fig.root_c, fig.ids_digest) != (root.count, root.root_s, root.root_c,
-                                                               root.ids_digest) or fig.missing_nonce:
+    check = ai.check_hour_rows(w.db, view, hour, salt)
+    if check.altered:
+        raise HourNotVerified(fmt.hour_text(hour), "unjustified")
+    if not check.gives(root) or check.fig.missing_nonce:
         raise HourNotVerified(fmt.hour_text(hour))
-    return root, wr, salt, c_prev
+    return root, wr, salt, check.c_prev
 
 
 def _materialise(w, hour: datetime, salt: Optional[bytes], wr) -> None:
@@ -153,10 +158,14 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None,
                     continue
                 try:
                     root, wr, salt, c_prev = _verify_hour(w, hour)
-                except HourNotVerified:
+                except HourNotVerified as nv:
                     skipped.add(hour)
-                    failures["rows-altered"] = f"the rows of {fmt.hour_text(hour)} no longer give its seal; it was " \
-                                               "not pruned"
+                    if nv.kind == "rows-altered":
+                        failures[nv.kind] = (f"the rows of {fmt.hour_text(hour)} no longer give its seal; it was "
+                                             "not pruned")
+                    else:
+                        failures[nv.kind] = (f"an erased row of {fmt.hour_text(hour)} is not what its erase seal says; "
+                                             "the hour was not pruned")
                     continue
                 found = w.db.query(A.id, A.timestamp).filter(
                     *conditions, A.timestamp >= hour, A.timestamp < hour + ai.HOUR).all()

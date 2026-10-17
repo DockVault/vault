@@ -325,7 +325,8 @@ def marker(view, acked: set, findings: List[list], any_failures: bool, now: date
 
 def late_rows_plan(db, view, record: Optional[dict], hour: datetime) -> dict:
     """The read phase of ``acknowledge --late-rows``: the rows added to ``hour`` that its seal does not hold,
-    once the rest still give the hour's root seal, and the figures a late seal would record."""
+    once the rest still give the hour's root seal and each erased row is what its erase seal says, and the
+    figures a late seal would record."""
     ai = _ai()
     import secrets
     if view.entry_for(hour) is None:
@@ -345,11 +346,11 @@ def late_rows_plan(db, view, record: Optional[dict], hour: datetime) -> dict:
     if not added:
         raise Refused(f"{fmt.hour_text(hour)} has no row its seal does not hold")
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
-    entry = view.own_entry(hour)
-    c_prev = ai.erase_c_prev(db, view, entry) if entry is not None and entry.erases else {}
-    before = ai.hour_figures(ai.iter_rows(db, hour, hour + ai.HOUR), salt, c_prev, exclude=set(added))
-    if (before.count, before.root_s, before.root_c, before.ids_digest) != (root.count, root.root_s, root.root_c,
-                                                                          root.ids_digest):
+    check = ai.check_hour_rows(db, view, hour, salt, exclude=set(added))
+    if check.altered:
+        raise Refused(f"an erased row of {fmt.hour_text(hour)} is not what its erase seal says: this is not a late "
+                      "arrival, and it is not sealed over (run audit verify)")
+    if not check.gives(root):
         raise Refused(f"the rows {fmt.hour_text(hour)}'s seal holds changed too: this is not a late arrival, and it "
                       "is not sealed over")
     added_set = set(added)

@@ -1326,14 +1326,60 @@ def working_row(db, hour: datetime):
             .order_by(S.seq).first())
 
 
-def erase_c_prev(db, view: View, entry: HourEntry) -> Dict:
-    """For each row an erase changed after the hour's root seal: its commitment before (``c_prev``)."""
+def erase_entries(db, view: View, entry: Optional[HourEntry]) -> Dict:
+    """For each row an erase seal after the hour's root seal changed: (its commitment before the erase, its
+    commitment after, the placeholder the erase wrote), each seal read again and used only when its link is the
+    view's (read_authenticated). {} when there is none. Raises ChainStopped (link-broken)."""
     out: Dict = {}
+    if entry is None or not entry.erases:
+        return out
     for seq in entry.erases:
-        seal = read_authenticated(db, view, seq)
-        for rid, c_prev, _c_next in (seal.detail or {}).get("rows") or []:
-            out.setdefault(fmt.as_uuid(rid), bytes.fromhex(c_prev))
+        d = read_authenticated(db, view, seq).detail or {}
+        for rid, c_prev, c_next in d.get("rows") or []:
+            out.setdefault(fmt.as_uuid(rid), (bytes.fromhex(c_prev), bytes.fromhex(c_next), d.get("placeholder")))
     return out
+
+
+def erased_as_sealed(row: dict, c_next: bytes, placeholder) -> bool:
+    """Whether an erased row holds what its erase seal says the erase wrote: the placeholder, and values whose
+    commitment under a zero nonce is the seal's ``c_next``. The hour's roots cannot tell: the row counts in them by
+    its commitment before the erase."""
+    return row.get("username") == placeholder and fmt.commitment(fmt.ZERO_NONCE, row) == c_next
+
+
+@dataclass
+class HourCheck:
+    """An hour's rows as its newest root seal holds them (check_hour_rows)."""
+    fig: HourFigures        # the rows, each erased one by its commitment before the erase
+    c_prev: Dict            # {row id: commitment before} of the rows an erase after the root seal changed
+    altered: List           # the ids of erased rows that no longer hold what their erase seal says
+
+    def gives(self, root) -> bool:
+        """Whether the rows give ``root``'s figures, and every erased row is what its erase seal says."""
+        return not self.altered and (self.fig.count, self.fig.root_s, self.fig.root_c, self.fig.ids_digest) == (
+            root.count, root.root_s, root.root_c, root.ids_digest)
+
+
+def check_hour_rows(db, view: View, hour: datetime, salt: Optional[bytes],
+                    exclude: Optional[set] = None) -> HourCheck:
+    """``hour``'s rows checked as its newest root seal holds them: their figures (a row an erase seal after it
+    changed counts by its commitment before the erase; ``exclude`` left out), and each such row still present
+    compared with what its erase seal says it wrote. Every path that checks an hour before it re-roots it (the
+    pruner and an erase, a late seal, the host's late rows and removal acknowledgment) asks this, as audit verify
+    does: the roots alone would take an edit of an erased row for the erase, and the new roots would seal it over.
+    Streamed. Raises ChainStopped (an erase seal changed after the view accepted it)."""
+    erased = erase_entries(db, view, view.own_entry(hour))
+    altered: List = []
+
+    def rows():
+        for r in iter_rows(db, hour, hour + HOUR):
+            e = erased.get(r["id"])
+            if e is not None and not erased_as_sealed(r, e[1], e[2]):
+                altered.append(r["id"])
+            yield r
+    c_prev = {rid: e[0] for rid, e in erased.items()}
+    fig = hour_figures(rows(), salt, c_prev, exclude)
+    return HourCheck(fig, c_prev, altered)
 
 
 # --------------------------------------------------------------------------- when an hour may be sealed
@@ -1476,7 +1522,6 @@ def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) 
     unchanged. None when nothing arrived or something else changed (the verifier reports that)."""
     from app.core.models import AuditLog as A
     db, view = w.db, w.st.view
-    own = view.own_entry(hour)
     count = int(db.query(func.count()).select_from(A).filter(A.timestamp >= hour, A.timestamp < hour + HOUR).scalar() or 0)
     if count <= view.entry_for(hour).root.count:
         return None
@@ -1492,10 +1537,9 @@ def check_late(w: ChainWriter, entry: HourEntry, hour: datetime, now: datetime) 
             added.append(r["id"])
             nonceless = nonceless or r["seal_nonce"] is None
     salt = bytes(wr.legacy_salt) if wr is not None and wr.legacy_salt is not None else None
-    c_prev = erase_c_prev(db, view, own) if own is not None and own.erases else {}
-    before = hour_figures(iter_rows(db, hour, hour + HOUR), salt, c_prev, exclude=set(added))
-    if (before.count, before.root_s, before.root_c, before.ids_digest) != (root.count, root.root_s, root.root_c,
-                                                                          root.ids_digest):
+    # The rows already sealed must still give the root, and each erased row hold what its erase seal says: the
+    # late seal's roots are over the rows as they are, and would seal over an edit of an erased one.
+    if not check_hour_rows(db, view, hour, salt, exclude=set(added)).gives(root):
         return None
     new_salt = secrets.token_bytes(32) if salt is None and nonceless else None
     use_salt = salt or new_salt

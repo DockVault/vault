@@ -304,7 +304,10 @@ def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: i
                         "operator")
     try:
         root, wr, salt, c_prev_old = prune_mod._verify_hour(w, hour)
-    except prune_mod.HourNotVerified:
+    except prune_mod.HourNotVerified as nv:
+        if nv.kind != "rows-altered":
+            raise NotErased(f"an erased row of {fmt.hour_text(hour)} is not what its erase seal says; nothing in it "
+                            "was erased", nv.kind) from None
         raise NotErased(f"the rows of {fmt.hour_text(hour)} no longer give its seal; nothing in it was erased",
                         "rows-altered") from None
     rows = [r for r in ai.iter_rows(db, hour, hour + HOUR) if pe.row_matches(r, name, fp)]
