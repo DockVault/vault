@@ -50,7 +50,7 @@ registry.register(registry.SettingSpec(
 registry.register(registry.SettingSpec(
     level=registry.ADVANCED, since="0.34.0",
     key=ALERT_RETENTION_KEY, kind="int", default=90, env="security_alert_retention_days", minimum=1,
-    maximum=3650, editable=registry.ENV_ONLY, group="retention", unit="days",
+    maximum=3650, editable=registry.ENV_ONLY, reduction=registry.LOWER, group="retention", unit="days",
     label="Keep resolved security alerts for"))
 
 

@@ -48,7 +48,7 @@ registry.register(registry.SettingSpec(
 registry.register(registry.SettingSpec(
     level=registry.ADVANCED, since="0.34.0",
     key=SINK_KEY, kind="int", default=15, env="log_pull_sink_max_mb", minimum=3, maximum=1000,
-    editable=registry.ENV_ONLY, group="retention", unit="MB",
+    editable=registry.ENV_ONLY, reduction=registry.LOWER, group="retention", unit="MB",
     label="Size of the log-access file",
     help="The copy of the server's output that Log access reads, in three files that rotate; the oldest lines "
          "go first. A log pull reads at most the newest 5 MB of it."))

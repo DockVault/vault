@@ -77,7 +77,7 @@ PROTECTED_MINIMUM_KEY = "erase_blocked_by_protected_minimum"
 registry.register(registry.SettingSpec(
     level=registry.ADVANCED, since="0.34.0",
     key=PROTECTED_MINIMUM_KEY, kind="bool", default=False, env="erase_blocked_by_protected_minimum",
-    editable=registry.ENV_ONLY, group="audit_retention",
+    editable=registry.ENV_ONLY, reduction=registry.LOWER, group="audit_retention",
     label="A per-person erase waits for the protected minimum",
     help="With it on, an erase waits while any audit row it would change is younger than the protected minimum for "
          "its kind, for deployments whose records must be kept intact that long."))

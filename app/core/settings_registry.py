@@ -3,7 +3,9 @@
 Each setting is described by a SettingSpec: its kind and bounds; whether an administrator may change it in
 the panel (``editable``); whether the deployment may lock it (``lockable``); a floor and a ceiling the
 deployment may set in .env; which direction of change deletes data sooner (``reduction``: the caller delays
-such a change rather than applying it at once); and its labels. The value in force is resolved in this order:
+such a change in the panel rather than applying it at once, and for a setting only .env sets, the host's
+``dockvault.py audit retention`` says so before it writes the line); and its labels. The value in force is
+resolved in this order:
 
 1. the deployment's value: the .env setting the spec names (``env``), else the spec's default;
 2. the administrator's value stored in ``managed_settings``, when the setting is editable in the panel, is
