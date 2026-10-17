@@ -201,19 +201,22 @@ def _retention(args) -> int:
         registry.refresh(SessionLocal)
         ai = _ai()
         try:
-            # Read under the chain lock, in one snapshot, as a host command's read phase does; nothing is written.
-            with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
-                out = retention_report.report(w.db, w.st, w.st.view, w.record or w.st.known_record(), w.st.clock(),
-                                              proposed)
-        except (ai.ChainStopped, ai.ChainBusy) as why:
-            # Sealing stopped, or the chain busy: the settings as the registry has them, and why.
-            db = SessionLocal()
             try:
-                out = retention_report.report(db, ai.ChainState(), ai.View(), None, None, proposed)
-            finally:
-                db.close()
-            out["chain_unreadable"] = f"{type(why).__name__}: {why}"
+                # Read under the chain lock, in one snapshot, as a host command's read phase does; nothing is
+                # written.
+                with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
+                    out = retention_report.report(w.db, w.st, w.st.view, w.record or w.st.known_record(),
+                                                  w.st.clock(), proposed)
+            except (ai.ChainStopped, ai.ChainBusy) as why:
+                # Sealing stopped, or the chain busy: the settings as the registry has them, and why.
+                db = SessionLocal()
+                try:
+                    out = retention_report.report(db, ai.ChainState(), ai.View(), None, None, proposed)
+                finally:
+                    db.close()
+                out["chain_unreadable"] = f"{type(why).__name__}: {why}"
         except retention_report.Refused as why:
+            # A value of the wrong kind, found with the chain read or without it.
             from app.core import audit_chain_host as host
             raise host.Refused(str(why))
         return out

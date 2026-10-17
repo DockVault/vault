@@ -220,9 +220,128 @@ def test_the_report_shows_the_chains_value_and_checks_against_the_databases(monk
     assert [(c["before"], c["after"]) for c in out["check"]["changes"]] == [(0, 30)]
 
 
+def test_the_report_lists_the_changes_waiting(monkeypatch):
+    from app.core import audit_chain_pending
+    seen = []
+    waiting = [{"key": "audit_max_days", "label": "Keep audit rows for at most", "old": 0, "new": 30,
+                "effective_at": "2026-10-27T12:00:00Z", "requested_by": "ada", "status": "waiting", "seq": 7,
+                "request_id": "r-1"},
+               {"key": "notification_retention_days", "label": "Delete notifications after", "old": 0, "new": 60,
+                "effective_at": "2026-10-28T12:00:00Z", "requested_by": "bob", "status": "waiting"}]
+
+    def entries(db, *, st, now):
+        seen.append((db, st, now))
+        return waiting
+    monkeypatch.setattr(audit_chain_pending, "entries", entries)
+    st = ai.ChainState()
+    out = rr.report("db", st, ai.View(), None, "now")
+    assert out["pending"] == [{k: e[k] for k in ("key", "label", "old", "new", "effective_at", "requested_by",
+                                                   "status")} for e in waiting]
+    assert seen == [("db", st, "now")] and "check" not in out
+
+
 def test_the_command_takes_its_lines(monkeypatch):
     seen = []
     monkeypatch.setattr(cli, "_retention", lambda args: seen.append(args.set) or 0)
     assert cli.main(["retention", "--set", "AUDIT_HOT_DAYS=120", "--set", "RETENTION_HOLD=true"]) == 0
     assert cli.main(["retention"]) == 0
     assert seen == [["AUDIT_HOT_DAYS=120", "RETENTION_HOLD=true"], None]
+
+
+class _Db:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _container(monkeypatch, enter, report=None):
+    """The container command with the server's configuration, the database and the chain lock stubbed: entering
+    the chain writer runs ``enter``; the report records what it was asked with."""
+    import json
+    from app.core import database
+    seen = {"reports": [], "dbs": []}
+
+    class _Writer:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return enter()
+
+        def __exit__(self, *exc):
+            return False
+
+    def _session():
+        seen["dbs"].append(_Db())
+        return seen["dbs"][-1]
+
+    def _report(db, st, view, record, now, proposed):
+        seen["reports"].append((db, st, view, record, now, proposed))
+        if report is not None:
+            return report(proposed)
+        return {"settings": [], "pending": []}
+
+    monkeypatch.setattr(cli, "_server", lambda: (None, ai.ChainState()))
+    monkeypatch.setattr(ai, "ChainWriter", _Writer)
+    monkeypatch.setattr(reg, "refresh", lambda *a, **k: None)
+    monkeypatch.setattr(database, "SessionLocal", _session)
+    monkeypatch.setattr(rr, "report", _report)
+
+    def run(*argv, capsys):
+        code = cli.main(["retention", *argv])
+        out = json.loads([ln for ln in capsys.readouterr().out.splitlines() if ln.strip()][-1])
+        return code, out
+    return seen, run
+
+
+@pytest.mark.parametrize("why", [lambda: ai.ChainBusy("busy, retry"),
+                                 lambda: ai.ChainStopped("not-started", "the audit chain has not started yet")])
+def test_the_command_gives_the_databases_values_and_why_while_the_chain_is_busy_or_stopped(monkeypatch, capsys, why):
+    def enter():
+        raise why()
+    seen, run = _container(monkeypatch, enter)
+    code, out = run("--set", "AUDIT_HOT_DAYS=120", capsys=capsys)
+    assert code == 0 and out["ok"] is True
+    assert out["chain_unreadable"] == f"{type(why()).__name__}: {why()}"
+    # The registry's values: a state of its own, no view of the chain, no record, and the lines to check.
+    ((db, st, view, record, now, proposed),) = seen["reports"]
+    assert isinstance(st, ai.ChainState) and view.newest_policy() is None and (record, now) == (None, None)
+    assert proposed == {"AUDIT_HOT_DAYS": "120"}
+    assert seen["dbs"] == [db] and db.closed
+
+
+def test_the_command_reads_under_the_chain_lock_when_it_can(monkeypatch, capsys):
+    held = SimpleNamespace(db="db", st=SimpleNamespace(view=ai.View(), known_record=lambda: "rec", clock=lambda: "now"),
+                           record=None)
+    seen, run = _container(monkeypatch, lambda: held)
+    code, out = run(capsys=capsys)
+    assert code == 0 and "chain_unreadable" not in out
+    ((db, st, view, record, now, _proposed),) = seen["reports"]
+    assert (db, st, view, record, now) == ("db", held.st, held.st.view, "rec", "now") and seen["dbs"] == []
+
+
+def test_another_failure_of_the_chain_read_is_not_taken_for_a_busy_chain(monkeypatch, capsys):
+    def enter():
+        raise RuntimeError("the database went away")
+    seen, run = _container(monkeypatch, enter)
+    code, out = run(capsys=capsys)
+    assert code == 2 and out == {"ok": False, "error": "RuntimeError: the database went away"}
+    assert seen["reports"] == []
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_a_value_of_the_wrong_kind_is_refused_in_plain_words_with_the_chain_or_without(monkeypatch, capsys, busy):
+    held = SimpleNamespace(db="db", st=SimpleNamespace(view=ai.View(), known_record=lambda: None, clock=lambda: None),
+                           record=None)
+
+    def enter():
+        if busy:
+            raise ai.ChainBusy("busy, retry")
+        return held
+
+    def report(proposed):
+        raise rr.Refused("AUDIT_HOT_DAYS=abc is not a whole number")
+    _seen, run = _container(monkeypatch, enter, report)
+    code, out = run("--set", "AUDIT_HOT_DAYS=abc", capsys=capsys)
+    assert code == 2 and out == {"ok": False, "error": "AUDIT_HOT_DAYS=abc is not a whole number"}

@@ -175,6 +175,50 @@ def test_with_yes_the_line_is_written_without_asking_and_replaces_the_old_one(tm
     assert _env(tmp_path) == "AUDIT_LOG_RETENTION_DAYS=30\nEXISTING=1\n"
 
 
+@pytest.mark.parametrize("answer", ["", "y", "Y", "ok", "no", "yes please", None])
+def test_only_yes_writes(tmp_path, monkeypatch, capsys, answer):
+    """Enter, y, anything but yes, or the end of the input: nothing is written."""
+    tool, _stub = _setup(tmp_path, monkeypatch, check=SOONER)
+
+    def ask(prompt=""):
+        if answer is None:
+            raise EOFError
+        return answer
+    monkeypatch.setattr("builtins.input", ask)
+    tool.audit(_args("retention", "--set", "AUDIT_LOG_RETENTION_DAYS=30"))
+    assert _env(tmp_path) == "EXISTING=1\n"
+    assert "Nothing written." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("answer", ["yes", "YES", " Yes "])
+def test_yes_in_any_case_writes(tmp_path, monkeypatch, answer):
+    tool, _stub = _setup(tmp_path, monkeypatch, check=SOONER)
+    monkeypatch.setattr("builtins.input", lambda prompt="": answer)
+    tool.audit(_args("retention", "--set", "AUDIT_LOG_RETENTION_DAYS=30"))
+    assert _env(tmp_path) == "EXISTING=1\nAUDIT_LOG_RETENTION_DAYS=30\n"
+
+
+def test_every_line_given_is_written(tmp_path, monkeypatch):
+    tool, _stub = _setup(tmp_path, monkeypatch, env="RETENTION_HOLD=false\nEXISTING=1\n")
+    tool.audit(_args("retention", "--set", "AUDIT_LOG_RETENTION_DAYS=30", "--set", "RETENTION_HOLD=true", "--set",
+                     "LOG_PULL_SINK_MAX_MB=60", "--yes"))
+    assert _env(tmp_path) == ("RETENTION_HOLD=true\nEXISTING=1\nAUDIT_LOG_RETENTION_DAYS=30\n"
+                              "LOG_PULL_SINK_MAX_MB=60\n")
+
+
+def test_values_the_chain_could_not_give_are_said_to_be_the_databases(tmp_path, monkeypatch, capsys):
+    tool, _stub = _setup(tmp_path, monkeypatch)
+    answer = {"ok": True, "settings": SETTINGS, "pending": [], "chain_unreadable": "ChainBusy: busy, retry"}
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, input_text=None: answer)
+    tool.audit(_args("retention"))
+    out = capsys.readouterr().out
+    assert ("The audit chain could not be read (ChainBusy: busy, retry): the values are the database's, not "
+            "necessarily what the pruner acts on.") in out
+    answer.pop("chain_unreadable")
+    tool.audit(_args("retention"))
+    assert "could not be read" not in capsys.readouterr().out
+
+
 def test_a_locked_env_is_never_written(tmp_path, monkeypatch):
     tool, stub = _setup(tmp_path, monkeypatch, check=SOONER, env=None)
     (tmp_path / ".env.enc").write_text("sealed", encoding="utf-8")
