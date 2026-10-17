@@ -166,6 +166,15 @@ def test_a_number_the_configuration_refuses_is_refused(raw, line):
         rr.check({line: raw}, _rows())
 
 
+def test_reading_a_value_leaves_the_running_configuration_as_it_was():
+    from app.core.config import settings
+    before = (settings.audit_hot_days, settings.retention_hold, settings.log_pull_sink_max_mb)
+    rr.check({"AUDIT_HOT_DAYS": "120", "RETENTION_HOLD": "true", "LOG_PULL_SINK_MAX_MB": "60"}, _rows())
+    with pytest.raises(rr.Refused):
+        rr.check({"AUDIT_HOT_DAYS": "abc"}, _rows())
+    assert (settings.audit_hot_days, settings.retention_hold, settings.log_pull_sink_max_mb) == before
+
+
 @pytest.mark.parametrize("raw", TAKEN_NUMBERS)
 def test_a_number_the_configuration_takes_is_read_as_it_reads_it(raw):
     want = _configured("audit_log_retention_days", raw)
