@@ -634,6 +634,8 @@ def shorten_job(p):
                 w.written = []
                 w.db.rollback()
         if outcome == FINISHED:
+            # Every row and archived day before the cutoff is done: the next pass reads only what has aged since.
+            _cursors[key] = before
             break
         _cursors[key] = cursor
         result.cleared += changed

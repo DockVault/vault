@@ -296,3 +296,18 @@ def test_a_rewrite_that_would_change_more_than_the_values_writes_nothing(env30, 
     rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert env.get(row).ip_address == "203.0.113.9" and len(env.seals()) == before
     assert "unjustified" in ((env.st.head_store().load() or {}).get("failures") or {})
+
+
+def test_once_done_a_pass_reads_only_what_has_aged_since(env30, monkeypatch):
+    env = env30
+    env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    key = next(iter(rw._cursors))
+    assert rw._cursors[key] == ai.hour_floor(env.clock() - timedelta(days=30))
+    seen = []
+    real = rw.step
+    monkeypatch.setattr(rw, "step", lambda p, w, scope, cursor: seen.append(cursor) or real(p, w, scope, cursor))
+    env.clock.advance(hours=6)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert seen == [ai.hour_floor(T0 - timedelta(days=30))]
