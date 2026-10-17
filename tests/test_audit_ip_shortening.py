@@ -145,6 +145,7 @@ def test_archived_days_are_shortened_in_their_blocks(env30):
     ids = [env.put(datetime.combine(DAY, time(3, 5))), env.put(datetime.combine(DAY, time(3, 15)), seal_nonce=None),
            env.put(datetime.combine(DAY, time(7, 5)), ip_address=None)]
     env.run_until_sealed()
+    nonces = {i: env.get(i).seal_nonce for i in ids}
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
     with env.session() as db:
         assert db.query(AuditArchiveBlock).count() == 1
@@ -156,7 +157,8 @@ def test_archived_days_are_shortened_in_their_blocks(env30):
         rows = {r["id"]: r for r in arc.PartReader(db, env.st.view, block.day, part).rows()}
     for i in ids[:2]:
         assert rows[i]["ip_address"] is None and json.loads(rows[i]["recorded"]) == {"ip": "203.0.113.0/24"}
-    assert rows[ids[2]]["recorded"] is None
+        assert rows[i]["seal_nonce"] is not None and rows[i]["seal_nonce"] != nonces[i]     # a fresh one
+    assert rows[ids[2]]["recorded"] is None and rows[ids[2]]["seal_nonce"] == bytes(nonces[ids[2]])
     seal = env.rewrite_seals()[0]
     after = next(s for s in env.seals() if s.seq == seal.seq + 1)
     assert after.kind == "archive" and after.detail["cause"] == "rewrite" and after.detail["after_seq"] == seal.seq

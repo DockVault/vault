@@ -46,6 +46,7 @@ holds and open cases).
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import secrets
@@ -99,11 +100,13 @@ class Context:
                    (c for (c,) in db.query(TemporaryCredential.temp_username).all() if c))
 
 
+@functools.lru_cache(maxsize=1)
 def typed_actions() -> frozenset:
     from app.core import audit_catalog
     return frozenset(a.name for a in audit_catalog.ACTIONS if a.typed_name)
 
 
+@functools.lru_cache(maxsize=1)
 def _system_names() -> frozenset:
     from app.core.credential_changes import HOST_OPERATOR
     return frozenset({HOST_OPERATOR, _ap().SERVER_CONFIGURATION})
