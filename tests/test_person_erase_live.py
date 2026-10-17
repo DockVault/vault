@@ -10,8 +10,9 @@ afterwards); a user, and no session, are refused; an account cannot be created w
 On a throwaway database of its own (tests/_throwaway_db.py), its passes run as a script whose clock is set: an
 erase over rows and an archived day on Postgres, the chain clean afterwards, the other stores given the placeholder,
 the head record holding no salt, the tables vacuumed; and deleting an account leaves its audit rows to the
-database's ON DELETE SET NULL, the chain still clean. tests/test_person_erase.py and tests/test_audit_chain_erase.py
-cover the rules offline.
+database's ON DELETE SET NULL, the chain still clean. And once the name is put back in an erased row, the audit job
+does not prune that hour (it reports the row), while it prunes the same rows of an hour left as the erase wrote it.
+tests/test_person_erase.py and tests/test_audit_chain_erase.py cover the rules offline.
 """
 import json
 import time
@@ -313,3 +314,112 @@ def test_an_erase_runs_over_rows_and_an_archived_day_on_postgres_and_the_chain_s
     assert out["failures"] == []
     assert out["orphan"] == 1 and out["failures_after_delete"] == []
     assert out["orm_updates"] == 0              # the database cleared user_id; the ORM loaded and wrote no row
+
+
+# Two hours, each with the person's administration row (kept by its floor) and alice's row, which turns 30 days old
+# a little after the erase completes; AUDIT_LOG_RETENTION_DAYS=30. Once the erase has completed, the person's name is
+# put back in one hour's erased row; a day of passes later the audit job has pruned alice's row of the other hour
+# only, and verify still finds the edit.
+EDITED_SCRIPT = PREAMBLE + r'''
+from app.core import audit_chain_format as fmt, audit_chain_policy_seals as ps, audit_chain_verify as v
+from app.core import person_erase as pe
+from app.core.models import AuditLog, EraseRequest, RoleEnum, User
+out = {}
+clock = [now]
+st = ai.ChainState(clock=lambda: clock[0])
+ai.set_state(st)
+NAME = "erase-edit-" + uuid.uuid4().hex[:8]
+
+
+def add_row(t, username, action):
+    rid = uuid.uuid4()
+    with engine.begin() as c:
+        c.execute(text(
+            "INSERT INTO audit_logs (id, action, status, timestamp, username, ip_address, details, seal_nonce, "
+            "privacy_version) VALUES (:id, :a, 'success', :t, :u, '203.0.113.5', CAST(:d AS json), :n, 3)"),
+            {"id": rid, "a": action, "t": t, "u": username, "d": json.dumps({"vault_id": "v1"}), "n": os.urandom(16)})
+    return rid
+
+
+def passes():
+    for _ in range(400):
+        r = ai.seal_pass(SessionLocal, st=st, now=clock[0])
+        if r.stopped or not r.sealed:
+            return r.stopped
+    return None
+
+
+def step():
+    clock[0] += timedelta(hours=6)
+    passes()
+    retention.run_pass(SessionLocal, engine=engine, now=clock[0])
+
+
+edited_hour = ai.hour_floor(now - timedelta(days=22, hours=12))
+plain_hour = edited_hour + timedelta(hours=2)
+rows = {}
+for label, h in (("edited", edited_hour), ("plain", plain_hour)):
+    rows[label] = (add_row(h + timedelta(minutes=5), NAME, "settings_updated"),
+                   add_row(h + timedelta(minutes=15), "alice", "file_uploaded"))
+out["stopped"] = passes()
+with SessionLocal() as db:
+    admin = User(id=uuid.uuid4(), username="ada-" + NAME[-8:], email=None, password_hash="x", role=RoleEnum.ADMIN,
+                 is_active=True)
+    db.add(admin)
+    db.commit()
+    with ps.change_transaction(engine) as w:
+        asked = pe.request(w, NAME, w.db.get(User, admin.id))
+out["placeholder"] = asked["placeholder"]
+for _ in range(4 * 9):
+    step()
+    with SessionLocal() as db:
+        if db.get(EraseRequest, uuid.UUID(asked["id"])).status == pe.COMPLETED:
+            break
+
+
+def present():
+    with SessionLocal() as db:
+        return {label: [db.get(AuditLog, i) is not None for i in ids] for label, ids in rows.items()}
+
+
+with SessionLocal() as db:
+    out["status"] = db.get(EraseRequest, uuid.UUID(asked["id"])).status
+    out["names"] = [db.get(AuditLog, rows[k][0]).username for k in ("edited", "plain")]
+out["present_at_erase"] = present()
+with engine.begin() as c:
+    c.execute(text("UPDATE audit_logs SET username = :n WHERE id = :id"), {"n": NAME, "id": rows["edited"][0]})
+held = {k: c.key for k, c in st.keys_held().items()}
+
+
+def failures():
+    with SessionLocal() as db:
+        report = v.verify(db, record=st.head_store().load(), held=held, current_key_id=st.current_key().key_id,
+                          now=clock[0])
+    return sorted({f.kind for f in report.findings if f.severity == "failure"})
+
+
+out["failures_before"] = failures()
+for _ in range(4):
+    step()
+out["present_after"] = present()
+with SessionLocal() as db:
+    prunes = [s.detail for s in ai.read_seals(db, 0) if s.kind == "prune"]
+out["pruned_hours"] = sorted({h[0] for d in prunes for h in d.get("hours") or []})
+out["hours"] = [fmt.hour_text(edited_hour), fmt.hour_text(plain_hour)]
+out["recorded"] = sorted((st.head_store().load() or {}).get("failures") or {})
+out["failures_after"] = failures()
+print(json.dumps(out, default=str))
+'''
+
+
+def test_the_audit_job_does_not_prune_an_hour_whose_erased_row_was_edited_on_postgres(throwaway):
+    out = run_in(throwaway, EDITED_SCRIPT, env={"AUDIT_ARCHIVE_START_AFTER_DAYS": "1000",
+                                                "AUDIT_LOG_RETENTION_DAYS": "30"})
+    assert out["stopped"] is None and out["status"] == "completed"
+    assert out["names"] == [out["placeholder"]] * 2
+    assert out["present_at_erase"] == {"edited": [True, True], "plain": [True, True]}
+    assert "unjustified" in out["failures_before"]
+    edited, plain = out["hours"]
+    assert out["present_after"] == {"edited": [True, True], "plain": [True, False]}
+    assert plain in out["pruned_hours"] and edited not in out["pruned_hours"]
+    assert "unjustified" in out["recorded"] and "unjustified" in out["failures_after"]

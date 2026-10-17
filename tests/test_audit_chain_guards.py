@@ -523,6 +523,23 @@ def test_an_erase_seal_for_an_hour_after_its_runs_scope_is_unjustified(env):
     assert any("for an hour after its run's scope" in m for m in _why(_off(env)))
 
 
+def test_a_row_an_erase_seal_lists_must_carry_its_placeholder(env):
+    """c_next commits to the row's values, its username among them, and the username is compared with the
+    placeholder as well: an erase seal over a row as it stands, which does not carry the placeholder, is unjustified
+    though c_next is that row's."""
+    rid = env.row(T0 - timedelta(hours=3), username="eve")
+    env.run_until_sealed()
+    hour = ai.hour_floor(T0 - timedelta(hours=3))
+    req, placeholder = _erase_request(env)
+    _wait_days(env, 8)
+    with env.session() as db:
+        row = next(r for r in ai.iter_rows(db, hour, hour + ai.HOUR) if r["id"] == rid)
+    _erase(env, req, placeholder, hour, [[str(rid), fmt.commitment(row["seal_nonce"], row).hex(),
+                                          fmt.commitment(fmt.ZERO_NONCE, row).hex()]], final=True)
+    assert any("is not what its erase seal says" in f.message for f in env.verify().findings
+               if f.kind == "unjustified")
+
+
 def test_a_cancel_of_a_pending_request_is_justified(env):
     env.run_until_sealed()
     req, _placeholder = _erase_request(env)
