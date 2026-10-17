@@ -187,6 +187,21 @@ def test_the_prefilter_selects_every_row_reduced_changes(factory):
         variants.append(_write(factory, levels))
         variants.append(_write(factory, levels, action="file_uploaded", username="alice"))
         variants.append(_write(factory, levels, details={"vault_id": VAULT, "n": 1}))
+    # Each kind of value alone, in one place only: the prefilter must find it there.
+    alone = {"action": "file_uploaded", "user_id": None, "temp_credential_id": None, "username": None,
+             "ip_address": None, "user_agent": None, "recorded": None, "details": None}
+    sign_fp = fp.fingerprint(fp.SIGNIN, "someone")
+    for extra in ({"details": {"client_ip": "198.51.100.1"}}, {"details": {"user_agent": "Agent/2"}},
+                  {"details": {"filters": {"user": "bob"}}}, {"details": {"file_name": "old.txt"}},
+                  {"details": {"to": "c@example.com"}}, {"recorded": {"ip": "198.51.100.0/24"}},
+                  {"recorded": {"details": {"filters.ip": "198.51.100.0/24"}}}, {"recorded": {"signin_name": sign_fp}},
+                  {"recorded": {"names": {"vault": VAULT, "values": {"file_name": {"fp": "fp1:x:y"}}}}},
+                  {"ip_address": "198.51.100.9"}, {"user_agent": "Agent/3"},
+                  {"action": "login_failure", "username": "typed name"}):
+        v = dict(alone, **extra)
+        for c in ("recorded", "details"):
+            v[c] = json.dumps(v[c]) if v[c] is not None else None
+        variants.append(v)
     db = factory()
     try:
         ids = []
@@ -206,6 +221,14 @@ def test_the_prefilter_selects_every_row_reduced_changes(factory):
             assert changed <= picked, levels
             if levels == FULL:
                 assert rw.prefilter(AuditLog, levels) == [] and changed == set()
-        assert any(rw.reduced(v, lv(ip=ap.NONE), ctx) for v in variants)
+        lowest = {k: ap.CHOICES[k][0] for k in ap.POLICY_KEYS}
+        assert all(rw.reduced(v, lowest, ctx) for v in variants[-12:])     # every one alone is a value to remove
     finally:
         db.close()
+
+
+def test_a_value_that_is_not_there_is_nothing_to_remove():
+    row = {"action": "file_uploaded", "user_id": uuid.uuid4(), "temp_credential_id": None, "username": "alice",
+           "ip_address": None, "user_agent": None, "recorded": None,
+           "details": json.dumps({"email": None, "ip_address": None, "filters": {"user": None}, "n": 1})}
+    assert rw.reduced(row, lv(emails=ap.NONE, ip=ap.NONE, signin_names=ap.NONE), rw.Context()) is None

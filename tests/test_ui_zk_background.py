@@ -3,7 +3,8 @@
 * A manager who holds a direct vault's key and opens it sets up the key check its current epoch lacks (an epoch made
   before key proofs): at once while the key is unlocked, with no prompt; while it is locked, once the opening's own
   passphrase prompt (for the vault's sealed name) is answered, so the opening asks once and nothing asks again; and
-  only once per vault and epoch for the page. An unlock after the vault was closed sets nothing up.
+  only once per vault and epoch for the page; a vault whose key check is there is left as it is. An unlock once
+  another vault is open sets nothing up.
 * A team vault, whose key check is its team key, is never set up this way.
 * A bulk share of ten, of a standard vault and of a zero-knowledge one while locked, never has more than four of
   its requests in flight, and the locked one asks for the passphrase once.
@@ -75,8 +76,12 @@ def test_opening_a_direct_vault_sets_up_its_key_check_once_and_asks_at_most_once
         _login(page, owner["_username"], owner["_password"])
         vid = _create_zk_vault_via_ui(page, co, PASSPHRASE)      # leaves the key unlocked
         assert _source(vid) == "create"
-        _forget_key_check(vid)
         page.evaluate(COUNTERS)
+        _open_vault(page, vid)                                   # its key check is there: nothing to set up
+        time.sleep(2)
+        assert _counts(page) == (0, 0)
+        _forget_key_check(vid)
+        page.click('.sidebar-item[data-section="vaults"]')
         _open_vault(page, vid)
         _wait_for(lambda: _source(vid) == "bootstrap", "the key check set up on opening")
         assert _counts(page) == (0, 1)
@@ -113,14 +118,15 @@ def test_opening_a_direct_vault_sets_up_its_key_check_once_and_asks_at_most_once
             co.delete_vault(vid)
 
 
-def test_an_unlock_after_the_vault_was_closed_sets_up_nothing(browser, zk):
+def test_an_unlock_once_another_vault_is_open_sets_up_nothing(browser, zk):
     owner, co = zk()
     ctx = browser.new_context(base_url=BASE_URL)
     page = ctx.new_page()
-    vid = None
+    vid = other = None
     try:
         _login(page, owner["_username"], owner["_password"])
         vid = _create_zk_vault_via_ui(page, co, PASSPHRASE)
+        other = co.create_vault()["id"]            # a standard vault: opening it asks for nothing
         _open_vault(page, vid)                     # its key check is there: nothing to set up
         page.evaluate(COUNTERS)
         _forget_key_check(vid)
@@ -128,20 +134,23 @@ def test_an_unlock_after_the_vault_was_closed_sets_up_nothing(browser, zk):
         # The vault seen again while the key is locked: the setup waits for an unlock, and asks nothing.
         page.evaluate("() => refreshZkRekeyNotice()")
         assert _counts(page) == (0, 0)
-        page.evaluate("() => closeVault()")
+        page.click('.sidebar-item[data-section="vaults"]')
+        _open_vault(page, other)
         page.evaluate("() => { window.__unlock = zkEnsureUnlocked().then(() => 'ok', e => String(e)); }")
         _answer_prompt(page)
         assert page.evaluate("() => window.__unlock") == "ok"
         time.sleep(3)
         assert _counts(page) == (1, 0) and _source(vid) == ""
         # The control: opened again, now unlocked, it is set up.
+        page.click('.sidebar-item[data-section="vaults"]')
         _open_vault(page, vid)
         _wait_for(lambda: _source(vid) == "bootstrap", "the key check set up on opening")
         assert _counts(page) == (1, 1)
     finally:
         ctx.close()
-        if vid:
-            co.delete_vault(vid)
+        for v in (vid, other):
+            if v:
+                co.delete_vault(v)
 
 
 def test_a_team_vault_is_never_set_up_on_opening(browser, zk):
