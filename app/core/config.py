@@ -491,6 +491,12 @@ class Settings(BaseSettings):
     log_prune_interval_minutes: int = Field(default=15)
     log_prune_batch_rows: int = Field(default=5000)
     retention_hold: bool = Field(default=False)
+    # Working records (app/core/working_records.py). Each person's notifications are deleted this many days
+    # after they arrive, read or not (30-3650; 0, the default, keeps them until the person dismisses them);
+    # the panel may change it. The log-access file (LOG_PULL_SINK_PATH) and its two older copies hold
+    # LOG_PULL_SINK_MAX_MB in all (3-1000).
+    notification_retention_days: int = Field(default=0)
+    log_pull_sink_max_mb: int = Field(default=15)
     # The audit log's integrity chain (app/core/audit_integrity.py): every closed hour of audit rows is
     # sealed, and the seals are chained under a key the database never holds. AUDIT_CHAIN_KEY is that key's
     # secret (at least 32 random characters, not ENCRYPTION_KEY; setup writes one). Unset, the key is

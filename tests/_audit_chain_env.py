@@ -27,8 +27,9 @@ ENC_KEY = "Y2hhbmdlbWVjaGFuZ2VtZWNoYW5nZW1lY2hhbmdlbWU="
 T0 = datetime(2026, 10, 20, 9, 0, 0)
 
 INPUT_ENV = ("AUDIT_LOG_MAX_MB", "AUDIT_LOG_RETENTION_DAYS", "AUDIT_MIN_RETENTION_DAYS", "AUDIT_PROTECTED_MIN_DAYS",
-             "PLAN_LOG_MAX_DAYS", "PLAN_LOG_MAX_MB", "RETENTION_HOLD", "RETENTION_REDUCTION_DELAY_DAYS",
-             "SECURITY_RECORD_DAYS", "SECURITY_RECORD_MAX_DAYS", "SECURITY_RECORD_MIN_DAYS")
+             "NOTIFICATION_RETENTION_DAYS", "PLAN_LOG_MAX_DAYS", "PLAN_LOG_MAX_MB", "RETENTION_HOLD",
+             "RETENTION_REDUCTION_DELAY_DAYS", "SECURITY_RECORD_DAYS", "SECURITY_RECORD_MAX_DAYS",
+             "SECURITY_RECORD_MIN_DAYS")
 
 
 def settings(tmp: Path, **kw):
@@ -39,7 +40,7 @@ def settings(tmp: Path, **kw):
                 security_record_days=30, security_record_min_days=7, security_record_max_days=365,
                 jwt_access_token_expire_minutes=60, audit_seal_lag_minutes=60, encryption_key=ENC_KEY,
                 audit_chain_key=KEY_TEXT, audit_chain_head_file=str(tmp / "keys" / "audit-chain-head.json"),
-                audit_hot_days=90, audit_archive_start_after_days=14)
+                audit_hot_days=90, audit_archive_start_after_days=14, notification_retention_days=0)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -175,7 +176,7 @@ def host_rows(env, action: str):
 CHAIN_SETTINGS = dict(encryption_key=ENC_KEY, audit_chain_key=KEY_TEXT, audit_seal_lag_minutes=60,
                       security_record_days=30, security_record_min_days=7, security_record_max_days=365,
                       audit_min_retention_days=0, audit_protected_min_days=365, audit_log_max_mb=0,
-                      plan_log_max_days=-1, plan_log_max_mb=-1)
+                      plan_log_max_days=-1, plan_log_max_mb=-1, notification_retention_days=0)
 
 
 class Chain:

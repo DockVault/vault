@@ -23,7 +23,8 @@ keeps), and every job over that table leaves them.
 The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with RETENTION_HOLD=true the panel
 cannot turn it off) stops every job over logs and security records while it is on. The jobs over working
 records (finished sessions, expired key-proof challenges, credential-change records, the sign-in throttle's
-fallback rows, waiting settings changes) keep running. Turning the hold off deletes sooner, so it waits like any such change
+fallback rows, ended invitations, used or expired reset links and one-time codes, old notifications, waiting
+settings changes) keep running. Turning the hold off deletes sooner, so it waits like any such change
 (app/core/setting_changes.py).
 """
 from __future__ import annotations
@@ -358,6 +359,24 @@ def prune_rate_limit_records(p: Pass) -> JobResult:
         RateLimitRecord.window_start)
 
 
+def prune_invitations(p: Pass) -> JobResult:
+    """Invitations accepted, revoked or expired 30 days ago (app/core/working_records.py)."""
+    from app.core import working_records
+    return working_records.prune_invitations(p)
+
+
+def prune_one_time_proofs(p: Pass) -> JobResult:
+    """Password reset links, one-time codes and email-change codes used or expired 30 days ago."""
+    from app.core import working_records
+    return working_records.prune_one_time_proofs(p)
+
+
+def prune_notifications(p: Pass) -> JobResult:
+    """Notifications older than notification_retention_days; none while it is 0, the default."""
+    from app.core import working_records
+    return working_records.prune_notifications(p)
+
+
 def prune_resolved_alerts(p: Pass) -> JobResult:
     """Security alerts resolved more than SECURITY_ALERT_RETENTION_DAYS ago. Unresolved alerts stay."""
     from app.core import security_records
@@ -420,6 +439,9 @@ JOBS: list[Job] = [
     Job("key_proof_challenges", "Expired key-proof challenges", prune_key_proof_challenges),
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
+    Job("invitations", "Invitations that ended 30 days ago", prune_invitations),
+    Job("one_time_proofs", "Reset links and one-time codes that ended 30 days ago", prune_one_time_proofs),
+    Job("notifications", "Notifications older than their window", prune_notifications),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),
     Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),

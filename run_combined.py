@@ -49,8 +49,11 @@ _STDOUT_LOCK = threading.Lock()
 # daemon thread does the actual (potentially slow) disk write. The file is best-effort: if its
 # directory is not writable the sink is simply disabled and stdout tagging is unaffected.
 _SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
-_SINK_MAX_BYTES = 5 * 1024 * 1024   # per file
-_SINK_BACKUPS = 2                   # + 2 rotations -> ~15 MB hard cap
+# The file and its two older copies hold LOG_PULL_SINK_MAX_MB in all (15 by default), split evenly: the same
+# limits the API's own writer uses (app/services/log_sink.py), which imports nothing beyond the standard library.
+from app.services.log_sink import sink_limits  # noqa: E402
+
+_SINK_MAX_BYTES, _SINK_BACKUPS = sink_limits()
 _SINK_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=20000)
 _sink_logger = None
 

@@ -255,6 +255,9 @@ RETENTION_ENV_KEYS = (
     ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
     ("log_prune_batch_rows", "LOG_PRUNE_BATCH_ROWS", "5000"),
     ("retention_hold", "RETENTION_HOLD", "false"),
+    # Working records: how long notifications are kept (0 keeps them), and the log-access file's size.
+    ("notification_retention_days", "NOTIFICATION_RETENTION_DAYS", "0"),
+    ("log_pull_sink_max_mb", "LOG_PULL_SINK_MAX_MB", "15"),
     ("audit_min_retention_days", "AUDIT_MIN_RETENTION_DAYS", "0"),
     ("audit_protected_min_days", "AUDIT_PROTECTED_MIN_DAYS", "365"),
     ("audit_log_max_mb", "AUDIT_LOG_MAX_MB", "0"),

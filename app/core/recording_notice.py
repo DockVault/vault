@@ -64,6 +64,16 @@ def _sessions_kept() -> str:
     return f"For the session's life, then {_days(SESSION_DATA_RETENTION_DAYS)}."
 
 
+def _notifications_kept() -> str:
+    from app.core import working_records
+    return working_records.notifications_kept()
+
+
+def _log_access_file_kept() -> str:
+    from app.core import settings_registry, working_records
+    return f"Up to {settings_registry.resolve(working_records.SINK_KEY)} MB; the oldest lines go first."
+
+
 STORES = (
     Store("audit_logs", "Every event: who acted (the username), what happened, when and its outcome, with the "
           "personal data the recording levels keep: names, a name typed at a failed sign-in, email addresses, the "
@@ -88,13 +98,13 @@ STORES = (
           lambda: "Until the administrator deletes the search, or their account is deleted.",
           table="activity_saved_searches"),
     Store("notifications", "Your notifications, including one telling you of a sign-in or a change to your account "
-          "from an address.", lambda: "Until you dismiss them.", table="notifications"),
+          "from an address.", _notifications_kept, table="notifications"),
     Store("cache", "Counts of requests and failed sign-ins by address and by account, in the cache.",
           lambda: "Minutes, or a day at most."),
     Store("container_output", "The server's output, which shows each request's address and route.",
           lambda: "As long as the operator's log rotation keeps it."),
     Store("log_access_file", "A copy of the server's output kept for log access.",
-          lambda: "Up to 15 MB; the oldest lines go first."),
+          _log_access_file_kept),
     Store("backups", "Backups of the database and its settings, made by the operator.",
           lambda: "As long as the operator keeps them."),
 )

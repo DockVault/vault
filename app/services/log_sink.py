@@ -18,10 +18,49 @@ import queue
 import threading
 from datetime import datetime, timezone
 
-# Same default + caps as run_combined.py, so both run shapes produce an identical, size-capped file.
+# The whole sink (the file and its two older copies) holds at most LOG_PULL_SINK_MAX_MB: 15 by default, 3 to 1000
+# (app/core/working_records.py lists it; a value outside that refuses to start the web app, and is read here as
+# the default). run_combined.py reads the same limits, so both run shapes produce the same size-capped files.
+SINK_DEFAULT_MB = 15
+SINK_MIN_MB = 3
+SINK_MAX_MB = 1000
+SINK_BACKUPS = 2
+# A log pull reads at most this much of the newest file, whatever the cap: the pull returns 5000 lines at most,
+# and reading a larger file would hold the web app's event loop.
+SINK_READ_BYTES = 5 * 1024 * 1024
+
+
+def sink_limits(environ=None) -> tuple:
+    """(the most bytes one file holds, how many older files are kept) for LOG_PULL_SINK_MAX_MB in ``environ``
+    (the process's environment by default): the cap split evenly over the file and its older copies."""
+    env = os.environ if environ is None else environ
+    raw = str(env.get("LOG_PULL_SINK_MAX_MB", "") or "").strip()
+    mb = int(raw) if raw.isdigit() else SINK_DEFAULT_MB
+    if not SINK_MIN_MB <= mb <= SINK_MAX_MB:
+        mb = SINK_DEFAULT_MB
+    return mb * 1024 * 1024 // (SINK_BACKUPS + 1), SINK_BACKUPS
+
+
+def read_tail(path: str, max_bytes: int = SINK_READ_BYTES) -> str:
+    """The last ``max_bytes`` of the file at ``path`` from the first whole line in them, or all of it when it
+    is no larger. Raises OSError as open() does."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        # One byte more before the window, to know whether the window starts a line.
+        f.seek(max(0, start - 1))
+        data = f.read(size - max(0, start - 1))
+    if start:
+        # The byte before the window ends a line, or the window begins inside one: drop that partial line.
+        cut = data.find(b"\n")
+        data = data[cut + 1:] if cut >= 0 else b""
+    return data.decode("utf-8", errors="replace")
+
+
+# Same path and limits as run_combined.py.
 _SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
-_SINK_MAX_BYTES = 5 * 1024 * 1024
-_SINK_BACKUPS = 2
+_SINK_MAX_BYTES, _SINK_BACKUPS = sink_limits()
 _SINK_QUEUE: "queue.Queue" = queue.Queue(maxsize=20000)
 _SINK_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"  # ISO-8601 UTC, trailing Z
 

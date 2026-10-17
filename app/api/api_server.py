@@ -4741,10 +4741,13 @@ def _read_sink_lines() -> list:
     stored record can carry attacker-influenced content (an SFTP filename/username). str.splitlines()
     would ALSO break on \\v \\f \\x1c-\\x1e \\x85 \\u2028 \\u2029, so a content byte like '\\u2028[web] ...'
     inside an [sftp] record would be re-split into a fragment served under `?service=web`
-    (within-tenant tag smuggling). Splitting on '\\n' makes the read match the write exactly."""
+    (within-tenant tag smuggling). Splitting on '\\n' makes the read match the write exactly.
+
+    Only the newest 5 MB of the file are read (log_sink.read_tail), from a whole line: the pull returns 5000
+    lines at most, and LOG_PULL_SINK_MAX_MB can make the file far larger than this handler should read."""
     try:
-        with open(_LOG_SINK_PATH, "r", encoding="utf-8", errors="replace") as f:
-            return f.read().split("\n")
+        from app.services.log_sink import read_tail
+        return read_tail(_LOG_SINK_PATH).split("\n")
     except Exception:  # noqa: BLE001
         return []
 
