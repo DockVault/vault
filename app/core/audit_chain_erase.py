@@ -477,9 +477,11 @@ def _progress(row, through: str, now: datetime, changed: int) -> None:
 
 # --------------------------------------------------------------------------- the job
 
-def step(p, w, seq: int, findings: Dict[str, str], tried: set) -> tuple:
+def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[dict] = None) -> tuple:
     """One transaction of the erase of request ``seq``: (outcome, rows changed, the notice's details when it
-    completed, the reason it waits). Writes nothing unless it returns ERASED (or DONE after a veto)."""
+    completed, the reason it waits). Writes nothing unless it returns ERASED (or DONE after a veto). ``cache`` keeps
+    the hours that hold the name for the rest of the pass, so the audit table is read once a pass and not once an
+    hour; the run's last unit is decided on the table as it is then."""
     from app.core import audit_archive as arc
     from app.core import audit_chain_policy_seals as ps
     from app.core import audit_retention as ar
@@ -538,7 +540,14 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set) -> tuple:
                 return STOP, 0, None, None
             return SCANNED, 0, None, None
     with_rows = [day for day in days if st.erase_scans[(seq, day)][1]]
-    hours = hot_hours(db, view, name, scope_end, fp)
+    cache = cache if cache is not None else {}
+    hours = cache.get("hours")
+    fresh = hours is None
+    if fresh:
+        hours = hot_hours(db, view, name, scope_end, fp)
+    if len(with_rows) + len(hours) <= 1 and not fresh:
+        hours = hot_hours(db, view, name, scope_end, fp)
+    cache["hours"] = list(hours)
     if not started and pe.protected_minimum():
         newest, newest_p = _hot_newest(db, name, fp, scope_end, ai.protected_names())
         for day in with_rows:
@@ -581,6 +590,8 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set) -> tuple:
             st.erase_scans.pop((seq, unit), None)
             return SCANNED, 0, None, None
         _progress(row, through, now, changed)
+        if kind == "hour" and unit in cache.get("hours", []):
+            cache["hours"].remove(unit)
         if not final:
             return ERASED, changed, None, None
     _progress(row, through, now, 0)
@@ -615,10 +626,11 @@ def run_job(p):
     finished = []
     for seq in sorted(set(due(st.view, st.known_record(), p.now)) | set(vetoed(st, p.session_factory))):
         tried: set = set()
+        cache: dict = {}
         while p.time_left():
             outcome, changed, done, why = STOP, 0, None, None
             with ai.ChainWriter(engine, st) as w:
-                outcome, changed, done, why = step(p, w, seq, findings, tried)
+                outcome, changed, done, why = step(p, w, seq, findings, tried, cache)
                 if outcome not in (ERASED, DONE) and w.written:
                     # Only an erase or a veto commits: anything else leaves the transaction as it found it.
                     w.written = []

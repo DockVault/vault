@@ -148,8 +148,8 @@ def test_rows_written_after_the_run_began_are_not_erased(env, monkeypatch):
     real = ae.step
     calls = []
 
-    def one_unit(p, w, seq, findings, tried):
-        out = real(p, w, seq, findings, tried)
+    def one_unit(p, w, seq, findings, tried, cache=None):
+        out = real(p, w, seq, findings, tried, cache)
         calls.append(out[0])
         if out[0] == ae.ERASED:
             p.deadline = 0          # the pass ends after the first unit
@@ -191,6 +191,39 @@ def test_a_crash_mid_run_resumes_from_the_hours_without_a_seal(env, monkeypatch)
     env.passes(6)
     assert {_rows(env, id=i)[0].username for i in ids} == {asked["placeholder"]}
     assert len(env.erase_seals()) == 3 and _done(env, asked["id"])
+    assert failures(env.verify()) == []
+
+
+def test_the_audit_table_is_read_for_the_hours_once_a_pass_and_again_for_the_last_unit(env, monkeypatch):
+    ids = [_put(env, T0 - timedelta(hours=h)) for h in (50, 40, 30, 20)]
+    env.run_until_sealed()
+    asked = env.ask("eve")
+    env.passes(24 * 7 - 6)
+    real, calls = ae.hot_hours, []
+    monkeypatch.setattr(ae, "hot_hours", lambda *a, **k: calls.append(1) or real(*a, **k))
+    env.clock.advance(hours=6)
+    retention.run_pass(env.session, now=env.clock())
+    assert {_rows(env, id=i)[0].username for i in ids} == {asked["placeholder"]} and _done(env, asked["id"])
+    assert len(calls) == 2                      # once for the pass, once more before the last unit
+
+
+def test_the_last_unit_is_decided_on_the_table_as_it_is_and_not_on_the_pass_list(env):
+    ids = [_put(env, T0 - timedelta(hours=h)) for h in (40, 30)]
+    env.run_until_sealed()
+    asked = env.ask("eve")
+    env.passes(24 * 7 - 6)
+    env.clock.advance(hours=6)
+    env.seal()
+    st = env.st
+    seq = asked["request_seq"]
+    p = retention.Pass(env.session, now=env.clock())
+    with ai.ChainWriter(env.engine, st) as w:
+        out = ae.step(p, w, seq, {}, set(), {"hours": []})        # a list that says nothing is left
+    assert out[0] == ae.ERASED and out[2] is None                  # not the end: the table still holds two hours
+    seals = env.erase_seals()
+    assert len(seals) == 1 and seals[0].detail["final"] is False and seals[0].detail["hour"] is not None
+    env.passes(6)
+    assert {_rows(env, id=i)[0].username for i in ids} == {asked["placeholder"]} and _done(env, asked["id"])
     assert failures(env.verify()) == []
 
 

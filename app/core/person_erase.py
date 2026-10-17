@@ -606,9 +606,15 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
     has = holder(db, name, now)
     fp = signin_fingerprint(name, st.cfg())
     mine = audit_matches(A, name, fp)
-    dated = db.query(A.username, A.recorded, A.timestamp).filter(mine, A.timestamp.isnot(None)).all()
-    times = [t for u, r, t in dated if row_matches({"username": u, "recorded": r}, name, fp)]
-    undated = db.query(func.count()).select_from(A).filter(A.username == name, A.timestamp.is_(None)).scalar() or 0
+    times, undated = None, 0
+    try:
+        with db.begin_nested():
+            dated = db.query(A.username, A.recorded, A.timestamp).filter(mine, A.timestamp.isnot(None)).all()
+            times = [t for u, r, t in dated if row_matches({"username": u, "recorded": r}, name, fp)]
+            undated = db.query(func.count()).select_from(A).filter(A.username == name,
+                                                                   A.timestamp.is_(None)).scalar() or 0
+    except Exception:  # noqa: BLE001 -- too slow to count in a request: the erase counts them as it runs
+        times = None
     placeholder = PREFIX + "00000000"
     stores = [{"key": s.key, "label": s.label, "count": int(s.count(db, name, placeholder, (fp,) if fp else (), now)
                                                              or 0)} for s in STORES]
@@ -626,7 +632,7 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
         not_reached.append(f"{undated} audit rows with no time")
     return {
         "refused": has,
-        "audit_rows": len(times),
+        "audit_rows": len(times) if times is not None else None,
         "oldest": min(times).isoformat() + "Z" if times else None,
         "newest": max(times).isoformat() + "Z" if times else None,
         "undated_rows": int(undated),
@@ -634,12 +640,12 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
         "stores": stores,
         "near_misses": _near_misses(db, name),
         "mentioned_by_others": mentions,
-        "delay_days": _delay_days(view, st),
+        "delay_days": delay_days(view, st),
         "not_reached": not_reached,
     }
 
 
-def _delay_days(view, st) -> int:
+def delay_days(view, st) -> int:
     from app.core import audit_chain_honour as honour
     from app.core import audit_chain_policy as pol
     try:
@@ -686,7 +692,7 @@ def request(w, name: str, actor, *, now: Optional[datetime] = None) -> dict:
     r = secrets.token_bytes(32)
     subject = subject_of(request_id, r, name)
     token = seal_name(st.cfg(), request_id, r, name)
-    delay = timedelta(days=_delay_days(view, st))
+    delay = timedelta(days=delay_days(view, st))
     effective = now + delay
     row = AuditLogger(db).build_row(
         action="person_erase_requested", status="success", user=actor, resource_type=RESOURCE_TYPE,

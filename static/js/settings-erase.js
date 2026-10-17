@@ -61,7 +61,8 @@
             box.appendChild(el('p', 'alert alert-warning', `This name cannot be erased now: ${p.refused}.`));
         }
         const list = el('ul', 'erase-preview-list');
-        let rows = `${plural(p.audit_rows, 'audit row', 'audit rows')}`;
+        let rows = p.audit_rows == null ? 'Audit rows: too many to count just now (the erase counts them as it runs)'
+            : `${plural(p.audit_rows, 'audit row', 'audit rows')}`;
         if (p.oldest && p.newest) rows += ` (${when(p.oldest)} to ${when(p.newest)})`;
         list.appendChild(el('li', null, rows));
         if (p.archived_days) {
@@ -158,7 +159,8 @@
         const name = current();
         if (S.busy || !S.preview || S.previewed !== name || S.preview.refused) return;
         const p = S.preview;
-        const message = `Erase this name from ${plural(p.audit_rows, 'audit row', 'audit rows')} and the other ` +
+        const where = p.audit_rows == null ? 'the audit log' : plural(p.audit_rows, 'audit row', 'audit rows');
+        const message = `Erase this name from ${where} and the other ` +
             `records? It runs in ${plural(p.delay_days, 'day', 'days')} unless an administrator cancels it, and ` +
             'cannot be undone once it has run.';
         const ok = await showConfirm(message, "Erase a person's records?", 'erase', 'Ask for this erase');

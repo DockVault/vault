@@ -219,6 +219,17 @@ def test_a_placeholder_already_taken_is_drawn_again(env, monkeypatch):
     assert second["placeholder"] == "erased-0a0b0c0d"
 
 
+def test_a_placeholder_the_chain_holds_is_drawn_again_when_its_row_is_gone(env, monkeypatch):
+    env.run_until_sealed()
+    first = env.ask("eve")
+    with env.session() as db:
+        db.query(EraseRequest).delete()
+        db.commit()
+    draws = iter([first["placeholder"][len("erased-"):], "0a0b0c0e"])
+    monkeypatch.setattr(pe.secrets, "token_hex", lambda n: next(draws))
+    assert env.ask("mallory")["placeholder"] == "erased-0a0b0c0e"
+
+
 def test_a_second_erase_of_a_name_already_waiting_is_refused(env):
     env.run_until_sealed()
     env.ask("eve")
@@ -275,8 +286,8 @@ def test_an_erase_that_has_begun_or_completed_cannot_be_cancelled(env, monkeypat
     env.passes(24 * 7 - 6)
     real = ae.step
 
-    def one_unit(p, w, seq, findings, tried):
-        out = real(p, w, seq, findings, tried)
+    def one_unit(p, w, seq, findings, tried, cache=None):
+        out = real(p, w, seq, findings, tried, cache)
         if out[0] == ae.ERASED:
             p.deadline = 0
         return out
@@ -302,8 +313,8 @@ def test_a_cancel_while_sealing_is_stopped_is_refused_for_an_erase_that_has_begu
     env.passes(24 * 7 - 6)
     real = ae.step
 
-    def one_unit(p, w, seq, findings, tried):
-        out = real(p, w, seq, findings, tried)
+    def one_unit(p, w, seq, findings, tried, cache=None):
+        out = real(p, w, seq, findings, tried, cache)
         if out[0] == ae.ERASED:
             p.deadline = 0
         return out

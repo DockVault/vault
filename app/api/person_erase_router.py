@@ -48,7 +48,7 @@ class EraseName(BaseModel):
 def list_erase_requests(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     limit_statements(db)
     st = audit_integrity.state()
-    return {"requests": pe.listing(db, st), "delay_days": pe._delay_days(st.view, st),
+    return {"requests": pe.listing(db, st), "delay_days": pe.delay_days(st.view, st),
             "protected_minimum": pe.protected_minimum()}
 
 
