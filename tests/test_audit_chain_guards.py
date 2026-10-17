@@ -476,6 +476,53 @@ def test_an_erase_request_naming_a_setting_or_a_value_is_unjustified(env):
     assert any("naming a setting or a value" in m for m in _why(_off(env)))
 
 
+def test_an_erase_sealed_after_not_before_but_inside_a_stops_extension_is_unjustified(env):
+    """A stop in sealing moves an erase on by its length, on verify's side too."""
+    env.row(T0 - timedelta(hours=3))
+    env.run_until_sealed()
+    hour = ai.hour_floor(T0 - timedelta(hours=3))
+    req, placeholder = _erase_request(env)
+    _wait_days(env, 2)
+    env.clock.advance(hours=48)                          # a two-day stop
+    for _ in range(4 * 4 + 2):                           # past not_before, inside the stop's length after it
+        env.clock.advance(hours=6)
+        env.seal()
+    not_before = fmt.parse_time_text(env.st.view.requests[req]["not_before"])
+    assert not_before + timedelta(hours=6) < env.clock() < not_before + timedelta(hours=48)
+    _erase(env, req, placeholder, hour, [], final=True)
+    assert any("before its request's delay has run" in m for m in _why(_off(env)))
+
+
+def _erase_seal(env, req, placeholder, hour, through, *, final=False):
+    return _append(env, "erase", {"hour": fmt.hour_text(hour), "request_seq": req, "request_id": None,
+                                  "placeholder": placeholder, "policy_seq": _newest_policy(env)[0], "bytes_now": 0,
+                                  "through": fmt.hour_text(through), "final": final, "rows": []})
+
+
+def test_an_erase_seal_whose_scope_is_not_its_runs_is_unjustified(env):
+    for h in (5, 3):
+        env.row(T0 - timedelta(hours=h))
+    env.run_until_sealed()
+    first, second = ai.hour_floor(T0 - timedelta(hours=5)), ai.hour_floor(T0 - timedelta(hours=3))
+    req, placeholder = _erase_request(env)
+    _wait_days(env, 8)
+    _erase_seal(env, req, placeholder, first, second)
+    assert _why(_off(env)) == []
+    _erase_seal(env, req, placeholder, first, first, final=True)        # an hour inside either scope
+    assert any("whose scope is not its run's" in m for m in _why(_off(env)))
+
+
+def test_an_erase_seal_for_an_hour_after_its_runs_scope_is_unjustified(env):
+    for h in (5, 3):
+        env.row(T0 - timedelta(hours=h))
+    env.run_until_sealed()
+    first, second = ai.hour_floor(T0 - timedelta(hours=5)), ai.hour_floor(T0 - timedelta(hours=3))
+    req, placeholder = _erase_request(env)
+    _wait_days(env, 8)
+    _erase_seal(env, req, placeholder, second, first, final=True)
+    assert any("for an hour after its run's scope" in m for m in _why(_off(env)))
+
+
 def test_a_cancel_of_a_pending_request_is_justified(env):
     env.run_until_sealed()
     req, _placeholder = _erase_request(env)

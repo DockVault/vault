@@ -112,7 +112,9 @@ def test_an_erase_gives_the_placeholder_clears_the_values_and_keeps_the_chain_va
     assert [s.detail["final"] for s in erases] == [False, True]
     assert {s.detail["placeholder"] for s in erases} == {asked["placeholder"]}
     assert {s.detail["through"] for s in erases} == {erases[0].detail["through"]}
-    assert all(s.detail["policy_seq"] == env.view().newest_policy()[0] or s.detail["policy_seq"] for s in erases)
+    policies = [s.seq for s in env.seals() if s.kind == "policy"]
+    # Each erase seal names the policy seal in force when it was written: the newest one before it.
+    assert [s.detail["policy_seq"] for s in erases] == [max(p for p in policies if p < s.seq) for s in erases]
     report = env.verify()
     assert failures(report) == [], report.findings
 

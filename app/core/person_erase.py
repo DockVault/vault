@@ -646,6 +646,9 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
 
 
 def delay_days(view, st) -> int:
+    """The delay of a new erase request: the longer of the honoured state's and the chain's newest state's. The
+    honoured state gives no shorter one today (audit_chain_honour.honoured_state keeps the longer delay of the
+    two), so the max holds the request to the newest delay whatever that function comes to do."""
     from app.core import audit_chain_honour as honour
     from app.core import audit_chain_policy as pol
     try:
