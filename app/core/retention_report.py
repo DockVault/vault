@@ -46,8 +46,8 @@ def env_lines() -> Dict[str, str]:
     return out
 
 
-def _row(r: dict, chain: Optional[dict]) -> dict:
-    row = {k: r.get(k) for k in ("key", "group", "label", "unit", "kind", "value", "source", "deployment",
+def _row(described: dict, chain: Optional[dict]) -> dict:
+    row = {k: described.get(k) for k in ("key", "group", "label", "unit", "kind", "value", "source", "deployment",
                                  "deployment_source", "min", "max", "unlimited", "floor", "ceiling", "env",
                                  "floor_env", "ceiling_env", "editable", "locked", "reduction")}
     if chain is not None:
@@ -111,7 +111,7 @@ def check(proposed: Dict[str, str], rows_before: List[dict]) -> dict:
     real = registry._deployment_settings
     registry._deployment_settings = lambda: ns
     try:
-        after = {r["key"]: r for r in registry.describe([s.key for s in specs()])}
+        after = {d["key"]: d for d in registry.describe([s.key for s in specs()])}
     finally:
         registry._deployment_settings = real
     changes, sooner = [], []
@@ -132,11 +132,11 @@ def report(db, st, view, record, now, proposed: Optional[Dict[str, str]] = None)
     from app.core import audit_chain_pending
     from app.core import audit_chain_policy_seals as chain_seals
     honoured = chain_seals.honoured_state(view, record, now) if view.newest_policy() is not None else {}
-    rows = [_row(r, honoured.get(r["key"])) for r in registry.describe([s.key for s in specs()])]
+    rows = [_row(d, honoured.get(d["key"])) for d in registry.describe([s.key for s in specs()])]
     pending = [{k: e.get(k) for k in ("key", "label", "old", "new", "effective_at", "requested_by", "status")}
                for e in audit_chain_pending.entries(db, st=st, now=now)]
     out = {"settings": rows, "pending": pending, "chain_started": bool(honoured)}
     if proposed:
-        before = [dict(r, value=r.get("database_value", r["value"])) for r in rows]
+        before = [dict(row, value=row.get("database_value", row["value"])) for row in rows]
         out["check"] = check(proposed, before)
     return out
