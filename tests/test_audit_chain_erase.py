@@ -270,11 +270,14 @@ def test_rows_of_a_name_recorded_as_a_fingerprint_are_erased_too(env):
                  status="failure")
     other = _put(env, T0 - timedelta(hours=30, minutes=-5), username=None, action="login_failed", status="failure",
                  recorded={"signin_name": pe.signin_fingerprint("mallory", env.settings)})
+    # A row with an account's username is that account's, whatever its recorded values say.
+    named = _put(env, T0 - timedelta(hours=30, minutes=-10), username="alice", recorded={"signin_name": fp})
     env.run_until_sealed()
     asked = _due(env)
     row = _rows(env, id=typed)[0]
     assert row.username == asked["placeholder"] and row.recorded is None and row.ip_address is None
     assert _rows(env, id=other)[0].username is None and _rows(env, id=other)[0].recorded is not None
+    assert _rows(env, id=named)[0].username == "alice" and _rows(env, id=named)[0].recorded == {"signin_name": fp}
     assert failures(env.verify()) == []
 
 
@@ -423,6 +426,25 @@ def test_nothing_is_due_while_a_gap_in_sealing_is_open(env):
     env.erase_job()
     assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
     env.clock.advance(hours=1)
+    env.seal()
+    env.erase_job()
+    assert _rows(env, id=rid)[0].username != "eve"
+
+
+def test_an_erase_long_due_does_not_run_while_a_gap_is_open(env):
+    """An erase held back past its date (a rule kept it waiting) is due at once when the rule ends; but not while
+    sealing has stopped for more than 12 hours: nothing applies while a gap is open."""
+    rid = _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    env.ask("eve")
+    held = {"on": True}
+    pe.register_wait(lambda db, now: "a legal hold stands" if held["on"] else None)
+    env.passes(24 * 10)
+    held["on"] = False
+    env.clock.advance(hours=13)                 # no seal for 13 hours
+    assert ae.due(env.view(), env.st.known_record(), env.clock()) == []
+    env.erase_job()
+    assert _rows(env, id=rid)[0].username == "eve"
     env.seal()
     env.erase_job()
     assert _rows(env, id=rid)[0].username != "eve"

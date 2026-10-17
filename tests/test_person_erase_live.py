@@ -51,10 +51,11 @@ def chain_started():
 
 
 def _typed_rows(name, n=2):
-    """Audit rows of a failed sign-in with ``name`` typed, as the app writes them (no account)."""
+    """Audit rows of a failed sign-in with ``name`` typed, as the app writes them (no account), dated now: a row
+    dated before the stack's chain began would be a finding of its own."""
     for _ in range(n):
         psql("INSERT INTO audit_logs (id, action, status, timestamp, username, ip_address, details, seal_nonce) "
-             f"VALUES ('{uuid.uuid4()}', 'login_failed', 'failure', now() at time zone 'utc' - interval '2 hours', "
+             f"VALUES ('{uuid.uuid4()}', 'login_failed', 'failure', now() at time zone 'utc', "
              f"'{name}', '198.51.100.23', '{{}}', decode('{uuid.uuid4().hex}', 'hex'))")
 
 

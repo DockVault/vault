@@ -46,8 +46,10 @@ def _chain_started():
 
 
 def _typed(name):
+    """A failed sign-in with ``name`` typed, dated now (a row dated before the stack's chain began would be a
+    finding of its own)."""
     psql("INSERT INTO audit_logs (id, action, status, timestamp, username, details, seal_nonce) "
-         f"VALUES ('{uuid.uuid4()}', 'login_failed', 'failure', now() at time zone 'utc' - interval '3 hours', "
+         f"VALUES ('{uuid.uuid4()}', 'login_failed', 'failure', now() at time zone 'utc', "
          f"'{name}', '{{}}', decode('{uuid.uuid4().hex}', 'hex'))")
 
 
