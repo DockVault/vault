@@ -1405,6 +1405,37 @@ class EraseRequest(Base):
     counts = Column(JSON, nullable=True)
 
 
+class AuditValueRemoval(Base):
+    """A removal of personal values recorded under earlier recording levels (app/core/audit_value_removal.py): the
+    audit rows written before ``before`` are brought down to ``levels``, the levels in force when it was asked for,
+    once the delay has passed.
+
+    The audit log's integrity chain holds the request: its ``request`` seal carries the levels and ``before``, and the
+    pruner acts on that seal, never on this row alone; ``levels``, ``before``, ``request_seq`` and ``effective_at``
+    are copies for the page, and a copy that differs from the seal is not acted on. ``status`` is pending, running,
+    completed or cancelled; ``waiting`` says why a due removal has not run yet; ``counts`` says how many rows it
+    changed. Created by create_all; an older release ignores the table.
+    """
+    __tablename__ = 'audit_value_removals'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status = Column(String(16), nullable=False, index=True)
+    levels = Column(JSON, nullable=False)
+    before = Column(DateTime, nullable=False)
+    request_seq = Column(BigInteger, nullable=True)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=True)
+    requested_at = Column(DateTime, nullable=False)
+    effective_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    waiting = Column(String(255), nullable=True)
+    counts = Column(JSON, nullable=True)
+
+
 class AuditSeal(Base):
     """One seal of the audit log's integrity chain (app/core/audit_integrity.py; the encoding is
     app/core/audit_chain_format.py).

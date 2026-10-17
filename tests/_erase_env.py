@@ -11,11 +11,11 @@ from app.core import audit_integrity as ai
 from app.core import person_erase as pe
 from app.core import retention
 from app.core.models import (AccountInvitation, ActivitySavedSearch, AdminGrant, AuditPrivacyPolicy,  # noqa: F401
-                             CredentialChange, EraseRequest, Note, Notification, RoleEnum, SecurityAlert,
-                             SecurityRecord, TemporaryCredential, User, UserSSHKey)
+                             AuditValueRemoval, CredentialChange, EraseRequest, Note, Notification, RoleEnum,
+                             SecurityAlert, SecurityRecord, TemporaryCredential, User, UserSSHKey)
 
 EXTRA = (EraseRequest, TemporaryCredential, AccountInvitation, SecurityRecord, SecurityAlert, CredentialChange,
-         AdminGrant, ActivitySavedSearch, Notification, Note, AuditPrivacyPolicy, UserSSHKey)
+         AdminGrant, ActivitySavedSearch, Notification, Note, AuditPrivacyPolicy, UserSSHKey, AuditValueRemoval)
 
 
 def add_tables(engine, models=EXTRA):

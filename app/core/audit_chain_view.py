@@ -228,6 +228,7 @@ class View:
         self.acked_rows: Dict[str, List[int]] = {}     # row id -> the host ack seals naming it
         self.late_seqs: List[int] = []
         self.erase_through: Dict[int, Any] = {}        # erase request seq -> its run's scope
+        self.rewrite_through: Dict[int, Any] = {}      # removal request seq -> its run's scope, once begun
         self.erased_rows: set = set()
         self.archives: Dict[date, ArchiveEntry] = {}   # day -> its latest archive seal
         # The newest prune, rewrite or erase seal and the days it changed: an archive seal of cause rewrite
@@ -506,6 +507,8 @@ class View:
                                (bytes.fromhex(h[4]), bytes.fromhex(h[5]), bytes.fromhex(h[6])),
                                h[7] if len(h) > 7 else 0)
             self.last_change = (seal.seq, frozenset(days))
+            if kind == "rewrite" and d.get("request_seq") is not None:
+                self.rewrite_through.setdefault(int(d["request_seq"]), d.get("through"))
             if d.get("request_seq") is not None and d.get("final"):
                 self.finals[int(d["request_seq"])] = seal.seq
         elif kind == "erase":

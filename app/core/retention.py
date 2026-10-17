@@ -425,6 +425,20 @@ def run_person_erases(p: Pass) -> JobResult:
     return audit_chain_erase.run_job(p)
 
 
+def shorten_audit_addresses(p: Pass) -> JobResult:
+    """Addresses in audit rows older than audit_ip_full_days, shortened to their network under the audit chain
+    (app/core/audit_rewrite.py). Held by the hold switch."""
+    from app.core import audit_rewrite
+    return audit_rewrite.shorten_job(p)
+
+
+def run_value_removals(p: Pass) -> JobResult:
+    """Removals of values recorded under earlier recording levels whose delay has run (app/core/audit_value_removal.py),
+    under the audit chain. Held by the hold switch."""
+    from app.core import audit_value_removal
+    return audit_value_removal.run_job(p)
+
+
 def archive_audit_rows(p: Pass) -> JobResult:
     """Audit days older than the row window, moved whole into compressed daily blocks once checked against
     their seals (app/core/audit_archive.py). Deletes nothing, so the hold does not stop it."""
@@ -447,6 +461,8 @@ JOBS: list[Job] = [
     Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),
     Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
     Job("person_erase", "Per-person erases that are due", run_person_erases, held=True),
+    Job("audit_value_removal", "Removals of values recorded under earlier levels", run_value_removals, held=True),
+    Job("audit_ip_shortening", "Full addresses in audit rows past their days", shorten_audit_addresses, held=True),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
     Job("audit_archive", "Audit days moved into compressed daily blocks", archive_audit_rows),
 ]

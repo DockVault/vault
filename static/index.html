@@ -3034,7 +3034,8 @@
                                     Every event is recorded: who acted, what happened, when and its outcome. These
                                     levels decide what is kept of the personal data that comes with an event. The
                                     deployment&apos;s <code>.env</code> sets the most each may record. A change applies to
-                                    events recorded from then on; rows already recorded keep what they recorded.
+                                    events recorded from then on; rows already recorded keep what they recorded, unless
+                                    the values recorded under earlier levels are removed (below).
                                 </p>
                                 <div id="recording-levels-presets" class="flex gap-sm mb-md" role="group" aria-label="Presets"></div>
                                 <div class="table-wrap">
@@ -3052,6 +3053,30 @@
                         <div data-setting="audit_levels" class="card mb-lg">
                             <div class="card-header"><h3>Earlier versions</h3></div>
                             <div class="p-lg"><ol id="recording-levels-history" class="recording-history"></ol></div>
+                        </div>
+                        <!-- Remove the values recorded under earlier levels (static/js/settings-removal.js): previewed
+                             first, asked for with the password, and run after the delay unless an administrator cancels
+                             it. -->
+                        <div data-setting="audit_levels" class="card mb-lg" id="removal-card">
+                            <div class="card-header"><h3>Remove values recorded under earlier levels</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">
+                                    After a level is lowered, the audit rows written before still hold what they
+                                    recorded. A removal brings every row written before it, archived or not, down to
+                                    the levels in force: a shortened address in place of a full one, a fingerprint in
+                                    place of a name typed at sign-in, nothing where a kind is no longer recorded. The
+                                    integrity chain records each changed row. Preview it first; asking asks for your
+                                    password, and it waits before it runs. Addresses can also be shortened as rows
+                                    age: see &quot;Keep full addresses in audit rows for&quot; under Retention.
+                                </p>
+                                <div class="flex gap-sm">
+                                    <button id="removal-preview-btn" class="btn btn-outline" type="button">Preview</button>
+                                    <button id="removal-ask" class="btn btn-danger" type="button" disabled>Ask for this removal</button>
+                                </div>
+                                <div id="removal-preview" class="mt-md" aria-live="polite"></div>
+                                <h4 class="mt-lg">Removals</h4>
+                                <div id="removal-list"></div>
+                            </div>
                         </div>
                         <div data-setting="recording_notice" class="card" id="recording-notice-card">
                             <div class="card-header"><h3>The notice users see</h3></div>
@@ -4153,6 +4178,7 @@
     <script src="/static/js/settings-records.js?v=20261003a"></script>
     <script src="/static/js/settings-retention.js?v=20261017a"></script>
     <script src="/static/js/settings-erase.js?v=20261017a"></script>
+    <script src="/static/js/settings-removal.js?v=20261018a"></script>
     <script src="/static/js/settings-integrity.js?v=20261007a"></script>
     <script src="/static/js/settings-levels.js?v=20261013a"></script>
     <script src="/static/js/notice-banner.js?v=20261002a"></script>

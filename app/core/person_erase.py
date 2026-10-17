@@ -492,6 +492,8 @@ STORES: List[Store] = [
     _simple_store("user_ssh_keys", "SSH keys they added to other accounts", "UserSSHKey", ("created_by_name",)),
     _simple_store("erase_requests", "Other erases they asked for or cancelled", "EraseRequest",
                   ("requested_by_name", "decided_by_name")),
+    _simple_store("audit_value_removals", "Removals of recorded values they asked for or cancelled",
+                  "AuditValueRemoval", ("requested_by_name", "decided_by_name")),
 ]
 STORE_KEYS = {s.key: s for s in STORES}
 
@@ -507,6 +509,7 @@ COVERAGE: Dict[str, str] = {
     "audit_archive_blocks": AUDIT_ROWS,
     "audit_seals": "holds no name: a row's values enter only as a hash under its nonce, which the erase destroys",
     "erase_requests": "erase_requests",
+    "audit_value_removals": "audit_value_removals",
     "security_records": "security_records",
     "security_alerts": "security_alerts",
     "credential_changes": "credential_changes",

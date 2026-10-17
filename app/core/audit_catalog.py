@@ -283,6 +283,14 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("person_erase_requested", "administration", "Erase of a person's records requested", "warning"),
     AuditAction("person_erase_cancelled", "administration", "Erase of a person's records cancelled", "notice"),
     AuditAction("person_erased", "administration", "A person's records erased", "warning", automatic=True),
+    # A removal of values recorded under earlier recording levels (app/core/audit_value_removal.py): asked for,
+    # cancelled by any administrator, and completed by the pruner.
+    AuditAction("audit_values_removal_requested", "administration", "Removal of earlier recorded values requested",
+                "warning"),
+    AuditAction("audit_values_removal_cancelled", "administration", "Removal of earlier recorded values cancelled",
+                "notice"),
+    AuditAction("audit_values_removed", "administration", "Earlier recorded values removed", "warning",
+                automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
     # A managed setting (app/core/settings_registry.py): the row carries the values before and after.

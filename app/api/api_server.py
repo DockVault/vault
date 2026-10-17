@@ -744,6 +744,9 @@ app.include_router(person_erase_router)
 # What the audit log records of personal data (Settings -> Activity and records).
 from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
 app.include_router(recording_levels_router)
+# Removing values recorded under earlier levels, beside them.
+from app.api.value_removal_router import router as value_removal_router  # noqa: E402
+app.include_router(value_removal_router)
 # What the Settings pages need to sort, mark and search every setting (its level, release and lock).
 from app.api.settings_catalogue_router import router as settings_catalogue_router  # noqa: E402
 app.include_router(settings_catalogue_router)

@@ -708,10 +708,10 @@ VACUUM_TABLES = ("audit_seals",) + tuple(s.key for s in pe.STORES) + ("audit_arc
 VACUUM_BUDGET_SECONDS = 300.0
 
 
-def vacuum(engine, budget: float = VACUUM_BUDGET_SECONDS) -> List[str]:
-    """A plain VACUUM of the tables an erase changes (Postgres; elsewhere nothing), within ``budget`` seconds in
-    all: the space of the old values is marked for reuse sooner. Returns the tables vacuumed. Never raises:
-    autovacuum follows anyway."""
+def vacuum(engine, budget: float = VACUUM_BUDGET_SECONDS, tables: tuple = VACUUM_TABLES) -> List[str]:
+    """A plain VACUUM of the tables an erase changes (or ``tables``; Postgres, elsewhere nothing), within ``budget``
+    seconds in all: the space of the old values is marked for reuse sooner. Returns the tables vacuumed. Never
+    raises: autovacuum follows anyway."""
     import time
     from sqlalchemy import text
     done: List[str] = []
@@ -720,7 +720,7 @@ def vacuum(engine, budget: float = VACUUM_BUDGET_SECONDS) -> List[str]:
     deadline = time.monotonic() + budget
     try:
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-            for table in VACUUM_TABLES:
+            for table in tables:
                 left = deadline - time.monotonic()
                 if left <= 1:
                     _ai()._say("Warning: the VACUUM after an erase stopped at its time budget; autovacuum follows")

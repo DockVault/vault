@@ -281,6 +281,11 @@ def request_problem(view, seal) -> Optional[str]:
             return f"a request for {d.get('setting')!r}, which is not a setting the panel manages"
         if d.get("subject") is not None or d.get("placeholder") is not None:
             return "a setting request with an erase's fields"
+    if what == "removal":
+        from app.core import audit_rewrite
+        problem = audit_rewrite.removal_request_problem(d, seal.sealed_at)
+        if problem:
+            return problem
     if what == "erase":
         ph = d.get("placeholder")
         if not isinstance(ph, str) or not PLACEHOLDER.match(ph) or not d.get("subject"):
@@ -349,7 +354,8 @@ def other_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
             return "a late seal more than 6 hours after its hour's seal"
     elif seal.kind in ("prune", "rewrite"):
         hours = d.get("hours")
-        if not isinstance(hours, list) or not hours:
+        # Only a removal's last rewrite seal holds no hour (app/core/audit_rewrite.py rewrite_problem).
+        if not isinstance(hours, list) or (not hours and not (seal.kind == "rewrite" and d.get("final") is True)):
             return f"a {seal.kind} seal with no hours"
         days = set()
         for h in hours:
@@ -381,6 +387,11 @@ def other_problem(view, seal, record: Optional[dict] = None) -> Optional[str]:
                 problem = audit_chain_size.size_problem(view, seal, record=record)
                 if problem:
                     return problem
+        if seal.kind == "rewrite":
+            from app.core import audit_rewrite
+            problem = audit_rewrite.rewrite_problem(view, seal)
+            if problem:
+                return problem
     elif seal.kind == "erase":
         req = view.requests.get(d.get("request_seq"))
         if req is None or req.get("what") != "erase" or req.get("placeholder") != d.get("placeholder"):
@@ -1139,6 +1150,14 @@ def daily_check(session_factory, st=None, now: Optional[datetime] = None, *, for
                 report.add(FAILURE, "unjustified-input", message)
         except Exception as exc:  # noqa: BLE001 -- the next check tries again
             ai._say(f"Warning: the waiting erases were not checked ({type(exc).__name__})")
+        # The same for each pending removal of values recorded under earlier levels: its row holds the levels and
+        # the scope its request seal holds (app/core/audit_value_removal.py).
+        try:
+            from app.core import audit_value_removal
+            for message in audit_value_removal.pending_input_problems(db, report.view):
+                report.add(FAILURE, "unjustified-input", message)
+        except Exception as exc:  # noqa: BLE001 -- the next check tries again
+            ai._say(f"Warning: the waiting removals were not checked ({type(exc).__name__})")
     finally:
         db.close()
     failures = {f.kind: f.message for f in report.findings if f.severity == FAILURE}

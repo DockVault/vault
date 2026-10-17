@@ -123,9 +123,13 @@ def describe(db: Session) -> dict:
                       "limit_source": "env" if settings_registry._env_is_set(ap.ENV_NAMES[key]) else "default",
                       "choices": choices})
     from app.core.sftp_versions import sftp_same_version
+    from app.core.audit_rewrite import FULL_DAYS_KEY
     check = sftp_same_version(db)
+    full_days = settings_registry.resolve(FULL_DAYS_KEY)
     return {
         "version": latest.version, "kinds": kinds, "locked": locked,
+        # How many days an address stays in full before the pruner shortens it (0: as recorded), a retention setting.
+        "ip_full_days": full_days if isinstance(full_days, int) and not isinstance(full_days, bool) else 0,
         "lock_line": f"SETTINGS_LOCKED_KEYS={ap.LOCK_GROUP}",
         "presets": [{"key": name, "label": PRESET_LABELS[name], "levels": within(levels, limits)}
                     for name, levels in PRESETS.items()],

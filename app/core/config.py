@@ -496,6 +496,10 @@ class Settings(BaseSettings):
     # the panel may change it. The log-access file (LOG_PULL_SINK_PATH) and its two older copies hold
     # LOG_PULL_SINK_MAX_MB in all (3-1000).
     notification_retention_days: int = Field(default=0)
+    # How many days an address in an audit row stays in full before it is shortened to its network
+    # (app/core/audit_rewrite.py); 0, the default, keeps it as recorded. The panel may change it (a lower number
+    # waits the reduction delay).
+    audit_ip_full_days: int = Field(default=0)
     log_pull_sink_max_mb: int = Field(default=15)
     # The audit log's integrity chain (app/core/audit_integrity.py): every closed hour of audit rows is
     # sealed, and the seals are chained under a key the database never holds. AUDIT_CHAIN_KEY is that key's

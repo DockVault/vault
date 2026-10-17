@@ -27,7 +27,7 @@ LINES = {"AUDIT_LOG_RETENTION_DAYS", "AUDIT_MIN_RETENTION_DAYS", "AUDIT_PROTECTE
          "LOG_PRUNE_INTERVAL_MINUTES", "LOG_PRUNE_BATCH_ROWS", "SECURITY_RECORD_DAYS", "SECURITY_RECORD_MIN_DAYS",
          "SECURITY_RECORD_MAX_DAYS", "SECURITY_ALERT_RETENTION_DAYS", "AUDIT_SEAL_LAG_MINUTES", "AUDIT_HOT_DAYS",
          "AUDIT_ARCHIVE_START_AFTER_DAYS", "ERASE_BLOCKED_BY_PROTECTED_MINIMUM", "NOTIFICATION_RETENTION_DAYS",
-         "LOG_PULL_SINK_MAX_MB"}
+         "LOG_PULL_SINK_MAX_MB", "AUDIT_IP_FULL_DAYS"}
 
 
 @pytest.fixture(autouse=True)
@@ -113,12 +113,13 @@ def test_every_setting_whose_change_deletes_sooner_has_its_direction():
     """The settings an administrator changes in the panel wait such a change; the ones only .env sets say so here
     (resolved alerts deleted sooner, a smaller log-access file, an erase no longer held by the protected
     minimum). The others delete nothing sooner: the delay, the pass's timing and size, the sealing lag, the
-    archive's window and start (archived rows are kept), and the fixed windows."""
+    archive's window and start (archived rows are kept), and the fixed windows. Fewer days of full addresses
+    removes them sooner."""
     assert {s.key: s.reduction for s in rr.specs() if s.reduction} == {
         key: reg.LOWER for key in ("audit_max_days", "audit_min_days", "audit_admin_min_days", "audit_max_mb",
                                    "logs_hold", "security_record_days", "notification_retention_days",
                                    "security_alert_retention_days", "log_pull_sink_max_mb",
-                                   "erase_blocked_by_protected_minimum")}
+                                   "erase_blocked_by_protected_minimum", "audit_ip_full_days")}
 
 
 def test_an_env_only_setting_lowered_is_said_to_delete_sooner(deployment):

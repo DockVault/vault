@@ -83,6 +83,8 @@ NOT_RECORDED = {
         "renders a preview; nothing is stored or sent",
     ("app/api/person_erase_router.py", "POST /settings/erase-requests/preview"):
         "counts what an erase would change; nothing is stored (asking for the erase is recorded)",
+    ("app/api/value_removal_router.py", "POST /settings/value-removals/preview"):
+        "counts what a removal would change; nothing is stored (asking for the removal is recorded)",
 }
 
 
