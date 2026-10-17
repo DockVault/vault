@@ -311,3 +311,20 @@ def test_once_done_a_pass_reads_only_what_has_aged_since(env30, monkeypatch):
     env.clock.advance(hours=6)
     rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert seen == [ai.hour_floor(T0 - timedelta(days=30))]
+
+
+def test_an_hour_another_writer_sealed_waits_for_the_host(env30, monkeypatch):
+    """An hour whose seal another writer appended and the host has not acknowledged is left as it is, and the run
+    waits there (its rows may have been edited and sealed over); once acknowledged, it goes on."""
+    env = env30
+    held_row, later = env.put(T0 - timedelta(days=40)), env.put(T0 - timedelta(days=35))
+    env.run_until_sealed()
+    hour = ai.hour_floor(T0 - timedelta(days=40))
+    real = ai.hour_held
+    monkeypatch.setattr(ai, "hour_held", lambda view, record, h: 77 if h == hour else real(view, record, h))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(held_row).ip_address == "203.0.113.9" and env.get(later).ip_address == "203.0.113.9"
+    assert env.rewrite_seals() == []
+    monkeypatch.setattr(ai, "hour_held", real)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(held_row)) and _shortened(env.get(later))

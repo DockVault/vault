@@ -358,3 +358,16 @@ def test_a_removal_request_not_well_formed_is_found_by_verify(env):
             "subject": None, "placeholder": None, "not_before": fmt.time_text(sealed_at + timedelta(days=7)),
             "audit_row": None, "by": "admin", "user_id": None})
     assert failures(env.verify()) != []
+
+
+def test_a_removal_waits_at_an_hour_another_writer_sealed(env, monkeypatch):
+    ids = _hot(env)
+    asked = env.ask_removal()
+    hour = ai.hour_floor(T0 - timedelta(hours=30))
+    real = ai.hour_held
+    monkeypatch.setattr(ai, "hour_held", lambda view, record, h: 77 if h == hour else real(view, record, h))
+    env.week()
+    assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    assert "waits for the host operator" in (env.removal_row(asked["id"]).waiting or "")
+    monkeypatch.setattr(ai, "hour_held", real)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
