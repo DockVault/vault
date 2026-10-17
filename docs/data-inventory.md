@@ -302,6 +302,11 @@ the recipients' mailboxes.
   acknowledge`** and the other host commands (`rekey`, `after-record`, `accept-database-head`,
   `accept-restore`, `acknowledge-removed-before`, `change-key`) write their seals audited as the host
   operator; `after-record --discard` saves the seals it deletes in a file beside the head record.
+  **`python dockvault.py audit retention`** (**new in 0.34.0**) prints how long each kind of record is kept,
+  as the server has it, and where each value comes from; with `--set NAME=VALUE` it changes a line of
+  `.env` once the server has checked it (it reads no personal data). `audit unarchive` restores archived
+  days as audit rows; `audit compact` gives the audit tables' free space back to the system (both are on
+  the `audit` menu too).
 - **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.
@@ -386,6 +391,9 @@ and the unlock state.
 
 ## Retention settings
 
+`python dockvault.py audit retention` prints these as the running server has them, and changes a `.env`
+line after checking it; Settings, Activity and records shows them in the panel.
+
 | Setting | Default | Governs |
 |---|---|---|
 | `AUDIT_LOG_RETENTION_DAYS` | `0` (keep for ever) | Audit rows: the deployment's maximum days, which the panel can change. |
@@ -395,6 +403,8 @@ and the unlock state.
 | `PLAN_LOG_MAX_DAYS`, `PLAN_LOG_MAX_MB` | `-1` (none) | Ceilings on the audit log's maximum days and size cap. |
 | `RETENTION_REDUCTION_DELAY_DAYS` | `7` | How long a change that deletes sooner waits; any administrator can cancel it meanwhile. |
 | `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
+| `AUDIT_HOT_DAYS` | `90` | Audit rows older than this (31 to 3650) are moved into compressed daily blocks, `audit_archive_blocks`; nothing is deleted. |
+| `AUDIT_ARCHIVE_START_AFTER_DAYS` | `14` | Archiving starts this long (0 to 90) after 0.34.0 first ran. |
 | `ERASE_BLOCKED_BY_PROTECTED_MINIMUM` | `false` | When `true`, a per-person erase waits until every audit row it would change is older than the protected minimum for its kind. |
 | `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records (and seals the audit log's hours). At most 360 take effect: the integrity chain needs a seal at least every 12 hours. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |
@@ -461,3 +471,27 @@ and the unlock state.
 - Changed: the web app's forms are sent only by its scripts, never by the browser itself, so what is
   typed into them (a username and password at sign-in included) no longer reaches an address, the
   browser history or a reverse proxy's log when a form is sent before the page has finished loading.
+
+## What 0.34.0 added
+
+How long records are kept, the audit log's integrity, its archive and erasing a person:
+
+- Timed deletion: the pruner deletes on a timer, in the web container only, never when a page is read.
+  Audit rows are still kept for ever by default; a positive `AUDIT_LOG_RETENTION_DAYS` from an earlier
+  release first waits `RETENTION_REDUCTION_DELAY_DAYS` with notice. Administration and security rows are kept
+  at least `AUDIT_PROTECTED_MIN_DAYS` (365). The panel can change the numbers within `.env`'s limits; a
+  change that deletes sooner waits and every administrator is told (`managed_settings`,
+  `managed_setting_changes`). The hold switch (`RETENTION_HOLD`) stops every deletion of logs.
+- `security_records`: each failed sign-in in full for `SECURITY_RECORD_DAYS` (30); security alerts lose
+  their names and addresses after the same time, and their messages no longer spell them out.
+- `audit_seals` and `audit_logs.seal_nonce`: the integrity chain, and the head record on the keys volume.
+- `audit_archive_blocks`: audit rows older than `AUDIT_HOT_DAYS` (90), compressed, from
+  `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) after the upgrade. They hold the same personal data as the rows they
+  replace. `python dockvault.py audit unarchive` restores them; an earlier release cannot read them.
+- `erase_requests`: a per-person erase, with its name only sealed; see [Erasing a person](#erasing-a-person)
+  and what it does not reach.
+- Working records: invitations, and used or expired reset links, one-time codes and email-change codes, are
+  deleted 30 days after they end (they were kept); notifications after `NOTIFICATION_RETENTION_DAYS` when
+  set (0 keeps them, as before). The log-access file holds `LOG_PULL_SINK_MAX_MB` (15) in all.
+- Container output rotates in the shipped compose files (`DOCKER_LOG_MAX_SIZE`, `DOCKER_LOG_MAX_FILE`), on
+  installs whose compose files come from 0.34.0.
