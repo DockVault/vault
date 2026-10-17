@@ -403,12 +403,14 @@ def test_used_or_expired_reset_links_and_codes_go_thirty_days_after_they_end(env
             _proof(db, model, user, expires_at=NOW - 29 * DAY),
             _proof(db, model, user, expires_at=NOW + timedelta(minutes=10))}
     gone = {_proof(db, model, user, consumed_at=NOW - 31 * DAY, expires_at=NOW - 31 * DAY + timedelta(minutes=10)),
+            # Used 31 days ago, before an expiry that has not come: it ended when it was used.
+            _proof(db, model, user, consumed_at=NOW - 31 * DAY, expires_at=NOW + DAY),
             _proof(db, model, user, expires_at=NOW - 31 * DAY)}
     result = _pass(factory)["one_time_proofs"]
-    assert result.deleted == 2
+    assert result.deleted == 3
     assert _ids(factory, model) == kept and not gone & _ids(factory, model)
     (row,) = _pruned(factory, "one_time_proofs")
-    assert (row["table"], row["deleted"]) == (model.__tablename__, 2)
+    assert (row["table"], row["deleted"]) == (model.__tablename__, 3)
 
 
 def test_each_kind_of_one_time_proof_goes_in_one_pass(env, factory):
