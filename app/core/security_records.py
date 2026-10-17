@@ -15,8 +15,9 @@ The pruner (app/core/retention.py) deletes records older than the window, and at
 name and the address from security alerts, resolved or not: an unresolved alert no longer holds personal
 data for ever. An alert's message never carries them: it holds ``{username}`` and ``{ip_address}`` where they
 belong, and the text is completed from the alert's own fields when it is shown (render_message), so once
-they are cleared the message says so. The security monitor's statistics of failed sign-ins read these
-records.
+they are cleared the message says so. The window both jobs act on is the longer of the database's value and
+the audit chain's honoured one, and they wait while the chain cannot give it (window()). The security
+monitor's statistics of failed sign-ins read these records.
 """
 from __future__ import annotations
 
@@ -58,8 +59,30 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def window() -> timedelta:
-    return timedelta(days=registry.resolve(WINDOW_KEY))
+def _chain_days() -> Optional[int]:
+    """security_record_days as the audit chain's honoured state gives it, or None while the chain cannot give it
+    (no chain yet, or sealing stopped)."""
+    from app.core import audit_chain_policy_seals as ps
+    values = ps.numbers()
+    if values is None:
+        return None
+    try:
+        return int(values[WINDOW_KEY])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def window() -> Optional[timedelta]:
+    """How long a failed sign-in is kept in full, and an alert keeps its name and address; None waits. A
+    setting an administrator may lower, so the two jobs act on the audit chain's honoured value
+    (audit_chain_policy_seals.numbers), never on the database's alone, and on whichever of the two keeps
+    longer: a value written into the database without the server's key cannot make them delete sooner. While
+    the chain cannot give the value, nothing is deleted or cleared."""
+    days = int(registry.resolve(WINDOW_KEY))
+    chain = _chain_days()
+    if chain is None:
+        return None
+    return timedelta(days=max(days, chain))
 
 
 def record(db, *, kind: str, name: Optional[str], address: Optional[str], channel: Optional[str] = None,
@@ -117,24 +140,33 @@ def _scrubbed(message: Optional[str], name: Optional[str], address: Optional[str
 
 
 def prune_records(p):
-    """The pruner's job: records older than the window."""
+    """The pruner's job: records older than the window; nothing while the audit chain cannot give it."""
     from app.core import retention
     from app.core.models import SecurityRecord
+    keep = window()
+    if keep is None:
+        registry._say("The pruner's security_records job waits for the audit chain")
+        return retention.JobResult()
     return p.delete_in_batches(
-        SecurityRecord, retention.deletable(SecurityRecord, p.now, SecurityRecord.at < p.now - window()),
+        SecurityRecord, retention.deletable(SecurityRecord, p.now, SecurityRecord.at < p.now - keep),
         SecurityRecord.at)
 
 
 def clear_alert_values(p):
     """The pruner's job: the name and the address of every alert older than the window, resolved or not,
-    cleared (and taken out of its message), in batches. Deletes nothing."""
+    cleared (and taken out of its message), in batches. Deletes nothing. Nothing while the audit chain cannot
+    give the window."""
     from app.core import retention
     from app.core.models import SecurityAlert
     result = retention.JobResult()
+    keep = window()
+    if keep is None:
+        registry._say("The pruner's security_alert_values job waits for the audit chain")
+        return result
     while p.time_left():
         with p.transaction() as db:
             alerts = (db.query(SecurityAlert)
-                      .filter(*retention.deletable(SecurityAlert, p.now, SecurityAlert.timestamp < p.now - window(),
+                      .filter(*retention.deletable(SecurityAlert, p.now, SecurityAlert.timestamp < p.now - keep,
                                                    or_(SecurityAlert.username.isnot(None),
                                                        SecurityAlert.ip_address.isnot(None))))
                       .order_by(SecurityAlert.timestamp).limit(p.batch_rows).with_for_update(skip_locked=True).all())

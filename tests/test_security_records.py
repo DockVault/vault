@@ -29,9 +29,10 @@ set_bare_api_env()
 from app.core import retention  # noqa: E402
 from app.core import security_records as srec  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, AuditSeal, ManagedSetting, ManagedSettingChange, RoleEnum,  # noqa: E402
-                             SecurityAlert, SecurityRecord, SystemSetting, User)
+from app.core.models import (AuditArchiveBlock, AuditLog, AuditSeal, ManagedSetting,  # noqa: E402
+                             ManagedSettingChange, RoleEnum, SecurityAlert, SecurityRecord, SystemSetting, User)
 from app.services import audit_logger, audit_row_hooks  # noqa: E402
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -59,8 +60,8 @@ def factory(monkeypatch):
         copies = sa.MetaData()
         # The audit chain's table too, empty: the pruner holds the jobs over logs when it cannot tell whether a
         # chain it has not read holds them.
-        for model in (User, AuditLog, AuditSeal, SecurityRecord, SecurityAlert, ManagedSetting, ManagedSettingChange,
-                      SystemSetting):
+        for model in (User, AuditLog, AuditSeal, AuditArchiveBlock, SecurityRecord, SecurityAlert, ManagedSetting,
+                      ManagedSettingChange, SystemSetting):
             columns = [sa.Column(c.name, c.type, primary_key=c.primary_key, nullable=c.nullable)
                        for c in model.__table__.columns]
             sa.Table(model.__tablename__, copies, *columns)
@@ -297,24 +298,78 @@ def test_every_place_that_audits_a_failed_sign_in_writes_the_record():
 
 # --------------------------------------------------------------------------- the window
 
+@pytest.fixture
+def chain(monkeypatch, tmp_path, env, factory):
+    """The audit log's integrity chain on the test's database, started: the record jobs act on its window."""
+    c = Chain(monkeypatch, tmp_path, env, factory, NOW)
+    c.seal_all(NOW)
+    return c
+
+
 def _old_record(db, days, name="x"):
     db.add(SecurityRecord(id=uuid.uuid4(), at=NOW - timedelta(days=days), kind=srec.LOGIN, name=name,
                           address="203.0.113.9"))
     db.commit()
 
 
-def test_records_go_after_the_window(env, factory):
+def test_records_go_after_the_window(env, factory, chain):
     db = factory()
-    for days, name in ((31, "old"), (29, "recent")):
+    for days, name in ((31, "old"), (29, "recent"), (11, "newer")):
         _old_record(db, days, name)
     done = dict(retention.run_pass(factory, now=NOW))
     assert done["security_records"].deleted == 1
-    assert [r.name for r in _records(factory)] == ["recent"]
-    s = factory()
-    reg.store(s, srec.WINDOW_KEY, 10)                   # the pass reads the stored window itself
-    s.commit()
+    assert [r.name for r in _records(factory)] == ["recent", "newer"]
+    # SECURITY_RECORD_DAYS changed in .env: the next pass seals it, then acts on it.
+    env.security_record_days = 10
+    chain.setenv("SECURITY_RECORD_DAYS", 10)
     retention.run_pass(factory, now=NOW)
     assert _records(factory) == []
+
+
+def test_a_shorter_window_written_into_the_database_deletes_no_record_sooner(env, factory, chain):
+    """The database's value of security_record_days, set without the server's key, cannot make the record jobs
+    delete or clear sooner than the audit chain's value: they act on whichever keeps longer."""
+    db = factory()
+    _old_record(db, 10, "young")
+    _old_record(db, 31, "old")
+    young_alert, old_alert = _alert(db, 10), _alert(db, 31)
+    reg.store(db, srec.WINDOW_KEY, 7)                   # behind the panel's back
+    db.commit()
+    done = dict(retention.run_pass(factory, now=NOW))
+    assert reg.resolve(srec.WINDOW_KEY) == 7 and srec.window() == timedelta(days=30)
+    assert done["security_records"].deleted == 1 and done["security_alert_values"].cleared == 1
+    assert [r.name for r in _records(factory)] == ["young"]
+    got = {a.id: a for a in factory().query(SecurityAlert).all()}
+    assert got[young_alert].username == "mallory" and got[old_alert].username is None
+
+
+def test_the_record_window_is_the_longer_of_the_database_and_the_chain_and_waits_for_the_chain(env, monkeypatch):
+    from app.core import audit_chain_policy_seals as ps
+    values = {"answer": None}
+    monkeypatch.setattr(ps, "numbers", lambda st=None: values["answer"])
+    assert srec.window() is None                        # no chain yet, or sealing stopped: wait
+    values["answer"] = {}
+    assert srec.window() is None                        # the chain's state does not hold it: wait
+    values["answer"] = {srec.WINDOW_KEY: 90}
+    assert srec.window() == timedelta(days=90)
+    values["answer"] = {srec.WINDOW_KEY: 10}
+    assert srec.window() == timedelta(days=30)          # the database's 30 keeps longer
+
+
+def test_the_record_jobs_delete_and_clear_nothing_while_the_chain_cannot_give_the_window(env, factory, monkeypatch,
+                                                                                        capsys):
+    from app.core import audit_chain_policy_seals as ps
+    db = factory()
+    _old_record(db, 400)
+    alert = _alert(db, 400)
+    monkeypatch.setattr(ps, "numbers", lambda st=None: None)
+    capsys.readouterr()
+    done = dict(retention.run_pass(factory, now=NOW))
+    assert (done["security_records"].deleted, done["security_alert_values"].cleared) == (0, 0)
+    assert len(_records(factory)) == 1 and factory().get(SecurityAlert, alert).username == "mallory"
+    said = capsys.readouterr().out
+    for job in ("security_records", "security_alert_values"):
+        assert f"The pruner's {job} job waits for the audit chain" in said, said
 
 
 def test_the_hold_switch_stops_the_record_jobs(env, factory):
@@ -339,7 +394,7 @@ def _alert(db, days, *, resolved=False, username="mallory", ip="203.0.113.66",
     return alert.id
 
 
-def test_old_alerts_lose_their_names_and_addresses_resolved_or_not(env, factory):
+def test_old_alerts_lose_their_names_and_addresses_resolved_or_not(env, factory, chain):
     db = factory()
     open_old = _alert(db, 40)
     resolved_old = _alert(db, 40, resolved=True)
