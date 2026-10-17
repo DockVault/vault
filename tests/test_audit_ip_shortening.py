@@ -328,3 +328,21 @@ def test_an_hour_another_writer_sealed_waits_for_the_host(env30, monkeypatch):
     monkeypatch.setattr(ai, "hour_held", real)
     rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert _shortened(env.get(held_row)) and _shortened(env.get(later))
+
+
+def test_an_archived_rewrite_that_would_change_more_than_the_values_writes_nothing(env30, monkeypatch):
+    env = env30
+    row = env.put(datetime.combine(DAY, time(3, 5)))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        before = db.query(AuditArchiveBlock).one().payload
+    seals = len(env.seals())
+    real = rw.shortened
+    monkeypatch.setattr(rw, "shortened", lambda r: dict(real(r) or {}, action="file_deleted") if real(r) else None)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == before
+    assert len(env.seals()) == seals
+    assert "rows-altered" in ((env.st.head_store().load() or {}).get("failures") or {})
+    assert failures(env.verify()) == []
