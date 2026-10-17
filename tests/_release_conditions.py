@@ -33,8 +33,9 @@ DETECT = {
     "archived-audit-history-hidden": (
         "SELECT count(DISTINCT day) AS days, sum(row_count) AS rows, min(day) AS first_day, max(day) AS last_day "
         "FROM audit_archive_blocks HAVING count(*) > 0"),
+    # A value cleared in the panel is stored as JSON null, not as SQL NULL.
     "panel-retention-not-read": (
-        "SELECT key, value FROM managed_settings WHERE value IS NOT NULL ORDER BY key"),
+        "SELECT key, value FROM managed_settings WHERE value IS NOT NULL AND value::text <> 'null' ORDER BY key"),
 }
 
 # The one whose rows stop the upgraded deployment going back across the edge.
