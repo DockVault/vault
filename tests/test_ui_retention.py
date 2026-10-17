@@ -103,6 +103,9 @@ def test_values_show_their_source_and_a_locked_one_its_env_line(page: Page, admi
     expect(keep.locator("input[type=number]")).to_be_visible()
     expect(keep.locator(".retention-source")).to_have_text(re.compile(r"^(Default|From \.env|Set here)$"))
     expect(page.locator('#retention-groups .retention-group[data-group="working_records"]')).to_contain_text("Fixed")
+    # One of a unit is said in the singular.
+    expect(_row(page, "rate_limit_records_hours").locator(".retention-value")).to_have_text("1 hour")
+    expect(_row(page, "session_records_days").locator(".retention-value")).to_have_text(re.compile(r"^\d+ days$"))
     expect(page.locator("#retention-storage")).to_contain_text("Audit rows:")
     expect(page.locator("#retention-storage")).to_contain_text("The database's volume is in another container")
     expect(page.locator("#retention-storage .retention-archive")).to_contain_text("The oldest day still kept as rows is ")

@@ -62,7 +62,8 @@
         if (v == null) return 'not set';
         if (row.kind === 'bool') return v ? 'On' : 'Off';
         if (row.unlimited != null && v === row.unlimited) return row.unit === 'MB' ? 'No cap' : 'No limit';
-        return row.unit ? `${v} ${row.unit}` : String(v);
+        if (!row.unit) return String(v);
+        return `${v} ${v === 1 && row.unit.endsWith('s') ? row.unit.slice(0, -1) : row.unit}`;   // 1 hour, 1 day
     }
 
     function rank(row, v) {

@@ -3286,6 +3286,8 @@ def retention_value_text(row, value):
     if row.get("unlimited") is not None and value == row.get("unlimited"):
         return "no cap" if row.get("unit") == "MB" else "no limit"
     unit = server_text(row.get("unit"))
+    if value == 1 and unit.endswith("s"):
+        unit = unit[:-1]                                  # 1 hour, 1 day
     return ("%s %s" % (server_text(value), unit)).strip()
 
 

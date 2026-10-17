@@ -126,6 +126,12 @@ def test_retention_shows_what_the_server_has(tmp_path, monkeypatch, capsys):
     assert _env(tmp_path) == "EXISTING=1\n"
 
 
+@pytest.mark.parametrize("value, unit, text", [(1, "hours", "1 hour"), (1, "days", "1 day"), (2, "hours", "2 hours"),
+                                              (1, "MB", "1 MB"), (1, "rows", "1 row"), (0, "days", "0 days")])
+def test_one_of_a_unit_is_said_in_the_singular(value, unit, text):
+    assert dv.retention_value_text({"kind": "int", "unit": unit, "unlimited": None}, value) == text
+
+
 def test_a_switch_held_on_by_env_says_so():
     held = dict(SETTINGS[2], floor=True)
     lines = dv.describe_retention({"settings": [held]})
