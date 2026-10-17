@@ -69,6 +69,17 @@ def test_the_queries_on_the_database_being_upgraded_read_only_what_0_33_2_has():
             assert columns <= set().union(*(rc.OLDER_SCHEMA[t] for t in rc.TABLES[cid])), (cid, columns)
 
 
+def test_the_archive_condition_counts_what_archiving_moves_when_it_starts():
+    """Archiving starts AUDIT_ARCHIVE_START_AFTER_DAYS after the upgrade and moves the days before the day
+    AUDIT_HOT_DAYS ago: with the defaults, the days before the day their difference ago today."""
+    from app.core import audit_archive
+    from app.core import settings_registry as reg
+    days = reg.spec_for(audit_archive.HOT_DAYS_KEY).default - reg.spec_for(audit_archive.START_AFTER_KEY).default
+    assert days == 76
+    assert (f"WHERE timestamp < date_trunc('day', (now() AT TIME ZONE 'utc') - interval '{days} days') "
+            in rc.DETECT["audit-history-compressed-after-90-days"])
+
+
 def test_the_older_schema_listed_is_0_33_2s():
     try:
         out = subprocess.run(["git", "show", "v0.33.2:app/core/models.py"], cwd=ROOT, capture_output=True, text=True,

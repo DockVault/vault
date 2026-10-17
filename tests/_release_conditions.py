@@ -9,9 +9,12 @@ others on the database being upgraded, so they read only tables and columns 0.33
 """
 
 DETECT = {
+    # What archiving moves when it starts, with the default windows: it starts AUDIT_ARCHIVE_START_AFTER_DAYS (14)
+    # after the upgrade and moves each UTC day before the day AUDIT_HOT_DAYS (90) ago, so the rows of the days before
+    # the day 76 days ago now (app/core/audit_archive.py takes days before the date of now less the hot days).
     "audit-history-compressed-after-90-days": (
         "SELECT count(*) AS rows_to_archive, min(timestamp) AS oldest FROM audit_logs "
-        "WHERE timestamp < (now() AT TIME ZONE 'utc') - interval '90 days' HAVING count(*) > 0"),
+        "WHERE timestamp < date_trunc('day', (now() AT TIME ZONE 'utc') - interval '76 days') HAVING count(*) > 0"),
     "audit-retention-runs-on-a-timer": (
         "SELECT count(*) AS audit_rows, min(timestamp) AS oldest FROM audit_logs HAVING count(*) > 0"),
     "alert-names-and-addresses-cleared-after-30-days": (
