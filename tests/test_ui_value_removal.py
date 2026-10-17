@@ -1,4 +1,4 @@
-"""UI — Settings -> Activity and records: remove the values recorded under earlier levels
+"""UI: Settings -> Activity and records: remove the values recorded under earlier levels
 (static/js/settings-removal.js).
 
 At full the preview says there is nothing to remove and asking stays off. With a level lowered the preview lists each
