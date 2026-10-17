@@ -115,9 +115,10 @@ def test_retention_shows_what_the_server_has(tmp_path, monkeypatch, capsys):
 
 
 def test_a_failure_of_the_server_fails_the_command(tmp_path, monkeypatch):
-    tool, _stub = _setup(tmp_path, monkeypatch, error="refused: NOPE is not a .env line")
+    tool, stub = _setup(tmp_path, monkeypatch, error="refused: NOPE is not a .env line")
     with pytest.raises(SystemExit):
         tool.audit(_args("retention", "--set", "NOPE=1"))
+    assert stub.calls == [["retention", "--set", "NOPE=1"]]
     assert _env(tmp_path) == "EXISTING=1\n"
 
 
@@ -166,10 +167,11 @@ def test_with_yes_the_line_is_written_without_asking_and_replaces_the_old_one(tm
 
 
 def test_a_locked_env_is_never_written(tmp_path, monkeypatch):
-    tool, _stub = _setup(tmp_path, monkeypatch, check=SOONER, env=None)
+    tool, stub = _setup(tmp_path, monkeypatch, check=SOONER, env=None)
     (tmp_path / ".env.enc").write_text("sealed", encoding="utf-8")
     with pytest.raises(SystemExit):
         tool.audit(_args("retention", "--set", "AUDIT_LOG_RETENTION_DAYS=30", "--yes"))
+    assert stub.calls == [["retention", "--set", "AUDIT_LOG_RETENTION_DAYS=30"]]       # checked, then refused
     assert not (tmp_path / ".env").exists()
 
 
