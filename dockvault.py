@@ -53,7 +53,7 @@ MENU = [
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
     ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
-    ("audit", "Audit log - verify its integrity chain and print the head to keep elsewhere"),
+    ("audit", "Audit log - retention, verify the integrity chain, unarchive, compact"),
 ]
 
 
@@ -251,6 +251,9 @@ REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
 # name, the app's default): written only when they differ from the default, and kept across a fresh volume
 # set (see .env.example).
 RETENTION_ENV_KEYS = (
+    # The audit log's maximum days, and how long resolved security alerts are kept (both older than the rest).
+    ("audit_log_retention_days", "AUDIT_LOG_RETENTION_DAYS", "0"),
+    ("security_alert_retention_days", "SECURITY_ALERT_RETENTION_DAYS", "90"),
     ("retention_reduction_delay_days", "RETENTION_REDUCTION_DELAY_DAYS", "7"),
     ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
     ("log_prune_batch_rows", "LOG_PRUNE_BATCH_ROWS", "5000"),
@@ -3242,6 +3245,94 @@ def server_text(value, default=""):
     return clean_matrix_text(value if isinstance(value, str) else str(value))
 
 
+# The audit menu: what `audit` does when it is chosen from the top menu (each is also `audit <action>`).
+AUDIT_MENU = (
+    ("retention", "Retention - how long records are kept, and change a .env limit"),
+    ("verify", "Verify - check the integrity chain and print its head to keep elsewhere"),
+    ("unarchive", "Unarchive - restore archived days as rows (checks the free space first)"),
+    ("compact", "Compact - give the audit tables' free space back to the system (locks them while it runs)"),
+)
+# The headings of the retention settings' groups, as the Settings page names them.
+RETENTION_GROUPS = (("audit_retention", "Audit log"), ("retention", "Other records"),
+                    ("audit_integrity", "Sealing"), ("working_records", "Fixed periods"))
+_RETENTION_SOURCES = {"default": "default", "env": "from .env", "admin": "set in the panel",
+                      "locked": "locked by .env"}
+_ENV_LINE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def parse_retention_sets(texts):
+    """--set NAME=VALUE texts as [(NAME, VALUE)], or raise ValueError naming the first that is not of that form
+    (an upper-case .env name, a value without a line break) or that repeats a name. Which names are lines of
+    the retention settings, and which values the server accepts, the server says (audit retention)."""
+    out, seen = [], set()
+    for text in texts or []:
+        name, sep, value = (text or "").partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not _ENV_LINE.match(name) or not value or "\n" in value or "\r" in value:
+            raise ValueError("%r is not NAME=VALUE (an upper-case .env name)" % (text,))
+        if name in seen:
+            raise ValueError("%s is given twice" % name)
+        seen.add(name)
+        out.append((name, value))
+    return out
+
+
+def retention_value_text(row, value):
+    """A retention setting's value as words: on/off, no limit (no cap, for a size), or the number and unit."""
+    if value is None:
+        return "not set"
+    if row.get("kind") == "bool" or isinstance(value, bool):
+        return "on" if value else "off"
+    if row.get("unlimited") is not None and value == row.get("unlimited"):
+        return "no cap" if row.get("unit") == "MB" else "no limit"
+    unit = server_text(row.get("unit"))
+    return ("%s %s" % (server_text(value), unit)).strip()
+
+
+def describe_retention(answer):
+    """The lines `audit retention` prints for the server's answer: each group's settings with the value in
+    force, where it comes from and the .env lines that set and bound it; then the changes waiting."""
+    rows = answer.get("settings") or []
+    lines = []
+    for group, heading in RETENTION_GROUPS:
+        mine = [r for r in rows if r.get("group") == group]
+        if not mine:
+            continue
+        lines.append("  %s" % heading)
+        for r in mine:
+            how = [_RETENTION_SOURCES.get(r.get("source"), server_text(r.get("source")))]
+            if r.get("editable") == "fixed":
+                how = ["fixed"]
+            elif r.get("env"):
+                how.append("set by %s" % server_text(r.get("env")))
+            if r.get("kind") == "bool":
+                if r.get("floor") is True and r.get("floor_env"):
+                    how.append("kept on by %s" % server_text(r.get("floor_env")))
+            elif r.get("floor") is not None and r.get("floor_env"):
+                how.append("at least %s (%s)" % (retention_value_text(r, r.get("floor")),
+                                                 server_text(r.get("floor_env"))))
+            if r.get("ceiling") is not None and r.get("ceiling_env"):
+                how.append("at most %s (%s)" % (retention_value_text(r, r.get("ceiling")),
+                                                server_text(r.get("ceiling_env"))))
+            if r.get("editable") == "env_only":
+                how.append("only .env changes it")
+            lines.append("    %-58s %s" % (server_text(r.get("label") or r.get("key")),
+                                           retention_value_text(r, r.get("value"))))
+            lines.append("    %-58s %s" % ("", "; ".join(how)))
+    pending = answer.get("pending") or []
+    if pending:
+        lines.append("  Waiting (any administrator can cancel them in Settings, Activity and records)")
+        for p in pending:
+            lines.append("    %s: %s -> %s from %s, asked by %s" % (
+                server_text(p.get("label") or p.get("key")), server_text(p.get("old"), "the deployment's"),
+                server_text(p.get("new"), "the deployment's"), server_text(p.get("effective_at"), "?"),
+                server_text(p.get("requested_by"), "?")))
+    if answer.get("chain_unreadable"):
+        lines.append("  The audit chain could not be read (%s): the values are the database's, not necessarily "
+                     "what the pruner acts on." % server_text(answer.get("chain_unreadable")))
+    return lines
+
+
 def username_confirmation_problem(username, typed_again):
     """Why an account change must not go ahead: the username was not given, or not typed again
     exactly. None when it may. The container checks the same again."""
@@ -6181,9 +6272,32 @@ class DockVault:
     def audit(self, args=None):
         """Verify the audit log's integrity chain in the running web container, and print every finding and
         the chain's head. Keep the head somewhere else (a ticket, a printout): a later change to the history
-        before it then shows. Exit status: 0 clean, 1 failures or warnings, 2 the check could not run."""
+        before it then shows. Exit status: 0 clean, 1 failures or warnings, 2 the check could not run.
+
+        From the top menu (no arguments) it asks first: how long records are kept, verify, unarchive or
+        compact. The other actions are commands only (audit <action>)."""
         pal = self.pal
+        if args is None:
+            print(pal.paint("\n  Audit log", "cyan"))
+            for i, (_key, label) in enumerate(AUDIT_MENU, 1):
+                print("  %s) %s" % (pal.paint(str(i), "bold"), label))
+            try:
+                choice = parse_menu_choice(input(pal.paint("\nChoose: ", "cyan")), len(AUDIT_MENU))
+            except EOFError:
+                choice = 0
+            if not choice:
+                print(pal.paint("  Nothing done.\n", "yellow"))
+                return
+            action = AUDIT_MENU[choice - 1][0]
+            if action == "retention":
+                return self._audit_retention(None)
+            if action == "unarchive":
+                return self._audit_unarchive(self._ask_unarchive_days())
+            if action == "compact":
+                return self._audit_compact(None)
         action = getattr(args, "audit_action", "verify") if args is not None else "verify"
+        if action == "retention":
+            return self._audit_retention(args)
         if action == "verify" and getattr(args, "acknowledge_removed_before", None):
             # The same command, spelled as a check's option: audit verify --acknowledge-removed-before <time>.
             args.before = args.acknowledge_removed_before
@@ -6468,6 +6582,84 @@ class DockVault:
             print(pal.paint("  %s: %s -> %s" % (server_text(t.get("table")),
                                                format_bytes(before) if isinstance(before, int) else "?",
                                                format_bytes(after) if isinstance(after, int) else "?"), "green"))
+
+    def _ask_unarchive_days(self):
+        """The days `unarchive` restores, asked in the menu: blank keeps the oldest, or the newest."""
+        pal = self.pal
+        first = ask("First day to restore (YYYY-MM-DD, blank for the oldest)", pal, default="")
+        last = ask("Last day to restore (YYYY-MM-DD, blank for the newest)", pal, default="")
+        return argparse.Namespace(audit_from=(first or "").strip() or None, audit_to=(last or "").strip() or None,
+                                  yes=False, confirm=None, old_key_file=None)
+
+    def _audit_retention(self, args):
+        """retention: how long records are kept, as the running server has it (the value in force, where it
+        comes from, the .env lines that set and bound it, the changes waiting). With --set NAME=VALUE, the
+        server first checks the lines (the names, that it would start with them, what changes and what deletes
+        sooner); then they are written to .env, after a confirmation, and take effect when the deployment is
+        recreated (python dockvault.py restart). A change of .env does not wait the panel's delay: one that
+        deletes sooner deletes at the restart, so it is confirmed by typing yes, or with --yes."""
+        pal = self.pal
+        interactive = args is None
+        texts = list(getattr(args, "audit_set", None) or []) if args is not None else []
+        try:
+            wanted = parse_retention_sets(texts)
+        except ValueError as exc:
+            self._fail(str(exc))
+        answer = self._audit_tool("retention", *[a for n, v in wanted for a in ("--set", "%s=%s" % (n, v))])
+        if not answer.get("ok"):
+            self._fail(server_text(answer.get("error")) or "the retention settings could not be read")
+        print(pal.paint("\n  How long records are kept (the value in force, and where it comes from)", "cyan"))
+        for line in describe_retention(answer):
+            print(line)
+        if interactive:
+            typed = ask("Change a .env line? NAME=VALUE (blank to leave everything as it is)", pal, default="")
+            if not (typed or "").strip():
+                print(pal.paint("  Nothing changed.\n", "yellow"))
+                return
+            try:
+                wanted = parse_retention_sets([typed])
+            except ValueError as exc:
+                self._fail(str(exc))
+            answer = self._audit_tool("retention", "--set", "%s=%s" % wanted[0])
+            if not answer.get("ok"):
+                self._fail(server_text(answer.get("error")) or "the line could not be checked")
+        if not wanted:
+            print()
+            return
+        checked = answer.get("check") or {}
+        problems = checked.get("problems") or []
+        if problems:
+            for p in problems:
+                print(pal.paint("  %s" % server_text(p), "red"))
+            print(pal.paint("  The server would not start with that: nothing written.", "red"))
+            raise SystemExit(2)
+        changes = checked.get("changes") or []
+        sooner = set(checked.get("deletes_sooner") or [])
+        for c in changes:
+            print(pal.paint("  %s: %s -> %s%s" % (
+                server_text(c.get("label") or c.get("key")), retention_value_text(c, c.get("before")),
+                retention_value_text(c, c.get("after")), "  (deletes sooner)" if c.get("key") in sooner else ""),
+                "yellow" if c.get("key") in sooner else ""))
+        if not changes:
+            print("  No value in force changes (an administrator's value in the panel, or a bound, keeps it).")
+        if sooner:
+            print(pal.paint("  This deletes records sooner, at the restart: a change of .env does not wait the "
+                            "delay a change in the panel waits.", "yellow"))
+        if self._is_locked():
+            self._fail(".env is locked: unlock it first (python dockvault.py unlock)")
+        if not getattr(args, "yes", False):
+            try:
+                ok = input(pal.paint("  Write %s to .env? Type yes: " % ", ".join(n for n, _v in wanted),
+                                     "cyan"))
+            except EOFError:
+                ok = ""
+            if ok.strip().lower() != "yes":
+                print(pal.paint("  Nothing written.\n", "yellow"))
+                return
+        for name, value in wanted:
+            self._set_env_key(self._env_path(), name, value)
+        print(pal.paint("  Written to .env. Recreate the deployment to apply it: python dockvault.py restart\n",
+                        "green"))
 
     def _audit_host_command(self, args, action):
         """rekey, after-record, accept-database-head, accept-restore, acknowledge-removed-before: in two steps,
@@ -6847,7 +7039,8 @@ def build_parser():
     au = parsers["audit"]
     au.add_argument("audit_action", nargs="?", default="verify",
                     choices=("verify", "acknowledge", "rekey", "after-record", "accept-database-head",
-                             "accept-restore", "acknowledge-removed-before", "change-key", "unarchive", "compact"),
+                             "accept-restore", "acknowledge-removed-before", "change-key", "unarchive", "compact",
+                             "retention"),
                     help="verify (the default): check the chain and print its head; acknowledge: acknowledge "
                          "warnings (--seqs), failures (--failures), rows (--rows) or late rows (--late-rows) once "
                          "you have looked at them; rekey: move the chain to the current AUDIT_CHAIN_KEY; "
@@ -6856,7 +7049,11 @@ def build_parser():
                          "backup; acknowledge-removed-before: seal over rows an older release removed by age; "
                          "change-key: give the chain a new AUDIT_CHAIN_KEY; unarchive: restore archived days as "
                          "rows (--from, --to: days) once they fit in the database volume; compact: give the audit "
-                         "tables' free space back to the system (locks them while it runs)")
+                         "tables' free space back to the system (locks them while it runs); retention: how long "
+                         "records are kept, and with --set NAME=VALUE a .env limit changed once the server has "
+                         "checked it")
+    au.add_argument("--set", dest="audit_set", action="append", metavar="NAME=VALUE",
+                    help="retention: a .env line to change (repeat for more); the server checks it first")
     au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
     au.add_argument("--failures", dest="failures", action="store_true",
                     help="acknowledge: every failure, and every warning kept by kind (not a seal's), not yet "

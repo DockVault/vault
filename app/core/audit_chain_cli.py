@@ -12,6 +12,7 @@
     acknowledge-removed-before T --retention-days N (--read | --expect)
     unarchive [--from DAY] [--to DAY] (--read | --expect)
     compact
+    retention [--set NAME=VALUE ...]
 
 Every command but verify and head answers with one JSON line on standard output (dockvault.py reads it):
 ``{"ok": true, ...}`` or ``{"ok": false, "error": ...}``; what the app prints while it starts goes to standard
@@ -186,6 +187,39 @@ def _compact(args) -> int:
     return _answer(run)
 
 
+def _retention(args) -> int:
+    def run():
+        from app.core import retention_report
+        from app.core import settings_registry as registry
+        from app.core.database import SessionLocal
+        engine, st = _server()
+        try:
+            proposed = retention_report.parse_lines(args.set or [])
+        except retention_report.Refused as why:
+            from app.core import audit_chain_host as host
+            raise host.Refused(str(why))
+        registry.refresh(SessionLocal)
+        ai = _ai()
+        try:
+            # Read under the chain lock, in one snapshot, as a host command's read phase does; nothing is written.
+            with ai.ChainWriter(engine, st, wait=30, writer="host", snapshot=True) as w:
+                out = retention_report.report(w.db, w.st, w.st.view, w.record or w.st.known_record(), w.st.clock(),
+                                              proposed)
+        except (ai.ChainStopped, ai.ChainBusy) as why:
+            # Sealing stopped, or the chain busy: the settings as the registry has them, and why.
+            db = SessionLocal()
+            try:
+                out = retention_report.report(db, ai.ChainState(), ai.View(), None, None, proposed)
+            finally:
+                db.close()
+            out["chain_unreadable"] = f"{type(why).__name__}: {why}"
+        except retention_report.Refused as why:
+            from app.core import audit_chain_host as host
+            raise host.Refused(str(why))
+        return out
+    return _answer(run)
+
+
 def _verify(args) -> int:
     from app.core import audit_chain_format as fmt
     from app.core import audit_chain_verify as v
@@ -315,10 +349,14 @@ def main(argv=None) -> int:
     ua.add_argument("--to", dest="to_day", help="the last day (YYYY-MM-DD); the newest by default")
     _phase(ua)
     sub.add_parser("compact", help="VACUUM FULL of the audit tables (blocks audit writes while it runs)")
+    rt = sub.add_parser("retention", help="how long records are kept, and a check of .env lines that change it")
+    rt.add_argument("--set", action="append", metavar="NAME=VALUE",
+                    help="a .env line to check (written by the host tool, never here)")
     args = p.parse_args(argv)
     handlers = {"acknowledge": _acknowledge, "rekey": _rekey, "after-record": _after_record,
                 "accept-database-head": _accept_database_head, "accept-restore": _accept_restore,
-                "acknowledge-removed-before": _removed_before, "unarchive": _unarchive, "compact": _compact}
+                "acknowledge-removed-before": _removed_before, "unarchive": _unarchive, "compact": _compact,
+                "retention": _retention}
     if args.action in handlers:
         return handlers[args.action](args)
     if args.action not in ("verify", "head"):

@@ -258,6 +258,26 @@ Permissions button on the Users page, which removes Manage Users with it (revoki
 leaves View Users). To keep a leftover one, revoke it and then grant it, so that it records who granted
 it: granting it while the account still holds it does nothing.
 
+### The audit log from the host
+
+```bash
+python dockvault.py audit                # a menu: retention, verify, unarchive, compact
+python dockvault.py audit retention      # how long each kind of record is kept, and where the value comes from
+python dockvault.py audit retention --set AUDIT_LOG_RETENTION_DAYS=400   # change a .env limit, checked first
+python dockvault.py audit verify         # check the integrity chain; keep the head it prints somewhere else
+python dockvault.py audit unarchive --from 2026-01-01 --to 2026-01-31   # archived days back as rows
+python dockvault.py audit compact        # give the audit tables' free space back (locks them while it runs)
+```
+
+`audit retention --set` asks the running server first: a line it would refuse to start with is not
+written, and a change that deletes records sooner says so and needs `yes` (or `--yes`). A change of `.env`
+takes effect when the deployment is recreated (`python dockvault.py restart`), without the delay a change
+made in Settings, Activity and records waits, so prefer the panel for anything that deletes sooner. An
+administrator's value in the panel stays in force over the `.env` value, within the limits `.env` sets.
+`audit unarchive` checks that the restored days fit in the database volume before it writes anything.
+Every setting is described in `.env.example`, and what each kind of record holds in
+[`docs/data-inventory.md`](docs/data-inventory.md).
+
 ### Sealing credentials at rest (optional)
 
 `.env` holds every secret (including `ENCRYPTION_KEY`). You can seal it while the deployment is off:
