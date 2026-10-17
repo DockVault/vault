@@ -21,8 +21,6 @@ from app.core import settings_registry as registry
 
 GROUPS = ("audit_retention", "retention", "audit_integrity", "working_records")
 _NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
-_TRUE = {"1", "on", "t", "true", "y", "yes"}
-_FALSE = {"0", "off", "f", "false", "n", "no"}
 
 
 class Refused(Exception):
@@ -83,21 +81,25 @@ def parse_lines(given: List[str]) -> Dict[str, str]:
 
 
 def _parse(field_name: str, raw: str):
-    """``raw`` as the app's configuration reads the field: an int, a bool, or the text."""
-    from app.core.config import Settings
-    annotation = Settings.model_fields[field_name].annotation
-    if annotation is bool:
-        if raw.lower() in _TRUE:
-            return True
-        if raw.lower() in _FALSE:
-            return False
-        raise Refused(f"{field_name.upper()}={raw} is not true or false")
-    if annotation is int:
-        try:
-            return int(raw)
-        except ValueError:
+    """``raw`` as the app's configuration reads the .env line: validated by the configuration's own field (its
+    type and its validators, as at startup), so a spelling the app would refuse to start with is refused here,
+    and one it takes is read as it reads it ("+20" and "1_000" are 20 and 1000; digits other than 0-9 are
+    refused). Raises Refused, in plain words, for a value the field refuses."""
+    from pydantic import ValidationError
+    from app.core.config import Settings, settings
+    probe = settings.model_copy()
+    try:
+        Settings.__pydantic_validator__.validate_assignment(probe, field_name, raw)
+    except ValidationError as exc:
+        annotation = Settings.model_fields[field_name].annotation
+        if annotation is bool:
+            raise Refused(f"{field_name.upper()}={raw} is not true or false")
+        if annotation is int:
             raise Refused(f"{field_name.upper()}={raw} is not a whole number")
-    return raw
+        errors = exc.errors()
+        raise Refused(f"{field_name.upper()}={raw} is refused by the configuration: "
+                      f"{errors[0].get('msg') if errors else exc}")
+    return getattr(probe, field_name)
 
 
 def check(proposed: Dict[str, str], rows_before: List[dict]) -> dict:

@@ -152,6 +152,26 @@ def test_a_line_longer_than_the_window_gives_nothing_rather_than_a_fragment(tmp_
     assert _sink().read_tail(str(path), max_bytes=100) == ""
 
 
+def test_a_window_with_no_line_break_in_it_gives_nothing(tmp_path):
+    path = tmp_path / "combined.log"
+    path.write_bytes(b"[web] " + b"z" * 1000)                      # no line break at all
+    assert _sink().read_tail(str(path), max_bytes=100) == ""
+    assert _sink().read_tail(str(path), max_bytes=2000) == "[web] " + "z" * 1000      # the whole file is read
+
+
+@pytest.mark.parametrize("environ, mb", [
+    ({"log_pull_sink_max_mb": "30"}, 30), ({"Log_Pull_Sink_Max_MB": "60"}, 60),
+    ({"LOG_PULL_SINK_MAX_MB": "60", "log_pull_sink_max_mb": "30"}, 30),
+    ({"log_pull_sink_max_mb": "30", "LOG_PULL_SINK_MAX_MB": "60"}, 60),
+    ({"LOG_PULL_SINK_MAX_MB": "+30"}, 30), ({"LOG_PULL_SINK_MAX_MB": "1_000"}, 1000),
+    ({"LOG_PULL_SINK_MAX_MB": "\uff13\uff10"}, 15), ({"LOG_PULL_SINK_MAX_MB": "\u0663\u0660"}, 15)])
+def test_the_cap_is_read_as_the_configuration_reads_it(environ, mb):
+    """The name in any case, the last one in the environment winning (the configuration's lookup ignores case);
+    the value by the configuration's whole-number rules: "+30" and "1_000" are numbers, other digits are not.
+    test_retention_report.py checks the same values against the configuration itself."""
+    assert _sink().sink_limits(environ) == (mb * MB // 3, 2)
+
+
 def test_an_absent_file_reads_as_no_lines(tmp_path, monkeypatch):
     from _bare_api_env import set_bare_api_env
     set_bare_api_env()

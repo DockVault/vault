@@ -19,8 +19,9 @@ import threading
 from datetime import datetime, timezone
 
 # The whole sink (the file and its two older copies) holds at most LOG_PULL_SINK_MAX_MB: 15 by default, 3 to 1000
-# (app/core/working_records.py lists it; a value outside that refuses to start the web app, and is read here as
-# the default). run_combined.py reads the same limits, so both run shapes produce the same size-capped files.
+# (app/core/working_records.py lists it; a value outside that, or one the app's configuration cannot read as a
+# whole number, refuses to start the web app, and is read here as the default). run_combined.py reads the same
+# limits, so both run shapes produce the same size-capped files.
 SINK_DEFAULT_MB = 15
 SINK_MIN_MB = 3
 SINK_MAX_MB = 1000
@@ -30,14 +31,31 @@ SINK_BACKUPS = 2
 SINK_READ_BYTES = 5 * 1024 * 1024
 
 
+def _sink_mb(env) -> int:
+    """LOG_PULL_SINK_MAX_MB as the app's configuration reads it (app/core/config.py, a whole number): the name in
+    any case, the last in the environment's order winning, as the configuration's case-insensitive lookup
+    does; the text read by pydantic's whole-number rules, so "+20" and "1_000" are 20 and 1000 and digits other
+    than 0-9 are refused. The default for a value the configuration refuses or that is outside the bounds: the
+    web app does not start with either."""
+    raw = None
+    for name, value in env.items():
+        if str(name).lower() == "log_pull_sink_max_mb":
+            raw = value
+    if raw is None:
+        return SINK_DEFAULT_MB
+    from pydantic import TypeAdapter, ValidationError
+    try:
+        mb = TypeAdapter(int).validate_python(raw)
+    except ValidationError:
+        return SINK_DEFAULT_MB
+    return mb if SINK_MIN_MB <= mb <= SINK_MAX_MB else SINK_DEFAULT_MB
+
+
 def sink_limits(environ=None) -> tuple:
     """(the most bytes one file holds, how many older files are kept) for LOG_PULL_SINK_MAX_MB in ``environ``
     (the process's environment by default): the cap split evenly over the file and its older copies."""
     env = os.environ if environ is None else environ
-    raw = str(env.get("LOG_PULL_SINK_MAX_MB", "") or "").strip()
-    mb = int(raw) if raw.isdigit() else SINK_DEFAULT_MB
-    if not SINK_MIN_MB <= mb <= SINK_MAX_MB:
-        mb = SINK_DEFAULT_MB
+    mb = _sink_mb(env)
     return mb * 1024 * 1024 // (SINK_BACKUPS + 1), SINK_BACKUPS
 
 

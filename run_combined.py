@@ -50,7 +50,8 @@ _STDOUT_LOCK = threading.Lock()
 # directory is not writable the sink is simply disabled and stdout tagging is unaffected.
 _SINK_PATH = os.environ.get("LOG_PULL_SINK_PATH", "./logs/combined.log")
 # The file and its two older copies hold LOG_PULL_SINK_MAX_MB in all (15 by default), split evenly: the same
-# limits the API's own writer uses (app/services/log_sink.py), which imports nothing beyond the standard library.
+# limits the API's own writer uses (app/services/log_sink.py), which imports only the standard library, and
+# pydantic to read the line as the app's configuration reads it.
 from app.services.log_sink import sink_limits  # noqa: E402
 
 _SINK_MAX_BYTES, _SINK_BACKUPS = sink_limits()

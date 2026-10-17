@@ -116,6 +116,78 @@ def test_a_value_of_the_wrong_kind_is_refused(line):
         rr.check(line, _rows())
 
 
+# Digits other than 0-9 (full-width, Arabic-Indic, mathematical bold), which int() takes and the app's
+# configuration refuses, and other spellings it refuses.
+REFUSED_NUMBERS = ["\uff12\uff10", "\u0662\u0660", "\U0001d7d0\U0001d7ce", "0x14", "2e1", "1__000", "_20", "20 MB"]
+# Spellings the configuration reads as a whole number.
+TAKEN_NUMBERS = ["+20", "1_000", "020", "20.0"]
+
+
+def _configured(field, raw):
+    """What the app's configuration makes of ``raw`` for ``field`` at startup, or None when it refuses it."""
+    from pydantic import ValidationError
+    from app.core.config import Settings
+    try:
+        return getattr(Settings(**{field: raw}), field)
+    except ValidationError:
+        return None
+
+
+@pytest.mark.parametrize("raw", REFUSED_NUMBERS)
+@pytest.mark.parametrize("line", ["LOG_PULL_SINK_MAX_MB", "AUDIT_LOG_RETENTION_DAYS", "SECURITY_RECORD_DAYS"])
+def test_a_number_the_configuration_refuses_is_refused(raw, line):
+    """A line the app would refuse to start with is never checked as fine (and so never written)."""
+    assert _configured(rr.env_lines()[line], raw) is None
+    with pytest.raises(rr.Refused, match=f"{line}=.* is not a whole number"):
+        rr.check({line: raw}, _rows())
+
+
+@pytest.mark.parametrize("raw", TAKEN_NUMBERS)
+def test_a_number_the_configuration_takes_is_read_as_it_reads_it(raw):
+    want = _configured("audit_log_retention_days", raw)
+    assert want in (20, 1000)
+    out = rr.check({"AUDIT_LOG_RETENTION_DAYS": raw}, _rows())
+    assert [(c["key"], c["after"]) for c in out["changes"]] == [("audit_max_days", want)]
+    assert out["problems"] == []
+
+
+@pytest.mark.parametrize("raw", ["yes", "On", "T", "1", "no", "OFF", "f", "0", "maybe", "2", "tru", "oui"])
+def test_a_switch_is_read_as_the_configuration_reads_it(raw):
+    want = _configured("retention_hold", raw)
+    if want is None:
+        with pytest.raises(rr.Refused, match="RETENTION_HOLD=.* is not true or false"):
+            rr.check({"RETENTION_HOLD": raw}, _rows())
+        return
+    out = rr.check({"RETENTION_HOLD": raw}, _rows())
+    assert [(c["key"], c["after"]) for c in out["changes"]] == ([("logs_hold", True)] if want else [])
+
+
+@pytest.mark.parametrize("raw", REFUSED_NUMBERS + TAKEN_NUMBERS + ["3", "1000", "2", "1001", "15"])
+def test_the_launcher_reads_the_log_access_size_as_the_configuration_does(raw):
+    """Both writers of the log-access file read LOG_PULL_SINK_MAX_MB as the app's configuration does: a value it
+    takes is that value (the default when outside the bounds, which the app refuses to start with), and one it
+    refuses is the default."""
+    from app.services import log_sink
+    want = _configured("log_pull_sink_max_mb", raw)
+    mb = want if want is not None and 3 <= want <= 1000 else 15
+    assert log_sink.sink_limits({"LOG_PULL_SINK_MAX_MB": raw}) == (mb * 1024 * 1024 // 3, 2)
+    if want is not None and 3 <= want <= 1000:
+        out = rr.check({"LOG_PULL_SINK_MAX_MB": raw}, _rows())
+        assert out["problems"] == [] and [c["after"] for c in out["changes"]] == ([want] if want != 15 else [])
+
+
+def test_the_launcher_finds_the_line_as_the_configuration_does(monkeypatch):
+    import os
+    from app.core.config import Settings
+    from app.services import log_sink
+    monkeypatch.setenv("LOG_PULL_SINK_MAX_MB", "60")
+    monkeypatch.setenv("log_pull_sink_max_mb", "30")
+    want = Settings().log_pull_sink_max_mb
+    assert log_sink.sink_limits() == (want * 1024 * 1024 // 3, 2)
+    if os.name == "posix":                                  # two names there; one on Windows
+        assert want == 30
+
+
 def test_an_administrators_value_keeps_its_value_in_force():
     reg._cache.rows = {"security_record_days": (40, 1)}
     assert _check(SECURITY_RECORD_DAYS=60)["changes"] == []
