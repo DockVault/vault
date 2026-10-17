@@ -118,6 +118,34 @@ def test_opening_a_direct_vault_sets_up_its_key_check_once_and_asks_at_most_once
             co.delete_vault(vid)
 
 
+def test_an_unlock_while_the_vault_is_still_open_sets_it_up(browser, zk):
+    """A vault seen while the key is locked (as one whose name an earlier release left unsealed is, its opening
+    asking for nothing) is set up by the next unlock, whatever asks for it, and that unlock is the only prompt."""
+    owner, co = zk()
+    ctx = browser.new_context(base_url=BASE_URL)
+    page = ctx.new_page()
+    vid = None
+    try:
+        _login(page, owner["_username"], owner["_password"])
+        vid = _create_zk_vault_via_ui(page, co, PASSPHRASE)
+        _open_vault(page, vid)
+        page.evaluate(COUNTERS)
+        _forget_key_check(vid)
+        page.evaluate("() => zkResetKeys()")
+        page.evaluate("() => refreshZkRekeyNotice()")
+        time.sleep(2)
+        assert _counts(page) == (0, 0) and _source(vid) == ""
+        page.evaluate("() => { window.__unlock = zkEnsureUnlocked().then(() => 'ok', e => String(e)); }")
+        _answer_prompt(page)
+        assert page.evaluate("() => window.__unlock") == "ok"
+        _wait_for(lambda: _source(vid) == "bootstrap", "the key check set up after the unlock")
+        assert _counts(page) == (1, 1)
+    finally:
+        ctx.close()
+        if vid:
+            co.delete_vault(vid)
+
+
 def test_an_unlock_once_another_vault_is_open_sets_up_nothing(browser, zk):
     owner, co = zk()
     ctx = browser.new_context(base_url=BASE_URL)
