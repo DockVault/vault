@@ -26,8 +26,10 @@ transaction:
   hold the name (a day whose ``archive`` seal changes is read again); then each part holding a row of the name is
   written anew, the changed hours' nonces materialised and their salts dropped, and checked as stored; one
   ``erase`` seal per changed hour, then the day's ``archive`` seal of cause ``rewrite`` after the last of them;
-- an hour of rows: its rows checked against its seal first (an hour that does not check out is reported and left
-  as it is), its nonces materialised and its salt deleted, the rows changed, one ``erase`` seal.
+- an hour of rows: its rows checked against its seal first, each row an earlier erase changed against that erase's
+  seal too (an hour that does not check out is reported and left as it is; one with rows that arrived after its
+  seal, within the window in which the sealer seals them late, waits for that seal), its nonces materialised and
+  its salt deleted, the rows changed, one ``erase`` seal.
 
 Each changed row: the username becomes the placeholder; the address, the browser description, the temporary
 credential's name, ``recorded`` and the error text (but an exception's type) are cleared; the endpoint is kept only
@@ -249,7 +251,8 @@ def _hot_newest(db, name: str, fp: Optional[str], scope_end: datetime, protected
 
 def scan_day(w, day, name: str, fp: Optional[str] = None) -> tuple:
     """(rows of ``name``, newest of them, newest protected one) in ``day``'s blocks, each part read and checked.
-    Raises NotVerified."""
+    A row of the name that an erase seal lists as erased already is a finding, as in an hour of rows (erase_hour):
+    the day is not erased. Raises NotVerified."""
     from app.core import audit_archive as arc
     ai = _ai()
     db, view = w.db, w.st.view
@@ -262,7 +265,10 @@ def scan_day(w, day, name: str, fp: Optional[str] = None) -> tuple:
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
         reader = arc.PartReader(db, view, day, part)
         for row in reader.rows():
-            if pe.row_matches(row, name, fp) and row["id"] not in view.erased_rows:
+            if pe.row_matches(row, name, fp):
+                if str(row["id"]) in view.erased_rows:
+                    raise arc.NotVerified("unjustified", f"a row of {day.isoformat()} that holds the name is listed "
+                                                         "as erased already", day.isoformat())
                 count += 1
                 t = row["timestamp"]
                 newest = t if newest is None or t > newest else newest
@@ -290,10 +296,10 @@ def _detail(hour: Optional[datetime], seq: int, d: dict, policy_seq: int, throug
 
 
 def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: int, through: str,
-               final: bool, templates: frozenset, fp: Optional[str] = None) -> int:
+               final: bool, templates: frozenset, fp: Optional[str] = None, now: Optional[datetime] = None) -> int:
     """Erase the rows of ``name`` in the sealed ``hour`` in ``w``'s transaction, with its erase seal. Returns how
     many rows it changed. Raises NotErased."""
-    from sqlalchemy import null
+    from sqlalchemy import func, null
     from app.core import audit_chain_prune as prune_mod
     from app.core.models import AuditLog as A
     ai = _ai()
@@ -302,6 +308,14 @@ def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: i
     if held is not None:
         raise NotErased(f"{fmt.hour_text(hour)}'s seal {held} was appended by another writer and waits for the host "
                         "operator")
+    root_entry = view.entry_for(hour).root
+    if root_entry.sealed_at >= (now or w.st.clock()) - ai.LATE_WINDOW and int(
+            db.query(func.count()).select_from(A).filter(A.timestamp >= hour, A.timestamp < hour + HOUR).scalar()
+            or 0) > root_entry.count:
+        # Rows that arrived after the hour's seal, within the window in which the sealer seals them late
+        # (audit_integrity.check_late): it waits for that seal rather than take them for a change. Once the window
+        # has closed, rows its seal does not hold are a finding.
+        raise NotErased(f"rows arrived in {fmt.hour_text(hour)} after its seal, and the sealer seals them first")
     try:
         root, wr, salt, c_prev_old = prune_mod._verify_hour(w, hour)
     except prune_mod.HourNotVerified as nv:
@@ -311,7 +325,7 @@ def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: i
         raise NotErased(f"the rows of {fmt.hour_text(hour)} no longer give its seal; nothing in it was erased",
                         "rows-altered") from None
     rows = [r for r in ai.iter_rows(db, hour, hour + HOUR) if pe.row_matches(r, name, fp)]
-    if not rows or any(r["id"] in view.erased_rows for r in rows):
+    if not rows or any(str(r["id"]) in view.erased_rows for r in rows):
         raise NotErased(f"rows of {fmt.hour_text(hour)} that hold the name are listed as erased already",
                         "unjustified")
     prune_mod._materialise(w, hour, salt, wr)
@@ -362,8 +376,9 @@ def erase_day(w, seq: int, d: dict, name: str, day, *, policy_seq: int, through:
         picked = {}
         for part in sorted(entry.parts, key=lambda p: p.first_hour):
             reader = arc.PartReader(db, view, day, part)
-            touched = {r["id"]: r["timestamp"] for r in reader.rows()
-                       if pe.row_matches(r, name, fp) and r["id"] not in view.erased_rows}
+            # A row of the name listed as erased already: scan_day has refused the day (it reads every day at its
+            # archive seal before any unit runs).
+            touched = {r["id"]: r["timestamp"] for r in reader.rows() if pe.row_matches(r, name, fp)}
             reader.finish()
             if touched:
                 picked[part.part] = touched
@@ -428,6 +443,8 @@ def erase_day(w, seq: int, d: dict, name: str, day, *, policy_seq: int, through:
     hours = sorted(by_hour)
     last = None
     for h in hours:
+        # The comparison _check_stored has just made of each part written (its hours against their roots, with
+        # these commitments), made again from the figures the seals record, so the seals never rest on that check.
         root = arc._root(db, view, h)
         f = figs[h]
         if root is None or (f.count, f.root_s, f.root_c, f.ids_digest) != (root.count, root.root_s, root.root_c,
@@ -579,7 +596,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
         try:
             if kind == "hour":
                 changed = erase_hour(w, seq, d, name, unit, policy_seq=policy_seq, through=through, final=final,
-                                     templates=templates, fp=fp)
+                                     templates=templates, fp=fp, now=now)
             else:
                 changed = erase_day(w, seq, d, name, unit, policy_seq=policy_seq, through=through, final=final,
                                     templates=templates, now=now, fp=fp)
