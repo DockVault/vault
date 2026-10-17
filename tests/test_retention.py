@@ -413,6 +413,42 @@ def test_used_or_expired_reset_links_and_codes_go_thirty_days_after_they_end(env
     assert (row["table"], row["deleted"]) == (model.__tablename__, 3)
 
 
+US = timedelta(microseconds=1)
+HALF = timedelta(hours=12)
+
+
+def test_the_working_record_windows_end_thirty_days_to_the_microsecond(env, factory):
+    """Ended exactly 30 days ago, or 29 and a half: kept. A microsecond more than 30 days: deleted. The same edge
+    for invitations, reset links and codes, and notifications on a 30-day window."""
+    db = factory()
+    user = _user(db)
+    later = NOW + 5 * DAY
+    kept, gone = {}, {}
+    for ended in (30 * DAY, 30 * DAY - HALF):
+        kept[f"accepted {ended}"] = _invitation(db, expires_at=later, accepted_at=NOW - ended)
+        kept[f"revoked {ended}"] = _invitation(db, expires_at=later, revoked_at=NOW - ended)
+        kept[f"expired {ended}"] = _invitation(db, expires_at=NOW - ended)
+    gone["accepted"] = _invitation(db, expires_at=later, accepted_at=NOW - 30 * DAY - US)
+    gone["revoked"] = _invitation(db, expires_at=later, revoked_at=NOW - 30 * DAY - US)
+    gone["expired"] = _invitation(db, expires_at=NOW - 30 * DAY - US)
+    proofs_kept, proofs_gone = {}, {}
+    for model in (PasswordResetToken, OtpCode, EmailChangeCode):
+        for ended in (30 * DAY, 30 * DAY - HALF):
+            proofs_kept[(model, "used", ended)] = _proof(db, model, user, consumed_at=NOW - ended, expires_at=later)
+            proofs_kept[(model, "expired", ended)] = _proof(db, model, user, expires_at=NOW - ended)
+        proofs_gone[(model, "used")] = _proof(db, model, user, consumed_at=NOW - 30 * DAY - US, expires_at=later)
+        proofs_gone[(model, "expired")] = _proof(db, model, user, expires_at=NOW - 30 * DAY - US)
+    notes_kept = {_notification(db, user, NOW - 30 * DAY), _notification(db, user, NOW - 30 * DAY + HALF)}
+    notes_gone = {_notification(db, user, NOW - 30 * DAY - US)}
+    _notification_days(env, 30)
+    done = _pass(factory)
+    assert (done["invitations"].deleted, done["one_time_proofs"].deleted, done["notifications"].deleted) == (3, 6, 1)
+    assert _ids(factory, AccountInvitation) == set(kept.values())
+    for model in (PasswordResetToken, OtpCode, EmailChangeCode):
+        assert _ids(factory, model) == {i for (m, *_), i in proofs_kept.items() if m is model}, model
+    assert _ids(factory, Notification) == notes_kept and not notes_gone & _ids(factory, Notification)
+
+
 def test_each_kind_of_one_time_proof_goes_in_one_pass(env, factory):
     db = factory()
     user = _user(db)
@@ -469,6 +505,9 @@ def test_the_notification_window_waits_for_the_audit_chain_and_keeps_the_longer(
     monkeypatch.setattr(ps, "numbers", lambda st=None: values["answer"])
     env.notification_retention_days = 0
     assert wr.notification_days() == 0                   # nothing to delete: the chain is not asked
+    values["answer"] = {wr.NOTIFICATION_DAYS_KEY: 30}
+    assert wr.notification_days() == 0                   # the database keeps them: the longer of the two
+    values["answer"] = None
     env.notification_retention_days = 60
     assert wr.notification_days() is None                # no chain yet, or sealing stopped: wait
     values["answer"] = {}
