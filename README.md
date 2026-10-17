@@ -261,7 +261,8 @@ it: granting it while the account still holds it does nothing.
 ### The audit log from the host
 
 ```bash
-python dockvault.py audit                # a menu: retention, verify, unarchive, compact
+python dockvault.py                      # the menu: its Audit log entry asks for retention, verify, unarchive or compact
+python dockvault.py audit                # the same as audit verify
 python dockvault.py audit retention      # how long each kind of record is kept, and where the value comes from
 python dockvault.py audit retention --set AUDIT_LOG_RETENTION_DAYS=400   # change a .env limit, checked first
 python dockvault.py audit verify         # check the integrity chain; keep the head it prints somewhere else

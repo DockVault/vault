@@ -83,6 +83,16 @@ def test_the_top_menu_names_what_the_audit_menu_does():
     assert [k for k, _ in dv.AUDIT_MENU] == ["retention", "verify", "unarchive", "compact"]
 
 
+def test_a_bare_audit_verifies_as_the_readme_says():
+    from pathlib import Path
+    assert _args().audit_action == "verify"
+    readme = (Path(dv.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+    lines = {ln.split("#", 1)[0].strip(): ln.split("#", 1)[1].strip() for ln in readme.splitlines()
+             if ln.startswith("python dockvault.py") and "#" in ln}
+    assert lines["python dockvault.py audit"] == "the same as audit verify"
+    assert "Audit log entry asks for retention, verify, unarchive or compact" in lines["python dockvault.py"]
+
+
 @pytest.mark.parametrize("texts, ok", [
     (["AUDIT_LOG_RETENTION_DAYS=30"], [("AUDIT_LOG_RETENTION_DAYS", "30")]),
     ([" RETENTION_HOLD = true "], [("RETENTION_HOLD", "true")]),
