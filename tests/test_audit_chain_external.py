@@ -187,6 +187,18 @@ def test_a_row_added_to_a_sealed_hour_is_no_removal(env):
                                             retention_days=34, read=True)
 
 
+def test_a_row_changed_in_an_hour_after_the_cutoff_is_no_removal(env):
+    _ids, cutoff = _rolled_back(env)
+    with env.session() as db:
+        newest = db.query(AuditLog).filter(AuditLog.action == "file_uploaded").order_by(
+            AuditLog.timestamp.desc()).first()
+        newest.ip_address = "198.51.100.1"
+        db.commit()
+    with pytest.raises(host.Refused, match="does not check out against its seal"):
+        external.acknowledge_removed_before(env.engine, _host(env), _first_kept_time(env, cutoff),
+                                            retention_days=34, read=True)
+
+
 def test_rows_missing_from_the_middle_of_the_cutoff_hour_are_no_time_cutoff(env):
     first = env.row(T0 - timedelta(days=33, hours=3))
     middle = env.row(T0 - timedelta(days=33, hours=3, minutes=-10))

@@ -104,7 +104,7 @@ def test_the_audit_job_does_not_prune_an_hour_whose_erased_row_was_edited(env, m
     erased, plain = _partly_pruned_hour(env, monkeypatch, edit)
     assert _row(env, plain) is not None, "the hour was pruned over an edited erased row"
     assert [s for s in env.seals() if s.kind == "prune"] == []
-    assert "unjustified" in _recorded_failures(env)
+    assert "unjustified" in _recorded_failures(env) and "rows-altered" not in _recorded_failures(env)
     assert "unjustified" in failures(env.verify())          # still found: nothing sealed over it
 
 
@@ -128,7 +128,7 @@ def test_a_second_erase_in_an_hour_whose_erased_row_was_edited_changes_nothing(e
     assert _row(env, mallory).username == "mallory" and _row(env, mallory).ip_address == "203.0.113.9"
     assert len(env.erase_seals()) == seals
     assert env.request_row(asked["id"]).status == pe.PENDING
-    assert "unjustified" in _recorded_failures(env)
+    assert "unjustified" in _recorded_failures(env) and "rows-altered" not in _recorded_failures(env)
     assert "unjustified" in failures(env.verify())
 
 
