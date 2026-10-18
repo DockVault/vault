@@ -13,6 +13,7 @@ same calls the start makes; the clock is the test's, so no test waits.
 from __future__ import annotations
 
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,9 @@ def _unreachable(message):
 
 
 class _Clock:
+    """The start's clock. Its sleep refuses a negative length, as time.sleep does: a wait that
+    lets its bound pass would otherwise move this clock back and never end."""
+
     def __init__(self):
         self.now = 1000.0
         self.slept = []
@@ -53,12 +57,18 @@ class _Clock:
         return self.now
 
     def sleep(self, seconds):
+        if seconds < 0:
+            raise ValueError("sleep length must be non-negative")
         self.slept.append(seconds)
         self.now += seconds
 
 
 class _Engine:
-    """Fails `failures` connects (each taking `connect_seconds` on the clock), then connects."""
+    """Fails `failures` connects (each taking `connect_seconds` on the clock), then connects.
+
+    A wait that never ends fails the test at MAX_ATTEMPTS, instead of running for ever."""
+
+    MAX_ATTEMPTS = 1000
 
     def __init__(self, real, clock, failures, error, connect_seconds=0.0):
         self.real, self.clock = real, clock
@@ -68,6 +78,8 @@ class _Engine:
 
     def connect(self):
         self.attempts += 1
+        if self.attempts > self.MAX_ATTEMPTS:
+            raise AssertionError(f"the start tried to connect {self.MAX_ATTEMPTS} times")
         if self.failures is None or self.attempts <= self.failures:
             self.clock.now += self.connect_seconds
             raise self.error
@@ -162,6 +174,13 @@ def test_a_database_that_never_comes_up_stops_the_start_after_the_bound(start, c
     assert len(lines) == len(slept) + 1
     assert lines[-1] == ("[sftp] The database could not be reached within 120 s (timeout expired); "
                          "stopping.")
+
+
+def test_the_test_clock_refuses_a_negative_sleep_as_time_sleep_does():
+    with pytest.raises(ValueError):
+        time.sleep(-1)
+    with pytest.raises(ValueError):
+        _Clock().sleep(-1)
 
 
 def test_the_wait_is_two_minutes():
