@@ -225,6 +225,25 @@ def test_a_server_error_paramiko_reports_as_an_ssh_error_keeps_its_detail(connec
     assert any("RuntimeError: the read broke" in m for m in messages), messages
 
 
+
+def test_a_text_line_then_a_server_side_read_error_keeps_its_detail(connect, monkeypatch):
+    """The peer sent a line that is not SSH, and then the server's own read broke: whose failure it
+    was is decided by the error beneath, before anything is said about the line the peer sent."""
+    real = paramiko.packet.Packetizer.readline
+    reads = []
+
+    def second_read_fails(self, timeout):
+        reads.append(1)
+        if len(reads) == 1:
+            return real(self, timeout)
+        raise RuntimeError("the read broke")
+
+    monkeypatch.setattr(paramiko.packet.Packetizer, "readline", second_read_fails)
+    lines, loud = connect(_sends(b"HELLO THERE\r\n"))
+    assert lines == [f"event client.handling.failed peer={PEER[0]} err=SSHException"], lines
+    messages = [r.getMessage() for r in loud]
+    assert any("RuntimeError: the read broke" in m for m in messages), messages
+
 def test_records_are_held_until_released_then_logged_as_they_were(caplog):
     left, right = socket.socketpair()
     try:
