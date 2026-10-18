@@ -3,9 +3,10 @@ running stack (app/api/value_removal_router.py, app/core/audit_value_removal.py,
 
 On the stack's own database, through the routes: a user is refused; at full there is nothing to remove; with a
 level lowered the preview counts the rows above it; asking asks for the password every time; a removal asked for is
-listed with its levels and its scope, its request seal and its audit row are written, a second one is refused while
-it waits, and any administrator cancels it (each one asked for here is cancelled, so the stack's rows stay as they
-are); a cancel of one that is not waiting is refused. The levels are set back afterwards.
+listed with its levels and its scope, its request seal and its audit row are written, every administrator is told,
+a second one is refused while it waits, and any administrator cancels it, every administrator told again (each one
+asked for here is cancelled, so the stack's rows stay as they are); a cancel of one that is not waiting is refused.
+The levels are set back afterwards.
 
 On a throwaway database of its own (tests/_throwaway_db.py), its passes run as a script whose clock is set, on
 Postgres: a removal over rows and an archived day, and AUDIT_IP_FULL_DAYS over rows and an archived day; the rows,
@@ -43,6 +44,17 @@ def _wait_for(check, timeout=20.0, step=0.5):
     return check()
 
 
+ASKED = "A removal of recorded values is waiting"
+CANCELLED = "A waiting removal of recorded values was cancelled"
+
+
+def _notices(username, title, body_start=""):
+    """How many in-app notices with ``title`` (and a body starting with ``body_start``) ``username`` holds."""
+    like = body_start.replace("'", "''").replace("%", r"\%").replace("_", r"\_") + "%"
+    return int(psql("SELECT count(*) FROM notifications n JOIN users u ON u.id = n.user_id "
+                    f"WHERE u.username = '{username}' AND n.title = '{title}' AND n.body LIKE '{like}'") or 0)
+
+
 @pytest.fixture(autouse=True, scope="module")
 def chain_started():
     ok = _wait_for(lambda: psql("SELECT count(*) FROM audit_seals WHERE kind = 'policy'") not in ("", "0"),
@@ -72,10 +84,13 @@ def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels
     assert out["rows"] > 0 and out["delay_days"] >= 1
     r = admin.post("/settings/value-removals")
     assert r.status_code == 403 and r.json()["detail"]["action"] == ACTION, r.text
+    me = admin_creds["username"]
+    told = _notices(me, ASKED, me + " asked")
     r = admin.post("/settings/value-removals", headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
     assert r.status_code == 200, r.text
     asked = r.json()["request"]
     try:
+        assert _wait_for(lambda: _notices(me, ASKED, me + " asked") == told + 1), "the administrators were not told"
         assert asked["status"] == "pending" and asked["levels"]["ip"] == "shortened" and asked["cancellable"]
         seal = psql("SELECT detail->>'what', detail->'new'->'levels'->>'user_agent', detail->>'request' FROM audit_seals "
                     f"WHERE kind = 'request' AND detail->>'request' = '{asked['id']}'")
@@ -87,9 +102,12 @@ def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels
         again = admin.post("/settings/value-removals",
                            headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
         assert again.status_code == 400 and "already waiting" in again.json()["detail"]
-        with second_admin(admin) as (_account, client):
+        with second_admin(admin) as (account, client):
             c = client.post(f"/settings/value-removals/{asked['id']}/cancel")
             assert c.status_code == 200 and c.json()["request"]["status"] == "cancelled", c.text
+            by = account["_username"] + " cancelled"
+            assert _wait_for(lambda: _notices(me, CANCELLED, by) == 1 and _notices(account["_username"], CANCELLED,
+                                                                                   by) == 1), "not told of the cancel"
             again = client.post(f"/settings/value-removals/{asked['id']}/cancel")
             assert again.status_code == 409 and "no longer waiting" in again.json()["detail"]
             assert client.post(f"/settings/value-removals/{uuid.uuid4()}/cancel").status_code == 404
