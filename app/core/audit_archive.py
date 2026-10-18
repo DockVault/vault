@@ -162,6 +162,11 @@ class NotArchivable(Exception):
     """A day, part or hour that is left as it is this time (not a finding)."""
 
 
+class LaterFormatDay(NotArchivable):
+    """A day a change of rows leaves as it is because a block of it is of a later release's block format: not a
+    finding, and not one that a later pass of this release changes either."""
+
+
 # --------------------------------------------------------------------------- when archiving may run
 
 def first_start(view) -> Optional[datetime]:
@@ -715,7 +720,8 @@ def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform:
     salts dropped, and checked as stored. Returns what changed, or None when nothing did. The caller then writes
     its change's seal with ``entries`` and calls seal_rewrite(): the new roots are over the rows as they are now,
     so an erase after an hour's root seal is then part of them. Raises NotVerified, or NotArchivable when an hour it
-    would change waits (another writer's seal the host has not acknowledged)."""
+    would change waits (another writer's seal the host has not acknowledged), LaterFormatDay (a NotArchivable) when
+    a block of the day is of a later release's block format."""
     from app.core.models import AuditArchiveBlock as B
     ai = _ai()
     db, view = w.db, w.st.view
@@ -730,7 +736,7 @@ def rewrite_day(w, day: date, pick: Callable[[Iterator[dict]], Dict], transform:
             reader = PartReader(db, view, day, part)
         except NotVerified as nv:
             if nv.kind == LATER_FORMAT:
-                raise NotArchivable(str(nv)) from None
+                raise LaterFormatDay(str(nv)) from None
             raise
         touched = pick(reader.rows())
         reader.finish()

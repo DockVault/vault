@@ -286,26 +286,6 @@ def test_the_setting_is_a_chain_setting_kept_in_step_with_env_example_the_host_t
     assert "`AUDIT_IP_FULL_DAYS`" in (ROOT / "docs" / "data-inventory.md").read_text(encoding="utf-8")
 
 
-def test_an_archived_day_the_days_reach_into_is_shortened_only_before_them(monkeypatch, tmp_path):
-    env = _env(monkeypatch, tmp_path, 100)
-    try:
-        cut = ai.hour_floor(T0 - timedelta(days=100))
-        early, late = env.put(cut - timedelta(hours=3)), env.put(cut + timedelta(hours=3))
-        env.run_until_sealed()
-        arc.archive_job(retention.Pass(env.session, now=env.clock()))
-        with env.session() as db:
-            assert db.query(AuditLog).filter(AuditLog.id.in_([early, late])).count() == 0
-        rw.shorten_job(retention.Pass(env.session, now=env.clock()))
-        with env.session() as db:
-            block = db.query(AuditArchiveBlock).one()
-            part = env.st.view.archives[block.day].parts[0]
-            rows = {r["id"]: r for r in arc.PartReader(db, env.st.view, block.day, part).rows()}
-        assert rows[early]["ip_address"] is None and rows[late]["ip_address"] == "203.0.113.9"
-        assert failures(env.verify()) == []
-    finally:
-        env.close()
-
-
 def test_a_transaction_stops_at_the_batch_and_the_rest_follows(env30):
     env = env30
     first = env.put(T0 - timedelta(days=40, hours=2))
@@ -518,3 +498,53 @@ def test_rows_left_in_an_archived_hour_are_reported_and_the_rows_after_the_day_a
     addresses = _addresses(env)
     assert addresses[kept] == "203.0.113.9" and addresses[stray] == "203.0.113.9"
     assert _shortened(env.get(after))
+
+
+def test_a_day_a_later_release_archived_is_passed_over(env30, monkeypatch):
+    """A day archived in a later release's block format (a rollback) is left as it is, as the audit job's prune leaves
+    it, with no finding: the rows after it are shortened."""
+    from app.core import audit_archive_format as af
+    env = env30
+    env.put(_at(3, 5))
+    hot = env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    monkeypatch.setattr(af, "FORMAT", 2)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(af, "FORMAT", 1)
+    with env.session() as db:
+        payload = db.query(AuditArchiveBlock).one().payload
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(hot)) and seen == {}
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == payload
+
+
+def test_an_archived_day_the_cutoff_runs_through_is_shortened_once_the_whole_day_is_past_it(monkeypatch, tmp_path):
+    """With the days past the row window, the cutoff runs through archived days: such a day is shortened once the
+    whole day is past it, in one rewrite of its block (one rewrite seal and one archive seal for the day, not one an
+    hour), and none of it before."""
+    env = _env(monkeypatch, tmp_path, 100)
+    try:
+        cut = ai.hour_floor(T0 - timedelta(days=100))
+        day0 = datetime.combine(cut.date(), time(0, 0))
+        ids = [env.put(day0 + timedelta(hours=h, minutes=7)) for h in range(24)]
+        env.run_until_sealed()
+        arc.archive_job(retention.Pass(env.session, now=env.clock()))
+        with env.session() as db:
+            assert db.query(AuditLog).filter(AuditLog.id.in_(ids)).count() == 0
+        archives = len([s for s in env.seals() if s.kind == "archive"])
+        for _ in range(26):
+            rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+            addresses = _addresses(env)
+            past = env.clock() - timedelta(days=100) >= day0 + timedelta(days=1)
+            assert [addresses[i] is None for i in ids] == [past] * 24, env.clock()
+            env.clock.advance(hours=1)
+            env.seal()
+        assert len(env.rewrite_seals()) == 1 and len(env.rewrite_seals()[0].detail["hours"]) == 24
+        rewrites = [s for s in env.seals() if s.kind == "archive"][archives:]
+        assert [s.detail["cause"] for s in rewrites] == ["rewrite"]
+        assert failures(env.verify()) == []
+    finally:
+        env.close()

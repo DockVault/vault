@@ -135,3 +135,31 @@ def test_the_card_fits_a_phone(page: Page, admin_creds):
     width = page.evaluate("() => [document.getElementById('removal-card').scrollWidth, "
                           "document.getElementById('removal-card').clientWidth]")
     assert width[0] <= width[1] + 1, width
+
+
+def test_a_removal_that_waits_says_why_on_its_card(page: Page, admin_creds):
+    """The list shows why a removal waits (here at a day a later release archived, which this release cannot
+    change)."""
+    why = ("It waits: 2026-07-10 is archived in a later release's block format, which this release does not change, "
+           "so this release cannot complete it.")
+
+    def answer(route):
+        if route.request.method != "GET":
+            route.continue_()
+            return
+        response = route.fetch()
+        data = response.json()
+        data["requests"] = [{"id": "00000000-0000-4000-8000-000000000001", "status": "running", "request_seq": 7,
+                             "levels": dict(FULL, ip="shortened"), "before": "2026-10-01T10:00:00Z",
+                             "requested_by": "ada", "requested_at": "2026-10-01T09:30:00Z",
+                             "effective_at": "2026-10-08T09:30:00Z", "started_at": "2026-10-08T12:00:00Z",
+                             "completed_at": None, "decided_by": None, "decided_at": None, "waiting": why,
+                             "counts": {"rows": 5, "archived_rows": 0}, "cancellable": False}]
+        route.fulfill(response=response, json=data)
+    page.route("**/settings/value-removals", answer)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open(page)
+    item = page.locator('#removal-list .removal-request[data-status="running"]')
+    expect(item).to_be_visible(timeout=15000)
+    expect(item.locator(".removal-waiting")).to_have_text(why)
+    expect(item.locator(".removal-cancel")).to_have_count(0)

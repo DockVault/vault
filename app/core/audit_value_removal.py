@@ -591,6 +591,8 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
         if nr.kind:
             findings[nr.kind] = f"{nr}; the removal of request seal {seq} waits"
             return STOP, 0, cursor, None, None
+        if nr.later_format:
+            return WAIT, 0, cursor, None, f"It waits: {nr}, so this release cannot complete it."
         return WAIT, 0, cursor, None, f"It waits: {nr}."
     if outcome == rw.CHANGED:
         _progress(row, now, changed, unit)

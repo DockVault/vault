@@ -681,3 +681,26 @@ def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_re
     assert env.get(stray).ip_address == "203.0.113.9" and env.rewrite_seals() == []
     assert env.removal_row(asked["id"]).status == vr.PENDING
     assert _values(env)[kept] == ("203.0.113.9", "Mozilla/5.0 test")
+
+
+def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env, monkeypatch):
+    """A day archived in a later release's block format (a rollback): a removal cannot complete in this release; it
+    waits there with no finding, and its row (which its card shows) says why it waits."""
+    from app.core import audit_archive_format as af
+    hot = env.put(T0 - timedelta(hours=30))
+    env.put(_at(3, 5))
+    env.run_until_sealed()
+    monkeypatch.setattr(af, "FORMAT", 2)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(af, "FORMAT", 1)
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    asked = env.ask_removal()
+    env.week()
+    env.passes(24)
+    row = env.removal_row(asked["id"])
+    assert row.status == vr.PENDING and seen == {}
+    assert row.waiting == (f"It waits: {DAY.isoformat()} is archived in a later release's block format, which "
+                           "this release does not change, so this release cannot complete it.")
+    assert env.get(hot).ip_address == "203.0.113.9"
+    assert vr.entry_of(row, env.st.view)["waiting"] == row.waiting

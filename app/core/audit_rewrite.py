@@ -6,8 +6,9 @@ Two changes rewrite rows:
   has been tightened, an administrator may ask for the rows written before to keep only what the levels in force
   record (seal reason ``levels``, naming the removal's ``request`` seal);
 - keeping full addresses for a number of days only (``audit_ip_full_days``, AUDIT_IP_FULL_DAYS in .env; no limit by
-  default): an address recorded in full is shortened to the network it is in once its row is that many days old
-  (seal reason ``shorten-ip``, the pruner's ``audit_ip_shortening`` job). Setting a number, or a smaller one, deletes
+  default): an address recorded in full is shortened to the network it is in once its row is that many days old,
+  in a day the archive holds once the whole day is (seal reason ``shorten-ip``, the pruner's
+  ``audit_ip_shortening`` job). Setting a number, or a smaller one, deletes
   sooner: it waits the reduction delay like any such change (app/core/setting_changes.py).
 
 What a row keeps (reduced()): of each kind of personal data whose level is below full, what a row written at that
@@ -38,7 +39,13 @@ One transaction per unit, under the chain lock:
   stable root and its ids; one ``rewrite`` seal carries the day's hours;
 - an archived day, through the block-rewrite primitive (app/core/audit_archive.py): each part holding a changed row
   written anew and checked as stored, its changed hours' salts dropped and every changed row given a fresh nonce;
-  the ``rewrite`` seal, then the day's ``archive`` seal of cause ``rewrite``.
+  the ``rewrite`` seal, then the day's ``archive`` seal of cause ``rewrite``. A day archived over several passes is
+  a unit up to the end of its parts: its later hours, still rows, are reached after it as hours of rows. A day with
+  rows of audit_logs in the hours its parts hold is reported (row-in-archived-day) and left as it is.
+
+The units go oldest first. The shortening takes an archived day once the whole day is past its cutoff (the day's
+blocks are written once, not once an hour), and passes over a day archived in a later release's block format, which
+this release neither checks nor changes; a removal waits at such a day (it cannot complete in this release).
 
 Nothing is rewritten while the hold switch is on (the jobs are held), while a restore is not finished or its grace
 runs, or while a rule another part of the app registers holds deletions back (person_erase.register_wait: legal
@@ -69,8 +76,9 @@ registry.register(registry.SettingSpec(
     key=FULL_DAYS_KEY, kind="int", default=0, env="audit_ip_full_days", minimum=1, maximum=36500, unlimited=0,
     reduction=registry.LOWER, group="audit_retention", unit="days",
     label="Keep full addresses in audit rows for",
-    help="After this, an address recorded in full is shortened to the network it is in (a /24, or a /48 for IPv6). "
-         "No limit keeps addresses as they were recorded."))
+    help="After this, an address recorded in full is shortened to the network it is in (a /24, or a /48 for IPv6); "
+         "in a day the archive holds, once the whole day is that old. No limit keeps addresses as they were "
+         "recorded."))
 
 
 def _ap():
@@ -317,12 +325,14 @@ def prefilter(model, levels: Mapping[str, str]) -> list:
 # --------------------------------------------------------------------------- one unit
 
 class NotRewritten(Exception):
-    """A unit that cannot be rewritten now: ``kind`` is a finding (reported), or None (it waits). ``until`` is the
-    end of the unit (step() sets it)."""
+    """A unit that cannot be rewritten now: ``kind`` is a finding (reported), or None (it waits). ``later_format``:
+    an archived day of a later release's block format, which this release never changes (not a finding). ``until``
+    is the end of the unit (step() sets it)."""
 
-    def __init__(self, message: str, kind: Optional[str] = None):
+    def __init__(self, message: str, kind: Optional[str] = None, *, later_format: bool = False):
         super().__init__(message)
         self.kind = kind
+        self.later_format = later_format
         self.until: Optional[datetime] = None
 
 
@@ -438,13 +448,15 @@ def rewrite_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, no
             row.update(new)
             row["seal_nonce"] = secrets.token_bytes(16)
         return row
+    later = f"{day.isoformat()} is archived in a later release's block format, which this release does not change"
     try:
         rw = arc.rewrite_day(w, day, pick, transform, now)
     except arc.NotVerified as nv:
         if nv.kind == arc.LATER_FORMAT:
-            raise NotRewritten(f"{day.isoformat()} is archived in a later release's block format, which this "
-                               "release does not change") from None
+            raise NotRewritten(later, later_format=True) from None
         raise NotRewritten(f"{nv}; nothing in {day.isoformat()} was rewritten", nv.kind) from None
+    except arc.LaterFormatDay:
+        raise NotRewritten(later, later_format=True) from None
     except arc.NotArchivable as why:
         raise NotRewritten(str(why)) from None
     if rw is None:
@@ -604,9 +616,22 @@ def full_days(st) -> Optional[int]:
     return max(days)
 
 
+def cutoff(view, before: datetime) -> datetime:
+    """Where the shortening stops now: ``before``, or the start of the archived day it runs through. Such a day is
+    shortened once the whole day is past the cutoff, its blocks written once and not once an hour, so an address
+    there stays in full up to a day longer than the setting says."""
+    from app.core import audit_archive as arc
+    for d, e in view.archives.items():
+        start = arc.day_start(d)
+        if e.parts and start < before < start + timedelta(days=1):
+            return start
+    return before
+
+
 def shorten_job(p):
     """The pruner's audit_ip_shortening job: addresses whose rows are older than audit_ip_full_days shortened, through
-    rewrite seals of reason shorten-ip. Returns a retention.JobResult (the rows changed, as cleared)."""
+    rewrite seals of reason shorten-ip (an archived day once the whole day is past the cutoff). A day archived in a
+    later release's block format is passed over. Returns a retention.JobResult (the rows changed, as cleared)."""
     from app.core import person_erase as pe
     from app.core import retention
     from app.core.models import AuditLog
@@ -628,7 +653,7 @@ def shorten_job(p):
     conditions = prefilter(AuditLog, {ap.IP: ap.SHORTENED})
     findings: Dict[str, str] = {}
     while p.time_left():
-        before = ai.hour_floor(min(p.now, st.clock()) - timedelta(days=days))
+        before = cutoff(st.view, ai.hour_floor(min(p.now, st.clock()) - timedelta(days=days)))
         cursor = _cursors.get(key, _EPOCH)
         if cursor >= before:
             break
@@ -646,13 +671,19 @@ def shorten_job(p):
             except NotRewritten as nr:
                 w.written = []
                 w.db.rollback()
-                if not nr.kind or nr.until is None:
+                if nr.later_format and nr.until is not None:
+                    # This release neither checks nor changes such a day: the run goes on after it, as the audit
+                    # job's prune does (no finding).
+                    ai._say(f"The pruner's audit_ip_shortening job passes over a day: {nr}")
+                    outcome, cursor, changed = CLEAN, nr.until, 0
+                elif not nr.kind or nr.until is None:
                     ai._say(f"The pruner's audit_ip_shortening job waits: {nr}")
                     break
-                # A finding: the unit is left as it is (reported), and the run goes on after it, as the audit
-                # job's prune does; this process tries it again after a restart.
-                findings[nr.kind] = f"{nr}; its addresses were not shortened"
-                outcome, cursor, changed = CLEAN, nr.until, 0
+                else:
+                    # A finding: the unit is left as it is (reported), and the run goes on after it, as the audit
+                    # job's prune does; this process tries it again after a restart.
+                    findings[nr.kind] = f"{nr}; its addresses were not shortened"
+                    outcome, cursor, changed = CLEAN, nr.until, 0
             if outcome == CHANGED:
                 batch = retention.JobResult()
                 batch.cleared = changed
