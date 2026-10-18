@@ -6,9 +6,12 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py):
 - once due, the rows written before it, as rows and in archived days, keep only what the levels record: each changed
   row gets a fresh nonce, one rewrite seal per day of hours (and per archived day, with the archive seal of cause
   rewrite after it) names the request and its scope, the last seal is final with no hour, the stable roots and ids
-  stay, and verify is clean; a row written after it is untouched; the preview counted what it changed;
-- a cancel stops it before it begins, never after; the database removing its row vetoes it; a row whose copies differ
-  from its seal is not acted on; it waits for a registered rule (legal holds, open cases) and the hold switch;
+  stay, and verify is clean; a row written after it is untouched; an erased row is passed over; the preview counted
+  what it changed, and one past its time says what it had counted;
+- a cancel stops it before it begins, never after; the database removing its row, or marking it no longer waiting,
+  vetoes it; a row whose copies differ from its seal is not acted on; it waits for a registered rule (legal holds,
+  open cases), the hold switch, and the hours it covers to be sealed; an hour that waits after one rewritten the
+  same day leaves that one rewritten;
 - verify refuses a rewrite seal for levels that names no removal, comes before its delay, after it is complete, over
   another scope, over hours after it, and a final seal with hours; and a removal request that is not well formed.
 """
@@ -294,6 +297,36 @@ def test_archived_days_are_rewritten_in_their_blocks(env):
     archive = next(s for s in env.seals() if s.kind == "archive" and s.seq == first.seq + 1)
     assert archive.detail["cause"] == "rewrite" and archive.detail["after_seq"] == first.seq
     assert env.removal_row(asked["id"]).counts == {"rows": 0, "archived_rows": 2}
+    report = env.verify()
+    assert failures(report) == [], report.findings
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_a_removal_passes_over_an_erased_row_even_when_its_change_would_take_it(env, monkeypatch, archived):
+    """An erased row stays as its erase seal says: a removal passes over it, as a row and in an archived day, even
+    when the change it runs would take it (here every row also gives up its browser description)."""
+    when = _at(3, 5) if archived else T0 - timedelta(hours=30)
+    erased = env.put(when, username="eve")
+    kept = env.put(when + timedelta(minutes=10))
+    env.run_until_sealed()
+    if archived:
+        arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    erase = env.ask("eve")
+    assert until(env, lambda: env.request_row(erase["id"]).status == pe.COMPLETED)
+    real = rw.reduced
+    monkeypatch.setattr(rw, "reduced", lambda row, levels, ctx: dict(real(row, levels, ctx) or {}, user_agent=None))
+    asked = env.ask_removal()
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    if archived:
+        with env.session() as db:
+            block = db.query(AuditArchiveBlock).one()
+            part = env.st.view.archives[block.day].parts[0]
+            rows = {r["id"]: r for r in arc.PartReader(db, env.st.view, block.day, part).rows()}
+    else:
+        rows = {i: {c: getattr(env.get(i), c) for c in ("username", "seal_nonce", "ip_address", "recorded")}
+                for i in (erased, kept)}
+    assert rows[erased]["username"] == erase["placeholder"] and bytes(rows[erased]["seal_nonce"]) == fmt.ZERO_NONCE
+    assert rows[kept]["ip_address"] is None and rows[kept]["recorded"] is not None
     report = env.verify()
     assert failures(report) == [], report.findings
 

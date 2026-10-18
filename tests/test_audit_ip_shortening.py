@@ -5,7 +5,8 @@ offline, on a throwaway SQLite database with a chain of its own (tests/_removal_
 - with a number, each address recorded in full (the column and the details classified as addresses) is shortened to
   its network once its row is that many days old, as rows and in archived days: rewrite seals of reason shorten-ip,
   the stable roots and ids kept, fresh nonces, verify clean; a row younger stays until it is old enough; a pass
-  with nothing to do writes nothing;
+  with nothing to do writes nothing; a transaction takes the hours of one day, an hour that does not check out
+  leaves the hours before it shortened, and an archived day with nothing to shorten is passed over;
 - setting a number in the panel deletes sooner: it waits the reduction delay; no limit again applies at once;
 - verify refuses a shortening while there is no limit, over rows younger than the days, or naming a request;
 - the setting is a chain setting whose lower values delete sooner, in .env, the host tool and the docs.
