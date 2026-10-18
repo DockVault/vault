@@ -16,7 +16,7 @@ from sqlalchemy import and_, or_, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
-from app.core import file_expiry
+from app.core import durable_write, file_expiry
 from app.core.safe_log import safe_event
 from app.core.security import (
     encrypt_file_content, decrypt_file_content,
@@ -511,7 +511,7 @@ class VaultService:
         self.db = db
         self.permission_service = permission_service
         self.storage_path = Path(settings.file_storage_path)
-        self.storage_path.mkdir(parents=True, exist_ok=True)
+        durable_write.make_directories(self.storage_path)
         
         # Initialize encrypted file storage handler
         self.encrypted_storage = EncryptedFileStorage(self.storage_path)
@@ -627,9 +627,10 @@ class VaultService:
         self.db.commit()
         self.db.refresh(vault)
         
-        # Create vault directory
+        # Create vault directory. Synced into the storage root, like every directory a stored file
+        # sits under (see durable_write).
         vault_dir = self._get_vault_path(vault.id)
-        vault_dir.mkdir(parents=True, exist_ok=True)
+        durable_write.make_directories(vault_dir)
         
         return vault
     
@@ -1189,9 +1190,9 @@ class VaultService:
             raise DuplicateNameError("A folder with that name already exists in this location")
         self.db.refresh(folder)
         
-        # Create physical directory
+        # Create physical directory, synced into its parent (see durable_write).
         folder_path = self._get_folder_path(vault_id, folder.id)
-        folder_path.mkdir(parents=True, exist_ok=True)
+        durable_write.make_directories(folder_path)
         
         return folder
     
@@ -1343,7 +1344,9 @@ class VaultService:
         # does NOT address re-claiming a retired id -- the transcript binds the row id, not the
         # path -- which is what the check above and the ledger behind it are for.
         storage_path = self._get_file_storage_path(vault_id, uuid.uuid4(), folder_id)
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        # Any directory made here is on the disk before the file in it is; the context below syncs
+        # the file and its name when it is closed, before the caller commits the row.
+        durable_write.make_directories(storage_path.parent)
         
         # Detect MIME type if not provided
         if not mime_type:
@@ -2019,8 +2022,7 @@ class VaultService:
                             n = min(1024 * 1024, remaining)
                             f.write(os.urandom(n))
                             remaining -= n
-                        f.flush()
-                        os.fsync(f.fileno())
+                        durable_write.sync_file(f)
                     storage_path.unlink()
                 except Exception as fallback_error:
                     safe_event('blob.fallback-delete.failed', fallback_error)

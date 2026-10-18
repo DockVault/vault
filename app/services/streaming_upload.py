@@ -4,6 +4,8 @@ Streaming upload context for handling chunked file uploads.
 import hashlib
 from pathlib import Path
 
+from app.core import durable_write
+
 
 class ChunkTooLarge(Exception):
     """A request body ran past the budget it was allowed."""
@@ -45,8 +47,10 @@ async def receive_bounded(stream, dest_path: Path, limit: int):
                     raise ChunkTooLarge(limit)
                 digest.update(piece)
                 handle.write(piece)
-        if not written:
-            raise EmptyBody()
+            if not written:
+                raise EmptyBody()
+            # On the disk before the caller can count it as received.
+            durable_write.sync_file(handle)
     except BaseException:
         # Within a live session nothing reclaims an individual temp file -- the periodic sweeper
         # and the completion paths remove the session directory wholesale, which is too late to
@@ -90,37 +94,63 @@ class StreamingUploadContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Close the stream -- writing its terminal first, if the format has one.
+        """Close the stream -- writing its terminal first, if the format has one -- and, on a clean
+        exit, leave the file on the disk before returning.
 
-        Only on a clean exit. A failed upload must NOT be terminated: a terminal says "this file is
-        complete", and writing one over a partial upload would turn a detectable truncation into an
-        object that authenticates as whole. On the error path the file is removed below anyway, but
-        the ordering matters more than the cleanup does, because the cleanup is best-effort.
+        The terminal only on a clean exit. A failed upload must NOT be terminated: a terminal says
+        "this file is complete", and writing one over a partial upload would turn a detectable
+        truncation into an object that authenticates as whole. On the error path the file is removed
+        below anyway, but the ordering matters more than the cleanup does, because the cleanup is
+        best-effort.
+
+        Every caller commits the file's row after this returns, and the database forces that commit
+        to the disk. So the file goes first: its content, synced before the close, and its name in
+        the directory, synced after it. A sync that fails fails the upload as a failed terminal write
+        does: the file is removed and the error raised, so no row is written for it. Nothing is synced
+        on the error path, where the file is removed.
         """
-        terminal_failed = None
-        if self.file_handle:
+        failed = None
+        # Taken once, so a second exit (an SFTP discard after a failed clean exit) finds nothing to
+        # close and only the removal below, which is then a no-op.
+        handle, self.file_handle = self.file_handle, None
+        if handle:
             try:
-                if exc_type is None and hasattr(self.codec, 'terminal'):
-                    self.file_handle.write(self.codec.terminal())
+                if exc_type is None:
+                    if hasattr(self.codec, 'terminal'):
+                        handle.write(self.codec.terminal())
+                    durable_write.sync_file(handle)
             except Exception as e:      # noqa: BLE001 - out of disk, I/O error
                 # Must not escape before the close below, or the handle leaks and the cleanup
                 # never runs -- `exc_type` is still None on this path, so the error branch would
                 # not fire either. The partial blob is unreadable regardless (no terminal), but
                 # leaking a descriptor and a file is not a good way to express that.
-                terminal_failed = e
+                failed = e
             finally:
-                self.file_handle.close()
+                handle.close()
+            if exc_type is None and failed is None:
+                try:
+                    durable_write.sync_directory(self.storage_path.parent)
+                except Exception as e:  # noqa: BLE001 - the file's name may not be on the disk
+                    failed = e
 
         # If there was an error, clean up the file
-        if (exc_type is not None or terminal_failed is not None) and self.storage_path.exists():
+        if (exc_type is not None or failed is not None) and self.storage_path.exists():
             try:
                 self.storage_path.unlink()
             except:
                 pass
 
-        if terminal_failed is not None:
-            raise terminal_failed
+        if failed is not None:
+            raise failed
         return False
+
+    def sync_written(self) -> None:
+        """Force what has been written so far to the disk, and keep the file open.
+
+        For a caller that finishes the upload under a lock: the clean exit syncs again, and then only
+        what was written since is left to go to the disk, so the lock is not held while a large file
+        is written out."""
+        durable_write.sync_file(self.file_handle)
 
     def write_chunk(self, chunk: bytes) -> int:
         """

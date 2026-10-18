@@ -76,6 +76,7 @@ from app.core.upload_chunk_crypto import (
     seal_stream_to_file, sealed_plaintext_size, open_staged_chunk, StagedChunkError,
 )
 from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
+from app.core import durable_write
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -6755,7 +6756,7 @@ async def upload_brand_asset(
             status_code=400,
             detail="Unsupported image type (allowed: png, jpg, gif, webp, ico, svg)")
     try:
-        os.makedirs(BRAND_ASSET_DIR, exist_ok=True)
+        durable_write.make_directories(BRAND_ASSET_DIR)
     except OSError:
         raise HTTPException(status_code=503, detail="Brand asset storage is not writable")
     fname = f"{slot}.{hashlib.sha256(data).hexdigest()[:8]}.{ext}"
@@ -6770,7 +6771,11 @@ async def upload_brand_asset(
     tmp = dest + ".tmp"
     with open(tmp, "wb") as fh:
         fh.write(data)
+        # The content is on the disk before the rename, and the name after it, before the brand row
+        # points at the file: a power cut must not leave the row naming an empty or missing image.
+        durable_write.sync_file(fh)
     os.replace(tmp, dest)  # atomic publish
+    durable_write.sync_directory(BRAND_ASSET_DIR)
     url = f"/brand-assets/{fname}"
     _update_brand_row(db, set_map={f: url for f in fields})
     db.commit()
@@ -14388,7 +14393,7 @@ async def open_receiver_upload_session(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     sdir = _upload_session_dir(vault_service, str(session.id))
-    sdir.mkdir(parents=True, exist_ok=True)
+    durable_write.make_directories(sdir)
     if not session.temp_file_path:
         session.temp_file_path = str(sdir)
         db.commit()
@@ -14469,7 +14474,7 @@ async def receiver_upload_chunk(
     _bytes_before = session.bytes_received or 0
     _vault_id = str(vault.id)
     sdir = _upload_session_dir(vault_service, str(_sid))
-    sdir.mkdir(parents=True, exist_ok=True)
+    durable_write.make_directories(sdir)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
     already = chunk_path.exists()
     existing_size = sealed_plaintext_size(chunk_path) if already else 0
@@ -14537,6 +14542,9 @@ async def receiver_upload_chunk(
             hash_path.write_text(chunk_digest, encoding='ascii')
         except Exception:
             pass
+        # The chunk was synced before the rename; its name goes to the disk before the row counts
+        # it and the answer says it was received (see upload_chunk).
+        durable_write.sync_directory(sdir)
 
         _present = sorted(sdir.glob("chunk_*"))
         _bytes = sum(sealed_plaintext_size(_p) for _p in _present)
@@ -20307,7 +20315,7 @@ async def init_chunked_upload(
         db.refresh(session)
 
     sdir = _upload_session_dir(vault_service, str(session.id))
-    sdir.mkdir(parents=True, exist_ok=True)
+    durable_write.make_directories(sdir)
     if not session.temp_file_path:
         session.temp_file_path = str(sdir)
         db.commit()
@@ -20381,7 +20389,7 @@ async def upload_chunk(
     _folder_id = session.folder_id
     _filename = session.filename          # a Standard session's name; a zero-knowledge one is never here
     sdir = _upload_session_dir(vault_service, str(_sid))
-    sdir.mkdir(parents=True, exist_ok=True)
+    durable_write.make_directories(sdir)
     chunk_path = sdir / f"chunk_{chunk_index:06d}"
     already = chunk_path.exists()
     # PLAINTEXT size of this index if it is being re-sent, so the running total stays accurate and
@@ -20535,6 +20543,14 @@ async def upload_chunk(
             hash_path.write_text(chunk_digest, encoding='ascii')
         except Exception:  # noqa: BLE001 -- a missing digest costs a re-send, never the upload
             pass
+        # The chunk's bytes were synced before the rename (seal_stream_to_file); its name goes to the
+        # disk now, before the session row counts it and the answer says it was received. The
+        # database keeps that count over a power cut. A name the disk lost would leave the count
+        # ahead of the chunks on the disk, and the session would then refuse the chunk sent again as
+        # larger than what is left of the file. The digest is not synced: one lost or emptied makes
+        # a resuming client send that chunk again, which is slower and never wrong. A failure here
+        # answers 500 with nothing counted, and the client sends the chunk again.
+        durable_write.sync_directory(sdir)
 
         _present = sorted(sdir.glob("chunk_*"))
         _bytes = 0

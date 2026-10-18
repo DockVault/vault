@@ -865,6 +865,10 @@ class _StreamingUpload:
     point, exactly as in the buffered path)."""
 
     RECORD_SIZE = 1024 * 1024
+    # From this size on, what was streamed is synced to the disk before the vault row is locked at
+    # close (see close()). Below it the sync under the lock is as quick as a sync of its own would be,
+    # and a second one would only add a wait to every small upload.
+    PRESYNC_BYTES = 8 * 1024 * 1024
 
     def __init__(self, handle, interface, vault_id, folder_id, filename,
                  can_overwrite, max_bytes, reorder_bytes):
@@ -967,6 +971,11 @@ class _StreamingUpload:
         try:
             checksum = self._ctx.get_checksum()
             total_size = self._ctx.get_total_size()
+            # The bytes so far go to the disk now, before the persist below locks the vault row: the
+            # clean exit under that lock then has only the terminal left to sync, so the lock is not
+            # held while a large upload is written out. A failure here discards the upload.
+            if total_size >= self.PRESYNC_BYTES:
+                self._ctx.sync_written()
             with get_db_context() as db:
                 authz = self._interface._authorize_upload_persist(
                     db, self._vault_id, self._folder_id, total_size)
@@ -1824,11 +1833,16 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                             bytes=buffered_size, limit=max_bytes)
                 return
 
+            # Refused up front, before any blob is written, by the same checks the insert must
+            # pass. The vault row this takes is unlocked when the session ends: the file is then
+            # encrypted, written and synced to the disk with no lock held, and authorized again,
+            # under the lock, for the insert -- the streaming path's order. Writing a large file
+            # out to the disk under the lock would hold every other upload to this vault.
             with get_db_context() as db:
                 authz = interface._authorize_upload_persist(db, vault_id, folder_id, buffered_size)
                 if authz is None:
                     return
-                user, vault, vault_service = authz
+                user, _vault, vault_service = authz
 
                 mime_type, _ = mimetypes.guess_type(filename)
                 file_info, stream_ctx = vault_service.upload_file_streaming(
@@ -1838,16 +1852,31 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     folder_id=folder_id,
                     mime_type=mime_type,
                 )
-                try:
-                    with stream_ctx as ctx:
-                        with open(tmp_path, "rb") as tf:
-                            while True:
-                                buf = tf.read(1024 * 1024)
-                                if not buf:
-                                    break
-                                ctx.write_chunk(buf)
-                        checksum = ctx.get_checksum()
-                        total_size = ctx.get_total_size()
+            storage_root = vault_service.storage_path
+
+            # Until the row commits, the blob is this function's to remove: the streaming context
+            # unlinks it only on an error inside its block, and a refusal or a failure after the
+            # block would otherwise strand an encrypted blob with no File row.
+            committed = False
+            try:
+                with stream_ctx as ctx:
+                    with open(tmp_path, "rb") as tf:
+                        while True:
+                            buf = tf.read(1024 * 1024)
+                            if not buf:
+                                break
+                            ctx.write_chunk(buf)
+                    checksum = ctx.get_checksum()
+                    total_size = ctx.get_total_size()
+
+                with get_db_context() as db:
+                    authz = interface._authorize_upload_persist(db, vault_id, folder_id, total_size)
+                    if authz is None:
+                        return
+                    user, vault, vault_service = authz
+                    # file_info's vault ORM came from the closed session above; re-bind it to this
+                    # one for finalize's same-name replacement + ZK check.
+                    file_info['vault'] = vault
                     # ATOMIC OVERWRITE: replace-on-clash is done inside finalize, in the
                     # SAME transaction as the new insert (old same-name row deleted before
                     # the new one commits) — so a failed/oversize upload never destroys the
@@ -1859,23 +1888,19 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         file_info=file_info, total_size=total_size, checksum=checksum,
                         replace_same_name=can_overwrite,
                     )
-                except Exception:
-                    # The streaming context only unlinks the blob on an in-block
-                    # error; a failure in finalize_streaming_upload (after the
-                    # block) would otherwise strand the encrypted blob with no
-                    # File row. Remove it so a failed put leaves no orphan.
+                    committed = True
+                    interface._audit(user, "file_upload", str(new_file.id),
+                                     {"vault_id": str(vault_id), "file_name": filename, "via": "sftp"})
+                    safe_event('upload.stored',
+                                file=new_file.id, vault=vault_id, bytes=total_size)
+            finally:
+                if not committed:
                     try:
-                        orphan = vault_service.storage_path / file_info["storage_path"]
+                        orphan = storage_root / file_info["storage_path"]
                         if orphan.exists():
                             orphan.unlink()
                     except Exception:  # noqa: BLE001
                         pass
-                    raise
-
-                interface._audit(user, "file_upload", str(new_file.id),
-                                 {"vault_id": str(vault_id), "file_name": filename, "via": "sftp"})
-                safe_event('upload.stored',
-                            file=new_file.id, vault=vault_id, bytes=total_size)
 
         return _finalize
 

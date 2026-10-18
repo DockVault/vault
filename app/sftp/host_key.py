@@ -19,18 +19,22 @@ from typing import Union
 
 import paramiko
 
+from app.core import durable_write
+
 
 def generate_ed25519_host_key(path: Union[str, Path]) -> None:
     """Write a fresh Ed25519 private key (OpenSSH format, owner-only) to ``path``.
 
     Intended to be called only when no host key exists, so it never overwrites a key a client has
-    already trusted. Written with 0600 from creation rather than widened then narrowed.
+    already trusted. Written with 0600 from creation rather than widened then narrowed, and synced
+    to the disk, file and name: a key lost to a power cut soon after the first start would leave an
+    empty file at this path, which the next start cannot load and does not replace.
     """
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_write.make_directories(path.parent)
     data = Ed25519PrivateKey.generate().private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.OpenSSH,
@@ -39,6 +43,7 @@ def generate_ed25519_host_key(path: Union[str, Path]) -> None:
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, data)
+        durable_write.sync_file(fd)
     finally:
         os.close(fd)
     # os.open's mode is subject to umask; pin the intended perms where the platform honours it.
@@ -46,6 +51,7 @@ def generate_ed25519_host_key(path: Union[str, Path]) -> None:
         os.chmod(str(path), stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    durable_write.sync_directory(path.parent)
 
 
 def load_host_key(path: Union[str, Path]) -> paramiko.PKey:
