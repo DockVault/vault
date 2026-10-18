@@ -4,8 +4,10 @@
 At full the preview says there is nothing to remove and asking stays off. With a level lowered the preview lists each
 kind below full with the rows above it; asking shows a confirmation that needs "remove" typed (dismissed, nothing is
 sent), then the password; the removal is listed waiting, with its levels and when it runs, and any administrator
-cancels it. A preview that ran out of time says "at least", and one that could not count says so. The page says how
-long addresses stay in full when that is set. The card fits a phone. No console error.
+cancels it. A preview that ran out of time says "at least", and one that could not count says so. The confirmation
+counts the archived days too; a removal that waits says why on its card; a level changed since the preview is
+refused, and the preview is made again. The page says how long addresses stay in full when that is set. The card
+fits a phone. No console error.
 """
 import re
 
@@ -135,6 +137,27 @@ def test_the_card_fits_a_phone(page: Page, admin_creds):
     width = page.evaluate("() => [document.getElementById('removal-card').scrollWidth, "
                           "document.getElementById('removal-card').clientWidth]")
     assert width[0] <= width[1] + 1, width
+
+
+def test_the_confirmation_counts_the_archived_days_too(page: Page, admin_creds, levels_restored):
+    """The confirmation names the archived days the removal changes as well as the rows it counted."""
+    store(dict(FULL, ip="shortened"))
+
+    def answer(route):
+        response = route.fetch()
+        data = response.json()
+        data.update({"rows": 3, "counted": True, "archived_days": 2, "waiting": False})
+        route.fulfill(response=response, json=data)
+    page.route("**/settings/value-removals/preview", answer)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open(page)
+    page.click("#removal-preview-btn")
+    expect(page.locator("#removal-preview .removal-total")).to_have_text(re.compile(r"^3 rows in all"), timeout=15000)
+    page.click("#removal-ask")
+    expect(page.locator("#confirm-modal")).to_have_class(re.compile(r"\bactive\b"), timeout=10000)
+    expect(page.locator("#confirm-modal")).to_contain_text("Remove from 3 audit rows and the rows of 2 archived days "
+                                                           "written before")
+    page.click("#confirm-modal-cancel-btn")
 
 
 def test_a_removal_that_waits_says_why_on_its_card(page: Page, admin_creds):

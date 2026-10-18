@@ -53,6 +53,9 @@ CANCELLED_ACTION = "audit_values_removal_cancelled"
 REMOVED_ACTION = "audit_values_removed"
 RESOURCE_TYPE = "value_removal"
 
+# The email every administrator gets (app/core/email_actions.py); the in-app notice is a records notice.
+EMAIL_ACTION = "recorded_values_removal"
+
 HOUR = timedelta(hours=1)
 # How long a preview may read rows: past it, its counts are what it had counted ("at least").
 PREVIEW_SECONDS = 20.0
@@ -158,7 +161,8 @@ def preview(db, st, now: datetime) -> dict:
     not_reached = ["exports and backups made before it",
                    "the server's logs and the log-access file",
                    "audit rows an erase has changed (they keep no personal value)",
-                   "values the levels do not govern: account usernames, ids, error types, route templates",
+                   "values the levels do not govern: account usernames, ids, error types and the error text "
+                   "earlier releases recorded, route templates",
                    "the security record of failed sign-ins and the security alerts, which keep addresses for "
                    "their own window"]
     if undated:
@@ -396,7 +400,7 @@ def tell_administrators(event: str, facts: dict, by: Optional[str] = None) -> No
         from app.api import api_server as api
         from app.core.database import get_db_context
         from app.core.models import RoleEnum, User
-        from app.core.person_erase import EMAIL_ACTION, NOTICE_TYPE
+        from app.core.person_erase import NOTICE_TYPE
         title, body = notice_words(event, facts, by)
         with get_db_context() as db:
             admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()

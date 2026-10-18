@@ -38,6 +38,8 @@ pytestmark = pytest.mark.unit
 
 LOWER = {ap.NAMES: ap.FULL, ap.SIGNIN_NAMES: ap.FULL, ap.EMAILS: ap.NONE, ap.IP: ap.SHORTENED,
          ap.USER_AGENT: ap.NONE}
+# The real notice sender (the test database records the notices instead).
+_TELL = vr.tell_administrators
 
 
 @pytest.fixture
@@ -746,3 +748,41 @@ def test_the_previewed_levels_are_the_ones_asked_for(env):
         shown = vr.preview(db, env.st, env.clock())["levels"]
     with ps.change_transaction(env.engine) as w:
         assert vr.request(w, env.admin("dee2"), expected=shown)["levels"] == dict(LOWER, emails=ap.FULL)
+
+
+def test_every_administrator_is_told_by_the_removal_s_own_email(env, monkeypatch):
+    """The notice goes to every active administrator in the app and by the email of a removal of recorded values
+    (not the one about how long records are kept)."""
+    from contextlib import contextmanager
+    import app.core.database as database
+    from app.api import api_server as api
+    from app.core import email_actions as ea
+    seen = {"notices": [], "emails": []}
+
+    @contextmanager
+    def ctx():
+        yield env.session()
+    monkeypatch.setattr(database, "get_db_context", ctx)
+    monkeypatch.setattr(api, "_notify_users", lambda ids, ntype, title, body=None, target=None, **k: seen[
+        "notices"].append((sorted(ids), title, body)))
+    monkeypatch.setattr(api, "_fire_action_email_bulk", lambda db, key, recipients, ctx=None: seen[
+        "emails"].append((key, sorted(recipients), ctx)))
+    admins = [env.admin("ada"), env.admin("bo")]
+    facts = {"before": fmt.hour_text(T0), "levels": dict(LOWER), "effective_at": fmt.time_text(T0)}
+    _TELL("asked", facts, "ada")
+    assert [(ids, title) for ids, title, _b in seen["notices"]] == [
+        (sorted(str(a.id) for a in admins), "A removal of recorded values is waiting")]
+    assert [(key, recipients) for key, recipients, _c in seen["emails"]] == [
+        ("recorded_values_removal", sorted((a.email, a.username) for a in admins))]
+    assert seen["emails"][0][2]["change"] == seen["notices"][0][2] and seen["emails"][0][2]["by"] == "ada"
+    template = ea.DEFAULT_TEMPLATES["recorded_values_removal"]
+    assert "removal of recorded values" in template["subject"] and "how long" not in template["subject"]
+    assert ea.SPEC_BY_KEY["recorded_values_removal"]["category"] == ea.SYSTEM
+
+
+def test_the_preview_says_what_a_removal_does_not_reach(env):
+    _hot(env)
+    with env.session() as db:
+        p = vr.preview(db, env.st, env.clock())
+    assert ("values the levels do not govern: account usernames, ids, error types and the error text earlier "
+            "releases recorded, route templates") in p["not_reached"]

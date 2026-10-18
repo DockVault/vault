@@ -198,6 +198,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "recorded_values_removal": {
+        "name": "Removal of recorded values",
+        "subject": "A removal of recorded values in the {{vault.name}} audit log",
+        "body_html": (
+            "<h2>A removal of recorded values</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>A removal waits before it runs, and any administrator can cancel it meanwhile on the Settings "
+            "page; once it has run, the values it removed cannot be brought back. If you did not expect this, "
+            "check the Settings page at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -233,6 +248,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
      SYSTEM),
+    ("recorded_values_removal", "Removal of recorded values",
+     "Sent to every administrator when a removal of the values the audit log recorded under earlier "
+     "recording levels is asked for, cancelled or completed — says what, when and by whom.", SYSTEM),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(

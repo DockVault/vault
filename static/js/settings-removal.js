@@ -154,8 +154,9 @@
     async function ask() {
         const p = S.preview;
         if (S.busy || !p || !(p.kinds || []).length || p.waiting) return;
-        const what = p.rows == null ? 'the audit rows' : (p.counted ? plural(p.rows, 'audit row', 'audit rows')
+        let what = p.rows == null ? 'the audit rows' : (p.counted ? plural(p.rows, 'audit row', 'audit rows')
             : `at least ${plural(p.rows, 'audit row', 'audit rows')}`);
+        if (p.archived_days) what += ` and the rows of ${plural(p.archived_days, 'archived day', 'archived days')}`;
         const message = `Remove from ${what} written before ${when(p.before)} the values above the levels in force ` +
             `(${levelsText(p.levels)})? It runs in ${plural(p.delay_days, 'day', 'days')} unless an administrator ` +
             'cancels it, and cannot be undone once it has run.';
