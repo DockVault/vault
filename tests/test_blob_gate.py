@@ -298,6 +298,79 @@ def test_delete_files_fallback_after_a_secure_delete_failure_never_reaches_a_kep
     assert not (world.root / gone_rel).exists(), "the fallback still destroys a blob no hold keeps"
 
 
+class _Disk:
+    """What reached the disk, in order, from the moment it is made: each os.fsync of a file (its inode and its
+    size at that moment), each unlink under the storage root (the file's name), and each commit of the world's
+    session. With ``fail``, a file's sync fails as a disk that cannot write fails it."""
+
+    def __init__(self, world, monkeypatch, *, fail=False):
+        import errno
+        import os
+        import stat
+        from sqlalchemy import event
+        self.events = []
+        real_fsync, real_unlink = os.fsync, Path.unlink
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode):
+                if fail:
+                    raise OSError(errno.EIO, "Input/output error")
+                self.events.append(("file", st.st_ino, st.st_size))
+            return real_fsync(fd)
+
+        def unlink(path, *a, **k):
+            if Path(path).is_relative_to(world.root):
+                self.events.append(("unlink", Path(path).name))
+            return real_unlink(path, *a, **k)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(Path, "unlink", unlink)
+        event.listen(world.db, "after_commit", lambda _session: self.events.append(("commit",)))
+
+
+def _secure_delete_fails(path):
+    raise OSError("device busy")
+
+
+def test_delete_files_fallback_overwrite_is_on_the_disk_before_the_blob_is_unlinked(world, monkeypatch):
+    """The row's deletion commits first; then the fallback overwrites the blob, syncs the whole overwrite, and
+    only then unlinks it: the unlink can never reach the disk ahead of the overwrite."""
+    rel = world.blob(b"evidence of a deleted file")
+    f = world.file(rel)
+    inode, size = (world.root / rel).stat().st_ino, (world.root / rel).stat().st_size
+    disk = _Disk(world, monkeypatch)
+    world.service(secure_delete=_secure_delete_fails).delete_file(f.id, world.owner)
+    assert disk.events == [("commit",), ("file", inode, size), ("unlink", Path(rel).name)]
+    assert not (world.root / rel).exists()
+    assert world.db.query(m.File).filter(m.File.id == f.id).count() == 0
+
+
+def test_a_fallback_overwrite_whose_sync_fails_still_removes_the_blob_and_says_so(world, monkeypatch):
+    """The row's deletion has committed, so a failed sync of the overwrite raises nothing into the request: it is
+    logged as the fallback's failure, and the blob is still unlinked, as the fallback's last resort."""
+    import app.services.vault_service as vs
+    logged = []
+    monkeypatch.setattr(vs, "safe_event", lambda code, *a, **k: logged.append(code))
+    rel = world.blob()
+    f = world.file(rel)
+    disk = _Disk(world, monkeypatch, fail=True)
+    assert world.service(secure_delete=_secure_delete_fails).delete_file(f.id, world.owner) is None
+    assert logged == ["blob.secure-delete.failed-using-fallback", "blob.fallback-delete.failed"]
+    assert disk.events == [("commit",), ("unlink", Path(rel).name)]
+    assert not (world.root / rel).exists()
+
+
+def test_a_kept_blob_is_neither_overwritten_nor_synced_nor_unlinked(world, monkeypatch):
+    rel = world.blob()
+    f = world.file(rel)
+    world.keep(rel, f.id)
+    disk = _Disk(world, monkeypatch)
+    world.service(secure_delete=_secure_delete_fails).delete_file(f.id, world.owner)
+    assert [e for e in disk.events if e[0] != "commit"] == []
+    assert (world.root / rel).read_bytes() == b"evidence"
+
+
 def test_a_blob_that_will_not_go_is_logged_under_its_paths_own_code(world, monkeypatch):
     import app.services.vault_service as vs
     logged = []
