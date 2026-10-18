@@ -131,15 +131,21 @@ def test_a_level_changed_since_the_preview_is_refused_and_nothing_is_asked_for(a
     store(dict(FULL, ip="none"))                 # another administrator, meanwhile
     count = psql("SELECT count(*) FROM audit_value_removals")
     seals = psql("SELECT count(*) FROM audit_seals WHERE kind = 'request'")
-    r = admin.post("/settings/value-removals", json={"levels": shown},
-                   headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
-    assert r.status_code == 409 and r.json()["reason"] == "levels-changed", r.text
-    assert "changed since the preview" in r.json()["detail"]
-    assert psql("SELECT count(*) FROM audit_value_removals") == count
-    assert psql("SELECT count(*) FROM audit_seals WHERE kind = 'request'") == seals
-    # A body that does not name each kind is refused before the password is asked for.
-    bad = admin.post("/settings/value-removals", json={"levels": {"ip": "none"}})
-    assert bad.status_code == 400 and "each kind" in bad.json()["detail"], bad.text
+    try:
+        r = admin.post("/settings/value-removals", json={"levels": shown},
+                       headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
+        assert r.status_code == 409 and r.json()["reason"] == "levels-changed", r.text
+        assert "changed since the preview" in r.json()["detail"]
+        assert psql("SELECT count(*) FROM audit_value_removals") == count
+        assert psql("SELECT count(*) FROM audit_seals WHERE kind = 'request'") == seals
+        # A body that does not name each kind is refused before the password is asked for.
+        bad = admin.post("/settings/value-removals", json={"levels": {"ip": "none"}})
+        assert bad.status_code == 400 and "each kind" in bad.json()["detail"], bad.text
+    finally:
+        # Never one left waiting on the stack, whatever went wrong above.
+        for rid in (psql("SELECT string_agg(id::text, ' ') FROM audit_value_removals WHERE status = 'pending'")
+                    or "").split():
+            admin.post(f"/settings/value-removals/{rid}/cancel")
 
 
 def test_the_levels_page_and_the_notice_say_how_long_addresses_stay_in_full(admin):

@@ -533,9 +533,11 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
     done. An archived day is a unit up to the end of its parts (or the scope's end), not of the day: a day archived
     over several passes still holds its later hours as rows, and those are reached after it as hours of rows (a pass
     that archives them meanwhile makes the day a unit again, its earlier parts then holding nothing to change). The
-    earliest of the next archived day and the next hours of rows goes next; hours of rows stop at the next archived
-    day's first hour, and a day with rows of audit_logs in the hours its parts hold is reported
-    (row-in-archived-day), not rewritten. Writes a rewrite seal only when it returns CHANGED. Raises NotRewritten."""
+    earliest of the next archived day and the next hours of rows goes next, and a day with rows of audit_logs in the
+    hours its parts hold is reported (row-in-archived-day), not rewritten. Hours of rows taken run within one day
+    and never into an archived day's parts: a day is archived from its first sealed hour on, so the hours of a day
+    that come before its parts are hours before the chain began, which no seal covers (rewrite_hour waits at the
+    first of them). Writes a rewrite seal only when it returns CHANGED. Raises NotRewritten."""
     from app.core import audit_archive as arc
     view = w.st.view
     newest = view.newest_policy()
@@ -568,10 +570,9 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
     if not hot:
         return FINISHED, cursor, 0, None, None, None
     day = hot[0].date()
-    stop = days[0][1] if days else None
     entries, changed, reached = [], 0, cursor
     for hour in hot:
-        if hour.date() != day or changed >= p.batch_rows or (stop is not None and hour >= stop):
+        if hour.date() != day or changed >= p.batch_rows:
             break
         try:
             # Each hour in a savepoint: an hour that cannot be rewritten leaves nothing behind, and the hours before

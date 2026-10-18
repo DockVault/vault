@@ -646,7 +646,10 @@ def test_a_removal_takes_the_day_again_when_the_archive_finishes_it_between_two_
 
 def test_a_removal_whose_own_day_is_archived_before_it_runs_completes(env, monkeypatch):
     """Held back for days, a removal meets the day it was asked in archived: the rows of that day written before its
-    scope's end are brought down, the later ones are not, and it completes."""
+    scope's end are brought down, the later ones are not, and it completes (each pass given a short time, so a run
+    that reads that day again and again ends its pass soon)."""
+    real_pass = retention.run_pass
+    monkeypatch.setattr(retention, "run_pass", lambda *a, **k: real_pass(*a, **dict(k, budget_seconds=10.0)))
     monkeypatch.setattr(arc, "hot_days", lambda: 0)
     real = _idle_archive(monkeypatch)
     inside = env.put(env.clock() - timedelta(minutes=20))
@@ -678,7 +681,7 @@ def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_re
     pe.WAIT_RULES.append(lambda db, now: "held for the test")
     env.week()
     pe.WAIT_RULES.clear()
-    stray = env.put(_at(3, 30))
+    stray = env.put(_at(3, 30))                  # in the first hour the block holds
     with env.session() as db:
         payload = db.query(AuditArchiveBlock).one().payload
     seen = {}

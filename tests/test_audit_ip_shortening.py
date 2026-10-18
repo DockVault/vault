@@ -489,7 +489,7 @@ def test_rows_left_in_an_archived_hour_are_reported_and_the_rows_after_the_day_a
     after = env.put(T0 - timedelta(days=40))
     env.run_until_sealed()
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
-    stray = env.put(_at(3, 30))
+    stray = env.put(_at(5, 30))                  # a later hour of the block than its first
     with env.session() as db:
         payload = db.query(AuditArchiveBlock).one().payload
     seen = {}
