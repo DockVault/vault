@@ -33,6 +33,12 @@ DIRECTORY_SYNC = os.name != "nt"
 # disk, and is raised.
 _CANNOT_SYNC_DIRECTORY = frozenset({errno.EINVAL, errno.EBADF})
 
+# A directory this process may create entries in but not read (write and search permission, no read)
+# cannot be opened, so it cannot be synced from here; PostgreSQL skips it too. That is a parent the
+# vault does not own, as the one a custom storage path is first created in can be: an upload or a
+# start there must not fail for a sync it cannot do, as neither did before directories were synced.
+_CANNOT_OPEN_DIRECTORY = frozenset({errno.EACCES})
+
 
 def sync_file(handle) -> None:
     """Force a file's content to the disk: an open file object (its buffer is flushed first) or a
@@ -49,7 +55,12 @@ def sync_directory(path) -> None:
     it is then found there after a power cut."""
     if not DIRECTORY_SYNC:
         return
-    fd = os.open(os.fspath(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fd = os.open(os.fspath(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        if exc.errno in _CANNOT_OPEN_DIRECTORY:
+            return
+        raise
     try:
         os.fsync(fd)
     except OSError as exc:

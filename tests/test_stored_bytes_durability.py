@@ -185,6 +185,55 @@ def test_a_file_in_the_way_is_refused_as_mkdir_refuses_it(tmp_path):
         durable_write.make_directories(tmp_path / "x" / "y")
 
 
+@pytest.mark.skipif(not DIRS, reason="a directory cannot be synced on Windows")
+def test_a_directory_that_cannot_be_opened_to_read_is_skipped_as_postgresql_skips_it(tmp_path,
+                                                                                     monkeypatch):
+    """Permission to create entries in a directory but not to read it: there is no descriptor to sync
+    it through. Any other failure to open it is raised."""
+    from app.core import durable_write
+    for code, raises in ((errno.EACCES, False), (errno.ENOENT, True), (errno.EIO, True)):
+        def fails(path, flags, *args, code=code, **kwargs):
+            raise OSError(code, os.strerror(code), path)
+        monkeypatch.setattr(os, "open", fails)
+        if raises:
+            with pytest.raises(OSError) as caught:
+                durable_write.sync_directory(tmp_path)
+            assert caught.value.errno == code
+        else:
+            durable_write.sync_directory(tmp_path)
+
+
+@pytest.mark.skipif(not DIRS, reason="a directory cannot be synced on Windows")
+def test_a_directory_is_made_in_a_parent_that_cannot_be_read(tmp_path):
+    from app.core import durable_write
+    parent = tmp_path / "drop"
+    parent.mkdir()
+    parent.chmod(0o300)                         # create entries and pass through; no reading
+    try:
+        durable_write.make_directories(parent / "storage" / "vaults")
+        assert (parent / "storage" / "vaults").is_dir()
+    finally:
+        parent.chmod(0o700)
+
+
+def test_a_start_syncs_the_storage_and_host_key_directories_it_creates(disk, tmp_path):
+    """Every process start makes them, before an upload or a host key would: a custom path that does
+    not exist yet is created there, and synced into its parent like every other directory."""
+    from app.core.config import Settings
+    storage = tmp_path / "data" / "storage"
+    key_dir = tmp_path / "keys" / "sftp"
+    paths = SimpleNamespace(file_storage_path=str(storage),
+                            sftp_host_key_path=str(key_dir / "ssh_host_key"))
+    Settings.ensure_directories(paths)
+    assert storage.is_dir() and key_dir.is_dir()
+    parents = [tmp_path, tmp_path / "data", tmp_path, tmp_path / "keys"]
+    assert [(k, i) for k, i, _ in disk.events] == (
+        [("dir", _ino(p)) for p in parents] if DIRS else [])
+    disk.events.clear()
+    Settings.ensure_directories(paths)
+    assert disk.events == [], "a directory that is there already is left as it is"
+
+
 # ---- the upload context: every file a vault stores is written through it --------------------------
 
 def _codecs():

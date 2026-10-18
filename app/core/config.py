@@ -466,13 +466,17 @@ class Settings(BaseSettings):
         return v
     
     def ensure_directories(self):
-        """Ensure required directories exist."""
+        """Ensure required directories exist. Each one a start creates is synced into its parent, as
+        every directory stored files need is: a storage path or a host-key directory that does not
+        exist yet is made here, at every process start, before anything else would make it."""
+        from app.core.durable_write import make_directories
+
         directories = [
             self.file_storage_path,
             Path(self.sftp_host_key_path).parent,
         ]
         for directory in directories:
-            Path(directory).mkdir(parents=True, exist_ok=True)
+            make_directories(directory)
 
 
 # The host port every shipped compose file publishes SFTP on, unless SFTP_HOST_PORT says otherwise.
