@@ -213,6 +213,29 @@ def test_it_waits_for_a_registered_rule_and_the_hold_switch(env, monkeypatch):
     assert env.get(ids[0]).ip_address is None
 
 
+def test_it_does_not_begin_while_the_hours_it_covers_are_not_all_sealed(env, monkeypatch):
+    """Its delay run, a removal does not begin, rewriting nothing and still cancellable, while sealing has stopped
+    (a gap is open, so it is not due), nor, a step of it taken on its own, while the hour it was asked in is not
+    sealed; once sealing goes on it begins and completes."""
+    ids = _hot(env)
+    asked = env.ask_removal()
+    real = ai.seal_pass
+    monkeypatch.setattr(ai, "seal_pass", lambda *a, **k: None)
+    env.week()
+    assert env.removal_row(asked["id"]).status == vr.PENDING
+    assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    seq = env.removal_row(asked["id"]).request_seq
+    p = retention.Pass(env.session, now=env.clock())
+    with ai.ChainWriter(ai._engine_of(env.session), env.st) as w:
+        outcome, changed, _cursor, done, why = vr.step(p, w, seq, {})
+        assert w.written == []
+    assert (outcome, changed, done, why) == (vr.WAIT, 0, None, "It waits until every hour it covers is sealed.")
+    assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    monkeypatch.setattr(ai, "seal_pass", real)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(ids[0]).ip_address is None and failures(env.verify()) == []
+
+
 DAY = (T0 - timedelta(days=100)).date()
 
 
