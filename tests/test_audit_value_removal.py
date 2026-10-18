@@ -11,8 +11,7 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py):
 - a cancel stops it before it begins, never after; the database removing its row, or marking it no longer waiting,
   vetoes it; a row whose copies differ from its seal is not acted on; it waits for a registered rule (legal holds,
   open cases), the hold switch, a restore's grace, and the hours it covers to be sealed; an hour that waits after
-  one rewritten the
-  same day leaves that one rewritten;
+  one rewritten the same day leaves that one rewritten;
 - verify refuses a rewrite seal for levels that names no removal, comes before its delay, after it is complete, over
   another scope, over hours after it, and a final seal with hours; and a removal request that is not well formed.
 """
