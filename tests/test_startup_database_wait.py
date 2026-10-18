@@ -291,6 +291,15 @@ def test_any_other_failure_is_not_retried(start, error):
     assert start.clock.slept == []
 
 
+def test_an_error_that_is_not_an_operational_error_is_not_waited_for_whatever_it_says(start):
+    """Only the database driver's own connection errors are judged by their words: any other error
+    stops the start at once, even one whose text reads like a database still on its way."""
+    with pytest.raises(RuntimeError):
+        start(None, RuntimeError("timeout expired"))
+    assert start.engine.attempts == 1
+    assert start.clock.slept == []
+
+
 def test_under_the_one_container_launcher_the_wait_lines_are_not_named_twice(start, monkeypatch,
                                                                              capsys):
     monkeypatch.setenv("VAULT_LOG_SINK_OWNER", "run_combined")
