@@ -8,6 +8,9 @@ environment and network), each with a throwaway database of its own and Docker's
 
 - the one-container shape (web and SFTP), with its database created but not yet started (no name to
   reach), started twelve seconds later;
+- the one-container shape again, with its database stopped (no name to reach) and started about
+  ninety seconds later, after the launcher's old one-minute wait for the web app: SFTP must start
+  only once the web app's start is done;
 - the SFTP process alone, with its database's server process stopped (SIGSTOP), so a connection is
   accepted and then times out, as it did after a host restart ("timeout expired"); continued
   (SIGCONT) fifteen seconds later.
@@ -98,8 +101,9 @@ class _Pair:
 
     def run_vault(self, *command, extra_env=()):
         env = []
+        replaced = tuple(entry.split("=", 1)[0] + "=" for entry in extra_env)
         for entry in self.api["Config"]["Env"]:
-            if entry.startswith("HOSTNAME="):
+            if entry.startswith(("HOSTNAME=", *replaced)):
                 continue
             if entry.startswith("DATABASE_URL="):
                 url = urlsplit(entry.split("=", 1)[1])
@@ -127,6 +131,12 @@ class _Pair:
     def logs(self):
         r = _docker("logs", self.vault_name, timeout=60)
         return (r.stdout or "") + (r.stderr or "")
+
+    def launcher_lines(self):
+        """The one-container launcher's output, in order: it passes on every line of both
+        processes, each tagged with the process's name, on its own standard output."""
+        r = _docker("logs", self.vault_name, timeout=60)
+        return (r.stdout or "").splitlines()
 
     def assert_never_restarted(self):
         state = self.state()
@@ -172,6 +182,41 @@ def test_the_one_container_vault_waits_for_a_database_that_starts_after_it(pair)
     pair.assert_never_restarted()
     logs = pair.logs()
     assert "The database answered after" in logs
+    assert "exited with code" not in logs and "Traceback" not in logs, logs[-3000:]
+
+
+def test_in_one_container_sftp_starts_only_after_a_web_start_that_waited_long(pair):
+    """A database that answers about ninety seconds after the vault started: after the launcher's
+    old one-minute wait for the web app, within the web app's own wait for its database. SFTP must
+    start only once the web app's start, its schema step included, is done."""
+    pair.create_database()
+    pair.start_database()
+    pair.wait_database_ready()            # initialised now, so its later start is quick
+    assert _docker("stop", pair.db_name).returncode == 0     # stopped: no name to reach
+    pair.run_vault("python", "run_combined.py", extra_env=["RUN_SFTP=true", "LOG_LEVEL=INFO"])
+
+    end = time.monotonic() + 90
+    while time.monotonic() < end:
+        pair.assert_never_restarted()
+        time.sleep(5)
+    lines = pair.launcher_lines()
+    assert any(line.startswith("[web] The database cannot be reached yet") for line in lines), lines[-40:]
+    assert not any(line.startswith("[sftp]") for line in lines), (
+        "SFTP started while the web app was still waiting for its database:\n" + "\n".join(lines[-40:]))
+
+    pair.start_database()
+    pair.wait_inside(_HEALTH, 120, "served the web app")
+    pair.wait_inside(_SSH_BANNER, 120, "served SFTP")
+    pair.assert_never_restarted()
+    lines = pair.launcher_lines()
+    text = "\n".join(lines[-60:])
+    assert not any("starting SFTP anyway" in line for line in lines), text
+    web_ready = next(i for i, line in enumerate(lines)
+                     if line.startswith("[web]") and "Application startup complete" in line)
+    first_sftp = next(i for i, line in enumerate(lines) if line.startswith("[sftp]"))
+    assert any(line.startswith("[web] The database answered after") for line in lines[:web_ready]), text
+    assert first_sftp > web_ready, "SFTP started before the web app's start was done:\n" + text
+    logs = pair.logs()
     assert "exited with code" not in logs and "Traceback" not in logs, logs[-3000:]
 
 

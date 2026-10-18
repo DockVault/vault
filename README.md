@@ -377,7 +377,9 @@ rollback to one of them is not protected by it; `dockvault.py update` from 0.33.
 rollback while the running version reports a change in the way. From 0.33.5 on, a process that
 cannot reach its database yet when it starts, as after a host restart, when the database starts
 with it, waits for up to two minutes, logging one line per try, and runs the check once the
-database answers; before that it stopped at once, and Docker started the container again.
+database answers; before that it stopped at once, and Docker started the container again. When
+one container runs both (`RUN_SFTP=1`), SFTP starts once the web app's start, that wait included,
+is done.
 
 What a given upgrade involves is declared in [`docs/upgrade-matrix.json`](docs/upgrade-matrix.json)
 and published with each release as an `upgrade.json` asset: whether the hop can be taken directly,

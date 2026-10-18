@@ -32,8 +32,21 @@ import threading
 import time
 import urllib.request
 
+from app.core.data_requirements import DATABASE_WAIT_SECONDS
+
 # (target, Popen) for each supervised child.
 _PROCS: list = []
+
+#: How long SFTP waits for the API to be ready. The API's start first waits up to
+#: DATABASE_WAIT_SECONDS for a database it cannot reach yet (after a host restart the database starts
+#: with the vault), and only then runs the schema step SFTP relies on; the margin is the time the rest
+#: of that start takes, the whole wait before the database wait existed.
+API_START_MARGIN_SECONDS = 60.0
+API_READY_SECONDS = DATABASE_WAIT_SECONDS + API_START_MARGIN_SECONDS
+
+# Seams for the tests, which run the wait on a clock of their own.
+_clock = time.monotonic
+_sleep = time.sleep
 
 # Serialize the tagging writers so a web line and an sftp line can never interleave mid-line
 # on the shared parent stdout.
@@ -230,10 +243,14 @@ def mark_sftp_in_container() -> bool:
     return True
 
 
-def _wait_api_ready(timeout: float = 60.0) -> bool:
+def _wait_api_ready(timeout: float = API_READY_SECONDS) -> bool:
     """Poll the API's /health until it answers, so the SFTP server starts only AFTER the
     API's lifespan has created/migrated the schema the SFTP path reads. Returns False on
-    timeout (we start SFTP anyway — it fails closed on DB errors, never serving stale).
+    timeout (we start SFTP anyway — it fails closed on DB errors, never serving stale), and
+    at once when the API process has exited.
+
+    The bound covers the API's own wait for its database (API_READY_SECONDS): with a shorter
+    one, a database that answered late in that wait let SFTP start before the schema step ran.
 
     Probes the scheme the API actually serves: the combined secure deployment terminates TLS
     in-process (API_USE_HTTPS=true), so a plain-http probe would never succeed and SFTP would
@@ -248,8 +265,8 @@ def _wait_api_ready(timeout: float = 60.0) -> bool:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = _clock() + timeout
+    while _clock() < deadline:
         # Stop early if the API process already died — the supervise loop will handle it.
         if _PROCS and _PROCS[0][1].poll() is not None:
             return False
@@ -259,7 +276,7 @@ def _wait_api_ready(timeout: float = 60.0) -> bool:
                     return True
         except Exception:  # noqa: BLE001 — not up yet
             pass
-        time.sleep(1)
+        _sleep(1)
     return False
 
 
