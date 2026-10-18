@@ -374,7 +374,10 @@ the data, and its log says what changed and how to undo it with the newer versio
 processes both check, whichever tool changed the image. `ALLOW_START_ON_NEWER_DATA=true` starts it
 anyway, at the risk described in `.env.example`. 0.33.0 and earlier do not read the mark, so a
 rollback to one of them is not protected by it; `dockvault.py update` from 0.33.1 on refuses such a
-rollback while the running version reports a change in the way.
+rollback while the running version reports a change in the way. From 0.33.5 on, a process that
+cannot reach its database yet when it starts, as after a host restart, when the database starts
+with it, waits for up to two minutes, logging one line per try, and runs the check once the
+database answers; before that it stopped at once, and Docker started the container again.
 
 What a given upgrade involves is declared in [`docs/upgrade-matrix.json`](docs/upgrade-matrix.json)
 and published with each release as an `upgrade.json` asset: whether the hop can be taken directly,

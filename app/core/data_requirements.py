@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -170,24 +171,113 @@ def _warn(text: str) -> None:
     print("WARNING: " + text.replace("\n", "\nWARNING: "), file=sys.stderr, flush=True)
 
 
+#: How long a start waits for a database it cannot reach yet. After a host restarts, the database and
+#: the vault start together, and the database can take a while to answer: a recovery after a power
+#: cut, or many deployments starting on one host. Long enough for that, and short enough that a
+#: database that is really gone still stops the start, with its error, within two minutes.
+DATABASE_WAIT_SECONDS = 120.0
+_FIRST_PAUSE = 1.0
+_LONGEST_PAUSE = 5.0
+
+# A server that answers with one of these is starting or stopping: reached, but not ready yet.
+_NOT_READY = (
+    "the database system is starting up",
+    "the database system is not yet accepting connections",
+    "the database system is in recovery mode",
+    "the database system is shutting down",
+)
+
+# Seams for the tests, which run the wait on a clock of their own.
+_clock = time.monotonic
+_sleep = time.sleep
+
+
+def _not_reachable_yet(exc: BaseException) -> bool:
+    """Whether a failed connection means the database cannot be reached yet.
+
+    The client library reports a connection that timed out, was refused, or found no name or route
+    without a server severity; a server that answers says ``FATAL:``. Of what a server answers, only
+    "starting" and "stopping" are waited for. A refusal it sent -- a wrong password, a missing
+    database or role, a rule that does not admit this address -- is not: waiting changes nothing.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    if not isinstance(exc, OperationalError):
+        return False
+    text = str(getattr(exc, "orig", None) or exc)
+    if "FATAL:" not in text:
+        return True
+    return any(marker in text for marker in _NOT_READY)
+
+
+def _reason(exc: BaseException) -> str:
+    """The client library's own words for why, on one line: "timeout expired", "Connection refused"."""
+    text = str(getattr(exc, "orig", None) or exc).strip()
+    line = text.splitlines()[0].strip() if text else type(exc).__name__
+    if "failed: " in line:
+        line = line.split("failed: ", 1)[1]
+    return line[:200]
+
+
+def _say(text: str) -> None:
+    print(text, file=sys.stderr, flush=True)
+
+
+def _connect_when_reachable(engine, prefix: str):
+    """A connection to the database, waiting up to DATABASE_WAIT_SECONDS for one it cannot reach yet.
+
+    One plain line per wait. Every other failure -- and the last one, when the wait runs out -- is
+    raised as it was before there was a wait.
+    """
+    started = _clock()
+    deadline = started + DATABASE_WAIT_SECONDS
+    pause = _FIRST_PAUSE
+    waited = False
+    while True:
+        try:
+            connection = engine.connect()
+        except Exception as exc:  # noqa: BLE001 -- classified below; anything else is raised
+            if not _not_reachable_yet(exc):
+                raise
+            left = deadline - _clock()
+            if left <= 0:
+                _say(f"{prefix}The database could not be reached within {DATABASE_WAIT_SECONDS:g} s "
+                     f"({_reason(exc)}); stopping.")
+                raise
+            this_pause = min(pause, left)
+            _say(f"{prefix}The database cannot be reached yet ({_reason(exc)}); trying again in "
+                 f"{this_pause:g} s.")
+            _sleep(this_pause)
+            pause = min(pause * 2, _LONGEST_PAUSE)
+            waited = True
+            continue
+        if waited:
+            _say(f"{prefix}The database answered after {_clock() - started:.0f} s.")
+        return connection
+
+
 def check_at_startup(process: str) -> None:
     """Run the check against this process's database before anything else touches it.
 
     On a refusal the message is printed as plain lines before the exception propagates, so it leads
-    the container log rather than sitting inside a traceback. A database that cannot be reached fails
-    the start here, as it would a moment later anyway: the check is never skipped, so a database that
-    comes up between this step and the next cannot let an unchecked start through.
+    the container log rather than sitting inside a traceback.
+
+    A database that cannot be reached yet is waited for, within DATABASE_WAIT_SECONDS: after a host
+    restart it starts with the vault, and failing at once stopped the container for Docker to start it
+    again. The check itself is never skipped: it runs on the connection the wait ends with, so a
+    database that comes up during the wait is checked like any other. A refusal, and every failure
+    other than a database that cannot be reached yet, stops the start at once.
     """
     from app.core.config import settings
     from app.core.database import _require_engine
 
     version = running_version()
+    # Each line names the process, except under the one-container launcher, which already puts the
+    # process's name in front of every line it passes on.
+    prefix = "" if os.environ.get("VAULT_LOG_SINK_OWNER") == "run_combined" else f"[{process}] "
     try:
-        with _require_engine().connect() as connection:
+        with _connect_when_reachable(_require_engine(), prefix) as connection:
             check(connection, version, allow=bool(settings.allow_start_on_newer_data))
     except NewerDataRefusal as refusal:
-        # Each line names the process, except under the one-container launcher, which already puts
-        # the process's name in front of every line it passes on.
-        prefix = "" if os.environ.get("VAULT_LOG_SINK_OWNER") == "run_combined" else f"[{process}] "
         print(prefix + str(refusal).replace("\n", "\n" + prefix), file=sys.stderr, flush=True)
         raise
