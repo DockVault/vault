@@ -10,7 +10,8 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py):
   what it changed, and one past its time says what it had counted;
 - a cancel stops it before it begins, never after; the database removing its row, or marking it no longer waiting,
   vetoes it; a row whose copies differ from its seal is not acted on; it waits for a registered rule (legal holds,
-  open cases), the hold switch, and the hours it covers to be sealed; an hour that waits after one rewritten the
+  open cases), the hold switch, a restore's grace, and the hours it covers to be sealed; an hour that waits after
+  one rewritten the
   same day leaves that one rewritten;
 - verify refuses a rewrite seal for levels that names no removal, comes before its delay, after it is complete, over
   another scope, over hours after it, and a final seal with hours; and a removal request that is not well formed.
@@ -234,6 +235,24 @@ def test_it_waits_for_a_registered_rule_and_the_hold_switch(env, monkeypatch):
     env.passes(24)
     assert env.rewrite_seals() == []
     env.settings.retention_hold = False
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(ids[0]).ip_address is None
+
+
+def test_the_job_itself_rewrites_nothing_during_the_grace_after_a_restore(env, monkeypatch):
+    """A pass skips the job while a restore's grace runs; the job run on its own, its delay run, rewrites nothing
+    either, and the removal goes on once the grace is over."""
+    ids = _hot(env)
+    asked = env.ask_removal()
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    real = type(env.st).holds_deletion
+    monkeypatch.setattr(type(env.st), "holds_deletion", lambda self: "the grace after a restore runs until later")
+    env.removal_job()                 # run directly: a pass skips a held job before it starts
+    assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    assert env.removal_row(asked["id"]).status == vr.PENDING
+    monkeypatch.setattr(type(env.st), "holds_deletion", real)
     assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
     assert env.get(ids[0]).ip_address is None
 

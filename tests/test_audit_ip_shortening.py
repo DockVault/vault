@@ -6,7 +6,8 @@ offline, on a throwaway SQLite database with a chain of its own (tests/_removal_
   its network once its row is that many days old, as rows and in archived days: rewrite seals of reason shorten-ip,
   the stable roots and ids kept, fresh nonces, verify clean; a row younger stays until it is old enough; a pass
   with nothing to do writes nothing; a transaction takes the hours of one day, an hour that does not check out
-  leaves the hours before it shortened, and an archived day with nothing to shorten is passed over;
+  leaves the hours before it shortened, and an archived day with nothing to shorten is passed over; a legal hold
+  or a restore's grace holds it;
 - setting a number in the panel deletes sooner: it waits the reduction delay; no limit again applies at once;
 - verify refuses a shortening while there is no limit, over rows younger than the days, or naming a request;
 - the setting is a chain setting whose lower values delete sooner, in .env, the host tool and the docs.
@@ -25,6 +26,7 @@ from app.core import audit_chain_policy as pol
 from app.core import audit_chain_policy_seals as ps
 from app.core import audit_integrity as ai
 from app.core import audit_rewrite as rw
+from app.core import person_erase as pe
 from app.core import retention
 from app.core import settings_registry as reg
 from app.core.models import AuditArchiveBlock, AuditLog
@@ -364,6 +366,25 @@ def test_once_done_a_pass_reads_only_what_has_aged_since(env30, monkeypatch):
     env.clock.advance(hours=6)
     rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert seen == [ai.hour_floor(T0 - timedelta(days=30))]
+
+
+def test_a_legal_hold_or_a_restore_s_grace_holds_the_shortening(env30, monkeypatch):
+    """A registered rule (legal holds, open cases) and the grace after a restore each hold the shortening: nothing is
+    shortened while one holds, and it goes on once neither does."""
+    env = env30
+    row = env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    monkeypatch.setattr(pe, "WAIT_RULES", [lambda db, now: "a legal hold is in force"])
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(row).ip_address == "203.0.113.9" and env.rewrite_seals() == []
+    monkeypatch.setattr(pe, "WAIT_RULES", [])
+    real = type(env.st).holds_deletion
+    monkeypatch.setattr(type(env.st), "holds_deletion", lambda self: "the grace after a restore runs until later")
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(row).ip_address == "203.0.113.9" and env.rewrite_seals() == []
+    monkeypatch.setattr(type(env.st), "holds_deletion", real)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(row)) and len(env.rewrite_seals()) == 1
 
 
 def test_an_hour_another_writer_sealed_waits_for_the_host(env30, monkeypatch):
