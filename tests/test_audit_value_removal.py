@@ -340,18 +340,21 @@ def test_verify_refuses_a_removal_request_that_is_not_well_formed(env):
             "new": {"levels": dict(LOWER), "before": before}}
     assert rw.removal_request_problem(good, at) is None
     bad = [
-        dict(good, setting="audit_max_days"),
-        dict(good, placeholder="erased-0a1b2c3d"),
-        dict(good, new={"levels": dict(LOWER)}),
-        dict(good, new={"levels": {k: ap.FULL for k in ap.POLICY_KEYS}, "before": before}),
-        dict(good, new={"levels": dict(LOWER, ip="fingerprint"), "before": before}),
-        dict(good, new={"levels": {ap.IP: ap.NONE}, "before": before}),
-        dict(good, new={"levels": dict(LOWER), "before": fmt.time_text(ai.hour_floor(at) + timedelta(minutes=30))}),
-        dict(good, new={"levels": dict(LOWER), "before": fmt.hour_text(ai.hour_floor(at))}),
-        dict(good, new={"levels": dict(LOWER), "before": fmt.hour_text(ai.hour_floor(at) + timedelta(hours=2))}),
+        (dict(good, setting="audit_max_days"), "naming a setting"),
+        (dict(good, placeholder="erased-0a1b2c3d"), "naming a setting"),
+        (dict(good, new={"levels": dict(LOWER)}), "its levels and the time"),
+        (dict(good, new={"levels": {k: ap.FULL for k in ap.POLICY_KEYS}, "before": before}), "removes nothing"),
+        (dict(good, new={"levels": dict(LOWER, ip="fingerprint"), "before": before}), "is not a level of ip"),
+        (dict(good, new={"levels": {ap.IP: ap.NONE}, "before": before}), "a level for each kind"),
+        (dict(good, new={"levels": dict(LOWER), "before": fmt.time_text(ai.hour_floor(at) + timedelta(minutes=30))}),
+         "before an hour boundary"),
+        (dict(good, new={"levels": dict(LOWER), "before": fmt.hour_text(ai.hour_floor(at))}),
+         "do not end with the hour"),
+        (dict(good, new={"levels": dict(LOWER), "before": fmt.hour_text(ai.hour_floor(at) + timedelta(hours=2))}),
+         "do not end with the hour"),
     ]
-    for detail in bad:
-        assert rw.removal_request_problem(detail, at) is not None, detail
+    for detail, why in bad:
+        assert why in (rw.removal_request_problem(detail, at) or ""), (detail, why)
 
 
 def test_a_forged_removal_rewrite_is_found_by_verify(env):
