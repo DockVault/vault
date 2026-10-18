@@ -530,14 +530,14 @@ def _rows_in_parts(db, entry) -> Optional[datetime]:
 def step(p, w, scope: Scope, cursor: datetime) -> tuple:
     """One transaction of a run: (outcome, the new cursor, rows changed, oldest, newest, the unit: "day" for an
     archived day, "hours" for hours of rows, None when FINISHED). The rows and archived parts before ``cursor`` are
-    done. An archived day is a unit up to the end of its parts (or the scope's end), not of the day: a day archived
-    over several passes still holds its later hours as rows, and those are reached after it as hours of rows (a pass
-    that archives them meanwhile makes the day a unit again, its earlier parts then holding nothing to change). The
-    earliest of the next archived day and the next hours of rows goes next, and a day with rows of audit_logs in the
-    hours its parts hold is reported (row-in-archived-day), not rewritten. Hours of rows taken run within one day
-    and never into an archived day's parts: a day is archived from its first sealed hour on, so the hours of a day
-    that come before its parts are hours before the chain began, which no seal covers (rewrite_hour waits at the
-    first of them). Writes a rewrite seal only when it returns CHANGED. Raises NotRewritten."""
+    done. An archived day is a unit up to the end of its parts, not of the day: a day archived over several passes
+    still holds its later hours as rows, and those are reached after it as hours of rows (a pass that archives them
+    meanwhile makes the day a unit again, its earlier parts then holding nothing to change). The earliest of the
+    next archived day and the next hours of rows goes next, and a day with rows of audit_logs in the hours its parts
+    hold is reported (row-in-archived-day), not rewritten. Hours of rows taken run within one day and never into an
+    archived day's parts: a day is archived from its first sealed hour on, so the hours of a day that come before
+    its parts are hours before the chain began, which no seal covers (rewrite_hour waits at the first of them).
+    Writes a rewrite seal only when it returns CHANGED. Raises NotRewritten."""
     from app.core import audit_archive as arc
     view = w.st.view
     newest = view.newest_policy()
@@ -546,7 +546,6 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
         if not e.parts or arc.day_start(d) >= scope.before:
             continue
         first, end = _span(e)
-        end = min(end, scope.before)
         if end > cursor:
             days.append((d, first, end))
     hot = _next_hot_hours(w.db, scope, cursor)
