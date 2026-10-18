@@ -112,6 +112,28 @@ def test_a_removal_brings_earlier_rows_down_to_the_levels_and_the_chain_still_ve
     assert failures(report) == [], report.findings
 
 
+def test_a_preview_that_runs_out_of_time_says_what_it_had_counted(env, monkeypatch):
+    """Past its time a preview gives what it had counted, marked not counted; one that cannot count gives no
+    number."""
+    _hot(env)
+    with env.session() as db:
+        ctx, before = rw.Context.load(db), vr.scope_end(env.clock())
+        assert vr.count_changes(db, env.st.view, LOWER, before, ctx)["counted"] is True
+        assert vr.count_changes(db, env.st.view, LOWER, before, ctx, budget=-1) == {
+            "rows": 0, "kinds": {ap.EMAILS: 0, ap.IP: 0, ap.USER_AGENT: 0}, "counted": False}
+    monkeypatch.setattr(vr, "PREVIEW_SECONDS", -1)
+    with env.session() as db:
+        p = vr.preview(db, env.st, env.clock())
+    assert p["counted"] is False and p["rows"] == 0
+
+    def cannot(*args, **kwargs):
+        raise RuntimeError("canceling statement due to statement timeout")
+    monkeypatch.setattr(vr, "count_changes", cannot)
+    with env.session() as db:
+        p = vr.preview(db, env.st, env.clock())
+    assert p["rows"] is None and p["counted"] is False and [k["rows"] for k in p["kinds"]] == [None] * 3
+
+
 def test_nothing_is_asked_for_at_full_and_one_removal_waits_at_a_time(env):
     _hot(env)
     env.levels = {k: ap.FULL for k in ap.POLICY_KEYS}
