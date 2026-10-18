@@ -335,6 +335,22 @@ def test_a_removal_over_archived_days_and_rows_reaches_both(env):
     assert failures(env.verify()) == []
 
 
+def test_an_archived_day_with_nothing_to_remove_is_passed_over_and_the_rows_after_it_are_reached(env):
+    env.put(_at(3, 5), ip_address=None, user_agent=None)
+    hot = env.put(T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        payload = db.query(AuditArchiveBlock).one().payload
+    asked = env.ask_removal()
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(hot).ip_address is None and env.get(hot).user_agent is None
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == payload
+    assert env.removal_row(asked["id"]).counts == {"rows": 1, "archived_rows": 0}
+    assert failures(env.verify()) == []
+
+
 def test_the_job_itself_rewrites_nothing_while_the_chain_holds(env, monkeypatch):
     from app.core import audit_chain_policy_seals as ps
     ids = _hot(env)
@@ -371,3 +387,22 @@ def test_a_removal_waits_at_an_hour_another_writer_sealed(env, monkeypatch):
     assert "waits for the host operator" in (env.removal_row(asked["id"]).waiting or "")
     monkeypatch.setattr(ai, "hour_held", real)
     assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+
+
+def test_an_hour_that_waits_after_one_rewritten_the_same_day_leaves_that_one_sealed(env, monkeypatch):
+    """The hours of one day go in one transaction: an hour that waits after one already rewritten in it leaves that
+    one rewritten under its rewrite seal; the removal waits at the other, and goes on once it no longer waits."""
+    ids = _hot(env)
+    asked = env.ask_removal()
+    first, held = ai.hour_floor(T0 - timedelta(hours=30)), ai.hour_floor(T0 - timedelta(hours=20))
+    real = ai.hour_held
+    monkeypatch.setattr(ai, "hour_held", lambda view, record, h: 77 if h == held else real(view, record, h))
+    env.week()
+    assert env.get(ids[0]).ip_address is None and env.get(ids[1]).ip_address is None
+    assert env.get(ids[2]).ip_address == "203.0.113.9"
+    assert [[e[0] for e in s.detail["hours"]] for s in env.rewrite_seals()] == [[fmt.hour_text(first)]]
+    assert "waits for the host operator" in (env.removal_row(asked["id"]).waiting or "")
+    monkeypatch.setattr(ai, "hour_held", real)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(ids[2]).ip_address is None
+    assert failures(env.verify()) == []

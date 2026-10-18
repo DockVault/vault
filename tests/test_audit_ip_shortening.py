@@ -137,6 +137,40 @@ def test_an_hour_that_does_not_check_out_is_reported_and_the_others_are_shortene
     assert "rows-altered" in ((env.st.head_store().load() or {}).get("failures") or {})
 
 
+def test_an_hour_that_does_not_check_out_after_one_shortened_the_same_day_leaves_that_one_sealed(env30):
+    """The hours of one day go in one transaction: an hour that does not check out after one already shortened in
+    it leaves that one shortened under its rewrite seal, and is reported."""
+    env = env30
+    day = (T0 - timedelta(days=40)).date()
+    good = env.put(datetime.combine(day, time(3, 5)))
+    bad = env.put(datetime.combine(day, time(4, 5)))
+    env.run_until_sealed()
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == bad).update({AuditLog.username: "mallory"})
+        db.commit()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(good)) and env.get(bad).ip_address == "203.0.113.9"
+    assert [[e[0] for e in s.detail["hours"]] for s in env.rewrite_seals()] == [
+        [fmt.hour_text(datetime.combine(day, time(3)))]]
+    assert "rows-altered" in ((env.st.head_store().load() or {}).get("failures") or {})
+
+
+def test_a_transaction_never_takes_the_hours_of_two_days(env30, monkeypatch):
+    """A rewrite seal covers hours of one day (verify holds every rewrite seal to that): handed hours that run into
+    the next day, a transaction stops at the end of the first and the next one takes the rest."""
+    env = env30
+    days = [(T0 - timedelta(days=d)).date() for d in (41, 40)]
+    rows = [env.put(datetime.combine(d, time(h, 5))) for d in days for h in (3, 22)]
+    env.run_until_sealed()
+    hours = sorted(ai.hour_floor(env.get(r).timestamp) for r in rows)
+    monkeypatch.setattr(rw, "_next_hot_hours", lambda db, scope, cursor, limit=48: [h for h in hours if h >= cursor])
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert [sorted({fmt.parse_time_text(e[0]).date() for e in s.detail["hours"]}) for s in env.rewrite_seals()] == [
+        [days[0]], [days[1]]]
+    assert all(_shortened(env.get(r)) for r in rows)
+    assert failures(env.verify()) == []
+
+
 DAY = (T0 - timedelta(days=100)).date()
 
 
@@ -164,6 +198,24 @@ def test_archived_days_are_shortened_in_their_blocks(env30):
     assert after.kind == "archive" and after.detail["cause"] == "rewrite" and after.detail["after_seq"] == seal.seq
     report = env.verify()
     assert failures(report) == [], report.findings
+
+
+def test_an_archived_day_with_nothing_to_shorten_is_passed_over_and_the_rows_after_it_are_reached(env30):
+    env = env30
+    env.put(datetime.combine(DAY, time(3, 5)), ip_address=None)
+    row = env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        payload = db.query(AuditArchiveBlock).one().payload
+    assert env.get(row) is not None
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(row))
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == payload
+    assert [[e[0] for e in s.detail["hours"]] for s in env.rewrite_seals()] == [
+        [fmt.hour_text(ai.hour_floor(T0 - timedelta(days=40)))]]
+    assert failures(env.verify()) == []
 
 
 def _change(env, actor, value):
