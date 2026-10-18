@@ -4,7 +4,8 @@
 At full the preview says there is nothing to remove and asking stays off. With a level lowered the preview lists each
 kind below full with the rows above it; asking shows a confirmation that needs "remove" typed (dismissed, nothing is
 sent), then the password; the removal is listed waiting, with its levels and when it runs, and any administrator
-cancels it. The page says how long addresses stay in full when that is set. The card fits a phone. No console error.
+cancels it. A preview that ran out of time says "at least", and one that could not count says so. The page says how
+long addresses stay in full when that is set. The card fits a phone. No console error.
 """
 import re
 
@@ -103,6 +104,29 @@ def test_a_removal_is_previewed_confirmed_asked_for_with_the_password_and_cancel
     assert psql(f"SELECT status FROM audit_value_removals WHERE id = '{request_id}'") == "cancelled"
     # The one console line: the browser's own for the 403 that asks for the password (the step-up).
     assert [e for e in errors if "status of 403" not in e] == [], errors
+
+
+@pytest.mark.parametrize("change, total, each", [
+    ({"rows": 1200, "counted": False}, r"At least 1,?200 rows in all \(there are too many to count", r"\d+ rows?"),
+    ({"rows": None, "counted": False, "kinds": None}, "could not be counted just now", "too many to count just now"),
+])
+def test_a_preview_not_fully_counted_says_so(page: Page, admin_creds, levels_restored, change, total, each):
+    """A preview that ran out of time says "at least"; one that could not count says so, for each kind too."""
+    store(dict(FULL, ip="shortened"))
+
+    def answer(route):
+        response = route.fetch()
+        data = response.json()
+        if change.get("kinds", 0) is None:
+            data["kinds"] = [dict(k, rows=None) for k in data["kinds"]]
+        data.update({k: v for k, v in change.items() if k != "kinds"})
+        route.fulfill(response=response, json=data)
+    page.route("**/settings/value-removals/preview", answer)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open(page)
+    page.click("#removal-preview-btn")
+    expect(page.locator("#removal-preview .removal-total")).to_have_text(re.compile(total), timeout=15000)
+    expect(page.locator('#removal-preview li[data-kind="ip"]')).to_contain_text(re.compile(each))
 
 
 def test_the_card_fits_a_phone(page: Page, admin_creds):
