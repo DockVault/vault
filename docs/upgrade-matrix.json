@@ -4615,6 +4615,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.33.5": {
+      "released": "2026-10-18",
+      "notes": "Uploads are on the disk before they are confirmed. Until now an upload could be confirmed while its content was still waiting in memory to be written out, so a host that lost power, or whose system crashed, within about half a minute of an upload could come back with the file listed and its content missing: its download failed. Every upload now waits until the file's content and its name are on the disk before it is recorded and confirmed: web uploads, resumable uploads (each part as it is acknowledged), uploads through an upload link, zero-knowledge uploads, SFTP uploads, copies, moves to another vault and replacements of a file of the same name. So do an uploaded logo or icon, a newly generated SFTP host key, and the storage and host-key directories when a start creates them. A file already lost this way cannot be recovered: upload it again. This is a durability fix, not a security fix. Waiting for the disk takes time. On the cloud disk it was measured on, each small upload took about 5 to 25 ms longer, depending on how busy the disk was; a file of a few tens of MiB sent in a single request took up to about two and a half times as long (60 MiB: 0.4 to 0.8 s more); and a 1 GiB upload took up to about a fifth longer over the web and up to about a seventh longer over SFTP. A vault that starts at the same time as its database, as after a host restart, now waits up to two minutes for the database to answer, with one log line per try, instead of stopping at once to be started again by Docker. Once the database answers, the start checks for data a newer release changed, as before; a database that refuses the connection, for a wrong password say, still stops the start at once. So does a connection that cannot be made as configured, such as one without a password, or one that requires SSL of a database that offers none, and any error not known to mean that the database is not up yet. When one container runs both the web app and SFTP, SFTP now starts only once the web app's start, that wait included, is done. The launcher used to wait one minute for the web app and then start SFTP anyway, so a database that answered later than that could let SFTP start before the web app had finished preparing the database; it now waits up to three minutes. A connection to the SFTP port that never speaks SSH, as internet scanners' probes do, is now logged as one line naming what it sent, `event connection.not-ssh.http`, `.text`, `.binary`, `.silent` or `.closed` with the peer's address, instead of error tracebacks. The line `event connection.accepted` is now written once a client has said it speaks SSH, not when the connection opens, so a probe no longer writes one. SSH clients are logged as before, their failures included, and so is a failure on the server's own side before a client has said anything, with its detail. Nothing changes in what is refused, rate-limited, blocked, or recorded in the audit and activity logs. This release fixes no advisory: none of these changes is a security fix. It attaches no VEX document: it holds no reviewed scanner exception, so scanners need none.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -5031,6 +5039,13 @@
     {
       "from": "0.33.3",
       "to": "0.33.4",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.4",
+      "to": "0.33.5",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
