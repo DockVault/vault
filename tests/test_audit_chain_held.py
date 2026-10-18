@@ -1,7 +1,8 @@
 """An hour re-rooted by a seal another writer appended after the head record, not yet acknowledged by the host, is
 left as it is by the pruner: its rows may have been edited and sealed over by whoever holds the key, and a prune
-would then seal them as genuine and destroy the evidence (app/core/audit_integrity.py hour_held). Offline, on a
-throwaway SQLite database with a chain of its own (tests/_audit_chain_env.py)."""
+would then seal them as genuine and destroy the evidence (app/core/audit_integrity.py hour_held). A day whose every
+hour is left so (or reported) does not stop the prune of the days after it. Offline, on a throwaway SQLite database
+with a chain of its own (tests/_audit_chain_env.py)."""
 from datetime import datetime, time, timedelta
 
 import pytest
@@ -93,3 +94,24 @@ def test_an_erase_seal_another_writer_appended_holds_its_hour(env):
     record["after_record"][0]["acknowledged"] = True
     assert ai.hour_held(env.st.view, record, at(3)) is None
     assert ai.hour_held(env.st.view, record, at(9)) is None
+
+
+@pytest.mark.parametrize("why", ["held", "altered"])
+def test_a_day_whose_every_hour_is_left_does_not_hold_back_the_days_after_it(env, monkeypatch, why):
+    """The pruner leaves an hour that waits (held by another writer's seal) or that does not check out (its row
+    edited after its seal), and goes on with the next day in the same pass: a day whose every hour is left does not
+    stop the prune of the days after it."""
+    from app.core.models import AuditLog as A
+    first, after = at(23), at(1, day=RECENT + timedelta(days=1))
+    edited = env.row(first)
+    env.row(after)
+    env.run_until_sealed()
+    if why == "held":
+        real = ai.hour_held
+        monkeypatch.setattr(ai, "hour_held", lambda view, record, h: 77 if h == first else real(view, record, h))
+    else:
+        with env.session() as db:
+            db.query(A).filter(A.id == edited).update({A.username: "mallory"}, synchronize_session=False)
+            db.commit()
+    _prune(env)
+    assert _hot(env) == 1 and _hot(env, RECENT + timedelta(days=1)) == 0

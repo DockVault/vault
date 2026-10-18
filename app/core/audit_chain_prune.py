@@ -186,7 +186,9 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None,
                 batch.add(len(gone), min(times) if times else None, max(times) if times else None)
             if not entries:
                 w.db.rollback()
-                if all(h in skipped for h in hours):
+                # Every hour of the day was left (it waits, or it was reported): the next day goes on, in this
+                # pass. Only the day's hours count, for those listed after it are not looked at yet.
+                if all(h in skipped for h in hours if h.date() == day):
                     continue
                 break
             detail = {"reason": reason, "policy_seq": newest[0], "request_seq": None, "hours": entries}
