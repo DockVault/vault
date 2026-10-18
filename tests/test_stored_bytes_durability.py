@@ -368,11 +368,15 @@ def _sftp_fakes(monkeypatch, tmp_path, disk):
     committed = []
 
     def finalize(**kw):
+        if vault_service.insert_error is not None:
+            disk.mark("insert failed")
+            raise vault_service.insert_error
         disk.mark("commit")
         committed.append(kw)
         return SimpleNamespace(id="F")
 
-    vault_service = SimpleNamespace(storage_path=tmp_path, finalize_streaming_upload=finalize)
+    vault_service = SimpleNamespace(storage_path=tmp_path, finalize_streaming_upload=finalize,
+                                    insert_error=None)
     # The persist check locks the vault row until its session ends; "lock" marks where it starts.
     answers = []
 
@@ -387,11 +391,12 @@ def _sftp_fakes(monkeypatch, tmp_path, disk):
     return mod, interface, vault_service, committed
 
 
-def _streaming(monkeypatch, tmp_path, disk):
+def _streaming(monkeypatch, tmp_path, disk, insert_error=None):
     from app.services.streaming_upload import StreamingUploadContext
     from app.core import security
     from app.sftp.sftp_server import VaultSFTPHandle, _StreamingUpload
     mod, interface, _vs, committed = _sftp_fakes(monkeypatch, tmp_path, disk)
+    _vs.insert_error = insert_error
     handle = VaultSFTPHandle(flags=os.O_WRONLY)
     handle._interface = interface
     stream = _StreamingUpload(handle=handle, interface=interface, vault_id="V", folder_id=None,
@@ -454,10 +459,25 @@ def test_an_sftp_streaming_upload_whose_final_sync_fails_writes_no_row(disk, tmp
     assert committed == [] and not blob.exists()
 
 
-def _buffered(monkeypatch, tmp_path, disk):
+def test_an_sftp_streaming_upload_whose_insert_fails_leaves_no_blob(disk, tmp_path, monkeypatch,
+                                                                    capsys):
+    """The file is complete and on the disk when the insert fails (the database went away, say):
+    the written file is removed, so nothing is left on the disk that no row knows of."""
+    from sqlalchemy.exc import OperationalError
+    stream, blob, committed = _streaming(
+        monkeypatch, tmp_path, disk,
+        insert_error=OperationalError(None, None, Exception("server closed the connection")))
+    stream.close()
+    assert disk.kinds() == _expect("lock", "file", "dir", "insert failed")
+    assert committed == [] and not blob.exists()
+    assert "event upload.stream.finalize-failed err=OperationalError" in capsys.readouterr().out
+
+
+def _buffered(monkeypatch, tmp_path, disk, insert_error=None):
     from app.services.streaming_upload import StreamingUploadContext
     from app.core import security
     mod, interface, vault_service, committed = _sftp_fakes(monkeypatch, tmp_path, disk)
+    vault_service.insert_error = insert_error
     blob = tmp_path / "blob"
 
     def upload_file_streaming(**kw):
@@ -505,6 +525,19 @@ def test_an_sftp_buffered_upload_refused_at_the_insert_leaves_no_blob(disk, tmp_
     finalize(str(staged))
     assert committed == [] and not blob.exists()
     assert disk.kinds() == _expect("lock", "file", "dir", "lock")
+
+
+def test_an_sftp_buffered_upload_whose_insert_fails_leaves_no_blob(disk, tmp_path, monkeypatch):
+    """Authorized again under the lock, then the insert itself fails: the written file is removed
+    and the failure reaches the handle's close(), which logs it."""
+    from sqlalchemy.exc import OperationalError
+    error = OperationalError(None, None, Exception("server closed the connection"))
+    finalize, staged, blob, committed, answers = _buffered(monkeypatch, tmp_path, disk,
+                                                           insert_error=error)
+    with pytest.raises(OperationalError):
+        finalize(str(staged))
+    assert disk.kinds() == _expect("lock", "file", "dir", "lock", "insert failed")
+    assert committed == [] and not blob.exists()
 
 
 # ---- chunked uploads: each chunk before the answer that it was received ---------------------------
