@@ -29,6 +29,13 @@ REFUSED = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: C
 NO_NAME = 'could not translate host name "vault-db" to address: Name or service not known\n'
 STARTING = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  the database '
             'system is starting up\n')
+NOT_ACCEPTING = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  the database '
+                 'system is not yet accepting connections\nDETAIL:  Consistent recovery state has not been '
+                 'yet reached.\n')
+IN_RECOVERY = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  the database '
+               'system is in recovery mode\n')
+SHUTTING_DOWN = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  the database '
+                 'system is shutting down\n')
 BAD_PASSWORD = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  password '
                 'authentication failed for user "sftp_user"\n')
 
@@ -116,7 +123,11 @@ def _mark_newer(engine):
     (REFUSED, "Connection refused"),
     (NO_NAME, 'could not translate host name "vault-db" to address: Name or service not known'),
     (STARTING, "FATAL:  the database system is starting up"),
-], ids=["timeout", "refused", "no-name-yet", "starting-up"])
+    (NOT_ACCEPTING, "FATAL:  the database system is not yet accepting connections"),
+    (IN_RECOVERY, "FATAL:  the database system is in recovery mode"),
+    (SHUTTING_DOWN, "FATAL:  the database system is shutting down"),
+], ids=["timeout", "refused", "no-name-yet", "starting-up", "not-yet-accepting", "in-recovery",
+        "shutting-down"])
 def test_a_database_that_comes_up_during_the_wait_is_checked_and_the_start_goes_on(
         start, capsys, message, reason):
     engine = start(3, _unreachable(message), connect_seconds=5.0)
