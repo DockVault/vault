@@ -331,7 +331,8 @@ services:
     # seconds while it is actually alive (accepting, its watchdog turning, no upload stuck in a
     # storage write), and the check reads that file's age: app/sftp/heartbeat.py. A bound port
     # says only that the process once started; and nothing opens a socket here — a raw TCP
-    # connect makes paramiko log "Error reading SSH protocol banner" on every probe.
+    # connect is a connection that never speaks SSH, logged as one line on every probe
+    # (`event connection.not-ssh.closed`), so the log would fill with the check's own visits.
     healthcheck:
       test: ["CMD", "python", "-B", "-m", "app.sftp.heartbeat"]
       interval: 30s

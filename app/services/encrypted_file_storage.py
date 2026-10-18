@@ -8,9 +8,9 @@ upload now goes through the AES-GCM chunked at-rest stream (see
 by the live code (``VaultService`` calls it when destroying a blob).
 """
 
-import os
 from pathlib import Path
 import secrets
+from app.core import durable_write
 from app.core.safe_log import safe_event
 
 
@@ -49,10 +49,8 @@ class EncryptedFileStorage:
                     chunk = secrets.token_bytes(min(chunk_size, remaining))
                     f.write(chunk)
                     remaining -= len(chunk)
-
-            # Flush to disk
-            with open(storage_path, 'rb') as f:
-                os.fsync(f.fileno())
+                # Flush to disk: the overwrite reaches it before the unlink below.
+                durable_write.sync_file(f)
 
             # Finally, delete the file
             storage_path.unlink()

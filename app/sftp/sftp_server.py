@@ -40,6 +40,7 @@ import socket
 import threading
 import weakref
 import posixpath
+import re
 import tempfile
 import mimetypes
 import time
@@ -875,6 +876,10 @@ class _StreamingUpload:
     point, exactly as in the buffered path)."""
 
     RECORD_SIZE = 1024 * 1024
+    # From this size on, what was streamed is synced to the disk before the vault row is locked at
+    # close (see close()). Below it the sync under the lock is as quick as a sync of its own would be,
+    # and a second one would only add a wait to every small upload.
+    PRESYNC_BYTES = 8 * 1024 * 1024
 
     def __init__(self, handle, interface, vault_id, folder_id, filename,
                  can_overwrite, max_bytes, reorder_bytes):
@@ -977,6 +982,11 @@ class _StreamingUpload:
         try:
             checksum = self._ctx.get_checksum()
             total_size = self._ctx.get_total_size()
+            # The bytes so far go to the disk now, before the persist below locks the vault row: the
+            # clean exit under that lock then has only the terminal left to sync, so the lock is not
+            # held while a large upload is written out. A failure here discards the upload.
+            if total_size >= self.PRESYNC_BYTES:
+                self._ctx.sync_written()
             with get_db_context() as db:
                 authz = self._interface._authorize_upload_persist(
                     db, self._vault_id, self._folder_id, total_size)
@@ -1834,11 +1844,16 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                             bytes=buffered_size, limit=max_bytes)
                 return
 
+            # Refused up front, before any blob is written, by the same checks the insert must
+            # pass. The vault row this takes is unlocked when the session ends: the file is then
+            # encrypted, written and synced to the disk with no lock held, and authorized again,
+            # under the lock, for the insert -- the streaming path's order. Writing a large file
+            # out to the disk under the lock would hold every other upload to this vault.
             with get_db_context() as db:
                 authz = interface._authorize_upload_persist(db, vault_id, folder_id, buffered_size)
                 if authz is None:
                     return
-                user, vault, vault_service = authz
+                user, _vault, vault_service = authz
 
                 mime_type, _ = mimetypes.guess_type(filename)
                 file_info, stream_ctx = vault_service.upload_file_streaming(
@@ -1848,16 +1863,31 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     folder_id=folder_id,
                     mime_type=mime_type,
                 )
-                try:
-                    with stream_ctx as ctx:
-                        with open(tmp_path, "rb") as tf:
-                            while True:
-                                buf = tf.read(1024 * 1024)
-                                if not buf:
-                                    break
-                                ctx.write_chunk(buf)
-                        checksum = ctx.get_checksum()
-                        total_size = ctx.get_total_size()
+            storage_root = vault_service.storage_path
+
+            # Until the row commits, the blob is this function's to remove: the streaming context
+            # unlinks it only on an error inside its block, and a refusal or a failure after the
+            # block would otherwise strand an encrypted blob with no File row.
+            committed = False
+            try:
+                with stream_ctx as ctx:
+                    with open(tmp_path, "rb") as tf:
+                        while True:
+                            buf = tf.read(1024 * 1024)
+                            if not buf:
+                                break
+                            ctx.write_chunk(buf)
+                    checksum = ctx.get_checksum()
+                    total_size = ctx.get_total_size()
+
+                with get_db_context() as db:
+                    authz = interface._authorize_upload_persist(db, vault_id, folder_id, total_size)
+                    if authz is None:
+                        return
+                    user, vault, vault_service = authz
+                    # file_info's vault ORM came from the closed session above; re-bind it to this
+                    # one for finalize's same-name replacement + ZK check.
+                    file_info['vault'] = vault
                     # ATOMIC OVERWRITE: replace-on-clash is done inside finalize, in the
                     # SAME transaction as the new insert (old same-name row deleted before
                     # the new one commits) — so a failed/oversize upload never destroys the
@@ -1869,23 +1899,19 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                         file_info=file_info, total_size=total_size, checksum=checksum,
                         replace_same_name=can_overwrite,
                     )
-                except Exception:
-                    # The streaming context only unlinks the blob on an in-block
-                    # error; a failure in finalize_streaming_upload (after the
-                    # block) would otherwise strand the encrypted blob with no
-                    # File row. Remove it so a failed put leaves no orphan.
+                    committed = True
+                    interface._audit(user, "file_upload", str(new_file.id),
+                                     {"vault_id": str(vault_id), "file_name": filename, "via": "sftp"})
+                    safe_event('upload.stored',
+                                file=new_file.id, vault=vault_id, bytes=total_size)
+            finally:
+                if not committed:
                     try:
-                        orphan = vault_service.storage_path / file_info["storage_path"]
+                        orphan = storage_root / file_info["storage_path"]
                         if orphan.exists():
                             orphan.unlink()
                     except Exception:  # noqa: BLE001
                         pass
-                    raise
-
-                interface._audit(user, "file_upload", str(new_file.id),
-                                 {"vault_id": str(vault_id), "file_name": filename, "via": "sftp"})
-                safe_event('upload.stored',
-                            file=new_file.id, vault=vault_id, bytes=total_size)
 
         return _finalize
 
@@ -2670,10 +2696,10 @@ def start_sftp_server():
 
             # Handle client in a new thread (the handler releases the admission slot in its finally).
             # Everything after a successful admit() lives in this try, so ANY failure before the
-            # handler thread owns the slot -- including a logging error on a broken stdout pipe --
-            # still releases the slot and closes the socket instead of leaking them.
+            # handler thread owns the slot still releases the slot and closes the socket instead of
+            # leaking them. The connection is logged as accepted once it says it speaks SSH (see
+            # _Transport): one that never does is logged as one line, saying so.
             try:
-                safe_event('connection.accepted', peer=client_address)
                 client_thread = threading.Thread(
                     target=handle_sftp_client,
                     args=(client_socket, client_address, host_key)
@@ -2681,8 +2707,8 @@ def start_sftp_server():
                 client_thread.daemon = True
                 client_thread.start()
             except Exception as e:  # noqa: BLE001
-                # Failed after admission (spawn, or the log above) -- release the slot and close, so
-                # neither the slot nor the socket FD is leaked.
+                # Failed after admission -- release the slot and close, so neither the slot nor the
+                # socket FD is leaked.
                 _connection_admission.release(client_address[0])
                 try:
                     client_socket.close()
@@ -2715,6 +2741,133 @@ def start_sftp_server():
     safe_event('server.stopped')
 
 
+# An HTTP request line: "GET / HTTP/1.1", "CONNECT host:443 HTTP/1.1", the HTTP/2 preface "PRI * HTTP/2.0".
+_HTTP_REQUEST_LINE = re.compile(r"^[A-Z]{3,16} \S+ HTTP/\d")
+
+
+class _Transport(paramiko.Transport):
+    """paramiko's Transport, which keeps a peer that never says it speaks SSH out of the log.
+
+    Scanners on the internet connect to a public SFTP port all day without speaking SSH: they send
+    nothing, an HTTP request, a TLS greeting, bytes that are not text, or close at once. paramiko
+    refuses each correctly, and logged each refusal as an error with its traceback, which reads like a
+    fault in the server. So until the peer has sent an SSH identification line ("SSH-..."), paramiko's
+    warnings and errors are held back, and handle_sftp_client decides whose failure they describe. The
+    peer's: the refusal is one line (see _report_not_ssh) and they are dropped. The server's own: they
+    are logged as paramiko wrote them (release_held_records), with the failure's event after them. From
+    that line on, and so for every real SSH session, paramiko logs exactly as before, a failed key
+    exchange or sign-in included.
+
+    The two methods it overrides are paramiko's own: ``_log``, through which the transport logs, and
+    ``_check_banner``, which reads the peer's identification line. tests/test_sftp_probe_log.py runs
+    them against paramiko's real transport, so a paramiko that renames either fails there.
+    """
+
+    # Before the banner, paramiko writes a warning or an error only as its thread ends: a few records.
+    # The bound only keeps one connection from holding more than that.
+    HELD_RECORDS_MAX = 32
+
+    def __init__(self, sock, *args, peer=None, **kwargs):
+        # Set before paramiko's own set-up, in case it logs.
+        self._held_records = []
+        self._held_lock = threading.Lock()
+        self._holding = True
+        super().__init__(sock, *args, **kwargs)
+        self._peer = peer
+        # The first line the peer sent that was not an SSH identification line. Read only to say what
+        # kind of probe it was; never logged, since it is whatever a stranger chose to send.
+        self.first_line = None
+
+    def _speaks_ssh(self) -> bool:
+        return bool(getattr(self, "remote_version", ""))
+
+    def _log(self, level, msg, *args):
+        if not self._speaks_ssh():
+            if (level == paramiko.common.DEBUG and getattr(self, "first_line", "") is None
+                    and isinstance(msg, str) and msg.startswith("Banner: ")):
+                self.first_line = msg[len("Banner: "):][:64]
+            if level >= paramiko.common.WARNING:
+                with self._held_lock:
+                    if self._holding:
+                        if len(self._held_records) < self.HELD_RECORDS_MAX:
+                            self._held_records.append((level, msg, args))
+                        return
+        super()._log(level, msg, *args)
+
+    def release_held_records(self) -> None:
+        """Log what was held back, as paramiko wrote it, and hold nothing more: the failure was not
+        that of a peer that never spoke SSH, so its detail is the server's to keep."""
+        with self._held_lock:
+            held, self._held_records, self._holding = self._held_records, [], False
+        for level, msg, args in held:
+            super()._log(level, msg, *args)
+
+    def _check_banner(self):
+        try:
+            super()._check_banner()
+        finally:
+            # Set as soon as the peer sends an "SSH-" line, before its version is checked: an SSH
+            # client of the wrong version is a connection, logged as one, with paramiko's own detail.
+            if self._speaks_ssh():
+                try:
+                    safe_event('connection.accepted', peer=self._peer)
+                except Exception:  # noqa: BLE001 -- a log write must not end the session
+                    pass
+
+
+# What a peer that never speaks SSH makes the start of a connection raise: paramiko's refusal of what
+# it read, a read that timed out, a connection closed or reset, bytes that are not text.
+# (socket.timeout is an OSError; it is named for the reader.)
+_PEER_FAILURES = (paramiko.SSHException, EOFError, socket.timeout, OSError, UnicodeDecodeError)
+_CHAIN_MAX = 8
+
+
+def _peer_failure_chain(exc):
+    """``exc`` and the exceptions it was raised from or during, when every one of them is a failure a
+    peer causes; None when one is not. That is a failure on the server's own side -- a thread that
+    could not be started, an error paramiko did not expect -- even when paramiko raised an SSHException
+    in its place."""
+    chain, seen = [], exc
+    while seen is not None:
+        if len(chain) >= _CHAIN_MAX or not isinstance(seen, _PEER_FAILURES):
+            return None
+        chain.append(seen)
+        seen = seen.__cause__ or seen.__context__
+    return chain
+
+
+def _report_not_ssh(transport, exc, peer) -> bool:
+    """Log a connection whose peer never sent an SSH identification line as one line, naming what it
+    sent instead, and return True. Return False, logging nothing, when the peer did speak SSH, or when
+    what failed was not the peer (see _peer_failure_chain): such a failure keeps its detail.
+
+    - ``connection.not-ssh.http``: an HTTP request;
+    - ``connection.not-ssh.text``: some other text that is not an SSH identification line;
+    - ``connection.not-ssh.binary``: bytes that are not text (a TLS greeting, for one);
+    - ``connection.not-ssh.silent``: nothing, until the sign-in grace period ran out;
+    - ``connection.not-ssh.closed``: the connection closed, or was reset, before anything else.
+    """
+    if transport._speaks_ssh():
+        return False
+    # What paramiko's read raised, beneath the SSHException it raised in its place.
+    causes = _peer_failure_chain(exc)
+    if causes is None:
+        return False
+    if transport.first_line is not None:
+        if _HTTP_REQUEST_LINE.match(transport.first_line):
+            safe_event('connection.not-ssh.http', peer=peer)
+        else:
+            safe_event('connection.not-ssh.text', peer=peer)
+        return True
+    if any(isinstance(c, UnicodeDecodeError) for c in causes):
+        safe_event('connection.not-ssh.binary', peer=peer)
+    elif any(isinstance(c, socket.timeout) for c in causes):
+        safe_event('connection.not-ssh.silent', peer=peer)
+    else:
+        safe_event('connection.not-ssh.closed', peer=peer)
+    return True
+
+
 def handle_sftp_client(
     client_socket: socket.socket,
     client_address: tuple,
@@ -2732,13 +2885,14 @@ def handle_sftp_client(
         # MD5/SHA1 (incl. truncated -96) MACs so an active downgrade or a hostile/misconfigured
         # client can't weaken the file-transfer channel; the strong defaults (aes-ctr/gcm +
         # hmac-sha2) are untouched, so conformant clients are unaffected.
-        transport = paramiko.Transport(
+        transport = _Transport(
             client_socket,
             disabled_algorithms={
                 'ciphers': ['3des-cbc', 'aes128-cbc', 'aes192-cbc', 'aes256-cbc',
                             'blowfish-cbc', 'cast128-cbc'],
                 'macs': ['hmac-md5', 'hmac-md5-96', 'hmac-sha1', 'hmac-sha1-96'],
             },
+            peer=client_address,
         )
         # Neutral version banner — don't leak the exact paramiko library + version pre-auth.
         transport.local_version = "SSH-2.0-DockVault"
@@ -2759,8 +2913,16 @@ def handle_sftp_client(
         # Create server instance
         server = SFTPServer(client_address[0])
 
-        # Start SSH server
-        transport.start_server(server=server)
+        # Start SSH server. A peer that never says it speaks SSH -- a scanner, almost always -- fails
+        # here, and is one line naming what it sent instead. An SSH peer's failure, and a failure on
+        # the server's own side, go on to the event below, with paramiko's own lines before it.
+        try:
+            transport.start_server(server=server)
+        except Exception as e:  # noqa: BLE001 -- re-raised unless it is reported here
+            if _report_not_ssh(transport, e, client_address):
+                return
+            transport.release_held_records()
+            raise
 
         # Wait for authentication
         channel = transport.accept(20)
