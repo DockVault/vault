@@ -163,3 +163,29 @@ def test_a_removal_that_waits_says_why_on_its_card(page: Page, admin_creds):
     expect(item).to_be_visible(timeout=15000)
     expect(item.locator(".removal-waiting")).to_have_text(why)
     expect(item.locator(".removal-cancel")).to_have_count(0)
+
+
+def test_a_level_changed_since_the_preview_is_refused_and_the_preview_made_again(page: Page, admin, admin_creds,
+                                                                                levels_restored):
+    """Another administrator changes a level between the preview and the ask: nothing is asked for, the page says
+    so, and the preview is made again with the levels in force."""
+    _chain_started()
+    store(dict(FULL, ip="shortened"))
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open(page)
+    page.click("#removal-preview-btn")
+    expect(page.locator('#removal-preview li[data-kind="ip"]')).to_contain_text("IP addresses, shortened",
+                                                                              timeout=15000)
+    store(dict(FULL, ip="none"))
+    count = psql("SELECT count(*) FROM audit_value_removals")
+    page.click("#removal-ask")
+    expect(page.locator("#confirm-modal")).to_have_class(re.compile(r"\bactive\b"), timeout=10000)
+    page.fill("#confirm-modal-input", "remove")
+    page.click("#confirm-modal-confirm-btn")
+    expect(page.locator("#stepup-modal.active")).to_be_visible(timeout=10000)
+    page.fill("#stepup-password-input", admin_creds["password"])
+    page.locator("#stepup-modal-body .btn-primary").click()
+    expect(page.locator("body")).to_contain_text("changed since the preview", timeout=15000)
+    expect(page.locator('#removal-preview li[data-kind="ip"]')).to_contain_text("IP addresses, not recorded",
+                                                                              timeout=15000)
+    assert psql("SELECT count(*) FROM audit_value_removals") == count

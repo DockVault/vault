@@ -74,7 +74,8 @@ def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels
     store(dict(FULL))
     full = admin.post("/settings/value-removals/preview")
     assert full.status_code == 200 and full.json()["kinds"] == [], full.text
-    r = admin.post("/settings/value-removals", headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
+    r = admin.post("/settings/value-removals", json={"levels": full.json()["levels"]},
+                   headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
     assert r.status_code == 400 and "nothing to remove" in r.json()["detail"], r.text
     store(dict(FULL, ip="shortened", user_agent="none"))
     p = admin.post("/settings/value-removals/preview")
@@ -82,11 +83,13 @@ def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels
     out = p.json()
     assert {k["key"]: k["level"] for k in out["kinds"]} == {"ip": "shortened", "user_agent": "none"}
     assert out["rows"] > 0 and out["delay_days"] >= 1
-    r = admin.post("/settings/value-removals")
+    shown = {"levels": out["levels"]}
+    r = admin.post("/settings/value-removals", json=shown)
     assert r.status_code == 403 and r.json()["detail"]["action"] == ACTION, r.text
     me = admin_creds["username"]
     told = _notices(me, ASKED, me + " asked")
-    r = admin.post("/settings/value-removals", headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
+    r = admin.post("/settings/value-removals", json=shown,
+                   headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
     assert r.status_code == 200, r.text
     asked = r.json()["request"]
     try:
@@ -99,7 +102,7 @@ def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels
                     f"AND resource_id = '{asked['id']}'") == "1"
         listed = admin.get("/settings/value-removals").json()
         assert listed["requests"][0]["id"] == asked["id"] and listed["requests"][0]["status"] == "pending"
-        again = admin.post("/settings/value-removals",
+        again = admin.post("/settings/value-removals", json=shown,
                            headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
         assert again.status_code == 400 and "already waiting" in again.json()["detail"]
         with second_admin(admin) as (account, client):
@@ -116,6 +119,24 @@ def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels
                     f"AND detail->>'request' = '{asked['id']}'") == "admin"
     finally:
         admin.post(f"/settings/value-removals/{asked['id']}/cancel")
+
+
+def test_a_level_changed_since_the_preview_is_refused_and_nothing_is_asked_for(admin, admin_creds, levels_restored):
+    store(dict(FULL, ip="shortened"))
+    shown = admin.post("/settings/value-removals/preview").json()["levels"]
+    assert shown["ip"] == "shortened"
+    store(dict(FULL, ip="none"))                 # another administrator, meanwhile
+    count = psql("SELECT count(*) FROM audit_value_removals")
+    seals = psql("SELECT count(*) FROM audit_seals WHERE kind = 'request'")
+    r = admin.post("/settings/value-removals", json={"levels": shown},
+                   headers={"X-Second-Factor": _receipt(admin, admin_creds["password"])})
+    assert r.status_code == 409 and r.json()["reason"] == "levels-changed", r.text
+    assert "changed since the preview" in r.json()["detail"]
+    assert psql("SELECT count(*) FROM audit_value_removals") == count
+    assert psql("SELECT count(*) FROM audit_seals WHERE kind = 'request'") == seals
+    # A body that does not name each kind is refused before the password is asked for.
+    bad = admin.post("/settings/value-removals", json={"levels": {"ip": "none"}})
+    assert bad.status_code == 400 and "each kind" in bad.json()["detail"], bad.text
 
 
 def test_the_levels_page_and_the_notice_say_how_long_addresses_stay_in_full(admin):

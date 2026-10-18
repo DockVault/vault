@@ -65,6 +65,10 @@ class Refused(Exception):
     """A request the removal will not take, in plain words."""
 
 
+class LevelsChanged(Refused):
+    """The levels in force are no longer the ones the preview showed."""
+
+
 def _ai():
     from app.core import audit_integrity
     return audit_integrity
@@ -169,7 +173,7 @@ def preview(db, st, now: datetime) -> dict:
         "archived_days": sum(1 for d, e in view.archives.items() if e.parts and arc.day_start(d) < before),
         "undated_rows": undated,
         "delay_days": delay_days(view, st),
-        "waiting": waiting(db, view) is not None,
+        "waiting": waiting(view) is not None,
         "not_reached": not_reached,
     }
 
@@ -185,30 +189,32 @@ def held_request(view, request_id) -> int:
     raise LookupError(request_id)
 
 
-def waiting(db, view) -> Optional[str]:
-    """The id of a removal that waits or runs, in the chain or in the database, or None."""
-    from app.core.models import AuditValueRemoval
+def waiting(view) -> Optional[str]:
+    """The id of the removal the chain holds waiting or running, or None. A row the database shows waiting with no
+    pending request in the chain is not one: nothing runs it (the job reads the chain), the page cannot cancel it,
+    and the server's daily check reports it."""
     for seq, d in view.pending_requests().items():
         if d.get("what") == "removal":
             return str(d.get("request"))
-    row = (db.query(AuditValueRemoval).filter(AuditValueRemoval.status.in_((PENDING, RUNNING)))
-           .order_by(AuditValueRemoval.requested_at.desc()).first())
-    return str(row.id) if row is not None else None
+    return None
 
 
-def request(w, actor, *, now: Optional[datetime] = None) -> dict:
+def request(w, actor, *, now: Optional[datetime] = None, expected: Optional[Dict[str, str]] = None) -> dict:
     """Ask for a removal in the chain writer ``w``'s transaction: the row, the request seal and the audit row.
-    Raises Refused."""
+    ``expected``: the levels the preview showed; when the levels in force are others now (another administrator
+    changed one meanwhile) nothing is asked for. Raises Refused (LevelsChanged for that)."""
     from app.core.models import AuditValueRemoval
     from app.services.audit_logger import AuditLogger
     st, db = w.st, w.db
     view = st.view
     now = now or st.clock()
     levels = in_force(db)
+    if expected is not None and dict(expected) != levels:
+        raise LevelsChanged("The recording levels changed since the preview: preview again, then ask.")
     if not below_full(levels):
         raise Refused("Every kind of personal data is recorded in full now, so there is nothing to remove. Choose a "
                       "lower level first.")
-    if waiting(db, view) is not None:
+    if waiting(view) is not None:
         raise Refused("A removal is already waiting or running: cancel it first, or let it complete.")
     request_id = uuid.uuid4()
     delay = timedelta(days=delay_days(view, st))

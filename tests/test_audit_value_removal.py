@@ -704,3 +704,45 @@ def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env
                            "this release does not change, so this release cannot complete it.")
     assert env.get(hot).ip_address == "203.0.113.9"
     assert vr.entry_of(row, env.st.view)["waiting"] == row.waiting
+
+
+def test_a_row_the_chain_holds_no_request_of_does_not_hold_a_new_removal_back(env):
+    """A removal row left waiting in the database with no request seal (a database edit) is no removal: the page
+    lists it as not recorded and not cancellable, it does not keep another from being asked for, and the daily
+    check reports it."""
+    _hot(env)
+    orphan = uuid.uuid4()
+    with env.session() as db:
+        db.add(AuditValueRemoval(id=orphan, status=vr.PENDING, levels=dict(LOWER), before=T0, requested_at=T0))
+        db.commit()
+    with env.session() as db:
+        assert vr.preview(db, env.st, env.clock())["waiting"] is False
+        entry = next(e for e in vr.listing(db, env.st) if e["id"] == str(orphan))
+    assert entry["status"] == "not recorded" and entry["cancellable"] is False
+    asked = env.ask_removal()
+    assert asked["status"] == vr.PENDING
+    with env.session() as db:
+        assert "a removal waiting in the database has no request seal; it is ignored" in vr.pending_input_problems(
+            db, env.st.view)
+    with pytest.raises(vr.Refused, match="already waiting"):
+        env.ask_removal()
+
+
+def test_the_previewed_levels_are_the_ones_asked_for(env):
+    """A request carries the levels the preview showed: when the levels in force are others now (another
+    administrator lowered or raised one meanwhile), nothing is asked for."""
+    from app.core import audit_chain_policy_seals as ps
+    _hot(env)
+    with env.session() as db:
+        shown = vr.preview(db, env.st, env.clock())["levels"]
+    env.levels = dict(LOWER, emails=ap.FULL)
+    with ps.change_transaction(env.engine) as w:
+        with pytest.raises(vr.LevelsChanged, match="changed since the preview"):
+            vr.request(w, env.admin("dee"), expected=shown)
+    with env.session() as db:
+        assert db.query(AuditValueRemoval).count() == 0
+    assert [s for s in env.seals() if s.kind == "request"] == []
+    with env.session() as db:
+        shown = vr.preview(db, env.st, env.clock())["levels"]
+    with ps.change_transaction(env.engine) as w:
+        assert vr.request(w, env.admin("dee2"), expected=shown)["levels"] == dict(LOWER, emails=ap.FULL)

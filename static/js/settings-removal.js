@@ -6,7 +6,9 @@
  * Once a level has been lowered, the audit rows written before still hold what they recorded. A removal brings every
  * row written before the end of the current hour, archived or not, down to the levels in force. It is previewed
  * first (for each kind below full, how many rows hold a value above its level), then asked for: asking needs the
- * password (apiRequest runs the step-up) and typing "remove". It waits the reduction delay, any administrator can
+ * password (apiRequest runs the step-up) and typing "remove", and sends the levels the preview showed (when another
+ * administrator changed one meanwhile, nothing is asked for and the preview is made again). It waits the reduction
+ * delay, any administrator can
  * cancel it until it begins, and every administrator is told. The list shows each removal: waiting (with the date it
  * runs and why it may wait longer), running, completed (with how many rows it changed) or cancelled.
  *
@@ -161,17 +163,23 @@
         if (!ok) return;
         S.busy = true;
         renderPreview();
+        let stale = false;
         try {
-            const out = await apiRequest('/settings/value-removals', { method: 'POST', silent: true });
+            const out = await apiRequest('/settings/value-removals', {
+                method: 'POST', body: JSON.stringify({ levels: p.levels }), silent: true,
+            });
             S.preview = null;
             showToast(`The removal runs on ${when(out.request.effective_at)} unless it is cancelled`, 'success');
         } catch (e) {
+            stale = e.status === 409 && e.reason === 'levels-changed';
             showToast(e.message || 'The removal was not asked for', 'error');
         } finally {
             S.busy = false;
             renderPreview();
             await load();
         }
+        // The levels changed since the preview: make it again, so what is asked for next is what it shows.
+        if (stale) await preview();
     }
 
     async function cancelRemoval(r) {
