@@ -181,6 +181,23 @@ def test_the_database_removing_its_row_vetoes_it_and_a_changed_copy_is_not_acted
     assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
 
 
+@pytest.mark.parametrize("status", [vr.CANCELLED, vr.COMPLETED])
+def test_the_database_marking_its_row_no_longer_waiting_vetoes_it(env, status):
+    """A row the database no longer shows waiting vetoes the removal as a removed row does, before its delay: it is
+    ended by a cancel seal from the database, and nothing is rewritten, then or later."""
+    ids = _hot(env)
+    asked = env.ask_removal()
+    with env.session() as db:
+        db.get(AuditValueRemoval, uuid.UUID(asked["id"])).status = status
+        db.commit()
+    env.removal_job()
+    cancel = [s for s in env.seals() if s.kind == "cancel"][-1]
+    assert cancel.detail["by"] == "database" and cancel.detail["request"] == asked["id"]
+    env.week()
+    assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    assert failures(env.verify()) == []
+
+
 def test_it_waits_for_a_registered_rule_and_the_hold_switch(env, monkeypatch):
     ids = _hot(env)
     asked = env.ask_removal()
