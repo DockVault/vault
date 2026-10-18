@@ -15,7 +15,9 @@ environment and network), each with a throwaway database of its own and Docker's
   accepted and then times out, as it did after a host restart ("timeout expired"); continued
   (SIGCONT) fifteen seconds later.
 
-Each must start and serve without exiting: Docker's restart count stays 0. The stack itself, its
+Each must start and serve without exiting: Docker's restart count stays 0. And one start that must not
+wait: the SFTP process alone, given no database password where the database asks for one, stops at
+once. The stack itself, its
 database included, is not touched. Every container made here is removed with its anonymous volumes.
 """
 from __future__ import annotations
@@ -99,15 +101,17 @@ class _Pair:
             time.sleep(2)
         pytest.fail("the throwaway database never became ready")
 
-    def run_vault(self, *command, extra_env=()):
+    def run_vault(self, *command, extra_env=(), restart="unless-stopped", with_password=True):
         env = []
         replaced = tuple(entry.split("=", 1)[0] + "=" for entry in extra_env)
         for entry in self.api["Config"]["Env"]:
-            if entry.startswith(("HOSTNAME=", *replaced)):
+            if entry.startswith(("HOSTNAME=", "PGPASSWORD=", *replaced)):
                 continue
             if entry.startswith("DATABASE_URL="):
                 url = urlsplit(entry.split("=", 1)[1])
                 credentials, _, hostport = url.netloc.rpartition("@")
+                if not with_password:
+                    credentials = credentials.partition(":")[0]
                 port = hostport.rpartition(":")[2] if ":" in hostport else "5432"
                 entry = "DATABASE_URL=" + urlunsplit(
                     url._replace(netloc=f"{credentials}@{self.db_name}:{port}"))
@@ -115,7 +119,7 @@ class _Pair:
         env.extend(extra_env)
         path = _env_file(env)
         try:
-            r = _docker("run", "-d", "--name", self.vault_name, "--restart", "unless-stopped",
+            r = _docker("run", "-d", "--name", self.vault_name, "--restart", restart,
                         "--env-file", path, "--network", self.network, self.api["Config"]["Image"],
                         *command, timeout=120)
         finally:
@@ -236,3 +240,33 @@ def test_the_sftp_process_waits_for_a_database_that_does_not_answer_yet(pair):
     pair.wait_inside(_SSH_BANNER, 90, "served SFTP")
     pair.assert_never_restarted()
     assert "[sftp] The database answered after" in pair.logs()
+
+
+def test_a_start_the_client_library_cannot_make_stops_at_once(pair):
+    """No password given, where the database asks for one: the client library refuses the connection
+    itself, without a word from the server. That is not a database that cannot be reached yet, so it
+    is not waited for: the start stops at once, with the library's own words."""
+    pair.create_database()
+    pair.start_database()
+    pair.wait_database_ready()
+    pair.run_vault("python", "-m", "app.sftp.sftp_server", restart="no", with_password=False)
+    end = time.monotonic() + 60
+    while time.monotonic() < end and pair.state()["Running"]:
+        time.sleep(1)
+    info = _inspect(pair.vault_name)
+    state = info["State"]
+    logs = pair.logs()
+    assert not state["Running"], "the start is still waiting:\n" + logs[-3000:]
+    assert state["ExitCode"] != 0, logs[-3000:]
+    assert "fe_sendauth: no password supplied" in logs, logs[-3000:]
+    assert "cannot be reached yet" not in logs, logs[-3000:]
+    started = _docker_time(state["StartedAt"])
+    finished = _docker_time(state["FinishedAt"])
+    assert finished - started < 30, f"the start took {finished - started:.0f} s to stop"
+
+
+def _docker_time(text):
+    """Seconds since the epoch of one of Docker's RFC 3339 times (nanoseconds, 'Z')."""
+    from datetime import datetime
+    head, _, fraction = text.rstrip("Z").partition(".")
+    return datetime.fromisoformat(f"{head}.{(fraction + '000000')[:6]}+00:00").timestamp()

@@ -4,8 +4,9 @@ After a host restarts, the database and the vault start together. The start-up c
 a database that did not answer in time (``timeout expired``) stopped the process, the one-container
 launcher stopped the container, and Docker started it again. Now a database that cannot be reached
 yet is waited for, one plain line per wait, up to DATABASE_WAIT_SECONDS, and then checked like any
-other: a newer-data refusal still refuses, and a database that answers with a refusal of its own (a
-wrong password, say) is not waited for.
+other: a newer-data refusal still refuses. Only words known to mean that the database cannot be reached
+yet are waited for: a refusal from the server (a wrong password, say) or from the client library
+itself (no password given), and words not known at all, stop the start at once.
 
 The engine here fails on demand and then hands out connections to a real SQLite database, through the
 same calls the start makes; the clock is the test's, so no test waits.
@@ -24,10 +25,40 @@ from app.core import data_requirements as dr
 
 pytestmark = pytest.mark.unit
 
+# The client library's words, as the image's (libpq 17 on musl) says them, unless named otherwise.
 TIMEOUT = 'connection to server at "vault-db" (10.200.7.2), port 5432 failed: timeout expired\n'
 REFUSED = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: Connection refused\n'
            '\tIs the server running on that host and accepting TCP/IP connections?\n')
 NO_NAME = 'could not translate host name "vault-db" to address: Name or service not known\n'
+NO_NAME_YET = 'could not translate host name "vault-db" to address: Try again\n'
+HOST_UNREACHABLE = ('connection to server at "10.200.7.2", port 5432 failed: Host is unreachable\n'
+                    '\tIs the server running on that host and accepting TCP/IP connections?\n')
+NETWORK_UNREACHABLE = ('connection to server at "2001:db8::7", port 5432 failed: Network unreachable\n'
+                       '\tIs the server running on that host and accepting TCP/IP connections?\n')
+NO_SOCKET = ('connection to server on socket "/run/postgresql/.s.PGSQL.5432" failed: No such file or '
+             'directory\n\tIs the server running locally and accepting connections on that socket?\n')
+CLOSED = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: server closed the '
+          'connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or '
+          'while processing the request.\n')
+# The other C library's words (glibc), and an older client library's (libpq 13).
+NAME_RESOLUTION = ('could not translate host name "vault-db" to address: Temporary failure in name '
+                   'resolution\n')
+KERNEL_TIMEOUT = ('connection to server at "10.200.7.2", port 5432 failed: Connection timed out\n'
+                  '\tIs the server running on that host and accepting TCP/IP connections?\n')
+OLD_REFUSED = ('could not connect to server: Connection refused\n\tIs the server running on host '
+               '"vault-db" (10.200.7.2) and accepting\n\tTCP/IP connections on port 5432?\n')
+# Each of the client library's words on its own, without the question it asks after them, so that each
+# is shown to be waited for by itself.
+ALONE = {
+    "could-not-connect": 'could not connect to server: Connection timed out\n',
+    "refused": 'connection to server at "vault-db" (10.200.7.2), port 5432 failed: Connection refused\n',
+    "no-route": 'connection to server at "10.200.7.2", port 5432 failed: No route to host\n',
+    "host-unreachable": 'connection to server at "10.200.7.2", port 5432 failed: Host is unreachable\n',
+    "network-is-unreachable": ('connection to server at "2001:db8::7", port 5432 failed: Network is '
+                               'unreachable\n'),
+    "network-unreachable": ('connection to server at "2001:db8::7", port 5432 failed: Network '
+                            'unreachable\n'),
+}
 STARTING = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  the database '
             'system is starting up\n')
 NOT_ACCEPTING = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  the database '
@@ -39,6 +70,25 @@ SHUTTING_DOWN = ('connection to server at "vault-db" (10.200.7.2), port 5432 fai
                  'system is shutting down\n')
 BAD_PASSWORD = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  password '
                 'authentication failed for user "sftp_user"\n')
+NO_DATABASE = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  database '
+               '"sftp_db" does not exist\n')
+UNKNOWN_SETTING = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  '
+                   'unrecognized configuration parameter "no_such_setting"\n')
+# Refusals the client library makes itself, with no server severity.
+NO_PASSWORD = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: fe_sendauth: no '
+               'password supplied\n')
+SSL_REQUIRED = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: server does not '
+                'support SSL, but SSL was required\n')
+BAD_SSLMODE = 'invalid sslmode value: "bogus"\n'
+# A server that answers in another language: its words are not known here, so none is waited for.
+TRANSLATED_REFUSAL = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: ВАЖНО:  '
+                      'пользователь "sftp_user" не прошёл проверку подлинности (по паролю)\n')
+TRANSLATED_STARTING = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: ВАЖНО:  '
+                       'система баз данных запускается\n')
+# A server's refusal is judged by the server's words alone, even when a name in it reads like the
+# client library's.
+REFUSAL_NAMING_THE_WORDS = ('connection to server at "vault-db" (10.200.7.2), port 5432 failed: FATAL:  '
+                            'database "no route to host" does not exist\n')
 
 
 def _unreachable(message):
@@ -113,6 +163,7 @@ def start(monkeypatch, database):
 
     def run(failures, error, process="sftp", connect_seconds=0.0):
         engine = _Engine(database, clock, failures, error, connect_seconds)
+        run.engine = engine
         monkeypatch.setattr(db_module, "_require_engine", lambda: engine)
         dr.check_at_startup(process)
         return engine
@@ -134,23 +185,41 @@ def _mark_newer(engine):
     (TIMEOUT, "timeout expired"),
     (REFUSED, "Connection refused"),
     (NO_NAME, 'could not translate host name "vault-db" to address: Name or service not known'),
+    (NO_NAME_YET, 'could not translate host name "vault-db" to address: Try again'),
+    (HOST_UNREACHABLE, "Host is unreachable"),
+    (NETWORK_UNREACHABLE, "Network unreachable"),
+    (NO_SOCKET, "No such file or directory"),
+    (CLOSED, "server closed the connection unexpectedly"),
+    (NAME_RESOLUTION,
+     'could not translate host name "vault-db" to address: Temporary failure in name resolution'),
+    (KERNEL_TIMEOUT, "Connection timed out"),
+    (OLD_REFUSED, "could not connect to server: Connection refused"),
+    (ALONE["could-not-connect"], "could not connect to server: Connection timed out"),
+    (ALONE["refused"], "Connection refused"),
+    (ALONE["no-route"], "No route to host"),
+    (ALONE["host-unreachable"], "Host is unreachable"),
+    (ALONE["network-is-unreachable"], "Network is unreachable"),
+    (ALONE["network-unreachable"], "Network unreachable"),
     (STARTING, "FATAL:  the database system is starting up"),
     (NOT_ACCEPTING, "FATAL:  the database system is not yet accepting connections"),
     (IN_RECOVERY, "FATAL:  the database system is in recovery mode"),
     (SHUTTING_DOWN, "FATAL:  the database system is shutting down"),
-], ids=["timeout", "refused", "no-name-yet", "starting-up", "not-yet-accepting", "in-recovery",
-        "shutting-down"])
+], ids=["timeout", "refused", "no-name", "no-name-yet", "host-unreachable", "network-unreachable",
+        "no-socket-yet", "closed-before-answering", "name-resolution", "kernel-timeout",
+        "older-client-refused"] + [f"alone-{key}" for key in ALONE] + [
+        "starting-up", "not-yet-accepting", "in-recovery", "shutting-down"])
+@pytest.mark.parametrize("process", ["sftp", "web"])
 def test_a_database_that_comes_up_during_the_wait_is_checked_and_the_start_goes_on(
-        start, capsys, message, reason):
-    engine = start(3, _unreachable(message), connect_seconds=5.0)
+        start, capsys, message, reason, process):
+    engine = start(3, _unreachable(message), process=process, connect_seconds=5.0)
     assert engine.attempts == 4
     assert start.clock.slept == [1.0, 2.0, 4.0]
     lines = capsys.readouterr().err.splitlines()
     assert lines == [
-        f"[sftp] The database cannot be reached yet ({reason}); trying again in 1 s.",
-        f"[sftp] The database cannot be reached yet ({reason}); trying again in 2 s.",
-        f"[sftp] The database cannot be reached yet ({reason}); trying again in 4 s.",
-        "[sftp] The database answered after 22 s.",
+        f"[{process}] The database cannot be reached yet ({reason}); trying again in 1 s.",
+        f"[{process}] The database cannot be reached yet ({reason}); trying again in 2 s.",
+        f"[{process}] The database cannot be reached yet ({reason}); trying again in 4 s.",
+        f"[{process}] The database answered after 22 s.",
     ]
 
 
@@ -195,10 +264,20 @@ def test_a_newer_data_refusal_is_not_retried(start, capsys):
     assert "cannot be reached yet" not in capsys.readouterr().err
 
 
-def test_a_database_that_refuses_this_process_is_not_waited_for(start, capsys):
-    """It was reached: waiting changes nothing, and the operator should see the error at once."""
+@pytest.mark.parametrize("message", [
+    BAD_PASSWORD, NO_DATABASE, UNKNOWN_SETTING, NO_PASSWORD, SSL_REQUIRED, BAD_SSLMODE,
+    TRANSLATED_REFUSAL, TRANSLATED_STARTING, REFUSAL_NAMING_THE_WORDS, "some other failure\n",
+], ids=["wrong-password", "no-database", "unknown-setting", "no-password-given", "ssl-required",
+        "bad-ssl-setting", "refusal-in-another-language", "starting-in-another-language",
+        "refusal-naming-the-words", "words-not-known"])
+@pytest.mark.parametrize("process", ["sftp", "web"])
+def test_a_refusal_is_not_waited_for(start, capsys, message, process):
+    """The server, or the client library itself, refused this connection, or said something not
+    known to mean the server cannot be reached yet: waiting changes nothing, and the operator should
+    see the error at once."""
     with pytest.raises(OperationalError):
-        start(None, _unreachable(BAD_PASSWORD))
+        start(None, _unreachable(message), process=process)
+    assert start.engine.attempts == 1
     assert start.clock.slept == []
     assert capsys.readouterr().err == ""
 

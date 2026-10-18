@@ -187,6 +187,25 @@ _NOT_READY = (
     "the database system is shutting down",
 )
 
+# What the client library says when it found no server to talk to yet, compared in lower case: the
+# question it asks after a connect that failed, whatever the reason (refused, no route, no such socket),
+# in its wordings for a host and for a socket; the connect timeout; a name not found (yet); a server
+# that closed the connection before it answered; the older client library's "could not connect"; and
+# the reasons a connect fails with, as either C library words them, in case a client library says
+# them without that question.
+_CANNOT_REACH = (
+    "is the server running",
+    "timeout expired",
+    "could not translate host name",
+    "server closed the connection unexpectedly",
+    "could not connect to server",
+    "connection refused",
+    "no route to host",
+    "host is unreachable",
+    "network is unreachable",
+    "network unreachable",
+)
+
 # Seams for the tests, which run the wait on a clock of their own.
 _clock = time.monotonic
 _sleep = time.sleep
@@ -195,19 +214,23 @@ _sleep = time.sleep
 def _not_reachable_yet(exc: BaseException) -> bool:
     """Whether a failed connection means the database cannot be reached yet.
 
-    The client library reports a connection that timed out, was refused, or found no name or route
-    without a server severity; a server that answers says ``FATAL:``. Of what a server answers, only
-    "starting" and "stopping" are waited for. A refusal it sent -- a wrong password, a missing
-    database or role, a rule that does not admit this address -- is not: waiting changes nothing.
+    Only what is known to mean that is waited for: the client library's own words for a server it
+    could not reach (_CANNOT_REACH), and a server that answers it is starting or stopping
+    (_NOT_READY). Everything else stops the start at once, as waiting changes nothing: a refusal the
+    server sent (a wrong password, a missing database or role, a rule that does not admit this
+    address), one the client library made itself (no password given, SSL required of a server
+    without it, a setting it does not know), and words it does not know, as from a server that
+    answers in another language.
     """
     from sqlalchemy.exc import OperationalError
 
     if not isinstance(exc, OperationalError):
         return False
     text = str(getattr(exc, "orig", None) or exc)
-    if "FATAL:" not in text:
-        return True
-    return any(marker in text for marker in _NOT_READY)
+    if "FATAL:" in text:
+        return any(marker in text for marker in _NOT_READY)
+    lowered = text.lower()
+    return any(marker in lowered for marker in _CANNOT_REACH)
 
 
 def _reason(exc: BaseException) -> str:
