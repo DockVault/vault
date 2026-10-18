@@ -318,6 +318,14 @@ def test_verify_refuses_a_rewrite_for_levels_out_of_its_removal(env):
     ]
     for detail, at, why in cases:
         assert why in (rw.rewrite_problem(view, _Seal(view.position + 1, "rewrite", detail, at)) or ""), (detail, why)
+    # A pending request of another kind is not a removal.
+    from app.core import audit_chain_policy_seals as ps
+    with ps.change_transaction(env.engine) as w:
+        ps.change(w, rw.FULL_DAYS_KEY, 30, env.admin("setter"), now=env.clock())
+    view = env.st.view
+    other = max(s for s, d in view.pending_requests().items() if d.get("what") == "setting")
+    assert "names no removal" in (rw.rewrite_problem(view, _Seal(view.position + 1, "rewrite",
+                                                                 dict(good, request_seq=other), after)) or "")
     # Once final, nothing more of it.
     assert until(env, lambda: seq in env.st.view.finals)
     assert "not pending" in rw.rewrite_problem(env.st.view, _Seal(env.st.view.position + 1, "rewrite", good,
