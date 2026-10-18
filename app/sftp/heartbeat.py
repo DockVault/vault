@@ -7,9 +7,10 @@ healthcheck is this module run as a program:
 
     python -B -m app.sftp.heartbeat        exit 0 = touched recently, 1 = stale or missing
 
-It reads a file's age and nothing else. It opens no socket -- a bare TCP connect makes paramiko log
-"Error reading SSH protocol banner" on every probe -- and it imports nothing but the standard
-library, so a check costs a Python start-up and one stat().
+It reads a file's age and nothing else. It opens no socket -- a bare TCP connect is a connection
+that never speaks SSH, which the server logs as one line (``event connection.not-ssh.closed``), so
+every check would add one -- and it imports nothing but the standard library, so a check costs a
+Python start-up and one stat().
 
 WHAT IT CAN AND CANNOT TELL YOU. The beats stop when the accept loop or the write-progress watchdog
 has stopped turning, and when an upload that was told to stop is still holding its thread half a
