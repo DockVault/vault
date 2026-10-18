@@ -6,8 +6,12 @@ offline, on a throwaway SQLite database with a chain of its own (tests/_removal_
   its network once its row is that many days old, as rows and in archived days: rewrite seals of reason shorten-ip,
   the stable roots and ids kept, fresh nonces, verify clean; a row younger stays until it is old enough; a pass
   with nothing to do writes nothing; a transaction takes the hours of one day, an hour that does not check out
-  leaves the hours before it shortened, and an archived day with nothing to shorten is passed over; a legal hold
-  or a restore's grace holds it;
+  leaves the hours before it shortened, and an archived day with nothing to shorten is passed over; a day archived
+  in part is shortened in its block and in its later hours still held as rows, and taken again when the archive
+  finishes it between two steps; an archived day the cutoff runs through is shortened once, when the whole day is
+  past it; rows left in an archived hour are reported, and a day a later release archived is passed over; an hour
+  sealed just now waits for its late rows; the days are the longer of the honoured and the newest policy seal's; a
+  legal hold or a restore's grace holds it;
 - setting a number in the panel deletes sooner: it waits the reduction delay; no limit again applies at once;
 - verify refuses a shortening while there is no limit, over rows younger than the days, or naming a request;
 - the setting is a chain setting whose lower values delete sooner, in .env, the host tool and the docs.
@@ -548,3 +552,39 @@ def test_an_archived_day_the_cutoff_runs_through_is_shortened_once_the_whole_day
         assert failures(env.verify()) == []
     finally:
         env.close()
+
+
+def test_an_hour_sealed_just_now_with_a_late_row_waits_for_its_late_seal(monkeypatch, tmp_path):
+    """An hour older than the cutoff sealed only now (a backlog sealed at once), a row arriving in it before the
+    sealer seals that row: the shortening waits, and reports nothing; once the row is sealed, both are shortened."""
+    env = _env(monkeypatch, tmp_path, 30)
+    try:
+        first = env.put(T0 - timedelta(days=40))
+        env.run_until_sealed()
+        late = env.put(T0 - timedelta(days=40) + timedelta(minutes=3))
+        seen = {}
+        real = ai.report_failures
+        monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+        rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+        assert seen == {} and env.rewrite_seals() == []
+        assert env.get(first).ip_address == "203.0.113.9" and env.get(late).ip_address == "203.0.113.9"
+        monkeypatch.setattr(ai, "report_failures", real)
+        env.run_until_sealed()
+        rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+        assert _shortened(env.get(first)) and _shortened(env.get(late))
+        assert failures(env.verify()) == []
+    finally:
+        env.close()
+
+
+def test_the_days_are_the_longer_of_the_honoured_value_and_the_newest_policy_seal_s(env30, monkeypatch):
+    """While a change of the days takes effect, the honoured value and the newest policy seal's can differ: the
+    shortening keeps addresses for the longer of the two."""
+    env = env30
+    forty, seventy = env.put(T0 - timedelta(days=40)), env.put(T0 - timedelta(days=70))
+    env.run_until_sealed()
+    numbers = ps.numbers
+    monkeypatch.setattr(ps, "numbers", lambda st=None: dict(numbers(st), **{rw.FULL_DAYS_KEY: 60}))
+    assert rw.full_days(env.st) == 60
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(forty).ip_address == "203.0.113.9" and _shortened(env.get(seventy))

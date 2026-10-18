@@ -1,8 +1,10 @@
 """Removing values recorded under earlier levels, and keeping full addresses for a number of days only, on a
 running stack (app/api/value_removal_router.py, app/core/audit_value_removal.py, app/core/audit_rewrite.py).
 
-On the stack's own database, through the routes: a user is refused; at full there is nothing to remove; with a
-level lowered the preview counts the rows above it; asking asks for the password every time; a removal asked for is
+On the stack's own database, through the routes: a user and no session are refused, at every route; at full there
+is nothing to remove; with a level lowered the preview counts the rows above it; asking asks for the password every
+time, and carries the levels the preview showed (a level changed since is refused, and nothing is asked for); a
+removal asked for is
 listed with its levels and its scope, its request seal and its audit row are written, every administrator is told,
 a second one is refused while it waits, and any administrator cancels it, every administrator told again (each one
 asked for here is cancelled, so the stack's rows stay as they are); a cancel of one that is not waiting is refused.
@@ -66,7 +68,8 @@ def test_a_user_and_no_session_are_refused(temp_user_client, anon):
     for client, status in ((temp_user_client, 403), (anon, 401)):
         assert client.get("/settings/value-removals").status_code == status
         assert client.post("/settings/value-removals/preview").status_code == status
-        assert client.post("/settings/value-removals").status_code == status
+        assert client.post("/settings/value-removals", json={"levels": FULL}).status_code == status
+        assert client.post(f"/settings/value-removals/{uuid.uuid4()}/cancel").status_code == status
 
 
 def test_a_removal_asks_for_the_password_is_listed_and_any_administrator_cancels_it(admin, admin_creds,

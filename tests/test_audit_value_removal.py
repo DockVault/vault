@@ -6,14 +6,22 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py):
 - once due, the rows written before it, as rows and in archived days, keep only what the levels record: each changed
   row gets a fresh nonce, one rewrite seal per day of hours (and per archived day, with the archive seal of cause
   rewrite after it) names the request and its scope, the last seal is final with no hour, the stable roots and ids
-  stay, and verify is clean; a row written after it is untouched; an erased row is passed over; the preview counted
-  what it changed, and one past its time says what it had counted;
-- a cancel stops it before it begins, never after; the database removing its row, or marking it no longer waiting,
-  vetoes it; a row whose copies differ from its seal is not acted on; it waits for a registered rule (legal holds,
-  open cases), the hold switch, a restore's grace, and the hours it covers to be sealed; an hour that waits after
-  one rewritten the same day leaves that one rewritten;
-- verify refuses a rewrite seal for levels that names no removal, comes before its delay, after it is complete, over
-  another scope, over hours after it, and a final seal with hours; and a removal request that is not well formed.
+  stay, and verify is clean; a row written after it is untouched; an erased row is passed over; rows an earlier
+  release wrote (no nonce) get theirs written out; a day archived in part is reached in its block and in its later
+  hours still held as rows, and taken again when the archive finishes it between two steps; the day it was asked in,
+  archived before it runs, is no obstacle; rows left in an archived hour are reported; a day a later release
+  archived holds it, and says so; the preview counted what it changed, and one past its time says what it had
+  counted;
+- a cancel stops it before it begins, never after (also while sealing is stopped); the database removing its row,
+  or marking it no longer waiting, vetoes it; a row whose copies (levels or scope) differ from its seal is not acted
+  on, and the daily check reports it, and a row the chain holds no request of, which holds no new removal back; a
+  request appended by another writer waits for the host; it waits for a registered rule (legal holds, open cases),
+  the hold switch, a restore's grace, and the last hour it covers to be sealed; an hour that waits after one
+  rewritten the same day leaves that one rewritten; a request carries the levels its preview showed;
+- every administrator is told, by the removal's own email;
+- verify refuses a rewrite seal for levels that names no removal, comes before its delay (a gap in sealing counted),
+  after it is complete, over another scope, over hours after it, and a final seal with hours; and a removal request
+  that is not well formed.
 """
 import json
 import uuid
@@ -708,6 +716,117 @@ def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env
     assert vr.entry_of(row, env.st.view)["waiting"] == row.waiting
 
 
+# --------------------------------------------------------------------------- rows of an earlier release, other writers
+
+def test_a_removal_over_rows_an_earlier_release_wrote_writes_out_their_nonces(env):
+    """Rows written before this release keep no nonce (their hour's salt derives one): the main case of removing what
+    earlier levels recorded. Each is brought down, every row of the hour then holds its own nonce, the hour's salt is
+    gone, and verify is clean."""
+    h = T0 - timedelta(hours=30)
+    ids = [env.put(h + timedelta(minutes=5), seal_nonce=None), env.put(h + timedelta(minutes=9), seal_nonce=None),
+           env.put(h + timedelta(minutes=12), seal_nonce=None, ip_address=None, user_agent=None)]
+    env.run_until_sealed()
+    with env.session() as db:
+        wr = ai.working_row(db, ai.hour_floor(h))
+        assert wr is not None and wr.legacy_salt is not None
+    asked = env.ask_removal()
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    rows = [env.get(i) for i in ids]
+    assert all(r.ip_address is None and r.user_agent is None for r in rows)
+    assert all(r.seal_nonce is not None for r in rows)
+    with env.session() as db:
+        wr = ai.working_row(db, ai.hour_floor(h))
+        assert wr is None or wr.legacy_salt is None
+    assert env.removal_row(asked["id"]).counts == {"rows": 2, "archived_rows": 0}
+    assert failures(env.verify()) == []
+
+
+def test_a_removal_another_writer_asked_for_waits_for_the_host(env, monkeypatch):
+    """A removal's request seal another writer appended waits for the host's acknowledgment, as a setting's request
+    does, however long its delay has run; once acknowledged, it runs."""
+    from app.core import audit_chain_honour as honour
+    row = env.put(T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    seq = env.removal_row(asked["id"]).request_seq
+    real_f, real_ack = ai.foreign_entries, honour.ack_time
+    monkeypatch.setattr(ai, "foreign_entries", lambda view, record: {**real_f(view, record), seq: {"seq": seq}})
+    monkeypatch.setattr(honour, "ack_time", lambda view, record, s: None if s == seq else real_ack(view, record, s))
+    env.week()
+    env.passes(24 * 3)
+    assert env.rewrite_seals() == [] and env.get(row).ip_address == "203.0.113.9"
+    assert env.removal_row(asked["id"]).status == vr.PENDING
+    monkeypatch.setattr(ai, "foreign_entries", real_f)
+    monkeypatch.setattr(honour, "ack_time", real_ack)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(row).ip_address is None
+
+
+def test_verify_counts_a_gap_in_sealing_in_a_removals_delay(env):
+    """A gap in sealing moves a removal's delay on (seven days of sealing): sealing stopped for two days after the
+    request, verify refuses a rewrite seal of it at eight days and a quarter, and takes one two days of sealing
+    later (the removal held back meanwhile, so that it has not run)."""
+    env.put(T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    seq = env.removal_row(asked["id"]).request_seq
+    req = env.st.view.requests[seq]
+    before = fmt.parse_time_text(req["new"]["before"])
+    not_before = fmt.parse_time_text(req["not_before"])
+    env.passes(6)
+    env.clock.advance(days=2)
+    env.passes(24 * 6)
+    view = env.st.view
+    at = env.clock()
+    assert not_before < at < not_before + timedelta(days=2)
+    assert env.rewrite_seals() == []
+    good = {"reason": "levels", "policy_seq": view.newest_policy()[0], "request_seq": seq,
+            "hours": [[fmt.hour_text(ai.hour_floor(T0 - timedelta(hours=30)))]],
+            "through": fmt.hour_text(before - timedelta(hours=1)), "final": False}
+    assert "before its request's delay" in (rw.rewrite_problem(view, _Seal(view.position + 1, "rewrite", good, at))
+                                            or "")
+    env.passes(24 * 2 + 6)
+    view = env.st.view
+    assert env.rewrite_seals() == []
+    assert rw.rewrite_problem(view, _Seal(view.position + 1, "rewrite", good, env.clock())) is None
+    pe.WAIT_RULES.clear()
+
+
+# --------------------------------------------------------------------------- what the server checks of the rows
+
+def test_the_daily_check_reports_a_waiting_removal_whose_row_differs_and_a_row_with_no_request(env):
+    """The server's daily check lists a pending removal whose row holds other levels than its request seal, and a
+    row waiting in the database that the chain holds no request of, as unjustified-input."""
+    env.put(T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    with env.session() as db:
+        db.get(AuditValueRemoval, uuid.UUID(asked["id"])).levels = dict(LOWER, ip=ap.NONE)
+        db.add(AuditValueRemoval(id=uuid.uuid4(), status=vr.PENDING, levels=dict(LOWER), before=T0, requested_at=T0))
+        db.commit()
+    report = v.daily_check(env.session, env.st, env.clock(), force=True)
+    messages = [f.message for f in report.findings if f.kind == "unjustified-input"]
+    assert any("holds other levels or another scope" in m for m in messages), messages
+    assert any("a removal waiting in the database has no request seal" in m for m in messages), messages
+
+
+def test_a_row_whose_copy_of_the_scope_s_time_differs_from_its_seal_is_not_acted_on(env):
+    """The row's copy of the scope's time must be its request seal's, as its levels must: moved an hour earlier, the
+    removal is unjustified-input and nothing is rewritten."""
+    row_id = env.put(T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    with env.session() as db:
+        r = db.get(AuditValueRemoval, uuid.UUID(asked["id"]))
+        r.before = r.before - timedelta(hours=1)
+        db.commit()
+    with env.session() as db:
+        assert any("another scope" in m for m in vr.pending_input_problems(db, env.st.view))
+    env.week()
+    assert env.rewrite_seals() == [] and env.get(row_id).ip_address == "203.0.113.9"
+
+
 def test_a_row_the_chain_holds_no_request_of_does_not_hold_a_new_removal_back(env):
     """A removal row left waiting in the database with no request seal (a database edit) is no removal: the page
     lists it as not recorded and not cancellable, it does not keep another from being asked for, and the daily
@@ -730,6 +849,27 @@ def test_a_row_the_chain_holds_no_request_of_does_not_hold_a_new_removal_back(en
         env.ask_removal()
 
 
+def test_a_cancel_while_sealing_is_stopped_refuses_a_removal_that_has_begun_or_ended(env):
+    """cancel_while_stopped is held to the rule a cancel is: a removal that has begun, or completed, is refused, and
+    its row stays as it is."""
+    env.put(T0 - timedelta(days=3), details={"email": "c@example.com"})      # another day: the first unit
+    _hot(env)
+    asked = env.ask_removal()
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    vr.run_job(_Steps(env, 1))
+    assert env.removal_row(asked["id"]).status == vr.RUNNING
+    for status, why in ((vr.RUNNING, "has begun"), (vr.COMPLETED, "no longer waiting")):
+        if status == vr.COMPLETED:
+            assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+        with env.session() as db:
+            with pytest.raises(vr.Refused, match=why):
+                vr.cancel_while_stopped(db, asked["id"], env.admin(f"cleo{status}"), env.st)
+            db.rollback()
+        assert env.removal_row(asked["id"]).status == status
+
+
 def test_the_previewed_levels_are_the_ones_asked_for(env):
     """A request carries the levels the preview showed: when the levels in force are others now (another
     administrator lowered or raised one meanwhile), nothing is asked for."""
@@ -748,6 +888,33 @@ def test_the_previewed_levels_are_the_ones_asked_for(env):
         shown = vr.preview(db, env.st, env.clock())["levels"]
     with ps.change_transaction(env.engine) as w:
         assert vr.request(w, env.admin("dee2"), expected=shown)["levels"] == dict(LOWER, emails=ap.FULL)
+
+
+def test_a_removal_waits_until_the_last_hour_of_its_scope_is_sealed(env):
+    """A removal begins only once every hour it covers is sealed: sealed through the hour before the last one it
+    waits, and through the last one it begins."""
+    _hot(env)
+    asked = env.ask_removal()
+    seq = env.removal_row(asked["id"]).request_seq
+    before = env.removal_row(asked["id"]).before
+    p = retention.Pass(env.session, now=env.clock())
+
+    def step_at(newest_end):
+        """A step taken while sealing stands at ``newest_end``: sealed at the lag after it."""
+        env.clock.at = max(env.clock(), newest_end + timedelta(minutes=61))
+        env.run_until_sealed()
+        assert env.st.view.newest_hour_end == newest_end
+        with ai.ChainWriter(env.engine, env.st) as w:
+            out = vr.step(p, w, seq, {})
+            if out[0] != vr.REWRITTEN:
+                w.written = []
+                w.db.rollback()
+        return out
+    outcome, _changed, _cursor, _done, why = step_at(before - timedelta(hours=1))
+    assert (outcome, why) == (vr.WAIT, "It waits until every hour it covers is sealed.")
+    assert env.rewrite_seals() == []
+    outcome, changed, _cursor, _done, _why = step_at(before)
+    assert outcome == vr.REWRITTEN and changed > 0
 
 
 def test_every_administrator_is_told_by_the_removal_s_own_email(env, monkeypatch):

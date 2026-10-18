@@ -332,7 +332,8 @@ def test_the_vacuum_after_an_erase_keeps_to_its_budget(monkeypatch):
     ("ManagedSettingChange", "decided_by_name"), ("ManagedSetting", "updated_by_name"),
     ("AuditPrivacyPolicy", "created_by_name"), ("UserSSHKey", "created_by_name"),
     ("EraseRequest", "requested_by_name"), ("CredentialChange", "requested_by_name"),
-    ("CredentialChange", "decided_by_name")])
+    ("CredentialChange", "decided_by_name"), ("AuditValueRemoval", "requested_by_name"),
+    ("AuditValueRemoval", "decided_by_name")])
 def test_a_name_column_of_each_store_gets_the_placeholder(env, model, column):
     import sqlalchemy as sa
     from app.core import models
