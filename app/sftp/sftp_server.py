@@ -40,6 +40,7 @@ import socket
 import threading
 import weakref
 import posixpath
+import re
 import tempfile
 import mimetypes
 import time
@@ -2661,10 +2662,10 @@ def start_sftp_server():
 
             # Handle client in a new thread (the handler releases the admission slot in its finally).
             # Everything after a successful admit() lives in this try, so ANY failure before the
-            # handler thread owns the slot -- including a logging error on a broken stdout pipe --
-            # still releases the slot and closes the socket instead of leaking them.
+            # handler thread owns the slot still releases the slot and closes the socket instead of
+            # leaking them. The connection is logged as accepted once it says it speaks SSH (see
+            # _Transport): one that never does is logged as one line, saying so.
             try:
-                safe_event('connection.accepted', peer=client_address)
                 client_thread = threading.Thread(
                     target=handle_sftp_client,
                     args=(client_socket, client_address, host_key)
@@ -2672,8 +2673,8 @@ def start_sftp_server():
                 client_thread.daemon = True
                 client_thread.start()
             except Exception as e:  # noqa: BLE001
-                # Failed after admission (spawn, or the log above) -- release the slot and close, so
-                # neither the slot nor the socket FD is leaked.
+                # Failed after admission -- release the slot and close, so neither the slot nor the
+                # socket FD is leaked.
                 _connection_admission.release(client_address[0])
                 try:
                     client_socket.close()
@@ -2705,6 +2706,91 @@ def start_sftp_server():
     safe_event('server.stopped')
 
 
+# An HTTP request line: "GET / HTTP/1.1", "CONNECT host:443 HTTP/1.1", the HTTP/2 preface "PRI * HTTP/2.0".
+_HTTP_REQUEST_LINE = re.compile(r"^[A-Z]{3,16} \S+ HTTP/\d")
+
+
+class _Transport(paramiko.Transport):
+    """paramiko's Transport, which keeps a peer that never says it speaks SSH out of the log.
+
+    Scanners on the internet connect to a public SFTP port all day without speaking SSH: they send
+    nothing, an HTTP request, a TLS greeting, bytes that are not text, or close at once. paramiko
+    refuses each correctly, and logged each refusal as an error with its traceback, which reads like a
+    fault in the server. So until the peer has sent an SSH identification line ("SSH-..."), paramiko's
+    warnings and errors about it are not logged; handle_sftp_client reports the refusal as one line
+    (see _report_not_ssh). From that line on, and so for every real SSH session, paramiko logs exactly
+    as before, a failed key exchange or sign-in included.
+
+    The two methods it overrides are paramiko's own: ``_log``, through which the transport logs, and
+    ``_check_banner``, which reads the peer's identification line. tests/test_sftp_probe_log.py runs
+    them against paramiko's real transport, so a paramiko that renames either fails there.
+    """
+
+    def __init__(self, sock, *args, peer=None, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self._peer = peer
+        # The first line the peer sent that was not an SSH identification line. Read only to say what
+        # kind of probe it was; never logged, since it is whatever a stranger chose to send.
+        self.first_line = None
+
+    def _speaks_ssh(self) -> bool:
+        return bool(getattr(self, "remote_version", ""))
+
+    def _log(self, level, msg, *args):
+        if not self._speaks_ssh():
+            if (level == paramiko.common.DEBUG and getattr(self, "first_line", "") is None
+                    and isinstance(msg, str) and msg.startswith("Banner: ")):
+                self.first_line = msg[len("Banner: "):][:64]
+            if level >= paramiko.common.WARNING:
+                return
+        super()._log(level, msg, *args)
+
+    def _check_banner(self):
+        try:
+            super()._check_banner()
+        finally:
+            # Set as soon as the peer sends an "SSH-" line, before its version is checked: an SSH
+            # client of the wrong version is a connection, logged as one, with paramiko's own detail.
+            if self._speaks_ssh():
+                try:
+                    safe_event('connection.accepted', peer=self._peer)
+                except Exception:  # noqa: BLE001 -- a log write must not end the session
+                    pass
+
+
+def _report_not_ssh(transport, exc, peer) -> bool:
+    """Log a connection whose peer never sent an SSH identification line as one line, naming what it
+    sent instead, and return True; return False, logging nothing, when the peer did speak SSH -- its
+    failure keeps its detail.
+
+    - ``connection.not-ssh.http``: an HTTP request;
+    - ``connection.not-ssh.text``: some other text that is not an SSH identification line;
+    - ``connection.not-ssh.binary``: bytes that are not text (a TLS greeting, for one);
+    - ``connection.not-ssh.silent``: nothing, until the sign-in grace period ran out;
+    - ``connection.not-ssh.closed``: the connection closed, or was reset, before anything else.
+    """
+    if transport._speaks_ssh():
+        return False
+    if transport.first_line is not None:
+        if _HTTP_REQUEST_LINE.match(transport.first_line):
+            safe_event('connection.not-ssh.http', peer=peer)
+        else:
+            safe_event('connection.not-ssh.text', peer=peer)
+        return True
+    # What paramiko's read raised, beneath the SSHException it raised in its place.
+    causes, seen = [], exc
+    while seen is not None and len(causes) < 5:
+        causes.append(seen)
+        seen = seen.__cause__ or seen.__context__
+    if any(isinstance(c, UnicodeDecodeError) for c in causes):
+        safe_event('connection.not-ssh.binary', peer=peer)
+    elif any(isinstance(c, socket.timeout) for c in causes):
+        safe_event('connection.not-ssh.silent', peer=peer)
+    else:
+        safe_event('connection.not-ssh.closed', peer=peer)
+    return True
+
+
 def handle_sftp_client(
     client_socket: socket.socket,
     client_address: tuple,
@@ -2722,13 +2808,14 @@ def handle_sftp_client(
         # MD5/SHA1 (incl. truncated -96) MACs so an active downgrade or a hostile/misconfigured
         # client can't weaken the file-transfer channel; the strong defaults (aes-ctr/gcm +
         # hmac-sha2) are untouched, so conformant clients are unaffected.
-        transport = paramiko.Transport(
+        transport = _Transport(
             client_socket,
             disabled_algorithms={
                 'ciphers': ['3des-cbc', 'aes128-cbc', 'aes192-cbc', 'aes256-cbc',
                             'blowfish-cbc', 'cast128-cbc'],
                 'macs': ['hmac-md5', 'hmac-md5-96', 'hmac-sha1', 'hmac-sha1-96'],
             },
+            peer=client_address,
         )
         # Neutral version banner — don't leak the exact paramiko library + version pre-auth.
         transport.local_version = "SSH-2.0-DockVault"
@@ -2749,8 +2836,15 @@ def handle_sftp_client(
         # Create server instance
         server = SFTPServer(client_address[0])
 
-        # Start SSH server
-        transport.start_server(server=server)
+        # Start SSH server. A peer that never says it speaks SSH -- a scanner, almost always -- fails
+        # here, and is one line naming what it sent instead; an SSH peer's failure goes on to the
+        # event below, with paramiko's own lines before it.
+        try:
+            transport.start_server(server=server)
+        except Exception as e:  # noqa: BLE001 -- re-raised unless it is reported here
+            if _report_not_ssh(transport, e, client_address):
+                return
+            raise
 
         # Wait for authentication
         channel = transport.accept(20)
