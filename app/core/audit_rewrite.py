@@ -497,22 +497,53 @@ def _next_hot_hours(db, scope: Scope, cursor: datetime, limit: int = 48) -> List
     return prune_mod._hours_matching(db, list(scope.conditions) + [A.timestamp >= start], end, limit)
 
 
+def _span(entry) -> Tuple[datetime, datetime]:
+    """(the first hour, the end of the last hour) of an archived day's parts. A day archived over several passes
+    holds its later hours as rows until the pass that archives them."""
+    return min(p.first_hour for p in entry.parts), max(p.last_hour for p in entry.parts) + HOUR
+
+
+def _rows_in_parts(db, entry) -> Optional[datetime]:
+    """The first hour of an archived day's parts that audit_logs holds rows in, or None."""
+    from sqlalchemy import func
+    from app.core.models import AuditLog as A
+    for part in sorted(entry.parts, key=lambda p: p.first_hour):
+        t = db.query(func.min(A.timestamp)).filter(A.timestamp >= part.first_hour,
+                                                    A.timestamp < part.last_hour + HOUR).scalar()
+        if t is not None:
+            return _ai().hour_floor(t)
+    return None
+
+
 def step(p, w, scope: Scope, cursor: datetime) -> tuple:
     """One transaction of a run: (outcome, the new cursor, rows changed, oldest, newest, the unit: "day" for an
-    archived day, "hours" for hours of rows, None when FINISHED). The rows and archived days before ``cursor`` are
-    done; the earliest of the next archived day and the next hours of rows goes next. Writes a rewrite seal only when
-    it returns CHANGED. Raises NotRewritten."""
+    archived day, "hours" for hours of rows, None when FINISHED). The rows and archived parts before ``cursor`` are
+    done. An archived day is a unit up to the end of its parts (or the scope's end), not of the day: a day archived
+    over several passes still holds its later hours as rows, and those are reached after it as hours of rows (a pass
+    that archives them meanwhile makes the day a unit again, its earlier parts then holding nothing to change). The
+    earliest of the next archived day and the next hours of rows goes next; hours of rows stop at the next archived
+    day's first hour, and a day with rows of audit_logs in the hours its parts hold is reported
+    (row-in-archived-day), not rewritten. Writes a rewrite seal only when it returns CHANGED. Raises NotRewritten."""
     from app.core import audit_archive as arc
     view = w.st.view
     newest = view.newest_policy()
-    days = [d for d, e in sorted(view.archives.items())
-            if e.parts and arc.day_start(d) < scope.before and arc.day_start(d) + timedelta(days=1) > cursor]
+    days = []
+    for d, e in sorted(view.archives.items()):
+        if not e.parts or arc.day_start(d) >= scope.before:
+            continue
+        first, end = _span(e)
+        end = min(end, scope.before)
+        if end > cursor:
+            days.append((d, first, end))
     hot = _next_hot_hours(w.db, scope, cursor)
-    first_day = arc.day_start(days[0]) if days else None
-    if first_day is not None and (not hot or first_day <= hot[0]):
-        day = days[0]
-        end = min(arc.day_start(day) + timedelta(days=1), scope.before)
+    if days and (not hot or days[0][1] <= hot[0]):
+        day, _first, end = days[0]
         try:
+            stray = _rows_in_parts(w.db, view.archives[day])
+            if stray is not None:
+                # Rows in an archived hour: no legitimate path writes them (the pruner reports them too).
+                raise NotRewritten(f"rows of audit_logs are in {fmt.hour_text(stray)}, which is archived; nothing in "
+                                   f"{day.isoformat()} was rewritten", "row-in-archived-day")
             rw = rewrite_archived_day(w, day, scope.change, now=p.now, before=scope.before)
         except NotRewritten as nr:
             nr.until = nr.until or end
@@ -525,15 +556,12 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
     if not hot:
         return FINISHED, cursor, 0, None, None, None
     day = hot[0].date()
+    stop = days[0][1] if days else None
     entries, changed, reached = [], 0, cursor
     for hour in hot:
-        if hour.date() != day or changed >= p.batch_rows:
+        if hour.date() != day or changed >= p.batch_rows or (stop is not None and hour >= stop):
             break
         try:
-            if view.archived_part(hour) is not None:
-                # Rows in an archived hour: no legitimate path writes them (the pruner reports them too).
-                raise NotRewritten(f"rows of audit_logs are in {fmt.hour_text(hour)}, which is archived; nothing "
-                                   "was rewritten", "row-in-archived-day")
             # Each hour in a savepoint: an hour that cannot be rewritten leaves nothing behind, and the hours before
             # it are sealed now; it is met again, first, by the next transaction.
             with w.db.begin_nested():

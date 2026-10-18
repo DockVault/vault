@@ -530,3 +530,154 @@ def test_an_hour_that_waits_after_one_rewritten_the_same_day_leaves_that_one_sea
     assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
     assert env.get(ids[2]).ip_address is None
     assert failures(env.verify()) == []
+
+
+# --------------------------------------------------------------------------- a day archived over several passes
+
+class _Steps(retention.Pass):
+    """A pass with time for ``n`` transactions of a job, so that a run can be taken a unit at a time."""
+
+    def __init__(self, env, n=1):
+        super().__init__(env.session, now=env.clock())
+        self.left = n
+
+    def time_left(self):
+        self.left -= 1
+        return self.left >= 0
+
+
+def _half_archived(env, monkeypatch):
+    """A day archived over two passes, as a large day is: its 02:00 rows in a block, its 09:00 rows still rows."""
+    monkeypatch.setattr(arc, "PART_ROWS", 3)
+    early = [env.put(_at(2, m)) for m in (5, 15, 25)]
+    late = [env.put(_at(9, m)) for m in (5, 15, 25)]
+    env.run_until_sealed()
+    monkeypatch.setattr(ai, "ROW_BUDGET", 3)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(ai, "ROW_BUDGET", 50000)
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).count() == 1
+        assert db.query(AuditLog).filter(AuditLog.id.in_(early)).count() == 0
+        assert db.query(AuditLog).filter(AuditLog.id.in_(late)).count() == 3
+    return early, late
+
+
+def _values(env):
+    """{id: (ip_address, user_agent)} of every row, as rows and in the archived days' blocks."""
+    out = {}
+    with env.session() as db:
+        for r in db.query(AuditLog).all():
+            out[r.id] = (r.ip_address, r.user_agent)
+        for day, entry in env.st.view.archives.items():
+            for part in entry.parts:
+                for r in arc.PartReader(db, env.st.view, day, part).rows():
+                    out[r["id"]] = (r["ip_address"], r["user_agent"])
+    return out
+
+
+def _idle_archive(monkeypatch):
+    """The archive job idle (a day this large takes several of its passes); returns the real one."""
+    real = arc.archive_job
+    monkeypatch.setattr(arc, "archive_job", lambda p: retention.JobResult())
+    return real
+
+
+def test_a_removal_over_a_day_archived_in_part_reaches_the_hours_still_held_as_rows(env, monkeypatch):
+    """A day whose first hours are in a block and whose later hours are still rows (between two archive passes): the
+    removal brings both down, its counts are the preview's rows and the block's, and verify is clean."""
+    early, late = _half_archived(env, monkeypatch)
+    with env.session() as db:
+        preview = vr.preview(db, env.st, env.clock())
+    assert preview["rows"] == 3 and preview["archived_days"] == 1
+    asked = env.ask_removal()
+    real = _idle_archive(monkeypatch)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    values = _values(env)
+    assert [i for i in early + late if values[i] != (None, None)] == []
+    assert env.removal_row(asked["id"]).counts == {"rows": preview["rows"], "archived_rows": 3}
+    assert failures(env.verify()) == []
+    # Archived afterwards, the later hours stay as the removal left them.
+    monkeypatch.setattr(arc, "archive_job", real)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        assert db.query(AuditLog).filter(AuditLog.id.in_(late)).count() == 0
+    values = _values(env)
+    assert [i for i in late if values[i] != (None, None)] == []
+    assert failures(env.verify()) == []
+
+
+def test_a_removal_takes_the_day_again_when_the_archive_finishes_it_between_two_of_its_steps(env, monkeypatch):
+    """The archive job archives the day's later hours after the removal rewrote its first block: the day is taken
+    again for them (its first block then holds nothing to change), and every row of it is brought down."""
+    early, late = _half_archived(env, monkeypatch)
+    asked = env.ask_removal()
+    real = _idle_archive(monkeypatch)
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    vr.run_job(_Steps(env, 1))
+    values = _values(env)
+    assert [values[i] for i in early] == [(None, None)] * 3
+    assert [values[i] for i in late] == [("203.0.113.9", "Mozilla/5.0 test")] * 3
+    assert env.removal_row(asked["id"]).status == vr.RUNNING
+    monkeypatch.setattr(arc, "archive_job", real)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        assert db.query(AuditLog).filter(AuditLog.id.in_(late)).count() == 0
+    monkeypatch.setattr(arc, "archive_job", lambda p: retention.JobResult())
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    values = _values(env)
+    assert [i for i in early + late if values[i] != (None, None)] == []
+    assert env.removal_row(asked["id"]).counts == {"rows": 0, "archived_rows": 6}
+    hours = [[e[0] for e in s.detail["hours"]] for s in env.rewrite_seals()]
+    assert hours == [[fmt.hour_text(_at(2))], [fmt.hour_text(_at(9))], []]
+    assert failures(env.verify()) == []
+
+
+def test_a_removal_whose_own_day_is_archived_before_it_runs_completes(env, monkeypatch):
+    """Held back for days, a removal meets the day it was asked in archived: the rows of that day written before its
+    scope's end are brought down, the later ones are not, and it completes."""
+    monkeypatch.setattr(arc, "hot_days", lambda: 0)
+    real = _idle_archive(monkeypatch)
+    inside = env.put(env.clock() - timedelta(minutes=20))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    before = env.removal_row(asked["id"]).before
+    after = env.put(before + timedelta(minutes=5))
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    monkeypatch.setattr(arc, "archive_job", real)
+    for _ in range(4):
+        arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    assert before.date() in env.st.view.archives
+    pe.WAIT_RULES.clear()
+    monkeypatch.setattr(arc, "archive_job", lambda p: retention.JobResult())
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED, hours=24 * 3)
+    values = _values(env)
+    assert values[inside] == (None, None) and values[after] == ("203.0.113.9", "Mozilla/5.0 test")
+    assert failures(env.verify()) == []
+
+
+def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_rewritten(env, monkeypatch):
+    """A row of audit_logs in an hour a block holds (no path of the app writes one there): the removal reports
+    row-in-archived-day for that day, rewrites nothing in it, and does not complete."""
+    kept = env.put(_at(3, 5))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    asked = env.ask_removal()
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    stray = env.put(_at(3, 30))
+    with env.session() as db:
+        payload = db.query(AuditArchiveBlock).one().payload
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    env.removal_job()
+    assert "row-in-archived-day" in seen
+    assert f"nothing in {DAY.isoformat()} was rewritten" in seen["row-in-archived-day"]
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == payload
+    assert env.get(stray).ip_address == "203.0.113.9" and env.rewrite_seals() == []
+    assert env.removal_row(asked["id"]).status == vr.PENDING
+    assert _values(env)[kept] == ("203.0.113.9", "Mozilla/5.0 test")

@@ -128,7 +128,7 @@ def test_the_levels_page_and_the_notice_say_how_long_addresses_stay_in_full(admi
 
 # --------------------------------------------------------------------------- the runs, on a database of their own
 
-SCRIPT = PREAMBLE + r'''
+HELPERS = r'''
 from sqlalchemy import func
 from app.core import audit_archive as arc, audit_chain_format as fmt, audit_chain_policy_seals as ps
 from app.core import audit_chain_verify as v, audit_value_removal as vr
@@ -186,6 +186,45 @@ def at(hour, minute=0):
     return datetime(DAY.year, DAY.month, DAY.day, hour, minute)
 
 
+def lower_and_ask():
+    """The levels lowered (names and emails none, addresses shortened, browsers none), and a removal asked for."""
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO audit_privacy_policies (version, names, signin_names, emails, ip, user_agent, "
+                       "reason, created_at, created_by_name) SELECT coalesce(max(version), 1) + 1, 'none', 'full', "
+                       "'none', 'shortened', 'none', 'admin', :t, 'test' FROM audit_privacy_policies"), {"t": clock[0]})
+    with SessionLocal() as db:
+        admin = User(id=uuid.uuid4(), username="ada-" + uuid.uuid4().hex[:8], email=None, password_hash="x",
+                     role=RoleEnum.ADMIN, is_active=True)
+        db.add(admin)
+        db.commit()
+        with SessionLocal() as db2:
+            out["preview"] = vr.preview(db2, st, clock[0])
+        with ps.change_transaction(engine) as w:
+            return vr.request(w, w.db.get(User, admin.id))
+
+
+def verify_failures():
+    held = {k: c.key for k, c in st.keys_held().items()}
+    with SessionLocal() as db:
+        report = v.verify(db, record=st.head_store().load(), held=held, current_key_id=st.current_key().key_id,
+                          now=clock[0])
+    return [[f.kind, f.message] for f in report.findings if f.severity == "failure"]
+
+
+def values_of(ids):
+    """[address, browser] of each row, as a row or in an archived day's block."""
+    found = {}
+    with SessionLocal() as db:
+        for r in db.query(AuditLog).filter(AuditLog.id.in_(ids)):
+            found[str(r.id)] = [r.ip_address, r.user_agent]
+        view = st.view
+        for day, part in view.archived_parts():
+            for r in arc.PartReader(db, view, day, part).rows():
+                found[str(r["id"])] = [r["ip_address"], r["user_agent"]]
+    return [found.get(str(i)) for i in ids]
+'''
+
+SCRIPT = PREAMBLE + HELPERS + r'''
 archived = [add_row(at(3, 5), {"email": "a@example.com", "count": 1}), add_row(at(3, 15))]
 old = [add_row(ai.hour_floor(now - timedelta(days=40)) + timedelta(minutes=5), {"client_ip": "198.51.100.4"}),
        add_row(ai.hour_floor(now - timedelta(days=40)) + timedelta(minutes=10))]
@@ -238,6 +277,54 @@ out["old"], out["young"], out["archived_ids"] = [str(i) for i in old], str(young
 print(json.dumps(out, default=str))
 '''
 
+# A day archived over two passes (its first hours in a block, its later hours still rows) when a removal runs, and
+# when the archive finishes the day between two of its steps.
+HALF = PREAMBLE + HELPERS + r'''
+early = [add_row(at(2, m)) for m in (5, 15, 25)]
+late = [add_row(at(9, m)) for m in (5, 15, 25)]
+out["stopped"] = passes()
+arc.PART_ROWS = 3
+budget = ai.ROW_BUDGET
+ai.ROW_BUDGET = 3
+arc.archive_job(retention.Pass(SessionLocal, now=clock[0]))
+ai.ROW_BUDGET = budget
+with SessionLocal() as db:
+    out["late_as_rows"] = db.query(func.count()).select_from(AuditLog).filter(AuditLog.id.in_(late)).scalar()
+asked = lower_and_ask()
+real = arc.archive_job
+arc.archive_job = lambda p: retention.JobResult()      # a day this large takes several of its passes
+if MODE == "between":
+    from app.core import person_erase as pe
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    run_days(7.5)
+    pe.WAIT_RULES.clear()
+
+    class OneStep(retention.Pass):
+        left = 1
+
+        def time_left(self):
+            self.left -= 1
+            return self.left >= 0
+    vr.run_job(OneStep(SessionLocal, now=clock[0]))
+    out["after_one_step"] = values_of(early + late)
+    arc.archive_job = real
+    arc.archive_job(retention.Pass(SessionLocal, now=clock[0]))
+    with SessionLocal() as db:
+        out["late_as_rows_then"] = db.query(func.count()).select_from(AuditLog).filter(AuditLog.id.in_(late)).scalar()
+    arc.archive_job = lambda p: retention.JobResult()
+    run_days(1)
+else:
+    run_days(7.5)
+arc.archive_job = real
+run_days(1)
+with SessionLocal() as db:
+    row = db.get(AuditValueRemoval, uuid.UUID(asked["id"]))
+    out["status"], out["counts"] = row.status, row.counts
+out["early"], out["late"] = values_of(early), values_of(late)
+out["failures"] = verify_failures()
+print(json.dumps(out, default=str))
+'''
+
 
 @pytest.fixture
 def throwaway():
@@ -282,3 +369,15 @@ def test_full_addresses_are_shortened_after_their_days_on_postgres_and_the_chain
     assert out["failures"] == []
 
 
+@pytest.mark.parametrize("scenario", ["half", "between"])
+def test_a_removal_over_a_day_archived_in_part_on_postgres_reaches_every_row_of_it(throwaway, scenario):
+    out = run_in(throwaway, HALF, env={"AUDIT_ARCHIVE_START_AFTER_DAYS": "0", "SCENARIO": scenario})
+    assert out["stopped"] is None and out["late_as_rows"] == 3, out
+    assert out["status"] == "completed", out
+    assert out["early"] == [[None, None]] * 3 and out["late"] == [[None, None]] * 3, out
+    if scenario == "half":
+        assert out["preview"]["rows"] == 3 and out["counts"] == {"rows": 3, "archived_rows": 3}, out
+    else:
+        assert out["after_one_step"] == [[None, None]] * 3 + [["203.0.113.5", "Mozilla/5.0 test"]] * 3, out
+        assert out["late_as_rows_then"] == 0 and out["counts"] == {"rows": 0, "archived_rows": 6}, out
+    assert out["failures"] == [], out

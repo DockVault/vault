@@ -420,3 +420,101 @@ def test_an_archived_rewrite_that_would_change_more_than_the_values_writes_nothi
     assert len(env.seals()) == seals
     assert "rows-altered" in ((env.st.head_store().load() or {}).get("failures") or {})
     assert failures(env.verify()) == []
+
+
+# --------------------------------------------------------------------------- archived days, and the edges of the days
+
+class _Steps(retention.Pass):
+    """A pass with time for ``n`` transactions of a job, so that a run can be taken a unit at a time."""
+
+    def __init__(self, env, n=1):
+        super().__init__(env.session, now=env.clock())
+        self.left = n
+
+    def time_left(self):
+        self.left -= 1
+        return self.left >= 0
+
+
+def _at(hour, minute=0):
+    return datetime.combine(DAY, time(hour, minute))
+
+
+def _half_archived(env, monkeypatch):
+    """A day archived over two passes, as a large day is: its 02:00 rows in a block, its 09:00 rows still rows."""
+    monkeypatch.setattr(arc, "PART_ROWS", 3)
+    early = [env.put(_at(2, m)) for m in (5, 15, 25)]
+    late = [env.put(_at(9, m)) for m in (5, 15, 25)]
+    env.run_until_sealed()
+    monkeypatch.setattr(ai, "ROW_BUDGET", 3)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(ai, "ROW_BUDGET", 50000)
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).count() == 1
+        assert db.query(AuditLog).filter(AuditLog.id.in_(late)).count() == 3
+    return early, late
+
+
+def _addresses(env):
+    """{id: ip_address} of every row, as rows and in the archived days' blocks."""
+    out = {}
+    with env.session() as db:
+        for r in db.query(AuditLog).all():
+            out[r.id] = r.ip_address
+        for day, entry in env.st.view.archives.items():
+            for part in entry.parts:
+                for r in arc.PartReader(db, env.st.view, day, part).rows():
+                    out[r["id"]] = r["ip_address"]
+    return out
+
+
+def test_a_day_archived_in_part_is_shortened_in_its_block_and_in_the_hours_still_held_as_rows(env30, monkeypatch):
+    env = env30
+    early, late = _half_archived(env, monkeypatch)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    addresses = _addresses(env)
+    assert [i for i in early + late if addresses[i] is not None] == []
+    assert [[e[0] for e in s.detail["hours"]] for s in env.rewrite_seals()] == [
+        [fmt.hour_text(_at(2))], [fmt.hour_text(_at(9))]]
+    assert failures(env.verify()) == []
+
+
+def test_the_archive_finishing_a_day_between_two_shortening_steps_has_the_day_taken_again(env30, monkeypatch):
+    """The archive job archives a day's later hours after the shortening rewrote its first block, in the same
+    process: the day is taken again for them, and every address of it is shortened."""
+    env = env30
+    early, late = _half_archived(env, monkeypatch)
+    rw.shorten_job(_Steps(env, 1))
+    addresses = _addresses(env)
+    assert [addresses[i] for i in early] == [None] * 3 and [addresses[i] for i in late] == ["203.0.113.9"] * 3
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    with env.session() as db:
+        assert db.query(AuditLog).filter(AuditLog.id.in_(late)).count() == 0
+    env.clock.advance(hours=1)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    addresses = _addresses(env)
+    assert [i for i in early + late if addresses[i] is not None] == []
+    assert failures(env.verify()) == []
+
+
+def test_rows_left_in_an_archived_hour_are_reported_and_the_rows_after_the_day_are_shortened(env30, monkeypatch):
+    """A row of audit_logs in an hour a block holds (no path of the app writes one there): the day is reported
+    (row-in-archived-day) and left as it is, and the shortening goes on after it."""
+    env = env30
+    kept = env.put(_at(3, 5))
+    after = env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    stray = env.put(_at(3, 30))
+    with env.session() as db:
+        payload = db.query(AuditArchiveBlock).one().payload
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert f"nothing in {DAY.isoformat()} was rewritten; its addresses were not shortened" in seen.get(
+        "row-in-archived-day", "")
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == payload
+    addresses = _addresses(env)
+    assert addresses[kept] == "203.0.113.9" and addresses[stray] == "203.0.113.9"
+    assert _shortened(env.get(after))
