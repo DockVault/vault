@@ -4,7 +4,8 @@ Scanners probe a public SFTP port all day. Each probe is refused correctly, and 
 as paramiko's "Exception (server): Error reading SSH protocol banner" and a traceback (two, chained,
 for bytes that are not text), then the handler's own event -- which reads like a fault in the server.
 Now a peer that never sends an SSH identification line is one line: the peer and what it sent instead.
-A peer that did send one is an SSH connection, and everything about it is logged as before.
+A peer that did send one is an SSH connection, and everything about it is logged as before. So is a
+failure on the server's own side before the peer has said anything: it is not a probe.
 
 These run the real connection handler over a real loopback connection, with paramiko's real transport
 on both ends: what paramiko logs is read from its logger, what the server logs from its output.
@@ -181,3 +182,92 @@ def test_the_accept_loop_no_longer_logs_a_connection_before_it_speaks():
                         and call.args and getattr(call.args[0], "value", None) == "connection.accepted"):
                     sites.append(node.name)
     assert sites == ["_check_banner"], sites
+
+
+# A failure on the server's own side before the peer has said anything is not a probe: it is logged
+# with its class, and with paramiko's own lines about it, as before -- whoever the peer is.
+
+def test_a_connection_whose_thread_cannot_be_started_keeps_its_detail(connect, monkeypatch):
+    def cannot_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(mod._Transport, "start", cannot_start)
+    lines, loud = connect(_silent)
+    assert lines == [f"event client.handling.failed peer={PEER[0]} err=RuntimeError"], lines
+    assert loud == [], [r.getMessage() for r in loud]
+
+
+def test_an_unexpected_error_in_the_transport_keeps_paramikos_lines(connect, monkeypatch):
+    """paramiko logs it as "Unknown exception" with its traceback, before any banner was read."""
+    def write_fails(self, out):
+        raise ValueError("the write broke")
+
+    monkeypatch.setattr(paramiko.packet.Packetizer, "write_all", write_fails)
+    lines, loud = connect(_silent)
+    assert lines == [f"event client.handling.failed peer={PEER[0]} err=ValueError"], lines
+    messages = [r.getMessage() for r in loud]
+    assert "Unknown exception: the write broke" in messages, messages
+    assert any("Traceback" in m for m in messages), messages
+    assert any("ValueError: the write broke" in m for m in messages), messages
+
+
+def test_a_server_error_paramiko_reports_as_an_ssh_error_keeps_its_detail(connect, monkeypatch):
+    """paramiko raises "Error reading SSH protocol banner" for whatever its read raised; it is the
+    error beneath that says whose failure it was."""
+    def read_fails(self, timeout):
+        raise RuntimeError("the read broke")
+
+    monkeypatch.setattr(paramiko.packet.Packetizer, "readline", read_fails)
+    lines, loud = connect(_silent)
+    assert lines == [f"event client.handling.failed peer={PEER[0]} err=SSHException"], lines
+    messages = [r.getMessage() for r in loud]
+    assert ("Exception (server): Error reading SSH protocol bannerthe read broke" in messages), messages
+    assert any("RuntimeError: the read broke" in m for m in messages), messages
+
+
+def test_records_are_held_until_released_then_logged_as_they_were(caplog):
+    left, right = socket.socketpair()
+    try:
+        transport = mod._Transport(left, peer=PEER)
+        transport.set_log_channel("paramiko.transport")
+        caplog.set_level(logging.DEBUG, logger="paramiko")
+        transport._log(logging.ERROR, "first")
+        transport._log(logging.DEBUG, "quiet")
+        assert [r.getMessage() for r in caplog.records] == ["quiet"]
+        transport.release_held_records()
+        transport._log(logging.WARNING, "after")
+        assert [r.getMessage() for r in caplog.records] == ["quiet", "first", "after"]
+        assert [r.levelno for r in caplog.records] == [logging.DEBUG, logging.ERROR, logging.WARNING]
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("chain, peers", [
+    ([paramiko.SSHException("Error reading SSH protocol banner"), socket.timeout()], True),
+    ([paramiko.SSHException("Error reading SSH protocol banner"), EOFError()], True),
+    ([paramiko.SSHException("Error reading SSH protocol banner"),
+      UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")], True),
+    ([paramiko.SSHException("Error reading SSH protocol banner"), ConnectionResetError()], True),
+    ([EOFError()], True),
+    ([RuntimeError("can't start new thread")], False),
+    ([paramiko.SSHException("Error reading SSH protocol banner"), MemoryError()], False),
+    ([paramiko.SSHException("Error reading SSH protocol banner"), ValueError(), OSError()], False),
+    ([OSError() for _ in range(64)], False),
+], ids=["timeout", "closed", "not-text", "reset", "eof-alone", "no-thread", "under-ssh-error",
+        "anywhere-in-the-chain", "too-long"])
+def test_only_a_chain_of_peer_failures_is_a_probe(chain, peers):
+    for outer, inner in zip(chain, chain[1:]):
+        outer.__context__ = inner
+    assert (mod._peer_failure_chain(chain[0]) is not None) is peers
+
+
+def test_a_chain_that_loops_is_not_followed_for_ever():
+    first, second = OSError(), EOFError()
+    first.__context__, second.__context__ = second, first
+    result = []
+    worker = threading.Thread(target=lambda: result.append(mod._peer_failure_chain(first)),
+                              daemon=True)
+    worker.start()
+    worker.join(5)
+    assert result == [None]

@@ -2717,16 +2717,26 @@ class _Transport(paramiko.Transport):
     nothing, an HTTP request, a TLS greeting, bytes that are not text, or close at once. paramiko
     refuses each correctly, and logged each refusal as an error with its traceback, which reads like a
     fault in the server. So until the peer has sent an SSH identification line ("SSH-..."), paramiko's
-    warnings and errors about it are not logged; handle_sftp_client reports the refusal as one line
-    (see _report_not_ssh). From that line on, and so for every real SSH session, paramiko logs exactly
-    as before, a failed key exchange or sign-in included.
+    warnings and errors are held back, and handle_sftp_client decides whose failure they describe. The
+    peer's: the refusal is one line (see _report_not_ssh) and they are dropped. The server's own: they
+    are logged as paramiko wrote them (release_held_records), with the failure's event after them. From
+    that line on, and so for every real SSH session, paramiko logs exactly as before, a failed key
+    exchange or sign-in included.
 
     The two methods it overrides are paramiko's own: ``_log``, through which the transport logs, and
     ``_check_banner``, which reads the peer's identification line. tests/test_sftp_probe_log.py runs
     them against paramiko's real transport, so a paramiko that renames either fails there.
     """
 
+    # Before the banner, paramiko writes a warning or an error only as its thread ends: a few records.
+    # The bound only keeps one connection from holding more than that.
+    HELD_RECORDS_MAX = 32
+
     def __init__(self, sock, *args, peer=None, **kwargs):
+        # Set before paramiko's own set-up, in case it logs.
+        self._held_records = []
+        self._held_lock = threading.Lock()
+        self._holding = True
         super().__init__(sock, *args, **kwargs)
         self._peer = peer
         # The first line the peer sent that was not an SSH identification line. Read only to say what
@@ -2742,8 +2752,20 @@ class _Transport(paramiko.Transport):
                     and isinstance(msg, str) and msg.startswith("Banner: ")):
                 self.first_line = msg[len("Banner: "):][:64]
             if level >= paramiko.common.WARNING:
-                return
+                with self._held_lock:
+                    if self._holding:
+                        if len(self._held_records) < self.HELD_RECORDS_MAX:
+                            self._held_records.append((level, msg, args))
+                        return
         super()._log(level, msg, *args)
+
+    def release_held_records(self) -> None:
+        """Log what was held back, as paramiko wrote it, and hold nothing more: the failure was not
+        that of a peer that never spoke SSH, so its detail is the server's to keep."""
+        with self._held_lock:
+            held, self._held_records, self._holding = self._held_records, [], False
+        for level, msg, args in held:
+            super()._log(level, msg, *args)
 
     def _check_banner(self):
         try:
@@ -2758,10 +2780,31 @@ class _Transport(paramiko.Transport):
                     pass
 
 
+# What a peer that never speaks SSH makes the start of a connection raise: paramiko's refusal of what
+# it read, a read that timed out, a connection closed or reset, bytes that are not text.
+# (socket.timeout is an OSError; it is named for the reader.)
+_PEER_FAILURES = (paramiko.SSHException, EOFError, socket.timeout, OSError, UnicodeDecodeError)
+_CHAIN_MAX = 8
+
+
+def _peer_failure_chain(exc):
+    """``exc`` and the exceptions it was raised from or during, when every one of them is a failure a
+    peer causes; None when one is not. That is a failure on the server's own side -- a thread that
+    could not be started, an error paramiko did not expect -- even when paramiko raised an SSHException
+    in its place."""
+    chain, seen = [], exc
+    while seen is not None:
+        if len(chain) >= _CHAIN_MAX or not isinstance(seen, _PEER_FAILURES):
+            return None
+        chain.append(seen)
+        seen = seen.__cause__ or seen.__context__
+    return chain
+
+
 def _report_not_ssh(transport, exc, peer) -> bool:
     """Log a connection whose peer never sent an SSH identification line as one line, naming what it
-    sent instead, and return True; return False, logging nothing, when the peer did speak SSH -- its
-    failure keeps its detail.
+    sent instead, and return True. Return False, logging nothing, when the peer did speak SSH, or when
+    what failed was not the peer (see _peer_failure_chain): such a failure keeps its detail.
 
     - ``connection.not-ssh.http``: an HTTP request;
     - ``connection.not-ssh.text``: some other text that is not an SSH identification line;
@@ -2771,17 +2814,16 @@ def _report_not_ssh(transport, exc, peer) -> bool:
     """
     if transport._speaks_ssh():
         return False
+    # What paramiko's read raised, beneath the SSHException it raised in its place.
+    causes = _peer_failure_chain(exc)
+    if causes is None:
+        return False
     if transport.first_line is not None:
         if _HTTP_REQUEST_LINE.match(transport.first_line):
             safe_event('connection.not-ssh.http', peer=peer)
         else:
             safe_event('connection.not-ssh.text', peer=peer)
         return True
-    # What paramiko's read raised, beneath the SSHException it raised in its place.
-    causes, seen = [], exc
-    while seen is not None and len(causes) < 5:
-        causes.append(seen)
-        seen = seen.__cause__ or seen.__context__
     if any(isinstance(c, UnicodeDecodeError) for c in causes):
         safe_event('connection.not-ssh.binary', peer=peer)
     elif any(isinstance(c, socket.timeout) for c in causes):
@@ -2837,13 +2879,14 @@ def handle_sftp_client(
         server = SFTPServer(client_address[0])
 
         # Start SSH server. A peer that never says it speaks SSH -- a scanner, almost always -- fails
-        # here, and is one line naming what it sent instead; an SSH peer's failure goes on to the
-        # event below, with paramiko's own lines before it.
+        # here, and is one line naming what it sent instead. An SSH peer's failure, and a failure on
+        # the server's own side, go on to the event below, with paramiko's own lines before it.
         try:
             transport.start_server(server=server)
         except Exception as e:  # noqa: BLE001 -- re-raised unless it is reported here
             if _report_not_ssh(transport, e, client_address):
                 return
+            transport.release_held_records()
             raise
 
         # Wait for authentication
