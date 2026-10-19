@@ -43,9 +43,12 @@ One transaction per unit, under the chain lock:
   a unit up to the end of its parts: its later hours, still rows, are reached after it as hours of rows. A day with
   rows of audit_logs in the hours its parts hold is reported (row-in-archived-day) and left as it is.
 
-The units go oldest first. The shortening takes an archived day once the whole day is past its cutoff (the day's
-blocks are written once, not once an hour), and passes over a day archived in a later release's block format, which
-this release neither checks nor changes; a removal waits at such a day (it cannot complete in this release).
+The units go oldest first. Rows dated before the chain's first hour, which no seal covers, are one unit that does
+not check out (row-before-genesis). The shortening reports a unit that does not check out and passes over it; a
+removal reports it and waits there, since it must reach every row it covers. The shortening takes an archived day
+once the whole day is past its cutoff (the day's blocks are written once, not once an hour), and passes over a day
+archived in a later release's block format, which this release neither checks nor changes; a removal waits at such
+a day (it cannot complete in this release).
 
 Nothing is rewritten while the hold switch is on (the jobs are held), while a restore is not finished or its grace
 runs, or while a rule another part of the app registers holds deletions back (person_erase.register_wait: legal
@@ -382,6 +385,14 @@ def rewrite_hour(w, hour: datetime, change: Callable[[dict], Optional[dict]], *,
                            "host operator")
     entry = view.entry_for(hour)
     if entry is None:
+        first = view.first_hour()
+        if first is not None and hour < first:
+            # Rows dated before the chain began: no seal covers them, so none can bind a rewrite of them (verify
+            # reports them, row-before-genesis). They are one unit, up to the chain's first hour.
+            nr = NotRewritten(f"rows of audit_logs are dated before the chain's first hour, {fmt.hour_text(first)}, "
+                              "which no seal covers; nothing before it was rewritten", "row-before-genesis")
+            nr.until = first
+            raise nr
         raise NotRewritten(f"{fmt.hour_text(hour)} is not sealed yet")
     root_entry = entry.root
     if root_entry.sealed_at >= now - ai.LATE_WINDOW and int(
@@ -536,8 +547,9 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
     next archived day and the next hours of rows goes next, and a day with rows of audit_logs in the hours its parts
     hold is reported (row-in-archived-day), not rewritten. Hours of rows taken run within one day and never into an
     archived day's parts: a day is archived from its first sealed hour on, so the hours of a day that come before
-    its parts are hours before the chain began, which no seal covers (rewrite_hour waits at the first of them).
-    Writes a rewrite seal only when it returns CHANGED. Raises NotRewritten."""
+    its parts are hours before the chain began, which no seal covers: rewrite_hour reports them as one unit
+    (row-before-genesis), up to the chain's first hour. Writes a rewrite seal only when it returns CHANGED. Raises
+    NotRewritten."""
     from app.core import audit_archive as arc
     view = w.st.view
     newest = view.newest_policy()
@@ -631,7 +643,8 @@ def cutoff(view, before: datetime) -> datetime:
 def shorten_job(p):
     """The pruner's audit_ip_shortening job: addresses whose rows are older than audit_ip_full_days shortened, through
     rewrite seals of reason shorten-ip (an archived day once the whole day is past the cutoff). A day archived in a
-    later release's block format is passed over. Returns a retention.JobResult (the rows changed, as cleared)."""
+    later release's block format is passed over; a unit that does not check out, rows dated before the chain's first
+    hour among them, is reported and passed over. Returns a retention.JobResult (the rows changed, as cleared)."""
     from app.core import person_erase as pe
     from app.core import retention
     from app.core.models import AuditLog

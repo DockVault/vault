@@ -9,8 +9,8 @@ offline, on a throwaway SQLite database with a chain of its own (tests/_removal_
   leaves the hours before it shortened, and an archived day with nothing to shorten is passed over; a day archived
   in part is shortened in its block and in its later hours still held as rows, and taken again when the archive
   finishes it between two steps; an archived day the cutoff runs through is shortened once, when the whole day is
-  past it; rows left in an archived hour are reported, and a day a later release archived is passed over; an hour
-  sealed just now waits for its late rows; the days are the longer of the honoured and the newest policy seal's; a
+  past it; rows left in an archived hour are reported, rows dated before the chain's first hour are reported and
+  passed over, and a day a later release archived is passed over; an hour sealed just now waits for its late rows; the days are the longer of the honoured and the newest policy seal's; a
   legal hold or a restore's grace holds it;
 - setting a number in the panel deletes sooner: it waits the reduction delay; no limit again applies at once;
 - verify refuses a shortening while there is no limit, over rows younger than the days, or naming a request;
@@ -502,6 +502,33 @@ def test_rows_left_in_an_archived_hour_are_reported_and_the_rows_after_the_day_a
     addresses = _addresses(env)
     assert addresses[kept] == "203.0.113.9" and addresses[stray] == "203.0.113.9"
     assert _shortened(env.get(after))
+
+
+def test_rows_dated_before_the_chains_first_hour_are_reported_and_the_rows_after_them_are_shortened(env30,
+                                                                                                    monkeypatch):
+    """Rows dated before the chain's first hour are in no sealed hour (verify: row-before-genesis), so no seal can
+    bind a rewrite of them: the shortening reports them as one unit that does not check out, leaves them as they
+    are, and goes on after them, as the audit job's prune does. On the next passes nothing changes."""
+    env = env30
+    a = env.put(T0 - timedelta(days=40, minutes=5))
+    b = env.put(T0 - timedelta(days=35, minutes=5))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    assert first is not None and first <= ai.hour_floor(T0 - timedelta(days=40, minutes=5))
+    pre = [env.put(first - timedelta(days=5)), env.put(first - timedelta(days=2, hours=3))]
+    seen = []
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.extend(found.items()))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(a)) and _shortened(env.get(b))
+    assert [env.get(i).ip_address for i in pre] == ["203.0.113.9", "203.0.113.9"]
+    assert [k for k, _m in seen] == ["row-before-genesis"]
+    assert seen[0][1].endswith("nothing before it was rewritten; its addresses were not shortened"), seen
+    assert fmt.hour_text(first) in seen[0][1]
+    rewrites = [s for s in env.seals() if s.kind == "rewrite"]
+    env.passes(12)
+    assert [s.seq for s in env.seals() if s.kind == "rewrite"] == [s.seq for s in rewrites]
+    assert [env.get(i).ip_address for i in pre] == ["203.0.113.9", "203.0.113.9"]
+    assert "row-before-genesis" in {f.kind for f in env.verify().findings}
 
 
 def test_a_day_a_later_release_archived_is_passed_over(env30, monkeypatch):

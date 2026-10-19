@@ -23,7 +23,8 @@ writer appended waits for the host's acknowledgment). It takes its levels and it
 a row whose copies differ is ``unjustified-input`` and nothing runs; a request whose row the database no longer
 shows waiting (removed, or cancelled while sealing was stopped) is ended by a ``cancel`` seal ``by: database``, a
 veto the host acknowledges like the others. It waits while a rule registered with person_erase.register_wait says
-so (legal holds, open cases), and the hold switch holds it.
+so (legal holds, open cases), and the hold switch holds it. A unit that does not check out (rows dated before the
+chain's first hour among them) is reported, and the removal waits there; its row says a finding holds it.
 
 Each transaction rewrites one unit, oldest first (audit_rewrite.step: an archived day, or hours of rows of one day),
 with a ``rewrite`` seal of reason ``levels`` naming the request seal and its scope (``through``, the last hour of
@@ -553,7 +554,8 @@ def finish(w, row, seq: int, d: dict, now: datetime) -> dict:
 
 def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     """One transaction of the removal of request ``seq``: (outcome, rows changed, the new cursor, the notice's facts
-    when it completed, the reason it waits). Writes nothing unless it returns REWRITTEN (or DONE after a veto)."""
+    when it completed, the reason it waits, or what holds it when it stops on a finding). Writes nothing unless it
+    returns REWRITTEN (or DONE after a veto)."""
     from app.core import audit_chain_policy_seals as ps
     from app.core import audit_retention as ar
     from app.core import person_erase as pe
@@ -586,7 +588,7 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
         return WAIT, 0, cursor, None, f"It waits: {why}."
     chain = ar.chain_numbers()
     if chain is None:
-        return STOP, 0, cursor, None, None
+        return STOP, 0, cursor, None, held_by("unjustified-input")
     if chain[2]:
         return WAIT, 0, cursor, None, "It waits while the hold switch is on."
     levels, before = rw.removal_scope(d)
@@ -600,12 +602,13 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     except rw.NotRewritten as nr:
         if nr.kind:
             findings[nr.kind] = f"{nr}; the removal of request seal {seq} waits"
-            return STOP, 0, cursor, None, None
+            return STOP, 0, cursor, None, held_by(nr.kind)
         if nr.later_format:
             return WAIT, 0, cursor, None, f"It waits: {nr}, so this release cannot complete it."
         return WAIT, 0, cursor, None, f"It waits: {nr}."
     if outcome == rw.CHANGED:
         _progress(row, now, changed, unit)
+            return STOP, 0, cursor, None, held_by("unjustified-input")
         return REWRITTEN, changed, cursor, None, None
     if outcome == rw.CLEAN:
         return SCANNED, 0, cursor, None, None
@@ -625,6 +628,8 @@ def _note_waiting(session_factory, request_id, why: Optional[str]) -> None:
             row.waiting = why[:255] if why else None
             db.commit()
     except Exception:  # noqa: BLE001 -- the next pass says it again
+            # A unit that does not check out (rows dated before the chain's first hour among them): reported, and the
+            # removal waits there, since it must reach every row it covers.
         db.rollback()
     finally:
         db.close()
@@ -641,6 +646,13 @@ def run_job(p):
         return result
     engine = ai._engine_of(p.session_factory)
     findings: Dict[str, str] = {}
+def held_by(kind: str) -> str:
+    """What the request says while a finding of the audit log's check holds it: a reason given before the finding
+    would no longer be true."""
+    return (f"It is held: the audit log's check found a fault ({kind}) where it would change rows, and it waits "
+            "until that is resolved.")
+
+
     finished = []
     for seq in sorted(set(due(st.view, st.known_record(), p.now)) | set(vetoed(st, p.session_factory))):
         while p.time_left():
@@ -654,7 +666,7 @@ def run_job(p):
             if outcome in (REWRITTEN, SCANNED) and cursor is not None:
                 _cursors[_cursor_key(st, seq)] = cursor
             result.cleared += changed
-            if outcome == WAIT:
+            if outcome == WAIT or (outcome == STOP and why):
                 _note_waiting(p.session_factory, st.view.requests[seq].get("request"), why)
                 break
             if outcome in (REWRITTEN, SCANNED) and done is None:

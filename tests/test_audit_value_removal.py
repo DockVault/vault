@@ -696,6 +696,31 @@ def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_re
     assert _values(env)[kept] == ("203.0.113.9", "Mozilla/5.0 test")
 
 
+def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_be_cancelled(env, monkeypatch):
+    """Rows dated before the chain's first hour, which no seal covers (verify: row-before-genesis): the removal
+    reports them and waits there, since it must reach every row it covers, and its row says a finding holds it. It
+    meets them before any other unit, so it has not begun: any administrator can still cancel it."""
+    ids = _hot(env)
+    first = env.st.view.first_hour()
+    pre = env.put(first - timedelta(days=2))
+    asked = env.ask_removal()
+    seen = []
+    real = ai.report_failures
+    monkeypatch.setattr(ai, "report_failures",
+                        lambda st, f, found, *a, **k: (seen.extend(found.items()), real(st, f, found, *a, **k))[1])
+    env.week()
+    ours = [m for k, m in seen if k == "row-before-genesis" and "the removal of request seal" in m]
+    assert ours and fmt.hour_text(first) in ours[0]
+    row = env.removal_row(asked["id"])
+    assert row.status == vr.PENDING and row.waiting == vr.held_by("row-before-genesis")
+    assert env.rewrite_seals() == []
+    assert [env.get(i).ip_address for i in ids[:3] + [pre]] == ["203.0.113.9"] * 4
+    out = env.cancel_removal(asked["id"], env.admin("bea"))
+    assert out["status"] == vr.CANCELLED
+    env.ask_removal()                                # and a new one may be asked for
+    assert "row-before-genesis" in failures(env.verify())
+
+
 def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env, monkeypatch):
     """A day archived in a later release's block format (a rollback): a removal cannot complete in this release; it
     waits there with no finding, and its row (which its card shows) says why it waits."""
