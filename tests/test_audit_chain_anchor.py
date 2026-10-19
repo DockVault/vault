@@ -156,6 +156,34 @@ def test_a_late_seal_of_an_hour_sealed_after_the_anchor_is_not_reported(env):
     assert _found(report, "changed-after-anchor") == []
 
 
+def test_the_anchor_does_not_cover_the_hour_that_begins_at_its_newest_hours_end(env):
+    """The edge of what an anchor covers: the hour that begins exactly where the newest hour sealed at the anchor
+    ends is the first one it does not cover. A row in that hour and one in the hour before it; the head then (the
+    anchor); the edge hour sealed after it; a late row added to each and sealed late. Off the server, without the
+    key, only the hour before the edge is reported."""
+    before = env.row(T0 - timedelta(minutes=70))
+    at_edge = env.row(T0 - timedelta(minutes=50))
+    assert before and at_edge
+    env.run_until_sealed()
+    anchor = env.verify().head
+    edge = env.st.view.newest_hour_end
+    covered = ai.hour_floor(T0 - timedelta(minutes=70))
+    assert edge == ai.hour_floor(T0 - timedelta(minutes=50)) == covered + ai.HOUR
+    env.clock.advance(hours=1)
+    env.run_until_sealed()                                # the edge hour is sealed now, after the anchor
+    assert env.st.view.newest_hour_end > edge
+    env.row(covered + timedelta(minutes=40), username="mallory")
+    env.row(edge + timedelta(minutes=40), username="mallory")
+    env.clock.advance(minutes=30)
+    env.run_until_sealed()
+    lates = {s.detail["hour"]: s.seq for s in env.seals() if s.kind == "late"}
+    assert set(lates) == {fmt.hour_text(covered), fmt.hour_text(edge)}
+    report = _off(env, anchor=anchor)
+    assert "anchor-mismatch" not in failures(report)
+    changed = _found(report, "changed-after-anchor")
+    assert [(f.seq, f.hour) for f in changed] == [(lates[fmt.hour_text(covered)], fmt.hour_text(covered))]
+
+
 def test_a_matching_anchor_authenticates_every_seal_up_to_it(env):
     env.row(T0 - timedelta(hours=5))
     env.run_until_sealed()
