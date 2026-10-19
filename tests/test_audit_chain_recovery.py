@@ -203,6 +203,23 @@ def test_a_seal_refused_on_its_face_is_discarded_with_its_rows_saved(env):
     assert told and "by host" in told[0].message and f"discarded seals {seq}" in told[0].message
 
 
+def test_the_saved_seals_of_a_discard_are_handed_to_their_owner_before_they_are_synced(env, monkeypatch, tmp_path):
+    """A discard run as root saves the seals in a file given the keys directory's owner before its sync, so the file
+    synced is the final one, owner and all."""
+    env.row(T0 - timedelta(hours=3))
+    env.run_until_sealed()
+    events = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(hr.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(hr.os, "chown", lambda path, uid, gid: events.append(("chown", path)), raising=False)
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append(("fsync", fd)), real_fsync(fd))[1])
+    with env.session() as db:
+        target = recovery._save_discarded(str(tmp_path / "audit-chain-head.json"), db, 1, env.clock())
+    with open(target, encoding="utf-8") as fh:
+        assert json.load(fh)
+    assert [e[0] for e in events] == ["chown", "fsync"] and events[0][1] == target, events
+
+
 def test_a_discard_that_fails_leaves_the_seals_and_writes_no_ack(env, monkeypatch):
     seq = _refused_on_its_face(env)
     seen = recovery.after_record(env.engine, _host(env), discard=True, read=True)

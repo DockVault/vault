@@ -516,6 +516,30 @@ def test_a_head_record_written_by_root_belongs_to_the_directorys_owner(tmp_path,
     assert chowned == []
 
 
+def test_a_head_record_written_by_root_is_handed_to_its_owner_before_it_is_synced(tmp_path, monkeypatch):
+    """The file is given its owner before its sync, so the file synced, then put in place, is the final one, owner
+    and all; the restore mark is written the same way."""
+    from app.core import audit_head_record as hr
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(hr.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(hr.os, "chown", lambda path, uid, gid: events.append(("chown", os.path.basename(path))),
+                        raising=False)
+    monkeypatch.setattr(hr.os, "fsync", lambda fd: (events.append(("fsync", fd)), real_fsync(fd))[1])
+    monkeypatch.setattr(hr.os, "replace", lambda a, b: (events.append(("replace", os.path.basename(a))),
+                                                        real_replace(a, b))[1])
+    path = str(tmp_path / "keys" / "audit-chain-head.json")
+    for write in (lambda: hr.HeadStore(path).write(lambda rec: {**rec, "seq": 1}, datetime(2026, 1, 1)),
+                  lambda: hr.write_mark(path, {"at": "2026-01-01T00:00:00Z"})):
+        events.clear()
+        write()
+        at = next(i for i, e in enumerate(events) if e[0] == "replace")
+        tmp = events[at][1]
+        assert tmp.startswith(".audit-chain-head.")
+        assert events[at - 1][0] == "fsync", events                       # the file's sync, then its rename
+        assert ("chown", tmp) in events[:at - 1], events                  # its owner before that sync
+
+
 def test_a_head_record_that_cannot_be_read_stops_a_new_process_and_not_a_running_one(env, monkeypatch):
     from app.core import audit_head_record as hr
     env.run_until_sealed()

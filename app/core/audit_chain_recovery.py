@@ -236,8 +236,8 @@ def _save_discarded(path: str, db, first: int, now: datetime) -> str:
     with open(target, "w", encoding="utf-8") as fh:
         json.dump(saved, fh, indent=1, sort_keys=True)
         fh.flush()
+        _owned_like_directory(target)          # before the sync: the file synced is the final one, owner and all
         os.fsync(fh.fileno())
-    _owned_like_directory(target)
     return target
 
 

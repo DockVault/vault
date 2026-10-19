@@ -184,8 +184,9 @@ def _write_file(path: str, record: Dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(record, fh, sort_keys=True, separators=(",", ":"))
             fh.flush()
+            # Its owner before the sync, so the file synced is the final one, owner and all.
+            _owned_like_directory(tmp)
             os.fsync(fh.fileno())
-        _owned_like_directory(tmp)
         os.replace(tmp, path)
     except BaseException:
         try:
