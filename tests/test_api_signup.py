@@ -24,15 +24,18 @@ ACCOUNT_KEYS = ("email_requirement", "invite_enabled", "invite_ttl_hours", "sign
                 "email_change_requires_verification")
 PASSWORD_KEYS = ("password_min_length", "require_uppercase", "require_lowercase",
                  "require_numbers", "require_special")
+# The policy test loads the settings with an SMTP server to show it does not leak; left there, it would count as
+# configured mail for every later test, and a restart of the app would import it as the default sending profile.
+SMTP_KEYS = ("smtp_server", "from_email")
 
 STRONG_PW = "S1gnup-Passw0rd!"
 
 
 @pytest.fixture
 def restore_settings(admin):
-    """Snapshot the account + password-policy keys these tests mutate and put them back afterwards."""
+    """Snapshot the account, password-policy and SMTP keys these tests change and put them back afterwards."""
     before = admin.get("/settings").json()
-    snap = restorable({k: before.get(k) for k in (ACCOUNT_KEYS + PASSWORD_KEYS)})
+    snap = restorable({k: before.get(k) for k in (ACCOUNT_KEYS + PASSWORD_KEYS + SMTP_KEYS)})
     yield snap
     r = admin.put("/settings", json=snap)
     assert r.status_code == 200, r.text
