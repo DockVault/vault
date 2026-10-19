@@ -455,6 +455,34 @@ def test_a_waiting_change_the_raise_a_whole_backup_restore_undid_superseded_ends
     assert failures(env.verify()) == []
 
 
+def test_accept_restore_offers_no_cancel_of_a_request_the_resealed_raise_supersedes(env):
+    """A whole backup taken while a reduction waited; the reduction then cancelled and the setting raised; the
+    backup restored. accept-restore seals the raise again, which supersedes the request: it says the cancel was
+    undone, offers no cancel to seal again, and ends the request's row as superseded."""
+    env.row(T0 - timedelta(days=60))
+    env.run_until_sealed()
+    admin = _admin(env)
+    assert _change(env, admin, "audit_min_days", 30).status == "applied"
+    waiting = _change(env, admin, "audit_min_days", 10)
+    assert waiting.status == "pending"
+    snap = _snapshot(env)
+    with ps.change_transaction(env.engine) as w:
+        ps.cancel(w, waiting.change.id, admin)
+    assert _change(env, admin, "audit_min_days", 60).status == "applied"
+    env.clock.advance(hours=1)
+    env.seal()
+    _restore_bundle(env, snap)
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+    assert any("Undone by the restore: the cancel" in ln for ln in seen["lines"]), seen["lines"]
+    assert not any("Cancels sealed again" in ln for ln in seen["lines"]), seen["lines"]
+    done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    assert done["resealed"] == ["audit_min_days"] and done["cancels"] == [], done
+    assert done["superseded"] == [str(waiting.change.id)], done
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
+
+
 def test_the_backup_windows_seals_are_acknowledged_and_a_later_one_is_not(env):
     env.row(T0 - timedelta(hours=8))
     env.run_until_sealed()
