@@ -1,7 +1,8 @@
 """UI — the anonymous public-note-link redemption page (/l/{token}).
 
-No login: a visitor opens the link, is prompted for a secret only when the link needs one, and sees
-the frozen snapshot rendered as TEXT (never markup)."""
+No login: a visitor opens the link, is prompted for a secret only when the link needs one (a link
+with none shows its note on a "Show note" click), and sees the frozen snapshot rendered as TEXT
+(never markup)."""
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -38,6 +39,7 @@ def test_no_secret_link_renders_snapshot(page: Page, admin, links_on):
     tag = _open_tag(admin)
     link = admin.post("/note-links", json={"note_id": note_id, "tag_id": tag["id"]}).json()
     page.goto(f"/l/{link['token']}")
+    page.click("#reveal-btn", timeout=10000)
     expect(page.locator("#content")).to_be_visible(timeout=10000)
     expect(page.locator("#note-title")).to_have_text("Public Title")
     expect(page.locator("#note-body")).to_contain_text("line one")
@@ -52,6 +54,7 @@ def test_note_body_is_rendered_as_text_not_markup(page: Page, admin, links_on):
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.goto(f"/l/{link['token']}")
+    page.click("#reveal-btn", timeout=10000)
     expect(page.locator("#content")).to_be_visible(timeout=10000)
     # The literal markup shows as text; no injected elements are created.
     expect(page.locator("#note-body")).to_contain_text("<img src=x")

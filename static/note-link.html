@@ -67,6 +67,13 @@
         <div id="secret-error" class="msg error hidden"></div>
       </form>
 
+      <!-- a link with no secret: the note is shown on this click, so loading the page spends nothing -->
+      <div id="reveal" class="hidden">
+        <p class="center">A note has been shared with you. Showing it counts as one view of this link.</p>
+        <button id="reveal-btn" type="button">Show note</button>
+        <div id="reveal-error" class="msg error hidden"></div>
+      </div>
+
       <!-- content -->
       <div id="content" class="hidden">
         <h1 id="note-title"></h1>

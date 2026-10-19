@@ -103,7 +103,11 @@ and per IP at 600/min — the enumeration bound), a per-link wrong-secret lockou
 **kill switch** (feature off ⇒ every minted link 404s), a uniform 404 for missing/revoked/expired/
 exhausted **or whose owner is no longer active or is locked by an administrator** (checked before any
 secret prompt; the automatic lock armed by wrong passwords does not count, see §5.1), and
-an atomic `UPDATE … WHERE` consume of one use. Owners revoke/delete; admins list
+an atomic `UPDATE … WHERE` consume of one use. The page first redeems with `peek: true`, which spends
+nothing and checks no secret: a link with no secret answers `{available, secret_kind}` and the page
+shows a "Show note" button, whose click is the redeem that spends the view, so a scanner or a link
+preview that loads the page (with its script or without) uses nothing; a link with a secret answers
+the peek with its prompt, as it always did. Owners revoke/delete; admins list
 (`/admin/note-links`, never the body), revoke one, or `revoke-all`. Owner tiles render in the Notes
 section's *Shared* tab (`_noteLinkCard`), coloured by the tag.
 

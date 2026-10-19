@@ -12486,6 +12486,11 @@ class NoteLinkCreate(BaseModel):
 
 class NoteLinkRedeem(BaseModel):
     secret: Optional[str] = None
+    # A peek says whether the link can be opened, and with what (no secret, a PIN or a password),
+    # WITHOUT spending a view or showing the note: the page of a link with no secret shows a "Show
+    # note" button first, so a scanner or a link preview that runs the page spends nothing. The click
+    # redeems with peek=false, which is where the view is spent. A peek never checks a secret.
+    peek: bool = False
 
 
 @app.post("/note-links")
@@ -12803,13 +12808,16 @@ async def redeem_note_link(
     """PUBLIC: redeem a snapshot link. Rate-limited per IP AND per token (fail-closed); a secret-gated
     link prompts for its PIN/password with a per-link lockout after repeated wrong attempts; expiry,
     max-uses and revocation are enforced atomically; every outcome is audited. Returns the frozen
-    snapshot on success."""
+    snapshot on success. With peek=true nothing is spent and no secret is checked: a link with no secret
+    answers {available, secret_kind} (its page then waits for a "Show note" click), one with a secret
+    answers with the prompt, as a first request without the secret does."""
     import time as _t
     from sqlalchemy import update as _sa_update, or_ as _or
     from app.core.security import verify_password
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
 
     client_ip = get_client_ip(request)
+    peek = bool(getattr(payload, "peek", False))
     if not token or len(token) > _NOTELINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This link is not available.")
 
@@ -12877,7 +12885,9 @@ async def redeem_note_link(
             _audit("failure", reason="locked_out", link_id=link.id)
             raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
                                 headers={"Retry-After": str(_NOTELINK_FAIL_WINDOW)})
-        raw = (payload.secret if payload else None) or ""
+        # A peek never checks a secret (so it can neither spend a view nor count a wrong guess): it is
+        # answered as a first request without one is, with the prompt.
+        raw = "" if peek else ((payload.secret if payload else None) or "")
         if not raw.strip():
             # The page needs to know which prompt to show; no consume, no failure recorded.
             raise HTTPException(status_code=401,
@@ -12896,6 +12906,11 @@ async def redeem_note_link(
             raise HTTPException(status_code=401,
                                 detail={"error": "wrong_secret", "secret_kind": link.secret_kind})
         _notelink_clear_fails(token)
+
+    if peek:
+        # A link with no secret, peeked at: the page shows its "Show note" button, nothing is spent.
+        _audit("success", reason="peek", link_id=link.id)
+        return {"available": True, "secret_kind": link.secret_kind}
 
     # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
     now = datetime.utcnow()
