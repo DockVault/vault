@@ -4,10 +4,11 @@ app/core/person_erase.py, the request side), offline on a throwaway SQLite datab
 
 - when it runs: a request another writer appended runs only once the host acknowledges it; the hold switch, a
   restore mark and a registered rule stop it between units, and a rule that cannot be read keeps it waiting; a
-  late row in an hour it reaches makes it wait for the late seal, while a row added to an hour sealed long ago is
-  a finding; the protected minimum is asked only before the run begins, and a row exactly at the minimum does
-  not hold it; the database vetoes on a day that holds no veto of its yet; a new request never takes a delay
-  shorter than the chain's newest;
+  late row in an hour it reaches makes it wait for the late seal, so does one that reaches an hour the run has
+  just erased (not the loop guard, which stops a unit that changed nothing where the scan found the name), while
+  a row added to an hour sealed long ago is a finding; the protected minimum is asked only before the run begins,
+  and a row exactly at the minimum does not hold it; the database vetoes on a day that holds no veto of its yet; a
+  new request never takes a delay shorter than the chain's newest;
 - what it acts on: a name the token opens to that no erase may take, a row already erased that holds the name
   again, an archived hour another writer sealed, and an invitation exactly at its expiry;
 - what it writes: an archived erased row keeps none of its personal values, a key that holds the name goes even
@@ -470,6 +471,86 @@ def test_a_row_of_the_name_in_an_archived_day_listed_as_erased_already_is_a_find
     assert [rows[i]["username"] for i in ids] == ["eve", "eve"] and env.erase_seals() == []
     assert "unjustified" in _recorded_failures(env)
     assert env.request_row(asked["id"]).waiting == ae.held_by("unjustified")
+
+
+def test_a_unit_that_changed_nothing_where_the_scan_found_the_name_stops_the_run_and_its_request_says_so(env,
+                                                                                                      monkeypatch):
+    """The loop guard: a unit tried in the pass that changed nothing, though the scan before it found the name there,
+    is not tried again and again: the run stops with a finding (unjustified), and its request says a finding holds
+    it. No path of the app gives this (an hour of rows changes at least one row or raises, and a day changes nothing
+    only when its blocks hold no row of the name, which the scan then reads too); erase_day is made to change
+    nothing here."""
+    ids = [_put(env, at(3, 5)), _put(env, at(5, 5))]
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(ae, "erase_day", lambda *a, **k: 0)
+    asked = env.ask("eve")
+    env.passes(24 * 8)
+    rows = _archived_rows(env)
+    assert [rows[i]["username"] for i in ids] == ["eve", "eve"] and env.erase_seals() == []
+    assert "unjustified" in _recorded_failures(env)
+    row = env.request_row(asked["id"])
+    assert row.status == pe.PENDING and row.waiting == ae.held_by("unjustified")
+
+
+def _two_hours_near_not_before(env):
+    """An erase asked, then eve's rows in two hours sealed hours before the request is due, then sealing on to half an
+    hour after it is due (both seals inside the six hours of the late window then). Returns (the request, the rows,
+    the hours)."""
+    _put(env, T0 - timedelta(hours=30), username="alice")
+    env.run_until_sealed()
+    asked = env.ask("eve")
+    not_before = fmt.parse_time_text(env.view().requests[asked["request_seq"]]["not_before"])
+    while env.clock() < not_before - timedelta(hours=4):
+        env.clock.advance(hours=1)
+        env.seal()
+    rows, hours = [], []
+    for _ in range(2):
+        rows.append(_put(env, env.clock() - timedelta(minutes=10)))
+        hours.append(ai.hour_floor(env.clock() - timedelta(minutes=10)))
+        env.clock.advance(hours=1)
+        env.seal()
+    while env.clock() < not_before + timedelta(minutes=30):
+        env.clock.advance(hours=1)
+        env.seal()
+    for hour in hours:
+        entry = env.view().entry_for(hour)
+        assert entry is not None and env.clock() - entry.root.sealed_at < ai.LATE_WINDOW
+    assert hours[1] == hours[0] + timedelta(hours=1)
+    return asked, rows, hours
+
+
+def test_a_late_row_of_the_name_in_an_hour_the_run_has_just_erased_waits_for_its_late_seal_without_a_finding(
+        hot, monkeypatch):
+    """A row of the name that arrives late in an hour the run changed earlier in the same pass (inside the six hours
+    in which the sealer seals it late) is a new row of that hour, not the unit again: the run meets the hour's own
+    check, waits for the late seal with no finding, and once it is sealed erases the row and completes."""
+    env = hot
+    asked, rows, hours = _two_hours_near_not_before(env)
+    real, erased, late = ae.step, [], []
+
+    def step(p, w, seq, findings, tried, cache=None):
+        if erased and not late:
+            late.append(_put(env, hours[0] + timedelta(minutes=50)))      # arrives late, in the hour just erased
+        out = real(p, w, seq, findings, tried, cache)
+        if out[0] == ae.ERASED and out[2] is None:
+            erased.append(out)
+        return out
+    monkeypatch.setattr(ae, "step", step)
+    env.erase_job()
+    monkeypatch.setattr(ae, "step", real)
+    assert len(erased) == 1 and len(late) == 1
+    assert [_row(env, i).username for i in rows + late] == [asked["placeholder"], "eve", "eve"]
+    assert _recorded_failures(env) == []
+    row = env.request_row(asked["id"])
+    assert row.status == pe.RUNNING and "the sealer seals them first" in (row.waiting or "")
+    env.clock.advance(minutes=10)
+    env.seal()
+    assert [s.detail["by"] for s in env.seals() if s.kind == "late"] == ["sealer"]
+    env.erase_job()
+    assert {_row(env, i).username for i in rows + late} == {asked["placeholder"]}
+    assert env.request_row(asked["id"]).status == pe.COMPLETED
+    assert _recorded_failures(env) == [] and failures(env.verify()) == []
 
 
 def test_an_invitation_exactly_at_its_expiry_no_longer_holds_the_name(hot):

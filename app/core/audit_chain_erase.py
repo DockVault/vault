@@ -618,6 +618,9 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
     else:
         kind, unit = units[0]
         if (kind, unit) in tried:
+            # A unit tried in this pass that changed nothing and still holds the name: the scan and the unit disagree,
+            # and trying it again would never end. (A unit that changed rows is no longer listed as tried: rows of the
+            # name that reach it later in the pass are met by the unit's own checks.)
             findings["unjustified"] = (f"the erase of request seal {seq} found nothing to change where it found the "
                                        f"name ({unit}); it waits")
             return STOP, 0, None, held_by("unjustified")
@@ -641,6 +644,10 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
             st.erase_scans.pop((seq, unit), None)
             return SCANNED, 0, None, None
         _progress(row, through, now, changed)
+        # Rows of the name that reach this unit later in the pass (one that arrived late in a sealed hour, say) are
+        # new rows, not this unit again: they meet the unit's own checks (a wait for the late seal, or a finding),
+        # never the loop guard above.
+        tried.discard((kind, unit))
         if kind == "hour" and unit in cache.get("hours", []):
             cache["hours"].remove(unit)
         if not final:
