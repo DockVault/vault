@@ -758,18 +758,19 @@ def test_a_waiting_erase_does_not_hold_a_removal_back(env):
 
 
 def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env, monkeypatch):
-    """A day archived in a later release's block format (a rollback): a removal cannot complete in this release; it
-    waits there with no finding, and its row (which its card shows) says why it waits."""
+    """A day archived in a later release's block format after the removal was asked for (a rollback): the removal
+    cannot complete in this release; it waits there with no finding, and its row (which its card shows) says why it
+    waits."""
     from app.core import audit_archive_format as af
     hot = env.put(T0 - timedelta(hours=30))
     env.put(_at(3, 5))
     env.run_until_sealed()
+    asked = env.ask_removal()
     monkeypatch.setattr(af, "FORMAT", 2)
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
     monkeypatch.setattr(af, "FORMAT", 1)
     seen = {}
     monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
-    asked = env.ask_removal()
     env.week()
     env.passes(24)
     row = env.removal_row(asked["id"])
@@ -778,6 +779,31 @@ def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env
                            "this release does not change, so this release cannot complete it.")
     assert env.get(hot).ip_address == "203.0.113.9"
     assert vr.entry_of(row, env.st.view)["waiting"] == row.waiting
+
+
+def test_the_preview_names_a_day_a_later_release_archived_and_no_removal_is_asked_for_over_it(env, monkeypatch):
+    """A day archived in a later release's block format before a removal is asked for: the preview names it, and a
+    removal reaching it is refused, since it could not complete here, could not be cancelled once begun, and would
+    hold every new removal back. Nothing is written; days before the scope's end only count."""
+    from app.core import audit_archive_format as af
+    from app.core.models import AuditSeal
+    env.put(T0 - timedelta(hours=30))
+    env.put(_at(3, 5))
+    env.run_until_sealed()
+    with env.session() as db:
+        assert vr.preview(db, env.st, env.clock())["later_format_days"] == []
+    monkeypatch.setattr(af, "FORMAT", 2)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(af, "FORMAT", 1)
+    with env.session() as db:
+        assert vr.preview(db, env.st, env.clock())["later_format_days"] == [DAY.isoformat()]
+        assert vr.later_format_days(db, env.st.view, arc.day_start(DAY)) == []          # a scope ending before it
+        seals = db.query(AuditSeal).count()
+    with pytest.raises(vr.Refused, match=f"The archived days {DAY.isoformat()} hold blocks of a later release"):
+        env.ask_removal()
+    with env.session() as db:
+        assert db.query(AuditSeal).count() == seals and db.query(AuditValueRemoval).count() == 0
+    assert _audit(env, vr.REQUESTED_ACTION) == []
 
 
 # --------------------------------------------------------------------------- rows of an earlier release, other writers

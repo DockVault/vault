@@ -356,6 +356,34 @@ print(json.dumps(out, default=str))
 '''
 
 
+# A day archived in a later release's block format, then a removal asked for over it, and one whose scope ends
+# before it.
+LATER = PREAMBLE + HELPERS + r'''
+from app.core import audit_archive_format as af
+from app.core.models import AuditSeal
+add_row(at(3, 5))
+add_row(now - timedelta(hours=30))
+out["stopped"] = passes()
+af.FORMAT = 2
+arc.archive_job(retention.Pass(SessionLocal, now=clock[0]))
+af.FORMAT = 1
+with SessionLocal() as db:
+    out["formats"] = sorted({int(b.format) for b in db.query(AuditArchiveBlock).all()})
+    out["before_day"] = vr.later_format_days(db, st.view, arc.day_start(DAY))
+    out["seals_before"] = db.query(func.count()).select_from(AuditSeal).scalar()
+try:
+    lower_and_ask()
+    out["asked"] = True
+except vr.Refused as exc:
+    out["asked"], out["refused"] = False, str(exc)
+with SessionLocal() as db:
+    out["seals_after"] = db.query(func.count()).select_from(AuditSeal).scalar()
+    out["rows"] = db.query(func.count()).select_from(AuditValueRemoval).scalar()
+out["day"] = DAY.isoformat()
+print(json.dumps(out, default=str))
+'''
+
+
 @pytest.fixture
 def throwaway():
     yield from throwaway_database()
@@ -411,3 +439,11 @@ def test_a_removal_over_a_day_archived_in_part_on_postgres_reaches_every_row_of_
         assert out["after_one_step"] == [[None, None]] * 3 + [["203.0.113.5", "Mozilla/5.0 test"]] * 3, out
         assert out["late_as_rows_then"] == 0 and out["counts"] == {"rows": 0, "archived_rows": 6}, out
     assert out["failures"] == [], out
+
+
+def test_a_day_a_later_release_archived_is_named_by_the_preview_and_no_removal_is_asked_for_over_it(throwaway):
+    out = run_in(throwaway, LATER, env={"AUDIT_ARCHIVE_START_AFTER_DAYS": "0", "SCENARIO": "later"})
+    assert out["stopped"] is None and out["formats"] == [2], out
+    assert out["day"] in out["preview"]["later_format_days"] and out["before_day"] == [], out
+    assert out["asked"] is False and out["refused"].startswith(f"The archived days {out['day']} hold blocks"), out
+    assert out["seals_after"] == out["seals_before"] and out["rows"] == 0, out

@@ -142,6 +142,27 @@ def count_changes(db, view, levels: Dict[str, str], before: datetime, ctx: "rw.C
     return out
 
 
+def later_format_days(db, view, before: datetime) -> List[str]:
+    """The archived days a removal before ``before`` would reach whose blocks the database marks with a later
+    release's block format (after a rollback from a release that writes one): this release neither checks nor
+    changes such a day, so a removal reaching one could not complete here. Their row says so; the run checks the
+    block itself (audit_rewrite.step)."""
+    from app.core import audit_archive as arc
+    from app.core import audit_archive_format as af
+    from app.core.models import AuditArchiveBlock as B
+    days = [d for d, e in view.archives.items() if e.parts and arc.day_start(d) < before]
+    if not days:
+        return []
+    found = db.query(B.day).filter(B.day.in_(days), B.format > af.FORMAT).distinct().all()
+    return sorted({(d if not isinstance(d, datetime) else d.date()).isoformat() for (d,) in found})
+
+
+def _later_format_words(days: List[str]) -> str:
+    return (f"The archived days {', '.join(days)} hold blocks of a later release's block format, which this release "
+            "neither checks nor changes, so a removal reaching them could not complete here. Ask for it with the "
+            "release that wrote them.")
+
+
 def preview(db, st, now: datetime) -> dict:
     """What a removal asked for now would change, and what it leaves."""
     from sqlalchemy import func
@@ -176,6 +197,7 @@ def preview(db, st, now: datetime) -> dict:
         "counted": counted["counted"],
         "before": fmt.time_text(before),
         "archived_days": sum(1 for d, e in view.archives.items() if e.parts and arc.day_start(d) < before),
+        "later_format_days": later_format_days(db, view, before),
         "undated_rows": undated,
         "delay_days": delay_days(view, st),
         "waiting": waiting(view) is not None,
@@ -221,6 +243,10 @@ def request(w, actor, *, now: Optional[datetime] = None, expected: Optional[Dict
                       "lower level first.")
     if waiting(view) is not None:
         raise Refused("A removal is already waiting or running: cancel it first, or let it complete.")
+    later = later_format_days(db, view, scope_end(now))
+    if later:
+        # Once begun, a removal cannot be cancelled, and one that waits for good holds every new removal back.
+        raise Refused(_later_format_words(later))
     request_id = uuid.uuid4()
     delay = timedelta(days=delay_days(view, st))
     audit = AuditLogger(db).build_row(
@@ -573,7 +599,7 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
         row = row_of(db, view, seq)
     except InputProblem as exc:
         findings["unjustified-input"] = str(exc)
-        return STOP, 0, cursor, None, None
+        return STOP, 0, cursor, None, held_by("unjustified-input")
     if row is None:
         if seq not in view.rewrite_through and ps._veto_allowed_today(view, now):
             w.append("cancel", detail={"cancels": seq, "request": d.get("request"), "audit_row": None,
@@ -582,13 +608,14 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
         if seq in view.rewrite_through:
             findings["unjustified-input"] = (f"the removal of request seal {seq} has begun, and its row no longer "
                                              "shows it running; it waits")
+            return STOP, 0, cursor, None, held_by("unjustified-input")
         return STOP, 0, cursor, None, None
     why = pe.rule_waits(db, now)
     if why:
         return WAIT, 0, cursor, None, f"It waits: {why}."
     chain = ar.chain_numbers()
     if chain is None:
-        return STOP, 0, cursor, None, held_by("unjustified-input")
+        return STOP, 0, cursor, None, None
     if chain[2]:
         return WAIT, 0, cursor, None, "It waits while the hold switch is on."
     levels, before = rw.removal_scope(d)
@@ -601,6 +628,8 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
         outcome, cursor, changed, _oldest, _newest, unit = rw.step(p, w, scope, cursor)
     except rw.NotRewritten as nr:
         if nr.kind:
+            # A unit that does not check out (rows dated before the chain's first hour among them): reported, and the
+            # removal waits there, since it must reach every row it covers.
             findings[nr.kind] = f"{nr}; the removal of request seal {seq} waits"
             return STOP, 0, cursor, None, held_by(nr.kind)
         if nr.later_format:
@@ -608,7 +637,6 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
         return WAIT, 0, cursor, None, f"It waits: {nr}."
     if outcome == rw.CHANGED:
         _progress(row, now, changed, unit)
-            return STOP, 0, cursor, None, held_by("unjustified-input")
         return REWRITTEN, changed, cursor, None, None
     if outcome == rw.CLEAN:
         return SCANNED, 0, cursor, None, None
@@ -616,6 +644,13 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     w.append("rewrite", detail=scope.detail(newest[0], [], final=True))
     _progress(row, now, 0, None)
     return REWRITTEN, 0, cursor, finish(w, row, seq, d, now), None
+
+
+def held_by(kind: str) -> str:
+    """What the request says while a finding of the audit log's check holds it: a reason given before the finding
+    would no longer be true."""
+    return (f"It is held: the audit log's check found a fault ({kind}) where it would change rows, and it waits "
+            "until that is resolved.")
 
 
 def _note_waiting(session_factory, request_id, why: Optional[str]) -> None:
@@ -628,8 +663,6 @@ def _note_waiting(session_factory, request_id, why: Optional[str]) -> None:
             row.waiting = why[:255] if why else None
             db.commit()
     except Exception:  # noqa: BLE001 -- the next pass says it again
-            # A unit that does not check out (rows dated before the chain's first hour among them): reported, and the
-            # removal waits there, since it must reach every row it covers.
         db.rollback()
     finally:
         db.close()
@@ -646,13 +679,6 @@ def run_job(p):
         return result
     engine = ai._engine_of(p.session_factory)
     findings: Dict[str, str] = {}
-def held_by(kind: str) -> str:
-    """What the request says while a finding of the audit log's check holds it: a reason given before the finding
-    would no longer be true."""
-    return (f"It is held: the audit log's check found a fault ({kind}) where it would change rows, and it waits "
-            "until that is resolved.")
-
-
     finished = []
     for seq in sorted(set(due(st.view, st.known_record(), p.now)) | set(vetoed(st, p.session_factory))):
         while p.time_left():

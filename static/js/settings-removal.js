@@ -55,7 +55,8 @@
         box.replaceChildren();
         const p = S.preview;
         const lowered = p ? (p.kinds || []) : [];
-        if (ask) ask.disabled = S.busy || !p || !lowered.length || Boolean(p.waiting);
+        const later = p ? (p.later_format_days || []) : [];
+        if (ask) ask.disabled = S.busy || !p || !lowered.length || Boolean(p.waiting) || later.length > 0;
         if (!p) return;
         if (!lowered.length) {
             box.appendChild(el('p', 'text-secondary', 'Every kind of personal data is recorded in full, so there is ' +
@@ -65,6 +66,11 @@
         if (p.waiting) {
             box.appendChild(el('p', 'alert alert-warning', 'A removal is already waiting or running: cancel it below, ' +
                 'or let it complete, before asking for another.'));
+        }
+        if (later.length) {
+            box.appendChild(el('p', 'alert alert-warning removal-later-format', `The archived days ${later.join(', ')} ` +
+                `hold blocks of a later release's block format, which this release neither checks nor changes, so a ` +
+                'removal reaching them could not complete here. Ask for it with the release that wrote them.'));
         }
         box.appendChild(el('p', null, `If it ran now, the audit rows written before ${when(p.before)} would keep only ` +
             'what the levels in force record:'));
@@ -153,7 +159,7 @@
 
     async function ask() {
         const p = S.preview;
-        if (S.busy || !p || !(p.kinds || []).length || p.waiting) return;
+        if (S.busy || !p || !(p.kinds || []).length || p.waiting || (p.later_format_days || []).length) return;
         let what = p.rows == null ? 'the audit rows' : (p.counted ? plural(p.rows, 'audit row', 'audit rows')
             : `at least ${plural(p.rows, 'audit row', 'audit rows')}`);
         if (p.archived_days) what += ` and the rows of ${plural(p.archived_days, 'archived day', 'archived days')}`;

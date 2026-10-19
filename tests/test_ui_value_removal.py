@@ -5,8 +5,8 @@ At full the preview says there is nothing to remove and asking stays off. With a
 kind below full with the rows above it; asking shows a confirmation that needs "remove" typed (dismissed, nothing is
 sent), then the password; the removal is listed waiting, with its levels and when it runs, and any administrator
 cancels it. A preview that ran out of time says "at least", and one that could not count says so. The confirmation
-counts the archived days too; a removal that waits says why on its card; a level changed since the preview is
-refused, and the preview is made again. The page says how long addresses stay in full when that is set. The card
+counts the archived days too; a preview naming days a later release archived keeps asking off; a removal that
+waits says why on its card; a level changed since the preview is refused, and the preview is made again. The page says how long addresses stay in full when that is set. The card
 fits a phone. No console error.
 """
 import re
@@ -158,6 +158,27 @@ def test_the_confirmation_counts_the_archived_days_too(page: Page, admin_creds, 
     expect(page.locator("#confirm-modal")).to_contain_text("Remove from 3 audit rows and the rows of 2 archived days "
                                                            "written before")
     page.click("#confirm-modal-cancel-btn")
+
+
+def test_a_preview_that_names_a_day_a_later_release_archived_keeps_asking_off(page: Page, admin_creds,
+                                                                                levels_restored):
+    """A preview naming archived days of a later release's block format says a removal reaching them could not
+    complete here, and asking stays off (the server refuses one too)."""
+    store(dict(FULL, ip="shortened"))
+
+    def answer(route):
+        response = route.fetch()
+        data = response.json()
+        data.update({"rows": 3, "counted": True, "waiting": False, "later_format_days": ["2026-01-02", "2026-01-03"]})
+        route.fulfill(response=response, json=data)
+    page.route("**/settings/value-removals/preview", answer)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open(page)
+    page.click("#removal-preview-btn")
+    expect(page.locator("#removal-preview .removal-later-format")).to_contain_text(
+        "The archived days 2026-01-02, 2026-01-03 hold blocks of a later release's block format", timeout=15000)
+    expect(page.locator("#removal-preview .removal-total")).to_have_text(re.compile(r"^3 rows in all"))
+    expect(page.locator("#removal-ask")).to_be_disabled()
 
 
 def test_a_removal_that_waits_says_why_on_its_card(page: Page, admin_creds):
