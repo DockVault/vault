@@ -68,6 +68,12 @@ class _Disk:
 
 @pytest.fixture
 def disk(monkeypatch):
+    # The process's runtime set-up runs once, at the first use of a key or a setting (here an upload's
+    # codec), and makes the storage and host-key directories, each new one synced into its parent. It
+    # runs here, before the recorder is installed, so those syncs are never taken for a test's own: in a
+    # fresh checkout, where the directories are not there yet, the test that set it up counted them.
+    from app.core.config import initialize_runtime
+    initialize_runtime(interactive=False)
     return _Disk(monkeypatch)
 
 
