@@ -629,8 +629,13 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     except rw.NotRewritten as nr:
         if nr.kind:
             # A unit that does not check out (rows dated before the chain's first hour among them): reported, and the
-            # removal waits there, since it must reach every row it covers.
-            findings[nr.kind] = f"{nr}; the removal of request seal {seq} waits"
+            # removal waits there, since it must reach every row it covers. Rows before the first hour hold it until
+            # they are gone: the next pass finds them again, acknowledged or not.
+            until = ""
+            if nr.kind == "row-before-genesis":
+                until = (f" until {'the row is' if nr.rows == 1 else 'those rows are'} removed from audit_logs (an "
+                         "acknowledgment of this finding does not release it)")
+            findings[nr.kind] = f"{nr}; the removal of request seal {seq} waits{until}"
             return STOP, 0, cursor, None, held_by(nr.kind)
         if nr.later_format:
             return WAIT, 0, cursor, None, f"It waits: {nr}, so this release cannot complete it."

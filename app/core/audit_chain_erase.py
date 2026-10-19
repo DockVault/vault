@@ -38,6 +38,8 @@ recorded, counts and exception types, and nothing whose value holds the name; th
 The seal lists [id, c_prev, c_next] of each row, and the hour's roots, which do not change, prove that nothing
 else did. Rows with no time are not reached (no hour holds them). Rows of the name dated before the chain's first
 hour, which no seal covers, are reported (row-before-genesis) and the erase waits: it must not complete without them.
+It looks for them before its first unit and again before its last, and waits until they are gone from audit_logs;
+an acknowledgment of the finding does not release it, since the next pass finds the rows again.
 
 The last unit's transaction carries ``final: true``: it also gives the placeholder to every other store
 (person_erase.STORES), deletes the sealed name, marks the row completed with its counts, and writes the
@@ -54,7 +56,7 @@ import json
 import re
 import sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from app.core import audit_chain_format as fmt
 from app.core import person_erase as pe
@@ -243,20 +245,24 @@ def hot_hours(db, view, name: str, scope_end: datetime, fp: Optional[str] = None
     return sorted(out)
 
 
-def before_first(db, view, name: str, fp: Optional[str] = None) -> Optional[datetime]:
-    """The chain's first hour when rows of ``name`` are dated before it, else None. No seal covers such rows (verify:
-    row-before-genesis), so none can bind an erase of them: hot_hours leaves them out, and the erase must not complete
-    without them."""
+def before_first(db, view, name: str, fp: Optional[str] = None) -> Optional[Tuple[datetime, int]]:
+    """(the chain's first hour, how many rows of ``name`` are dated before it) when there are any, else None. No seal
+    covers such rows (verify: row-before-genesis), so none can bind an erase of them: hot_hours leaves them out, and
+    the erase must not complete without them."""
     first = view.first_hour()
-    if first is None or not _hot_rows(db, name, fp, first):
+    if first is None:
         return None
-    return first
+    n = len(_hot_rows(db, name, fp, first))
+    return (first, n) if n else None
 
 
-def _held_before_first(findings: Dict[str, str], seq: int, first: datetime) -> str:
-    findings["row-before-genesis"] = (f"rows of audit_logs that hold the name are dated before the chain's first hour, "
-                                      f"{fmt.hour_text(first)}, which no seal covers; the erase of request seal {seq} "
-                                      "waits")
+def _held_before_first(findings: Dict[str, str], seq: int, found: Tuple[datetime, int]) -> str:
+    first, n = found
+    findings["row-before-genesis"] = (
+        f"audit_logs holds {n} row{'' if n == 1 else 's'} of the name dated before the chain's first hour, "
+        f"{fmt.hour_text(first)}, which no seal covers; the erase of request seal {seq} waits until "
+        f"{'the row is' if n == 1 else 'those rows are'} removed from audit_logs (an acknowledgment of this finding "
+        "does not release it)")
     return held_by("row-before-genesis")
 
 

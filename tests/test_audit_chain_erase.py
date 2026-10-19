@@ -12,6 +12,9 @@ of its own (tests/_erase_env.py):
   waiting invitation that has the name, a restore not finished, and with ERASE_BLOCKED_BY_PROTECTED_MINIMUM for the
   protected minimum; a database that removes or ends its row vetoes it (a cancel seal by the database), and one that
   changes its name, its token or its placeholder copy gets nothing erased (unjustified-input);
+- rows of the name dated before the chain's first hour (by its username or its sign-in fingerprint, in the hour just
+  before it too, or dated there during a run) hold it with a finding (row-before-genesis) until they are removed:
+  an acknowledgment does not release it, and the finding says how many rows hold it;
 - archived days: the blocks holding the name are rewritten (an erase seal per hour, then the archive seal of cause
   rewrite), verify reads the erased rows back from the blocks, and an erased hour is archived and pruned like any.
 """
@@ -519,7 +522,10 @@ def test_rows_of_the_name_dated_before_the_chains_first_hour_hold_the_erase_whic
     pre = _put(env, first - timedelta(days=3))
     asked = _due(env)
     ours = [m for k, m in seen if k == "row-before-genesis" and "the erase of request seal" in m]
-    assert ours and fmt.hour_text(first) in ours[0]
+    assert ours and ours[0] == (
+        f"audit_logs holds 1 row of the name dated before the chain's first hour, {fmt.hour_text(first)}, which no "
+        f"seal covers; the erase of request seal {asked['request_seq']} waits until the row is removed from "
+        "audit_logs (an acknowledgment of this finding does not release it)")
     row = env.request_row(asked["id"])
     assert row.status == pe.PENDING and row.waiting == ae.held_by("row-before-genesis")
     assert _rows(env, id=rid)[0].username == "eve" and _rows(env, id=pre)[0].username == "eve"
@@ -527,6 +533,100 @@ def test_rows_of_the_name_dated_before_the_chains_first_hour_hold_the_erase_whic
     assert not any(s.detail.get("request_seq") == asked["request_seq"] for s in env.erase_seals())
     out = env.cancel(asked["id"], env.admin("bea"))
     assert out["status"] == pe.CANCELLED
+
+
+def _erase_findings(env, monkeypatch):
+    """The findings the erase reports (each pass's own check reports rows before the first hour too, in its words)."""
+    seen = []
+    real = ai.report_failures
+    monkeypatch.setattr(ai, "report_failures",
+                        lambda st, f, found, *a, **k: (seen.extend(found.items()), real(st, f, found, *a, **k))[1])
+    return lambda: [m for k, m in seen if k == "row-before-genesis" and "the erase of request seal" in m]
+
+
+def test_a_sign_in_row_of_the_name_dated_before_the_chains_first_hour_holds_the_erase_too(env, monkeypatch):
+    """A failed sign-in recorded at the fingerprint level (no username, the name's fingerprint in ``recorded``) is a
+    row of the name as one with its username is: dated before the chain's first hour, it holds the erase as well."""
+    rid = _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    fp = pe.signin_fingerprint("eve", env.settings)
+    pre = _put(env, first - timedelta(days=2), username=None, recorded={"signin_name": fp}, action="login_failed",
+               status="failure")
+    ours = _erase_findings(env, monkeypatch)
+    asked = _due(env)
+    row = env.request_row(asked["id"])
+    assert row.status == pe.PENDING and row.waiting == ae.held_by("row-before-genesis")
+    assert ours() and ours()[0].startswith("audit_logs holds 1 row of the name dated before the chain's first hour")
+    assert _rows(env, id=pre)[0].recorded == {"signin_name": fp} and _rows(env, id=rid)[0].username == "eve"
+    assert not any(s.detail.get("request_seq") == asked["request_seq"] for s in env.erase_seals())
+
+
+def test_rows_of_the_name_in_the_hour_just_before_the_chains_first_hour_hold_the_erase(env, monkeypatch):
+    """The edge: the hour that ends where the chain's first hour begins is before it, and no seal covers it either."""
+    rid = _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    pre = [_put(env, first - timedelta(minutes=30)), _put(env, first - timedelta(microseconds=1))]
+    ours = _erase_findings(env, monkeypatch)
+    asked = _due(env)
+    row = env.request_row(asked["id"])
+    assert row.status == pe.PENDING and row.waiting == ae.held_by("row-before-genesis")
+    assert ours() and ours()[0].startswith(
+        f"audit_logs holds 2 rows of the name dated before the chain's first hour, {fmt.hour_text(first)},")
+    assert ours()[0].endswith("waits until those rows are removed from audit_logs (an acknowledgment of this finding "
+                              "does not release it)")
+    assert [_rows(env, id=i)[0].username for i in [rid] + pre] == ["eve"] * 3
+
+
+def test_a_row_of_the_name_dated_before_the_first_hour_during_a_run_holds_it_until_the_row_is_removed(env,
+                                                                                                      monkeypatch):
+    """A row of the name dated before the chain's first hour that arrives between two units of a run (only a database
+    writer can date one there) holds it before its last unit: the erase has begun, so it cannot be cancelled, and it
+    waits with a finding. An acknowledgment of the finding does not release it (the next pass finds the row again);
+    removing the row does, and the erase then completes with the name nowhere."""
+    from app.core import audit_chain_host as host
+    ids = [_put(env, T0 - timedelta(days=3)), _put(env, T0 - timedelta(hours=30))]
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    asked = env.ask("eve")
+    env.passes(24 * 7 - 6)
+    assert env.erase_seals() == []
+    env.clock.advance(hours=6)
+    real, added, erased = ae.step, [], []
+
+    def step(p, w, seq, findings, tried, cache=None):
+        if erased and not added:
+            added.append(_put(env, first - timedelta(days=1)))           # a database writer, between two units
+        out = real(p, w, seq, findings, tried, cache)
+        if out[0] == ae.ERASED and out[2] is None:
+            erased.append(out)
+        return out
+    monkeypatch.setattr(ae, "step", step)
+    ours = _erase_findings(env, monkeypatch)
+    ae.run_job(retention.Pass(env.session, now=env.clock()))
+    monkeypatch.setattr(ae, "step", real)
+    assert len(erased) == 1 and len(added) == 1
+    row = env.request_row(asked["id"])
+    assert row.status == pe.RUNNING and row.waiting == ae.held_by("row-before-genesis")
+    assert [_rows(env, id=i)[0].username for i in ids + added] == [asked["placeholder"], "eve", "eve"]
+    assert ours() and ours()[0].startswith("audit_logs holds 1 row of the name dated before the chain's first hour")
+    with pytest.raises(pe.Refused, match="has begun"):
+        env.cancel(asked["id"], env.admin("bea"))
+    seen = host.acknowledge(env.engine, env.st, seqs=[], failures=True, read=True)
+    host.acknowledge(env.engine, env.st, seqs=[], failures=True, expect=seen["state"])
+    assert "row-before-genesis" not in ai.open_failures(env.st.head_store().load())
+    env.passes(12)
+    assert env.request_row(asked["id"]).waiting == ae.held_by("row-before-genesis")
+    assert "row-before-genesis" in ai.open_failures(env.st.head_store().load())
+    assert _rows(env, id=ids[1])[0].username == "eve"
+    with env.session() as db:                                             # the host removes the row
+        db.query(AuditLog).filter(AuditLog.id == added[0]).delete()
+        db.commit()
+    env.passes(6)
+    assert _done(env, asked["id"])
+    assert {_rows(env, id=i)[0].username for i in ids} == {asked["placeholder"]}
+    assert failures(env.verify()) == []
 
 
 @pytest.mark.parametrize("who", ["account", "credential", "invitation"])

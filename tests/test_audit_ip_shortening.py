@@ -522,13 +522,35 @@ def test_rows_dated_before_the_chains_first_hour_are_reported_and_the_rows_after
     assert _shortened(env.get(a)) and _shortened(env.get(b))
     assert [env.get(i).ip_address for i in pre] == ["203.0.113.9", "203.0.113.9"]
     assert [k for k, _m in seen] == ["row-before-genesis"]
-    assert seen[0][1].endswith("nothing before it was rewritten; its addresses were not shortened"), seen
-    assert fmt.hour_text(first) in seen[0][1]
+    assert seen[0][1] == (f"audit_logs holds 2 rows dated before the chain's first hour, {fmt.hour_text(first)}, "
+                          "that this run must reach, and no seal covers them; nothing before it was rewritten; its "
+                          "addresses were not shortened"), seen
     rewrites = [s for s in env.seals() if s.kind == "rewrite"]
     env.passes(12)
     assert [s.seq for s in env.seals() if s.kind == "rewrite"] == [s.seq for s in rewrites]
     assert [env.get(i).ip_address for i in pre] == ["203.0.113.9", "203.0.113.9"]
     assert "row-before-genesis" in {f.kind for f in env.verify().findings}
+
+
+def test_a_row_in_the_hour_just_before_the_chains_first_hour_is_passed_over_with_a_finding(env30, monkeypatch):
+    """The edge: the hour that ends where the chain's first hour begins is before it, so no seal covers it either.
+    The shortening reports it and passes over it (it never waits there, as it would at an hour not sealed yet), and
+    shortens the rows after it; a row already shortened there is not counted as one it would change."""
+    env = env30
+    a = env.put(T0 - timedelta(days=40, minutes=5))
+    b = env.put(T0 - timedelta(days=35, minutes=5))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    pre = env.put(first - timedelta(minutes=30))
+    done = env.put(first - timedelta(minutes=20), ip_address=None, recorded={"ip": "203.0.113.0/24"})
+    seen = []
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a_, **k: seen.extend(found.items()))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(a)) and _shortened(env.get(b))
+    assert env.get(pre).ip_address == "203.0.113.9" and _shortened(env.get(done))
+    assert [k for k, _m in seen] == ["row-before-genesis"]
+    assert seen[0][1].startswith(f"audit_logs holds 1 row dated before the chain's first hour, {fmt.hour_text(first)}, "
+                                 "that this run must reach, and no seal covers it;"), seen
 
 
 def test_rows_dated_before_the_chains_first_hour_are_one_unit_however_many_hours_they_span(env30):

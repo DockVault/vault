@@ -238,6 +238,18 @@ def test_rows_dated_before_genesis_or_ahead_are_found(env):
     env.seal()
     rec = env.st.head_store().load()
     assert {"row-before-genesis", "future-dated"} <= set(rec["failures"])
+    first = env.st.view.first_hour()
+    assert rec["failures"]["row-before-genesis"]["message"] == (
+        f"1 audit row is dated before the chain's first hour, {fmt.hour_text(first)}, which no seal covers: the "
+        "shortening of addresses passes over it, and a removal of earlier values or a per-person erase that reaches "
+        "it waits until the row is removed from audit_logs (an acknowledgment of this finding does not release it)")
+    env.row(first - timedelta(minutes=1))
+    env.clock.advance(hours=1)
+    env.seal()
+    message = env.st.head_store().load()["failures"]["row-before-genesis"]["message"]
+    assert message.startswith(f"2 audit rows are dated before the chain's first hour, {fmt.hour_text(first)}, ")
+    assert ("passes over them, and a removal of earlier values or a per-person erase that reaches them waits until "
+            "those rows are removed from audit_logs") in message
 
 
 # --------------------------------------------------------------------------- late rows

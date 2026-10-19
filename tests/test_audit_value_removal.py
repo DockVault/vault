@@ -722,13 +722,16 @@ def test_a_row_put_back_into_the_last_hour_of_a_part_of_a_day_archived_in_part_i
     assert env.removal_row(asked["id"]).waiting == vr.held_by("row-in-archived-day")
 
 
-def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_be_cancelled(env, monkeypatch):
-    """Rows dated before the chain's first hour, which no seal covers (verify: row-before-genesis): the removal
-    reports them and waits there, since it must reach every row it covers, and its row says a finding holds it. It
+@pytest.mark.parametrize("before", [timedelta(days=2), timedelta(minutes=30)], ids=["days before", "the hour before"])
+def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_be_cancelled(env, monkeypatch,
+                                                                                            before):
+    """Rows dated before the chain's first hour, which no seal covers (verify: row-before-genesis), the hour just
+    before it included: the removal reports them and waits there, since it must reach every row it covers, and its
+    row says a finding holds it; the finding says how many rows hold it and that it waits until they are removed. It
     meets them before any other unit, so it has not begun: any administrator can still cancel it."""
     ids = _hot(env)
     first = env.st.view.first_hour()
-    pre = env.put(first - timedelta(days=2))
+    pre = env.put(first - before)
     asked = env.ask_removal()
     seen = []
     real = ai.report_failures
@@ -736,7 +739,11 @@ def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_
                         lambda st, f, found, *a, **k: (seen.extend(found.items()), real(st, f, found, *a, **k))[1])
     env.week()
     ours = [m for k, m in seen if k == "row-before-genesis" and "the removal of request seal" in m]
-    assert ours and fmt.hour_text(first) in ours[0]
+    seq = env.removal_row(asked["id"]).request_seq
+    assert ours and ours[0] == (
+        f"audit_logs holds 1 row dated before the chain's first hour, {fmt.hour_text(first)}, that this run must "
+        f"reach, and no seal covers it; nothing before it was rewritten; the removal of request seal {seq} waits until "
+        "the row is removed from audit_logs (an acknowledgment of this finding does not release it)")
     row = env.removal_row(asked["id"])
     assert row.status == vr.PENDING and row.waiting == vr.held_by("row-before-genesis")
     assert env.rewrite_seals() == []

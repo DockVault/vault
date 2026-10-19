@@ -7,7 +7,7 @@ Two changes rewrite rows:
   record (seal reason ``levels``, naming the removal's ``request`` seal);
 - keeping full addresses for a number of days only (``audit_ip_full_days``, AUDIT_IP_FULL_DAYS in .env; no limit by
   default): an address recorded in full is shortened to the network it is in once its row is that many days old,
-  in a day the archive holds once the whole day is (seal reason ``shorten-ip``, the pruner's
+  in a day the archive holds once the whole day is that old (seal reason ``shorten-ip``, the pruner's
   ``audit_ip_shortening`` job). Setting a number, or a smaller one, deletes
   sooner: it waits the reduction delay like any such change (app/core/setting_changes.py).
 
@@ -45,10 +45,11 @@ One transaction per unit, under the chain lock:
 
 The units go oldest first. Rows dated before the chain's first hour, which no seal covers, are one unit that does
 not check out (row-before-genesis). The shortening reports a unit that does not check out and passes over it; a
-removal reports it and waits there, since it must reach every row it covers. The shortening takes an archived day
-once the whole day is past its cutoff (the day's blocks are written once, not once an hour), and passes over a day
-archived in a later release's block format, which this release neither checks nor changes; a removal waits at such
-a day (it cannot complete in this release).
+removal reports it and waits there, since it must reach every row it covers: rows before the first hour hold it
+until they are gone from audit_logs (an acknowledgment of the finding does not release it, since the next pass finds
+the rows again). The shortening takes an archived day once the whole day is past its cutoff (the day's blocks are
+written once, not once an hour), and passes over a day archived in a later release's block format, which this
+release neither checks nor changes; a removal waits at such a day (it cannot complete in this release).
 
 Nothing is rewritten while the hold switch is on (the jobs are held), while a restore is not finished or its grace
 runs, or while a rule another part of the app registers holds deletions back (person_erase.register_wait: legal
@@ -61,7 +62,7 @@ import json
 import re
 import secrets
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.core import audit_chain_format as fmt
 from app.core import settings_registry as registry
@@ -330,13 +331,14 @@ def prefilter(model, levels: Mapping[str, str]) -> list:
 class NotRewritten(Exception):
     """A unit that cannot be rewritten now: ``kind`` is a finding (reported), or None (it waits). ``later_format``:
     an archived day of a later release's block format, which this release never changes (not a finding). ``until``
-    is the end of the unit (step() sets it)."""
+    is the end of the unit (step() sets it); ``rows``, for rows before the chain's first hour, how many hold it."""
 
     def __init__(self, message: str, kind: Optional[str] = None, *, later_format: bool = False):
         super().__init__(message)
         self.kind = kind
         self.later_format = later_format
         self.until: Optional[datetime] = None
+        self.rows: Optional[int] = None
 
 
 def _write_row(db, row_id, new: dict, nonce: bytes) -> None:
@@ -370,10 +372,10 @@ def _took(r: Mapping, want: dict, nonce: bytes) -> bool:
 
 
 def rewrite_hour(w, hour: datetime, change: Callable[[dict], Optional[dict]], *, now: datetime,
-                 before: datetime) -> Tuple[int, Optional[list]]:
+                 before: datetime, conditions: Sequence = ()) -> Tuple[int, Optional[list]]:
     """Rewrite the rows of the sealed ``hour`` (those before ``before``) that ``change`` changes, in ``w``'s
-    transaction: (rows changed, the hour's entry for the rewrite seal), or (0, None) when none changes. Raises
-    NotRewritten."""
+    transaction: (rows changed, the hour's entry for the rewrite seal), or (0, None) when none changes. ``conditions``
+    are the run's (they count the rows before the chain's first hour that hold it). Raises NotRewritten."""
     from sqlalchemy import func
     from app.core import audit_chain_prune as prune_mod
     from app.core.models import AuditLog as A
@@ -389,9 +391,12 @@ def rewrite_hour(w, hour: datetime, change: Callable[[dict], Optional[dict]], *,
         if first is not None and hour < first:
             # Rows dated before the chain began: no seal covers them, so none can bind a rewrite of them (verify
             # reports them, row-before-genesis). They are one unit, up to the chain's first hour.
-            nr = NotRewritten(f"rows of audit_logs are dated before the chain's first hour, {fmt.hour_text(first)}, "
-                              "which no seal covers; nothing before it was rewritten", "row-before-genesis")
-            nr.until = first
+            n = int(db.query(func.count()).select_from(A).filter(
+                *conditions, A.timestamp < first, A.timestamp < before).scalar() or 0)
+            nr = NotRewritten(f"audit_logs holds {n} row{'' if n == 1 else 's'} dated before the chain's first hour, "
+                              f"{fmt.hour_text(first)}, that this run must reach, and no seal covers "
+                              f"{'it' if n == 1 else 'them'}; nothing before it was rewritten", "row-before-genesis")
+            nr.until, nr.rows = first, n
             raise nr
         raise NotRewritten(f"{fmt.hour_text(hour)} is not sealed yet")
     root_entry = entry.root
@@ -589,7 +594,8 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
             # Each hour in a savepoint: an hour that cannot be rewritten leaves nothing behind, and the hours before
             # it are sealed now; it is met again, first, by the next transaction.
             with w.db.begin_nested():
-                n, entry = rewrite_hour(w, hour, scope.change, now=p.now, before=scope.before)
+                n, entry = rewrite_hour(w, hour, scope.change, now=p.now, before=scope.before,
+                                        conditions=scope.conditions)
         except NotRewritten as nr:
             if entries:
                 break

@@ -1766,6 +1766,17 @@ def write_key_move(w: ChainWriter) -> Seal:
 
 # --------------------------------------------------------------------------- the checks every pass runs
 
+def before_first_words(n: int, first: datetime) -> str:
+    """The finding for ``n`` audit rows dated before the chain's first hour: what they hold back, and that only their
+    removal releases it (each pass counts them again, so an acknowledgment does not)."""
+    one = n == 1
+    return (f"{n} audit row{'' if one else 's'} {'is' if one else 'are'} dated before the chain's first hour, "
+            f"{fmt.hour_text(first)}, which no seal covers: the shortening of addresses passes over "
+            f"{'it' if one else 'them'}, and a removal of earlier values or a per-person erase that reaches "
+            f"{'it' if one else 'them'} waits until {'the row is' if one else 'those rows are'} removed from "
+            "audit_logs (an acknowledgment of this finding does not release it)")
+
+
 def every_pass_checks(session_factory, st: ChainState, now: datetime) -> Dict[str, str]:
     """future-dated rows, rows before the chain's first hour, undated rows, and hooks on the audit tables."""
     from app.core.models import AuditLog as A
@@ -1779,7 +1790,7 @@ def every_pass_checks(session_factory, st: ChainState, now: datetime) -> Dict[st
         if first is not None:
             before = db.query(func.count()).select_from(A).filter(A.timestamp < first).scalar() or 0
             if before:
-                found["row-before-genesis"] = f"{before} audit rows are dated before the chain's first hour"
+                found["row-before-genesis"] = before_first_words(int(before), first)
             undated = db.query(func.count()).select_from(A).filter(A.timestamp.is_(None)).scalar() or 0
             if undated != int((st.view.genesis or {}).get("undated_rows") or 0):
                 found["undated-row"] = f"{undated} audit rows have no timestamp"
