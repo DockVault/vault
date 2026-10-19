@@ -2,11 +2,11 @@
 on real Postgres: on a throwaway database of the stack's server, with the app's schema, each query finds rows only
 once rows it is about are seeded, and counts exactly those. The seeded rows sit on each side of every threshold
 and each branch alone: audit rows of the days archiving moves when it starts and of the days just after; old
-security alerts with a name and an address, a name only, an address only or neither, and one just inside 30
-days; invitations ended by acceptance, revocation or expiry 31 days ago and 29 days ago, and a pending one; reset
-links, codes and email-change codes used 31 days ago before an expiry still ahead, or expired, beside ones that
-ended 29 days ago and live ones; an archived day and a value set in the panel. test_release_conditions.py checks
-the queries offline.
+security alerts with a name and an address, a name only, an address only or neither, one a day past 30 days
+and one just inside them; invitations ended by acceptance, revocation or expiry 31 days ago and 29 days ago, and
+a pending one; reset links, codes and email-change codes used 31 days ago before an expiry still ahead, or
+expired, beside ones that ended 29 days ago and live ones; an archived day and a value set in the panel.
+test_release_conditions.py checks the queries offline.
 """
 import json
 
@@ -45,7 +45,8 @@ def alert(days, username, ip_address):
     db.add(SecurityAlert(id=uuid.uuid4(), event_type="failed_login", severity="warning", message="m",
                          timestamp=ago(days), username=username, ip_address=ip_address, resolved=False, details={}))
 for days, username, ip_address in ((40, "someone", "203.0.113.9"), (40, "someone", None), (40, None, "203.0.113.9"),
-                                   (40, None, None), (29, "someone", "203.0.113.9"), (5, "someone", "203.0.113.9")):
+                                   (40, None, None), (31, "someone", None), (29, "someone", "203.0.113.9"),
+                                   (5, "someone", "203.0.113.9")):
     alert(days, username, ip_address)
 ahead = now + timedelta(days=1)
 for i, (expires, accepted, revoked) in enumerate((
@@ -99,9 +100,10 @@ def test_each_detect_query_finds_what_was_seeded_and_only_that(throwaway):
     assert _int(after[q], "rows_to_archive") - _int(before[q], "rows_to_archive") == 3
     q = "audit-retention-runs-on-a-timer"
     assert _int(after[q], "audit_rows") - _int(before[q], "audit_rows") == 6 and after[q][0]["oldest"]
-    # Older than 30 days with a name and an address, a name only, or an address only.
+    # Older than 30 days with a name and an address, a name only, or an address only, 40 days old and one 31 days
+    # old (a day past the threshold); none 29 days old.
     q = "alert-names-and-addresses-cleared-after-30-days"
-    assert before[q] == [] and _int(after[q], "alerts") == 3
+    assert before[q] == [] and _int(after[q], "alerts") == 4
     # Each table's rows that ended 31 days ago, each way it can end; none of 29 days, none live.
     q = "ended-invitations-and-codes-deleted-after-30-days"
     assert before[q] == []
