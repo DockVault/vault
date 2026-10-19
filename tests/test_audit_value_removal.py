@@ -781,23 +781,26 @@ def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env
     assert vr.entry_of(row, env.st.view)["waiting"] == row.waiting
 
 
-def test_the_preview_names_a_day_a_later_release_archived_and_no_removal_is_asked_for_over_it(env, monkeypatch):
-    """A day archived in a later release's block format before a removal is asked for: the preview names it, and a
-    removal reaching it is refused, since it could not complete here, could not be cancelled once begun, and would
-    hold every new removal back. Nothing is written; days before the scope's end only count."""
-    from app.core import audit_archive_format as af
+def test_the_preview_names_a_day_a_later_release_archived_and_no_removal_is_asked_for_over_it(env):
+    """Two archived days, the older one's blocks marked as a later release writes them (a rollback): the preview names
+    that day only, and a removal reaching it is refused, since it could not complete here, could not be cancelled
+    once begun, and would hold every new removal back. Nothing is written. A scope that ends before the day does
+    not count it."""
     from app.core.models import AuditSeal
-    env.put(T0 - timedelta(hours=30))
     env.put(_at(3, 5))
+    env.put(_at(3, 5) + timedelta(days=1))
     env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    later_day = DAY + timedelta(days=1)
+    assert {DAY, later_day} <= set(env.st.view.archives)
     with env.session() as db:
         assert vr.preview(db, env.st, env.clock())["later_format_days"] == []
-    monkeypatch.setattr(af, "FORMAT", 2)
-    arc.archive_job(retention.Pass(env.session, now=env.clock()))
-    monkeypatch.setattr(af, "FORMAT", 1)
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == DAY).update({AuditArchiveBlock.format: 2})
+        db.commit()
     with env.session() as db:
         assert vr.preview(db, env.st, env.clock())["later_format_days"] == [DAY.isoformat()]
         assert vr.later_format_days(db, env.st.view, arc.day_start(DAY)) == []          # a scope ending before it
+        assert vr.later_format_days(db, env.st.view, arc.day_start(DAY) + timedelta(hours=1)) == [DAY.isoformat()]
         seals = db.query(AuditSeal).count()
     with pytest.raises(vr.Refused, match=f"The archived days {DAY.isoformat()} hold blocks of a later release"):
         env.ask_removal()
