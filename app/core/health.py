@@ -13,6 +13,7 @@ the breaker and off the loop).
 import os
 import uuid
 
+from app.core import durable_write
 from app.core.config import settings
 
 
@@ -70,11 +71,12 @@ def check_storage_status() -> str:
     here are a full disk and a volume that mounted read-only, and neither shows up in a
     permission check. The probe file is uniquely named and removed in a ``finally``, so two
     concurrent checks cannot collide and a mid-check crash leaves at most one stray zero-byte
-    file inside the storage root.
+    file inside the storage root. A storage root that is not there is made as every directory
+    stored files live in is, synced into its parent (see durable_write).
     """
     probe = os.path.join(settings.file_storage_path, f".health-{uuid.uuid4().hex}")
     try:
-        os.makedirs(settings.file_storage_path, exist_ok=True)
+        durable_write.make_directories(settings.file_storage_path)
         with open(probe, "wb") as fh:
             fh.write(b"")
         return "writable"

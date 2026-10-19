@@ -240,6 +240,34 @@ def test_a_start_syncs_the_storage_and_host_key_directories_it_creates(disk, tmp
     assert disk.events == [], "a directory that is there already is left as it is"
 
 
+def test_a_storage_root_the_health_check_finds_missing_is_made_as_a_start_makes_it(disk, tmp_path,
+                                                                                  monkeypatch):
+    """A start makes the storage root; one removed while the process runs is made again by the health
+    check's write test, synced into its parent like every directory stored files live in."""
+    from app.core import health
+    root = tmp_path / "data" / "storage"
+    monkeypatch.setattr(health.settings, "file_storage_path", str(root))
+    assert health.check_storage_status() == "writable"
+    assert root.is_dir() and list(root.iterdir()) == []
+    assert [(k, i) for k, i, _ in disk.events] == (
+        [("dir", _ino(p)) for p in (tmp_path, tmp_path / "data")] if DIRS else [])
+    disk.events.clear()
+    assert health.check_storage_status() == "writable"
+    assert disk.events == [], "a storage root that is there is left as it is"
+
+
+def test_the_blob_store_makes_a_missing_storage_root_as_a_start_makes_it(disk, tmp_path):
+    from app.services.encrypted_file_storage import EncryptedFileStorage
+    root = tmp_path / "data" / "storage"
+    EncryptedFileStorage(root)
+    assert root.is_dir()
+    assert [(k, i) for k, i, _ in disk.events] == (
+        [("dir", _ino(p)) for p in (tmp_path, tmp_path / "data")] if DIRS else [])
+    disk.events.clear()
+    EncryptedFileStorage(root)
+    assert disk.events == []
+
+
 # ---- the upload context: every file a vault stores is written through it --------------------------
 
 def _codecs():

@@ -20,10 +20,11 @@ class EncryptedFileStorage:
     def __init__(self, base_storage_path: Path):
         """
         Args:
-            base_storage_path: Base directory for file storage
+            base_storage_path: Base directory for file storage; made, if it is not there, as every
+                directory stored files live in is, synced into its parent (see durable_write)
         """
         self.storage_path = Path(base_storage_path)
-        self.storage_path.mkdir(parents=True, exist_ok=True)
+        durable_write.make_directories(self.storage_path)
 
     def secure_delete(self, storage_path: Path) -> None:
         """
