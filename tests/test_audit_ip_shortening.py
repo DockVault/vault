@@ -553,6 +553,26 @@ def test_a_row_in_the_hour_just_before_the_chains_first_hour_is_passed_over_with
                                  "that this run must reach, and no seal covers it;"), seen
 
 
+def test_rows_before_the_chains_first_hour_not_old_enough_yet_are_not_counted_among_those_it_must_reach(env30,
+                                                                                                         monkeypatch):
+    """A chain younger than the days addresses stay in full: of the rows dated before its first hour, the finding
+    counts only those old enough to be shortened, the rows the run must reach; the younger one is not counted."""
+    env = env30
+    env.put(T0 - timedelta(days=5, minutes=5))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    assert first > env.clock() - timedelta(days=30)
+    old = env.put(first - timedelta(days=40))
+    young = env.put(first - timedelta(days=2))
+    seen = []
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a_, **k: seen.extend(found.items()))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert [env.get(i).ip_address for i in (old, young)] == ["203.0.113.9", "203.0.113.9"]
+    assert [k for k, _m in seen] == ["row-before-genesis"]
+    assert seen[0][1].startswith(f"audit_logs holds 1 row dated before the chain's first hour, {fmt.hour_text(first)}, "
+                                 "that this run must reach, and no seal covers it;"), seen
+
+
 def test_rows_dated_before_the_chains_first_hour_are_one_unit_however_many_hours_they_span(env30):
     """However many hours they span, the rows before the chain's first hour are one unit: a pass with time for two
     transactions passes over all of them in the first and shortens the oldest day after them in the second."""

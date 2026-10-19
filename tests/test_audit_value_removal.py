@@ -196,6 +196,41 @@ def test_a_removal_that_has_begun_completes_and_cannot_be_cancelled(env):
     assert failures(env.verify()) == []
 
 
+@pytest.mark.parametrize("how", ["removed", "ended"])
+def test_a_removal_that_has_begun_is_not_vetoed_and_its_row_gone_is_a_finding(env, monkeypatch, how):
+    """Once a removal has begun, the database can no longer veto it (a begun removal completes): its row removed, or
+    no longer shown running, is reported (unjustified-input); no cancel seal is written, nothing more is rewritten,
+    and it stays pending in the chain. (Its row is gone or no longer waits, so there is no row to say it is held.)"""
+    env.put(T0 - timedelta(days=3), details={"email": "c@example.com"})      # another day: the first unit
+    ids = _hot(env)
+    asked = env.ask_removal()
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    seq = env.removal_row(asked["id"]).request_seq
+    p = retention.Pass(env.session, now=env.clock())
+    with ai.ChainWriter(env.engine, env.st) as w:
+        outcome, changed, _cursor, done, _why = vr.step(p, w, seq, {})
+    assert outcome == vr.REWRITTEN and changed == 1 and done is None
+    rewrites = len(env.rewrite_seals())
+    with env.session() as db:
+        if how == "removed":
+            db.query(AuditValueRemoval).filter(AuditValueRemoval.id == uuid.UUID(asked["id"])).delete()
+        else:
+            db.get(AuditValueRemoval, uuid.UUID(asked["id"])).status = vr.CANCELLED
+        db.commit()
+    seen = {}
+    real = ai.report_failures
+    monkeypatch.setattr(ai, "report_failures",
+                        lambda st, f, found, *a, **k: (seen.update(found), real(st, f, found, *a, **k))[1])
+    env.passes(24)
+    assert seen.get("unjustified-input") == (f"the removal of request seal {seq} has begun, and its row no longer "
+                                             "shows it running; it waits")
+    assert not [s for s in env.seals() if s.kind == "cancel" and s.detail.get("cancels") == seq]
+    assert len(env.rewrite_seals()) == rewrites and seq in env.st.view.pending_requests()
+    assert [env.get(i).ip_address for i in ids[:3]] == ["203.0.113.9"] * 3
+
+
 def test_the_database_removing_its_row_vetoes_it_and_a_changed_copy_is_not_acted_on(env):
     ids = _hot(env)
     asked = env.ask_removal()
