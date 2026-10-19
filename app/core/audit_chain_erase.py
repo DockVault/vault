@@ -36,7 +36,8 @@ credential's name, ``recorded`` and the error text (but an exception's type) are
 when it is one of the app's route templates; ``details`` keep only the keys the recording levels classify as always
 recorded, counts and exception types, and nothing whose value holds the name; the nonce becomes sixteen 00 bytes.
 The seal lists [id, c_prev, c_next] of each row, and the hour's roots, which do not change, prove that nothing
-else did. Rows with no time are not reached (no hour holds them).
+else did. Rows with no time are not reached (no hour holds them). Rows of the name dated before the chain's first
+hour, which no seal covers, are reported (row-before-genesis) and the erase waits: it must not complete without them.
 
 The last unit's transaction carries ``final: true``: it also gives the placeholder to every other store
 (person_erase.STORES), deletes the sealed name, marks the row completed with its counts, and writes the
@@ -240,6 +241,23 @@ def hot_hours(db, view, name: str, scope_end: datetime, fp: Optional[str] = None
             continue
         out.add(h)
     return sorted(out)
+
+
+def before_first(db, view, name: str, fp: Optional[str] = None) -> Optional[datetime]:
+    """The chain's first hour when rows of ``name`` are dated before it, else None. No seal covers such rows (verify:
+    row-before-genesis), so none can bind an erase of them: hot_hours leaves them out, and the erase must not complete
+    without them."""
+    first = view.first_hour()
+    if first is None or not _hot_rows(db, name, fp, first):
+        return None
+    return first
+
+
+def _held_before_first(findings: Dict[str, str], seq: int, first: datetime) -> str:
+    findings["row-before-genesis"] = (f"rows of audit_logs that hold the name are dated before the chain's first hour, "
+                                      f"{fmt.hour_text(first)}, which no seal covers; the erase of request seal {seq} "
+                                      "waits")
+    return held_by("row-before-genesis")
 
 
 def _hot_newest(db, name: str, fp: Optional[str], scope_end: datetime, protected: frozenset) -> tuple:
@@ -544,6 +562,11 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
     fp = pe.signin_fingerprint(name, st.cfg())
     through = view.erase_through.get(seq) or fmt.hour_text(view.newest_hour_end - HOUR)
     scope_end = fmt.parse_time_text(through) + HOUR
+    cache = cache if cache is not None else {}
+    if "before_first" not in cache:
+        cache["before_first"] = before_first(db, view, name, fp)
+    if cache["before_first"] is not None:
+        return STOP, 0, None, _held_before_first(findings, seq, cache["before_first"])
     # The archived days are read first, a day per transaction, nothing written.
     days = [day for day, e in sorted(view.archives.items()) if e.parts and arc.day_start(day) < scope_end]
     for day in days:
@@ -560,13 +583,15 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
                 return STOP, 0, None, held_by(nv.kind)
             return SCANNED, 0, None, None
     with_rows = [day for day in days if st.erase_scans[(seq, day)][1]]
-    cache = cache if cache is not None else {}
     hours = cache.get("hours")
     fresh = hours is None
     if fresh:
         hours = hot_hours(db, view, name, scope_end, fp)
     if len(with_rows) + len(hours) <= 1 and not fresh:
         hours = hot_hours(db, view, name, scope_end, fp)
+        cache["before_first"] = before_first(db, view, name, fp)
+        if cache["before_first"] is not None:
+            return STOP, 0, None, _held_before_first(findings, seq, cache["before_first"])
     cache["hours"] = list(hours)
     if not started and pe.protected_minimum():
         newest, newest_p = _hot_newest(db, name, fp, scope_end, ai.protected_names())

@@ -500,6 +500,35 @@ def test_a_registered_rule_defers_it_and_says_why(env):
     assert _done(env, asked["id"]) and env.request_row(asked["id"]).waiting is None
 
 
+def test_rows_of_the_name_dated_before_the_chains_first_hour_hold_the_erase_which_can_still_be_cancelled(env,
+                                                                                                         monkeypatch):
+    """A row of the name dated before the chain's first hour is in no sealed hour, so no seal can bind its erase: the
+    erase reports it (row-before-genesis) and waits, rather than complete with the name left there; its request says
+    a finding holds it. It stops before its first unit, so any administrator can still cancel it. Rows of other names
+    there do not hold it."""
+    rid = _put(env, T0 - timedelta(hours=30))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    other = _put(env, first - timedelta(days=2), username="alice")
+    seen = []
+    real = ai.report_failures
+    monkeypatch.setattr(ai, "report_failures",
+                        lambda st, f, found, *a, **k: (seen.extend(found.items()), real(st, f, found, *a, **k))[1])
+    asked = _due(env, "bob")                                # the name has no row before the first hour: it runs
+    assert _done(env, asked["id"])
+    pre = _put(env, first - timedelta(days=3))
+    asked = _due(env)
+    ours = [m for k, m in seen if k == "row-before-genesis" and "the erase of request seal" in m]
+    assert ours and fmt.hour_text(first) in ours[0]
+    row = env.request_row(asked["id"])
+    assert row.status == pe.PENDING and row.waiting == ae.held_by("row-before-genesis")
+    assert _rows(env, id=rid)[0].username == "eve" and _rows(env, id=pre)[0].username == "eve"
+    assert _rows(env, id=other)[0].username == "alice"
+    assert not any(s.detail.get("request_seq") == asked["request_seq"] for s in env.erase_seals())
+    out = env.cancel(asked["id"], env.admin("bea"))
+    assert out["status"] == pe.CANCELLED
+
+
 @pytest.mark.parametrize("who", ["account", "credential", "invitation"])
 def test_a_name_someone_took_meanwhile_waits(env, who):
     rid = _put(env, T0 - timedelta(hours=30))
