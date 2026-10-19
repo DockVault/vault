@@ -517,9 +517,9 @@ def _progress(row, through: str, now: datetime, changed: int) -> None:
 
 def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[dict] = None) -> tuple:
     """One transaction of the erase of request ``seq``: (outcome, rows changed, the notice's details when it
-    completed, the reason it waits, or what holds it when it stops on a finding). Writes nothing unless it returns ERASED (or DONE after a veto). ``cache`` keeps
-    the hours that hold the name for the rest of the pass, so the audit table is read once a pass and not once an
-    hour; the run's last unit is decided on the table as it is then."""
+    completed, the reason it waits, or what holds it when it stops on a finding). Writes nothing unless it returns
+    ERASED (or DONE after a veto). ``cache`` keeps the hours that hold the name for the rest of the pass, so the audit
+    table is read once a pass and not once an hour; the run's last unit is decided on the table as it is then."""
     from app.core import audit_archive as arc
     from app.core import audit_chain_policy_seals as ps
     from app.core import audit_retention as ar
