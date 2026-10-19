@@ -545,6 +545,26 @@ def test_rows_dated_before_the_chains_first_hour_are_one_unit_however_many_hours
     assert _shortened(env.get(a)) and not _shortened(env.get(b))
 
 
+def test_the_chains_first_hour_not_sealed_yet_is_waited_for_and_not_reported(env30, monkeypatch):
+    """The chain's first hour itself is no row before it: while the sealer has not sealed it yet (the chain has just
+    begun), the shortening waits there with no finding, and shortens it once it is sealed."""
+    env = env30
+    a = env.put(T0 - timedelta(days=40, minutes=5))
+    real = ai.seal_hour
+    monkeypatch.setattr(ai, "seal_hour", lambda *args, **kwargs: None)
+    env.seal()                                           # the genesis and its policy seal, no hour yet
+    monkeypatch.setattr(ai, "seal_hour", real)
+    assert env.st.view.first_hour() == ai.hour_floor(T0 - timedelta(days=40, minutes=5))
+    assert env.st.view.newest_hour_end is None and env.st.view.newest_policy() is not None
+    seen = []
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *args, **kwargs: seen.extend(found))
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert seen == [] and env.get(a).ip_address == "203.0.113.9"
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert _shortened(env.get(a)) and seen == []
+
+
 def test_a_day_a_later_release_archived_is_passed_over(env30, monkeypatch):
     """A day archived in a later release's block format (a rollback) is left as it is, as the audit job's prune leaves
     it, with no finding: the rows after it are shortened."""
