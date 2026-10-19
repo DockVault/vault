@@ -12,7 +12,9 @@ The levels are set back afterwards.
 
 On a throwaway database of its own (tests/_throwaway_db.py), its passes run as a script whose clock is set, on
 Postgres: a removal over rows and an archived day, and AUDIT_IP_FULL_DAYS over rows and an archived day; the rows,
-the blocks and the seals as they should be, and the chain clean afterwards.
+the blocks and the seals as they should be, and the chain clean afterwards. Rows dated before the chain's first hour
+hold a removal, and are passed over by the shortening, with a finding that counts the rows each must reach; an
+acknowledgment does not release the removal, and once the rows are removed it completes.
 """
 import json
 import time
@@ -447,3 +449,91 @@ def test_a_day_a_later_release_archived_is_named_by_the_preview_and_no_removal_i
     assert out["day"] in out["preview"]["later_format_days"] and out["before_day"] == [], out
     assert out["asked"] is False and out["refused"].startswith(f"The archived days {out['day']} hold blocks"), out
     assert out["seals_after"] == out["seals_before"] and out["rows"] == 0, out
+
+
+# Rows dated before the chain's first hour (two days before it, and two in the hour just before it, one of them with
+# no address): a removal is held there with a finding that counts the rows it must reach, which the host's
+# acknowledgment does not release, and completes once they are removed; the shortening passes over them with a
+# finding that counts the rows it must reach (not the one with no address).
+BEFORE_FIRST = PREAMBLE + HELPERS + r'''
+from app.core import audit_chain_host as host
+seen = []
+real_report = ai.report_failures
+
+
+def _report(st_, f, found, *a, **k):
+    seen.extend(sorted(found.items()))
+    return real_report(st_, f, found, *a, **k)
+
+
+ai.report_failures = _report
+
+
+def ours(words):
+    return [m for k, m in seen if k == "row-before-genesis" and words in m]
+
+
+def removal_row(rid):
+    with SessionLocal() as db:
+        r = db.get(AuditValueRemoval, uuid.UUID(rid))
+        return [r.status, r.waiting]
+
+
+rows = [add_row(ai.hour_floor(now - timedelta(days=d)) + timedelta(minutes=5)) for d in (40, 35)]
+out["stopped"] = passes()
+first = st.view.first_hour()
+out["first"] = fmt.hour_text(first)
+pre = [add_row(first - timedelta(days=2)), add_row(first - timedelta(minutes=30)),
+       add_row(first - timedelta(minutes=20), ip=None)]
+if MODE == "removal":
+    asked = lower_and_ask()
+    out["seq"] = asked["request_seq"]
+    run_days(8)
+    out["row1"] = removal_row(asked["id"])
+    out["message"] = (ours("the removal of request seal") or [None])[-1]
+    read = host.acknowledge(engine, st, seqs=[], failures=True, read=True)
+    host.acknowledge(engine, st, seqs=[], failures=True, expect=read["state"])
+    told = len(ours("the removal of request seal"))
+    run_days(1)
+    out["row2"] = removal_row(asked["id"])
+    out["told_again"] = len(ours("the removal of request seal")) > told
+    with engine.begin() as c:                                    # the host removes the rows
+        c.execute(text("DELETE FROM audit_logs WHERE timestamp < :f"), {"f": first})
+    run_days(1)
+    out["row3"] = removal_row(asked["id"])
+    out["values"] = values_of(rows)
+    out["held"] = vr.held_by("row-before-genesis")
+else:
+    run_days(1)
+    out["message"] = (ours("its addresses were not shortened") or [None])[-1]
+    out["values"] = values_of(rows + pre)
+    out["every_pass"] = ai.every_pass_checks(SessionLocal, st, clock[0]).get("row-before-genesis")
+out["failures"] = verify_failures()
+print(json.dumps(out, default=str))
+'''
+
+
+@pytest.mark.parametrize("scenario", ["removal", "shorten"])
+def test_rows_dated_before_the_chains_first_hour_are_counted_in_their_finding_on_postgres(throwaway, scenario):
+    env = {"AUDIT_ARCHIVE_START_AFTER_DAYS": "1000", "SCENARIO": scenario}
+    if scenario == "shorten":
+        env["AUDIT_IP_FULL_DAYS"] = "30"
+    out = run_in(throwaway, BEFORE_FIRST, env=env)
+    assert out["stopped"] is None, out
+    first = out["first"]
+    if scenario == "removal":
+        assert out["row1"] == ["pending", out["held"]], out
+        assert out["message"] == (
+            f"audit_logs holds 3 rows dated before the chain's first hour, {first}, that this run must reach, and no "
+            f"seal covers them; nothing before it was rewritten; the removal of request seal {out['seq']} waits until "
+            "those rows are removed from audit_logs (an acknowledgment of this finding does not release it)"), out
+        assert out["row2"] == ["pending", out["held"]] and out["told_again"], out
+        assert out["row3"][0] == "completed" and out["values"] == [[None, None]] * 2, out
+        assert out["failures"] == [], out
+    else:
+        assert out["message"] == (
+            f"audit_logs holds 2 rows dated before the chain's first hour, {first}, that this run must reach, and no "
+            "seal covers them; nothing before it was rewritten; its addresses were not shortened"), out
+        assert [v[0] for v in out["values"]] == [None, None, "203.0.113.5", "203.0.113.5", None], out
+        assert out["every_pass"].startswith(f"3 audit rows are dated before the chain's first hour, {first}, "), out
+        assert [k for k, _m in out["failures"]] == ["row-before-genesis"], out

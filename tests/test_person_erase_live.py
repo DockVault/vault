@@ -12,6 +12,8 @@ erase over rows and an archived day on Postgres, the chain clean afterwards, the
 the head record holding no salt, the tables vacuumed; and deleting an account leaves its audit rows to the
 database's ON DELETE SET NULL, the chain still clean. And once the name is put back in an erased row, the audit job
 does not prune that hour (it reports the row), while it prunes the same rows of an hour left as the erase wrote it.
+Rows of the name dated before the chain's first hour (by the name, or a failed sign-in's fingerprint of it) hold an
+erase with a finding that counts them, which an acknowledgment does not release; once they are removed it completes.
 tests/test_person_erase.py and tests/test_audit_chain_erase.py cover the rules offline.
 """
 import json
@@ -423,3 +425,136 @@ def test_the_audit_job_does_not_prune_an_hour_whose_erased_row_was_edited_on_pos
     assert out["present_after"] == {"edited": [True, True], "plain": [True, False]}
     assert plain in out["pruned_hours"] and edited not in out["pruned_hours"]
     assert "unjustified" in out["recorded"] and "unjustified" in out["failures_after"]
+
+
+# Rows of the name dated before the chain's first hour (one with the name, one of a failed sign-in recorded as the
+# name's fingerprint, both in the hour just before it) hold the erase with a finding that counts them; the host's
+# acknowledgment of the finding does not release it; removing the rows does, and the erase then completes.
+BEFORE_FIRST_SCRIPT = PREAMBLE + r'''
+from app.core import audit_chain_erase as ae, audit_chain_format as fmt, audit_chain_host as host
+from app.core import audit_chain_policy_seals as ps
+from app.core import audit_chain_verify as v, person_erase as pe
+from app.core.models import AuditLog, EraseRequest, RoleEnum, User
+out = {}
+clock = [now]
+st = ai.ChainState(clock=lambda: clock[0])
+ai.set_state(st)
+NAME = "erase-first-" + uuid.uuid4().hex[:8]
+from app.services import audit_logger as _logger
+
+
+class _AtTheClock(datetime):
+    """The audit rows the app writes itself (the acknowledgment's, a finding's) are dated by the scenario's clock."""
+    @classmethod
+    def now(cls, tz=None):
+        return clock[0].replace(tzinfo=tz) if tz is not None else clock[0]
+
+
+_logger.datetime = _AtTheClock
+seen = []
+real_report = ai.report_failures
+
+
+def _report(st_, f, found, *a, **k):
+    seen.extend(sorted(found.items()))
+    return real_report(st_, f, found, *a, **k)
+
+
+ai.report_failures = _report
+
+
+def add_row(t, username, recorded=None, action="file_uploaded"):
+    rid = uuid.uuid4()
+    with engine.begin() as c:
+        c.execute(text(
+            "INSERT INTO audit_logs (id, action, status, timestamp, username, ip_address, details, recorded, "
+            "seal_nonce, privacy_version) VALUES (:id, :a, 'success', :t, :u, '203.0.113.5', CAST(:d AS json), "
+            "CAST(:r AS jsonb), :n, 3)"),
+            {"id": rid, "a": action, "t": t, "u": username, "d": json.dumps({"vault_id": "v1", "count": 1}),
+             "r": json.dumps(recorded) if recorded is not None else None, "n": os.urandom(16)})
+    return str(rid)
+
+
+def passes():
+    r = None
+    for _ in range(400):
+        r = ai.seal_pass(SessionLocal, st=st, now=clock[0])
+        if r.stopped or not r.sealed:
+            break
+    return r.stopped if r else None
+
+
+def run_days(days):
+    end = clock[0] + timedelta(days=days)
+    while clock[0] + timedelta(hours=6) <= end:
+        clock[0] += timedelta(hours=6)
+        passes()
+        retention.run_pass(SessionLocal, engine=engine, now=clock[0])
+
+
+def request_row(rid):
+    with SessionLocal() as db:
+        r = db.get(EraseRequest, uuid.UUID(rid))
+        return [r.status, r.waiting]
+
+
+def ours():
+    return [m for k, m in seen if k == "row-before-genesis" and "the erase of request seal" in m]
+
+
+rows = [add_row(ai.hour_floor(now - timedelta(days=d)) + timedelta(minutes=5), NAME) for d in (40, 30, 20)]
+out["stopped"] = passes()
+first = st.view.first_hour()
+fp = pe.signin_fingerprint(NAME, st.cfg())
+pre = [add_row(first - timedelta(minutes=30), NAME),
+       add_row(first - timedelta(minutes=10), None, recorded={"signin_name": fp}, action="login_failed")]
+with SessionLocal() as db:
+    admin = User(id=uuid.uuid4(), username="ada-" + NAME[-8:], email=None, password_hash="x", role=RoleEnum.ADMIN,
+                 is_active=True)
+    db.add(admin)
+    db.commit()
+    with ps.change_transaction(engine) as w:
+        asked = pe.request(w, NAME, w.db.get(User, admin.id))
+run_days(8)
+out["row1"] = request_row(asked["id"])
+out["message"] = (ours() or [None])[-1]
+out["first"] = fmt.hour_text(first)
+out["seq"] = asked["request_seq"]
+read = host.acknowledge(engine, st, seqs=[], failures=True, read=True)
+host.acknowledge(engine, st, seqs=[], failures=True, expect=read["state"])
+out["open_after_ack"] = "row-before-genesis" in ai.open_failures(st.head_store().load())
+told = len(ours())
+run_days(1)
+out["row2"] = request_row(asked["id"])
+out["told_again"] = len(ours()) > told
+out["open_again"] = "row-before-genesis" in ai.open_failures(st.head_store().load())
+with engine.begin() as c:                                    # the host removes the rows
+    for rid in pre:
+        c.execute(text("DELETE FROM audit_logs WHERE id = :id"), {"id": rid})
+run_days(1)
+out["row3"] = request_row(asked["id"])
+with engine.connect() as c:
+    out["left"] = c.execute(text("SELECT count(*) FROM audit_logs WHERE username = :n OR recorded::text LIKE :p"),
+                            {"n": NAME, "p": "%" + fp + "%"}).scalar()
+held = {k: c.key for k, c in st.keys_held().items()}
+with SessionLocal() as db:
+    report = v.verify(db, record=st.head_store().load(), held=held, current_key_id=st.current_key().key_id,
+                      now=clock[0])
+out["failures"] = [[f.kind, f.message] for f in report.findings if f.severity == "failure"]
+out["held"] = ae.held_by("row-before-genesis")
+print(json.dumps(out, default=str))
+'''
+
+
+def test_rows_of_the_name_before_the_chains_first_hour_hold_an_erase_until_they_are_removed_on_postgres(throwaway):
+    out = run_in(throwaway, BEFORE_FIRST_SCRIPT, env={"AUDIT_ARCHIVE_START_AFTER_DAYS": "1000"})
+    assert out["stopped"] is None, out
+    assert out["row1"] == ["pending", out["held"]], out
+    assert out["message"] == (
+        f"audit_logs holds 2 rows of the name dated before the chain's first hour, {out['first']}, which no seal "
+        f"covers; the erase of request seal {out['seq']} waits until those rows are removed from audit_logs (an "
+        "acknowledgment of this finding does not release it)"), out
+    assert out["open_after_ack"] is False, out
+    assert out["row2"] == ["pending", out["held"]] and out["told_again"] and out["open_again"], out
+    assert out["row3"][0] == "completed" and out["left"] == 0, out
+    assert out["failures"] == [], out
