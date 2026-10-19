@@ -214,6 +214,7 @@ def test_the_database_removing_its_row_vetoes_it_and_a_changed_copy_is_not_acted
         assert any("other levels" in m for m in vr.pending_input_problems(db, env.st.view))
     env.week()
     assert env.rewrite_seals() == [] and env.get(ids[0]).ip_address == "203.0.113.9"
+    assert env.removal_row(second["id"]).waiting == vr.held_by("unjustified-input")
 
 
 @pytest.mark.parametrize("status", [vr.CANCELLED, vr.COMPLETED])
@@ -925,6 +926,7 @@ def test_a_row_whose_copy_of_the_scope_s_time_differs_from_its_seal_is_not_acted
         assert any("another scope" in m for m in vr.pending_input_problems(db, env.st.view))
     env.week()
     assert env.rewrite_seals() == [] and env.get(row_id).ip_address == "203.0.113.9"
+    assert env.removal_row(asked["id"]).waiting == vr.held_by("unjustified-input")
 
 
 def test_a_row_the_chain_holds_no_request_of_does_not_hold_a_new_removal_back(env):

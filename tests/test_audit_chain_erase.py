@@ -723,6 +723,7 @@ def test_a_database_that_changes_the_name_gets_nothing_erased(env, how):
     assert not any(s.detail.get("request_seq") == asked["request_seq"] for s in env.erase_seals())
     record = env.st.head_store().load()
     assert "unjustified-input" in (record.get("failures") or {})
+    assert env.request_row(asked["id"]).waiting == ae.held_by("unjustified-input")
 
 
 def test_the_daily_check_reports_a_waiting_erase_whose_name_was_swapped(env):

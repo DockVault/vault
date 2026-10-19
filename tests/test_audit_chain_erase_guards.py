@@ -464,11 +464,12 @@ def test_a_row_of_the_name_in_an_archived_day_listed_as_erased_already_is_a_find
     env.run_until_sealed()
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
     env.st.view.erased_rows.add(str(ids[0]))
-    env.ask("eve")
+    asked = env.ask("eve")
     env.passes(24 * 8)
     rows = _archived_rows(env)
     assert [rows[i]["username"] for i in ids] == ["eve", "eve"] and env.erase_seals() == []
     assert "unjustified" in _recorded_failures(env)
+    assert env.request_row(asked["id"]).waiting == ae.held_by("unjustified")
 
 
 def test_an_invitation_exactly_at_its_expiry_no_longer_holds_the_name(hot):
