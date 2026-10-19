@@ -4,7 +4,8 @@ Redeeming a link spends one of its uses and mints a grant; the download that fol
 more. So the download does not ask whether the link has a use left (the redeem spent it), only
 whether this grant may still deliver: it must belong to this link and to the address that redeemed
 it, it must not have been used, and it must have been minted before the link expired. A grant that
-lost the race for the link's last use is discarded at once.
+lost the race for the link's last use is discarded at once, and so is one whose use the database could
+not record (the real redeem handler, against a stand-in database).
 """
 from datetime import datetime, timedelta, timezone
 
@@ -138,3 +139,118 @@ def test_the_mint_time_defaults_to_now_in_utc(store):
     after = datetime.utcnow()
     minted = datetime.fromisoformat(store.data[S._publiclink_grant_key(grant)].decode().split("|")[2])
     assert before <= minted <= after
+
+
+@pytest.mark.parametrize("hours", [-5, 3])
+def test_an_aware_expiry_on_either_side_of_utc_is_compared_in_utc(store, hours):
+    # Behind UTC the wall clock reads EARLIER than the instant, ahead of it LATER. Compared by its wall
+    # clock, an expiry at minus five hours would refuse a grant minted a second before it, and one at
+    # plus three would let a grant minted a second after it through.
+    offset = timezone(timedelta(hours=hours))
+    after = (MINTED + timedelta(seconds=1)).replace(tzinfo=timezone.utc).astimezone(offset)
+    before = (MINTED - timedelta(seconds=1)).replace(tzinfo=timezone.utc).astimezone(offset)
+    assert after.utcoffset() == timedelta(hours=hours) and after.hour == (10 + hours) % 24
+    assert S._publiclink_consume_grant(_issue(), LINK, ADDRESS, expires_at=after) is True
+    assert S._publiclink_consume_grant(_issue(), LINK, ADDRESS, expires_at=before) is False
+
+
+@pytest.mark.parametrize("expires_at", [None, MINTED + timedelta(hours=1)])
+@pytest.mark.parametrize("stamp", ["2026-10-16T10:00:00+00:00", "2026-10-16T10:00:00-05:00"])
+def test_a_grant_whose_mint_time_carries_an_offset_is_refused(store, stamp, expires_at):
+    # This release writes the mint time as naive UTC (the time the redeem checked the link's expiry
+    # against). A time with an offset was not written by it, and holding an aware time against the
+    # naive expiry would raise in the middle of a download: refused, and left to expire.
+    grant = "a-grant-with-an-aware-mint-time"
+    store.data[S._publiclink_grant_key(grant)] = f"{LINK}|{ADDRESS}|{stamp}".encode()
+    assert S._publiclink_consume_grant(grant, LINK, ADDRESS, expires_at=expires_at) is False
+    assert S._publiclink_grant_key(grant) in store.data
+
+
+# ---- the redeem that mints a grant and then cannot record its use ---------------------------------
+
+class _UpdateFailed(Exception):
+    pass
+
+
+class _Rows:
+    def __init__(self, row):
+        self._row = row
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self._row
+
+    def all(self):
+        return []
+
+
+class _RedeemDB:
+    """The redeem's reads answered from a {model: row} map; its one write (the guarded update that spends
+    the use) raises, or matches no row. Audit rows are best-effort in the handler, so they are dropped."""
+
+    def __init__(self, rows, update):
+        self.rows, self.update, self.updates = rows, update, 0
+
+    def query(self, model, *more):
+        return _Rows(self.rows.get(model))
+
+    def execute(self, statement, *args, **kwargs):
+        self.updates += 1
+        if self.update == "raises":
+            raise _UpdateFailed("the database went away")
+        return type("Result", (), {"rowcount": 0})()
+
+    def add(self, obj):
+        pass
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+@pytest.fixture
+def redeem(store, monkeypatch):
+    import types
+    import uuid
+
+    from _async_run import run_coroutine
+
+    monkeypatch.setattr(R.rate_limiter, "check_rate_limit", lambda *a, **k: (True, 0, 0))
+    monkeypatch.setattr(S, "get_client_ip", lambda request: ADDRESS)
+    monkeypatch.setattr(S.note_link_policy, "public_file_links_enabled", lambda blob: True)
+    vault = types.SimpleNamespace(id=uuid.uuid4())
+    monkeypatch.setattr(S, "_publiclink_resolve_live", lambda db, link: (vault, object()))
+
+    def run(update):
+        token = "tok-" + uuid.uuid4().hex
+        file_row = types.SimpleNamespace(id=uuid.uuid4(), name="report.pdf", size_bytes=10, password_hash=None)
+        link = types.SimpleNamespace(
+            id=uuid.UUID(LINK), token_hash=S._publiclink_token_hash(token), owner_id=uuid.uuid4(),
+            vault_id=vault.id, revoked=False, expires_at=None, max_uses=1, use_count=0, secret_kind="none",
+            password_hash=None, target_type="file", target_file_id=file_row.id, target_folder_id=None)
+        db = _RedeemDB({S.PublicLink: link, S.File: file_row}, update)
+        return db, run_coroutine(S.redeem_public_link(token, S.PublicLinkRedeem(), None, db))
+
+    return run
+
+
+def test_a_redeem_whose_guarded_update_raises_discards_the_grant_it_minted(store, redeem):
+    # The grant is minted before the use is spent, so a store outage costs no use. When the update that
+    # spends it then raises, the use was never recorded, and the grant must not outlive the error.
+    with pytest.raises(_UpdateFailed):
+        redeem("raises")
+    assert len(store.expiry) == 1, "the redeem did not mint a grant before its update"
+    assert store.data == {}, "a grant whose use was never recorded is still held"
+
+
+def test_a_redeem_whose_guarded_update_matches_nothing_discards_the_grant_it_minted(store, redeem):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as refused:
+        redeem("no row")
+    assert refused.value.status_code == 404
+    assert len(store.expiry) == 1 and store.data == {}
