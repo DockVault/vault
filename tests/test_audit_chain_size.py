@@ -89,7 +89,7 @@ def test_a_large_row_in_the_current_hour_deletes_nothing_before_the_delay(env):
     assert failures(env.verify()) == [] and failures(_off(env)) == []
 
 
-def test_the_bytes_now_take_growth_in_at_once_and_the_cap_deletes_from_its_first_over(env):
+def test_the_bytes_now_take_growth_in_at_once_and_the_cap_deletes_from_its_first_over(env, monkeypatch):
     """A large row in the current hour, sealed: the cap's count takes it in only a delay after the hour's seal,
     the bytes now (what the retention screen warns on) at once. first_over names when the count first passes the
     cap: the hour's seal plus the delay. The pruner deletes nothing before then and the oldest rows after it, as
@@ -109,6 +109,15 @@ def test_the_bytes_now_take_growth_in_at_once_and_the_cap_deletes_from_its_first
     assert over is not None and abs(over - (_sealed_at(env, at) + delay)) < timedelta(seconds=1)
     assert size.first_over(st.view, st.known_record(), now, delay, grown) is None
     assert size.first_over(st.view, st.known_record(), now, delay, counted - 1) == now      # over it already
+    # A count equal to the limit is not over it (the pruner deletes nothing at equality): it passes only once the
+    # growth counts. The Storage card with a cap of exactly the count says the same.
+    assert size.first_over(st.view, st.known_record(), now, delay, counted) == over
+    from app.core import retention_storage as rs
+    with monkeypatch.context() as m:
+        m.setattr(ar, "MB", counted)                         # AUDIT_LOG_MAX_MB=1: a cap of exactly the count
+        card = rs.cap_counted(now, st)
+    assert (card["cap_bytes"], card["counted_bytes"]) == (counted, counted) and card["now_bytes"] > counted
+    assert card["over_from"] == over.isoformat() + "Z"
     with env.session() as db:
         today = ar.preview(db, now, ar.current())["by_size"]["rows"]
         as_counted = ar.preview(db, now, ar.current(), bytes_now=True)["by_size"]["rows"]

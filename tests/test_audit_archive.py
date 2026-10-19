@@ -959,6 +959,9 @@ def test_when_counts_an_archived_part_once_the_window_passes_its_hours_seals(env
     full = min(part.length, sum(view.entry_for(h).root.bytes for h in hours))
     total = chain_size.cap_count(view, record, now, delay)[4]
     assert counted == 0 and full > 0
+    # The block compresses: the part counts its length, less than its hours' bytes, at every moment to come.
+    assert full == part.length < sum(view.entry_for(h).root.bytes for h in hours)
+    assert chain_size.first_over(view, record, now, delay, total + full) is None
     limit = total + full - 1
     over = chain_size.first_over(view, record, now, delay, limit)
     sealed = max(view.entry_for(h).root.sealed_at for h in hours)
