@@ -289,9 +289,17 @@ def test_a_sigkilled_client_removes_the_marker_before_the_ttl(admin, temp_vault)
     reason="opt-in: pauses Redis; set VAULT_REDIS_OUTAGE_TEST=1 to run")
 def test_breaker_open_skips_the_marker_and_still_allows_the_upload(admin, temp_vault):
     # Positive control FIRST: a marker row must be visible BEFORE the outage, or the empty listing
-    # after proves nothing. Then prove the breaker is really OPEN (not just Redis slow), then confirm
-    # the listing shows no rows AND an upload still succeeds (fails open).
-    user, cred = _device_sftp_creds(admin, temp_vault)
+    # after proves nothing. Then pause Redis, drive requests so the breaker discovers the outage, and
+    # confirm the listing shows no rows while an upload still signs in and is written (fails open):
+    # it is listed as a file once Redis is back.
+    #
+    # A device's sync credential signs in once (the sign-in claims it), so the upload during the
+    # outage needs a credential of its own. Both are minted now, before the pause: a mint needs Redis.
+    dev = register_device(admin, label="marker-box")
+    grant(admin, dev["device_id"], temp_vault["id"])
+    minted = [mint_sync_cred(dev["secret"], temp_vault["id"]).json() for _ in range(2)]
+    (user, cred), (outage_user, outage_cred) = [(m["temp_username"], m["credential"]) for m in minted]
+    assert user != outage_user
     name = unique("outage") + ".bin"
     held = _HeldUpload(user, cred, temp_vault["name"], name)
     try:
@@ -314,9 +322,10 @@ def test_breaker_open_skips_the_marker_and_still_allows_the_upload(admin, temp_v
                 admin.session.get("%s/vaults/%s/files" % (BASE_URL, temp_vault["id"]), timeout=8)
             except Exception:  # noqa: BLE001 -- a stalled request during the outage is expected
                 pass
-        # During the outage an upload still succeeds (fails open) and the listing shows no rows.
-        # (A fresh device mint needs Redis too; reuse the existing SFTP creds to write, fail-open.)
-        held2 = _HeldUpload(user, cred, temp_vault["name"], unique("faildopen") + ".bin")
+        # During the outage an upload still signs in and is written (fails open), and the listing
+        # shows no rows while it is in flight.
+        outage_name = unique("failopen") + ".bin"
+        held2 = _HeldUpload(outage_user, outage_cred, temp_vault["name"], outage_name)
         try:
             items = _web_items(admin, temp_vault["id"])
             assert all(not i.get("in_progress") for i in items), "a marker row showed during the outage"
@@ -327,6 +336,15 @@ def test_breaker_open_skips_the_marker_and_still_allows_the_upload(admin, temp_v
         # The breaker closes only ~a cooldown after Redis returns (its background probe), so wait it
         # out before yielding, or the next test starts on an open breaker.
         wait_out_breaker_cooldown()
+    # The upload made during the outage is a file.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if any(i.get("name") == outage_name and not i.get("in_progress")
+               for i in _web_items(admin, temp_vault["id"])):
+            break
+        time.sleep(1)
+    else:
+        pytest.fail("the upload made during the outage is not listed as a file")
 
 
 def test_a_web_door_credential_frees_its_cap_slot_on_logout(admin, temp_user_client):
