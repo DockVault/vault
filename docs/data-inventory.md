@@ -415,7 +415,7 @@ line after checking it; Settings, Activity and records shows them in the panel.
 | `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
 | `AUDIT_HOT_DAYS` | `90` | Audit rows older than this (31 to 3650) are moved into compressed daily blocks, `audit_archive_blocks`; nothing is deleted. |
 | `AUDIT_ARCHIVE_START_AFTER_DAYS` | `14` | Archiving starts this long (0 to 90) after 0.34.0 first ran. |
-| `AUDIT_IP_FULL_DAYS` | `0` (keep) | Addresses in audit rows: one recorded in full is shortened to its /24 or /48 once its row is this many days old, and in a day the archive holds once the whole day is (1 to 36500; the panel can change it). |
+| `AUDIT_IP_FULL_DAYS` | `0` (keep) | Addresses in audit rows: one recorded in full is shortened to its /24 or /48 once its row is this many days old, and in a day the archive holds once the whole day is that old (1 to 36500; the panel can change it). |
 | `ERASE_BLOCKED_BY_PROTECTED_MINIMUM` | `false` | When `true`, a per-person erase waits until every audit row it would change is older than the protected minimum for its kind. |
 | `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records (and seals the audit log's hours). At most 360 take effect: the integrity chain needs a seal at least every 12 hours. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |

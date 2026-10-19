@@ -72,7 +72,7 @@ def test_the_table_renders_with_a_forbidden_level_disabled_and_its_env_line(page
 
 def test_the_card_says_an_address_in_an_archived_day_can_stay_in_full_a_day_longer(page: Page, admin_creds):
     """With full addresses kept for a number of days (served here as 30), the card says when an address is shortened,
-    and that in a day the archive holds it is once the whole day is: up to a day later."""
+    and that in a day the archive holds it is once the whole day is that old: up to a day later."""
     def handle(route):
         if route.request.method != "GET":
             return route.continue_()
@@ -85,7 +85,7 @@ def test_the_card_says_an_address_in_an_archived_day_can_stay_in_full_a_day_long
     _open(page)
     expect(page.locator(TAB)).to_contain_text(
         "An address recorded in full is shortened to its network once its row is 30 days old, and in a day the archive "
-        "holds once the whole day is (up to a day later;")
+        "holds once the whole day is that old (up to a day later;")
 
 
 def test_a_preset_fills_the_rows_and_the_save_waits_for_a_change(page: Page, admin_creds):

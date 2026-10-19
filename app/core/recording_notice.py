@@ -33,7 +33,7 @@ class Store:
 
 # An archived day's blocks are rewritten once the whole day is past the cutoff, not once an hour
 # (app/core/audit_rewrite.py cutoff).
-ARCHIVED_DAY_LATER = "in a day the archive holds, once the whole day is: up to a day later"
+ARCHIVED_DAY_LATER = "in a day the archive holds, once the whole day is past them: up to a day later"
 
 
 def _days(n: int) -> str:

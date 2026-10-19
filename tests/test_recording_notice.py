@@ -165,7 +165,7 @@ def test_the_days_an_address_stays_in_full_say_an_archived_day_can_take_a_day_lo
     monkeypatch.setattr(rn, "_full_address_days", lambda: 0)
     assert "shortened" not in rn._audit_kept() and "shortened" not in rn._level_words(ap.IP, ap.FULL)
     monkeypatch.setattr(rn, "_full_address_days", lambda: 30)
-    later = "in a day the archive holds, once the whole day is: up to a day later"
+    later = "in a day the archive holds, once the whole day is past them: up to a day later"
     assert f"shortened to the network it is in after 30 days ({later})." in rn._audit_kept()
     assert rn._level_words(ap.IP, ap.FULL).endswith(f", then shortened to the network it is in after 30 days ({later})")
     assert "after 30 days" not in rn._level_words(ap.IP, ap.SHORTENED)
