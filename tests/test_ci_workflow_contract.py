@@ -273,6 +273,34 @@ def test_disposable_ci_enables_outage_and_same_commit_guards():
     assert "VAULT_SAME_COMMIT_CI=1" in _WORKFLOW
 
 
+def test_the_full_suite_runs_the_streaming_sftp_tests_and_nothing_else_changes():
+    """tests/test_sftp_streaming_upload.py is skipped unless VAULT_SFTP_STREAMING=1, and CI never set it,
+    so the streaming upload tests never ran there. The full suite's command sets it, after the SFTP
+    container says it streams (the shipped default); nothing else in the workflow sees it: not a job's or
+    a step's env, not GITHUB_ENV, not another command."""
+    jobs = yaml.safe_load(_WORKFLOW)["jobs"]
+    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run the full test suite"]
+    assert "env" not in step
+    lines = [line.strip() for line in step["run"].splitlines() if line.strip()]
+    assert lines == [
+        "set -euo pipefail",
+        "streaming=\"$(docker compose exec -T vault-sftp python -c 'from app.core.config import settings; "
+        "print(settings.sftp_streaming_upload)')\"",
+        'test "$streaming" = "True"',
+        "VAULT_SFTP_STREAMING=1 python -m pytest --maxfail=1 --junitxml=pytest-results.xml "
+        "-o faulthandler_timeout=300",
+    ]
+    commands = [line.strip() for line in _WORKFLOW.splitlines()
+                if "VAULT_SFTP_STREAMING" in line and not line.strip().startswith("#")]
+    assert commands == [lines[-1]], "the opt-in reaches something besides the full suite's command"
+    # The setting the check reads is the one the SFTP server streams by, and the opt-in is the one the
+    # streaming tests read.
+    config = (_ROOT / "app" / "core" / "config.py").read_text(encoding="utf-8")
+    assert re.search(r"^    sftp_streaming_upload: bool = Field\(default=True\)$", config, re.M)
+    streaming_tests = (_ROOT / "tests" / "test_sftp_streaming_upload.py").read_text(encoding="utf-8")
+    assert streaming_tests.count('os.environ.get("VAULT_SFTP_STREAMING") != "1"') == 1
+
+
 def test_same_commit_missing_endpoint_is_a_failure(monkeypatch):
     monkeypatch.setenv("VAULT_SAME_COMMIT_CI", "1")
     with pytest.raises(pytest.fail.Exception, match="newly built image"):
