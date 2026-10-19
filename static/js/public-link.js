@@ -1,10 +1,15 @@
 /* Anonymous public FILE/FOLDER-link page.
  *
- * Reads the token from /p/{token}, POSTs to /public-links/{token}/redeem, and renders either one file
- * or a one-level folder listing. Redeeming consumes one use of the link and returns a single-use
- * download GRANT; a file download sends that grant in an X-Download-Grant HEADER (never a URL), which
- * the server consumes single-use. Because a grant is good for exactly one download, each download
- * re-redeems if it has no unused grant in hand.
+ * Reads the token from /p/{token}, POSTs to /public-links/{token}/redeem with peek=true to render
+ * either one file or a one-level folder listing (a visit spends nothing). The Download click redeems
+ * for real, which spends one use of the link and returns a single-use download GRANT, and then hands
+ * the file to the browser itself: an ordinary GET of the download address with the grant in its query,
+ * which the browser saves as the server's Content-Disposition says. Nothing is fetched into the page,
+ * so a file of any size never sits in its memory, and in-app browsers that cannot save a script's blob
+ * can still save it. The grant is used by that one request and otherwise expires within 60 s, and the
+ * page sends no more than its origin in a Referer, so the address it appears in holds nothing worth
+ * keeping. A public file link never serves a zero-knowledge file (the server refuses one), so there is
+ * nothing for the page to decrypt.
  *
  * All names come from the server as data and are written with textContent only (never innerHTML), so a
  * file name can never inject markup. No inline handlers (strict CSP: script-src 'self'); everything is
@@ -20,7 +25,6 @@
   var token = parts.length ? decodeURIComponent(parts[parts.length - 1]) : "";
 
   var secret = null;        // the PIN/password the user entered, if any (reused when re-redeeming)
-  var pendingGrant = null;  // an unused download grant held from the last redeem, or null
 
   function notice(text) {
     hide("loading"); hide("secret-form"); hide("content");
@@ -43,7 +47,7 @@
   function redeem(peek) {
     var body = {};
     if (secret != null) { body.secret = secret; }
-    // A peek renders the landing page WITHOUT spending a use; the download click re-redeems for real.
+    // A peek renders the landing page WITHOUT spending a use; the download click redeems for real.
     if (peek) { body.peek = true; }
     return fetch("/public-links/" + encodeURIComponent(token) + "/redeem", {
       method: "POST",
@@ -69,43 +73,52 @@
     input.focus();
   }
 
-  // Fetch the file bytes with a single-use grant and hand the browser a download.
-  function download(fileId, name, btn) {
+  // The address the browser downloads from: the grant rides the query of this one request.
+  function downloadAddress(fileId, grant) {
+    return "/public-links/" + encodeURIComponent(token) + "/download/" + encodeURIComponent(fileId) +
+      "?grant=" + encodeURIComponent(grant);
+  }
+
+  // Hand the download to the browser: a link made for this click and removed after it, so nothing on
+  // the page holds the grant for a prefetch or a later look to find.
+  function startDownload(fileId, grant) {
+    var a = document.createElement("a");
+    a.href = downloadAddress(fileId, grant);
+    a.rel = "noreferrer";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function refusedText(status) {
+    if (status === 429) { return "Too many attempts. Please wait a minute and try again."; }
+    if (status === 503) { return "The service is busy. Please try again shortly."; }
+    return "That file is no longer available.";
+  }
+
+  // Redeem for a single-use grant (this is where the link's use is spent), then let the browser fetch
+  // and save the file itself.
+  function download(fileId, btn) {
     var errBox = $("dl-error");
     errBox.classList.add("hidden");
     btn.disabled = true;
-
-    function withGrant(grant) {
-      pendingGrant = null; // consumed by this attempt
-      return fetch("/public-links/" + encodeURIComponent(token) + "/download/" + encodeURIComponent(fileId), {
-        method: "GET",
-        headers: { "X-Download-Grant": grant }
-      }).then(function (r) {
-        if (r.status !== 200) { throw new Error("unavailable"); }
-        return r.blob();
-      }).then(function (blob) {
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = url; a.download = name || "download";
-        document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    redeem(false).then(function (resp) {
+      if (resp.status !== 200) {
+        errBox.textContent = refusedText(resp.status);
+        errBox.classList.remove("hidden");
+        return null;
+      }
+      return resp.json().then(function (data) {
+        if (!data || !data.grant) { throw new Error("no grant"); }
+        startDownload(fileId, data.grant);
       });
-    }
-
-    // Use a grant already in hand, else redeem for a fresh one first.
-    var chain;
-    if (pendingGrant) {
-      chain = withGrant(pendingGrant);
-    } else {
-      chain = redeem().then(function (resp) {
-        if (resp.status !== 200) { throw new Error("unavailable"); }
-        return resp.json();
-      }).then(function (data) { return withGrant(data.grant); });
-    }
-    chain.catch(function () {
-      errBox.textContent = "That file is no longer available.";
+    }).catch(function () {
+      errBox.textContent = "Network error. Please try again.";
       errBox.classList.remove("hidden");
-    }).then(function () { btn.disabled = false; });
+    }).then(function () {
+      // Kept off for a moment, so a double click does not spend a second use on the same file.
+      setTimeout(function () { btn.disabled = false; }, 1500);
+    });
   }
 
   function fileRow(entry) {
@@ -128,7 +141,7 @@
     if (!entry.is_folder) {
       var btn = document.createElement("button");
       btn.type = "button"; btn.textContent = "Download";
-      btn.addEventListener("click", function () { download(entry.id, entry.name, btn); });
+      btn.addEventListener("click", function () { download(entry.id, btn); });
       row.appendChild(btn);
     }
     return row;
@@ -136,7 +149,6 @@
 
   function render(data) {
     hide("loading"); hide("secret-form"); hide("notice");
-    pendingGrant = data.grant || null;
     var listing = $("listing");
     listing.textContent = "";
     if (data.kind === "file") {

@@ -389,7 +389,21 @@ from app.core.log_redaction import (  # noqa: E402
     access_target as _access_target,
     AccessLogRedactFilter as _AccessLogRedactFilter,
     WebSocketLogRedactFilter as _WebSocketLogRedactFilter,
+    SECRET_QUERY_RE as _SECRET_QUERY_RE,
+    redact_log_path as _redact_log_path,
 )
+
+
+def _referrer_policy(path: str, query: str) -> str:
+    """The Referrer-Policy for a response: strict-origin-when-cross-origin, except when the response's own
+    address holds a secret, a link's token in the path (a note, file or upload link's page, its redeem,
+    its download) or an invitation's or a reset's token in the query: the routes the access log masks
+    (app/core/log_redaction.py). Then a Referer carries the origin alone, to this origin as well, where a
+    reverse proxy may log it, so the page's own requests (its script, its redeem, the download it starts)
+    never repeat the token. Not no-referrer: that would also send `Origin: null` on the page's own POST."""
+    if _redact_log_path(path) != path or (query and _SECRET_QUERY_RE.search("?" + query)):
+        return "strict-origin"
+    return "strict-origin-when-cross-origin"
 
 
 def _public_base_url(request) -> str:
@@ -473,8 +487,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # value has historically been abusable for same-origin info leaks). CSP is the real control.
         response.headers['X-XSS-Protection'] = '0'
         
-        # Security Header: Referrer policy
-        response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+        # Security Header: Referrer policy (origin only, wherever the address itself holds a secret)
+        response.headers['Referrer-Policy'] = _referrer_policy(request.url.path, request.url.query)
         
         # Security Header: Permissions policy (disable unnecessary features)
         response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
@@ -13885,6 +13899,43 @@ async def redeem_public_link(
     return {**meta, "grant": grant}
 
 
+def _publiclink_is_speculative(request) -> bool:
+    """A request made ahead of the person rather than by them: a browser's prefetch or prerender, or a
+    preview, which says so in Sec-Purpose (or the older Purpose, X-Purpose, X-Moz). The download refuses
+    it before it looks at the grant, so it spends nothing, and the person's own request finds the grant
+    unused."""
+    headers = getattr(request, "headers", None) or {}
+    for name in ("sec-purpose", "purpose", "x-purpose", "x-moz"):
+        value = (headers.get(name) or "").lower()
+        if "prefetch" in value or "prerender" in value or "preview" in value:
+            return True
+    return False
+
+
+# What a browser shows when the link page's own download (an ordinary request the browser saves itself)
+# is refused, in place of an error document the person would otherwise see as raw JSON. Fixed text only.
+_PUBLIC_DOWNLOAD_REFUSALS = {
+    404: ("This file could not be downloaded",
+          "Go back to the link page to see whether the link can still be used."),
+    429: ("Too many requests", "Wait a minute, then go back to the link page and try again."),
+    503: ("The server is busy", "Wait a few seconds, then go back to the link page and try again."),
+}
+
+
+def _public_download_refusal_page(refused: HTTPException):
+    from fastapi.responses import HTMLResponse
+    title, text = _PUBLIC_DOWNLOAD_REFUSALS.get(refused.status_code, _PUBLIC_DOWNLOAD_REFUSALS[404])
+    page = ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="robots" content="noindex, nofollow">'
+            f'<title>{title}</title></head>'
+            '<body style="font-family: system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem;">'
+            f'<h1 style="font-size: 1.3rem;">{title}</h1><p>{text}</p></body></html>')
+    headers = dict(refused.headers or {})
+    headers.update({"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+    return HTMLResponse(page, status_code=refused.status_code, headers=headers)
+
+
 @app.get("/public-links/{token}/download/{file_id}")
 async def download_public_link(
     token: str,
@@ -13892,17 +13943,37 @@ async def download_public_link(
     request: Request,
     db: Session = Depends(get_db),
     x_download_grant: Optional[str] = Header(None),
+    grant: Optional[str] = Query(None),
 ):
-    """PUBLIC: stream one file of a redeemed public link. The download GRANT rides an X-Download-Grant
-    HEADER (never a query string, which proxies/history record) and is single-use. The redeem that
-    minted the grant spent the link's use, so the download spends nothing and does NOT ask whether the
-    link has a use left: a link capped at N downloads delivers N. It re-checks every other gate from
-    redemption (master switch, link present and not revoked, vault Standard+not-pw, owner active +
-    still holds READ, target present + not password-protected), requires the grant to have been minted
-    before the link expired, and confines the requested file_id to the link's target subtree
-    (id_scope). Any failure is the uniform 404. No principal is synthesised: the blob is opened
-    directly once every gate passes. When the server fails after the grant is used and before the
-    first byte of the file goes out, the redeem's use is given back (_publiclink_refund_use)."""
+    """PUBLIC: stream one file of a redeemed public link. The single-use download GRANT comes one of two
+    ways. A script or API client sends it in an X-Download-Grant header. The link page sends it as the
+    `grant` query parameter of an ordinary GET the browser saves itself (Content-Disposition:
+    attachment), so the file never passes through the page's memory and in-app browsers can save it.
+    In that address the grant can be logged or kept (a proxy's log, the browser's list of downloads),
+    which is harmless: it is used by the request that carries it and otherwise expires within 60 s.
+    The access line keeps only the parameter's name, and the link's token in the path is masked; the
+    page and this response send at most the origin in a Referer (_referrer_policy). A refusal of the
+    query form is a small page the browser can show; the header form keeps the JSON body. The redeem
+    that minted the grant spent the link's use (see _serve_public_link_download)."""
+    if x_download_grant is not None or grant is None:
+        return await _serve_public_link_download(token, file_id, request, db, x_download_grant)
+    try:
+        return await _serve_public_link_download(token, file_id, request, db, grant)
+    except HTTPException as refused:
+        return _public_download_refusal_page(refused)
+
+
+async def _serve_public_link_download(token, file_id, request, db, presented_grant):
+    """Serve one file of a redeemed public link for `presented_grant`, which is single-use. The redeem
+    that minted the grant spent the link's use, so the download spends nothing and does NOT ask whether
+    the link has a use left: a link capped at N downloads delivers N. It refuses a prefetch or preview
+    first (_publiclink_is_speculative), then re-checks every other gate from redemption (master switch,
+    link present and not revoked, vault Standard+not-pw, owner active + still holds READ, target present
+    + not password-protected), requires the grant to have been minted before the link expired, and
+    confines the requested file_id to the link's target subtree (id_scope). Any failure is the uniform
+    404. No principal is synthesised: the blob is opened directly once every gate passes. When the
+    server fails after the grant is used and before the first byte of the file goes out, the redeem's
+    use is given back (_publiclink_refund_use)."""
     import time as _t
     from app.core.id_scope import id_in_scope
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -13910,7 +13981,9 @@ async def download_public_link(
     client_ip = get_client_ip(request)
     if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This file is not available.")
-    if not x_download_grant:
+    if not presented_grant:
+        raise HTTPException(status_code=404, detail="This file is not available.")
+    if _publiclink_is_speculative(request):
         raise HTTPException(status_code=404, detail="This file is not available.")
 
     # Per-IP rate limit (fail-closed): this is an anonymous endpoint that does DB work before it can
@@ -13965,7 +14038,7 @@ async def download_public_link(
 
     # Consume the single-use grant (bound to this link + client IP, minted before the link expired).
     # A miss = uniform 404.
-    if not _publiclink_consume_grant(x_download_grant, link.id, client_ip, expires_at=link.expires_at):
+    if not _publiclink_consume_grant(presented_grant, link.id, client_ip, expires_at=link.expires_at):
         _deny()
 
     # Everything authorized: open the blob for streaming (no principal — the equivalent of the authed

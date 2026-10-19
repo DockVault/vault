@@ -618,7 +618,7 @@ _READ_PATHS = [
     (API, "async def delete_file(", 1),              # an expired file answers 404 here too
     (API, "async def create_public_link(", 1),
     (API, "async def redeem_public_link(", 2),      # a file target, and a folder's children
-    (API, "async def download_public_link(", 1),
+    (API, "async def _serve_public_link_download(", 1),   # the download route's body, for both grant forms
     (API, "async def create_share(", 1),
     (API, "def _claim_resolved_share(", 1),
     (API, "def _share_dict(", 1),

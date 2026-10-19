@@ -243,8 +243,19 @@ cannot be stored is never handed out, and the download endpoint refuses any gran
 Standard vault's in-memory-decrypted `File.name` / `Folder.name` (the same plaintext the internal
 share card shows), no recursion in v1 (Q3).
 
-`GET /public-links/{token}/download/{file_id}` with the grant in an `X-Download-Grant` header — never a
-query parameter, which proxies and browser history record — streams the file. The grant is consumed on
+`GET /public-links/{token}/download/{file_id}` streams the file, with the grant in an `X-Download-Grant`
+header (a script or an API client) or in the `grant` query parameter. The link page uses the query
+form: its Download click redeems for a grant and then navigates to that address, an ordinary request
+the browser saves itself from the `Content-Disposition: attachment` response, so the file never passes
+through the page's memory and in-app browsers that cannot save a script's blob can save it (no public
+file link serves a zero-knowledge file, so the page never has to decrypt one). In that address the
+grant can be recorded (a proxy's log, the browser's list of downloads), which is harmless: the request
+that carries it uses it up, and it expires within 60 s otherwise. The vault's own access line keeps only
+the parameter's name and masks the link's token, the audit row keeps the route template, and every
+address holding a secret is served with `Referrer-Policy: strict-origin`, so the page's own requests
+send no more than the origin in a Referer. A request that says it is a prefetch or a preview
+(`Sec-Purpose`, `Purpose`, `X-Purpose`, `X-Moz`) is refused before the grant is looked at, and a refusal
+of the query form is a short page a browser can show (the header form keeps its JSON). The grant is consumed on
 first use (single winner, like the OTP service), the `file_id` must lie inside the link's target
 (`app/core/id_scope.id_in_scope` with the folder ancestry — the same membership check
 `require_scope` uses for temp credentials and share claims), and the response is built with
