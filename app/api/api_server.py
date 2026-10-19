@@ -750,7 +750,7 @@ app.include_router(info_router)
 # SystemSetting key that holds the brand overrides (A3 mirrors the Settings brand
 # fields into it so /branding + the rendered shell update live).
 from app.config.branding import HEX_COLOR_RE
-from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
+from app.config.effective import BRAND_SETTINGS_KEY, load_brand_overrides, set_brand_overrides
 
 # Import and include ECC router (Elliptic Curve Cryptography)
 from app.api.ecc_router import router as ecc_router
@@ -7216,24 +7216,54 @@ async def upload_brand_asset(
         raise HTTPException(status_code=503, detail="Brand asset storage is not writable")
     fname = f"{slot}.{hashlib.sha256(data).hexdigest()[:8]}.{ext}"
     dest = os.path.join(BRAND_ASSET_DIR, fname)
-    # keep one asset per slot: drop older files for this slot (different hash/ext)
+    url = f"/brand-assets/{fname}"
+    # What the slot shows now, so a save that fails below can tell its own new file from it.
+    shown_before = load_brand_overrides(db).get(fields[0])
+    # The new image first, content and name on the disk; then the setting points at it; only then is
+    # the slot's old image removed. A write or a save that fails leaves the old image in place, and
+    # still shown, instead of a setting that names a file already gone.
+    tmp = dest + ".tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            # The content is on the disk before the rename, and the name after it, before the brand row
+            # points at the file: a power cut must not leave the row naming an empty or missing image.
+            durable_write.sync_file(fh)
+        os.replace(tmp, dest)  # atomic publish
+        durable_write.sync_directory(BRAND_ASSET_DIR)
+        written = True
+    except OSError:
+        written = False
+    if written:
+        try:
+            _update_brand_row(db, set_map={f: url for f in fields})
+            db.commit()
+        except Exception:
+            db.rollback()
+            if shown_before != url:        # the new file is no one's: the setting still names the old one
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+            raise
+    else:
+        # The temporary file, and the new name if the rename got that far but its sync did not; never the
+        # file the setting names (the same image uploaded again).
+        for leftover in (tmp, dest if shown_before != url else None):
+            if leftover:
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+        raise HTTPException(status_code=503, detail="Brand asset storage is not writable")
+    # Keep one asset per slot: now that the setting names the new image, drop the slot's other files
+    # (another hash or type, or a temporary file a failed upload left).
     for existing in os.listdir(BRAND_ASSET_DIR):
         if existing.startswith(slot + ".") and existing != fname:
             try:
                 os.remove(os.path.join(BRAND_ASSET_DIR, existing))
             except OSError:
                 pass
-    tmp = dest + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-        # The content is on the disk before the rename, and the name after it, before the brand row
-        # points at the file: a power cut must not leave the row naming an empty or missing image.
-        durable_write.sync_file(fh)
-    os.replace(tmp, dest)  # atomic publish
-    durable_write.sync_directory(BRAND_ASSET_DIR)
-    url = f"/brand-assets/{fname}"
-    _update_brand_row(db, set_map={f: url for f in fields})
-    db.commit()
     try:
         AuditLogger(db).log_action(
             action="brand_asset_uploaded", status="success", user=current_user,

@@ -57,7 +57,8 @@ CLASSIFIED = {
     ("app/sftp/sftp_server.py", "_sweep_sftp_tmp"): (["f.unlink"], STAGING),
     ("app/sftp/sftp_server.py", "_StreamingUpload.close"): (["orphan.unlink"], NEW_BLOB),
     ("app/sftp/sftp_server.py", "SFTPServerInterface._make_upload_finalizer._finalize"): (["orphan.unlink"], NEW_BLOB),
-    ("app/api/api_server.py", "upload_brand_asset"): (["os.remove"], NOT_CONTENT),
+    # A failed write's temporary file, a new image the setting never came to name, and the slot's old one.
+    ("app/api/api_server.py", "upload_brand_asset"): (["os.remove"] * 3, NOT_CONTENT),
     ("app/api/api_server.py", "reset_brand_asset"): (["os.remove"], NOT_CONTENT),
     ("app/core/admin_password_hygiene.py", "scrub_bootstrap_password_source"): (["os.remove"], NOT_CONTENT),
     ("app/core/health.py", "check_storage_status"): (["os.remove"], NOT_CONTENT),
