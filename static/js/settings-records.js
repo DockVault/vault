@@ -113,7 +113,8 @@
         }
         if (S.data.ip_full_days > 0) {
             parts.push(`An address recorded in full is shortened to its network once its row is ${S.data.ip_full_days} ` +
-                `day${S.data.ip_full_days === 1 ? '' : 's'} old ("Keep full addresses in audit rows for", under Retention).`);
+                `day${S.data.ip_full_days === 1 ? '' : 's'} old, and in a day the archive holds once the whole day is ` +
+                '(up to a day later; "Keep full addresses in audit rows for", under Retention).');
         }
         if (S.data.sftp && !S.data.sftp.same_version) {
             parts.push(`Levels that record less than earlier releases cannot be saved yet: ${S.data.sftp.explain}`);

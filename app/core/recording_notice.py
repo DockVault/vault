@@ -31,6 +31,11 @@ class Store:
     follows_levels: bool = False
 
 
+# An archived day's blocks are rewritten once the whole day is past the cutoff, not once an hour
+# (app/core/audit_rewrite.py cutoff).
+ARCHIVED_DAY_LATER = "in a day the archive holds, once the whole day is: up to a day later"
+
+
 def _days(n: int) -> str:
     return "for ever" if not n else (f"{n} day" if n == 1 else f"{n} days")
 
@@ -46,7 +51,8 @@ def _audit_kept() -> str:
         text += f"; the oldest events go first once the log passes {numbers.max_mb} MB"
     days = _full_address_days()
     if days:
-        text += f"; an address recorded in full is shortened to the network it is in after {_days(days)}"
+        text += (f"; an address recorded in full is shortened to the network it is in after {_days(days)} "
+                 f"({ARCHIVED_DAY_LATER})")
     return text + "."
 
 
@@ -197,7 +203,7 @@ def _level_words(key: str, level: str) -> str:
         except Exception:  # noqa: BLE001 -- the level alone
             days = 0
         if days:
-            words += f", then shortened to the network it is in after {_days(days)}"
+            words += f", then shortened to the network it is in after {_days(days)} ({ARCHIVED_DAY_LATER})"
     return words
 
 
