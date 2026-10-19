@@ -8,8 +8,9 @@ the web app asks before it makes one.
 Each SFTP process records itself in ``sftp_processes`` (an id of its own, its host and its version) when
 it starts and every RECORD_SECONDS after, on a thread of its own, so a database that does not answer never
 holds up the server or its heartbeat (app/sftp/heartbeat.py). A process counts as live while it has
-recorded itself within LIVE_WITHIN_SECONDS. It removes its own row when it stops cleanly, and rows no
-process has refreshed for PRUNE_AFTER_DAYS are removed when a process starts.
+recorded itself within LIVE_WITHIN_SECONDS. It removes its own row when it stops cleanly, waiting at most
+FORGET_SECONDS for the database (a row it could not remove goes stale on its own), and rows no process has
+refreshed for PRUNE_AFTER_DAYS are removed when a process starts.
 
 sftp_same_version() answers whether SFTP is off, or every live SFTP process runs this version:
 
@@ -36,6 +37,9 @@ from pathlib import Path
 from typing import Optional
 
 RECORD_SECONDS = 30.0
+# How long a stop waits for its row's removal. A database that does not answer then (stopped, or frozen)
+# never holds up the stop: the process ends, and its row is no longer live after LIVE_WITHIN_SECONDS.
+FORGET_SECONDS = 2.0
 LIVE_WITHIN_SECONDS = 120
 PRUNE_AFTER_DAYS = 7
 
@@ -197,20 +201,30 @@ class Recorder:
 
     def stop(self, *, forget_row: bool = True) -> None:
         """End the recording, and remove this process's row, if it made one, so it no longer counts as
-        live. Waits at most a second for the thread: a stop never hangs on the database."""
+        live. Waits at most a second for the thread and FORGET_SECONDS for the removal, which runs on a
+        daemon thread of its own: a stop never hangs on the database."""
         self._stop.set()
         if self.thread is not None:
             self.thread.join(timeout=1)
         if forget_row and self.recorded:
-            db = None
-            try:
-                db = self._session()
-                forget(db, self.process_id)
-            except Exception:  # noqa: BLE001 - its row goes stale on its own
-                pass
-            finally:
-                if db is not None:
-                    try:
-                        db.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+            forgetting = threading.Thread(target=self._forget, name="version-forget", daemon=True)
+            forgetting.start()
+            forgetting.join(timeout=FORGET_SECONDS)
+
+    def _forget(self) -> None:
+        """Remove this process's row, once a turn still in flight has ended, so that turn cannot write the
+        row again after it. Never raises: a row it cannot remove goes stale on its own."""
+        if self.thread is not None:
+            self.thread.join()
+        db = None
+        try:
+            db = self._session()
+            forget(db, self.process_id)
+        except Exception:  # noqa: BLE001 - its row goes stale on its own
+            pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:  # noqa: BLE001
+                    pass

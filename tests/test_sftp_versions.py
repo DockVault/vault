@@ -249,6 +249,100 @@ def test_a_database_that_does_not_answer_never_holds_up_the_server():
     release.set()
 
 
+# docker stop kills a process that has not ended 10 s after it was asked to; the recorder's stop must fit
+# well inside that, with room for the rest of the server's own.
+STOP_WITHIN_SECONDS = 5
+
+
+def _wait_recorded(recorder):
+    deadline = time.monotonic() + 5
+    while not recorder.recorded and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert recorder.recorded, "the recorder never recorded itself"
+
+
+def _row_gone_within(factory, process_id, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        db = factory()
+        try:
+            if db.get(SftpProcess, process_id) is None:
+                return True
+        finally:
+            db.close()
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize("where", ["opening a session", "removing the row"])
+def test_a_database_that_stops_answering_after_a_record_never_holds_up_the_stop(factory, monkeypatch, where):
+    """The process recorded itself, then the database stopped answering (frozen, as a paused container is):
+    the removal of its row is given FORGET_SECONDS, on a daemon thread that never holds up the process's
+    exit, and the stop returns. When the database answers again while the process lives, the row goes."""
+    frozen, answering = threading.Event(), threading.Event()
+
+    def session():
+        if frozen.is_set() and where == "opening a session":
+            answering.wait(30)
+        return factory()
+
+    real_forget = SV.forget
+
+    def forget(db, process_id):
+        if where == "removing the row":
+            answering.wait(30)
+        real_forget(db, process_id)
+
+    monkeypatch.setattr(SV, "forget", forget)
+    recorder = SV.Recorder(session, interval=10)
+    recorder.start()
+    # Lets a stop that waits on the database return at last, so that it fails here instead of hanging.
+    thaw = threading.Timer(STOP_WITHIN_SECONDS + 3, answering.set)
+    try:
+        _wait_recorded(recorder)
+        frozen.set()
+        thaw.start()
+        t0 = time.monotonic()
+        recorder.stop()
+        took = time.monotonic() - t0
+        assert took < STOP_WITHIN_SECONDS, f"the stop waited {took:.1f} s on a database that did not answer"
+        assert took < 1 + SV.FORGET_SECONDS + 0.5
+        waiting = [t for t in threading.enumerate() if t.name == "version-forget"]
+        assert waiting and all(t.daemon for t in waiting), "the removal is not on a daemon thread of its own"
+    finally:
+        thaw.cancel()
+        answering.set()
+    assert _row_gone_within(factory, recorder.process_id, 5), "the row stayed once the database answered"
+
+
+def test_the_row_is_removed_after_a_record_still_in_flight_not_before_it(factory):
+    """A refresh that the frozen database holds up is still in flight when the process stops. The removal
+    waits for it, so that the turn, once the database answers, cannot write the row again after it."""
+    frozen, answering = threading.Event(), threading.Event()
+    held = threading.Event()
+
+    def session():
+        if frozen.is_set() and threading.current_thread().name == "version-record":
+            held.set()
+            answering.wait(30)
+        return factory()
+
+    recorder = SV.Recorder(session, interval=0.05)
+    recorder.start()
+    try:
+        _wait_recorded(recorder)
+        frozen.set()
+        assert held.wait(5), "no turn reached the frozen database"
+        t0 = time.monotonic()
+        recorder.stop()
+        assert time.monotonic() - t0 < STOP_WITHIN_SECONDS
+    finally:
+        answering.set()
+    recorder.thread.join(5)
+    assert not recorder.thread.is_alive()
+    assert _row_gone_within(factory, recorder.process_id, 5), "the turn in flight wrote the row again"
+
+
 def test_a_failed_record_is_tried_again_at_the_next_turn(factory):
     calls = []
 
