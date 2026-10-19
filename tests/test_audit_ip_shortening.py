@@ -531,6 +531,20 @@ def test_rows_dated_before_the_chains_first_hour_are_reported_and_the_rows_after
     assert "row-before-genesis" in {f.kind for f in env.verify().findings}
 
 
+def test_rows_dated_before_the_chains_first_hour_are_one_unit_however_many_hours_they_span(env30):
+    """However many hours they span, the rows before the chain's first hour are one unit: a pass with time for two
+    transactions passes over all of them in the first and shortens the oldest day after them in the second."""
+    env = env30
+    a = env.put(T0 - timedelta(days=40, minutes=5))
+    b = env.put(T0 - timedelta(days=35, minutes=5))
+    env.run_until_sealed()
+    first = env.st.view.first_hour()
+    for days in (5, 4, 2):
+        env.put(first - timedelta(days=days, hours=3))
+    rw.shorten_job(_Steps(env, 2))
+    assert _shortened(env.get(a)) and not _shortened(env.get(b))
+
+
 def test_a_day_a_later_release_archived_is_passed_over(env30, monkeypatch):
     """A day archived in a later release's block format (a rollback) is left as it is, as the audit job's prune leaves
     it, with no finding: the rows after it are shortened."""
