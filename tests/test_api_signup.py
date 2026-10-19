@@ -15,6 +15,7 @@ creates.
 import pytest
 
 from conftest import BASE_URL, unique
+from test_invite_accept import restorable
 
 pytestmark = pytest.mark.integration
 
@@ -31,9 +32,10 @@ STRONG_PW = "S1gnup-Passw0rd!"
 def restore_settings(admin):
     """Snapshot the account + password-policy keys these tests mutate and put them back afterwards."""
     before = admin.get("/settings").json()
-    snap = {k: before.get(k) for k in (ACCOUNT_KEYS + PASSWORD_KEYS)}
+    snap = restorable({k: before.get(k) for k in (ACCOUNT_KEYS + PASSWORD_KEYS)})
     yield snap
-    admin.put("/settings", json=snap)
+    r = admin.put("/settings", json=snap)
+    assert r.status_code == 200, r.text
 
 
 def _set(admin, **kw):
